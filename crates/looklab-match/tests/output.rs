@@ -6,6 +6,7 @@ use looklab_match::{
     TargetSpec, optimize, predicted_trace, settings_card,
 };
 use looklab_model::ProbeSetVersion;
+use looklab_model::file::{ProbeCovariance, UncertaintyData};
 
 #[test]
 fn permalink_round_trips_through_its_canonical_form() {
@@ -24,6 +25,7 @@ fn permalink_round_trips_through_its_canonical_form() {
         probe_set: ProbeSetVersion::V1,
         optimizer: "looklab-match/1".to_string(),
         emphasis: Emphasis::Skin,
+        seed: 42,
         sources: PermalinkSources {
             target_look: Some("looks/classic-chrome.looklab".to_string()),
             base_look: Some("looks/provia.looklab".to_string()),
@@ -101,6 +103,151 @@ fn covariance_round_trips_and_predicts_a_band() {
     assert!(!model.groups.is_empty());
     let trace = predicted_trace(&model, &body.settings, probes.probes[0].xyz).expect("trace");
     assert!(trace > 0.0, "trace {trace}");
+}
+
+#[test]
+fn target_confidence_scales_error_but_not_predicted_covariance() {
+    let probes = synth::probes();
+    let body = synth::body(8).expect("synthetic body");
+    let mut values = vec![0.0_f64; probes.probes.len() * 9];
+    values[0] = 1.0;
+    let uncertainty = UncertaintyData {
+        probe_cov: Some(ProbeCovariance::new(probes.probes.len(), values).expect("covariance")),
+        density: None,
+    };
+    let target_function = body.target();
+    let target = PreparedTarget::new(TargetSpec {
+        probes: &probes,
+        function: &target_function,
+        uncertainty: Some(&uncertainty),
+        emphasis: Emphasis::Balanced,
+        tau: 1.0,
+        support_sigma: 1.5,
+        density_floor: None,
+    })
+    .expect("target");
+    assert!(target.covariance_weight[0] > 0.0);
+    let ratio = target.weight[0] / target.covariance_weight[0];
+    assert!((ratio - 0.5).abs() < 1e-12, "c_p ratio {ratio}");
+    let unaffected = (1..probes.probes.len())
+        .find(|index| target.covariance_weight[*index] > 0.0)
+        .expect("supported probe");
+    assert!((target.weight[unaffected] - target.covariance_weight[unaffected]).abs() < 1e-12);
+}
+
+#[test]
+fn residual_summary_includes_input_effects() {
+    let plan = synth::plan();
+    let probes = synth::probes();
+    let schema = synth::schema();
+    let body = synth::body(10).expect("synthetic body");
+    let sim = looklab_schema::SimKey::new(synth::SYNTH_SIM).expect("sim");
+    let mut crm = looklab_model::realization::ControlResponseModel::zeroed(&schema, 1, &sim, 1)
+        .expect("zeroed model");
+    for step in &mut crm.exposure.steps {
+        if step.key.as_str() == "exposure_compensation" {
+            step.ev_per_step = 1.0;
+        }
+    }
+    let model = looklab_match::MatchModel::new(
+        body.model.base_look.clone(),
+        crm,
+        body.model.transform,
+        None,
+        1,
+        1,
+    )
+    .expect("model");
+    let target_function = &body.model.base_look;
+    let target = PreparedTarget::new(TargetSpec {
+        probes: &probes,
+        function: target_function,
+        uncertainty: None,
+        emphasis: Emphasis::Balanced,
+        tau: 1.0,
+        support_sigma: 1.5,
+        density_floor: None,
+    })
+    .expect("target");
+    let ec = plan
+        .by_key
+        .get(&looklab_schema::ControlKey::new("exposure_compensation").expect("key"))
+        .copied()
+        .expect("exposure control");
+    let mut settings = plan.default.clone();
+    settings.set(
+        plan.key(ec).clone(),
+        looklab_model::realization::ControlValue::Step(6),
+    );
+    let suggestion = looklab_match::Suggestion {
+        sim: model.sim().clone(),
+        settings,
+        objective: 0.0,
+        median_delta_e: 0.0,
+        p95_delta_e: 0.0,
+        max_delta_e: 0.0,
+        sigma_band: 0.0,
+    };
+    let card = settings_card(&target, &plan, &model, &suggestion).expect("card");
+    assert!(card.median_delta_e > 0.1, "median {}", card.median_delta_e);
+    assert!(
+        !card.residual_summary.contains("indistinguishable"),
+        "summary {}",
+        card.residual_summary
+    );
+}
+
+#[test]
+fn confidence_rejects_support_that_only_covers_defaults() {
+    let plan = synth::plan();
+    let probes = synth::probes();
+    let body = synth::body(11).expect("synthetic body");
+    let mut crm = body.model.crm.clone();
+    crm.support.controls = plan
+        .domains
+        .iter()
+        .map(|domain| looklab_model::realization::ControlSupport {
+            key: domain.key.clone(),
+            default: domain.default_value().clone(),
+            observed: vec![domain.default_value().clone()],
+        })
+        .collect();
+    let model = looklab_match::MatchModel::new(
+        body.model.base_look.clone(),
+        crm,
+        body.model.transform,
+        None,
+        1,
+        1,
+    )
+    .expect("model");
+    let target_function = body.target();
+    let target = PreparedTarget::new(TargetSpec {
+        probes: &probes,
+        function: &target_function,
+        uncertainty: None,
+        emphasis: Emphasis::Balanced,
+        tau: 1.0,
+        support_sigma: 1.5,
+        density_floor: None,
+    })
+    .expect("target");
+    let suggestion = looklab_match::Suggestion {
+        sim: model.sim().clone(),
+        settings: plan.default.clone(),
+        objective: 0.0,
+        median_delta_e: 0.0,
+        p95_delta_e: 0.0,
+        max_delta_e: 0.0,
+        sigma_band: 0.0,
+    };
+    let card = settings_card(&target, &plan, &model, &suggestion).expect("card");
+    assert_eq!(
+        card.confidence.level,
+        looklab_match::ConfidenceLevel::Low,
+        "{}",
+        card.confidence.reason
+    );
 }
 
 #[test]

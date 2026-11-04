@@ -13,6 +13,8 @@ use crate::optimizer::{MatchOptions, Suggestion, optimize, quantile};
 use crate::settings::Plan;
 use crate::target::PreparedTarget;
 
+/// `in_rgb` is camera RGB before the body realization effects; `A_c · in_rgb`
+/// is the scene the target is evaluated on. `out_rgb` is linear output RGB.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObservedRender {
     pub samples: SampleSet,
@@ -117,7 +119,7 @@ impl ObservedFitter for ScaleFitter {
                 let stride = (n / options.max_samples.max(1)).max(1);
                 for sample in (0..n).step_by(stride) {
                     let rgb = render.samples.in_rgb()[sample].map(f64::from);
-                    let scene = candidate.xyz_from_camera(&realization, rgb);
+                    let scene = candidate.scene_from_camera(rgb);
                     let input_xyz = candidate.input_xyz(&realization, scene);
                     let prediction = realization.look.eval(input_xyz);
                     let observed_ucs = observed_ucs(&render.samples, sample, space)?;
@@ -270,16 +272,15 @@ fn solve(matrix: &mut [Vec<f64>], rhs: &mut [f64]) -> Result<Vec<f64>> {
 pub fn measure_target_error(
     target: &PreparedTarget<'_>,
     model: &MatchModel,
-    settings: &Settings,
+    _settings: &Settings,
     observed: &[ObservedRender],
 ) -> Result<DeltaStats> {
-    let realization = model.realize(settings)?;
     let mut values = Vec::new();
     for render in observed {
         let space = output_space(render.samples.header().output_space);
         for sample in 0..render.samples.n() {
             let rgb = render.samples.in_rgb()[sample].map(f64::from);
-            let scene = model.xyz_from_camera(&realization, rgb);
+            let scene = model.scene_from_camera(rgb);
             let expected = target.function.predict(scene);
             let observed_ucs = observed_ucs(&render.samples, sample, space)?;
             values.push(delta_e_ucs(expected, observed_ucs));
@@ -303,7 +304,7 @@ pub fn select_verification_samples(
         let mut seen = 0_usize;
         for sample in (0..n).step_by(stride) {
             let rgb = samples.in_rgb()[sample].map(f64::from);
-            let scene = model.xyz_from_camera(&realization, rgb);
+            let scene = model.scene_from_camera(rgb);
             total += crate::covariance::trace_with(model, &realization, settings, scene)?;
             seen += 1;
         }
@@ -385,7 +386,6 @@ pub fn verify_once(
             request.target,
             request.model,
             truth,
-            &first.settings,
             &second.settings,
             request.observed,
         )?),
@@ -412,16 +412,14 @@ fn measure_truth(
     target: &PreparedTarget<'_>,
     model: &MatchModel,
     truth: &dyn TruthRenderer,
-    first: &Settings,
     second: &Settings,
     observed: &[ObservedRender],
 ) -> Result<DeltaStats> {
-    let realization = model.realize(first)?;
     let mut values = Vec::new();
     for render in observed {
         for sample in 0..render.samples.n() {
             let rgb = render.samples.in_rgb()[sample].map(f64::from);
-            let scene = model.xyz_from_camera(&realization, rgb);
+            let scene = model.scene_from_camera(rgb);
             let expected = target.function.predict(scene);
             let rendered = truth.render(model, second, scene)?;
             values.push(delta_e_ucs(expected, rendered));

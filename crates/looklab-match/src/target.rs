@@ -50,6 +50,8 @@ pub struct PreparedTarget<'a> {
     pub sigma2: Vec<f64>,
     /// `probe.weight × emphasis × c_p`; zero for unsupported probes.
     pub weight: Vec<f64>,
+    /// `probe.weight × emphasis`, without `c_p`.
+    pub covariance_weight: Vec<f64>,
     pub target: Vec<Ucs>,
     pub density_floor: f64,
 }
@@ -88,6 +90,7 @@ impl<'a> PreparedTarget<'a> {
 
         let mut supported = Vec::with_capacity(count);
         let mut weight = vec![0.0_f64; count];
+        let mut covariance_weight = vec![0.0_f64; count];
         let mut target = Vec::with_capacity(count);
         for (index, probe) in spec.probes.probes.iter().enumerate() {
             target.push(spec.function.predict(probe.xyz));
@@ -100,7 +103,9 @@ impl<'a> PreparedTarget<'a> {
             if sigma <= spec.support_sigma && dense >= density_floor {
                 supported.push(index);
                 let c = 1.0 / (1.0 + sigma2[index] / (spec.tau * spec.tau));
-                weight[index] = probe.weight * spec.emphasis.group_multiplier(probe.group) * c;
+                covariance_weight[index] =
+                    probe.weight * spec.emphasis.group_multiplier(probe.group);
+                weight[index] = covariance_weight[index] * c;
             }
         }
         if supported.is_empty() {
@@ -115,6 +120,7 @@ impl<'a> PreparedTarget<'a> {
             supported,
             sigma2,
             weight,
+            covariance_weight,
             target,
             density_floor,
         })
@@ -131,6 +137,11 @@ impl<'a> PreparedTarget<'a> {
                 .supported
                 .iter()
                 .map(|index| self.weight[*index])
+                .collect(),
+            covariance_weights: self
+                .supported
+                .iter()
+                .map(|index| self.covariance_weight[*index])
                 .collect(),
         }
     }
@@ -171,6 +182,15 @@ impl<'a> PreparedTarget<'a> {
         let total_weight: Vec<f64> = members
             .iter()
             .map(|indices| indices.iter().map(|index| self.weight[*index]).sum::<f64>())
+            .collect();
+        let total_covariance: Vec<f64> = members
+            .iter()
+            .map(|indices| {
+                indices
+                    .iter()
+                    .map(|index| self.covariance_weight[*index])
+                    .sum::<f64>()
+            })
             .collect();
         let total: f64 = total_weight.iter().sum();
         let quota: Vec<f64> = if total > 0.0 {
@@ -234,6 +254,7 @@ impl<'a> PreparedTarget<'a> {
 
         let mut indices = Vec::with_capacity(count);
         let mut weights = Vec::with_capacity(count);
+        let mut covariance_weights = Vec::with_capacity(count);
         for (group, &take) in selected_counts.iter().enumerate() {
             let pool = &members[group];
             if take == 0 {
@@ -248,17 +269,31 @@ impl<'a> PreparedTarget<'a> {
             chosen.sort_unstable();
             chosen.dedup();
             let selected_weight: f64 = chosen.iter().map(|index| self.weight[*index]).sum();
+            let selected_covariance: f64 = chosen
+                .iter()
+                .map(|index| self.covariance_weight[*index])
+                .sum();
             let scale = if selected_weight > 0.0 {
                 total_weight[group] / selected_weight
+            } else {
+                1.0
+            };
+            let covariance_scale = if selected_covariance > 0.0 {
+                total_covariance[group] / selected_covariance
             } else {
                 1.0
             };
             for index in chosen {
                 indices.push(index);
                 weights.push(self.weight[index] * scale);
+                covariance_weights.push(self.covariance_weight[index] * covariance_scale);
             }
         }
-        ProbeSubset { indices, weights }
+        ProbeSubset {
+            indices,
+            weights,
+            covariance_weights,
+        }
     }
 }
 

@@ -65,7 +65,7 @@ Cov(D) arrives as `looklab-crm-cov/1`: the control-response model's `parameter_i
 
 **Search:** for each kept base sim, run staged integer coordinate descent following the schema's `solve_plan` (tone stage, then color stage; each control swept over its range; iterate to convergence). Then 3 perturbation rounds (random joint ±1–2 step moves on 2–3 controls, accepted if better). Keep a beam of 5 per sim and return the top 3 overall. Defaults: 500-probe subset, 5-probe full rescore, 4 coordinate passes, 1 re-linearization, 2 exact warm restarts for the leading sim, seed supplied by the caller.
 
-Large nonlinear moves, such as a two-stop tone change together with exposure compensation, can be pruned by a linearization at default. The leading sim therefore gets a coarse exact coordinate descent on 64 probes, plus two random-restart descents on 48 probes, and the beam seeds are exact-scored on the full set. On 3 synthetic sims and the 1057-probe set the native release search measures median 0.85 s, p95 1.14 s; the same example under wasm32-wasip1 on wasmtime measures median 1.06 s, p95 1.38 s.
+Large nonlinear moves, such as a two-stop tone change together with exposure compensation, can be pruned by a linearization at default. The leading sim therefore gets a coarse exact coordinate descent on 64 probes, plus two random-restart descents on 48 probes, and the beam seeds are exact-scored on the full set. On 3 synthetic sims and the 1057-probe set a clean native release run measures median 0.72 s, p95 0.77 s; the same example under wasm32-wasip1 on wasmtime measures median 1.10 s, p95 1.26 s. Runs under concurrent build load reach a native p95 near 2.0 s.
 
 ## 4. Settings card and permalinks
 
@@ -78,9 +78,9 @@ The **settings card** shows:
 
 **Permalinks** pin everything needed to reproduce the result: Look version, base realization Look version, control-response model version, input transform version, realization params version, epoch map version, probe set version, optimizer version and the user's emphasis. All versions are immutable, so a permalink always reproduces.
 
-The canonical encoding is a single line of `key=value` fields joined by `|`, starting with `looklab-match/1`, in this order: `look`, `base`, `crm`, `input`, `realization`, `epoch_map`, `probes`, `optimizer`, `emphasis`, then optional `target_file`, `base_file`, `body_file`, `crm_file`, `transform_file`, `covariance_file`. Look and base are `slug@version`; CRM is `body@epoch@sim@version`. Values are percent-encoded. `looklab match` writes this string; `looklab verify --permalink` resolves the optional file fields relative to the permalink's directory.
+The canonical encoding is a single line of `key=value` fields joined by `|`, starting with `looklab-match/1`, in this order: `look`, `base`, `crm`, `input`, `realization`, `epoch_map`, `probes`, `optimizer`, `emphasis`, `seed`, then optional `target_file`, `base_file`, `body_file`, `crm_file`, `transform_file`, `covariance_file`. Look and base are `slug@version`; CRM is `body@epoch@sim@version`. Values are percent-encoded. `looklab match` writes this string; `looklab verify --permalink` resolves the optional file fields relative to the permalink's directory and rejects an unsupported optimizer or a mismatched epoch map, transform version, or model version.
 
-`looklab match --look <target.looklab> --body <schema.yaml> --crm <crm.json> [--emphasis skin]` prints the settings card and the permalink; `looklab verify --permalink <file> --observed <dir>` runs one loop iteration and prints the measured error of the first suggestion and the re-optimized second suggestion.
+`looklab match --look <target.looklab> --body <schema.yaml> --crm <crm.json> --base-look <sim.looklab> --transform <transform.yaml> [--emphasis skin]` prints the settings card and the permalink. `--synthetic` substitutes the target Look as the base realization and the identity transform; it is required when those inputs are absent. `looklab verify --permalink <file> --observed <dir>` runs one loop iteration, prints the second suggestion's settings card, and writes an updated local CRM, a new permalink and a replay JSON carrying the second settings. Re-render at those settings and run `verify` with the new permalink to continue.
 
 ## 5. Verification loop (local, anonymous OK)
 
@@ -89,7 +89,7 @@ The canonical encoding is a single line of `key=value` fields joined by `|`, sta
 3. The client fits the observed realization, compares it with the prediction, updates a **local** copy of D (a few LM iterations) and re-optimizes. Repeat 1–3 times.
 4. At the end, offer to contribute (this creates a credential if there isn't one). Verification renders are re-render series plus recipe data.
 
-The first implementation updates one scale factor per non-default control with two Gauss-Newton iterations (ridge 1e-3, factor clamped to 0.05–20), then re-runs the full search. Selection ranks candidate RAW sample sets by mean `tr Cov_pred` at the recommended settings and keeps 2–4. `looklab verify` reports the first suggestion's error against the observed re-renders; measuring the second suggestion needs a re-render at its settings.
+The first implementation updates one scale factor per non-default control with two Gauss-Newton iterations (ridge 1e-3, factor clamped to 0.05–20), then re-runs the full search. Selection ranks candidate RAW sample sets by mean `tr Cov_pred` at the recommended settings and keeps 2–4. Stored `in_rgb` is camera RGB before the body realization effects; `A_c · in_rgb` is the unmodified scene, and the realization applies WB and exposure once for prediction and target measurement. `looklab verify` reports the first suggestion's error against the observed re-renders; measuring the second suggestion needs a re-render at its settings.
 
 ## 6. Firmware interface profiles
 

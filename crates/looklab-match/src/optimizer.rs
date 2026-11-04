@@ -558,7 +558,15 @@ fn coarse_subset(target: &PreparedTarget<'_>, count: usize) -> ProbeSubset {
         }
     }
     let weights = indices.iter().map(|index| target.weight[*index]).collect();
-    ProbeSubset { indices, weights }
+    let covariance_weights = indices
+        .iter()
+        .map(|index| target.covariance_weight[*index])
+        .collect();
+    ProbeSubset {
+        indices,
+        weights,
+        covariance_weights,
+    }
 }
 
 fn exact_objective(
@@ -603,7 +611,7 @@ fn exact_objective(
         ];
         let squared = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
         let trace = crate::covariance::trace_with(&cache.model, &realization, settings, probe.xyz)?;
-        total += subset.weights[slot] * (squared + beta * trace);
+        total += subset.weights[slot] * squared + beta * subset.covariance_weights[slot] * trace;
     }
     Ok(total)
 }
@@ -807,7 +815,8 @@ fn exact_score(
                 probe.xyz,
             )?
         };
-        objective += subset.weights[slot] * (delta_e * delta_e + beta * trace);
+        objective += subset.weights[slot] * delta_e * delta_e
+            + beta * subset.covariance_weights[slot] * trace;
         deltas.push(delta_e);
         predictions.push(prediction.to_array());
         traces.push(trace);

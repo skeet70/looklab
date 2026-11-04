@@ -106,6 +106,14 @@ impl MatchModel {
         Ok(self.input_ucs(&realization, xyz, [0.0, 0.0], 0.0))
     }
 
+    pub fn scene_from_camera(&self, rgb: [f64; 3]) -> Xyz {
+        Xyz::from_array(self.transform.mul_vec(rgb))
+    }
+
+    pub fn camera_from_scene(&self, xyz: Xyz) -> [f64; 3] {
+        self.inverse.mul_vec(xyz.to_array())
+    }
+
     pub fn camera_from_xyz(&self, realization: &Realization, xyz: Xyz) -> [f64; 3] {
         let camera = self.inverse.mul_vec(xyz.to_array());
         let exposure = libm::pow(2.0, realization.exposure_ev);

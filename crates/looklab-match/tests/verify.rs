@@ -2,9 +2,78 @@
 
 use looklab_match::synth;
 use looklab_match::{
-    Emphasis, FitObservedOptions, MatchOptions, ObservedRender, PreparedTarget, ScaleFitter,
-    TargetSpec, VerifyRequest, optimize, verify_once,
+    Emphasis, FitObservedOptions, MatchOptions, ObservedFitter, ObservedRender, PreparedTarget,
+    ScaleFitter, TargetSpec, VerifyRequest, measure_target_error, optimize, verify_once,
 };
+
+#[test]
+fn scale_fitter_leaves_a_correct_model_unchanged() {
+    let seed = 3;
+    let plan = synth::plan();
+    let probes = synth::probes();
+    let truth = synth::body(seed).expect("synthetic body");
+    let samples = synth::observed(&truth.model, &truth.settings, &probes, 400).expect("observed");
+    let observed = vec![ObservedRender { samples }];
+    let fitted = ScaleFitter
+        .fit(
+            &truth.model,
+            &plan,
+            &truth.settings,
+            &observed,
+            &FitObservedOptions::default(),
+        )
+        .expect("fit");
+    for control in &truth.model.crm.controls {
+        let before = response_norm(&truth.model.crm, &control.key);
+        let after = response_norm(&fitted, &control.key);
+        assert!(
+            (after - before).abs() <= 1e-3 * before.max(1e-9),
+            "{} changed from {before} to {after}",
+            control.key
+        );
+    }
+}
+
+#[test]
+fn measured_error_is_independent_of_the_settings_argument() {
+    let seed = 3;
+    let probes = synth::probes();
+    let plan = synth::plan();
+    let truth = synth::body(seed).expect("synthetic body");
+    let target_function = truth.target();
+    let target = PreparedTarget::new(TargetSpec {
+        probes: &probes,
+        function: &target_function,
+        uncertainty: None,
+        emphasis: Emphasis::Balanced,
+        tau: 1.0,
+        support_sigma: 1.5,
+        density_floor: None,
+    })
+    .expect("target");
+    let samples = synth::observed(&truth.model, &truth.settings, &probes, 300).expect("observed");
+    let observed = vec![ObservedRender { samples }];
+    let first =
+        measure_target_error(&target, &truth.model, &truth.settings, &observed).expect("first");
+    let second =
+        measure_target_error(&target, &truth.model, &plan.default, &observed).expect("second");
+    assert_eq!(first, second);
+}
+
+fn response_norm(
+    crm: &looklab_model::realization::ControlResponseModel,
+    key: &looklab_schema::ControlKey,
+) -> f64 {
+    crm.controls
+        .iter()
+        .filter(|control| &control.key == key)
+        .flat_map(|control| control.values.iter())
+        .flat_map(|value| value.delta.layers.iter())
+        .flat_map(|layer| layer.entries.iter())
+        .map(|(_, value)| value * value)
+        .sum::<f64>()
+        .sqrt()
+}
 
 #[test]
 fn one_loop_iteration_reduces_measured_error_by_at_least_30_percent() {

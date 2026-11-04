@@ -179,19 +179,20 @@ fn gaussian(rng: &mut ChaCha12Rng) -> f64 {
     (-2.0 * libm::log(u1)).sqrt() * libm::cos(2.0 * core::f64::consts::PI * u2)
 }
 
+/// Samples obey the fitting contract: `in_rgb = A_c⁻¹ · scene`, without the
+/// realization's WB or exposure effects.
 pub fn observed(
     model: &MatchModel,
     settings: &Settings,
     probes: &ProbeSet,
     sample_limit: usize,
 ) -> Result<SampleSet> {
-    let realization = model.realize(settings)?;
     let mut in_rgb = Vec::new();
     let mut out_rgb = Vec::new();
     let stride = (probes.probes.len() / sample_limit.max(1)).max(1);
     for probe in probes.probes.iter().step_by(stride) {
         let scene = probe.xyz;
-        let camera = model.camera_from_xyz(&realization, scene);
+        let camera = model.camera_from_scene(scene);
         if camera
             .iter()
             .any(|value| !value.is_finite() || *value < -0.4 || *value > 32.0)

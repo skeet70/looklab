@@ -2,9 +2,13 @@
 
 use core::fmt;
 
-use looklab_model::{LookInput, ProbeSet};
-use looklab_report::summary::HueRegion;
-use looklab_report::{ComparisonInput, FunctionName, LayerId, compare};
+use looklab_color::Xyz;
+use looklab_color::ucs::{Ucs, delta_e_ucs};
+use looklab_model::realization::Realization;
+use looklab_model::{LayerValues, Look, LookInput, ProbeSet};
+use looklab_report::compare::LookFunction;
+use looklab_report::summary::{HueRegion, summary_line};
+use looklab_report::{ComparisonInput, FunctionName, LayerContribution, LayerId, compare};
 use looklab_schema::{ControlKey, SimKey};
 
 use crate::error::Result;
@@ -164,14 +168,28 @@ pub fn settings_card(
     };
     let (residual_summary, attribution) = match target.function.look() {
         Some(look) => {
+            let realized = RealizedFunction {
+                model,
+                realization: &realization,
+            };
             let comparison = compare(&ComparisonInput {
                 a: look,
-                b: &realization.look,
+                b: &realized,
                 probes: &filtered,
                 a_name: &FunctionName::new("target"),
                 b_name: &FunctionName::new(model.sim().to_string()),
             });
-            (comparison.summary, comparison.attribution)
+            let attribution = realized_attribution(look, model, &realization, &filtered);
+            let summary = summary_line(
+                &FunctionName::new("target"),
+                &FunctionName::new(model.sim().to_string()),
+                &comparison.tone,
+                &comparison.tint,
+                comparison.grl.as_ref(),
+                &comparison.delta_e,
+                &attribution,
+            );
+            (summary, attribution)
         }
         None => (
             format!(
@@ -236,7 +254,7 @@ pub fn settings_card(
         .collect();
 
     let exposure_note = exposure_note(plan, &suggestion.settings);
-    let confidence = confidence(target, plan, model);
+    let confidence = confidence(target, plan, model, &suggestion.settings);
     Ok(SettingsCard {
         sim: model.sim().clone(),
         entries,
@@ -248,6 +266,85 @@ pub fn settings_card(
         unreachable,
         confidence,
     })
+}
+
+struct RealizedFunction<'a> {
+    model: &'a MatchModel,
+    realization: &'a Realization,
+}
+
+impl LookFunction for RealizedFunction<'_> {
+    fn predict(&self, xyz: Xyz) -> Ucs {
+        self.model.input_ucs(self.realization, xyz, [0.0, 0.0], 0.0)
+    }
+
+    fn layer_values(&self, input: &LookInput) -> Option<LayerValues> {
+        let warped = self.model.input_xyz(self.realization, input.xyz);
+        Some(self.realization.look.layer_values(&LookInput::new(warped)))
+    }
+
+    fn look(&self) -> Option<&Look> {
+        Some(&self.realization.look)
+    }
+}
+
+fn realized_attribution(
+    target: &Look,
+    model: &MatchModel,
+    realization: &Realization,
+    probes: &ProbeSet,
+) -> Vec<LayerContribution> {
+    if probes.probes.is_empty() {
+        return Vec::new();
+    }
+    let realized = RealizedFunction { model, realization };
+    let baseline = probes
+        .probes
+        .iter()
+        .map(|probe| delta_e_ucs(target.eval(probe.xyz), realized.predict(probe.xyz)))
+        .sum::<f64>()
+        / probes.probes.len() as f64;
+    let mut contributions = Vec::with_capacity(LayerId::ALL.len());
+    for layer in LayerId::ALL {
+        let hybrid = with_layer(target, &realization.look, layer);
+        let mut error = 0.0_f64;
+        for probe in &probes.probes {
+            let warped = model.input_xyz(realization, probe.xyz);
+            error += delta_e_ucs(hybrid.eval(warped), realized.predict(probe.xyz));
+        }
+        contributions.push(LayerContribution {
+            layer,
+            contribution: (baseline - error / probes.probes.len() as f64).max(0.0),
+        });
+    }
+    let mut input_error = 0.0_f64;
+    for probe in &probes.probes {
+        let warped = model.input_xyz(realization, probe.xyz);
+        input_error += delta_e_ucs(target.eval(warped), realized.predict(probe.xyz));
+    }
+    let input_contribution = (baseline - input_error / probes.probes.len() as f64).max(0.0);
+    if input_contribution > 0.0
+        && let Some(tone) = contributions
+            .iter_mut()
+            .find(|entry| entry.layer == LayerId::Tone)
+    {
+        tone.contribution += input_contribution;
+    }
+    contributions.sort_by(|left, right| right.contribution.total_cmp(&left.contribution));
+    contributions
+}
+
+fn with_layer(base: &Look, other: &Look, layer: LayerId) -> Look {
+    let mut hybrid = base.clone();
+    match layer {
+        LayerId::Tone => hybrid.tone = other.tone,
+        LayerId::Tint => hybrid.tint = other.tint.clone(),
+        LayerId::Chroma => hybrid.color.g = other.color.g.clone(),
+        LayerId::Hue => hybrid.color.r = other.color.r.clone(),
+        LayerId::Lightness => hybrid.color.lambda = other.color.lambda.clone(),
+        LayerId::Residual => hybrid.residual = other.residual.clone(),
+    }
+    hybrid
 }
 
 fn layer_noun(layer: LayerId) -> &'static str {
@@ -302,31 +399,49 @@ fn exposure_note(plan: &Plan, settings: &looklab_model::realization::Settings) -
     }
 }
 
-fn confidence(target: &PreparedTarget<'_>, plan: &Plan, model: &MatchModel) -> Confidence {
-    let observed = plan
-        .stage_controls()
-        .filter(|index| {
-            model
-                .crm
-                .support
-                .observed(&plan.domains[*index].key)
-                .is_some()
-        })
-        .count();
+fn confidence(
+    target: &PreparedTarget<'_>,
+    plan: &Plan,
+    model: &MatchModel,
+    settings: &looklab_model::realization::Settings,
+) -> Confidence {
+    let mut covered = 0_usize;
+    let mut extrapolated = 0_usize;
+    let mut missing = 0_usize;
+    for control in plan.stage_controls() {
+        let domain = &plan.domains[control];
+        let Some(support) = model.crm.support.observed(&domain.key) else {
+            missing += 1;
+            continue;
+        };
+        let has_nondefault = support
+            .observed
+            .iter()
+            .any(|value| value != domain.default_value());
+        if !has_nondefault {
+            missing += 1;
+            continue;
+        }
+        let value = plan.value(control, settings);
+        if model.crm.support.value_inflation(support, &value) > 1.0 {
+            extrapolated += 1;
+        } else {
+            covered += 1;
+        }
+    }
     let planned = plan.plan_controls.len();
     let fraction = target.support_fraction();
-    let mut level = if observed == planned && fraction >= 0.9 {
-        ConfidenceLevel::High
-    } else if observed * 2 >= planned && fraction >= 0.6 {
-        ConfidenceLevel::Medium
-    } else {
-        ConfidenceLevel::Low
-    };
-    if model.covariance.is_none() && level == ConfidenceLevel::High {
-        level = ConfidenceLevel::Medium;
-    }
+    let level =
+        if covered == planned && extrapolated == 0 && fraction >= 0.9 && model.covariance.is_some()
+        {
+            ConfidenceLevel::High
+        } else if covered + extrapolated >= planned.div_ceil(2) && fraction >= 0.6 {
+            ConfidenceLevel::Medium
+        } else {
+            ConfidenceLevel::Low
+        };
     let reason = format!(
-        "{observed} of {planned} solve-plan controls have observed settings; {:.0}% of probes are supported{}",
+        "{covered} of {planned} solve-plan controls have nondefault observed responses; {extrapolated} recommended values extrapolate; {missing} controls lack nondefault support; {:.0}% of probes are supported{}",
         fraction * 100.0,
         if model.covariance.is_none() {
             "; no control-response covariance, so the predicted band is unavailable"

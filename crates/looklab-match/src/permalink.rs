@@ -35,6 +35,7 @@ pub struct Permalink {
     pub probe_set: ProbeSetVersion,
     pub optimizer: String,
     pub emphasis: Emphasis,
+    pub seed: u64,
     pub sources: PermalinkSources,
 }
 
@@ -65,6 +66,7 @@ impl Permalink {
         push("probes", probe_set_name(self.probe_set));
         push("optimizer", &self.optimizer);
         push("emphasis", self.emphasis.as_str());
+        push("seed", &self.seed.to_string());
         if let Some(value) = &self.sources.target_look {
             push("target_file", value);
         }
@@ -155,6 +157,9 @@ impl Permalink {
             probe_set: parse_probe_set(required("probes")?)?,
             optimizer: required("optimizer")?.to_string(),
             emphasis,
+            seed: required("seed")?
+                .parse()
+                .map_err(|_| MatchError::Permalink("seed".to_string()))?,
             sources,
         })
     }

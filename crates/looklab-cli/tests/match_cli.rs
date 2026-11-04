@@ -87,13 +87,49 @@ fn match_prints_a_card_and_verify_runs_one_iteration() {
             .arg(&transform_path)
             .arg("--permalink")
             .arg(&permalink_path)
-            .args(["--emphasis", "skin"]);
+            .args(["--emphasis", "skin", "--seed", "7"]);
         command
     });
     assert!(stdout.contains("base sim"), "{stdout}");
     assert!(stdout.contains("predicted ΔE"), "{stdout}");
     assert!(stdout.contains("confidence"), "{stdout}");
     assert!(permalink_path.exists());
+    let permalink_text = std::fs::read_to_string(&permalink_path).expect("permalink");
+    assert!(permalink_text.contains("seed=7"), "{permalink_text}");
+    let bad_permalink = temp.path().join("bad.permalink");
+    std::fs::write(
+        &bad_permalink,
+        permalink_text.replace("optimizer=looklab-match/1", "optimizer=other/1"),
+    )
+    .expect("bad permalink");
+    let output = looklab()
+        .arg("verify")
+        .arg("--permalink")
+        .arg(&bad_permalink)
+        .arg("--observed")
+        .arg(temp.path())
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("not supported"), "{stderr}");
+    let bad_epoch = temp.path().join("bad-epoch.permalink");
+    std::fs::write(
+        &bad_epoch,
+        permalink_text.replace("epoch_map=0", "epoch_map=1"),
+    )
+    .expect("bad epoch");
+    let output = looklab()
+        .arg("verify")
+        .arg("--permalink")
+        .arg(&bad_epoch)
+        .arg("--observed")
+        .arg(temp.path())
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("epoch map"), "{stderr}");
 
     let observed_dir = temp.path().join("observed");
     std::fs::create_dir_all(&observed_dir).expect("observed dir");

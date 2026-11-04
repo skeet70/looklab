@@ -12,6 +12,7 @@ use crate::target::PreparedTarget;
 pub struct ProbeSubset {
     pub indices: Vec<usize>,
     pub weights: Vec<f64>,
+    pub covariance_weights: Vec<f64>,
 }
 
 /// Per-probe linearization of a base sim at one settings point (docs/04 §3
@@ -38,6 +39,7 @@ pub struct LinearCache {
     pub settings: Settings,
     pub indices: Vec<usize>,
     pub weights: Vec<f64>,
+    pub covariance_weights: Vec<f64>,
     pub target: Vec<[f64; 3]>,
     pub output: Vec<[f64; 3]>,
     /// `[probe][control][value]`, relative to `settings`.
@@ -133,6 +135,7 @@ impl LinearCache {
             settings: settings.clone(),
             indices: subset.indices.clone(),
             weights: subset.weights.clone(),
+            covariance_weights: subset.covariance_weights.clone(),
             target: target_out,
             output,
             contributions,
@@ -269,7 +272,8 @@ impl LinearCache {
                 self.target[probe][2] - prediction[2],
             ];
             let squared = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
-            total += weight * (squared + self.beta * trace * inflation);
+            total +=
+                weight * squared + self.beta * self.covariance_weights[probe] * trace * inflation;
         }
         total
     }

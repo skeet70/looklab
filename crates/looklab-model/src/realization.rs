@@ -30,8 +30,11 @@ const HUE_BUMP_CENTERS: [f64; 4] = [45.0, 135.0, 225.0, 315.0];
 const HUE_BUMP_SIGMA: f64 = 40.0;
 
 /// Orthonormal hue patterns: constant, cosine, sine and four Gaussian bumps.
+static HUE_PATTERNS: std::sync::LazyLock<[[f64; HUE_COEFS]; 7]> =
+    std::sync::LazyLock::new(hue_patterns);
+
 #[allow(clippy::needless_range_loop)]
-static HUE_PATTERNS: std::sync::LazyLock<[[f64; HUE_COEFS]; 7]> = std::sync::LazyLock::new(|| {
+fn hue_patterns() -> [[f64; HUE_COEFS]; 7] {
     let mut raw = [[0.0_f64; HUE_COEFS]; 7];
     for hue in 0..HUE_COEFS {
         let angle = 2.0 * PI * hue as f64 / HUE_COEFS as f64;
@@ -69,7 +72,7 @@ static HUE_PATTERNS: std::sync::LazyLock<[[f64; HUE_COEFS]; 7]> = std::sync::Laz
         }
     }
     basis
-});
+}
 
 /// Numeric controls store the integer multiple of their schema step, so `1/3`
 /// EV is `Step(1)`.
