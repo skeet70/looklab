@@ -8,6 +8,13 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+looklab-color.workspace = true
+looklab-model.workspace = true
+libm.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+roxmltree.workspace = true
 
 [lints]
 workspace = true

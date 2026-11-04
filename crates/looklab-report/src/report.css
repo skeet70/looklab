@@ -1,0 +1,110 @@
+:root {
+  color-scheme: light;
+  --text: #1a1a1a;
+  --muted: #5a5a5a;
+  --rule: #d8d8d8;
+  --panel: #f7f7f7;
+  --ok: #0072b2;
+  --bad: #d55e00;
+}
+
+body {
+  margin: 0;
+  background: #ffffff;
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  line-height: 1.5;
+}
+
+main {
+  margin: 0 auto;
+  max-width: 960px;
+  padding: 24px 16px 64px;
+}
+
+header h1 {
+  font-size: 1.6rem;
+  margin: 0 0 4px;
+}
+
+h2 {
+  border-bottom: 1px solid var(--rule);
+  font-size: 1.15rem;
+  margin: 32px 0 8px;
+  padding-bottom: 4px;
+}
+
+h3 {
+  font-size: 1rem;
+  margin: 16px 0 6px;
+}
+
+p {
+  margin: 6px 0;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.summary {
+  background: var(--panel);
+  border-left: 4px solid var(--ok);
+  font-size: 1.05rem;
+  margin: 20px 0;
+  padding: 10px 14px;
+}
+
+.hash code {
+  background: var(--panel);
+  padding: 2px 6px;
+  word-break: break-all;
+}
+
+.ok {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.bad {
+  color: var(--bad);
+  font-weight: 600;
+}
+
+table {
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  margin: 8px 0;
+  width: 100%;
+}
+
+th,
+td {
+  border-bottom: 1px solid var(--rule);
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+thead th {
+  background: var(--panel);
+  font-weight: 600;
+}
+
+table.kv th {
+  color: var(--muted);
+  font-weight: 500;
+  width: 34%;
+}
+
+svg {
+  display: block;
+  height: auto;
+  max-width: 100%;
+}
+
+.columns {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
