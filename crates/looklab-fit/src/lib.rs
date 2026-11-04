@@ -5,6 +5,7 @@
 mod basis;
 mod cam;
 mod density;
+pub mod epoch;
 mod fit;
 mod layout;
 mod outlier;
@@ -17,6 +18,7 @@ mod uncertainty;
 #[cfg(feature = "synth")]
 pub mod synth;
 
+pub use epoch::{SplitDecision, SplitOptions, SplitSample, detect_split};
 pub use looklab_color::{Mat3, RgbSpace, Xyz};
 pub use looklab_model::realization::{
     ControlResponseModel, ControlValue, ResponseParamId, Settings,
