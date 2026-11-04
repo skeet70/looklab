@@ -8,6 +8,19 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+postcard.workspace = true
+ruzstd.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+postcard.workspace = true
+ruzstd.workspace = true
+
+# Examples build with dev-dependencies, and `proptest` (via `wait-timeout`)
+# does not build for wasi targets, which `examples/bitid_samples.rs` needs.
+[target.'cfg(not(target_os = "wasi"))'.dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true

@@ -10,6 +10,12 @@ publish = false
 [dependencies]
 libm.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
+
+# proptest's test-runner dependencies do not build for wasm; the bitid examples
+# (which pull dev-dependencies) must build for wasm32-wasip1.
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+proptest.workspace = true

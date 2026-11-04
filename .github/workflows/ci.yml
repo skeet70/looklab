@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Format
+        run: nix develop -c cargo fmt --all --check
+      - name: Clippy
+        run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: nix develop -c cargo test --workspace
+      - name: Float method allow-list
+        run: nix develop -c cargo xtask float-methods
+      - name: SPDX headers
+        run: nix develop -c cargo xtask spdx
+      - name: Core crates build for wasm32
+        run: nix develop -c cargo xtask wasm-core
+      - name: Native/wasm bit identity
+        run: nix develop -c cargo xtask bitid

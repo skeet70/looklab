@@ -1,0 +1,3 @@
+# Non-core crate: the root clippy.toml float/std bans do not apply here.
+disallowed-methods = []
+disallowed-types = []

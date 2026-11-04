@@ -83,7 +83,11 @@ mod tests {
 
     #[test]
     fn inverse_times_matrix_is_identity() {
-        let m = Mat3([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]]);
+        let m = Mat3([
+            [0.4124, 0.3576, 0.1805],
+            [0.2126, 0.7152, 0.0722],
+            [0.0193, 0.1192, 0.9505],
+        ]);
         let p = m.mul(&m.inverse().unwrap());
         for (i, row) in p.0.iter().enumerate() {
             for (j, v) in row.iter().enumerate() {

@@ -52,3 +52,15 @@ impl Rgb {
         Self::new(v[0], v[1], v[2])
     }
 }
+
+impl Xyy {
+    pub const fn new(x: f64, y: f64, big_y: f64) -> Self {
+        Self { x, y, big_y }
+    }
+    pub const fn to_array(self) -> [f64; 3] {
+        [self.x, self.y, self.big_y]
+    }
+    pub const fn from_array(v: [f64; 3]) -> Self {
+        Self::new(v[0], v[1], v[2])
+    }
+}

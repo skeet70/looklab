@@ -1,0 +1,27 @@
+id: example-firmware/sim-v1
+name: "Example firmware sim slot"
+version: 1
+bodies: [vendor/model-a]
+insertion:
+  point: camera_rgb_wb_linear
+  encoding:
+    transfer: log2_shaper
+    shaper: { min_ev: -12, max_ev: 6, mid_gray: 0.18 }
+    primaries: camera_native
+    range: [0.0, 1.0]
+  illuminant_handling: single
+accepts:
+  - type: lut3d
+    sizes: [17, 33]
+    interpolation: tetrahedral
+    precision: f16
+    with_shaper: true
+  - type: matrix3x3
+  - type: curve1d
+    points_max: 256
+    per_channel: true
+downstream:
+  - output_transform: { primaries: srgb, transfer: srgb }
+  - gamut_clip: hard
+formats: [cube, native_json]
+limits: { max_bytes: 262144 }

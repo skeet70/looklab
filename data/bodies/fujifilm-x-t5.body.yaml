@@ -1,0 +1,11 @@
+id: fujifilm/x-t5
+make: Fujifilm
+model: X-T5
+exif_aliases: [X-T5]
+kind: camera
+capabilities:
+  in_camera_raw_conversion: true
+  jpeg_color_spaces: [srgb, adobe_rgb]
+  heif: true
+status: active
+mapping_status: provisional

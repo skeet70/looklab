@@ -1,0 +1,105 @@
+body: fujifilm/x-t5
+epochs:
+  - id: 1
+    firmware: { from: "1.00", to: "1.99" }
+    native_sims:
+      - key: classic_chrome
+        look: classic-chrome
+        makernote: { tag: FilmMode, value: 0x0700 }
+      - key: provia
+        look: provia
+        makernote: { tag: FilmMode, value: 0x0000 }
+    exposure_modes:
+      - key: dr100
+      - key: dr200
+      - key: dr400
+    controls:
+      - key: dynamic_range
+        type: enum
+        values: [dr100, dr200, dr400]
+        default: dr100
+        look_affecting: true
+        affects: [tone, exposure]
+        constraints: { min_iso: { dr200: 320, dr400: 640 } }
+      - key: highlight_tone
+        type: decimal
+        range: [-2.0, 4.0]
+        step: 0.5
+        default: 0.0
+        look_affecting: true
+        affects: [tone]
+      - key: shadow_tone
+        type: decimal
+        range: [-2.0, 4.0]
+        step: 0.5
+        default: 0.0
+        look_affecting: true
+        affects: [tone]
+      - key: color
+        type: int
+        range: [-4, 4]
+        step: 1
+        default: 0
+        look_affecting: true
+        affects: [chroma]
+      - key: color_chrome_effect
+        type: enum
+        values: [off, weak, strong]
+        default: off
+        look_affecting: true
+        affects: [chroma, lightness]
+      - key: color_chrome_fx_blue
+        type: enum
+        values: [off, weak, strong]
+        default: off
+        look_affecting: true
+        affects: [chroma, lightness]
+      - key: wb_shift_r
+        type: int
+        range: [-9, 9]
+        step: 1
+        default: 0
+        look_affecting: true
+        affects: [wb]
+      - key: wb_shift_b
+        type: int
+        range: [-9, 9]
+        step: 1
+        default: 0
+        look_affecting: true
+        affects: [wb]
+      - key: exposure_compensation
+        type: decimal
+        range: [-3.0, 3.0]
+        step: 1/3
+        default: 0.0
+        look_affecting: false
+        affects: [exposure]
+      - key: grain
+        type: enum
+        values: [off, weak, strong]
+        default: off
+        look_affecting: false
+        spatial: true
+        tolerated: [off]
+      - key: clarity
+        type: int
+        range: [-5, 5]
+        step: 1
+        default: 0
+        look_affecting: false
+        spatial: true
+        tolerated: [0]
+      - key: noise_reduction
+        type: int
+        range: [-4, 4]
+        step: 1
+        default: 0
+        look_affecting: false
+        spatial: true
+        tolerated: any
+    solve_plan:
+      - stage: tone
+        controls: [dynamic_range, highlight_tone, shadow_tone, exposure_compensation]
+      - stage: color
+        controls: [color, color_chrome_effect, color_chrome_fx_blue, wb_shift_r, wb_shift_b]
