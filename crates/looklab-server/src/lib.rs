@@ -11,6 +11,7 @@ mod db;
 mod error;
 mod ids;
 mod preparse;
+mod proposals;
 mod rate_limit;
 mod state;
 mod store;
@@ -61,6 +62,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/mod/session", post(api::moderation::session))
         .route("/api/mod/queue", get(api::moderation::queue))
         .route("/api/mod/decision", post(api::moderation::decision))
+        .route("/api/proposals", post(api::proposals::submit))
+        .route("/api/proposals/confirm", post(api::proposals::confirm))
+        .route("/api/proposals/thread", post(api::proposals::thread))
+        .route(
+            "/api/proposals/message",
+            post(api::proposals::proposer_message),
+        )
+        .route("/api/proposals/{id}", get(api::proposals::proposal))
+        .route("/api/mod/proposal/{id}", get(api::proposals::mod_proposal))
+        .route(
+            "/api/mod/proposal-message",
+            post(api::proposals::mod_message),
+        )
+        .route(
+            "/api/fixtures/manifest.toml",
+            get(api::proposals::fixture_manifest),
+        )
         .route("/log.json", get(api::public::audit_log))
         .route("/lists/grants.json", get(api::public::grants))
         .route("/lists/endorsements.json", get(api::public::endorsements))

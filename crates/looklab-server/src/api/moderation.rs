@@ -61,17 +61,6 @@ pub struct DecisionRequest {
     reason: String,
 }
 
-#[derive(Serialize)]
-pub struct DecisionResponse {
-    state: DecisionState,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DecisionState {
-    Recorded,
-}
-
 pub async fn decision(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -81,16 +70,12 @@ pub async fn decision(
     let Json(payload) = payload.map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
     let proposal = ProposalId::try_from(payload.proposal_id)
         .map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
-    admin::decide(
-        &state.db,
+    crate::api::proposals::decide(
+        &state,
         &moderator,
         &proposal,
         payload.decision,
         &payload.reason,
     )
-    .await?;
-    Ok(Json(DecisionResponse {
-        state: DecisionState::Recorded,
-    })
-    .into_response())
+    .await
 }

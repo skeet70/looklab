@@ -48,6 +48,7 @@ struct FileConfig {
     origin: String,
     server_secret_path: PathBuf,
     bodies_dir: PathBuf,
+    snapshot_dir: PathBuf,
     nonce_ttl_seconds: u64,
     registration_ttl_seconds: u64,
     body_timeout_seconds: u64,
@@ -98,6 +99,7 @@ impl Default for FileConfig {
             origin: "https://looklab.example".to_owned(),
             server_secret_path: PathBuf::from("server-secret"),
             bodies_dir: PathBuf::from("data/bodies"),
+            snapshot_dir: PathBuf::from("data/community"),
             nonce_ttl_seconds: 0,
             registration_ttl_seconds: 0,
             body_timeout_seconds: 30,
@@ -117,6 +119,7 @@ pub struct Config {
     pub origin: String,
     pub server_secret_path: PathBuf,
     pub bodies_dir: PathBuf,
+    pub snapshot_dir: PathBuf,
     pub nonce_ttl: Duration,
     pub registration_ttl: Duration,
     pub body_timeout: Duration,
@@ -182,6 +185,9 @@ impl Config {
         }
         if let Some(value) = env("LOOKLAB_BODIES_DIR") {
             self.bodies_dir = PathBuf::from(value);
+        }
+        if let Some(value) = env("LOOKLAB_SNAPSHOT_DIR") {
+            self.snapshot_dir = PathBuf::from(value);
         }
         if let Some(value) = env("LOOKLAB_NONCE_TTL_SECONDS") {
             self.nonce_ttl = Duration::from_secs(parse_value("LOOKLAB_NONCE_TTL_SECONDS", &value)?);
@@ -291,6 +297,7 @@ impl FileConfig {
             origin: self.origin,
             server_secret_path: self.server_secret_path,
             bodies_dir: self.bodies_dir,
+            snapshot_dir: self.snapshot_dir,
             nonce_ttl: Duration::from_secs(nonce_ttl),
             registration_ttl: Duration::from_secs(registration_ttl),
             body_timeout: Duration::from_secs(self.body_timeout_seconds),

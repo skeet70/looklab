@@ -12,6 +12,7 @@ looklab-color.workspace = true
 looklab-model.workspace = true
 looklab-publish.workspace = true
 looklab-report.workspace = true
+looklab-schema.workspace = true
 
 leptos.workspace = true
 leptos_router.workspace = true

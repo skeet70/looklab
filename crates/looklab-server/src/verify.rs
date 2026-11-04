@@ -116,6 +116,9 @@ pub enum RequestDomain {
     AdmitRoot,
     RevokeRoot,
     ModSession,
+    Proposal,
+    ProposalConfirmation,
+    ProposalThread,
 }
 
 impl RequestDomain {
@@ -130,6 +133,9 @@ impl RequestDomain {
             Self::AdmitRoot => "admit-root",
             Self::RevokeRoot => "revoke-root",
             Self::ModSession => "mod-session",
+            Self::Proposal => "proposal",
+            Self::ProposalConfirmation => "proposal-confirmation",
+            Self::ProposalThread => "proposal-thread",
         }
     }
 }

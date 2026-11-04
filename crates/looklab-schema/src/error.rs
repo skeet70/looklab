@@ -44,6 +44,10 @@ pub enum ErrorKind {
     FirmwareRangeOverlap,
     #[error("`spatial: true` requires `tolerated`")]
     SpatialToleratedRequired,
+    #[error("snapshot manifest: {0}")]
+    SnapshotManifest(String),
+    #[error("snapshot content hash is {found}, the manifest declares {declared}")]
+    SnapshotHashMismatch { declared: String, found: String },
 }
 
 /// A rule violation at a YAML path such as `epochs[0].controls[3].default`.

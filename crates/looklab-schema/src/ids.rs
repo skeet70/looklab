@@ -148,6 +148,7 @@ impl BodyId {
 }
 
 id_type!(LookId);
+id_type!(ProposalRef);
 id_type!(
     /// Interface profile id, for example `example-firmware/sim-v1`.
     InterfaceId

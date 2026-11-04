@@ -3365,7 +3365,10 @@ name = "looklab-schema"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "serde_norway",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 
@@ -3378,6 +3381,9 @@ dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
  "http-body-util",
+ "looklab-color",
+ "looklab-export",
+ "looklab-model",
  "looklab-samples",
  "looklab-schema",
  "looklab-trust",
@@ -3458,6 +3464,7 @@ dependencies = [
  "looklab-model",
  "looklab-publish",
  "looklab-report",
+ "looklab-schema",
  "serde",
  "serde_json",
  "wasm-bindgen",

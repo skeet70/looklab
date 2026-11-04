@@ -4,6 +4,7 @@ pub mod admin;
 pub mod auth;
 pub mod moderation;
 pub mod passkey;
+pub mod proposals;
 pub mod public;
 pub mod status;
 pub mod upload;

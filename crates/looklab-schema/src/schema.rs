@@ -154,7 +154,7 @@ impl fmt::Display for FirmwareVersion {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct MakernoteValue(pub u64);
 
 impl<'de> Deserialize<'de> for MakernoteValue {

@@ -81,6 +81,7 @@ uuid_id!(EndorsementId);
 uuid_id!(RootAdmissionId);
 uuid_id!(LookVersionId);
 uuid_id!(ProposalId);
+uuid_id!(ProposalMessageId);
 uuid_id!(ModerationDecisionId);
 
 /// The WebAuthn credential id as it appears on the wire.

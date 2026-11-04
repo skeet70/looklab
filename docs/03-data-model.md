@@ -231,7 +231,9 @@ The model serializes as `crm.json`:
 ### AuditLogEntry, Job, CommunityDataSnapshot
 - `AuditLogEntry`: `seq` (autoincrement), `type`, `payload` (JSON text), `ts`. Append-only (no UPDATE/DELETE in application code). Published as a page and JSON ([05 §11](05-trust-and-integrity.md)).
 - `Job`: `id`, `kind`, `payload`, `status`, `attempts`, `run_after`, `locked_until`. The worker polls this table.
-- `CommunityDataSnapshot`: `version`, `content_hash`, export of approved bodies/schemas/interfaces. CI validates every snapshot.
+- `CommunityDataSnapshot`: `version`, `content_hash`, export of approved bodies/schemas/interfaces.
+  A snapshot lives in `data/community/v<version>/` with `bodies/`, `interfaces/` and `snapshot.json` (`{version, content_hash}`);
+  the hash covers each file's relative path and bytes in path order, and `looklab validate-snapshot <dir>` checks both the files and the hash.
 
 ## 2. Samples: preparation and format
 

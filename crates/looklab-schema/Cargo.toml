@@ -9,7 +9,9 @@ publish = false
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 serde_norway.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [features]
@@ -18,3 +20,6 @@ fs = []
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

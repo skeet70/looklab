@@ -48,6 +48,8 @@ pub enum Command {
     Export(export::ExportArgs),
     /// Validate a data directory and its probe set files.
     Validate(validate::ValidateArgs),
+    /// Validate a community data snapshot directory and its content hash.
+    ValidateSnapshot(validate::ValidateSnapshotArgs),
     /// Write a synthetic dataset so the whole flow runs without fixtures.
     Synth(synth::SynthArgs),
     /// Reproduce a browser upload from a HAR under wasmtime and compare it byte for byte.
@@ -71,6 +73,7 @@ pub fn run_with(cli: Cli) -> Result<()> {
         Command::Compare(args) => compare::run(&args),
         Command::Export(args) => export::run(&args),
         Command::Validate(args) => validate::run(&args),
+        Command::ValidateSnapshot(args) => validate::run_snapshot(&args),
         Command::Synth(args) => synth::run(&args),
         Command::VerifyPayload(args) => verify_payload::run(&args),
         Command::Match(args) => match_cmd::run_match(&args),

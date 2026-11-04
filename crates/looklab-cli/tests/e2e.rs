@@ -368,4 +368,3 @@ fn fit_skips_an_undecodable_sample_and_keeps_going() {
     );
     assert!(out.exists());
 }
-

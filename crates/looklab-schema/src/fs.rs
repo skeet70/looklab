@@ -26,9 +26,7 @@ impl fmt::Display for FileErrors {
 
 pub fn validate_dir(root: impl AsRef<Path>) -> io::Result<Vec<FileErrors>> {
     let root = root.as_ref();
-    let mut paths = Vec::new();
-    collect(root, &mut paths)?;
-    paths.sort();
+    let paths = classified_yaml_files(root)?;
     let mut failures = Vec::new();
     for path in paths {
         let Some(kind) = classify(&path) else {
@@ -70,6 +68,14 @@ fn classify(path: &Path) -> Option<Kind> {
         "interfaces" => Some(Kind::Interface),
         _ => None,
     }
+}
+
+pub(crate) fn classified_yaml_files(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    collect(root, &mut paths)?;
+    paths.retain(|path| classify(path).is_some());
+    paths.sort();
+    Ok(paths)
 }
 
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {

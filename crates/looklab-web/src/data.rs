@@ -9,6 +9,7 @@ use looklab_publish::{
     ArtifactHash, AuditLog, BodyPage, LUT_BYTES, LookArtifact, LookPage, PreparedScene, Scene,
     SceneIndex, SceneName, SiteIndex, VersionManifest, VersionSummary, verify_artifact,
 };
+use looklab_schema::ProposalView;
 use serde::de::DeserializeOwned;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,6 +69,20 @@ pub async fn body(make: &str, model: &str) -> Result<BodyPage, String> {
 
 pub async fn look(slug: &str) -> Result<LookPage, String> {
     get_json(&format!("/data/looks/{slug}.json")).await
+}
+
+pub async fn proposal(id: &str) -> Result<ProposalView, String> {
+    get_json(&format!("/data/proposals/{id}.json")).await
+}
+
+pub async fn proposal_queue() -> Result<Vec<ProposalView>, String> {
+    let file: ProposalQueueFile = get_json("/data/proposals/queue.json").await?;
+    Ok(file.proposals)
+}
+
+#[derive(serde::Deserialize)]
+struct ProposalQueueFile {
+    proposals: Vec<ProposalView>,
 }
 
 pub async fn audit_log() -> Result<AuditLog, String> {

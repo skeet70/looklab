@@ -20,6 +20,9 @@ pub enum Action {
     Endorse,
     Root,
     ModSession,
+    Proposal,
+    Confirmation,
+    ProposalThread,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -69,6 +72,18 @@ impl RateKey {
                     capacity: 20.0,
                     refill_per_second: 0.1,
                 },
+                Action::Proposal => Quota {
+                    capacity: 10.0,
+                    refill_per_second: 0.02,
+                },
+                Action::Confirmation => Quota {
+                    capacity: 30.0,
+                    refill_per_second: 0.1,
+                },
+                Action::ProposalThread => Quota {
+                    capacity: 60.0,
+                    refill_per_second: 1.0,
+                },
             },
         }
     }
@@ -84,6 +99,9 @@ impl core::fmt::Display for RateKey {
             Action::Endorse => "endorse",
             Action::Root => "root",
             Action::ModSession => "mod-session",
+            Action::Proposal => "proposal",
+            Action::Confirmation => "confirmation",
+            Action::ProposalThread => "proposal-thread",
         };
         match self {
             Self::Nonce => f.write_str("nonce"),

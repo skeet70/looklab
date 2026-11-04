@@ -14,6 +14,29 @@ pub struct ValidateArgs {
     pub dir: PathBuf,
 }
 
+#[derive(Debug, Args)]
+pub struct ValidateSnapshotArgs {
+    /// Community data snapshot directory: bodies/, interfaces/ and snapshot.json.
+    pub dir: PathBuf,
+}
+
+pub fn run_snapshot(args: &ValidateSnapshotArgs) -> Result<()> {
+    if !args.dir.is_dir() {
+        bail!("{} is not a directory", args.dir.display());
+    }
+    let failures = looklab_schema::validate_snapshot_dir(&args.dir)
+        .with_context(|| format!("walking {}", args.dir.display()))?;
+    for failure in &failures {
+        print!("{failure}");
+    }
+    if !failures.is_empty() {
+        let errors: usize = failures.iter().map(|failure| failure.errors.len()).sum();
+        bail!("{errors} snapshot error(s) in {}", args.dir.display());
+    }
+    println!("valid snapshot: {}", args.dir.display());
+    Ok(())
+}
+
 pub fn run(args: &ValidateArgs) -> Result<()> {
     let mut errors = 0usize;
     let files = looklab_schema::validate_dir(&args.dir)

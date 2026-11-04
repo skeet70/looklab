@@ -18,6 +18,9 @@ use looklab_samples::{
     InputSpace, OutputSpace, PatchId, PatchRow, PatchTable, PatchTableHeader, PrepParamsHash,
     PrepVersion, PriorTransformVersion, RerenderGroupId, SampleFlags, SampleHeader, SampleSet,
 };
+use looklab_schema::{
+    Date, FixtureDonation, FixtureLicense, LabeledTag, MakernoteValue, Sha256Hex,
+};
 use looklab_server::{AppState, Config, PowConfig, router};
 use looklab_upload::{
     BatchManifest, BlobKind, BodyId, Challenge, ContributionKind, ControlEntry, ControlKey,
@@ -105,6 +108,7 @@ impl TestServer {
             origin: ORIGIN.to_owned(),
             server_secret_path: secret,
             bodies_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies"),
+            snapshot_dir: dir.path().join("community"),
             nonce_ttl: Duration::from_secs(300),
             registration_ttl: Duration::from_secs(300),
             body_timeout: Duration::from_secs(30),
@@ -1595,10 +1599,11 @@ async fn moderator_session_serves_the_queue_and_records_decisions() {
     let proposal = looklab_server::ProposalId::new();
     sqlx::query(
         "INSERT INTO proposals (id, credential_id, type, payload, human_summary, evidence, status, created_at)
-         VALUES (?, ?, 'body', '{}', 'adds a body', '[]', 'pending', 0)",
+         VALUES (?, ?, 'body', ?, 'adds a body', '[]', 'pending', 0)",
     )
     .bind(proposal.as_str())
     .bind(&actor)
+    .bind(include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml"))
     .execute(&server.db)
     .await
     .expect("proposal");
@@ -1803,10 +1808,11 @@ async fn admin_and_public_endpoints_publish_no_secrets() {
     let proposal = looklab_server::ProposalId::new();
     sqlx::query(
         "INSERT INTO proposals (id, credential_id, type, payload, human_summary, evidence, status, created_at)
-         VALUES (?, ?, 'body', '{}', 'adds a body', '[]', 'pending', 0)",
+         VALUES (?, ?, 'body', ?, 'adds a body', '[]', 'pending', 0)",
     )
     .bind(proposal.as_str())
     .bind(&actor)
+    .bind(include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml"))
     .execute(&server.db)
     .await
     .expect("proposal");
@@ -1866,4 +1872,323 @@ async fn admin_and_public_endpoints_publish_no_secrets() {
         assert_absent(&format!("{table}.{column}"), &value, &key_needles);
         assert_absent(&format!("{table}.{column}"), &value, &serial_needles);
     }
+}
+
+#[derive(serde::Serialize)]
+struct ProposalSigningBody<'a> {
+    kind: &'a str,
+    payload: &'a str,
+    fixtures: &'a [FixtureDonation],
+}
+
+#[derive(serde::Serialize)]
+struct ConfirmationSigningBody<'a> {
+    proposal_id: &'a str,
+    tags: &'a [LabeledTag],
+}
+
+#[derive(serde::Serialize)]
+struct ThreadSigningBody<'a> {
+    proposal_id: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct MessageSigningBody<'a> {
+    proposal_id: &'a str,
+    body: &'a str,
+}
+
+impl TestServer {
+    async fn submit_proposal(
+        &mut self,
+        kind: &str,
+        payload: &str,
+        fixtures: &[FixtureDonation],
+        pow_ok: bool,
+    ) -> (StatusCode, Value) {
+        let signing = ProposalSigningBody {
+            kind,
+            payload,
+            fixtures,
+        };
+        let bytes = serde_json::to_vec(&signing).expect("signing body");
+        let nonce = self.nonce().await;
+        let digest = action_digest("proposal", &bytes);
+        let challenge = Challenge::new(&nonce, &digest);
+        let assertion = self.assertion(&challenge).await;
+        let pow = if pow_ok {
+            solve(&challenge, 1, &pow_params(), 0).expect("proof-of-work")
+        } else {
+            bad_pow(&challenge, 1)
+        };
+        let body = json!({
+            "kind": kind,
+            "payload": payload,
+            "fixtures": serde_json::to_value(fixtures).expect("fixtures json"),
+            "pow": pow.as_array().to_vec(),
+            "nonce": b64(nonce.as_bytes()),
+            "credential_id": b64(&assertion.credential_id),
+            "authenticator_data": b64(&assertion.authenticator_data),
+            "client_data_json": b64(&assertion.client_data_json),
+            "signature": b64(&assertion.signature),
+        });
+        post_json(&self.app, "/api/proposals", &body).await
+    }
+
+    async fn confirm_proposal(
+        &mut self,
+        proposal: &str,
+        tags: Vec<LabeledTag>,
+    ) -> (StatusCode, Value) {
+        let signing = ConfirmationSigningBody {
+            proposal_id: proposal,
+            tags: &tags,
+        };
+        let bytes = serde_json::to_vec(&signing).expect("signing body");
+        let nonce = self.nonce().await;
+        let digest = action_digest("proposal-confirmation", &bytes);
+        let challenge = Challenge::new(&nonce, &digest);
+        let assertion = self.assertion(&challenge).await;
+        let body = json!({
+            "proposal_id": proposal,
+            "tags": serde_json::to_value(&tags).expect("tags json"),
+            "nonce": b64(nonce.as_bytes()),
+            "credential_id": b64(&assertion.credential_id),
+            "authenticator_data": b64(&assertion.authenticator_data),
+            "client_data_json": b64(&assertion.client_data_json),
+            "signature": b64(&assertion.signature),
+        });
+        post_json(&self.app, "/api/proposals/confirm", &body).await
+    }
+
+    async fn read_thread(&mut self, proposal: &str) -> (StatusCode, Value) {
+        let signing = ThreadSigningBody {
+            proposal_id: proposal,
+        };
+        let bytes = serde_json::to_vec(&signing).expect("signing body");
+        let nonce = self.nonce().await;
+        let digest = action_digest("proposal-thread", &bytes);
+        let challenge = Challenge::new(&nonce, &digest);
+        let assertion = self.assertion(&challenge).await;
+        let body = json!({
+            "proposal_id": proposal,
+            "nonce": b64(nonce.as_bytes()),
+            "credential_id": b64(&assertion.credential_id),
+            "authenticator_data": b64(&assertion.authenticator_data),
+            "client_data_json": b64(&assertion.client_data_json),
+            "signature": b64(&assertion.signature),
+        });
+        post_json(&self.app, "/api/proposals/thread", &body).await
+    }
+
+    async fn post_proposer_message(
+        &mut self,
+        proposal: &str,
+        message: &str,
+    ) -> (StatusCode, Value) {
+        let signing = MessageSigningBody {
+            proposal_id: proposal,
+            body: message,
+        };
+        let bytes = serde_json::to_vec(&signing).expect("signing body");
+        let nonce = self.nonce().await;
+        let digest = action_digest("proposal-thread", &bytes);
+        let challenge = Challenge::new(&nonce, &digest);
+        let assertion = self.assertion(&challenge).await;
+        let body = json!({
+            "proposal_id": proposal,
+            "body": message,
+            "nonce": b64(nonce.as_bytes()),
+            "credential_id": b64(&assertion.credential_id),
+            "authenticator_data": b64(&assertion.authenticator_data),
+            "client_data_json": b64(&assertion.client_data_json),
+            "signature": b64(&assertion.signature),
+        });
+        post_json(&self.app, "/api/proposals/message", &body).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proposal_decision_writes_a_validated_snapshot() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let body_yaml = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
+    let (status, body) = server.submit_proposal("body", body_yaml, &[], false).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "bad pow: {body}");
+
+    let (status, body) = server.submit_proposal("body", body_yaml, &[], true).await;
+    assert_eq!(status, StatusCode::CREATED, "submit: {body}");
+    let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    assert_eq!(
+        body["view"]["summary"]["headline"],
+        "adds Fujifilm X-T5 as a camera body"
+    );
+    assert_eq!(body["view"]["status"], "pending");
+    assert!(body["round_trip"].is_null());
+
+    let tags = vec![LabeledTag {
+        tag: "FilmMode".try_into().expect("tag"),
+        value: MakernoteValue(0x0700),
+        label: "classic_chrome".try_into().expect("label"),
+    }];
+    let (status, body) = server.confirm_proposal(&proposal, tags).await;
+    assert_eq!(status, StatusCode::OK, "confirm: {body}");
+    assert_eq!(body["evidence"].as_array().expect("evidence").len(), 1);
+
+    let (status, body) = server
+        .post_proposer_message(&proposal, "firmware 2.00")
+        .await;
+    assert_eq!(status, StatusCode::OK, "message: {body}");
+
+    server
+        .set_credential_tier_roles(&server.credential_id, "new", "[\"moderator\"]")
+        .await;
+    let signed = server.signed_fields("mod-session", &[]).await;
+    let (status, session) = post_json(&server.app, "/api/mod/session", &signed).await;
+    assert_eq!(status, StatusCode::OK, "session: {session}");
+    let token = session["session_token"].as_str().expect("token").to_owned();
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/api/mod/proposal/{proposal}"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, body) = send(&server.app, request).await;
+    assert_eq!(status, StatusCode::OK, "mod view: {body:?}");
+    let record: Value = serde_json::from_slice(&body).expect("mod view json");
+    assert_eq!(record["thread"].as_array().expect("thread").len(), 1);
+    assert_eq!(record["thread"][0]["author"], "proposer");
+
+    let message = json!({ "proposal_id": proposal, "body": "please add the fixture" });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/mod/proposal-message")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&message).expect("message")))
+        .expect("request");
+    let (status, _, body) = send(&server.app, request).await;
+    assert_eq!(status, StatusCode::OK, "mod message: {body:?}");
+
+    let (status, thread) = server.read_thread(&proposal).await;
+    assert_eq!(status, StatusCode::OK, "thread: {thread}");
+    let messages = thread["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1]["author"], "moderator");
+
+    let decision = json!({
+        "proposal_id": proposal,
+        "decision": "approve",
+        "reason": "validated locally",
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/mod/decision")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&decision).expect("decision")))
+        .expect("request");
+    let (status, _, body) = send(&server.app, request).await;
+    assert_eq!(status, StatusCode::OK, "decision: {body:?}");
+    let decided: Value = serde_json::from_slice(&body).expect("decision json");
+    assert_eq!(decided["snapshot"]["version"], 1);
+    let hash = decided["snapshot"]["content_hash"]
+        .as_str()
+        .expect("content hash");
+    assert_eq!(hash.len(), 64);
+
+    let snapshot = server.dir.path().join("community/v1");
+    assert!(
+        looklab_schema::validate_snapshot_dir(&snapshot)
+            .expect("snapshot walk")
+            .is_empty()
+    );
+    let manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(snapshot.join("snapshot.json")).expect("manifest"),
+    )
+    .expect("manifest json");
+    assert_eq!(manifest["content_hash"], hash);
+    assert!(snapshot.join("bodies/fujifilm-x-t5.body.yaml").is_file());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fixture_donations_export_and_interface_profiles_carry_a_report() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let mapping = "\
+body: fujifilm/x-t5
+epoch: 2
+sim_key: reala_ace
+look: reala-ace
+firmware_from: \"2.00\"
+makernote: { tag: FilmMode, value: 1792 }
+";
+    let fixture = FixtureDonation {
+        file: "fujifilm-x-t5-2.00.raf".to_owned(),
+        description: "X-T5 firmware 2.00, Reala Ace".to_owned(),
+        make: "Fujifilm".to_owned(),
+        model: "X-T5".to_owned(),
+        sha256: Sha256Hex::parse(&"ab".repeat(32)).expect("sha256"),
+        size: 24_000_000,
+        source_url: None,
+        donator: Some("tester".to_owned()),
+        donated_on: Date::parse("2026-11-04").expect("date"),
+        license: FixtureLicense::Cc0_1_0,
+        committed: false,
+    };
+    let (status, body) = server
+        .submit_proposal("mapping", mapping, std::slice::from_ref(&fixture), true)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "mapping: {body}");
+    assert_eq!(
+        body["view"]["summary"]["headline"],
+        "adds Reala Ace to X-T5 firmware 2.00+"
+    );
+    let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+
+    let profile = include_str!("../../../data/interfaces/example-firmware-sim-v1.yaml");
+    let (status, body) = server
+        .submit_proposal("interface_profile", profile, &[], true)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "interface: {body}");
+    let report = &body["round_trip"];
+    assert!(report["probes"].as_u64().is_some(), "{report}");
+    assert!(!report["ccts"].as_array().expect("ccts").is_empty());
+
+    server
+        .set_credential_tier_roles(&server.credential_id, "new", "[\"moderator\"]")
+        .await;
+    let signed = server.signed_fields("mod-session", &[]).await;
+    let (status, session) = post_json(&server.app, "/api/mod/session", &signed).await;
+    assert_eq!(status, StatusCode::OK, "session: {session}");
+    let token = session["session_token"].as_str().expect("token").to_owned();
+    let decision = json!({
+        "proposal_id": proposal,
+        "decision": "approve",
+        "reason": "fixture matches the label",
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/mod/decision")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&decision).expect("decision")))
+        .expect("request");
+    let (status, _, body) = send(&server.app, request).await;
+    assert_eq!(status, StatusCode::OK, "decision: {body:?}");
+    let decided: Value = serde_json::from_slice(&body).expect("decision json");
+    assert!(decided["snapshot"].is_null(), "a mapping is not a document");
+
+    let (status, _, body) = server.get("/api/fixtures/manifest.toml").await;
+    assert_eq!(status, StatusCode::OK);
+    let manifest = String::from_utf8(body.to_vec()).expect("toml");
+    assert!(manifest.contains("[[fixture]]"), "{manifest}");
+    assert!(manifest.contains("file = \"fujifilm-x-t5-2.00.raf\""));
+    assert!(manifest.contains("license = \"CC0-1.0\""));
+    assert!(manifest.contains("Donated by tester on 2026-11-04"));
 }

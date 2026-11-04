@@ -7,7 +7,7 @@ use leptos_router::path;
 
 use crate::pages::{
     BodiesPage, BodyDetail, ComparePage, Landing, LogPage, LookDetail, LooksPage, MatchPlaceholder,
-    NotFound, PrivacyPage,
+    ModQueuePage, NotFound, PrivacyPage, ProposalDetail, ProposePage,
 };
 
 #[component]
@@ -22,6 +22,8 @@ pub fn App() -> impl IntoView {
                     <A href="/looks">"Looks"</A>
                     <A href="/compare">"Compare"</A>
                     <A href="/log">"Audit log"</A>
+                    <A href="/propose">"Propose"</A>
+                    <A href="/mod">"Moderation"</A>
                     <A href="/about/privacy">"Privacy"</A>
                 </nav>
             </header>
@@ -35,6 +37,9 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/compare") view=ComparePage/>
                     <Route path=path!("/match") view=MatchPlaceholder/>
                     <Route path=path!("/log") view=LogPage/>
+                    <Route path=path!("/propose") view=ProposePage/>
+                    <Route path=path!("/proposals/:id") view=ProposalDetail/>
+                    <Route path=path!("/mod") view=ModQueuePage/>
                     <Route path=path!("/about/privacy") view=PrivacyPage/>
                 </Routes>
             </main>
