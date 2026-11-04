@@ -10,7 +10,47 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["ui"]
+ui = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys"]
+# Omitted from the standalone worker build, which instantiates without imports.
+worker = []
+fixtures = []
+
 [dependencies]
+looklab-color.workspace = true
+looklab-match.workspace = true
+looklab-meta.workspace = true
+looklab-model.workspace = true
+looklab-prep.workspace = true
+looklab-prep-module.workspace = true
+looklab-samples.workspace = true
+looklab-schema.workspace = true
+looklab-upload.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+thiserror.workspace = true
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true, features = ["Window", "Navigator"] }
+
+[dev-dependencies]
+looklab-publish.workspace = true
+looklab-raw.workspace = true
+jpeg-encoder.workspace = true
+libm.workspace = true
+sha2.workspace = true
+
+[[example]]
+name = "publish_match_fixture"
+required-features = ["fixtures"]
+
+[[example]]
+name = "make_contribution_fixture"
+required-features = ["fixtures"]
+
 
 [lints]
 workspace = true

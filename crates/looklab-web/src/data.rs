@@ -118,13 +118,21 @@ pub async fn scene(name: &str) -> Result<PreparedScene, String> {
     Ok(PreparedScene::new(scene))
 }
 
-/// A look version whose manifest and every downloaded artifact matched the site index.
+
+pub fn artifact<'a>(version: &'a LoadedVersion, name: &str) -> Option<&'a [u8]> {
+    version
+        .artifacts
+        .iter()
+        .find(|(entry, _)| entry == name)
+        .map(|(_, bytes)| bytes.as_slice())
+}
 #[derive(Clone, Debug)]
 pub struct LoadedVersion {
     pub manifest: VersionManifest,
     pub document: LookDocument,
     pub lut: Arc<Vec<u8>>,
     pub diagnostics: looklab_report::LookDiagnostics,
+    pub artifacts: Vec<(String, Vec<u8>)>,
 }
 
 fn version_summary<'a>(
@@ -201,6 +209,7 @@ pub async fn version(slug: &str, version: &str) -> Result<LoadedVersion, String>
     }
     let mut look_bytes = None;
     let mut lut = None;
+    let mut artifacts = Vec::with_capacity(manifest.artifacts.len());
     for entry in &manifest.artifacts {
         let bytes = get(&format!(
             "/data/looks/{slug}/{version}/{}",
@@ -210,10 +219,11 @@ pub async fn version(slug: &str, version: &str) -> Result<LoadedVersion, String>
         verify_artifact(&manifest, &entry.name, &bytes)
             .map_err(|error| format!("{slug} {version}: {error}"))?;
         match LookArtifact::of(&entry.name) {
-            LookArtifact::Document => look_bytes = Some(bytes),
-            LookArtifact::PreviewLut => lut = Some(bytes),
+            LookArtifact::Document => look_bytes = Some(bytes.clone()),
+            LookArtifact::PreviewLut => lut = Some(bytes.clone()),
             LookArtifact::Other => {}
         }
+        artifacts.push((entry.name.as_str().to_owned(), bytes));
     }
     let look_bytes = look_bytes.ok_or_else(|| format!("{slug} {version}: no look artifact"))?;
     let lut = lut.ok_or_else(|| format!("{slug} {version}: no preview LUT"))?;
@@ -233,5 +243,6 @@ pub async fn version(slug: &str, version: &str) -> Result<LoadedVersion, String>
         document,
         lut: Arc::new(lut),
         diagnostics,
+        artifacts,
     })
 }

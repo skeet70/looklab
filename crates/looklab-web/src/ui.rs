@@ -8,7 +8,7 @@ pub fn loading() -> impl IntoView {
     view! { <p class="muted" role="status">"Loading…"</p> }
 }
 
-pub fn failure(message: &str) -> impl IntoView {
+pub fn failure(message: &str) -> impl IntoView + use<> {
     view! {
         <div class="error" role="alert">
             <strong>"Could not load this page."</strong>

@@ -239,6 +239,20 @@ fn balanced_input_matrix(m: Mat3) -> Result<Mat3> {
     Ok(m.mul(&Mat3::diag(neutral)))
 }
 
+/// Camera-to-XYZ(D65) for white-balanced camera RGB at the as-shot illuminant (docs/02 §2).
+/// The profile matrix is taken at the neutral's white and the balance divided out.
+pub fn camera_to_xyz_at_wb(spec: &DngColorSpec, multipliers: [f32; 3]) -> Result<Mat3> {
+    let wb = multipliers.map(f64::from);
+    for value in wb {
+        if !(value.is_finite() && value > 0.0) {
+            return Err(BodyError::InvalidWbMultipliers);
+        }
+    }
+    let neutral = neutral_from_wb(wb)?;
+    let d65 = spec.from_neutral(neutral).map_err(BodyError::Dng)?;
+    Ok(d65.matrix.mul(&Mat3::diag(wb.map(|value| 1.0 / value))))
+}
+
 /// Camera-neutral tristimulus values from as-shot multipliers.
 pub fn neutral_from_wb(multipliers: [f64; 3]) -> Result<[f64; 3]> {
     if !multipliers

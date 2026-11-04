@@ -3,3 +3,8 @@ target = "index.html"
 dist = "dist"
 public_url = "/"
 filehash = false
+
+[[hooks]]
+stage = "pre_build"
+command = "sh"
+command_arguments = ["scripts/wasm-assets.sh"]
