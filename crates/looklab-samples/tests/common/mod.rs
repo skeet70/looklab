@@ -18,6 +18,25 @@ pub fn compress(raw: &[u8]) -> Vec<u8> {
     out
 }
 
+/// RFC 8878 §3.1.1 header length, so tests can rewrap a frame's blocks.
+pub fn frame_header_len(frame: &[u8]) -> usize {
+    let descriptor = frame[4];
+    let single_segment = descriptor & 0b0010_0000 != 0;
+    let fcs_flag = descriptor >> 6;
+    let dict_len = [0usize, 1, 2, 4][usize::from(descriptor & 0b11)];
+    let mut len = 5 + dict_len;
+    if !single_segment {
+        len += 1;
+    }
+    len + match (fcs_flag, single_segment) {
+        (0, true) => 1,
+        (0, false) => 0,
+        (1, _) => 2,
+        (2, _) => 4,
+        _ => 8,
+    }
+}
+
 pub fn header(n: u32) -> SampleHeader {
     SampleHeader {
         n,

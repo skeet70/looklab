@@ -258,7 +258,7 @@ columns:
 
 The reader rejects: unknown enum values, n out of range, a header over the limit, decompressed size ≠ expected, NaN/Inf, and out-of-range values. Chart and pattern patch tables are separate small blobs with the same limits.
 
-**Value limits (version 1):** `in_rgb`/`out_rgb` and patch-table means finite in [-0.5, 64.0]; `density_w` finite in (0, 10⁶]; patch-table standard deviations finite in [0, 64]; `wb_multipliers` finite in [0.01, 64]; `cct_hint_k` in [0, 100 000] (0 = unknown); `exposure_hint_ev` within ±16; sample and patch-row counts in 1..=65 536; flags bits above bit 2 rejected; an encoded header is at most 4096 bytes; a zstd frame either declares its content size, which must equal the expected column bytes, or needs a window of at most 1 MiB, so decompression reads at most n × 29 + 1024 bytes. The C `zstd` crate does not build for `wasm32-unknown-unknown`, so both blobs use the pure-Rust `ruzstd` codec (`Fastest` level, single-threaded, no dictionary) in `looklab-samples`.
+**Value limits (version 1):** `in_rgb`/`out_rgb` and patch-table means finite in [-0.5, 64.0]; `density_w` finite in (0, 10⁶]; patch-table standard deviations finite in [0, 64]; `wb_multipliers` finite in [0.01, 64]; `cct_hint_k` in [0, 100 000] (0 = unknown); `exposure_hint_ev` within ±16; sample and patch-row counts in 1..=65 536; flags bits above bit 2 rejected; an encoded header is at most 4096 bytes; a zstd frame either declares its content size, which must equal the expected column bytes, or needs a window of at most 1 MiB, so decompression reads at most n × 29 + 1024 bytes and the codec holds at most one decoded block, bounded by the frame window. The C `zstd` crate does not build for `wasm32-unknown-unknown`, so both blobs use the pure-Rust `ruzstd` codec (`Fastest` level, single-threaded, no dictionary) in `looklab-samples`.
 
 ### 2.3 Upload envelope (canonical)
 An upload is **one `application/octet-stream` body** in a single canonical encoding: no JSON, no multipart, no optional whitespace or field order. Any data a client hid in formatting would make the body non-canonical and fail verification.
@@ -300,7 +300,7 @@ The challenge signed by WebAuthn is `H(nonce ‖ sha256(manifest))`. The server 
     "lightness": { "coef_ref": "bin:Lambda" },
     "residual":  { "grid": [17,17,17], "domain": {}, "coef_ref": "bin:res" }
   },
-  "output_clip": { "function": "tanh_soft_v1" },
+  "output_clip": { "function": "tanh_soft_v1", "k": 0.03 },
   "regularization": { "lambda_T": 0, "lambda_N": 0, "lambda_GRL": 0, "lambda_res": 0 },
   "uncertainty": { "probe_cov_ref": "bin:probe_cov", "density_ref": "bin:kde", "method": "bootstrap|sandwich" },
   "provenance": {
@@ -319,6 +319,8 @@ The challenge signed by WebAuthn is `H(nonce ‖ sha256(manifest))`. The server 
 ```
 
 A `lut_defined` Look stores the uploaded LUT, its declared encodings and license, plus a fitted layered approximation.
+
+`look.bin` is a named-array container: `LKBN`, a little-endian `u32` array count, then per array a `u8` name length, the ASCII name, a little-endian `u32` element count and that many little-endian `f64`, arrays sorted by name. v1 names are `T` (absent for a colorimetric tone), `N`, `G`, `R`, `Lambda` and `res`; `res` is channel-minor, `((s·17 + a)·17 + b)·3 + channel`. v1 fixes the knot vectors and residual domain, repeated in `look.json` for validation; the zip is stored, fixed-order and fixed-timestamp.
 
 ## 4. Storage notes
 

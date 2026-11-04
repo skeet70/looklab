@@ -344,13 +344,19 @@ fn validate_columns(
         check_rgb(Field::OutRgb, index, rgb)?;
     }
     for (index, w) in density_w.iter().enumerate() {
-        check_value(
-            Field::DensityW,
-            index,
-            *w,
-            f32::MIN_POSITIVE,
-            crate::MAX_DENSITY_WEIGHT,
-        )?;
+        if !w.is_finite() {
+            return Err(Error::NonFinite {
+                field: Field::DensityW,
+                index,
+            });
+        }
+        if *w <= 0.0 {
+            return Err(Error::NotPositive {
+                field: Field::DensityW,
+                index,
+            });
+        }
+        check_value(Field::DensityW, index, *w, 0.0, crate::MAX_DENSITY_WEIGHT)?;
     }
     for (index, flag) in flags.iter().enumerate() {
         if flag.bits() & !SampleFlags::KNOWN_BITS != 0 {

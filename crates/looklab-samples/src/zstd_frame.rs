@@ -113,7 +113,9 @@ pub(crate) fn decompress(frame: &[u8], expected: usize) -> Result<Vec<u8>, Error
         });
     }
     let cap = expected.saturating_add(crate::DECOMPRESS_HEADROOM);
-    let mut decoder = StreamingDecoder::new(frame).map_err(|_| Error::InvalidFrameHeader)?;
+    let window_limit = crate::MAX_WINDOW_BYTES.max(expected as u64);
+    let mut decoder = StreamingDecoder::new_with_max_window_size(frame, window_limit)
+        .map_err(|_| Error::InvalidFrameHeader)?;
     let mut out = Vec::new();
     {
         let mut limited = (&mut decoder).take(cap as u64);

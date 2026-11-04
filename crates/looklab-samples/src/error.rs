@@ -60,6 +60,9 @@ pub enum Error {
     #[error("{field} value at index {index} is not finite")]
     NonFinite { field: Field, index: usize },
 
+    #[error("{field} value at index {index} is not positive")]
+    NotPositive { field: Field, index: usize },
+
     #[error("{field} value {value} at index {index} is outside [{min}, {max}]")]
     ValueOutOfRange {
         field: Field,

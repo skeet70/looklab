@@ -164,6 +164,54 @@ fn zip_bomb_is_capped_before_allocation() {
 }
 
 #[test]
+fn a_compressed_block_that_expands_past_the_cap_is_cut_off() {
+    use std::io::Read;
+
+    let plaintext = vec![0u8; 128 * 1024];
+    let frame = compress(&plaintext);
+    let mut expanded = Vec::new();
+    ruzstd::decoding::StreamingDecoder::new(&frame[..])
+        .expect("the seed frame has a valid header")
+        .read_to_end(&mut expanded)
+        .expect("the seed frame decodes");
+    assert_eq!(expanded.len(), plaintext.len());
+
+    let blocks = &frame[common::frame_header_len(&frame)..];
+    let bomb = |window_descriptor: u8| {
+        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0b1000_0000, window_descriptor];
+        frame.extend_from_slice(&(looklab_samples::ROW_BYTES as u32).to_le_bytes());
+        frame.extend_from_slice(blocks);
+        frame
+    };
+    let wrap = |body: &[u8]| {
+        container(
+            looklab_samples::SAMPLE_MAGIC,
+            looklab_samples::SAMPLE_VERSION,
+            &header_bytes_with(1),
+            body,
+        )
+    };
+    let cap = looklab_samples::ROW_BYTES + looklab_samples::DECOMPRESS_HEADROOM;
+
+    // A 1 KiB window: the block would expand to 128 KiB inside the decoder, so
+    // ruzstd refuses it before materialising any of it.
+    assert!(matches!(
+        decode(&wrap(&bomb(0x00))),
+        Err(Error::InvalidBody)
+    ));
+
+    // A 128 KiB window: the block is within the decoder's bound, but far past
+    // the reader's cap, which stops the collection.
+    match decode(&wrap(&bomb(0x38))) {
+        Err(Error::BodySizeMismatch { actual, expected }) => {
+            assert_eq!(expected, looklab_samples::ROW_BYTES);
+            assert_eq!(actual, cap);
+        }
+        other => panic!("expected BodySizeMismatch, got {other:?}"),
+    }
+}
+
+#[test]
 fn trailing_bytes_after_the_frame_are_rejected() {
     let mut bytes = encode(&common::set(2)).expect("valid set encodes");
     bytes.extend_from_slice(b"junk");
@@ -235,11 +283,44 @@ fn zero_density_weight_is_rejected() {
     let bytes = sample_blob(1, &raw);
     assert!(matches!(
         decode(&bytes),
-        Err(Error::ValueOutOfRange {
+        Err(Error::NotPositive {
             field: Field::DensityW,
-            ..
+            index: 0
         })
     ));
+}
+
+#[test]
+fn negative_density_weight_is_rejected() {
+    let raw = raw_body(&[[0.1, 0.2, 0.3]], &[[0.1, 0.2, 0.3]], &[-1.0e-30], &[0]);
+    let bytes = sample_blob(1, &raw);
+    assert!(matches!(
+        decode(&bytes),
+        Err(Error::NotPositive {
+            field: Field::DensityW,
+            index: 0
+        })
+    ));
+}
+
+#[test]
+fn subnormal_density_weights_are_accepted() {
+    let smallest = f32::from_bits(1);
+    let raw = raw_body(&[[0.1, 0.2, 0.3]], &[[0.1, 0.2, 0.3]], &[smallest], &[0]);
+    let decoded = decode(&sample_blob(1, &raw)).expect("a positive subnormal weight is in range");
+    assert_eq!(decoded.density_w()[0].to_bits(), smallest.to_bits());
+}
+
+#[test]
+fn the_density_ceiling_is_inclusive() {
+    let raw = raw_body(
+        &[[0.1, 0.2, 0.3]],
+        &[[0.1, 0.2, 0.3]],
+        &[looklab_samples::MAX_DENSITY_WEIGHT],
+        &[0],
+    );
+    let decoded = decode(&sample_blob(1, &raw)).expect("the ceiling itself is allowed");
+    assert_eq!(decoded.density_w()[0], looklab_samples::MAX_DENSITY_WEIGHT);
 }
 
 #[test]

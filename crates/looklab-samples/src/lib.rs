@@ -20,8 +20,9 @@
 //!   [`MAX_PATCHES`].
 //! - an encoded header is at most [`MAX_HEADER_LEN`] bytes; a zstd frame
 //!   either declares its content size, which must equal `n × 29`, or needs a
-//!   window of at most [`MAX_WINDOW_BYTES`]. Decompression is capped at
-//!   `n × 29 + 1024` bytes.
+//!   window of at most [`MAX_WINDOW_BYTES`]. Decompression collects at most
+//!   `n × 29 + 1024` bytes, and the codec holds at most one decoded block,
+//!   bounded by the frame window.
 //!
 //! ## Errors
 //!
