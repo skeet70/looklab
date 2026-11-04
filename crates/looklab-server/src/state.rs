@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sqlx::SqlitePool;
 use tokio::sync::Semaphore;
@@ -11,7 +11,7 @@ use crate::blob::{BlobError, BlobStore, FsBlobStore};
 use crate::body_schema::{Bodies, BodiesError};
 use crate::config::{Config, ConfigError, ServerSecret};
 use crate::db::{DbError, open};
-use crate::ids::RegistrationHandle;
+use crate::ids::{CredentialId, RandomError, RegistrationHandle, StatusToken, TokenHash};
 use crate::rate_limit::RateLimiter;
 use crate::trust::{DefaultTrustPolicy, TrustPolicy};
 
@@ -55,6 +55,68 @@ fn upload_slots(max_body_bytes: usize) -> usize {
     usize::try_from((UPLOAD_MEMORY_BUDGET / per_upload).clamp(1, 16)).unwrap_or(1)
 }
 
+pub const MOD_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
+const MAX_MOD_SESSIONS: usize = 1024;
+
+#[derive(Debug)]
+struct ModSessionEntry {
+    credential: CredentialId,
+    expires: Instant,
+}
+
+/// Moderator sessions opened by a passkey assertion.
+#[derive(Debug, Default)]
+pub struct ModSessions {
+    sessions: Mutex<HashMap<TokenHash, ModSessionEntry>>,
+}
+
+impl ModSessions {
+    pub fn open(&self, credential: CredentialId) -> Result<StatusToken, RandomError> {
+        let token = StatusToken::generate()?;
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return Err(RandomError);
+        };
+        let now = Instant::now();
+        sessions.retain(|_, entry| entry.expires > now);
+        while sessions.len() >= MAX_MOD_SESSIONS {
+            let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires)
+                .map(|(hash, _)| *hash)
+            else {
+                break;
+            };
+            sessions.remove(&oldest);
+        }
+        sessions.insert(
+            token.hash(),
+            ModSessionEntry {
+                credential,
+                expires: now + MOD_SESSION_TTL,
+            },
+        );
+        Ok(token)
+    }
+
+    pub fn authenticate(&self, token: &StatusToken) -> Option<CredentialId> {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return None;
+        };
+        let now = Instant::now();
+        sessions.retain(|_, entry| entry.expires > now);
+        sessions
+            .get(&token.hash())
+            .map(|entry| entry.credential.clone())
+    }
+
+    pub fn close(&self, token: &StatusToken) {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return;
+        };
+        sessions.remove(&token.hash());
+    }
+}
+
 pub struct AppState {
     pub config: Config,
     pub db: SqlitePool,
@@ -65,6 +127,7 @@ pub struct AppState {
     pub rate_limiter: RateLimiter,
     pub trust: Arc<dyn TrustPolicy>,
     pub upload_slots: Arc<Semaphore>,
+    pub mod_sessions: ModSessions,
     pending: Mutex<HashMap<RegistrationHandle, PendingRegistration>>,
 }
 
@@ -103,6 +166,7 @@ impl AppState {
             rate_limiter: RateLimiter::default(),
             trust,
             upload_slots: Arc::new(Semaphore::new(slots)),
+            mod_sessions: ModSessions::default(),
             pending: Mutex::new(HashMap::new()),
         })
     }

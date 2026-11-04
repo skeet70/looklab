@@ -26,6 +26,9 @@ pub enum ErrorCode {
     RegistrationUnknown,
     TokenUnknown,
     ContributionUnknown,
+    Forbidden,
+    NotFound,
+    Conflict,
     RateLimited,
     UnsupportedMediaType,
     Internal,
@@ -49,6 +52,9 @@ impl ErrorCode {
             Self::RegistrationUnknown => StatusCode::NOT_FOUND,
             Self::TokenUnknown => StatusCode::NOT_FOUND,
             Self::ContributionUnknown => StatusCode::NOT_FOUND,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Conflict => StatusCode::CONFLICT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
@@ -74,6 +80,9 @@ impl ErrorCode {
             Self::RegistrationUnknown => "REGISTRATION_UNKNOWN",
             Self::TokenUnknown => "TOKEN_UNKNOWN",
             Self::ContributionUnknown => "CONTRIBUTION_UNKNOWN",
+            Self::Forbidden => "FORBIDDEN",
+            Self::NotFound => "NOT_FOUND",
+            Self::Conflict => "CONFLICT",
             Self::RateLimited => "RATE_LIMITED",
             Self::UnsupportedMediaType => "UNSUPPORTED_MEDIA_TYPE",
             Self::Internal => "INTERNAL",
@@ -124,6 +133,36 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response()
+    }
+}
+
+impl From<crate::admin::AdminError> for ApiError {
+    fn from(error: crate::admin::AdminError) -> Self {
+        use crate::admin::AdminError as E;
+        use looklab_trust::TrustError as T;
+        let code = match error {
+            E::Database(_) | E::Corrupt => ErrorCode::Internal,
+            E::UnknownCredential
+            | E::UnknownContribution
+            | E::UnknownRootAdmission
+            | E::UnknownVersion
+            | E::UnknownProposal
+            | E::NoActiveRecord(_) => ErrorCode::NotFound,
+            E::NotAuthorized => ErrorCode::Forbidden,
+            E::Trust(T::NotAuthorized { .. } | T::ScopeNotWithinIssuer) => ErrorCode::Forbidden,
+            E::Trust(T::UnknownCredential(_)) => ErrorCode::NotFound,
+            E::Trust(T::CannotEndorseSeeder(_)) => ErrorCode::Conflict,
+            E::Trust(_) => ErrorCode::MalformedEnvelope,
+            E::ProposalDecided | E::ManifestExists => ErrorCode::Conflict,
+            E::InvalidReason
+            | E::InvalidEvidence
+            | E::EmptyScope
+            | E::ScopeTooLarge
+            | E::IneligibleContribution
+            | E::EmptyManifest
+            | E::InvalidArtifact(_) => ErrorCode::MalformedEnvelope,
+        };
+        Self::new(code)
     }
 }
 

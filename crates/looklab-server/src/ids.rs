@@ -33,6 +33,12 @@ macro_rules! uuid_id {
             }
         }
 
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
         impl core::fmt::Display for $name {
             fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 f.write_str(&self.0)
@@ -70,6 +76,12 @@ uuid_id!(ContributionId);
 uuid_id!(ContributionImageId);
 uuid_id!(JobId);
 uuid_id!(WithdrawalId);
+uuid_id!(GrantId);
+uuid_id!(EndorsementId);
+uuid_id!(RootAdmissionId);
+uuid_id!(LookVersionId);
+uuid_id!(ProposalId);
+uuid_id!(ModerationDecisionId);
 
 /// The WebAuthn credential id as it appears on the wire.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -92,7 +104,7 @@ impl core::fmt::Debug for RawCredentialId {
 }
 
 /// SHA-256 of a capability token.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TokenHash([u8; 32]);
 
 impl TokenHash {

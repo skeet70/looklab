@@ -166,6 +166,10 @@ A failed gate leaves the candidate provisional and opens a moderation item.
 | Mislabeled images | ≥ 95% quarantined |
 | Rollback | Revert + exclude restores the pre-attack version within one release cycle |
 
+The two gauge rows (a body joining a component; two components merging) need the multi-body component fit ([09 P4.2](09-roadmap.md)). Their scenarios exist and are ignored until that fit lands; the exposure conversion they depend on is exercised through `convert_exposure_gauge`.
+
+The harness runs in CI as `cargo test -p looklab-trust --features harness --release`.
+
 ## 11. Audit log and artifact integrity
 
 - A plain **append-only table** (`audit_log`), published as a page and as JSON on the static site. Entries cover:
@@ -178,6 +182,7 @@ A failed gate leaves the candidate provisional and opens a moderation item.
   - release manifests.
 - Artifacts are **content-addressed** ([03 §4](03-data-model.md)). Each version manifest lists its artifact hashes, and clients check downloaded artifacts against the manifest.
 - Entries reference credentials by internal id or display handle, never by public key or serial HMAC.
+- The server publishes the log at `GET /log.json` (paged with `after` and `limit`), the grant and endorsement lists at `GET /lists/grants.json` and `GET /lists/endorsements.json`, and each version manifest at `GET /manifests/<look>/<version>.json`. Both lists render scope rules as plain-language text alongside the rule list.
 
 ## 12. Recipe channel and bounties
 

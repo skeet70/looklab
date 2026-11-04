@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+pub mod admin;
+pub mod auth;
+pub mod moderation;
 pub mod passkey;
+pub mod public;
 pub mod status;
 pub mod upload;
 pub mod withdraw;

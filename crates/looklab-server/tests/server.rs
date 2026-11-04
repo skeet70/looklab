@@ -184,6 +184,93 @@ impl TestServer {
         }
     }
 
+    async fn credential_uuid(&self) -> String {
+        self.credential_uuid_for(&self.credential_id).await
+    }
+
+    async fn credential_uuid_for(&self, raw_id: &[u8]) -> String {
+        sqlx::query_scalar("SELECT id FROM credentials WHERE credential_id = ?")
+            .bind(raw_id)
+            .fetch_one(&self.db)
+            .await
+            .expect("credential id")
+    }
+
+    async fn persist_credential(&self) -> String {
+        let (passkey, display_handle) = self
+            .state
+            .pending_credential(&self.credential_id)
+            .expect("pending credential");
+        let id = looklab_server::CredentialId::new();
+        let passkey = serde_json::to_string(&passkey).expect("passkey json");
+        sqlx::query(
+            "INSERT INTO credentials
+             (id, credential_id, webauthn_credential, display_handle, tier, roles, reputation,
+              created_at, status)
+             VALUES (?, ?, ?, ?, 'new', '[]', 0.5, 0, 'active')",
+        )
+        .bind(id.as_str())
+        .bind(&self.credential_id)
+        .bind(passkey)
+        .bind(display_handle)
+        .execute(&self.db)
+        .await
+        .expect("credential");
+        id.as_str().to_owned()
+    }
+
+    async fn add_credential(&self) -> String {
+        let id = looklab_server::CredentialId::new();
+        sqlx::query(
+            "INSERT INTO credentials (id, credential_id, webauthn_credential, created_at)
+             VALUES (?, ?, '{}', 0)",
+        )
+        .bind(id.as_str())
+        .bind(id.as_str().as_bytes())
+        .execute(&self.db)
+        .await
+        .expect("credential");
+        id.as_str().to_owned()
+    }
+
+    async fn set_credential_tier_roles(&self, raw_id: &[u8], tier: &str, roles: &str) {
+        sqlx::query("UPDATE credentials SET tier = ?, roles = ? WHERE credential_id = ?")
+            .bind(tier)
+            .bind(roles)
+            .bind(raw_id)
+            .execute(&self.db)
+            .await
+            .expect("update credential");
+    }
+
+    async fn signed_fields(&mut self, domain: &str, payload: &[u8]) -> Value {
+        let nonce = self.nonce().await;
+        let digest = action_digest(domain, payload);
+        let challenge = Challenge::new(&nonce, &digest);
+        let assertion = self.assertion(&challenge).await;
+        json!({
+            "nonce": b64(nonce.as_bytes()),
+            "credential_id": b64(&assertion.credential_id),
+            "authenticator_data": b64(&assertion.authenticator_data),
+            "client_data_json": b64(&assertion.client_data_json),
+            "signature": b64(&assertion.signature),
+        })
+    }
+
+    async fn post_signed(
+        &mut self,
+        path: &str,
+        domain: &str,
+        payload: &[u8],
+        mut body: Value,
+    ) -> (StatusCode, Value) {
+        let signed = self.signed_fields(domain, payload).await;
+        for (key, value) in signed.as_object().expect("signed object") {
+            body[key.as_str()] = value.clone();
+        }
+        post_json(&self.app, path, &body).await
+    }
+
     async fn upload_bytes(&self, bytes: Vec<u8>) -> (StatusCode, Value) {
         let length = bytes.len();
         let request = Request::builder()
@@ -520,6 +607,24 @@ fn request_digest(domain: RequestDomain, payload: &str) -> ManifestHash {
     hasher.update(domain.as_str().as_bytes());
     hasher.update(b":");
     hasher.update(payload.as_bytes());
+    ManifestHash::from_bytes(hasher.finalize().into())
+}
+
+fn bind_fields(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for part in parts {
+        out.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        out.extend_from_slice(part);
+    }
+    out
+}
+
+fn action_digest(domain: &str, payload: &[u8]) -> ManifestHash {
+    let mut hasher = Sha256::new();
+    hasher.update(b"looklab-request-v1:");
+    hasher.update(domain.as_bytes());
+    hasher.update(b":");
+    hasher.update(payload);
     ManifestHash::from_bytes(hasher.finalize().into())
 }
 
@@ -1231,4 +1336,534 @@ async fn column_values(db: &SqlitePool) -> Vec<(String, String, Vec<u8>)> {
         }
     }
     values
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grants_endorsements_and_root_admissions_are_logged_and_published() {
+    use looklab_server::RootAdmissionId;
+    use looklab_server::admin::{ManifestArtifact, write_version_manifest};
+
+    let mut server = TestServer::start().await;
+    let serial = RawSerial::new(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server.upload_valid(Some(&serial)).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let contribution_id: String = sqlx::query_scalar("SELECT id FROM contributions LIMIT 1")
+        .fetch_one(&server.db)
+        .await
+        .expect("contribution");
+    sqlx::query("UPDATE contributions SET kind = 'chart' WHERE id = ?")
+        .bind(&contribution_id)
+        .execute(&server.db)
+        .await
+        .expect("chart contribution");
+    let second = server.add_credential().await;
+    let endorsed = server.add_credential().await;
+    let actor = server.credential_uuid().await;
+    server
+        .set_credential_tier_roles(&server.credential_id, "seeder", "[\"admin\"]")
+        .await;
+
+    let digest = bind_fields(&[second.as_bytes(), b"seeder", b"", b"bootstrap"]);
+    let (status, grant) = server
+        .post_signed(
+            "/api/admin/grant",
+            "grant",
+            &digest,
+            json!({ "subject": second, "grant": "seeder", "scope": Value::Null, "reason": "bootstrap" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    assert_eq!(grant["subject"], second);
+    assert_eq!(grant["grant"], "seeder");
+    assert!(grant["revoked_at"].is_null());
+    let grants: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM grants")
+        .fetch_one(&server.db)
+        .await
+        .expect("grants");
+    assert_eq!(grants, 1);
+    let last: String = sqlx::query_scalar("SELECT type FROM audit_log ORDER BY seq DESC LIMIT 1")
+        .fetch_one(&server.db)
+        .await
+        .expect("audit type");
+    assert_eq!(last, "grant_created");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT tier FROM credentials WHERE id = ?")
+            .bind(&second)
+            .fetch_one(&server.db)
+            .await
+            .expect("tier"),
+        "seeder"
+    );
+
+    let scope = json!({ "rules": [{ "body": "fujifilm/x-t5", "look": Value::Null }] });
+    let evidence = vec!["chart-session-1"];
+    let scope_bytes = serde_json::to_vec(&scope).expect("scope");
+    let evidence_bytes = serde_json::to_vec(&evidence).expect("evidence");
+    let digest = bind_fields(&[
+        endorsed.as_bytes(),
+        &scope_bytes,
+        b"reviewed chart",
+        &evidence_bytes,
+    ]);
+    let (status, endorsement) = server
+        .post_signed(
+            "/api/seeder/endorse",
+            "endorse",
+            &digest,
+            json!({
+                "subject": endorsed,
+                "scope": scope,
+                "reason": "reviewed chart",
+                "evidence": evidence,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "endorse: {endorsement}");
+    assert_eq!(endorsement["scope_text"], "Fujifilm X-T5 · all looks");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT tier FROM credentials WHERE id = ?")
+            .bind(&endorsed)
+            .fetch_one(&server.db)
+            .await
+            .expect("tier"),
+        "endorsed"
+    );
+
+    let root_scope = json!({ "rules": [{ "body": "fujifilm/x-t5", "look": "classic-chrome" }] });
+    let root_scope_bytes = serde_json::to_vec(&root_scope).expect("scope");
+    let digest = bind_fields(&[
+        contribution_id.as_bytes(),
+        &root_scope_bytes,
+        b"anchored session",
+    ]);
+    let (status, root) = server
+        .post_signed(
+            "/api/seeder/admit-root",
+            "admit-root",
+            &digest,
+            json!({
+                "contribution_id": contribution_id,
+                "scope": root_scope,
+                "reason": "anchored session",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "admit: {root}");
+    assert_eq!(root["subject"], actor);
+    let root_id = root["id"].as_str().expect("root id").to_owned();
+
+    let look = looklab_upload::LookSlug::try_from("classic-chrome").expect("look");
+    let artifacts = vec![ManifestArtifact {
+        name: "look.json".to_owned(),
+        sha256: "ab".repeat(32),
+    }];
+    let root_typed = RootAdmissionId::try_from(root_id.clone()).expect("root id");
+    let manifest = write_version_manifest(
+        &server.db,
+        &look,
+        looklab_trust::VersionId::new(1),
+        &artifacts,
+        std::slice::from_ref(&root_typed),
+    )
+    .await
+    .expect("manifest");
+    assert_eq!(
+        manifest.status,
+        looklab_server::admin::VersionStatus::Published
+    );
+    let (status, _, body) = server.get("/manifests/classic-chrome/1.json").await;
+    assert_eq!(status, StatusCode::OK, "manifest: {body:?}");
+    let served: Value = serde_json::from_slice(&body).expect("manifest json");
+    assert_eq!(served["artifacts"][0]["name"], "look.json");
+    assert_eq!(served["artifacts"][0]["sha256"], "ab".repeat(32));
+
+    let digest = bind_fields(&[root_id.as_bytes(), b"root withdrawn"]);
+    let (status, revocation) = server
+        .post_signed(
+            "/api/seeder/revoke-root",
+            "revoke-root",
+            &digest,
+            json!({ "root_admission_id": root_id, "reason": "root withdrawn" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "revoke root: {revocation}");
+    assert_eq!(revocation["new_versions"][0]["look"], "classic-chrome");
+    assert_eq!(revocation["new_versions"][0]["version"], 2);
+    assert_eq!(
+        revocation["regating"].as_array().expect("regating").len(),
+        1
+    );
+    let versions: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM look_versions WHERE look = 'classic-chrome' ORDER BY version",
+    )
+    .fetch_all(&server.db)
+    .await
+    .expect("versions");
+    assert_eq!(versions, vec![1, 2]);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM look_versions WHERE version = 2")
+            .fetch_one(&server.db)
+            .await
+            .expect("status"),
+        "provisional"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM version_regating")
+            .fetch_one(&server.db)
+            .await
+            .expect("regating"),
+        1
+    );
+
+    let digest = bind_fields(&[endorsed.as_bytes(), b"evidence withdrawn"]);
+    let (status, revoked) = server
+        .post_signed(
+            "/api/seeder/revoke-endorsement",
+            "revoke-endorsement",
+            &digest,
+            json!({ "subject": endorsed, "reason": "evidence withdrawn" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "revoke endorsement: {revoked}");
+    assert_eq!(revoked["revoked"], 1);
+
+    let digest = bind_fields(&[second.as_bytes(), b"seeder", b"role withdrawn"]);
+    let (status, revoked) = server
+        .post_signed(
+            "/api/admin/revoke-grant",
+            "revoke-grant",
+            &digest,
+            json!({ "subject": second, "grant": "seeder", "reason": "role withdrawn" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "revoke grant: {revoked}");
+    assert!(revoked["revoked_at"].is_number());
+
+    let (status, _, body) = server.get("/lists/grants.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let grants: Value = serde_json::from_slice(&body).expect("grants json");
+    assert_eq!(grants["grants"].as_array().expect("grants").len(), 1);
+    assert!(grants["grants"][0]["revoked_at"].is_number());
+    let (status, _, body) = server.get("/lists/endorsements.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let endorsements: Value = serde_json::from_slice(&body).expect("endorsements json");
+    assert_eq!(
+        endorsements["endorsements"]
+            .as_array()
+            .expect("endorsements")
+            .len(),
+        1
+    );
+    assert!(endorsements["endorsements"][0]["revoked_at"].is_number());
+
+    let (status, _, body) = server.get("/log.json?limit=100").await;
+    assert_eq!(status, StatusCode::OK);
+    let log: Value = serde_json::from_slice(&body).expect("log json");
+    let kinds: std::collections::HashSet<&str> = log["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter_map(|entry| entry["type"].as_str())
+        .collect();
+    for expected in [
+        "grant_created",
+        "endorsement_issued",
+        "root_admitted",
+        "release_manifest",
+        "root_revoked",
+        "endorsement_revoked",
+        "grant_revoked",
+    ] {
+        assert!(kinds.contains(expected), "missing audit entry {expected}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn moderator_session_serves_the_queue_and_records_decisions() {
+    let mut server = TestServer::start().await;
+    let second = server.add_credential().await;
+    let actor = server.persist_credential().await;
+    server
+        .set_credential_tier_roles(&server.credential_id, "new", "[\"moderator\"]")
+        .await;
+    sqlx::query("UPDATE credentials SET reputation = 1.4 WHERE id = ?")
+        .bind(&second)
+        .execute(&server.db)
+        .await
+        .expect("reputation");
+
+    let proposal = looklab_server::ProposalId::new();
+    sqlx::query(
+        "INSERT INTO proposals (id, credential_id, type, payload, human_summary, evidence, status, created_at)
+         VALUES (?, ?, 'body', '{}', 'adds a body', '[]', 'pending', 0)",
+    )
+    .bind(proposal.as_str())
+    .bind(&actor)
+    .execute(&server.db)
+    .await
+    .expect("proposal");
+    sqlx::query(
+        "INSERT INTO gate_failures (id, look, version, report, status, created_at)
+         VALUES ('gate-1', 'classic-chrome', 1, '{\"median\":0.4}', 'pending', 0)",
+    )
+    .execute(&server.db)
+    .await
+    .expect("gate failure");
+    for credential in [&actor, &second] {
+        let id = looklab_server::ContributionId::new();
+        sqlx::query(
+            "INSERT INTO contributions
+             (id, credential_id, batch_manifest_hash, signature, pow, kind, serial_hmac, intent,
+              body_id, firmware_version, sim_key, settings, status, created_at)
+             VALUES (?, ?, x'00', x'00', 'pow', 'chart', x'abab', 'native',
+                     'fujifilm/x-t5', '2.10', 'classic-chrome', '{}', 'pending', 0)",
+        )
+        .bind(id.as_str())
+        .bind(credential)
+        .execute(&server.db)
+        .await
+        .expect("contribution");
+    }
+
+    let signed = server.signed_fields("mod-session", &[]).await;
+    let (status, session) = post_json(&server.app, "/api/mod/session", &signed).await;
+    assert_eq!(status, StatusCode::OK, "session: {session}");
+    let token = session["session_token"].as_str().expect("token").to_owned();
+    assert_eq!(session["expires_in_seconds"], 900);
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/mod/queue")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, body) = send(&server.app, request).await;
+    assert_eq!(status, StatusCode::OK, "queue: {body:?}");
+    let queue: Value = serde_json::from_slice(&body).expect("queue json");
+    assert_eq!(queue["proposals"].as_array().expect("proposals").len(), 1);
+    assert_eq!(queue["proposals"][0]["kind"], "body");
+    assert_eq!(queue["failed_gates"].as_array().expect("gates").len(), 1);
+    assert_eq!(queue["serial_reuse"].as_array().expect("reuse").len(), 1);
+    assert_eq!(
+        queue["serial_reuse"][0]["contributions"]
+            .as_array()
+            .expect("reuse contributions")
+            .len(),
+        2
+    );
+    assert!(
+        queue["nominations"]
+            .as_array()
+            .expect("nominations")
+            .iter()
+            .any(|nomination| nomination["credential"] == second),
+        "second credential is nominated"
+    );
+
+    let decision = json!({
+        "proposal_id": proposal.as_str(),
+        "decision": "approve",
+        "reason": "validated locally",
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/mod/decision")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&decision).expect("decision")))
+        .expect("request");
+    let (status, _, body) = send(&server.app, request).await;
+    assert_eq!(status, StatusCode::OK, "decision: {body:?}");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM moderation_decisions")
+            .fetch_one(&server.db)
+            .await
+            .expect("decisions"),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM proposals WHERE id = ?")
+            .bind(proposal.as_str())
+            .fetch_one(&server.db)
+            .await
+            .expect("proposal status"),
+        "approved"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT type FROM audit_log ORDER BY seq DESC LIMIT 1")
+            .fetch_one(&server.db)
+            .await
+            .expect("audit type"),
+        "moderation_decision"
+    );
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/mod/queue")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, body) = send(&server.app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let queue: Value = serde_json::from_slice(&body).expect("queue json");
+    assert!(queue["proposals"].as_array().expect("proposals").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_and_public_endpoints_publish_no_secrets() {
+    use looklab_server::RootAdmissionId;
+    use looklab_server::admin::{ManifestArtifact, write_version_manifest};
+
+    let mut server = TestServer::start().await;
+    let serial = RawSerial::new(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server.upload_valid(Some(&serial)).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let hmac = serial.hmac(&SerialHmacKey::new([9; 32]), "Fujifilm", "X-T5");
+    let contribution_id: String = sqlx::query_scalar("SELECT id FROM contributions LIMIT 1")
+        .fetch_one(&server.db)
+        .await
+        .expect("contribution");
+    sqlx::query("UPDATE contributions SET kind = 'chart' WHERE id = ?")
+        .bind(&contribution_id)
+        .execute(&server.db)
+        .await
+        .expect("chart contribution");
+    let second = server.add_credential().await;
+    let endorsed = server.add_credential().await;
+    let actor = server.credential_uuid().await;
+    server
+        .set_credential_tier_roles(&server.credential_id, "seeder", "[\"admin\",\"moderator\"]")
+        .await;
+
+    let mut responses: Vec<Vec<u8>> = Vec::new();
+    let digest = bind_fields(&[second.as_bytes(), b"seeder", b"", b"bootstrap"]);
+    let (status, grant) = server
+        .post_signed(
+            "/api/admin/grant",
+            "grant",
+            &digest,
+            json!({ "subject": second, "grant": "seeder", "scope": Value::Null, "reason": "bootstrap" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "grant: {grant}");
+    responses.push(serde_json::to_vec(&grant).expect("grant json"));
+
+    let scope = json!({ "rules": [{ "body": "fujifilm/x-t5", "look": Value::Null }] });
+    let scope_bytes = serde_json::to_vec(&scope).expect("scope");
+    let digest = bind_fields(&[endorsed.as_bytes(), &scope_bytes, b"reviewed", b"[]"]);
+    let (status, endorsement) = server
+        .post_signed(
+            "/api/seeder/endorse",
+            "endorse",
+            &digest,
+            json!({
+                "subject": endorsed,
+                "scope": scope,
+                "reason": "reviewed",
+                "evidence": [],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "endorse: {endorsement}");
+    responses.push(serde_json::to_vec(&endorsement).expect("endorsement json"));
+
+    let root_scope = json!({ "rules": [{ "body": "fujifilm/x-t5", "look": "classic-chrome" }] });
+    let root_scope_bytes = serde_json::to_vec(&root_scope).expect("scope");
+    let digest = bind_fields(&[contribution_id.as_bytes(), &root_scope_bytes, b"anchored"]);
+    let (status, root) = server
+        .post_signed(
+            "/api/seeder/admit-root",
+            "admit-root",
+            &digest,
+            json!({
+                "contribution_id": contribution_id,
+                "scope": root_scope,
+                "reason": "anchored",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "admit: {root}");
+    responses.push(serde_json::to_vec(&root).expect("root json"));
+    let root_id = root["id"].as_str().expect("root id").to_owned();
+
+    let look = looklab_upload::LookSlug::try_from("classic-chrome").expect("look");
+    write_version_manifest(
+        &server.db,
+        &look,
+        looklab_trust::VersionId::new(1),
+        &[ManifestArtifact {
+            name: "look.json".to_owned(),
+            sha256: "cd".repeat(32),
+        }],
+        &[RootAdmissionId::try_from(root_id).expect("root id")],
+    )
+    .await
+    .expect("manifest");
+
+    let proposal = looklab_server::ProposalId::new();
+    sqlx::query(
+        "INSERT INTO proposals (id, credential_id, type, payload, human_summary, evidence, status, created_at)
+         VALUES (?, ?, 'body', '{}', 'adds a body', '[]', 'pending', 0)",
+    )
+    .bind(proposal.as_str())
+    .bind(&actor)
+    .execute(&server.db)
+    .await
+    .expect("proposal");
+
+    let signed = server.signed_fields("mod-session", &[]).await;
+    let (status, session) = post_json(&server.app, "/api/mod/session", &signed).await;
+    assert_eq!(status, StatusCode::OK, "session: {session}");
+    responses.push(serde_json::to_vec(&session).expect("session json"));
+    let token = session["session_token"].as_str().expect("token").to_owned();
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/mod/queue")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, body) = send(&server.app, request).await;
+    assert_eq!(status, StatusCode::OK, "queue: {body:?}");
+    responses.push(body.to_vec());
+
+    for path in [
+        "/lists/grants.json",
+        "/lists/endorsements.json",
+        "/log.json?limit=100",
+        "/manifests/classic-chrome/1.json",
+    ] {
+        let (status, _, body) = server.get(path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body:?}");
+        responses.push(body.to_vec());
+    }
+
+    let mut key_needles = Vec::new();
+    let credentials: Vec<String> =
+        sqlx::query_scalar("SELECT webauthn_credential FROM credentials")
+            .fetch_all(&server.db)
+            .await
+            .expect("credentials");
+    for json in credentials {
+        if let Ok(passkey) = serde_json::from_str::<webauthn_rs::prelude::Passkey>(&json) {
+            key_needles.extend(public_key_needles(&passkey));
+        }
+    }
+    let serial_needles = encoded_needles(SERIAL.as_bytes());
+    let hmac_needles = encoded_needles(hmac.as_bytes());
+    for response in &responses {
+        assert_absent("responses", response, &key_needles);
+        assert_absent("responses", response, &serial_needles);
+        assert_absent("responses", response, &hmac_needles);
+    }
+    let log_bytes = log_bytes();
+    assert_absent("logs", &log_bytes, &key_needles);
+    assert_absent("logs", &log_bytes, &serial_needles);
+    assert_absent("logs", &log_bytes, &hmac_needles);
+    for (table, column, value) in column_values(&server.db).await {
+        if table == "credentials" && column == "webauthn_credential" {
+            continue;
+        }
+        assert_absent(&format!("{table}.{column}"), &value, &key_needles);
+        assert_absent(&format!("{table}.{column}"), &value, &serial_needles);
+    }
 }

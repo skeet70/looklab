@@ -19,6 +19,7 @@ getrandom.workspace = true
 http-body-util.workspace = true
 looklab-samples.workspace = true
 looklab-schema.workspace = true
+looklab-trust.workspace = true
 looklab-upload.workspace = true
 postcard.workspace = true
 serde.workspace = true

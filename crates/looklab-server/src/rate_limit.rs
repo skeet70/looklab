@@ -16,6 +16,10 @@ pub enum Action {
     Upload,
     StatusReissue,
     Withdraw,
+    Admin,
+    Endorse,
+    Root,
+    ModSession,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -51,7 +55,12 @@ impl RateKey {
                     capacity: 30.0,
                     refill_per_second: 0.2,
                 },
-                Action::StatusReissue | Action::Withdraw => Quota {
+                Action::StatusReissue
+                | Action::Withdraw
+                | Action::Admin
+                | Action::Endorse
+                | Action::Root
+                | Action::ModSession => Quota {
                     capacity: 20.0,
                     refill_per_second: 0.1,
                 },
@@ -66,6 +75,10 @@ impl core::fmt::Display for RateKey {
             Action::Upload => "upload",
             Action::StatusReissue => "status-reissue",
             Action::Withdraw => "withdraw",
+            Action::Admin => "admin",
+            Action::Endorse => "endorse",
+            Action::Root => "root",
+            Action::ModSession => "mod-session",
         };
         match self {
             Self::Nonce => f.write_str("nonce"),

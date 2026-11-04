@@ -108,6 +108,13 @@ pub fn verify_assertion(
 pub enum RequestDomain {
     StatusReissue,
     Withdraw,
+    Grant,
+    RevokeGrant,
+    Endorse,
+    RevokeEndorsement,
+    AdmitRoot,
+    RevokeRoot,
+    ModSession,
 }
 
 impl RequestDomain {
@@ -115,6 +122,13 @@ impl RequestDomain {
         match self {
             Self::StatusReissue => "status-reissue",
             Self::Withdraw => "withdraw",
+            Self::Grant => "grant",
+            Self::RevokeGrant => "revoke-grant",
+            Self::Endorse => "endorse",
+            Self::RevokeEndorsement => "revoke-endorsement",
+            Self::AdmitRoot => "admit-root",
+            Self::RevokeRoot => "revoke-root",
+            Self::ModSession => "mod-session",
         }
     }
 }

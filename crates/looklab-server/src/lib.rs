@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Upload intake and moderation API.
 
+pub mod admin;
 mod api;
+mod audit;
 mod blob;
 mod body_schema;
 mod config;
@@ -25,7 +27,12 @@ use tokio::net::TcpListener;
 use tracing::Instrument as _;
 
 pub use config::{Config, PowConfig};
-pub use state::AppState;
+pub use db::{DbError, open as open_database};
+pub use ids::{
+    ContributionId, CredentialId, EndorsementId, GrantId, LookVersionId, ModerationDecisionId,
+    ProposalId, RootAdmissionId,
+};
+pub use state::{AppState, ModSessions};
 pub use trust::{CredentialStanding, DefaultTrustPolicy, Tier, TrustPolicy};
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -42,6 +49,22 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/upload", post(api::upload::upload))
         .route("/api/status/reissue", post(api::status::reissue))
         .route("/api/withdraw", post(api::withdraw::withdraw))
+        .route("/api/admin/grant", post(api::admin::grant))
+        .route("/api/admin/revoke-grant", post(api::admin::revoke_grant))
+        .route("/api/seeder/endorse", post(api::admin::endorse))
+        .route(
+            "/api/seeder/revoke-endorsement",
+            post(api::admin::revoke_endorsement),
+        )
+        .route("/api/seeder/admit-root", post(api::admin::admit_root))
+        .route("/api/seeder/revoke-root", post(api::admin::revoke_root))
+        .route("/api/mod/session", post(api::moderation::session))
+        .route("/api/mod/queue", get(api::moderation::queue))
+        .route("/api/mod/decision", post(api::moderation::decision))
+        .route("/log.json", get(api::public::audit_log))
+        .route("/lists/grants.json", get(api::public::grants))
+        .route("/lists/endorsements.json", get(api::public::endorsements))
+        .route("/manifests/{look}/{version}", get(api::public::manifest))
         .route("/status/{token}", get(api::status::status))
         .with_state(state)
         .layer(middleware::from_fn(request_span))
