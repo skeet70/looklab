@@ -1,0 +1,38 @@
+# `committed = true` files live in this directory; the rest are download-only
+# into fixtures/cache/ (gitignored). tools/fetch-fixtures.sh verifies both sets.
+
+[[fixture]]
+file = "fujifilm-x-s10.raf"
+description = "Fujifilm X-S10, 14-bit compressed RAF, X-Trans IV"
+make = "Fujifilm"
+model = "X-S10"
+sha256 = "9419d1408ebf850395e5dd563beb96309466546252caf541466034c9cb7e9724"
+size = 18675216
+source_url = "https://raw.pixls.us/getfile.php/4190/nice/Fujifilm%20-%20X-S10%20-%2014bit%2014bit%20compressed%20(3:2).RAF"
+license = "CC0-1.0"
+consent = "CC0 public sample (raw.pixls.us)"
+committed = true
+
+[[fixture]]
+file = "canon-eos-60d.dng"
+description = "Canon EOS 60D, 14-bit DNG crop"
+make = "Canon"
+model = "EOS 60D"
+sha256 = "5d826ccdde8f31569c4f147f97610e423107cba3cbb26edcb89df86055824d97"
+size = 471476
+source_url = "https://raw.pixls.us/getfile.php/2671/nice/Canon%20-%20EOS%2060D%20-%2014bit%20(16:9).dng"
+license = "CC0-1.0"
+consent = "CC0 public sample (raw.pixls.us)"
+committed = true
+
+[[fixture]]
+file = "sigma-fp-8bit.dng"
+description = "Sigma fp, 8-bit DNG, fetch-only"
+make = "Sigma"
+model = "fp"
+sha256 = "80ae0b8fdce3f58286fc194513c6ec0080ab07caca753408b00ca72c90e5ad0c"
+size = 2190336
+source_url = "https://raw.pixls.us/getfile.php/7280/nice/Sigma%20-%20fp%20-%208bit%20(16:9).DNG"
+license = "CC0-1.0"
+consent = "CC0 public sample (raw.pixls.us)"
+committed = false

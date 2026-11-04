@@ -88,7 +88,7 @@ Nothing in the core depends on `server`/`web`. Core crates (everything except `s
 | Small linear algebra | `nalgebra` | 3×3 and fixed-size math |
 | Large/sparse solves | `faer` | Fitting only. **Not** in the Look evaluation path (runtime-dispatched SIMD changes summation order) |
 | Optimization | hand-rolled LM on `faer` | Robust losses, warm starts |
-| RAW decode | `rawler` (dnglab) | LGPL-2.1, isolated in `looklab-raw`. wasm32 needs the `uuid` `js` feature; single-threaded via rayon-core's fallback |
+| RAW decode | `rawler` (dnglab) | LGPL-2.1, isolated in `looklab-raw`. wasm32 needs the `uuid` `js` feature and getrandom's `wasm_js` backend; the reduced decode path spawns no rayon threads |
 | JPEG decode | `zune-jpeg` | Must expose ICC/EXIF |
 | HEIF (later) | TBD | Keep the decode trait ready |
 | EXIF | `kamadak-exif` + custom makernote parsers | Data-driven per make |
