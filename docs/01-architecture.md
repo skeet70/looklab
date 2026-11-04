@@ -54,6 +54,7 @@ crates/
   looklab-trust     # weights, tiers, reputation, caps, gates, rollback, red-team harness
   looklab-schema    # validators for data/ (bodies, interfaces, probes); also built to WASM
   looklab-report    # static HTML/SVG reports (CLI and site)
+  looklab-publish   # published static data: version manifests, artifact hashes, page data
   looklab-wasm      # wasm-bindgen facade for the browser
   looklab-web       # frontend (Leptos)
   looklab-server    # axum API
@@ -78,6 +79,7 @@ fuzz/               # cargo-fuzz project (its own workspace, excluded from the c
 - `match` ← {`fit`, `model`}
 - `trust` ← {`fit`, `model`, `samples`}
 - `export` ← `model`
+- `publish` ← {`model`, `schema`, `color`}
 - `raw`, `meta` → `prep` → `samples`
 - `schema` is a leaf utility.
 

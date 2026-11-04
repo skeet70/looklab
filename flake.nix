@@ -46,11 +46,16 @@
           wabt
           nodejs_22
           cargo-nextest
+          trunk
         ];
       in
       {
         devShells.default = pkgs.mkShell {
           buildInputs = [ rusttoolchain ] ++ common;
+          # trunk 0.21 parses NO_COLOR as a bool; the conventional value 1 fails its CLI parser.
+          shellHook = ''
+            if [ "''${NO_COLOR:-}" = "1" ]; then export NO_COLOR=true; fi
+          '';
         };
         # Golden-vector generation (dev-time only).
         devShells.golden = pkgs.mkShell {

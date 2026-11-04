@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "xtask"]
+members = ["crates/*", "xtask", "site"]
 exclude = ["fuzz"]
 
 [workspace.package]
@@ -25,6 +25,9 @@ looklab-report = { path = "crates/looklab-report" }
 looklab-upload = { path = "crates/looklab-upload" }
 looklab-wasm = { path = "crates/looklab-wasm" }
 looklab-prep-module = { path = "crates/looklab-prep-module" }
+looklab-publish = { path = "crates/looklab-publish" }
+looklab-web = { path = "crates/looklab-web" }
+looklab-server = { path = "crates/looklab-server" }
 
 libm = "0.2"
 thiserror = "2"
@@ -67,6 +70,15 @@ tempfile = "3"
 wasmtime = "50"
 clap = { version = "4", features = ["derive"] }
 assert_cmd = "2"
+leptos = { version = "0.8", default-features = false, features = ["csr"] }
+leptos_router = "0.8"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = "0.3"
+console_error_panic_hook = "0.1"
+gloo-net = { version = "0.6", features = ["http"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

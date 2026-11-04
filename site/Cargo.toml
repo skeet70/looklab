@@ -1,0 +1,18 @@
+[package]
+name = "looklab-site"
+description = "Trunk entry point for the looklab static site."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "looklab-web"
+path = "src/main.rs"
+
+[dependencies]
+looklab-web.workspace = true
+
+[lints]
+workspace = true
