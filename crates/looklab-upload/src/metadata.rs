@@ -214,7 +214,7 @@ pub enum EffectStrength {
 }
 
 /// Mirror of [`looklab_meta::LookSettings`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LookSettings {
     pub film_mode: Option<Tagged<FilmMode>>,
     pub dynamic_range: Option<Tagged<DynamicRange>>,
@@ -234,6 +234,45 @@ pub struct LookSettings {
     pub color_chrome_fx_blue: Option<Tagged<EffectStrength>>,
 }
 
+/// A metadata value that fails the checks [`looklab_meta`] applies when it
+/// constructs the same field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataField {
+    FocalLength,
+    Iso,
+    Shutter,
+    Aperture,
+    ExposureCompensation,
+    AsShotWhiteBalance,
+    HighlightTone,
+    ShadowTone,
+}
+
+impl core::fmt::Display for MetadataField {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::FocalLength => "focal length",
+            Self::Iso => "ISO",
+            Self::Shutter => "shutter",
+            Self::Aperture => "aperture",
+            Self::ExposureCompensation => "exposure compensation",
+            Self::AsShotWhiteBalance => "as-shot white balance",
+            Self::HighlightTone => "highlight tone",
+            Self::ShadowTone => "shadow tone",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MetadataError {
+    #[error("{field} is not finite")]
+    NonFinite { field: MetadataField },
+    #[error("{field} must be positive")]
+    NotPositive { field: MetadataField },
+    #[error("ISO must be positive")]
+    ZeroIso,
+}
+
 /// Mirror of [`looklab_meta::SanitizedMetadata`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManifestMetadata {
@@ -250,6 +289,63 @@ pub struct ManifestMetadata {
     pub capture_month: Option<CaptureMonth>,
     pub software: Option<String>,
     pub look: Option<LookSettings>,
+}
+
+impl ManifestMetadata {
+    pub fn validate(&self) -> Result<(), MetadataError> {
+        if let Some(value) = self.focal_length_mm {
+            check_positive(value, MetadataField::FocalLength)?;
+        }
+        if self.iso == Some(0) {
+            return Err(MetadataError::ZeroIso);
+        }
+        if let Some(value) = self.shutter_seconds {
+            check_positive(value, MetadataField::Shutter)?;
+        }
+        if let Some(value) = self.aperture_f_number {
+            check_positive(value, MetadataField::Aperture)?;
+        }
+        if let Some(value) = self.exposure_compensation_ev {
+            check_finite(value, MetadataField::ExposureCompensation)?;
+        }
+        if let Some(wb) = self.as_shot_wb {
+            for value in [wb.r, wb.g, wb.b] {
+                check_finite(value, MetadataField::AsShotWhiteBalance)?;
+            }
+        }
+        if let Some(look) = &self.look {
+            if let Some(Tagged {
+                value: Some(value), ..
+            }) = look.highlight_tone
+            {
+                check_finite(value, MetadataField::HighlightTone)?;
+            }
+            if let Some(Tagged {
+                value: Some(value), ..
+            }) = look.shadow_tone
+            {
+                check_finite(value, MetadataField::ShadowTone)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn check_finite(value: f64, field: MetadataField) -> Result<(), MetadataError> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(MetadataError::NonFinite { field })
+    }
+}
+
+fn check_positive(value: f64, field: MetadataField) -> Result<(), MetadataError> {
+    check_finite(value, field)?;
+    if value > 0.0 {
+        Ok(())
+    } else {
+        Err(MetadataError::NotPositive { field })
+    }
 }
 
 impl From<&SanitizedMetadata> for ManifestMetadata {

@@ -7,61 +7,14 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
-const MAX_SLUG_LEN: usize = 64;
-const MAX_BODY_ID_LEN: usize = 128;
+pub use looklab_schema::{
+    BodyId, ControlKey, IdError, MAX_BODY_ID_LEN, MAX_SLUG_LEN, SimKey, validate_slug,
+};
 
-/// A rejected identifier.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum IdError {
-    #[error("identifier is empty")]
-    Empty,
-    #[error("identifier of {len} bytes exceeds the {max}-byte limit")]
-    TooLong { len: usize, max: usize },
-    #[error("byte {byte:#04x} at index {index} is not allowed in an identifier")]
-    InvalidCharacter { index: usize, byte: u8 },
-    #[error("body id must be `make/model`, with exactly one `/`")]
-    BodyIdShape,
-}
+pub const MAX_FIRMWARE_LEN: usize = MAX_SLUG_LEN;
 
-fn check_slug(value: &str, max: usize) -> Result<(), IdError> {
-    if value.is_empty() {
-        return Err(IdError::Empty);
-    }
-    if value.len() > max {
-        return Err(IdError::TooLong {
-            len: value.len(),
-            max,
-        });
-    }
-    for (index, byte) in value.bytes().enumerate() {
-        if !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_') {
-            return Err(IdError::InvalidCharacter { index, byte });
-        }
-    }
-    Ok(())
-}
-
-fn check_slug_64(value: &str) -> Result<(), IdError> {
-    check_slug(value, MAX_SLUG_LEN)
-}
-
-fn check_body_id(value: &str) -> Result<(), IdError> {
-    if value.len() > MAX_BODY_ID_LEN {
-        return Err(IdError::TooLong {
-            len: value.len(),
-            max: MAX_BODY_ID_LEN,
-        });
-    }
-    let mut parts = value.split('/');
-    let (Some(make), Some(model), None) = (parts.next(), parts.next(), parts.next()) else {
-        return Err(IdError::BodyIdShape);
-    };
-    check_slug(make, MAX_SLUG_LEN)?;
-    check_slug(model, MAX_SLUG_LEN)
-}
-
-macro_rules! slug_type {
-    ($(#[$meta:meta])* $name:ident, $check:path) => {
+macro_rules! upload_id_type {
+    ($(#[$meta:meta])* $name:ident, $max:expr, $check:expr) => {
         $(#[$meta])*
         #[derive(
             Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
@@ -71,7 +24,20 @@ macro_rules! slug_type {
 
         impl $name {
             pub fn new(value: &str) -> Result<Self, IdError> {
-                $check(value)?;
+                if value.is_empty() {
+                    return Err(IdError::Empty);
+                }
+                if value.len() > $max {
+                    return Err(IdError::TooLong {
+                        len: value.len(),
+                        max: $max,
+                    });
+                }
+                for (index, byte) in value.bytes().enumerate() {
+                    if !$check(byte) {
+                        return Err(IdError::InvalidCharacter { index, byte });
+                    }
+                }
                 Ok(Self(value.to_owned()))
             }
 
@@ -84,7 +50,7 @@ macro_rules! slug_type {
             type Error = IdError;
 
             fn try_from(value: String) -> Result<Self, Self::Error> {
-                $check(&value)?;
+                Self::new(&value)?;
                 Ok(Self(value))
             }
         }
@@ -111,95 +77,27 @@ macro_rules! slug_type {
     };
 }
 
-slug_type!(
-    /// `make/model` body id, for example `fujifilm/x-t5`.
-    BodyId,
-    check_body_id
-);
-
-impl BodyId {
-    pub fn make(&self) -> &str {
-        self.0.split('/').next().unwrap_or(&self.0)
-    }
-
-    pub fn model(&self) -> &str {
-        self.0.split('/').nth(1).unwrap_or(&self.0)
-    }
+fn is_slug_byte(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
 }
 
-slug_type!(
+fn is_printable_byte(byte: u8) -> bool {
+    byte.is_ascii_graphic() || byte == b' '
+}
+
+upload_id_type!(
     /// Look slug, for example `classic-chrome`.
     LookSlug,
-    check_slug_64
-);
-slug_type!(
-    /// Native simulation key, for example `classic_chrome`.
-    SimKey,
-    check_slug_64
-);
-slug_type!(
-    /// Control key from the body's control schema, for example `highlight_tone`.
-    ControlKey,
-    check_slug_64
+    MAX_SLUG_LEN,
+    is_slug_byte
 );
 
-/// The firmware version string as the body reports it, for example `2.10`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct FirmwareVersionString(String);
-
-impl FirmwareVersionString {
-    pub fn new(value: &str) -> Result<Self, IdError> {
-        if value.is_empty() {
-            return Err(IdError::Empty);
-        }
-        if value.len() > MAX_SLUG_LEN {
-            return Err(IdError::TooLong {
-                len: value.len(),
-                max: MAX_SLUG_LEN,
-            });
-        }
-        for (index, byte) in value.bytes().enumerate() {
-            if !(byte.is_ascii_graphic() || byte == b' ') {
-                return Err(IdError::InvalidCharacter { index, byte });
-            }
-        }
-        Ok(Self(value.to_owned()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for FirmwareVersionString {
-    type Error = IdError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(&value)?;
-        Ok(Self(value))
-    }
-}
-
-impl TryFrom<&str> for FirmwareVersionString {
-    type Error = IdError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl From<FirmwareVersionString> for String {
-    fn from(value: FirmwareVersionString) -> Self {
-        value.0
-    }
-}
-
-impl fmt::Display for FirmwareVersionString {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+upload_id_type!(
+    /// The firmware version string as the body reports it, for example `2.10`.
+    FirmwareVersionString,
+    MAX_FIRMWARE_LEN,
+    is_printable_byte
+);
 
 /// The contribution kind is claimed by the client; nothing verifies it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -228,6 +228,43 @@ fn malformed_client_data_fails() {
 }
 
 #[test]
+fn duplicate_top_level_key_fails() {
+    let assertion = assertion(&challenge(), r#","aa":1,"aa":2"#, 0x01, &[], vec![0xab; 64]);
+    assert!(matches!(
+        failure(&assertion, SignatureAlgorithm::Ed25519),
+        StructuralError::DuplicateClientDataKey { key } if key == "aa"
+    ));
+}
+
+#[test]
+fn duplicate_nested_key_fails() {
+    let assertion = assertion(
+        &challenge(),
+        r#","aa":{"x":1,"x":2}"#,
+        0x01,
+        &[],
+        vec![0xab; 64],
+    );
+    assert!(matches!(
+        failure(&assertion, SignatureAlgorithm::Ed25519),
+        StructuralError::DuplicateClientDataKey { key } if key == "x"
+    ));
+}
+
+#[test]
+fn duplicate_accepted_extra_key_fails() {
+    let extra = format!(
+        r#","other_keys_can_be_added_here":"first","other_keys_can_be_added_here":"{OTHER_KEYS}""#
+    );
+    let assertion = assertion(&challenge(), &extra, 0x01, &[], vec![0xab; 64]);
+    assert!(matches!(
+        failure(&assertion, SignatureAlgorithm::Ed25519),
+        StructuralError::DuplicateClientDataKey { key }
+            if key == "other_keys_can_be_added_here"
+    ));
+}
+
+#[test]
 fn wrong_rp_id_hash_fails() {
     let mut assertion = valid();
     assertion.authenticator_data[0] ^= 0xff;

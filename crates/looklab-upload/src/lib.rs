@@ -18,7 +18,7 @@ pub mod webauthn;
 
 pub use envelope::{
     DEFAULT_MAX_BLOB_BYTES, DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_IMAGES, DEFAULT_MAX_MANIFEST_BYTES,
-    Envelope, EnvelopeError, EnvelopeParts, Limits, MAGIC, VERSION, encode_envelope,
+    Envelope, EnvelopeError, EnvelopeParts, Limits, MAGIC, ManifestField, VERSION, encode_envelope,
     parse_envelope_strict, peek_nonce,
 };
 pub use ids::{
@@ -32,9 +32,9 @@ pub use manifest::{
 };
 pub use metadata::{
     BadMonth, CaptureMonth, DynamicRange, DynamicRangeSetting, EffectStrength, FilmMode,
-    GrainRoughness, GrainSize, LookSettings, ManifestMetadata, MonochromeFilter, NoiseReduction,
-    Saturation, Sharpness, Tagged, WhiteBalanceFineTune, WhiteBalanceMode, WhiteBalanceMultipliers,
-    WhiteBalanceShift,
+    GrainRoughness, GrainSize, LookSettings, ManifestMetadata, MetadataError, MetadataField,
+    MonochromeFilter, NoiseReduction, Saturation, Sharpness, Tagged, WhiteBalanceFineTune,
+    WhiteBalanceMode, WhiteBalanceMultipliers, WhiteBalanceShift,
 };
 pub use nonce::{Challenge, ManifestHash, Nonce};
 pub use pow::{POW_K, PowError, PowParams, PowSolutions, solve, verify};

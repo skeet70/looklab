@@ -223,6 +223,19 @@ pub struct Offsets {
     pub blob_count: usize,
 }
 
+/// Byte offset of the `images` length varint inside the canonical manifest.
+pub fn images_count_offset(manifest: &BatchManifest) -> usize {
+    let parts = [
+        postcard::to_allocvec(&manifest.kind).expect("kind serializes"),
+        postcard::to_allocvec(&manifest.intent).expect("intent serializes"),
+        postcard::to_allocvec(&manifest.body).expect("body serializes"),
+        postcard::to_allocvec(&manifest.firmware_version).expect("firmware serializes"),
+        postcard::to_allocvec(&manifest.sim_key).expect("sim key serializes"),
+        postcard::to_allocvec(&manifest.settings).expect("settings serialize"),
+    ];
+    parts.iter().map(Vec::len).sum()
+}
+
 pub fn compact_limits() -> Limits {
     Limits {
         max_body_bytes: 1 << 20,

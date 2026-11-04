@@ -7,8 +7,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ciborium::value::Value as CborValue;
 use serde::Deserialize;
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::nonce::Challenge;
 
@@ -104,6 +106,8 @@ pub enum StructuralError {
     SignatureTooLong { len: usize, max: usize },
     #[error("client_data_json is not a valid WebAuthn client data object")]
     ClientDataJson(#[source] serde_json::Error),
+    #[error("client_data_json repeats the JSON object key {key:?}")]
+    DuplicateClientDataKey { key: String },
     #[error("client_data_json type is {found:?}, expected \"webauthn.get\"")]
     WrongType { found: String },
     #[error("client_data_json challenge does not match H(nonce ‖ manifest hash)")]
@@ -147,7 +151,90 @@ struct ClientData {
     #[serde(rename = "topOrigin", default)]
     top_origin: Option<String>,
     #[serde(flatten)]
-    extras: std::collections::BTreeMap<String, JsonValue>,
+    extras: BTreeMap<String, JsonValue>,
+}
+
+/// Rejects repeated object keys at any depth.
+struct DuplicateScan<'a> {
+    duplicate: &'a mut Option<String>,
+}
+
+impl<'de, 'a> DeserializeSeed<'de> for DuplicateScan<'a> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(ScanVisitor {
+            duplicate: self.duplicate,
+        })
+    }
+}
+
+struct ScanVisitor<'a> {
+    duplicate: &'a mut Option<String>,
+}
+
+impl<'de, 'a> Visitor<'de> for ScanVisitor<'a> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_borrowed_str<E>(self, _: &'de str) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _: String) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq
+            .next_element_seed(DuplicateScan {
+                duplicate: &mut *self.duplicate,
+            })?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let mut seen = BTreeSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                *self.duplicate = Some(key);
+                return Err(de::Error::custom("duplicate JSON object key"));
+            }
+            map.next_value_seed(DuplicateScan {
+                duplicate: &mut *self.duplicate,
+            })?;
+        }
+        Ok(())
+    }
 }
 
 pub fn check_structure(
@@ -219,6 +306,24 @@ fn check_client_data(
     assertion: &WebAuthnAssertion,
     expected: &ExpectedAssertion<'_>,
 ) -> Result<Vec<ClientDataExtra>, StructuralError> {
+    let mut duplicate = None;
+    let mut deserializer = serde_json::Deserializer::from_slice(&assertion.client_data_json);
+    let scanned = DuplicateScan {
+        duplicate: &mut duplicate,
+    }
+    .deserialize(&mut deserializer);
+    match scanned {
+        Ok(()) => deserializer
+            .end()
+            .map_err(StructuralError::ClientDataJson)?,
+        Err(error) => {
+            return Err(match duplicate {
+                Some(key) => StructuralError::DuplicateClientDataKey { key },
+                None => StructuralError::ClientDataJson(error),
+            });
+        }
+    }
+
     let client: ClientData = serde_json::from_slice(&assertion.client_data_json)
         .map_err(StructuralError::ClientDataJson)?;
     if client.kind != CLIENT_DATA_TYPE {

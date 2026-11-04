@@ -53,7 +53,7 @@ base64 = "0.22"
 jpeg-encoder = "0.6"
 zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 roxmltree = "0.21"
-axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "matched-path", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 tower = { version = "0.5", features = ["util"] }

@@ -2,7 +2,10 @@
 mod common;
 
 use common::{Fixture, compact_limits, image, manifest};
-use looklab_upload::{BlobKind, EnvelopeError, Limits, parse_envelope_strict};
+use looklab_upload::{
+    BlobKind, EnvelopeError, Limits, LookSettings, ManifestField, ManifestMetadata, MetadataError,
+    MetadataField, Tagged, WhiteBalanceMultipliers, parse_envelope_strict,
+};
 
 fn parse_error(bytes: &[u8], limits: &Limits) -> EnvelopeError {
     match parse_envelope_strict(bytes, limits) {
@@ -297,6 +300,139 @@ fn rejects_trailing_bytes() {
     assert!(matches!(
         parse_error(&bytes, &compact_limits()),
         EnvelopeError::TrailingBytes { count: 1 }
+    ));
+}
+
+fn fixture_with_meta(meta: ManifestMetadata) -> Fixture {
+    let mut fixture = Fixture::new();
+    let blob = fixture.blobs[0].clone();
+    let mut image = image(&blob, BlobKind::Samples);
+    image.meta = meta;
+    fixture.manifest = manifest(vec![image]);
+    fixture.blobs = vec![blob];
+    fixture
+}
+
+#[test]
+fn rejects_too_many_images_before_decoding() {
+    let fixture = Fixture::new();
+    let offsets = fixture.offsets();
+    let count_at = offsets.manifest + common::images_count_offset(&fixture.manifest);
+    let mut bytes = fixture.bytes();
+    bytes[count_at] = 3;
+    write_u32(
+        &mut bytes,
+        offsets.manifest_len,
+        (count_at - offsets.manifest + 1) as u32,
+    );
+    let limits = Limits {
+        max_images: 2,
+        ..compact_limits()
+    };
+    assert!(matches!(
+        parse_error(&bytes, &limits),
+        EnvelopeError::ImageCountOutOfRange { count: 3, max: 2 }
+    ));
+}
+
+#[test]
+fn rejects_oversized_manifest_string_before_decoding() {
+    let fixture = Fixture::new();
+    let offsets = fixture.offsets();
+    let length_at = offsets.manifest + 2;
+    let mut bytes = fixture.bytes();
+    bytes[length_at] = 0x81;
+    bytes[length_at + 1] = 0x01;
+    assert!(matches!(
+        parse_error(&bytes, &compact_limits()),
+        EnvelopeError::ManifestStringTooLong {
+            field: ManifestField::Body,
+            len: 129,
+            max: 128
+        }
+    ));
+}
+
+#[test]
+fn rejects_non_finite_exposure_compensation() {
+    let mut meta = common::metadata();
+    meta.exposure_compensation_ev = Some(f64::NAN);
+    assert!(matches!(
+        parse_error(&fixture_with_meta(meta).bytes(), &compact_limits()),
+        EnvelopeError::MetadataInvalid {
+            index: 0,
+            source: MetadataError::NonFinite {
+                field: MetadataField::ExposureCompensation
+            }
+        }
+    ));
+}
+
+#[test]
+fn rejects_zero_iso() {
+    let mut meta = common::metadata();
+    meta.iso = Some(0);
+    assert!(matches!(
+        parse_error(&fixture_with_meta(meta).bytes(), &compact_limits()),
+        EnvelopeError::MetadataInvalid {
+            index: 0,
+            source: MetadataError::ZeroIso
+        }
+    ));
+}
+
+#[test]
+fn rejects_non_positive_shutter() {
+    let mut meta = common::metadata();
+    meta.shutter_seconds = Some(0.0);
+    assert!(matches!(
+        parse_error(&fixture_with_meta(meta).bytes(), &compact_limits()),
+        EnvelopeError::MetadataInvalid {
+            index: 0,
+            source: MetadataError::NotPositive {
+                field: MetadataField::Shutter
+            }
+        }
+    ));
+}
+
+#[test]
+fn rejects_non_finite_white_balance() {
+    let mut meta = common::metadata();
+    meta.as_shot_wb = Some(WhiteBalanceMultipliers {
+        r: 1.0,
+        g: f64::INFINITY,
+        b: 1.0,
+    });
+    assert!(matches!(
+        parse_error(&fixture_with_meta(meta).bytes(), &compact_limits()),
+        EnvelopeError::MetadataInvalid {
+            index: 0,
+            source: MetadataError::NonFinite {
+                field: MetadataField::AsShotWhiteBalance
+            }
+        }
+    ));
+}
+
+#[test]
+fn rejects_non_finite_look_tone() {
+    let mut meta = common::metadata();
+    meta.look = Some(LookSettings {
+        highlight_tone: Some(Tagged {
+            raw: 0,
+            value: Some(f64::NAN),
+        }),
+        ..LookSettings::default()
+    });
+    assert!(matches!(
+        parse_error(&fixture_with_meta(meta).bytes(), &compact_limits()),
+        EnvelopeError::MetadataInvalid {
+            index: 0,
+            source: MetadataError::NonFinite {
+                field: MetadataField::HighlightTone
+            }
+        }
     ));
 }
 

@@ -7,7 +7,9 @@
 use looklab_meta::RawSerial;
 use sha2::{Digest, Sha256};
 
+use crate::ids::{MAX_BODY_ID_LEN, MAX_FIRMWARE_LEN, MAX_SLUG_LEN};
 use crate::manifest::{BatchManifest, BlobKind, canonical_manifest_bytes, manifest_hash};
+use crate::metadata::MetadataError;
 use crate::nonce::{Challenge, ManifestHash, Nonce};
 use crate::pow::{POW_K, PowSolutions};
 use crate::webauthn::{
@@ -25,7 +27,7 @@ pub const DEFAULT_MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_IMAGES: usize = 100;
 pub const DEFAULT_MAX_BLOB_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Limits {
     pub max_body_bytes: usize,
     pub max_manifest_bytes: usize,
@@ -74,6 +76,27 @@ impl Envelope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestField {
+    LookSlug,
+    Body,
+    FirmwareVersion,
+    SimKey,
+    ControlKey,
+}
+
+impl core::fmt::Display for ManifestField {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::LookSlug => "look slug",
+            Self::Body => "body id",
+            Self::FirmwareVersion => "firmware version",
+            Self::SimKey => "sim key",
+            Self::ControlKey => "control key",
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EnvelopeError {
     #[error("envelope of {len} bytes exceeds the {max}-byte limit")]
@@ -94,6 +117,18 @@ pub enum EnvelopeError {
     ManifestNotCanonical,
     #[error("batch has {count} images, outside 1..={max}")]
     ImageCountOutOfRange { count: usize, max: usize },
+    #[error("{field} of {len} bytes exceeds the {max}-byte limit")]
+    ManifestStringTooLong {
+        field: ManifestField,
+        len: usize,
+        max: usize,
+    },
+    #[error("image {index} metadata is invalid: {source}")]
+    MetadataInvalid {
+        index: usize,
+        #[source]
+        source: MetadataError,
+    },
     #[error("credential id is empty")]
     CredentialIdEmpty,
     #[error("authenticator data of {len} bytes exceeds the {max}-byte limit")]
@@ -250,6 +285,14 @@ pub fn parse_envelope_strict(bytes: &[u8], limits: &Limits) -> Result<Envelope, 
         });
     }
     let manifest_bytes = reader.take(manifest_len)?;
+    if let Some(count) = scan_manifest_images(manifest_bytes)?
+        && (count == 0 || count > limits.max_images)
+    {
+        return Err(EnvelopeError::ImageCountOutOfRange {
+            count,
+            max: limits.max_images,
+        });
+    }
     let (manifest, rest) = postcard::take_from_bytes::<BatchManifest>(manifest_bytes)
         .map_err(EnvelopeError::ManifestCodec)?;
     if !rest.is_empty() {
@@ -263,6 +306,12 @@ pub fn parse_envelope_strict(bytes: &[u8], limits: &Limits) -> Result<Envelope, 
             count: manifest.images.len(),
             max: limits.max_images,
         });
+    }
+    for (index, image) in manifest.images.iter().enumerate() {
+        image
+            .meta
+            .validate()
+            .map_err(|source| EnvelopeError::MetadataInvalid { index, source })?;
     }
 
     let credential_len = usize::from(reader.u8()?);
@@ -356,6 +405,114 @@ pub fn parse_envelope_strict(bytes: &[u8], limits: &Limits) -> Result<Envelope, 
         serial,
         blobs,
     })
+}
+
+/// Walks the fixed manifest prefix to the image-count varint without allocating.
+/// `None` means the bytes could not be scanned and the decoder should report.
+fn scan_manifest_images(bytes: &[u8]) -> Result<Option<usize>, EnvelopeError> {
+    let mut scan = Scan::new(bytes);
+    let Some(_kind) = scan.varint() else {
+        return Ok(None);
+    };
+    let Some(intent) = scan.varint() else {
+        return Ok(None);
+    };
+    if intent == 1 {
+        let Some(len) = scan.varint() else {
+            return Ok(None);
+        };
+        check_string_len(len, ManifestField::LookSlug, MAX_SLUG_LEN)?;
+        if !scan.skip(len) {
+            return Ok(None);
+        }
+    }
+    for (field, max) in [
+        (ManifestField::Body, MAX_BODY_ID_LEN),
+        (ManifestField::FirmwareVersion, MAX_FIRMWARE_LEN),
+        (ManifestField::SimKey, MAX_SLUG_LEN),
+    ] {
+        let Some(len) = scan.varint() else {
+            return Ok(None);
+        };
+        check_string_len(len, field, max)?;
+        if !scan.skip(len) {
+            return Ok(None);
+        }
+    }
+    let Some(controls) = scan.varint() else {
+        return Ok(None);
+    };
+    if controls > bytes.len() as u64 {
+        return Ok(None);
+    }
+    for _ in 0..controls {
+        let Some(len) = scan.varint() else {
+            return Ok(None);
+        };
+        check_string_len(len, ManifestField::ControlKey, MAX_SLUG_LEN)?;
+        if !scan.skip(len) {
+            return Ok(None);
+        }
+        if scan.varint().is_none() {
+            return Ok(None);
+        }
+    }
+    let Some(images) = scan.varint() else {
+        return Ok(None);
+    };
+    Ok(Some(usize::try_from(images).unwrap_or(usize::MAX)))
+}
+
+fn check_string_len(len: u64, field: ManifestField, max: usize) -> Result<(), EnvelopeError> {
+    if len > max as u64 {
+        return Err(EnvelopeError::ManifestStringTooLong {
+            field,
+            len: usize::try_from(len).unwrap_or(usize::MAX),
+            max,
+        });
+    }
+    Ok(())
+}
+
+struct Scan<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Scan<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn varint(&mut self) -> Option<u64> {
+        let mut value = 0u64;
+        for index in 0..10 {
+            let byte = *self.bytes.get(self.pos)?;
+            self.pos += 1;
+            let payload = u64::from(byte & 0x7f);
+            if index == 9 && payload > 1 {
+                return None;
+            }
+            value |= payload << (7 * index);
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn skip(&mut self, len: u64) -> bool {
+        let Ok(len) = usize::try_from(len) else {
+            return false;
+        };
+        match self.pos.checked_add(len) {
+            Some(end) if end <= self.bytes.len() => {
+                self.pos = end;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 struct Reader<'a> {

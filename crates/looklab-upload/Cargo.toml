@@ -14,6 +14,7 @@ ciborium.workspace = true
 libm.workspace = true
 looklab-meta.workspace = true
 looklab-samples.workspace = true
+looklab-schema.workspace = true
 postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
