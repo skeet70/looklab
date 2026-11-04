@@ -65,7 +65,7 @@ fn main() -> Result<(), String> {
             jpeg_encoder::ColorType::Rgb,
         )
         .map_err(|error| error.to_string())?;
-    let jpeg = insert_exif(&jpeg);
+    let jpeg = splice_exif(&raf_jpeg(&raw), &jpeg);
 
     let out = output;
     if let Some(parent) = out.parent() {
@@ -82,22 +82,39 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-/// A minimal EXIF APP1 block carrying orientation 1.
-fn insert_exif(jpeg: &[u8]) -> Vec<u8> {
-    let tiff: [u8; 26] = [
-        b'I', b'I', 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, // header, IFD at 8
-        0x01, 0x00, // one entry
-        0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // orientation
-        0x00, 0x00, 0x00, 0x00, // next IFD
-    ];
-    let mut payload = b"Exif\0\0".to_vec();
-    payload.extend_from_slice(&tiff);
-    let length = u16::try_from(payload.len() + 2).unwrap_or(u16::MAX);
-    let mut out = Vec::with_capacity(jpeg.len() + payload.len() + 4);
-    out.extend_from_slice(&jpeg[..2]);
-    out.extend_from_slice(&[0xff, 0xe1]);
-    out.extend_from_slice(&length.to_be_bytes());
-    out.extend_from_slice(&payload);
-    out.extend_from_slice(&jpeg[2..]);
+fn raf_jpeg(raw: &[u8]) -> Vec<u8> {
+    let offset = u32::from_be_bytes(raw[0x54..0x58].try_into().expect("RAF JPEG offset")) as usize;
+    let length = u32::from_be_bytes(raw[0x58..0x5c].try_into().expect("RAF JPEG length")) as usize;
+    raw[offset..offset + length].to_vec()
+}
+
+fn exif_segment(jpeg: &[u8]) -> Option<&[u8]> {
+    let mut index = 2;
+    while index + 4 <= jpeg.len() {
+        if jpeg[index] != 0xff {
+            return None;
+        }
+        let marker = jpeg[index + 1];
+        if marker == 0xda || marker == 0xd9 {
+            return None;
+        }
+        let length = usize::from(u16::from_be_bytes([jpeg[index + 2], jpeg[index + 3]]));
+        if marker == 0xe1 && jpeg.get(index + 4..index + 10)? == b"Exif\0\0" {
+            return Some(&jpeg[index..index + 2 + length]);
+        }
+        index += 2 + length;
+    }
+    None
+}
+
+/// The RAW's EXIF block, makernotes included.
+fn splice_exif(original: &[u8], render: &[u8]) -> Vec<u8> {
+    let Some(segment) = exif_segment(original) else {
+        return render.to_vec();
+    };
+    let mut out = Vec::with_capacity(render.len() + segment.len());
+    out.extend_from_slice(&render[..2]);
+    out.extend_from_slice(segment);
+    out.extend_from_slice(&render[2..]);
     out
 }

@@ -88,8 +88,9 @@ function launchOptions() {
   }
   return {
     firefoxUserPrefs: {
-      'security.webauthn.webauthn_enable_softtoken': true,
-      'security.webauthn.webauthn_enable_usbtoken': false,
+      'security.webauth.webauthn_enable_softtoken': true,
+      'security.webauth.webauthn_enable_usbtoken': false,
+      'security.webauth.webauthn_enable_android_fido2': false,
     },
   };
 }
@@ -305,7 +306,21 @@ async function pages() {
         await page.waitForSelector('text=Now drop the re-rendered RAW+JPEG pairs', { timeout: 120_000 });
         await page.screenshot({ path: `${options.out}/verify-${size}.png`, fullPage: true });
         await page.setInputFiles('input[type=file]', [options.raw, options.jpeg]);
-        await page.click('button:has-text("Run one iteration")');
+        for (let attempt = 0; attempt < 6; attempt += 1) {
+          await page.waitForTimeout(2000);
+          await page.click('button:has-text("Run one iteration")');
+          try {
+            await page.waitForSelector('h2:text("Result")', { timeout: 20_000 });
+            break;
+          } catch {
+            const failure = await page.evaluate(
+              () => document.querySelector('.error')?.textContent ?? '',
+            );
+            if (!failure.includes('drop the re-rendered files')) {
+              throw new Error(`verify: ${failure}`);
+            }
+          }
+        }
         await page.waitForSelector('h2:text("Result")', { timeout: 900_000 });
         await page.screenshot({ path: `${options.out}/verify-result-${size}.png`, fullPage: true });
       } else {
@@ -370,6 +385,10 @@ async function flatness() {
     check(rows.length === options.count, `${options.count} files processed, ${rows.length} rows reported`);
     check(peak < 768, `peak worker memory ${peak} MiB stays under the 75% budget of 768 MiB`);
     check(problems.length === 0, `${options.browser}: no page errors during the ${options.count}-file run`);
+    await writeFile(
+      `${options.out}/flatness-${options.count}.json`,
+      JSON.stringify({ rows, peak, min: Math.min(...memory) }, null, 2),
+    );
     console.log(JSON.stringify({ rows, peak, min: Math.min(...memory) }, null, 2));
     return { rows: rows.length, peak, memory };
   } finally {
