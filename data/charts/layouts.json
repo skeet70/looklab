@@ -1,0 +1,24 @@
+{
+ "version": 1,
+ "note": "Nominal geometry, fractions of the chart outline the user clicks. Patches are laid out row-major and match the patch order of the referenced file in this directory. Refine against a photographed chart before anchoring.",
+ "layouts": [
+  {
+   "id": "colorchecker-classic",
+   "name": "X-Rite ColorChecker Classic",
+   "reference": "colorchecker24_2014",
+   "rows": 4,
+   "cols": 6,
+   "margin": [0.055, 0.075],
+   "gap": 0.10
+  },
+  {
+   "id": "colorchecker-passport",
+   "name": "X-Rite ColorChecker Passport (24-patch side)",
+   "reference": "colorchecker24_2014",
+   "rows": 4,
+   "cols": 6,
+   "margin": [0.045, 0.095],
+   "gap": 0.08
+  }
+ ]
+}

@@ -29,6 +29,7 @@ zune-jpeg.workspace = true
 
 [dev-dependencies]
 jpeg-encoder.workspace = true
+png.workspace = true
 proptest.workspace = true
 rand_chacha.workspace = true
 

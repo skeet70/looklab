@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Sample exclusion masks, [docs/03 §2.1 step 5](../../../docs/03-data-model.md). Chart and pattern regions are masked by the patch-table flows, not here.
+//! Sample exclusion masks, [docs/03 §2.1 step 5](../../../docs/03-data-model.md).
+//! A chart session's region enters through [`Mask::exclude_region`].
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +36,8 @@ pub struct MaskCounts {
     pub gradient: usize,
     /// A non-finite channel or luminance.
     pub invalid: usize,
+    /// Inside a chart region, counted by [`Mask::exclude_region`].
+    pub chart: usize,
 }
 
 /// Per-pixel keep bits for one image. Reasons are exclusive: border and
@@ -89,6 +92,15 @@ impl Mask {
             if *excluded && self.keep.get(index).copied().unwrap_or(false) {
                 self.keep[index] = false;
                 self.counts.clipped += 1;
+            }
+        }
+    }
+
+    pub fn exclude_region(&mut self, inside: &[bool]) {
+        for (index, excluded) in inside.iter().enumerate() {
+            if *excluded && self.keep.get(index).copied().unwrap_or(false) {
+                self.keep[index] = false;
+                self.counts.chart += 1;
             }
         }
     }

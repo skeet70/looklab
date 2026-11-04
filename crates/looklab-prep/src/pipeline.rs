@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::align::{AlignParams, Alignment, align};
+use crate::chart::ChartRegion;
 use crate::error::PrepError;
+use crate::geom::Point;
 use crate::image::Image3;
 use crate::jpeg::{DecodedJpeg, decode_jpeg};
 use crate::mask::{MaskOptions, build_mask};
@@ -151,6 +153,43 @@ pub struct PreparedImage {
     pub removed: Vec<RemovedField>,
 }
 
+/// A RAW after orientation, alignment and the fitted radial gain.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlignedRaw {
+    image: Image3,
+    alignment: Alignment,
+}
+
+impl AlignedRaw {
+    /// White-balanced linear camera RGB.
+    pub fn image(&self) -> &Image3 {
+        &self.image
+    }
+
+    pub fn alignment(&self) -> &Alignment {
+        &self.alignment
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.image.width, self.image.height)
+    }
+}
+
+/// Decodes, orients, aligns and gain-corrects the RAW side of a pair.
+pub fn prepare_aligned_raw(
+    raw: &DecodedRaw,
+    reference: &DecodedJpeg,
+    params: &PrepParams,
+) -> Result<AlignedRaw, PrepError> {
+    let orientation = meta_orientation(raw.orientation);
+    let raw_image = raw_linear_image(raw)?.apply_orientation(orientation);
+    let alignment = align(&raw_image, reference, &params.align)?;
+    Ok(AlignedRaw {
+        image: apply_gain(&raw_image, &alignment),
+        alignment,
+    })
+}
+
 /// Prepares one RAW/JPEG pair from file bytes.
 pub fn prepare_pair(
     raw_bytes: &[u8],
@@ -163,6 +202,19 @@ pub fn prepare_pair(
     prepared.pop().ok_or(PrepError::NoJpeg)
 }
 
+/// Prepares one RAW/JPEG pair, excluding `chart` from density sampling.
+pub fn prepare_pair_with_chart(
+    raw_bytes: &[u8],
+    jpeg_bytes: &[u8],
+    prior: &PriorTransform,
+    seed: SamplingSeed,
+    params: &PrepParams,
+    chart: Option<&ChartRegion>,
+) -> Result<PreparedImage, PrepError> {
+    let mut prepared = prepare_group_chart(raw_bytes, &[jpeg_bytes], prior, seed, params, chart)?;
+    prepared.pop().ok_or(PrepError::NoJpeg)
+}
+
 /// Prepares one RAW and every JPEG rendered from it.
 pub fn prepare_group(
     raw_bytes: &[u8],
@@ -170,6 +222,17 @@ pub fn prepare_group(
     prior: &PriorTransform,
     seed: SamplingSeed,
     params: &PrepParams,
+) -> Result<Vec<PreparedImage>, PrepError> {
+    prepare_group_chart(raw_bytes, jpegs, prior, seed, params, None)
+}
+
+fn prepare_group_chart(
+    raw_bytes: &[u8],
+    jpegs: &[&[u8]],
+    prior: &PriorTransform,
+    seed: SamplingSeed,
+    params: &PrepParams,
+    chart: Option<&ChartRegion>,
 ) -> Result<Vec<PreparedImage>, PrepError> {
     if jpegs.is_empty() {
         return Err(PrepError::NoJpeg);
@@ -196,7 +259,15 @@ pub fn prepare_group(
 
     let members: Vec<&DecodedJpeg> = decoded_jpegs.iter().collect();
     let exposure_hint = exposure_hint_ev(&metadata);
-    let sets = prepare_sets(&decoded, &members, prior, exposure_hint, seed, params)?;
+    let sets = prepare_sets(
+        &decoded,
+        &members,
+        prior,
+        exposure_hint,
+        seed,
+        params,
+        chart,
+    )?;
     Ok(sets
         .into_iter()
         .zip(rendering)
@@ -235,10 +306,34 @@ pub fn prepare_decoded(
     seed: SamplingSeed,
     params: &PrepParams,
 ) -> Result<Vec<SampleSet>, PrepError> {
+    prepare_decoded_chart(raw, jpegs, prior, seed, params, None)
+}
+
+/// Prepares one RAW and its decoded JPEGs, excluding `chart` from density
+/// sampling.
+pub fn prepare_decoded_with_chart(
+    raw: &DecodedRaw,
+    jpegs: &[&DecodedJpeg],
+    prior: &PriorTransform,
+    seed: SamplingSeed,
+    params: &PrepParams,
+    chart: Option<&ChartRegion>,
+) -> Result<Vec<SampleSet>, PrepError> {
+    prepare_decoded_chart(raw, jpegs, prior, seed, params, chart)
+}
+
+fn prepare_decoded_chart(
+    raw: &DecodedRaw,
+    jpegs: &[&DecodedJpeg],
+    prior: &PriorTransform,
+    seed: SamplingSeed,
+    params: &PrepParams,
+    chart: Option<&ChartRegion>,
+) -> Result<Vec<SampleSet>, PrepError> {
     if jpegs.is_empty() {
         return Err(PrepError::NoJpeg);
     }
-    prepare_sets(raw, jpegs, prior, 0.0, seed, params)
+    prepare_sets(raw, jpegs, prior, 0.0, seed, params, chart)
 }
 
 /// RAW capture fields with the JPEG's rendering fields.
@@ -287,6 +382,7 @@ fn prepare_sets(
     exposure_hint_ev: f32,
     seed: SamplingSeed,
     params: &PrepParams,
+    chart: Option<&ChartRegion>,
 ) -> Result<Vec<SampleSet>, PrepError> {
     params.sample.validate()?;
     for multiplier in raw.as_shot_wb {
@@ -300,18 +396,26 @@ fn prepare_sets(
     }
 
     let orientation = meta_orientation(raw.orientation);
-    let raw_image = raw_linear_image(raw)?.apply_orientation(orientation);
     let clip_marker = raw_clip_marker(raw)?.apply_orientation(orientation);
     let reference = jpegs[0];
-    let alignment = align(&raw_image, reference, &params.align)?;
-    let gain_corrected = apply_gain(&raw_image, &alignment);
-    let downsampled = gain_corrected.downsample_area(params.downsample_max_pixels);
+    let aligned = prepare_aligned_raw(raw, reference, params)?;
+    let downsampled = aligned.image.downsample_area(params.downsample_max_pixels);
     let clipped = clip_marker.downsample_area(params.downsample_max_pixels);
     debug_assert_eq!(clipped.data.len(), downsampled.data.len());
     let clipped_flags: Vec<bool> = clipped.data.iter().map(|px| px[0] > 0.0).collect();
 
     let mut mask = build_mask(&downsampled, &params.mask);
     mask.exclude_clipped(&clipped_flags);
+    if let Some(region) = chart {
+        mask.exclude_region(&chart_exclusion(
+            region,
+            &aligned.alignment,
+            reference,
+            &downsampled,
+            aligned.image.width,
+            aligned.image.height,
+        )?);
+    }
 
     let mut rng = seed.rng();
     let mut group_bytes = [0u8; 16];
@@ -329,8 +433,8 @@ fn prepare_sets(
         .iter()
         .map(|index| clamp_rgb(downsampled.data[*index]))
         .collect();
-    let scale_x = raw_image.width as f64 / downsampled.width as f64;
-    let scale_y = raw_image.height as f64 / downsampled.height as f64;
+    let scale_x = f64::from(aligned.image.width) / f64::from(downsampled.width);
+    let scale_y = f64::from(aligned.image.height) / f64::from(downsampled.height);
 
     let cct_hint_k = if prior.cct_k().is_finite() {
         prior.cct_k().clamp(0.0, 100_000.0) as f32
@@ -350,7 +454,7 @@ fn prepare_sets(
         rerender_group: (jpegs.len() > 1).then(|| RerenderGroupId::new(group_bytes)),
         prep_version: PrepVersion::new(PREP_VERSION),
         prior_transform_version: prior.version(),
-        prep_params_hash: params.hash()?,
+        prep_params_hash: prep_params_hash(params, chart)?,
     };
 
     let mut sets = Vec::with_capacity(jpegs.len());
@@ -360,15 +464,17 @@ fn prepare_sets(
         for &index in selection.indices() {
             let x = (index % downsampled.width as usize) as f64;
             let y = (index / downsampled.width as usize) as f64;
-            let x_raw = ((x + 0.5) * scale_x - 0.5).clamp(0.0, raw_image.width as f64 - 1.0);
-            let y_raw = ((y + 0.5) * scale_y - 0.5).clamp(0.0, raw_image.height as f64 - 1.0);
+            let x_raw =
+                ((x + 0.5) * scale_x - 0.5).clamp(0.0, f64::from(aligned.image.width) - 1.0);
+            let y_raw =
+                ((y + 0.5) * scale_y - 0.5).clamp(0.0, f64::from(aligned.image.height) - 1.0);
             let (rgb, near_clip) = jpeg_footprint(
                 jpeg,
-                &alignment,
+                &aligned.alignment,
                 (x_raw, y_raw),
                 (scale_x, scale_y),
-                raw_image.width,
-                raw_image.height,
+                aligned.image.width,
+                aligned.image.height,
             )?;
             out_rgb.push(clamp_rgb(rgb));
             flags.push(if near_clip {
@@ -388,6 +494,29 @@ fn prepare_sets(
         )?);
     }
     Ok(sets)
+}
+
+/// SHA-256 over the parameters, plus the corners and JPEG size of the chart
+/// region when one shaped the density sampling.
+fn prep_params_hash(
+    params: &PrepParams,
+    chart: Option<&ChartRegion>,
+) -> Result<PrepParamsHash, PrepError> {
+    let Some(region) = chart else {
+        return params.hash();
+    };
+    let mut encoded = postcard::to_allocvec(params)?;
+    for point in region.corners() {
+        encoded.extend_from_slice(&point.x.to_le_bytes());
+        encoded.extend_from_slice(&point.y.to_le_bytes());
+    }
+    let (width, height) = region.jpeg_size();
+    encoded.extend_from_slice(&width.to_le_bytes());
+    encoded.extend_from_slice(&height.to_le_bytes());
+    let digest = Sha256::digest(&encoded);
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(digest.as_slice());
+    Ok(PrepParamsHash::new(bytes))
 }
 
 fn raw_linear_image(raw: &DecodedRaw) -> Result<Image3, PrepError> {
@@ -435,6 +564,64 @@ fn raw_clip_marker(raw: &DecodedRaw) -> Result<Image3, PrepError> {
         data.push([if clipped { 1.0 } else { 0.0 }; 3]);
     }
     Image3::new(raw.width as u32, raw.height as u32, data)
+}
+
+/// Per-pixel membership of `region`, mapped through the alignment onto the
+/// downsampled RAW grid.
+fn chart_exclusion(
+    region: &ChartRegion,
+    alignment: &Alignment,
+    reference: &DecodedJpeg,
+    target: &Image3,
+    raw_width: u32,
+    raw_height: u32,
+) -> Result<Vec<bool>, PrepError> {
+    let (jpeg_width, jpeg_height) = (reference.image.width, reference.image.height);
+    if region.jpeg_size() != (jpeg_width, jpeg_height) {
+        return Err(PrepError::ChartRegionSize);
+    }
+    let scale_x = f64::from(raw_width) / f64::from(target.width);
+    let scale_y = f64::from(raw_height) / f64::from(target.height);
+    let mut inside = vec![false; target.data.len()];
+
+    let mut min_x = f64::from(target.width);
+    let mut min_y = f64::from(target.height);
+    let mut max_x = 0.0f64;
+    let mut max_y = 0.0f64;
+    for corner in region.corners() {
+        let (raw_x, raw_y) = alignment.jpeg_to_raw(
+            corner.x,
+            corner.y,
+            jpeg_width,
+            jpeg_height,
+            raw_width,
+            raw_height,
+        );
+        let x = (raw_x + 0.5) / scale_x - 0.5;
+        let y = (raw_y + 0.5) / scale_y - 0.5;
+        if !x.is_finite() || !y.is_finite() {
+            return Err(PrepError::ChartRegionSize);
+        }
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    let x0 = min_x.floor().clamp(0.0, f64::from(target.width - 1)) as u32;
+    let y0 = min_y.floor().clamp(0.0, f64::from(target.height - 1)) as u32;
+    let x1 = max_x.ceil().clamp(0.0, f64::from(target.width - 1)) as u32;
+    let y1 = max_y.ceil().clamp(0.0, f64::from(target.height - 1)) as u32;
+    for y in y0..=y1 {
+        let raw_y = (f64::from(y) + 0.5) * scale_y - 0.5;
+        for x in x0..=x1 {
+            let raw_x = (f64::from(x) + 0.5) * scale_x - 0.5;
+            let (jpeg_x, jpeg_y) =
+                alignment.raw_to_jpeg(raw_x, raw_y, raw_width, raw_height, jpeg_width, jpeg_height);
+            let index = y as usize * target.width as usize + x as usize;
+            inside[index] = region.contains(Point::new(jpeg_x, jpeg_y));
+        }
+    }
+    Ok(inside)
 }
 
 /// Applies the alignment's radial gain on normalized radius from the centre.

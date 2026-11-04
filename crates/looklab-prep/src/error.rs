@@ -35,6 +35,8 @@ pub enum PrepError {
     NoJpeg,
     #[error("an aligned sample falls outside the JPEG")]
     SampleOutsideJpeg,
+    #[error("the chart region was measured on a different JPEG size")]
+    ChartRegionSize,
     #[error("a sampled value is not finite")]
     NonFiniteSample,
     #[error("operating-system randomness is unavailable")]

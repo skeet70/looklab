@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>looklab contribution pattern</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  img { position: fixed; inset: 0; width: 100vw; height: 100vh; object-fit: contain; }
+  p { position: fixed; left: 0; right: 0; bottom: 0; margin: 0; padding: 0.6rem;
+      color: #8a8a8a; background: #000; font: 14px system-ui, sans-serif; text-align: center; }
+  :fullscreen p, :-webkit-full-screen p { display: none; }
+</style>
+<img src="pattern.png" alt="Contribution pattern">
+<p>Tap or click for full screen, then raise the brightness.</p>
+<script>
+  document.addEventListener("click", function () {
+    if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+      var root = document.documentElement;
+      var request = root.requestFullscreen || root.webkitRequestFullscreen;
+      if (request) { request.call(root).catch(function () {}); }
+    }
+  });
+</script>
+</html>
