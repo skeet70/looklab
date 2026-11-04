@@ -8,6 +8,22 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+libm.workspace = true
+looklab-color.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+thiserror.workspace = true
+zip.workspace = true
+
+# `proptest` and `criterion` do not build for wasi, which the bitid examples need.
+[target.'cfg(not(target_os = "wasi"))'.dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "eval"
+harness = false
 
 [lints]
 workspace = true

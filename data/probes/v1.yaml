@@ -1,0 +1,7409 @@
+format: looklab-probes/1
+version: v1
+description: looklab probe set v1 (docs/02 §6)
+notes:
+- SG 140 is absent from the committed chart data; the chart group is ColorChecker 24 only.
+- Chart and skin patches are scaled by 2^s from the D65-adapted ColorChecker 24 values.
+- 'Hue grid: 24 hues, 20/40/60/80% of the Pointer gamut boundary at L* = 49.5, D65 adapted.'
+- 'Skin: ColorChecker patches 1 and 2 only (docs/10 Q5).'
+- 'Memory colors: sky = ColorChecker patch 3 (blue sky), foliage = patch 4.'
+probes:
+- id: gray-s-10.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.00016707233092705165
+    y: 0.00017578125
+    z: 0.00019143593275075988
+- id: gray-s-9.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.00019868360465853896
+    y: 0.00020904031318407204
+    z: 0.00022765697329438605
+- id: gray-s-9.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.00023627595629432233
+    y: 0.0002485922277608956
+    z: 0.0002707312924216684
+- id: gray-s-9.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.00028098104832928006
+    y: 0.000295627645987634
+    z: 0.00032195557920173027
+- id: gray-s-9.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0003341446618541033
+    y: 0.0003515625
+    z: 0.00038287186550151975
+- id: gray-s-8.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0003973672093170779
+    y: 0.0004180806263681441
+    z: 0.0004553139465887721
+- id: gray-s-8.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.00047255191258864466
+    y: 0.0004971844555217912
+    z: 0.0005414625848433368
+- id: gray-s-8.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0005619620966585601
+    y: 0.000591255291975268
+    z: 0.0006439111584034605
+- id: gray-s-8.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0006682893237082066
+    y: 0.000703125
+    z: 0.0007657437310030395
+- id: gray-s-7.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0007947344186341558
+    y: 0.0008361612527362881
+    z: 0.0009106278931775442
+- id: gray-s-7.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0009451038251772893
+    y: 0.0009943689110435824
+    z: 0.0010829251696866736
+- id: gray-s-7.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0011239241933171202
+    y: 0.001182510583950536
+    z: 0.001287822316806921
+- id: gray-s-7.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0013365786474164132
+    y: 0.00140625
+    z: 0.001531487462006079
+- id: gray-s-6.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0015894688372683117
+    y: 0.0016723225054725763
+    z: 0.0018212557863550884
+- id: gray-s-6.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0018902076503545787
+    y: 0.001988737822087165
+    z: 0.002165850339373347
+- id: gray-s-6.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0022478483866342405
+    y: 0.002365021167901072
+    z: 0.002575644633613842
+- id: gray-s-6.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0026731572948328263
+    y: 0.0028125
+    z: 0.003062974924012158
+- id: gray-s-5.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0031789376745366233
+    y: 0.0033446450109451526
+    z: 0.0036425115727101768
+- id: gray-s-5.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0037804153007091573
+    y: 0.00397747564417433
+    z: 0.004331700678746694
+- id: gray-s-5.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.004495696773268481
+    y: 0.004730042335802144
+    z: 0.005151289267227684
+- id: gray-s-5.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.005346314589665653
+    y: 0.005625
+    z: 0.006125949848024316
+- id: gray-s-4.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.006357875349073247
+    y: 0.006689290021890305
+    z: 0.0072850231454203536
+- id: gray-s-4.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.007560830601418315
+    y: 0.00795495128834866
+    z: 0.008663401357493388
+- id: gray-s-4.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.008991393546536962
+    y: 0.009460084671604288
+    z: 0.010302578534455369
+- id: gray-s-4.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.010692629179331305
+    y: 0.01125
+    z: 0.012251899696048632
+- id: gray-s-3.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.012715750698146493
+    y: 0.01337858004378061
+    z: 0.014570046290840707
+- id: gray-s-3.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.01512166120283663
+    y: 0.01590990257669732
+    z: 0.017326802714986777
+- id: gray-s-3.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.017982787093073924
+    y: 0.018920169343208577
+    z: 0.020605157068910737
+- id: gray-s-3.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.02138525835866261
+    y: 0.0225
+    z: 0.024503799392097264
+- id: gray-s-2.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.025431501396292987
+    y: 0.02675716008756122
+    z: 0.029140092581681414
+- id: gray-s-2.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.03024332240567326
+    y: 0.03181980515339464
+    z: 0.034653605429973554
+- id: gray-s-2.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.03596557418614785
+    y: 0.03784033868641715
+    z: 0.041210314137821474
+- id: gray-s-2.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.04277051671732522
+    y: 0.045
+    z: 0.04900759878419453
+- id: gray-s-1.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.05086300279258597
+    y: 0.05351432017512244
+    z: 0.05828018516336283
+- id: gray-s-1.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.06048664481134652
+    y: 0.06363961030678927
+    z: 0.06930721085994711
+- id: gray-s-1.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.0719311483722957
+    y: 0.0756806773728343
+    z: 0.08242062827564295
+- id: gray-s-1.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.08554103343465044
+    y: 0.09
+    z: 0.09801519756838906
+- id: gray-s-0.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.10172600558517195
+    y: 0.10702864035024488
+    z: 0.11656037032672566
+- id: gray-s-0.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.12097328962269303
+    y: 0.12727922061357855
+    z: 0.13861442171989422
+- id: gray-s-0.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.1438622967445914
+    y: 0.1513613547456686
+    z: 0.1648412565512859
+- id: gray-s+0.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.1710820668693009
+    y: 0.18
+    z: 0.1960303951367781
+- id: gray-s+0.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.2034520111703439
+    y: 0.21405728070048977
+    z: 0.2331207406534513
+- id: gray-s+0.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.24194657924538607
+    y: 0.2545584412271571
+    z: 0.27722884343978843
+- id: gray-s+0.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.2877245934891828
+    y: 0.3027227094913372
+    z: 0.3296825131025718
+- id: gray-s+1.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.3421641337386018
+    y: 0.36
+    z: 0.3920607902735562
+- id: gray-s+1.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.4069040223406878
+    y: 0.42811456140097953
+    z: 0.4662414813069026
+- id: gray-s+1.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.48389315849077214
+    y: 0.5091168824543142
+    z: 0.5544576868795769
+- id: gray-s+1.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.5754491869783656
+    y: 0.6054454189826745
+    z: 0.6593650262051436
+- id: gray-s+2.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.6843282674772035
+    y: 0.72
+    z: 0.7841215805471125
+- id: gray-s+2.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.8138080446813756
+    y: 0.8562291228019591
+    z: 0.9324829626138053
+- id: gray-s+2.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 0.9677863169815443
+    y: 1.0182337649086284
+    z: 1.1089153737591537
+- id: gray-s+2.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 1.1508983739567311
+    y: 1.210890837965349
+    z: 1.3187300524102872
+- id: gray-s+3.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 1.368656534954407
+    y: 1.44
+    z: 1.568243161094225
+- id: gray-s+3.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 1.6276160893627512
+    y: 1.7124582456039181
+    z: 1.8649659252276105
+- id: gray-s+3.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 1.9355726339630885
+    y: 2.0364675298172568
+    z: 2.2178307475183074
+- id: gray-s+3.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 2.3017967479134622
+    y: 2.421781675930698
+    z: 2.6374601048205744
+- id: gray-s+4.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 2.737313069908814
+    y: 2.88
+    z: 3.13648632218845
+- id: gray-s+4.25
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 3.2552321787255023
+    y: 3.4249164912078363
+    z: 3.729931850455221
+- id: gray-s+4.50
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 3.871145267926177
+    y: 4.0729350596345135
+    z: 4.435661495036615
+- id: gray-s+4.75
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 4.6035934958269245
+    y: 4.843563351861396
+    z: 5.274920209641149
+- id: gray-s+5.00
+  group: gray_ramp
+  weight: 1.0
+  xyz:
+    x: 5.474626139817628
+    y: 5.76
+    z: 6.2729726443769
+- id: chart-dark-skin-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.027335373748726122
+    y: 0.024272360547807674
+    z: 0.015745447524109828
+- id: chart-dark-skin-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.054670747497452245
+    y: 0.04854472109561535
+    z: 0.031490895048219655
+- id: chart-dark-skin-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.10934149499490449
+    y: 0.0970894421912307
+    z: 0.06298179009643931
+- id: chart-dark-skin-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.21868298998980898
+    y: 0.1941788843824614
+    z: 0.12596358019287862
+- id: chart-dark-skin-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.43736597997961796
+    y: 0.3883577687649228
+    z: 0.25192716038575724
+- id: chart-light-skin-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.09203180631705504
+    y: 0.08316270070108853
+    z: 0.061080340172874587
+- id: chart-light-skin-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.18406361263411009
+    y: 0.16632540140217705
+    z: 0.12216068034574917
+- id: chart-light-skin-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.36812722526822017
+    y: 0.3326508028043541
+    z: 0.24432136069149835
+- id: chart-light-skin-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.7362544505364403
+    y: 0.6653016056087082
+    z: 0.4886427213829967
+- id: chart-light-skin-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 1.4725089010728807
+    y: 1.3306032112174164
+    z: 0.9772854427659934
+- id: chart-blue-sky-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.04247362762277645
+    y: 0.045251798222634684
+    z: 0.08429339440135819
+- id: chart-blue-sky-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.0849472552455529
+    y: 0.09050359644526937
+    z: 0.16858678880271638
+- id: chart-blue-sky-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.1698945104911058
+    y: 0.18100719289053874
+    z: 0.33717357760543276
+- id: chart-blue-sky-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.3397890209822116
+    y: 0.3620143857810775
+    z: 0.6743471552108655
+- id: chart-blue-sky-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.6795780419644232
+    y: 0.724028771562155
+    z: 1.348694310421731
+- id: chart-foliage-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.026672776304741
+    y: 0.03349124848716423
+    z: 0.017082143417911
+- id: chart-foliage-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.053345552609482
+    y: 0.06698249697432845
+    z: 0.034164286835822
+- id: chart-foliage-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.106691105218964
+    y: 0.1339649939486569
+    z: 0.068328573671644
+- id: chart-foliage-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.213382210437928
+    y: 0.2679299878973138
+    z: 0.136657147343288
+- id: chart-foliage-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.426764420875856
+    y: 0.5358599757946276
+    z: 0.273314294686576
+- id: chart-blue-flower-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.06167968381031347
+    y: 0.05776197884517273
+    z: 0.10876016654571033
+- id: chart-blue-flower-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.12335936762062694
+    y: 0.11552395769034546
+    z: 0.21752033309142066
+- id: chart-blue-flower-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.24671873524125387
+    y: 0.23104791538069092
+    z: 0.4350406661828413
+- id: chart-blue-flower-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.49343747048250775
+    y: 0.46209583076138183
+    z: 0.8700813323656826
+- id: chart-blue-flower-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.9868749409650155
+    y: 0.9241916615227637
+    z: 1.7401626647313653
+- id: chart-bluish-green-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.07580111693915234
+    y: 0.1042750806344034
+    z: 0.11337003661665548
+- id: chart-bluish-green-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.15160223387830468
+    y: 0.2085501612688068
+    z: 0.22674007323331097
+- id: chart-bluish-green-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.30320446775660936
+    y: 0.4171003225376136
+    z: 0.45348014646662194
+- id: chart-bluish-green-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.6064089355132187
+    y: 0.8342006450752272
+    z: 0.9069602929332439
+- id: chart-bluish-green-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 1.2128178710264375
+    y: 1.6684012901504544
+    z: 1.8139205858664877
+- id: chart-orange-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.09632022486567347
+    y: 0.07632294318325866
+    z: 0.01671890460167695
+- id: chart-orange-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.19264044973134695
+    y: 0.15264588636651732
+    z: 0.0334378092033539
+- id: chart-orange-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.3852808994626939
+    y: 0.30529177273303465
+    z: 0.0668756184067078
+- id: chart-orange-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.7705617989253878
+    y: 0.6105835454660693
+    z: 0.1337512368134156
+- id: chart-orange-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 1.5411235978507756
+    y: 1.2211670909321386
+    z: 0.2675024736268312
+- id: chart-purplish-blue-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.03259785790033146
+    y: 0.02821135871969455
+    z: 0.09543653979786929
+- id: chart-purplish-blue-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.06519571580066293
+    y: 0.0564227174393891
+    z: 0.19087307959573857
+- id: chart-purplish-blue-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.13039143160132585
+    y: 0.1128454348787782
+    z: 0.38174615919147714
+- id: chart-purplish-blue-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.2607828632026517
+    y: 0.2256908697575564
+    z: 0.7634923183829543
+- id: chart-purplish-blue-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.5215657264053034
+    y: 0.4513817395151128
+    z: 1.5269846367659086
+- id: chart-moderate-red-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.07008465055276655
+    y: 0.04616808303202088
+    z: 0.03231890905163302
+- id: chart-moderate-red-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.1401693011055331
+    y: 0.09233616606404176
+    z: 0.06463781810326603
+- id: chart-moderate-red-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.2803386022110662
+    y: 0.1846723321280835
+    z: 0.12927563620653207
+- id: chart-moderate-red-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.5606772044221324
+    y: 0.369344664256167
+    z: 0.25855127241306414
+- id: chart-moderate-red-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 1.1213544088442648
+    y: 0.738689328512334
+    z: 0.5171025448261283
+- id: chart-purple-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.021242882402571963
+    y: 0.015804631644014796
+    z: 0.034602858043600436
+- id: chart-purple-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.042485764805143926
+    y: 0.03160926328802959
+    z: 0.06920571608720087
+- id: chart-purple-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.08497152961028785
+    y: 0.06321852657605918
+    z: 0.13841143217440174
+- id: chart-purple-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.1699430592205757
+    y: 0.12643705315211837
+    z: 0.2768228643488035
+- id: chart-purple-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.3398861184411514
+    y: 0.25287410630423673
+    z: 0.553645728697607
+- id: chart-yellow-green-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.08069247901392153
+    y: 0.10738225219599713
+    z: 0.026547273191868944
+- id: chart-yellow-green-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.16138495802784306
+    y: 0.21476450439199427
+    z: 0.05309454638373789
+- id: chart-yellow-green-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.3227699160556861
+    y: 0.42952900878398853
+    z: 0.10618909276747578
+- id: chart-yellow-green-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.6455398321113722
+    y: 0.8590580175679771
+    z: 0.21237818553495155
+- id: chart-yellow-green-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 1.2910796642227444
+    y: 1.7181160351359541
+    z: 0.4247563710699031
+- id: chart-orange-yellow-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.11241218636878372
+    y: 0.105340207892044
+    z: 0.019243444064787618
+- id: chart-orange-yellow-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.22482437273756745
+    y: 0.210680415784088
+    z: 0.038486888129575236
+- id: chart-orange-yellow-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.4496487454751349
+    y: 0.421360831568176
+    z: 0.07697377625915047
+- id: chart-orange-yellow-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.8992974909502698
+    y: 0.842721663136352
+    z: 0.15394755251830095
+- id: chart-orange-yellow-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 1.7985949819005396
+    y: 1.685443326272704
+    z: 0.3078951050366019
+- id: chart-blue-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.019230604882834818
+    y: 0.014740942432850158
+    z: 0.06903338132226773
+- id: chart-blue-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.038461209765669635
+    y: 0.029481884865700317
+    z: 0.13806676264453546
+- id: chart-blue-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.07692241953133927
+    y: 0.058963769731400634
+    z: 0.2761335252890709
+- id: chart-blue-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.15384483906267854
+    y: 0.11792753946280127
+    z: 0.5522670505781418
+- id: chart-blue-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.3076896781253571
+    y: 0.23585507892560253
+    z: 1.1045341011562837
+- id: chart-green-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.03363095374260245
+    y: 0.0557737570335897
+    z: 0.0235328755664073
+- id: chart-green-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.0672619074852049
+    y: 0.1115475140671794
+    z: 0.0470657511328146
+- id: chart-green-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.1345238149704098
+    y: 0.2230950281343588
+    z: 0.0941315022656292
+- id: chart-green-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.2690476299408196
+    y: 0.4461900562687176
+    z: 0.1882630045312584
+- id: chart-green-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.5380952598816392
+    y: 0.8923801125374352
+    z: 0.3765260090625168
+- id: chart-red-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.051084023739447204
+    y: 0.03095347688295494
+    z: 0.012873130234724016
+- id: chart-red-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.10216804747889441
+    y: 0.06190695376590988
+    z: 0.025746260469448033
+- id: chart-red-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.20433609495778882
+    y: 0.12381390753181976
+    z: 0.051492520938896065
+- id: chart-red-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.40867218991557763
+    y: 0.2476278150636395
+    z: 0.10298504187779213
+- id: chart-red-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.8173443798311553
+    y: 0.495255630127279
+    z: 0.20597008375558426
+- id: chart-yellow-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.13833675348176194
+    y: 0.1475165833155035
+    z: 0.022283428051624282
+- id: chart-yellow-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.2766735069635239
+    y: 0.295033166631007
+    z: 0.044566856103248564
+- id: chart-yellow-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.5533470139270478
+    y: 0.590066333262014
+    z: 0.08913371220649713
+- id: chart-yellow-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 1.1066940278540955
+    y: 1.180132666524028
+    z: 0.17826742441299426
+- id: chart-yellow-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 2.213388055708191
+    y: 2.360265333048056
+    z: 0.3565348488259885
+- id: chart-magenta-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.07386406920040556
+    y: 0.0468958775142119
+    z: 0.07358637399323883
+- id: chart-magenta-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.14772813840081112
+    y: 0.0937917550284238
+    z: 0.14717274798647767
+- id: chart-magenta-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.29545627680162223
+    y: 0.1875835100568476
+    z: 0.29434549597295534
+- id: chart-magenta-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.5909125536032445
+    y: 0.3751670201136952
+    z: 0.5886909919459107
+- id: chart-magenta-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 1.181825107206489
+    y: 0.7503340402273904
+    z: 1.1773819838918214
+- id: chart-cyan-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.03338050618517589
+    y: 0.04625121296311935
+    z: 0.09637970350861283
+- id: chart-cyan-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.06676101237035179
+    y: 0.0925024259262387
+    z: 0.19275940701722566
+- id: chart-cyan-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.13352202474070357
+    y: 0.1850048518524774
+    z: 0.3855188140344513
+- id: chart-cyan-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.26704404948140714
+    y: 0.3700097037049548
+    z: 0.7710376280689026
+- id: chart-cyan-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.5340880989628143
+    y: 0.7400194074099096
+    z: 1.5420752561378053
+- id: chart-white-9-5-05-d-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.20744013275191672
+    y: 0.22003859997292008
+    z: 0.228850776752547
+- id: chart-white-9-5-05-d-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.41488026550383345
+    y: 0.44007719994584016
+    z: 0.457701553505094
+- id: chart-white-9-5-05-d-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.8297605310076669
+    y: 0.8801543998916803
+    z: 0.915403107010188
+- id: chart-white-9-5-05-d-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 1.6595210620153338
+    y: 1.7603087997833606
+    z: 1.830806214020376
+- id: chart-white-9-5-05-d-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 3.3190421240306676
+    y: 3.5206175995667213
+    z: 3.661612428040752
+- id: chart-neutral-8-23-d-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.13957154672802333
+    y: 0.14748904052289294
+    z: 0.15935025255944893
+- id: chart-neutral-8-23-d-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.27914309345604665
+    y: 0.2949780810457859
+    z: 0.31870050511889786
+- id: chart-neutral-8-23-d-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.5582861869120933
+    y: 0.5899561620915718
+    z: 0.6374010102377957
+- id: chart-neutral-8-23-d-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 1.1165723738241866
+    y: 1.1799123241831435
+    z: 1.2748020204755914
+- id: chart-neutral-8-23-d-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 2.2331447476483732
+    y: 2.359824648366287
+    z: 2.549604040951183
+- id: chart-neutral-6-5-44-d-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.08617495716841092
+    y: 0.0912339531595008
+    z: 0.09945917119006692
+- id: chart-neutral-6-5-44-d-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.17234991433682184
+    y: 0.1824679063190016
+    z: 0.19891834238013384
+- id: chart-neutral-6-5-44-d-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.3446998286736437
+    y: 0.3649358126380032
+    z: 0.3978366847602677
+- id: chart-neutral-6-5-44-d-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.6893996573472874
+    y: 0.7298716252760064
+    z: 0.7956733695205354
+- id: chart-neutral-6-5-44-d-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 1.3787993146945747
+    y: 1.4597432505520127
+    z: 1.5913467390410707
+- id: chart-neutral-5-70-d-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.045226111977449586
+    y: 0.04765446557995187
+    z: 0.05170841398153124
+- id: chart-neutral-5-70-d-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.09045222395489917
+    y: 0.09530893115990374
+    z: 0.10341682796306248
+- id: chart-neutral-5-70-d-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.18090444790979834
+    y: 0.19061786231980749
+    z: 0.20683365592612496
+- id: chart-neutral-5-70-d-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.3618088958195967
+    y: 0.38123572463961497
+    z: 0.4136673118522499
+- id: chart-neutral-5-70-d-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.7236177916391934
+    y: 0.7624714492792299
+    z: 0.8273346237044998
+- id: chart-neutral-3-5-1-05-d-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.020844032163138456
+    y: 0.02205303899025528
+    z: 0.024398111059403864
+- id: chart-neutral-3-5-1-05-d-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.04168806432627691
+    y: 0.04410607798051056
+    z: 0.04879622211880773
+- id: chart-neutral-3-5-1-05-d-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.08337612865255382
+    y: 0.08821215596102112
+    z: 0.09759244423761546
+- id: chart-neutral-3-5-1-05-d-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.16675225730510765
+    y: 0.17642431192204225
+    z: 0.1951848884752309
+- id: chart-neutral-3-5-1-05-d-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.3335045146102153
+    y: 0.3528486238440845
+    z: 0.3903697769504618
+- id: chart-black-2-1-5-d-s-2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.007506684563164797
+    y: 0.007881023189824027
+    z: 0.008770342215319566
+- id: chart-black-2-1-5-d-s-1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.015013369126329595
+    y: 0.015762046379648054
+    z: 0.017540684430639133
+- id: chart-black-2-1-5-d-s+0
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.03002673825265919
+    y: 0.03152409275929611
+    z: 0.035081368861278266
+- id: chart-black-2-1-5-d-s+1
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.06005347650531838
+    y: 0.06304818551859222
+    z: 0.07016273772255653
+- id: chart-black-2-1-5-d-s+2
+  group: chart_patches
+  weight: 1.0
+  xyz:
+    x: 0.12010695301063676
+    y: 0.12609637103718443
+    z: 0.14032547544511306
+- id: hue-000-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0062770780207977135
+    y: 0.005625
+    z: 0.006135182760893247
+- id: hue-000-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.012554156041595427
+    y: 0.01125
+    z: 0.012270365521786494
+- id: hue-000-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.025108312083190854
+    y: 0.0225
+    z: 0.02454073104357299
+- id: hue-000-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05021662416638171
+    y: 0.045
+    z: 0.04908146208714598
+- id: hue-000-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.10043324833276342
+    y: 0.09
+    z: 0.09816292417429195
+- id: hue-000-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.20086649666552683
+    y: 0.18
+    z: 0.1963258483485839
+- id: hue-000-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.40173299333105367
+    y: 0.36
+    z: 0.3926516966971678
+- id: hue-000-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.8034659866621073
+    y: 0.72
+    z: 0.7853033933943356
+- id: hue-000-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.6069319733242147
+    y: 1.44
+    z: 1.5706067867886713
+- id: hue-000-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007316141223564522
+    y: 0.005625
+    z: 0.006145489977201464
+- id: hue-000-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.014632282447129044
+    y: 0.01125
+    z: 0.012290979954402929
+- id: hue-000-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.029264564894258088
+    y: 0.0225
+    z: 0.024581959908805857
+- id: hue-000-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.058529129788516175
+    y: 0.045
+    z: 0.049163919817611715
+- id: hue-000-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.11705825957703235
+    y: 0.09
+    z: 0.09832783963522343
+- id: hue-000-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2341165191540647
+    y: 0.18
+    z: 0.19665567927044686
+- id: hue-000-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.4682330383081294
+    y: 0.36
+    z: 0.3933113585408937
+- id: hue-000-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9364660766162588
+    y: 0.72
+    z: 0.7866227170817874
+- id: hue-000-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.8729321532325176
+    y: 1.44
+    z: 1.5732454341635749
+- id: hue-000-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008483573772407679
+    y: 0.005625
+    z: 0.0061570705815132565
+- id: hue-000-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.016967147544815358
+    y: 0.01125
+    z: 0.012314141163026513
+- id: hue-000-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.033934295089630716
+    y: 0.0225
+    z: 0.024628282326053026
+- id: hue-000-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06786859017926143
+    y: 0.045
+    z: 0.04925656465210605
+- id: hue-000-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.13573718035852286
+    y: 0.09
+    z: 0.0985131293042121
+- id: hue-000-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2714743607170457
+    y: 0.18
+    z: 0.1970262586084242
+- id: hue-000-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5429487214340915
+    y: 0.36
+    z: 0.3940525172168484
+- id: hue-000-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.085897442868183
+    y: 0.72
+    z: 0.7881050344336968
+- id: hue-000-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 2.171794885736366
+    y: 1.44
+    z: 1.5762100688673937
+- id: hue-000-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.00980473065542502
+    y: 0.005625
+    z: 0.006170176088217846
+- id: hue-000-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01960946131085004
+    y: 0.01125
+    z: 0.012340352176435691
+- id: hue-000-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03921892262170008
+    y: 0.0225
+    z: 0.024680704352871383
+- id: hue-000-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07843784524340015
+    y: 0.045
+    z: 0.049361408705742765
+- id: hue-000-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1568756904868003
+    y: 0.09
+    z: 0.09872281741148553
+- id: hue-000-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3137513809736006
+    y: 0.18
+    z: 0.19744563482297106
+- id: hue-000-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6275027619472012
+    y: 0.36
+    z: 0.3948912696459421
+- id: hue-000-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.2550055238944025
+    y: 0.72
+    z: 0.7897825392918842
+- id: hue-000-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 2.510011047788805
+    y: 1.44
+    z: 1.5795650785837685
+- id: hue-015-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.006307438131927104
+    y: 0.005625
+    z: 0.005669339072582076
+- id: hue-015-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.012614876263854208
+    y: 0.01125
+    z: 0.011338678145164151
+- id: hue-015-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.025229752527708416
+    y: 0.0225
+    z: 0.022677356290328302
+- id: hue-015-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05045950505541683
+    y: 0.045
+    z: 0.045354712580656605
+- id: hue-015-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.10091901011083367
+    y: 0.09
+    z: 0.09070942516131321
+- id: hue-015-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.20183802022166733
+    y: 0.18
+    z: 0.18141885032262642
+- id: hue-015-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.40367604044333466
+    y: 0.36
+    z: 0.36283770064525284
+- id: hue-015-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.8073520808866693
+    y: 0.72
+    z: 0.7256754012905057
+- id: hue-015-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.6147041617733386
+    y: 1.44
+    z: 1.4513508025810113
+- id: hue-015-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0073270087729193425
+    y: 0.005625
+    z: 0.005184961237131067
+- id: hue-015-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.014654017545838685
+    y: 0.01125
+    z: 0.010369922474262133
+- id: hue-015-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02930803509167737
+    y: 0.0225
+    z: 0.020739844948524266
+- id: hue-015-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05861607018335474
+    y: 0.045
+    z: 0.04147968989704853
+- id: hue-015-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.11723214036670948
+    y: 0.09
+    z: 0.08295937979409707
+- id: hue-015-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.23446428073341896
+    y: 0.18
+    z: 0.16591875958819413
+- id: hue-015-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.4689285614668379
+    y: 0.36
+    z: 0.33183751917638826
+- id: hue-015-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9378571229336758
+    y: 0.72
+    z: 0.6636750383527765
+- id: hue-015-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.8757142458673517
+    y: 1.44
+    z: 1.327350076705553
+- id: hue-015-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008410525058692515
+    y: 0.005625
+    z: 0.0046702040912525245
+- id: hue-015-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01682105011738503
+    y: 0.01125
+    z: 0.009340408182505049
+- id: hue-015-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03364210023477006
+    y: 0.0225
+    z: 0.018680816365010098
+- id: hue-015-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06728420046954012
+    y: 0.045
+    z: 0.037361632730020196
+- id: hue-015-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.13456840093908023
+    y: 0.09
+    z: 0.07472326546004039
+- id: hue-015-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.26913680187816047
+    y: 0.18
+    z: 0.14944653092008078
+- id: hue-015-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5382736037563209
+    y: 0.36
+    z: 0.29889306184016157
+- id: hue-015-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.0765472075126419
+    y: 0.72
+    z: 0.5977861236803231
+- id: hue-015-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 2.1530944150252838
+    y: 1.44
+    z: 1.1955722473606463
+- id: hue-015-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.00956419758237891
+    y: 0.005625
+    z: 0.004122117105049502
+- id: hue-015-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01912839516475782
+    y: 0.01125
+    z: 0.008244234210099004
+- id: hue-015-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03825679032951564
+    y: 0.0225
+    z: 0.016488468420198008
+- id: hue-015-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07651358065903129
+    y: 0.045
+    z: 0.032976936840396015
+- id: hue-015-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.15302716131806257
+    y: 0.09
+    z: 0.06595387368079203
+- id: hue-015-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.30605432263612514
+    y: 0.18
+    z: 0.13190774736158406
+- id: hue-015-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6121086452722503
+    y: 0.36
+    z: 0.2638154947231681
+- id: hue-015-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.2242172905445006
+    y: 0.72
+    z: 0.5276309894463362
+- id: hue-015-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 2.448434581089001
+    y: 1.44
+    z: 1.0552619788926725
+- id: hue-030-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.006399287573831748
+    y: 0.005625
+    z: 0.005249767410784038
+- id: hue-030-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.012798575147663496
+    y: 0.01125
+    z: 0.010499534821568075
+- id: hue-030-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02559715029532699
+    y: 0.0225
+    z: 0.02099906964313615
+- id: hue-030-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05119430059065398
+    y: 0.045
+    z: 0.0419981392862723
+- id: hue-030-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.10238860118130796
+    y: 0.09
+    z: 0.0839962785725446
+- id: hue-030-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.20477720236261593
+    y: 0.18
+    z: 0.1679925571450892
+- id: hue-030-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.40955440472523186
+    y: 0.36
+    z: 0.3359851142901784
+- id: hue-030-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.8191088094504637
+    y: 0.72
+    z: 0.6719702285803568
+- id: hue-030-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.6382176189009274
+    y: 1.44
+    z: 1.3439404571607136
+- id: hue-030-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007474264158011722
+    y: 0.005625
+    z: 0.004355275702386637
+- id: hue-030-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.014948528316023444
+    y: 0.01125
+    z: 0.008710551404773274
+- id: hue-030-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02989705663204689
+    y: 0.0225
+    z: 0.01742110280954655
+- id: hue-030-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05979411326409378
+    y: 0.045
+    z: 0.0348422056190931
+- id: hue-030-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.11958822652818756
+    y: 0.09
+    z: 0.0696844112381862
+- id: hue-030-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2391764530563751
+    y: 0.18
+    z: 0.1393688224763724
+- id: hue-030-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.4783529061127502
+    y: 0.36
+    z: 0.2787376449527448
+- id: hue-030-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9567058122255004
+    y: 0.72
+    z: 0.5574752899054896
+- id: hue-030-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.9134116244510009
+    y: 1.44
+    z: 1.1149505798109791
+- id: hue-030-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008571941326566948
+    y: 0.005625
+    z: 0.003441894759750778
+- id: hue-030-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.017143882653133897
+    y: 0.01125
+    z: 0.006883789519501556
+- id: hue-030-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.034287765306267794
+    y: 0.0225
+    z: 0.013767579039003112
+- id: hue-030-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06857553061253559
+    y: 0.045
+    z: 0.027535158078006224
+- id: hue-030-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.13715106122507117
+    y: 0.09
+    z: 0.05507031615601245
+- id: hue-030-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.27430212245014235
+    y: 0.18
+    z: 0.1101406323120249
+- id: hue-030-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5486042449002847
+    y: 0.36
+    z: 0.2202812646240498
+- id: hue-030-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.0972084898005694
+    y: 0.72
+    z: 0.4405625292480996
+- id: hue-030-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 2.194416979601139
+    y: 1.44
+    z: 0.8811250584961992
+- id: hue-030-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009693045814820046
+    y: 0.005625
+    z: 0.002509019863918054
+- id: hue-030-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01938609162964009
+    y: 0.01125
+    z: 0.005018039727836108
+- id: hue-030-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03877218325928018
+    y: 0.0225
+    z: 0.010036079455672217
+- id: hue-030-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07754436651856036
+    y: 0.045
+    z: 0.020072158911344434
+- id: hue-030-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.15508873303712073
+    y: 0.09
+    z: 0.04014431782268887
+- id: hue-030-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.31017746607424146
+    y: 0.18
+    z: 0.08028863564537773
+- id: hue-030-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6203549321484829
+    y: 0.36
+    z: 0.16057727129075547
+- id: hue-030-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.2407098642969658
+    y: 0.72
+    z: 0.32115454258151094
+- id: hue-030-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 2.4814197285939317
+    y: 1.44
+    z: 0.6423090851630219
+- id: hue-045-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.006392030782049077
+    y: 0.005625
+    z: 0.0049493023713116915
+- id: hue-045-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.012784061564098155
+    y: 0.01125
+    z: 0.009898604742623383
+- id: hue-045-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02556812312819631
+    y: 0.0225
+    z: 0.019797209485246766
+- id: hue-045-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05113624625639262
+    y: 0.045
+    z: 0.03959441897049353
+- id: hue-045-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.10227249251278524
+    y: 0.09
+    z: 0.07918883794098706
+- id: hue-045-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.20454498502557047
+    y: 0.18
+    z: 0.15837767588197413
+- id: hue-045-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.40908997005114095
+    y: 0.36
+    z: 0.31675535176394826
+- id: hue-045-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.8181799401022819
+    y: 0.72
+    z: 0.6335107035278965
+- id: hue-045-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.6363598802045638
+    y: 1.44
+    z: 1.267021407055793
+- id: hue-045-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007421852452879373
+    y: 0.005625
+    z: 0.003790539526027048
+- id: hue-045-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.014843704905758747
+    y: 0.01125
+    z: 0.007581079052054096
+- id: hue-045-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.029687409811517494
+    y: 0.0225
+    z: 0.015162158104108193
+- id: hue-045-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05937481962303499
+    y: 0.045
+    z: 0.030324316208216386
+- id: hue-045-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.11874963924606997
+    y: 0.09
+    z: 0.06064863241643277
+- id: hue-045-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.23749927849213995
+    y: 0.18
+    z: 0.12129726483286554
+- id: hue-045-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.4749985569842799
+    y: 0.36
+    z: 0.24259452966573108
+- id: hue-045-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9499971139685598
+    y: 0.72
+    z: 0.48518905933146217
+- id: hue-045-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.8999942279371196
+    y: 1.44
+    z: 0.9703781186629243
+- id: hue-045-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008436139255632196
+    y: 0.005625
+    z: 0.0026492566274598367
+- id: hue-045-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.016872278511264393
+    y: 0.01125
+    z: 0.005298513254919673
+- id: hue-045-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.033744557022528786
+    y: 0.0225
+    z: 0.010597026509839347
+- id: hue-045-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06748911404505757
+    y: 0.045
+    z: 0.021194053019678694
+- id: hue-045-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.13497822809011514
+    y: 0.09
+    z: 0.04238810603935739
+- id: hue-045-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2699564561802303
+    y: 0.18
+    z: 0.08477621207871477
+- id: hue-045-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5399129123604606
+    y: 0.36
+    z: 0.16955242415742955
+- id: hue-045-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.0798258247209211
+    y: 0.72
+    z: 0.3391048483148591
+- id: hue-045-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 2.1596516494418423
+    y: 1.44
+    z: 0.6782096966297182
+- id: hue-045-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009435240074261298
+    y: 0.005625
+    z: 0.0015250611088440137
+- id: hue-045-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.018870480148522596
+    y: 0.01125
+    z: 0.0030501222176880275
+- id: hue-045-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03774096029704519
+    y: 0.0225
+    z: 0.006100244435376055
+- id: hue-045-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07548192059409038
+    y: 0.045
+    z: 0.01220048887075211
+- id: hue-045-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.15096384118818076
+    y: 0.09
+    z: 0.02440097774150422
+- id: hue-045-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.30192768237636153
+    y: 0.18
+    z: 0.04880195548300844
+- id: hue-045-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6038553647527231
+    y: 0.36
+    z: 0.09760391096601688
+- id: hue-045-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.2077107295054461
+    y: 0.72
+    z: 0.19520782193203376
+- id: hue-045-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 2.4154214590108922
+    y: 1.44
+    z: 0.3904156438640675
+- id: hue-060-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005995535881407839
+    y: 0.005625
+    z: 0.004782028659971237
+- id: hue-060-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.011991071762815678
+    y: 0.01125
+    z: 0.009564057319942474
+- id: hue-060-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.023982143525631355
+    y: 0.0225
+    z: 0.01912811463988495
+- id: hue-060-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04796428705126271
+    y: 0.045
+    z: 0.0382562292797699
+- id: hue-060-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.09592857410252542
+    y: 0.09
+    z: 0.0765124585595398
+- id: hue-060-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.19185714820505084
+    y: 0.18
+    z: 0.1530249171190796
+- id: hue-060-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3837142964101017
+    y: 0.36
+    z: 0.3060498342381592
+- id: hue-060-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7674285928202034
+    y: 0.72
+    z: 0.6120996684763184
+- id: hue-060-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.5348571856404067
+    y: 1.44
+    z: 1.2241993369526367
+- id: hue-060-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.006594058559372544
+    y: 0.005625
+    z: 0.003543056188368347
+- id: hue-060-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.013188117118745088
+    y: 0.01125
+    z: 0.007086112376736694
+- id: hue-060-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.026376234237490175
+    y: 0.0225
+    z: 0.014172224753473388
+- id: hue-060-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05275246847498035
+    y: 0.045
+    z: 0.028344449506946777
+- id: hue-060-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1055049369499607
+    y: 0.09
+    z: 0.056688899013893554
+- id: hue-060-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2110098738999214
+    y: 0.18
+    z: 0.11337779802778711
+- id: hue-060-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.4220197477998428
+    y: 0.36
+    z: 0.22675559605557422
+- id: hue-060-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.8440394955996856
+    y: 0.72
+    z: 0.45351119211114843
+- id: hue-060-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.6880789911993712
+    y: 1.44
+    z: 0.9070223842222969
+- id: hue-060-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007147598147133225
+    y: 0.005625
+    z: 0.0023972010078928963
+- id: hue-060-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01429519629426645
+    y: 0.01125
+    z: 0.0047944020157857925
+- id: hue-060-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0285903925885329
+    y: 0.0225
+    z: 0.009588804031571585
+- id: hue-060-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0571807851770658
+    y: 0.045
+    z: 0.01917760806314317
+- id: hue-060-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1143615703541316
+    y: 0.09
+    z: 0.03835521612628634
+- id: hue-060-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2287231407082632
+    y: 0.18
+    z: 0.07671043225257268
+- id: hue-060-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.4574462814165264
+    y: 0.36
+    z: 0.15342086450514536
+- id: hue-060-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9148925628330528
+    y: 0.72
+    z: 0.3068417290102907
+- id: hue-060-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.8297851256661055
+    y: 1.44
+    z: 0.6136834580205814
+- id: hue-060-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0076610421617445915
+    y: 0.005625
+    z: 0.0013343457089492051
+- id: hue-060-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.015322084323489183
+    y: 0.01125
+    z: 0.0026686914178984103
+- id: hue-060-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.030644168646978366
+    y: 0.0225
+    z: 0.0053373828357968205
+- id: hue-060-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06128833729395673
+    y: 0.045
+    z: 0.010674765671593641
+- id: hue-060-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.12257667458791346
+    y: 0.09
+    z: 0.021349531343187282
+- id: hue-060-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.24515334917582693
+    y: 0.18
+    z: 0.042699062686374564
+- id: hue-060-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.49030669835165386
+    y: 0.36
+    z: 0.08539812537274913
+- id: hue-060-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9806133967033077
+    y: 0.72
+    z: 0.17079625074549826
+- id: hue-060-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.9612267934066154
+    y: 1.44
+    z: 0.3415925014909965
+- id: hue-075-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005649593620232266
+    y: 0.005625
+    z: 0.0046920964808634755
+- id: hue-075-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.011299187240464532
+    y: 0.01125
+    z: 0.009384192961726951
+- id: hue-075-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.022598374480929065
+    y: 0.0225
+    z: 0.018768385923453902
+- id: hue-075-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04519674896185813
+    y: 0.045
+    z: 0.037536771846907804
+- id: hue-075-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.09039349792371626
+    y: 0.09
+    z: 0.07507354369381561
+- id: hue-075-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.18078699584743252
+    y: 0.18
+    z: 0.15014708738763122
+- id: hue-075-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.36157399169486504
+    y: 0.36
+    z: 0.30029417477526243
+- id: hue-075-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7231479833897301
+    y: 0.72
+    z: 0.6005883495505249
+- id: hue-075-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.4462959667794602
+    y: 1.44
+    z: 1.2011766991010497
+- id: hue-075-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005915251132084379
+    y: 0.005625
+    z: 0.0034361114654502113
+- id: hue-075-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.011830502264168758
+    y: 0.01125
+    z: 0.006872222930900423
+- id: hue-075-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.023661004528337515
+    y: 0.0225
+    z: 0.013744445861800845
+- id: hue-075-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04732200905667503
+    y: 0.045
+    z: 0.02748889172360169
+- id: hue-075-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.09464401811335006
+    y: 0.09
+    z: 0.05497778344720338
+- id: hue-075-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.18928803622670012
+    y: 0.18
+    z: 0.10995556689440676
+- id: hue-075-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.37857607245340025
+    y: 0.36
+    z: 0.21991113378881352
+- id: hue-075-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7571521449068005
+    y: 0.72
+    z: 0.43982226757762705
+- id: hue-075-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.514304289813601
+    y: 1.44
+    z: 0.8796445351552541
+- id: hue-075-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.00614987866606556
+    y: 0.005625
+    z: 0.0023268310809837073
+- id: hue-075-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01229975733213112
+    y: 0.01125
+    z: 0.0046536621619674146
+- id: hue-075-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02459951466426224
+    y: 0.0225
+    z: 0.009307324323934829
+- id: hue-075-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04919902932852448
+    y: 0.045
+    z: 0.018614648647869658
+- id: hue-075-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.09839805865704895
+    y: 0.09
+    z: 0.037229297295739316
+- id: hue-075-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1967961173140979
+    y: 0.18
+    z: 0.07445859459147863
+- id: hue-075-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3935922346281958
+    y: 0.36
+    z: 0.14891718918295727
+- id: hue-075-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7871844692563916
+    y: 0.72
+    z: 0.29783437836591453
+- id: hue-075-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.5743689385127833
+    y: 1.44
+    z: 0.5956687567318291
+- id: hue-075-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.006358612888407248
+    y: 0.005625
+    z: 0.0013399700145025732
+- id: hue-075-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.012717225776814497
+    y: 0.01125
+    z: 0.0026799400290051464
+- id: hue-075-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.025434451553628994
+    y: 0.0225
+    z: 0.005359880058010293
+- id: hue-075-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05086890310725799
+    y: 0.045
+    z: 0.010719760116020586
+- id: hue-075-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.10173780621451597
+    y: 0.09
+    z: 0.02143952023204117
+- id: hue-075-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.20347561242903195
+    y: 0.18
+    z: 0.04287904046408234
+- id: hue-075-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.4069512248580639
+    y: 0.36
+    z: 0.08575808092816468
+- id: hue-075-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.8139024497161278
+    y: 0.72
+    z: 0.17151616185632937
+- id: hue-075-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.6278048994322556
+    y: 1.44
+    z: 0.34303232371265874
+- id: hue-090-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.00536027452994373
+    y: 0.005625
+    z: 0.004665654025173277
+- id: hue-090-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01072054905988746
+    y: 0.01125
+    z: 0.009331308050346553
+- id: hue-090-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02144109811977492
+    y: 0.0225
+    z: 0.018662616100693107
+- id: hue-090-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04288219623954984
+    y: 0.045
+    z: 0.03732523220138621
+- id: hue-090-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08576439247909969
+    y: 0.09
+    z: 0.07465046440277243
+- id: hue-090-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.17152878495819937
+    y: 0.18
+    z: 0.14930092880554485
+- id: hue-090-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.34305756991639874
+    y: 0.36
+    z: 0.2986018576110897
+- id: hue-090-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6861151398327975
+    y: 0.72
+    z: 0.5972037152221794
+- id: hue-090-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.372230279665595
+    y: 1.44
+    z: 1.1944074304443588
+- id: hue-090-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005372056817317944
+    y: 0.005625
+    z: 0.003433154122346782
+- id: hue-090-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010744113634635889
+    y: 0.01125
+    z: 0.006866308244693564
+- id: hue-090-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.021488227269271777
+    y: 0.0225
+    z: 0.013732616489387128
+- id: hue-090-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.042976454538543554
+    y: 0.045
+    z: 0.027465232978774255
+- id: hue-090-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08595290907708711
+    y: 0.09
+    z: 0.05493046595754851
+- id: hue-090-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.17190581815417422
+    y: 0.18
+    z: 0.10986093191509702
+- id: hue-090-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.34381163630834843
+    y: 0.36
+    z: 0.21972186383019404
+- id: hue-090-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6876232726166969
+    y: 0.72
+    z: 0.4394437276603881
+- id: hue-090-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.3752465452333937
+    y: 1.44
+    z: 0.8788874553207762
+- id: hue-090-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005382134132266513
+    y: 0.005625
+    z: 0.002379004847219918
+- id: hue-090-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010764268264533026
+    y: 0.01125
+    z: 0.004758009694439836
+- id: hue-090-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.021528536529066052
+    y: 0.0225
+    z: 0.009516019388879672
+- id: hue-090-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.043057073058132105
+    y: 0.045
+    z: 0.019032038777759344
+- id: hue-090-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08611414611626421
+    y: 0.09
+    z: 0.03806407755551869
+- id: hue-090-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.17222829223252842
+    y: 0.18
+    z: 0.07612815511103738
+- id: hue-090-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.34445658446505684
+    y: 0.36
+    z: 0.15225631022207475
+- id: hue-090-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6889131689301137
+    y: 0.72
+    z: 0.3045126204441495
+- id: hue-090-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.3778263378602273
+    y: 1.44
+    z: 0.609025240888299
+- id: hue-090-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005390851585560776
+    y: 0.005625
+    z: 0.0014671054853363198
+- id: hue-090-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010781703171121553
+    y: 0.01125
+    z: 0.0029342109706726395
+- id: hue-090-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.021563406342243106
+    y: 0.0225
+    z: 0.005868421941345279
+- id: hue-090-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04312681268448621
+    y: 0.045
+    z: 0.011736843882690558
+- id: hue-090-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08625362536897242
+    y: 0.09
+    z: 0.023473687765381116
+- id: hue-090-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.17250725073794484
+    y: 0.18
+    z: 0.04694737553076223
+- id: hue-090-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3450145014758897
+    y: 0.36
+    z: 0.09389475106152446
+- id: hue-090-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6900290029517794
+    y: 0.72
+    z: 0.18778950212304893
+- id: hue-090-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.3800580059035588
+    y: 1.44
+    z: 0.37557900424609786
+- id: hue-105-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005107477192500879
+    y: 0.005625
+    z: 0.004585646233808831
+- id: hue-105-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010214954385001758
+    y: 0.01125
+    z: 0.009171292467617663
+- id: hue-105-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.020429908770003516
+    y: 0.0225
+    z: 0.018342584935235325
+- id: hue-105-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04085981754000703
+    y: 0.045
+    z: 0.03668516987047065
+- id: hue-105-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08171963508001406
+    y: 0.09
+    z: 0.0733703397409413
+- id: hue-105-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.16343927016002813
+    y: 0.18
+    z: 0.1467406794818826
+- id: hue-105-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.32687854032005625
+    y: 0.36
+    z: 0.2934813589637652
+- id: hue-105-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6537570806401125
+    y: 0.72
+    z: 0.5869627179275304
+- id: hue-105-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.307514161280225
+    y: 1.44
+    z: 1.1739254358550608
+- id: hue-105-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004913661651800637
+    y: 0.005625
+    z: 0.0033356963458281244
+- id: hue-105-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009827323303601273
+    y: 0.01125
+    z: 0.006671392691656249
+- id: hue-105-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.019654646607202546
+    y: 0.0225
+    z: 0.013342785383312497
+- id: hue-105-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03930929321440509
+    y: 0.045
+    z: 0.026685570766624995
+- id: hue-105-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07861858642881019
+    y: 0.09
+    z: 0.05337114153324999
+- id: hue-105-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.15723717285762037
+    y: 0.18
+    z: 0.10674228306649998
+- id: hue-105-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.31447434571524074
+    y: 0.36
+    z: 0.21348456613299996
+- id: hue-105-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6289486914304815
+    y: 0.72
+    z: 0.4269691322659999
+- id: hue-105-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.257897382860963
+    y: 1.44
+    z: 0.8539382645319998
+- id: hue-105-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.00475323425483824
+    y: 0.005625
+    z: 0.002301072361922109
+- id: hue-105-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.00950646850967648
+    y: 0.01125
+    z: 0.004602144723844218
+- id: hue-105-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01901293701935296
+    y: 0.0225
+    z: 0.009204289447688436
+- id: hue-105-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03802587403870592
+    y: 0.045
+    z: 0.01840857889537687
+- id: hue-105-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07605174807741184
+    y: 0.09
+    z: 0.03681715779075374
+- id: hue-105-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1521034961548237
+    y: 0.18
+    z: 0.07363431558150749
+- id: hue-105-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3042069923096474
+    y: 0.36
+    z: 0.14726863116301497
+- id: hue-105-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6084139846192947
+    y: 0.72
+    z: 0.29453726232602995
+- id: hue-105-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.2168279692385895
+    y: 1.44
+    z: 0.5890745246520599
+- id: hue-105-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004618251648372092
+    y: 0.005625
+    z: 0.0014305462254620251
+- id: hue-105-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009236503296744185
+    y: 0.01125
+    z: 0.0028610924509240502
+- id: hue-105-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01847300659348837
+    y: 0.0225
+    z: 0.0057221849018481005
+- id: hue-105-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03694601318697674
+    y: 0.045
+    z: 0.011444369803696201
+- id: hue-105-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07389202637395348
+    y: 0.09
+    z: 0.022888739607392402
+- id: hue-105-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.14778405274790696
+    y: 0.18
+    z: 0.045777479214784804
+- id: hue-105-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2955681054958139
+    y: 0.36
+    z: 0.09155495842956961
+- id: hue-105-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5911362109916278
+    y: 0.72
+    z: 0.18310991685913922
+- id: hue-105-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.1822724219832557
+    y: 1.44
+    z: 0.36621983371827843
+- id: hue-120-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004875356545034675
+    y: 0.005625
+    z: 0.00457083152188885
+- id: hue-120-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.00975071309006935
+    y: 0.01125
+    z: 0.0091416630437777
+- id: hue-120-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0195014261801387
+    y: 0.0225
+    z: 0.0182833260875554
+- id: hue-120-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0390028523602774
+    y: 0.045
+    z: 0.0365666521751108
+- id: hue-120-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0780057047205548
+    y: 0.09
+    z: 0.0731333043502216
+- id: hue-120-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1560114094411096
+    y: 0.18
+    z: 0.1462666087004432
+- id: hue-120-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3120228188822192
+    y: 0.36
+    z: 0.2925332174008864
+- id: hue-120-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6240456377644384
+    y: 0.72
+    z: 0.5850664348017728
+- id: hue-120-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.2480912755288769
+    y: 1.44
+    z: 1.1701328696035456
+- id: hue-120-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004504192461658339
+    y: 0.005625
+    z: 0.003345236005171248
+- id: hue-120-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009008384923316678
+    y: 0.01125
+    z: 0.006690472010342496
+- id: hue-120-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.018016769846633356
+    y: 0.0225
+    z: 0.013380944020684992
+- id: hue-120-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03603353969326671
+    y: 0.045
+    z: 0.026761888041369985
+- id: hue-120-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07206707938653342
+    y: 0.09
+    z: 0.05352377608273997
+- id: hue-120-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.14413415877306684
+    y: 0.18
+    z: 0.10704755216547994
+- id: hue-120-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2882683175461337
+    y: 0.36
+    z: 0.21409510433095988
+- id: hue-120-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5765366350922674
+    y: 0.72
+    z: 0.42819020866191976
+- id: hue-120-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.1530732701845348
+    y: 1.44
+    z: 0.8563804173238395
+- id: hue-120-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004204142090081566
+    y: 0.005625
+    z: 0.002354460209063089
+- id: hue-120-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008408284180163131
+    y: 0.01125
+    z: 0.004708920418126178
+- id: hue-120-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.016816568360326262
+    y: 0.0225
+    z: 0.009417840836252356
+- id: hue-120-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.033633136720652525
+    y: 0.045
+    z: 0.01883568167250471
+- id: hue-120-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06726627344130505
+    y: 0.09
+    z: 0.03767136334500942
+- id: hue-120-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1345325468826101
+    y: 0.18
+    z: 0.07534272669001885
+- id: hue-120-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2690650937652202
+    y: 0.36
+    z: 0.1506854533800377
+- id: hue-120-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5381301875304404
+    y: 0.72
+    z: 0.3013709067600754
+- id: hue-120-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.0762603750608808
+    y: 1.44
+    z: 0.6027418135201508
+- id: hue-120-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.003956554460373058
+    y: 0.005625
+    z: 0.0015369180422532365
+- id: hue-120-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007913108920746117
+    y: 0.01125
+    z: 0.003073836084506473
+- id: hue-120-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.015826217841492234
+    y: 0.0225
+    z: 0.006147672169012946
+- id: hue-120-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03165243568298447
+    y: 0.045
+    z: 0.012295344338025892
+- id: hue-120-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06330487136596893
+    y: 0.09
+    z: 0.024590688676051783
+- id: hue-120-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.12660974273193787
+    y: 0.18
+    z: 0.04918137735210357
+- id: hue-120-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.25321948546387574
+    y: 0.36
+    z: 0.09836275470420713
+- id: hue-120-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5064389709277515
+    y: 0.72
+    z: 0.19672550940841427
+- id: hue-120-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.012877941855503
+    y: 1.44
+    z: 0.39345101881682853
+- id: hue-135-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004600214075287386
+    y: 0.005625
+    z: 0.004559133394101465
+- id: hue-135-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009200428150574771
+    y: 0.01125
+    z: 0.00911826678820293
+- id: hue-135-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.018400856301149543
+    y: 0.0225
+    z: 0.01823653357640586
+- id: hue-135-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.036801712602299086
+    y: 0.045
+    z: 0.03647306715281172
+- id: hue-135-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07360342520459817
+    y: 0.09
+    z: 0.07294613430562344
+- id: hue-135-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.14720685040919634
+    y: 0.18
+    z: 0.14589226861124688
+- id: hue-135-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2944137008183927
+    y: 0.36
+    z: 0.29178453722249376
+- id: hue-135-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5888274016367854
+    y: 0.72
+    z: 0.5835690744449875
+- id: hue-135-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.1776548032735707
+    y: 1.44
+    z: 1.167138148889975
+- id: hue-135-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004031924216427367
+    y: 0.005625
+    z: 0.00336572059743377
+- id: hue-135-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008063848432854733
+    y: 0.01125
+    z: 0.00673144119486754
+- id: hue-135-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.016127696865709466
+    y: 0.0225
+    z: 0.01346288238973508
+- id: hue-135-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03225539373141893
+    y: 0.045
+    z: 0.02692576477947016
+- id: hue-135-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06451078746283787
+    y: 0.09
+    z: 0.05385152955894032
+- id: hue-135-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.12902157492567573
+    y: 0.18
+    z: 0.10770305911788064
+- id: hue-135-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.25804314985135146
+    y: 0.36
+    z: 0.21540611823576128
+- id: hue-135-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5160862997027029
+    y: 0.72
+    z: 0.43081223647152256
+- id: hue-135-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.0321725994054058
+    y: 1.44
+    z: 0.8616244729430451
+- id: hue-135-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0035846490705538064
+    y: 0.005625
+    z: 0.0024264395696363024
+- id: hue-135-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007169298141107613
+    y: 0.01125
+    z: 0.004852879139272605
+- id: hue-135-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.014338596282215225
+    y: 0.0225
+    z: 0.00970575827854521
+- id: hue-135-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02867719256443045
+    y: 0.045
+    z: 0.01941151655709042
+- id: hue-135-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0573543851288609
+    y: 0.09
+    z: 0.03882303311418084
+- id: hue-135-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1147087702577218
+    y: 0.18
+    z: 0.07764606622836168
+- id: hue-135-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2294175405154436
+    y: 0.36
+    z: 0.15529213245672335
+- id: hue-135-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.4588350810308872
+    y: 0.72
+    z: 0.3105842649134467
+- id: hue-135-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9176701620617744
+    y: 1.44
+    z: 0.6211685298268934
+- id: hue-135-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0032234539391622716
+    y: 0.005625
+    z: 0.0016679271922354158
+- id: hue-135-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.006446907878324543
+    y: 0.01125
+    z: 0.0033358543844708315
+- id: hue-135-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.012893815756649087
+    y: 0.0225
+    z: 0.006671708768941663
+- id: hue-135-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.025787631513298173
+    y: 0.045
+    z: 0.013343417537883326
+- id: hue-135-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.051575263026596346
+    y: 0.09
+    z: 0.026686835075766652
+- id: hue-135-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.10315052605319269
+    y: 0.18
+    z: 0.053373670151533305
+- id: hue-135-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.20630105210638539
+    y: 0.36
+    z: 0.10674734030306661
+- id: hue-135-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.41260210421277077
+    y: 0.72
+    z: 0.21349468060613322
+- id: hue-135-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.8252042084255415
+    y: 1.44
+    z: 0.42698936121226644
+- id: hue-150-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004388413325831467
+    y: 0.005625
+    z: 0.004738088904324236
+- id: hue-150-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008776826651662933
+    y: 0.01125
+    z: 0.009476177808648472
+- id: hue-150-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.017553653303325867
+    y: 0.0225
+    z: 0.018952355617296943
+- id: hue-150-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.035107306606651734
+    y: 0.045
+    z: 0.03790471123459389
+- id: hue-150-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07021461321330347
+    y: 0.09
+    z: 0.07580942246918777
+- id: hue-150-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.14042922642660693
+    y: 0.18
+    z: 0.15161884493837555
+- id: hue-150-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.28085845285321387
+    y: 0.36
+    z: 0.3032376898767511
+- id: hue-150-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5617169057064277
+    y: 0.72
+    z: 0.6064753797535022
+- id: hue-150-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.1234338114128555
+    y: 1.44
+    z: 1.2129507595070044
+- id: hue-150-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.003661649798343847
+    y: 0.005625
+    z: 0.0036851132447364575
+- id: hue-150-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007323299596687694
+    y: 0.01125
+    z: 0.007370226489472915
+- id: hue-150-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.014646599193375388
+    y: 0.0225
+    z: 0.01474045297894583
+- id: hue-150-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.029293198386750777
+    y: 0.045
+    z: 0.02948090595789166
+- id: hue-150-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05858639677350155
+    y: 0.09
+    z: 0.05896181191578332
+- id: hue-150-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1171727935470031
+    y: 0.18
+    z: 0.11792362383156664
+- id: hue-150-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2343455870940062
+    y: 0.36
+    z: 0.23584724766313328
+- id: hue-150-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.4686911741880124
+    y: 0.72
+    z: 0.47169449532626656
+- id: hue-150-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9373823483760249
+    y: 1.44
+    z: 0.9433889906525331
+- id: hue-150-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0030913717394258963
+    y: 0.005625
+    z: 0.002858862487060956
+- id: hue-150-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0061827434788517925
+    y: 0.01125
+    z: 0.005717724974121912
+- id: hue-150-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.012365486957703585
+    y: 0.0225
+    z: 0.011435449948243824
+- id: hue-150-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02473097391540717
+    y: 0.045
+    z: 0.022870899896487648
+- id: hue-150-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04946194783081434
+    y: 0.09
+    z: 0.045741799792975296
+- id: hue-150-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.09892389566162868
+    y: 0.18
+    z: 0.09148359958595059
+- id: hue-150-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.19784779132325736
+    y: 0.36
+    z: 0.18296719917190118
+- id: hue-150-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3956955826465147
+    y: 0.72
+    z: 0.36593439834380237
+- id: hue-150-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7913911652930294
+    y: 1.44
+    z: 0.7318687966876047
+- id: hue-150-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.00263195024585725
+    y: 0.005625
+    z: 0.0021932269234663194
+- id: hue-150-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0052639004917145
+    y: 0.01125
+    z: 0.004386453846932639
+- id: hue-150-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010527800983429
+    y: 0.0225
+    z: 0.008772907693865278
+- id: hue-150-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.021055601966858
+    y: 0.045
+    z: 0.017545815387730555
+- id: hue-150-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.042111203933716
+    y: 0.09
+    z: 0.03509163077546111
+- id: hue-150-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.084222407867432
+    y: 0.18
+    z: 0.07018326155092222
+- id: hue-150-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.168444815734864
+    y: 0.36
+    z: 0.14036652310184444
+- id: hue-150-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.336889631469728
+    y: 0.72
+    z: 0.2807330462036889
+- id: hue-150-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.673779262939456
+    y: 1.44
+    z: 0.5614660924073778
+- id: hue-165-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004430159776700149
+    y: 0.005625
+    z: 0.005355915278700222
+- id: hue-165-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008860319553400298
+    y: 0.01125
+    z: 0.010711830557400444
+- id: hue-165-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.017720639106800596
+    y: 0.0225
+    z: 0.021423661114800888
+- id: hue-165-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03544127821360119
+    y: 0.045
+    z: 0.042847322229601775
+- id: hue-165-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07088255642720238
+    y: 0.09
+    z: 0.08569464445920355
+- id: hue-165-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.14176511285440477
+    y: 0.18
+    z: 0.1713892889184071
+- id: hue-165-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.28353022570880954
+    y: 0.36
+    z: 0.3427785778368142
+- id: hue-165-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5670604514176191
+    y: 0.72
+    z: 0.6855571556736284
+- id: hue-165-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.1341209028352381
+    y: 1.44
+    z: 1.3711143113472568
+- id: hue-165-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0036784912752470442
+    y: 0.005625
+    z: 0.0047241326120596614
+- id: hue-165-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0073569825504940884
+    y: 0.01125
+    z: 0.009448265224119323
+- id: hue-165-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.014713965100988177
+    y: 0.0225
+    z: 0.018896530448238646
+- id: hue-165-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.029427930201976354
+    y: 0.045
+    z: 0.03779306089647729
+- id: hue-165-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05885586040395271
+    y: 0.09
+    z: 0.07558612179295458
+- id: hue-165-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.11771172080790542
+    y: 0.18
+    z: 0.15117224358590917
+- id: hue-165-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.23542344161581083
+    y: 0.36
+    z: 0.30234448717181833
+- id: hue-165-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.47084688323162166
+    y: 0.72
+    z: 0.6046889743436367
+- id: hue-165-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9416937664632433
+    y: 1.44
+    z: 1.2093779486872733
+- id: hue-165-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0030506603447400947
+    y: 0.005625
+    z: 0.004196436295520781
+- id: hue-165-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0061013206894801894
+    y: 0.01125
+    z: 0.008392872591041562
+- id: hue-165-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.012202641378960379
+    y: 0.0225
+    z: 0.016785745182083124
+- id: hue-165-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.024405282757920758
+    y: 0.045
+    z: 0.03357149036416625
+- id: hue-165-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.048810565515841516
+    y: 0.09
+    z: 0.0671429807283325
+- id: hue-165-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.09762113103168303
+    y: 0.18
+    z: 0.134285961456665
+- id: hue-165-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.19524226206336606
+    y: 0.36
+    z: 0.26857192291333
+- id: hue-165-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3904845241267321
+    y: 0.72
+    z: 0.53714384582666
+- id: hue-165-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7809690482534642
+    y: 1.44
+    z: 1.07428769165332
+- id: hue-165-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.002518392679107391
+    y: 0.005625
+    z: 0.0037490615758007267
+- id: hue-165-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005036785358214782
+    y: 0.01125
+    z: 0.007498123151601453
+- id: hue-165-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010073570716429564
+    y: 0.0225
+    z: 0.014996246303202907
+- id: hue-165-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.020147141432859127
+    y: 0.045
+    z: 0.029992492606405814
+- id: hue-165-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.040294282865718255
+    y: 0.09
+    z: 0.05998498521281163
+- id: hue-165-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08058856573143651
+    y: 0.18
+    z: 0.11996997042562325
+- id: hue-165-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.16117713146287302
+    y: 0.36
+    z: 0.2399399408512465
+- id: hue-165-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.32235426292574604
+    y: 0.72
+    z: 0.479879881702493
+- id: hue-165-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6447085258514921
+    y: 1.44
+    z: 0.959759763404986
+- id: hue-180-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004597534490074046
+    y: 0.005625
+    z: 0.006118522158897005
+- id: hue-180-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009195068980148092
+    y: 0.01125
+    z: 0.01223704431779401
+- id: hue-180-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.018390137960296184
+    y: 0.0225
+    z: 0.02447408863558802
+- id: hue-180-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03678027592059237
+    y: 0.045
+    z: 0.04894817727117604
+- id: hue-180-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07356055184118473
+    y: 0.09
+    z: 0.09789635454235208
+- id: hue-180-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.14712110368236947
+    y: 0.18
+    z: 0.19579270908470417
+- id: hue-180-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.29424220736473894
+    y: 0.36
+    z: 0.39158541816940834
+- id: hue-180-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5884844147294779
+    y: 0.72
+    z: 0.7831708363388167
+- id: hue-180-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.1769688294589558
+    y: 1.44
+    z: 1.5663416726776334
+- id: hue-180-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.003912185563552666
+    y: 0.005625
+    z: 0.006111723689262578
+- id: hue-180-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007824371127105332
+    y: 0.01125
+    z: 0.012223447378525156
+- id: hue-180-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.015648742254210663
+    y: 0.0225
+    z: 0.02444689475705031
+- id: hue-180-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.031297484508421326
+    y: 0.045
+    z: 0.04889378951410062
+- id: hue-180-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06259496901684265
+    y: 0.09
+    z: 0.09778757902820125
+- id: hue-180-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1251899380336853
+    y: 0.18
+    z: 0.1955751580564025
+- id: hue-180-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2503798760673706
+    y: 0.36
+    z: 0.391150316112805
+- id: hue-180-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5007597521347412
+    y: 0.72
+    z: 0.78230063222561
+- id: hue-180-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.0015195042694824
+    y: 1.44
+    z: 1.56460126445122
+- id: hue-180-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0032825351977592834
+    y: 0.005625
+    z: 0.006105477733769686
+- id: hue-180-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.006565070395518567
+    y: 0.01125
+    z: 0.012210955467539373
+- id: hue-180-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.013130140791037134
+    y: 0.0225
+    z: 0.024421910935078745
+- id: hue-180-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.026260281582074267
+    y: 0.045
+    z: 0.04884382187015749
+- id: hue-180-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.052520563164148534
+    y: 0.09
+    z: 0.09768764374031498
+- id: hue-180-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.10504112632829707
+    y: 0.18
+    z: 0.19537528748062996
+- id: hue-180-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.21008225265659414
+    y: 0.36
+    z: 0.3907505749612599
+- id: hue-180-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.4201645053131883
+    y: 0.72
+    z: 0.7815011499225198
+- id: hue-180-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.8403290106263765
+    y: 1.44
+    z: 1.5630022998450397
+- id: hue-180-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0027020585662770233
+    y: 0.005625
+    z: 0.006099719567965507
+- id: hue-180-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005404117132554047
+    y: 0.01125
+    z: 0.012199439135931014
+- id: hue-180-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010808234265108093
+    y: 0.0225
+    z: 0.024398878271862028
+- id: hue-180-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.021616468530216187
+    y: 0.045
+    z: 0.048797756543724057
+- id: hue-180-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04323293706043237
+    y: 0.09
+    z: 0.09759551308744811
+- id: hue-180-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08646587412086475
+    y: 0.18
+    z: 0.19519102617489623
+- id: hue-180-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1729317482417295
+    y: 0.36
+    z: 0.39038205234979245
+- id: hue-180-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.345863496483459
+    y: 0.72
+    z: 0.7807641046995849
+- id: hue-180-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.691726992966918
+    y: 1.44
+    z: 1.5615282093991698
+- id: hue-195-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004833546386663873
+    y: 0.005625
+    z: 0.0066029003247932636
+- id: hue-195-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009667092773327746
+    y: 0.01125
+    z: 0.013205800649586527
+- id: hue-195-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.019334185546655492
+    y: 0.0225
+    z: 0.026411601299173054
+- id: hue-195-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.038668371093310984
+    y: 0.045
+    z: 0.05282320259834611
+- id: hue-195-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07733674218662197
+    y: 0.09
+    z: 0.10564640519669222
+- id: hue-195-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.15467348437324394
+    y: 0.18
+    z: 0.21129281039338443
+- id: hue-195-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.30934696874648787
+    y: 0.36
+    z: 0.42258562078676887
+- id: hue-195-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6186939374929757
+    y: 0.72
+    z: 0.8451712415735377
+- id: hue-195-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.2373878749859515
+    y: 1.44
+    z: 1.6903424831470755
+- id: hue-195-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004322922128451514
+    y: 0.005625
+    z: 0.007077856614942425
+- id: hue-195-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008645844256903028
+    y: 0.01125
+    z: 0.01415571322988485
+- id: hue-195-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.017291688513806056
+    y: 0.0225
+    z: 0.0283114264597697
+- id: hue-195-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03458337702761211
+    y: 0.045
+    z: 0.0566228529195394
+- id: hue-195-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06916675405522422
+    y: 0.09
+    z: 0.1132457058390788
+- id: hue-195-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.13833350811044845
+    y: 0.18
+    z: 0.2264914116781576
+- id: hue-195-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2766670162208969
+    y: 0.36
+    z: 0.4529828233563152
+- id: hue-195-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5533340324417938
+    y: 0.72
+    z: 0.9059656467126304
+- id: hue-195-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.1066680648835876
+    y: 1.44
+    z: 1.8119312934252607
+- id: hue-195-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0038144283969479696
+    y: 0.005625
+    z: 0.0075508311992767705
+- id: hue-195-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007628856793895939
+    y: 0.01125
+    z: 0.015101662398553541
+- id: hue-195-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.015257713587791879
+    y: 0.0225
+    z: 0.030203324797107082
+- id: hue-195-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.030515427175583757
+    y: 0.045
+    z: 0.060406649594214164
+- id: hue-195-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.061030854351167514
+    y: 0.09
+    z: 0.12081329918842833
+- id: hue-195-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.12206170870233503
+    y: 0.18
+    z: 0.24162659837685665
+- id: hue-195-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.24412341740467006
+    y: 0.36
+    z: 0.4832531967537133
+- id: hue-195-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.4882468348093401
+    y: 0.72
+    z: 0.9665063935074266
+- id: hue-195-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9764936696186802
+    y: 1.44
+    z: 1.9330127870148532
+- id: hue-195-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0033080518858106317
+    y: 0.005625
+    z: 0.008021836454668385
+- id: hue-195-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.006616103771621263
+    y: 0.01125
+    z: 0.01604367290933677
+- id: hue-195-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.013232207543242527
+    y: 0.0225
+    z: 0.03208734581867354
+- id: hue-195-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.026464415086485053
+    y: 0.045
+    z: 0.06417469163734708
+- id: hue-195-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05292883017297011
+    y: 0.09
+    z: 0.12834938327469417
+- id: hue-195-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.10585766034594021
+    y: 0.18
+    z: 0.25669876654938834
+- id: hue-195-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.21171532069188043
+    y: 0.36
+    z: 0.5133975330987767
+- id: hue-195-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.42343064138376085
+    y: 0.72
+    z: 1.0267950661975533
+- id: hue-195-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.8468612827675217
+    y: 1.44
+    z: 2.0535901323951067
+- id: hue-210-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004949809459965512
+    y: 0.005625
+    z: 0.007026300027609799
+- id: hue-210-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009899618919931024
+    y: 0.01125
+    z: 0.014052600055219598
+- id: hue-210-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01979923783986205
+    y: 0.0225
+    z: 0.028105200110439196
+- id: hue-210-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0395984756797241
+    y: 0.045
+    z: 0.05621040022087839
+- id: hue-210-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0791969513594482
+    y: 0.09
+    z: 0.11242080044175679
+- id: hue-210-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1583939027188964
+    y: 0.18
+    z: 0.22484160088351357
+- id: hue-210-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3167878054377928
+    y: 0.36
+    z: 0.44968320176702714
+- id: hue-210-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6335756108755856
+    y: 0.72
+    z: 0.8993664035340543
+- id: hue-210-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.2671512217511711
+    y: 1.44
+    z: 1.7987328070681086
+- id: hue-210-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0045292252490121854
+    y: 0.005625
+    z: 0.007981326940247772
+- id: hue-210-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009058450498024371
+    y: 0.01125
+    z: 0.015962653880495545
+- id: hue-210-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.018116900996048742
+    y: 0.0225
+    z: 0.03192530776099109
+- id: hue-210-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.036233801992097484
+    y: 0.045
+    z: 0.06385061552198218
+- id: hue-210-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07246760398419497
+    y: 0.09
+    z: 0.12770123104396436
+- id: hue-210-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.14493520796838993
+    y: 0.18
+    z: 0.2554024620879287
+- id: hue-210-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.28987041593677987
+    y: 0.36
+    z: 0.5108049241758574
+- id: hue-210-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5797408318735597
+    y: 0.72
+    z: 1.0216098483517149
+- id: hue-210-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.1594816637471195
+    y: 1.44
+    z: 2.0432196967034297
+- id: hue-210-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004082299847384927
+    y: 0.005625
+    z: 0.00899616719192553
+- id: hue-210-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008164599694769854
+    y: 0.01125
+    z: 0.01799233438385106
+- id: hue-210-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01632919938953971
+    y: 0.0225
+    z: 0.03598466876770212
+- id: hue-210-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03265839877907942
+    y: 0.045
+    z: 0.07196933753540424
+- id: hue-210-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06531679755815883
+    y: 0.09
+    z: 0.14393867507080849
+- id: hue-210-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.13063359511631767
+    y: 0.18
+    z: 0.28787735014161697
+- id: hue-210-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.26126719023263534
+    y: 0.36
+    z: 0.5757547002832339
+- id: hue-210-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5225343804652707
+    y: 0.72
+    z: 1.1515094005664679
+- id: hue-210-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.0450687609305414
+    y: 1.44
+    z: 2.3030188011329358
+- id: hue-210-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.003606478633811186
+    y: 0.005625
+    z: 0.010076621599705031
+- id: hue-210-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007212957267622372
+    y: 0.01125
+    z: 0.020153243199410063
+- id: hue-210-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.014425914535244744
+    y: 0.0225
+    z: 0.040306486398820125
+- id: hue-210-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.028851829070489488
+    y: 0.045
+    z: 0.08061297279764025
+- id: hue-210-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.057703658140978976
+    y: 0.09
+    z: 0.1612259455952805
+- id: hue-210-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.11540731628195795
+    y: 0.18
+    z: 0.322451891190561
+- id: hue-210-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2308146325639159
+    y: 0.36
+    z: 0.644903782381122
+- id: hue-210-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.4616292651278318
+    y: 0.72
+    z: 1.289807564762244
+- id: hue-210-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9232585302556636
+    y: 1.44
+    z: 2.579615129524488
+- id: hue-225-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005050696044908554
+    y: 0.005625
+    z: 0.007318120240686138
+- id: hue-225-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010101392089817108
+    y: 0.01125
+    z: 0.014636240481372275
+- id: hue-225-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.020202784179634215
+    y: 0.0225
+    z: 0.02927248096274455
+- id: hue-225-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04040556835926843
+    y: 0.045
+    z: 0.0585449619254891
+- id: hue-225-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08081113671853686
+    y: 0.09
+    z: 0.1170899238509782
+- id: hue-225-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.16162227343707372
+    y: 0.18
+    z: 0.2341798477019564
+- id: hue-225-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.32324454687414744
+    y: 0.36
+    z: 0.4683596954039128
+- id: hue-225-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6464890937482949
+    y: 0.72
+    z: 0.9367193908078256
+- id: hue-225-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.2929781874965898
+    y: 1.44
+    z: 1.8734387816156512
+- id: hue-225-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004722358278560671
+    y: 0.005625
+    z: 0.008642240701918665
+- id: hue-225-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009444716557121343
+    y: 0.01125
+    z: 0.01728448140383733
+- id: hue-225-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.018889433114242685
+    y: 0.0225
+    z: 0.03456896280767466
+- id: hue-225-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03777886622848537
+    y: 0.045
+    z: 0.06913792561534932
+- id: hue-225-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07555773245697074
+    y: 0.09
+    z: 0.13827585123069863
+- id: hue-225-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.15111546491394148
+    y: 0.18
+    z: 0.27655170246139726
+- id: hue-225-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.30223092982788297
+    y: 0.36
+    z: 0.5531034049227945
+- id: hue-225-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6044618596557659
+    y: 0.72
+    z: 1.106206809845589
+- id: hue-225-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.2089237193115319
+    y: 1.44
+    z: 2.212413619691178
+- id: hue-225-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004355550995834733
+    y: 0.005625
+    z: 0.010121501019088252
+- id: hue-225-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008711101991669466
+    y: 0.01125
+    z: 0.020243002038176503
+- id: hue-225-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.017422203983338932
+    y: 0.0225
+    z: 0.040486004076353006
+- id: hue-225-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.034844407966677864
+    y: 0.045
+    z: 0.08097200815270601
+- id: hue-225-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06968881593335573
+    y: 0.09
+    z: 0.16194401630541203
+- id: hue-225-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.13937763186671145
+    y: 0.18
+    z: 0.32388803261082405
+- id: hue-225-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2787552637334229
+    y: 0.36
+    z: 0.6477760652216481
+- id: hue-225-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5575105274668458
+    y: 0.72
+    z: 1.2955521304432962
+- id: hue-225-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.1150210549336916
+    y: 1.44
+    z: 2.5911042608865924
+- id: hue-225-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.003943092592291603
+    y: 0.005625
+    z: 0.011784863164763898
+- id: hue-225-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007886185184583207
+    y: 0.01125
+    z: 0.023569726329527797
+- id: hue-225-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.015772370369166414
+    y: 0.0225
+    z: 0.04713945265905559
+- id: hue-225-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03154474073833283
+    y: 0.045
+    z: 0.09427890531811119
+- id: hue-225-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06308948147666565
+    y: 0.09
+    z: 0.18855781063622237
+- id: hue-225-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1261789629533313
+    y: 0.18
+    z: 0.37711562127244475
+- id: hue-225-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2523579259066626
+    y: 0.36
+    z: 0.7542312425448895
+- id: hue-225-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5047158518133252
+    y: 0.72
+    z: 1.508462485089779
+- id: hue-225-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.0094317036266505
+    y: 1.44
+    z: 3.016924970179558
+- id: hue-240-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005141227389063602
+    y: 0.005625
+    z: 0.007562100424933514
+- id: hue-240-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010282454778127203
+    y: 0.01125
+    z: 0.015124200849867028
+- id: hue-240-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.020564909556254406
+    y: 0.0225
+    z: 0.030248401699734057
+- id: hue-240-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04112981911250881
+    y: 0.045
+    z: 0.06049680339946811
+- id: hue-240-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08225963822501763
+    y: 0.09
+    z: 0.12099360679893623
+- id: hue-240-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.16451927645003525
+    y: 0.18
+    z: 0.24198721359787245
+- id: hue-240-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3290385529000705
+    y: 0.36
+    z: 0.4839744271957449
+- id: hue-240-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.658077105800141
+    y: 0.72
+    z: 0.9679488543914898
+- id: hue-240-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.316154211600282
+    y: 1.44
+    z: 1.9358977087829796
+- id: hue-240-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004904314631652612
+    y: 0.005625
+    z: 0.009221113723833354
+- id: hue-240-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009808629263305224
+    y: 0.01125
+    z: 0.018442227447666708
+- id: hue-240-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.019617258526610448
+    y: 0.0225
+    z: 0.036884454895333416
+- id: hue-240-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.039234517053220896
+    y: 0.045
+    z: 0.07376890979066683
+- id: hue-240-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07846903410644179
+    y: 0.09
+    z: 0.14753781958133366
+- id: hue-240-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.15693806821288359
+    y: 0.18
+    z: 0.2950756391626673
+- id: hue-240-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.31387613642576717
+    y: 0.36
+    z: 0.5901512783253346
+- id: hue-240-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6277522728515343
+    y: 0.72
+    z: 1.1803025566506693
+- id: hue-240-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.2555045457030687
+    y: 1.44
+    z: 2.3606051133013386
+- id: hue-240-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004627545109610562
+    y: 0.005625
+    z: 0.011159229352623094
+- id: hue-240-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009255090219221124
+    y: 0.01125
+    z: 0.022318458705246187
+- id: hue-240-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01851018043844225
+    y: 0.0225
+    z: 0.044636917410492374
+- id: hue-240-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0370203608768845
+    y: 0.045
+    z: 0.08927383482098475
+- id: hue-240-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.074040721753769
+    y: 0.09
+    z: 0.1785476696419695
+- id: hue-240-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.148081443507538
+    y: 0.18
+    z: 0.357095339283939
+- id: hue-240-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.296162887015076
+    y: 0.36
+    z: 0.714190678567878
+- id: hue-240-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.592325774030152
+    y: 0.72
+    z: 1.428381357135756
+- id: hue-240-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.184651548060304
+    y: 1.44
+    z: 2.856762714271512
+- id: hue-240-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004299937191060801
+    y: 0.005625
+    z: 0.013453347658612374
+- id: hue-240-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008599874382121602
+    y: 0.01125
+    z: 0.026906695317224748
+- id: hue-240-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.017199748764243204
+    y: 0.0225
+    z: 0.053813390634449496
+- id: hue-240-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03439949752848641
+    y: 0.045
+    z: 0.10762678126889899
+- id: hue-240-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06879899505697282
+    y: 0.09
+    z: 0.21525356253779798
+- id: hue-240-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.13759799011394563
+    y: 0.18
+    z: 0.43050712507559596
+- id: hue-240-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.27519598022789127
+    y: 0.36
+    z: 0.8610142501511919
+- id: hue-240-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5503919604557825
+    y: 0.72
+    z: 1.7220285003023839
+- id: hue-240-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.100783920911565
+    y: 1.44
+    z: 3.4440570006047677
+- id: hue-255-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0052288807729597925
+    y: 0.005625
+    z: 0.007826234413549168
+- id: hue-255-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010457761545919585
+    y: 0.01125
+    z: 0.015652468827098337
+- id: hue-255-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02091552309183917
+    y: 0.0225
+    z: 0.031304937654196674
+- id: hue-255-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04183104618367834
+    y: 0.045
+    z: 0.06260987530839335
+- id: hue-255-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08366209236735668
+    y: 0.09
+    z: 0.1252197506167867
+- id: hue-255-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.16732418473471336
+    y: 0.18
+    z: 0.2504395012335734
+- id: hue-255-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3346483694694267
+    y: 0.36
+    z: 0.5008790024671468
+- id: hue-255-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6692967389388534
+    y: 0.72
+    z: 1.0017580049342936
+- id: hue-255-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.3385934778777069
+    y: 1.44
+    z: 2.003516009868587
+- id: hue-255-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005087484696585315
+    y: 0.005625
+    z: 0.00987346044289189
+- id: hue-255-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01017496939317063
+    y: 0.01125
+    z: 0.01974692088578378
+- id: hue-255-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02034993878634126
+    y: 0.0225
+    z: 0.03949384177156756
+- id: hue-255-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04069987757268252
+    y: 0.045
+    z: 0.07898768354313512
+- id: hue-255-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08139975514536504
+    y: 0.09
+    z: 0.15797536708627025
+- id: hue-255-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1627995102907301
+    y: 0.18
+    z: 0.3159507341725405
+- id: hue-255-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3255990205814602
+    y: 0.36
+    z: 0.631901468345081
+- id: hue-255-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6511980411629203
+    y: 0.72
+    z: 1.263802936690162
+- id: hue-255-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.3023960823258407
+    y: 1.44
+    z: 2.527605873380324
+- id: hue-255-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0049139588604225825
+    y: 0.005625
+    z: 0.012385882411482864
+- id: hue-255-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009827917720845165
+    y: 0.01125
+    z: 0.02477176482296573
+- id: hue-255-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01965583544169033
+    y: 0.0225
+    z: 0.04954352964593146
+- id: hue-255-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03931167088338066
+    y: 0.045
+    z: 0.09908705929186291
+- id: hue-255-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07862334176676132
+    y: 0.09
+    z: 0.19817411858372583
+- id: hue-255-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.15724668353352264
+    y: 0.18
+    z: 0.39634823716745166
+- id: hue-255-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3144933670670453
+    y: 0.36
+    z: 0.7926964743349033
+- id: hue-255-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6289867341340906
+    y: 0.72
+    z: 1.5853929486698066
+- id: hue-255-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.2579734682681811
+    y: 1.44
+    z: 3.1707858973396132
+- id: hue-255-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.004695948142685782
+    y: 0.005625
+    z: 0.01554238595437061
+- id: hue-255-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009391896285371563
+    y: 0.01125
+    z: 0.03108477190874122
+- id: hue-255-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.018783792570743127
+    y: 0.0225
+    z: 0.06216954381748244
+- id: hue-255-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.037567585141486254
+    y: 0.045
+    z: 0.12433908763496487
+- id: hue-255-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07513517028297251
+    y: 0.09
+    z: 0.24867817526992975
+- id: hue-255-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.15027034056594502
+    y: 0.18
+    z: 0.4973563505398595
+- id: hue-255-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.30054068113189003
+    y: 0.36
+    z: 0.994712701079719
+- id: hue-255-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6010813622637801
+    y: 0.72
+    z: 1.989425402159438
+- id: hue-255-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.2021627245275601
+    y: 1.44
+    z: 3.978850804318876
+- id: hue-270-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005329404298311899
+    y: 0.005625
+    z: 0.00789487058372834
+- id: hue-270-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010658808596623798
+    y: 0.01125
+    z: 0.01578974116745668
+- id: hue-270-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.021317617193247596
+    y: 0.0225
+    z: 0.03157948233491336
+- id: hue-270-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04263523438649519
+    y: 0.045
+    z: 0.06315896466982672
+- id: hue-270-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08527046877299038
+    y: 0.09
+    z: 0.12631792933965344
+- id: hue-270-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.17054093754598076
+    y: 0.18
+    z: 0.2526358586793069
+- id: hue-270-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.34108187509196153
+    y: 0.36
+    z: 0.5052717173586138
+- id: hue-270-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6821637501839231
+    y: 0.72
+    z: 1.0105434347172275
+- id: hue-270-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.3643275003678461
+    y: 1.44
+    z: 2.021086869434455
+- id: hue-270-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005308632616709193
+    y: 0.005625
+    z: 0.01006771654680578
+- id: hue-270-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010617265233418386
+    y: 0.01125
+    z: 0.02013543309361156
+- id: hue-270-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.021234530466836772
+    y: 0.0225
+    z: 0.04027086618722312
+- id: hue-270-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.042469060933673544
+    y: 0.045
+    z: 0.08054173237444624
+- id: hue-270-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08493812186734709
+    y: 0.09
+    z: 0.16108346474889249
+- id: hue-270-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.16987624373469418
+    y: 0.18
+    z: 0.32216692949778497
+- id: hue-270-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.33975248746938835
+    y: 0.36
+    z: 0.6443338589955699
+- id: hue-270-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6795049749387767
+    y: 0.72
+    z: 1.2886677179911399
+- id: hue-270-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.3590099498775534
+    y: 1.44
+    z: 2.5773354359822798
+- id: hue-270-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005282506480449142
+    y: 0.005625
+    z: 0.012800671479836745
+- id: hue-270-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010565012960898283
+    y: 0.01125
+    z: 0.02560134295967349
+- id: hue-270-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.021130025921796566
+    y: 0.0225
+    z: 0.05120268591934698
+- id: hue-270-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04226005184359313
+    y: 0.045
+    z: 0.10240537183869396
+- id: hue-270-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08452010368718627
+    y: 0.09
+    z: 0.2048107436773879
+- id: hue-270-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.16904020737437253
+    y: 0.18
+    z: 0.4096214873547758
+- id: hue-270-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.33808041474874506
+    y: 0.36
+    z: 0.8192429747095517
+- id: hue-270-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6761608294974901
+    y: 0.72
+    z: 1.6384859494191033
+- id: hue-270-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.3523216589949802
+    y: 1.44
+    z: 3.2769718988382066
+- id: hue-270-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005248649179167066
+    y: 0.005625
+    z: 0.016342353940532545
+- id: hue-270-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010497298358334132
+    y: 0.01125
+    z: 0.03268470788106509
+- id: hue-270-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.020994596716668264
+    y: 0.0225
+    z: 0.06536941576213018
+- id: hue-270-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04198919343333653
+    y: 0.045
+    z: 0.13073883152426036
+- id: hue-270-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08397838686667305
+    y: 0.09
+    z: 0.2614776630485207
+- id: hue-270-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1679567737333461
+    y: 0.18
+    z: 0.5229553260970414
+- id: hue-270-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3359135474666922
+    y: 0.36
+    z: 1.0459106521940829
+- id: hue-270-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6718270949333844
+    y: 0.72
+    z: 2.0918213043881657
+- id: hue-270-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.3436541898667689
+    y: 1.44
+    z: 4.183642608776331
+- id: hue-285-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005440292594762953
+    y: 0.005625
+    z: 0.007813493512623521
+- id: hue-285-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.010880585189525905
+    y: 0.01125
+    z: 0.015626987025247042
+- id: hue-285-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02176117037905181
+    y: 0.0225
+    z: 0.031253974050494085
+- id: hue-285-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04352234075810362
+    y: 0.045
+    z: 0.06250794810098817
+- id: hue-285-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08704468151620724
+    y: 0.09
+    z: 0.12501589620197634
+- id: hue-285-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.17408936303241448
+    y: 0.18
+    z: 0.2500317924039527
+- id: hue-285-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.34817872606482897
+    y: 0.36
+    z: 0.5000635848079054
+- id: hue-285-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.6963574521296579
+    y: 0.72
+    z: 1.0001271696158107
+- id: hue-285-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.3927149042593159
+    y: 1.44
+    z: 2.0002543392316214
+- id: hue-285-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005556133575112822
+    y: 0.005625
+    z: 0.00989362611692799
+- id: hue-285-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.011112267150225645
+    y: 0.01125
+    z: 0.01978725223385598
+- id: hue-285-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02222453430045129
+    y: 0.0225
+    z: 0.03957450446771196
+- id: hue-285-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04444906860090258
+    y: 0.045
+    z: 0.07914900893542393
+- id: hue-285-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08889813720180516
+    y: 0.09
+    z: 0.15829801787084785
+- id: hue-285-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.17779627440361032
+    y: 0.18
+    z: 0.3165960357416957
+- id: hue-285-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.35559254880722063
+    y: 0.36
+    z: 0.6331920714833914
+- id: hue-285-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7111850976144413
+    y: 0.72
+    z: 1.2663841429667828
+- id: hue-285-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.4223701952288825
+    y: 1.44
+    z: 2.5327682859335656
+- id: hue-285-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0057024710598767014
+    y: 0.005625
+    z: 0.01252137816434573
+- id: hue-285-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.011404942119753403
+    y: 0.01125
+    z: 0.02504275632869146
+- id: hue-285-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.022809884239506806
+    y: 0.0225
+    z: 0.05008551265738292
+- id: hue-285-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04561976847901361
+    y: 0.045
+    z: 0.10017102531476584
+- id: hue-285-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.09123953695802722
+    y: 0.09
+    z: 0.20034205062953167
+- id: hue-285-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.18247907391605445
+    y: 0.18
+    z: 0.40068410125906334
+- id: hue-285-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3649581478321089
+    y: 0.36
+    z: 0.8013682025181267
+- id: hue-285-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7299162956642178
+    y: 0.72
+    z: 1.6027364050362534
+- id: hue-285-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.4598325913284356
+    y: 1.44
+    z: 3.2054728100725067
+- id: hue-285-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005893173399162649
+    y: 0.005625
+    z: 0.015945780758900203
+- id: hue-285-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.011786346798325298
+    y: 0.01125
+    z: 0.031891561517800406
+- id: hue-285-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.023572693596650596
+    y: 0.0225
+    z: 0.06378312303560081
+- id: hue-285-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04714538719330119
+    y: 0.045
+    z: 0.12756624607120162
+- id: hue-285-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.09429077438660238
+    y: 0.09
+    z: 0.25513249214240324
+- id: hue-285-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.18858154877320477
+    y: 0.18
+    z: 0.5102649842848065
+- id: hue-285-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.37716309754640953
+    y: 0.36
+    z: 1.020529968569613
+- id: hue-285-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7543261950928191
+    y: 0.72
+    z: 2.041059937139226
+- id: hue-285-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.5086523901856381
+    y: 1.44
+    z: 4.082119874278452
+- id: hue-300-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005559768736453017
+    y: 0.005625
+    z: 0.007618632553447042
+- id: hue-300-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.011119537472906034
+    y: 0.01125
+    z: 0.015237265106894084
+- id: hue-300-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02223907494581207
+    y: 0.0225
+    z: 0.030474530213788167
+- id: hue-300-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04447814989162414
+    y: 0.045
+    z: 0.060949060427576335
+- id: hue-300-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.08895629978324827
+    y: 0.09
+    z: 0.12189812085515267
+- id: hue-300-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.17791259956649655
+    y: 0.18
+    z: 0.24379624171030534
+- id: hue-300-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3558251991329931
+    y: 0.36
+    z: 0.4875924834206107
+- id: hue-300-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7116503982659862
+    y: 0.72
+    z: 0.9751849668412214
+- id: hue-300-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.4233007965319724
+    y: 1.44
+    z: 1.9503699336824427
+- id: hue-300-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005820546509669747
+    y: 0.005625
+    z: 0.009442248903365185
+- id: hue-300-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.011641093019339493
+    y: 0.01125
+    z: 0.01888449780673037
+- id: hue-300-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.023282186038678987
+    y: 0.0225
+    z: 0.03776899561346074
+- id: hue-300-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.046564372077357974
+    y: 0.045
+    z: 0.07553799122692148
+- id: hue-300-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.09312874415471595
+    y: 0.09
+    z: 0.15107598245384296
+- id: hue-300-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1862574883094319
+    y: 0.18
+    z: 0.3021519649076859
+- id: hue-300-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3725149766188638
+    y: 0.36
+    z: 0.6043039298153718
+- id: hue-300-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7450299532377276
+    y: 0.72
+    z: 1.2086078596307437
+- id: hue-300-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.4900599064754552
+    y: 1.44
+    z: 2.4172157192614874
+- id: hue-300-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.006146347720285042
+    y: 0.005625
+    z: 0.011720573498181753
+- id: hue-300-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.012292695440570083
+    y: 0.01125
+    z: 0.023441146996363505
+- id: hue-300-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.024585390881140166
+    y: 0.0225
+    z: 0.04688229399272701
+- id: hue-300-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04917078176228033
+    y: 0.045
+    z: 0.09376458798545402
+- id: hue-300-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.09834156352456067
+    y: 0.09
+    z: 0.18752917597090804
+- id: hue-300-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.19668312704912133
+    y: 0.18
+    z: 0.3750583519418161
+- id: hue-300-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.39336625409824266
+    y: 0.36
+    z: 0.7501167038836322
+- id: hue-300-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7867325081964853
+    y: 0.72
+    z: 1.5002334077672643
+- id: hue-300-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.5734650163929707
+    y: 1.44
+    z: 3.0004668155345287
+- id: hue-300-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.006564956048750618
+    y: 0.005625
+    z: 0.014647897336349863
+- id: hue-300-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.013129912097501237
+    y: 0.01125
+    z: 0.029295794672699726
+- id: hue-300-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.026259824195002474
+    y: 0.0225
+    z: 0.05859158934539945
+- id: hue-300-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05251964839000495
+    y: 0.045
+    z: 0.1171831786907989
+- id: hue-300-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1050392967800099
+    y: 0.09
+    z: 0.2343663573815978
+- id: hue-300-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2100785935600198
+    y: 0.18
+    z: 0.4687327147631956
+- id: hue-300-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.4201571871200396
+    y: 0.36
+    z: 0.9374654295263912
+- id: hue-300-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.8403143742400792
+    y: 0.72
+    z: 1.8749308590527825
+- id: hue-300-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.6806287484801583
+    y: 1.44
+    z: 3.749861718105565
+- id: hue-315-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0057362699160451395
+    y: 0.005625
+    z: 0.007511566524184249
+- id: hue-315-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.011472539832090279
+    y: 0.01125
+    z: 0.015023133048368498
+- id: hue-315-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.022945079664180558
+    y: 0.0225
+    z: 0.030046266096736995
+- id: hue-315-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.045890159328361116
+    y: 0.045
+    z: 0.06009253219347399
+- id: hue-315-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.09178031865672223
+    y: 0.09
+    z: 0.12018506438694798
+- id: hue-315-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.18356063731344446
+    y: 0.18
+    z: 0.24037012877389596
+- id: hue-315-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3671212746268889
+    y: 0.36
+    z: 0.4807402575477919
+- id: hue-315-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7342425492537779
+    y: 0.72
+    z: 0.9614805150955839
+- id: hue-315-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.4684850985075557
+    y: 1.44
+    z: 1.9229610301911677
+- id: hue-315-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0062166060881035405
+    y: 0.005625
+    z: 0.009218330774197977
+- id: hue-315-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.012433212176207081
+    y: 0.01125
+    z: 0.018436661548395954
+- id: hue-315-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.024866424352414162
+    y: 0.0225
+    z: 0.03687332309679191
+- id: hue-315-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.049732848704828324
+    y: 0.045
+    z: 0.07374664619358381
+- id: hue-315-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.09946569740965665
+    y: 0.09
+    z: 0.14749329238716763
+- id: hue-315-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1989313948193133
+    y: 0.18
+    z: 0.29498658477433526
+- id: hue-315-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3978627896386266
+    y: 0.36
+    z: 0.5899731695486705
+- id: hue-315-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7957255792772532
+    y: 0.72
+    z: 1.179946339097341
+- id: hue-315-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.5914511585545064
+    y: 1.44
+    z: 2.359892678194682
+- id: hue-315-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.006822863399451477
+    y: 0.005625
+    z: 0.011372526867496359
+- id: hue-315-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.013645726798902955
+    y: 0.01125
+    z: 0.022745053734992717
+- id: hue-315-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02729145359780591
+    y: 0.0225
+    z: 0.045490107469985434
+- id: hue-315-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05458290719561182
+    y: 0.045
+    z: 0.09098021493997087
+- id: hue-315-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.10916581439122364
+    y: 0.09
+    z: 0.18196042987994174
+- id: hue-315-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.21833162878244727
+    y: 0.18
+    z: 0.3639208597598835
+- id: hue-315-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.43666325756489455
+    y: 0.36
+    z: 0.727841719519767
+- id: hue-315-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.8733265151297891
+    y: 0.72
+    z: 1.455683439039534
+- id: hue-315-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.7466530302595782
+    y: 1.44
+    z: 2.911366878079068
+- id: hue-315-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007612026972943341
+    y: 0.005625
+    z: 0.014176638348164182
+- id: hue-315-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.015224053945886683
+    y: 0.01125
+    z: 0.028353276696328363
+- id: hue-315-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.030448107891773366
+    y: 0.0225
+    z: 0.056706553392656726
+- id: hue-315-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06089621578354673
+    y: 0.045
+    z: 0.11341310678531345
+- id: hue-315-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.12179243156709346
+    y: 0.09
+    z: 0.2268262135706269
+- id: hue-315-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.24358486313418692
+    y: 0.18
+    z: 0.4536524271412538
+- id: hue-315-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.48716972626837385
+    y: 0.36
+    z: 0.9073048542825076
+- id: hue-315-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9743394525367477
+    y: 0.72
+    z: 1.8146097085650152
+- id: hue-315-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.9486789050734954
+    y: 1.44
+    z: 3.6292194171300305
+- id: hue-330-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.005964056932799287
+    y: 0.005625
+    z: 0.007241989418857373
+- id: hue-330-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.011928113865598574
+    y: 0.01125
+    z: 0.014483978837714746
+- id: hue-330-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02385622773119715
+    y: 0.0225
+    z: 0.028967957675429493
+- id: hue-330-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0477124554623943
+    y: 0.045
+    z: 0.057935915350858985
+- id: hue-330-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.0954249109247886
+    y: 0.09
+    z: 0.11587183070171797
+- id: hue-330-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.1908498218495772
+    y: 0.18
+    z: 0.23174366140343594
+- id: hue-330-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3816996436991544
+    y: 0.36
+    z: 0.4634873228068719
+- id: hue-330-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7633992873983088
+    y: 0.72
+    z: 0.9269746456137438
+- id: hue-330-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.5267985747966175
+    y: 1.44
+    z: 1.8539492912274875
+- id: hue-330-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.006721224761054891
+    y: 0.005625
+    z: 0.00860992099662228
+- id: hue-330-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.013442449522109781
+    y: 0.01125
+    z: 0.01721984199324456
+- id: hue-330-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.026884899044219562
+    y: 0.0225
+    z: 0.03443968398648912
+- id: hue-330-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.053769798088439125
+    y: 0.045
+    z: 0.06887936797297824
+- id: hue-330-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.10753959617687825
+    y: 0.09
+    z: 0.13775873594595647
+- id: hue-330-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2150791923537565
+    y: 0.18
+    z: 0.27551747189191295
+- id: hue-330-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.430158384707513
+    y: 0.36
+    z: 0.5510349437838259
+- id: hue-330-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.860316769415026
+    y: 0.72
+    z: 1.1020698875676518
+- id: hue-330-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.720633538830052
+    y: 1.44
+    z: 2.2041397751353036
+- id: hue-330-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007671025417287256
+    y: 0.005625
+    z: 0.01032587122820486
+- id: hue-330-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.015342050834574511
+    y: 0.01125
+    z: 0.02065174245640972
+- id: hue-330-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.030684101669149023
+    y: 0.0225
+    z: 0.04130348491281944
+- id: hue-330-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.061368203338298045
+    y: 0.045
+    z: 0.08260696982563888
+- id: hue-330-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.12273640667659609
+    y: 0.09
+    z: 0.16521393965127776
+- id: hue-330-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.24547281335319218
+    y: 0.18
+    z: 0.3304278793025555
+- id: hue-330-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.49094562670638436
+    y: 0.36
+    z: 0.660855758605111
+- id: hue-330-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9818912534127687
+    y: 0.72
+    z: 1.321711517210222
+- id: hue-330-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.9637825068255375
+    y: 1.44
+    z: 2.643423034420444
+- id: hue-330-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008897685262248305
+    y: 0.005625
+    z: 0.012542007036515996
+- id: hue-330-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01779537052449661
+    y: 0.01125
+    z: 0.025084014073031992
+- id: hue-330-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.03559074104899322
+    y: 0.0225
+    z: 0.050168028146063984
+- id: hue-330-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07118148209798644
+    y: 0.045
+    z: 0.10033605629212797
+- id: hue-330-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.14236296419597289
+    y: 0.09
+    z: 0.20067211258425594
+- id: hue-330-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.28472592839194577
+    y: 0.18
+    z: 0.40134422516851187
+- id: hue-330-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5694518567838915
+    y: 0.36
+    z: 0.8026884503370237
+- id: hue-330-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.138903713567783
+    y: 0.72
+    z: 1.6053769006740475
+- id: hue-330-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 2.277807427135566
+    y: 1.44
+    z: 3.210753801348095
+- id: hue-345-20-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.00618426874210911
+    y: 0.005625
+    z: 0.006707230108734268
+- id: hue-345-20-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.01236853748421822
+    y: 0.01125
+    z: 0.013414460217468536
+- id: hue-345-20-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.02473707496843644
+    y: 0.0225
+    z: 0.02682892043493707
+- id: hue-345-20-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.04947414993687288
+    y: 0.045
+    z: 0.05365784086987414
+- id: hue-345-20-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.09894829987374576
+    y: 0.09
+    z: 0.10731568173974829
+- id: hue-345-20-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.19789659974749152
+    y: 0.18
+    z: 0.21463136347949657
+- id: hue-345-20-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.39579319949498304
+    y: 0.36
+    z: 0.42926272695899315
+- id: hue-345-20-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.7915863989899661
+    y: 0.72
+    z: 0.8585254539179863
+- id: hue-345-20-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.5831727979799322
+    y: 1.44
+    z: 1.7170509078359726
+- id: hue-345-40-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.007173932435602221
+    y: 0.005625
+    z: 0.007393749732858535
+- id: hue-345-40-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.014347864871204442
+    y: 0.01125
+    z: 0.01478749946571707
+- id: hue-345-40-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.028695729742408884
+    y: 0.0225
+    z: 0.02957499893143414
+- id: hue-345-40-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.05739145948481777
+    y: 0.045
+    z: 0.05914999786286828
+- id: hue-345-40-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.11478291896963554
+    y: 0.09
+    z: 0.11829999572573656
+- id: hue-345-40-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.22956583793927107
+    y: 0.18
+    z: 0.23659999145147312
+- id: hue-345-40-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.45913167587854214
+    y: 0.36
+    z: 0.47319998290294624
+- id: hue-345-40-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.9182633517570843
+    y: 0.72
+    z: 0.9463999658058925
+- id: hue-345-40-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.8365267035141686
+    y: 1.44
+    z: 1.892799931611785
+- id: hue-345-60-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.008360606424990534
+    y: 0.005625
+    z: 0.00821693339263031
+- id: hue-345-60-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.016721212849981067
+    y: 0.01125
+    z: 0.01643386678526062
+- id: hue-345-60-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.033442425699962135
+    y: 0.0225
+    z: 0.03286773357052124
+- id: hue-345-60-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.06688485139992427
+    y: 0.045
+    z: 0.06573546714104248
+- id: hue-345-60-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.13376970279984854
+    y: 0.09
+    z: 0.13147093428208495
+- id: hue-345-60-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.2675394055996971
+    y: 0.18
+    z: 0.2629418685641699
+- id: hue-345-60-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.5350788111993942
+    y: 0.36
+    z: 0.5258837371283398
+- id: hue-345-60-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.0701576223987883
+    y: 0.72
+    z: 1.0517674742566796
+- id: hue-345-60-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 2.1403152447975766
+    y: 1.44
+    z: 2.103534948513359
+- id: hue-345-80-s-05
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.009809620931618046
+    y: 0.005625
+    z: 0.009222099997186015
+- id: hue-345-80-s-04
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.019619241863236093
+    y: 0.01125
+    z: 0.01844419999437203
+- id: hue-345-80-s-03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.039238483726472186
+    y: 0.0225
+    z: 0.03688839998874406
+- id: hue-345-80-s-02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.07847696745294437
+    y: 0.045
+    z: 0.07377679997748812
+- id: hue-345-80-s-01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.15695393490588874
+    y: 0.09
+    z: 0.14755359995497624
+- id: hue-345-80-s+00
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.3139078698117775
+    y: 0.18
+    z: 0.2951071999099525
+- id: hue-345-80-s+01
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 0.627815739623555
+    y: 0.36
+    z: 0.590214399819905
+- id: hue-345-80-s+02
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 1.25563147924711
+    y: 0.72
+    z: 1.18042879963981
+- id: hue-345-80-s+03
+  group: hue_grid
+  weight: 0.5
+  xyz:
+    x: 2.51126295849422
+    y: 1.44
+    z: 2.36085759927962
+- id: skin-dark-skin-s-1
+  group: skin
+  weight: 2.0
+  xyz:
+    x: 0.054670747497452245
+    y: 0.04854472109561535
+    z: 0.031490895048219655
+- id: skin-dark-skin-s+0
+  group: skin
+  weight: 2.0
+  xyz:
+    x: 0.10934149499490449
+    y: 0.0970894421912307
+    z: 0.06298179009643931
+- id: skin-dark-skin-s+1
+  group: skin
+  weight: 2.0
+  xyz:
+    x: 0.21868298998980898
+    y: 0.1941788843824614
+    z: 0.12596358019287862
+- id: skin-light-skin-s-1
+  group: skin
+  weight: 2.0
+  xyz:
+    x: 0.18406361263411009
+    y: 0.16632540140217705
+    z: 0.12216068034574917
+- id: skin-light-skin-s+0
+  group: skin
+  weight: 2.0
+  xyz:
+    x: 0.36812722526822017
+    y: 0.3326508028043541
+    z: 0.24432136069149835
+- id: skin-light-skin-s+1
+  group: skin
+  weight: 2.0
+  xyz:
+    x: 0.7362544505364403
+    y: 0.6653016056087082
+    z: 0.4886427213829967
+- id: memory-blue-sky-s-1
+  group: memory_colors
+  weight: 1.5
+  xyz:
+    x: 0.0849472552455529
+    y: 0.09050359644526937
+    z: 0.16858678880271638
+- id: memory-blue-sky-s+0
+  group: memory_colors
+  weight: 1.5
+  xyz:
+    x: 0.1698945104911058
+    y: 0.18100719289053874
+    z: 0.33717357760543276
+- id: memory-blue-sky-s+1
+  group: memory_colors
+  weight: 1.5
+  xyz:
+    x: 0.3397890209822116
+    y: 0.3620143857810775
+    z: 0.6743471552108655
+- id: memory-foliage-s-1
+  group: memory_colors
+  weight: 1.5
+  xyz:
+    x: 0.053345552609482
+    y: 0.06698249697432845
+    z: 0.034164286835822
+- id: memory-foliage-s+0
+  group: memory_colors
+  weight: 1.5
+  xyz:
+    x: 0.106691105218964
+    y: 0.1339649939486569
+    z: 0.068328573671644
+- id: memory-foliage-s+1
+  group: memory_colors
+  weight: 1.5
+  xyz:
+    x: 0.213382210437928
+    y: 0.2679299878973138
+    z: 0.136657147343288

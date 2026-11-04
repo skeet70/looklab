@@ -93,23 +93,22 @@ A Look maps adapted scene XYZ to CAM16-UCS `J'a'b'`. Input coordinates:
 ### 3.3 Chroma, hue and lightness relative to a colorimetric reference
 To separate tone from color, G, R and Λ are defined **relative to what a purely colorimetric rendering would produce at the output lightness**:
 
-1. Solve for `Y_ref` such that the colorimetric CAM16-UCS lightness of the input chromaticity at luminance `Y_ref` equals `J'_base = T(s)`. J′ is monotone in Y at fixed chromaticity, so solve it **exactly**: safeguarded Newton (bisection fallback) with an analytic derivative, a fixed initial guess that depends only on the inputs, and convergence to |ΔJ′| < 1e-10. The result doesn't depend on caches or call history, so outputs are deterministic and gradients are smooth.
-2. `(M'_ref, h_ref)` = CAM16-UCS colorfulness and hue of `XYZ_ref` (input chromaticity at `Y_ref`).
-3. Layers over `(h_in, s, √C_in)`:
-   - chroma gain `log G`;
-   - hue rotation `R` (degrees);
-   - lightness shift `Λ` (J′ units).
+1. `J'_base = T(s)`.
+2. Solve exactly for `Y_ref` such that the colorimetric CAM16-UCS lightness of a **D65 neutral** at luminance `Y_ref` equals `J'_base`. `J'` is monotone in `Y` for a neutral, so solve with safeguarded Newton (bisection fallback), an analytic derivative, a fixed initial guess that depends only on the inputs, and convergence to |ΔJ′| < 1e-10. The result doesn't depend on caches or call history, so outputs are deterministic and gradients are smooth.
+3. `XYZ_ref` is the input chromaticity scaled to `Y_ref`; `(J'_ref, M'_ref, h_ref)` = CAM16-UCS of `XYZ_ref`.
 4. Output:
    ```
-   J'   = T(s) + Λ(h_in, s, C_in)
+   J'   = J'_ref + Λ(h_in, s, C_in)
    M'   = G(h_in, s, C_in) · M'_ref
    h    = h_ref + R(h_in, s, C_in)
    a'b' = N(J'_base) + polar(M', h)
    ```
 
+With colorimetric `T` (`T(s)` = neutral `J'` at `Y = 0.18·2^s`), `Y_ref = Y` and the output equals colorimetric CAM16-UCS of the input.
+
 **G = 1, R = 0, Λ = 0 means "tone change only, otherwise colorimetric".** Two looks that differ only in tone report identical G/R/Λ.
 
-Splines are tensor-product B-splines: **periodic cubic in hue (24 knots)** × cubic in s × cubic in √C (4 knots). The **s-knots (10) are a subset of the tone knot vector**: dense where T is dense, including the shoulder, so highlight desaturation is representable.
+Splines are tensor-product B-splines: **periodic cubic in hue (24 knots)** × cubic in s × cubic in √C (4 knots). The **s-knots (10) are a subset of the tone knot vector**: dense where T is dense, including the shoulder, so highlight desaturation is representable. At `C_in = 0` the hue axis has no meaning, so the `C = 0` coefficient plane is shared across hue and G/R/Λ are hue-independent there.
 
 ### 3.4 Output encoding and soft clip
 The Look predicts appearance before output encoding. To compare with JPEGs: J′a′b′ → XYZ → linear output RGB (the JPEG's primaries) → per-channel **soft clip** → back to XYZ → CAM16-UCS J′a′b′, where residuals are measured. (The JPEG side is decoded through its TRC to linear first, so no TRC round-trip is needed on the prediction side.)

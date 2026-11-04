@@ -293,9 +293,9 @@ The challenge signed by WebAuthn is `H(nonce ‖ sha256(manifest))`. The server 
   "viewing_conditions": { "white": "D65", "L_A": 4.074, "Y_b": 20, "surround": "average", "discount_illuminant": true },
   "probe_set": "v1",
   "layers": {
-    "tone":      { "knots": [], "coef_ref": "bin:T" },
+    "tone":      { "kind": "spline", "knots": [], "coef_ref": "bin:T" },
     "tint":      { "knots": [], "coef_ref": "bin:N" },
-    "chroma":    { "hue_knots": 24, "s_knots": [], "c_knots": [], "coef_ref": "bin:G", "reference": "colorimetric_at_output_lightness" },
+    "chroma":    { "hue_knots": 24, "s_knots": [], "c_knots": 4, "c_max": 120, "coef_ref": "bin:G", "reference": "colorimetric_at_output_lightness" },
     "hue":       { "coef_ref": "bin:R" },
     "lightness": { "coef_ref": "bin:Lambda" },
     "residual":  { "grid": [17,17,17], "domain": {}, "coef_ref": "bin:res" }

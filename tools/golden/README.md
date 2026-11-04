@@ -9,6 +9,8 @@ From the repo root:
 ```
 nix develop .#golden -c python3 tools/golden/gen_basics.py
 nix develop .#golden -c python3 tools/golden/gen_cam16.py
+nix develop .#golden -c python3 tools/golden/gen_dng.py
+nix develop .#golden -c python3 tools/golden/gen_pointer.py
 ```
 
 Commit the regenerated JSON with the code change that requires it. Never hand-edit the files.
@@ -26,6 +28,8 @@ Commit the regenerated JSON with the code change that requires it. Never hand-ed
 |---|---|
 | `gen_basics.py` | `crates/looklab-color/tests/golden/basics.json`, `data/charts/colorchecker24_2014.json` |
 | `gen_cam16.py` | `crates/looklab-color/tests/golden/cam16_forward.json`, `cam16_inverse.json`, `cam16_ucs.json` |
+| `gen_dng.py` | `crates/looklab-color/tests/golden/dng.json` |
+| `gen_pointer.py` | `data/probes/pointer_gamut.json` |
 
 `gen_basics.py` covers XYZ/xyY, the five RGB transfer functions, RGB/XYZ conversions per space, the three chromatic adaptation transforms, CIELAB, LCh, CIEDE2000 and the standard illuminants. The chart file holds `CCS_COLOURCHECKERS["ColorChecker24 - After November 2014"]`: xyY under D50, BabelColor/X-Rite reference values.
 
