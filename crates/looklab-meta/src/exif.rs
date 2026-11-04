@@ -36,6 +36,9 @@ const TAG_LENS_SERIAL: u16 = 0xa435;
 pub struct ParsedMetadata {
     pub exif: ExifData,
     pub fuji: Option<FujiMakernote>,
+    /// Camera firmware: RAF header `FirmwareVersion` (0x3c, four digits normalized to `x.yy`),
+    /// else the `Ver` token of the EXIF `Software` tag (`Ver1.00` -> `1.00`).
+    pub firmware: Option<String>,
 }
 
 impl ParsedMetadata {
@@ -156,6 +159,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<ParsedMetadata, MetaError> {
             lens_serial_present: get(TAG_LENS_SERIAL).is_some(),
         },
         fuji,
+        firmware: None,
     })
 }
 

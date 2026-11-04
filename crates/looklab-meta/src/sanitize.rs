@@ -58,7 +58,7 @@ pub fn sanitize(parsed: &ParsedMetadata) -> (SanitizedMetadata, RemovedFields) {
     let metadata = SanitizedMetadata {
         make: exif.make.clone(),
         model: exif.model.clone(),
-        firmware: fuji.and_then(|fuji| fuji.firmware.clone()),
+        firmware: parsed.firmware.clone(),
         lens_model: exif.lens_model.clone(),
         focal_length: exif.focal_length,
         iso: exif.iso,

@@ -48,11 +48,10 @@ fn parses_jpeg_app1_exif() {
     assert!(exif.lens_serial_present);
 
     let serial = exif.body_serial.as_ref().expect("BodySerialNumber");
-    assert_eq!(serial.envelope_ascii(), &b"SERIAL123"[..]);
-    assert_eq!(
-        serial.hmac_message("FUJIFILM", "X-T5"),
-        &b"FUJIFILM\0X-T5\0SERIAL123"[..]
-    );
+    let mut envelope = Vec::new();
+    serial.write_envelope_field(&mut envelope);
+    assert_eq!(&envelope[..], b"\x01\x09SERIAL123");
+    assert_eq!(parsed.firmware.as_deref(), Some("1.01"));
 
     assert_eq!(
         exif.image_unique_id
@@ -68,6 +67,7 @@ fn parses_jpeg_app1_exif() {
 fn parses_tiff_and_dng_streams() {
     let parsed = parse_tiff(&support::full_exif_tiff()).expect("bare TIFF EXIF");
     assert_eq!(parsed.exif.model.as_deref(), Some("X-T5"));
+    assert_eq!(parsed.firmware, None);
     assert!(parsed.fuji.is_some());
 }
 
@@ -77,7 +77,31 @@ fn parses_raf_embedded_jpeg() {
     let parsed = parse_raf(&raf).expect("RAF header points at an embedded JPEG");
     assert_eq!(parsed.exif.make.as_deref(), Some("FUJIFILM"));
     assert_eq!(parsed.exif.model.as_deref(), Some("X-T5"));
+    assert_eq!(parsed.firmware.as_deref(), Some("1.01"));
     assert!(parsed.fuji.is_some());
+}
+
+#[test]
+fn raf_header_firmware_wins_over_software() {
+    let jpeg = support::build_jpeg(&support::full_exif_tiff());
+    let raf = support::build_raf_with_firmware(&jpeg, b"0200");
+    let parsed = parse_raf(&raf).expect("RAF header points at an embedded JPEG");
+    assert_eq!(parsed.firmware.as_deref(), Some("2.00"));
+}
+
+#[test]
+fn hostile_exif_ifd_offset_is_ignored() {
+    let tiff = support::build_tiff(
+        &[
+            (0x010f, support::Value::Ascii("FUJIFILM".into())),
+            (0x8769, support::Value::Long(u32::MAX)),
+        ],
+        &[],
+        None,
+    );
+    let parsed = parse_tiff(&tiff).expect("IFD0 is still readable");
+    assert_eq!(parsed.exif.make.as_deref(), Some("FUJIFILM"));
+    assert!(parsed.exif.model.is_none());
 }
 
 #[test]

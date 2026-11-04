@@ -377,6 +377,10 @@ pub fn full_exif_tiff() -> Vec<u8> {
     )
 }
 
+pub fn full_exif_jpeg() -> Vec<u8> {
+    build_jpeg(&full_exif_tiff())
+}
+
 pub fn build_jpeg(tiff: &[u8]) -> Vec<u8> {
     let length = 2 + 6 + tiff.len();
     assert!(length <= u16::MAX as usize);
@@ -389,12 +393,16 @@ pub fn build_jpeg(tiff: &[u8]) -> Vec<u8> {
 }
 
 pub fn build_raf(jpeg: &[u8]) -> Vec<u8> {
+    build_raf_with_firmware(jpeg, b"0101")
+}
+
+pub fn build_raf_with_firmware(jpeg: &[u8], firmware: &[u8; 4]) -> Vec<u8> {
     let header_length = 0x94usize;
     let mut out = vec![0u8; header_length];
     out[..16].copy_from_slice(b"FUJIFILMCCD-RAW ");
     out[16..20].copy_from_slice(b"0201");
     out[0x1c..0x1c + 6].copy_from_slice(b"X-T5\0\0");
-    out[0x3c..0x40].copy_from_slice(b"0101");
+    out[0x3c..0x40].copy_from_slice(firmware);
     out[0x54..0x58].copy_from_slice(&(header_length as u32).to_be_bytes());
     out[0x58..0x5c].copy_from_slice(&(jpeg.len() as u32).to_be_bytes());
     out.extend_from_slice(jpeg);

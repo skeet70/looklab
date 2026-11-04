@@ -2,17 +2,18 @@
 mod support;
 
 use looklab_meta::{
-    EffectStrength, FilmMode, RemovedField, WhiteBalanceMultipliers, parse_tiff, sanitize,
+    EffectStrength, FilmMode, RemovedField, WhiteBalanceMultipliers, parse_jpeg, parse_tiff,
+    sanitize,
 };
 
 #[test]
 fn sanitizes_only_documented_fields() {
-    let parsed = parse_tiff(&support::full_exif_tiff()).expect("synthetic TIFF");
+    let parsed = parse_jpeg(&support::full_exif_jpeg()).expect("synthetic JPEG");
     let (sanitized, _) = sanitize(&parsed);
 
     assert_eq!(sanitized.make.as_deref(), Some("FUJIFILM"));
     assert_eq!(sanitized.model.as_deref(), Some("X-T5"));
-    assert_eq!(sanitized.firmware.as_deref(), Some("0101"));
+    assert_eq!(sanitized.firmware.as_deref(), Some("1.01"));
     assert_eq!(sanitized.lens_model.as_deref(), Some("XF35mmF1.4 R"));
     assert_eq!(
         sanitized.focal_length.expect("focal length").millimetres(),

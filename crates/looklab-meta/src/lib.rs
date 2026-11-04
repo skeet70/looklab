@@ -22,7 +22,7 @@ pub use fuji::{
     ToneAdjustment, WhiteBalanceFineTune, WhiteBalanceMode,
 };
 pub use sanitize::{RemovedField, RemovedFields, SanitizedMetadata, sanitize};
-pub use serial::RawSerial;
+pub use serial::{RawSerial, SerialHmac, SerialHmacKey};
 pub use types::{
     Aperture, CaptureTime, ExposureCompensation, ExposureTime, FocalLength, ImageNumber, Iso,
     Orientation, SubSec, WhiteBalanceMultipliers, YearMonth,

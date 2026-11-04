@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 mod support;
 
-use looklab_meta::{has_makernotes, pairing_data, parse_tiff, software_matches_firmware};
+use looklab_meta::{
+    has_makernotes, pairing_data, parse_jpeg, parse_tiff, software_matches_firmware,
+};
 
 #[test]
 fn detects_makernote_presence() {
@@ -37,24 +39,35 @@ fn matches_software_against_firmware_versions() {
 }
 
 #[test]
+fn accepts_firmware_derived_from_camera_software() {
+    let parsed = parse_jpeg(&support::full_exif_jpeg()).expect("synthetic JPEG");
+    assert_eq!(parsed.firmware.as_deref(), Some("1.01"));
+    assert!(software_matches_firmware(
+        parsed.exif.software.as_deref(),
+        parsed.firmware.as_deref()
+    ));
+}
+
+#[test]
 fn body_serial_prefers_exif_then_internal() {
     let parsed = parse_tiff(&support::full_exif_tiff()).expect("synthetic TIFF");
-    assert_eq!(
-        parsed.body_serial().expect("EXIF serial").envelope_ascii(),
-        &b"SERIAL123"[..]
-    );
+    let mut field = Vec::new();
+    parsed
+        .body_serial()
+        .expect("EXIF serial")
+        .write_envelope_field(&mut field);
+    assert_eq!(&field[..], b"\x01\x09SERIAL123");
 
     let makernote =
         support::build_makernote(&[(0x0010, support::FujiValue::Ascii("INTERNAL".into()))]);
     let tiff = support::build_tiff(&[], &[(0x927c, support::Value::Undefined(makernote))], None);
     let parsed = parse_tiff(&tiff).expect("synthetic TIFF");
-    assert_eq!(
-        parsed
-            .body_serial()
-            .expect("makernote serial")
-            .envelope_ascii(),
-        &b"INTERNAL"[..]
-    );
+    let mut field = Vec::new();
+    parsed
+        .body_serial()
+        .expect("makernote serial")
+        .write_envelope_field(&mut field);
+    assert_eq!(&field[..], b"\x01\x08INTERNAL");
 }
 
 #[test]

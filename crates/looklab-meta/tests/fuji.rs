@@ -4,7 +4,7 @@ mod support;
 use looklab_meta::{
     ColorSaturation, DynamicRange, DynamicRangeSetting, EffectStrength, FilmMode, FujiTag,
     GrainRoughness, GrainSize, ImageGeneration, LookSettings, NoiseReduction, Sharpness,
-    WhiteBalanceMode, parse_tiff,
+    WhiteBalanceMode, parse_jpeg, parse_tiff, sanitize, software_matches_firmware,
 };
 
 fn makernote_look() -> LookSettings {
@@ -116,30 +116,33 @@ fn decodes_tone_and_detail_tags() {
 }
 
 #[test]
-fn decodes_shot_number_and_firmware_tags() {
+fn decodes_shot_number_and_maker_note_version() {
     let fuji = parse_tiff(&support::full_exif_tiff())
         .expect("synthetic TIFF")
         .fuji
         .expect("Fujifilm makernote");
 
-    assert_eq!(fuji.firmware.as_deref(), Some("0101"));
+    assert_eq!(fuji.maker_note_version.as_deref(), Some("0101"));
     assert_eq!(
         fuji.image_generation,
         Some(ImageGeneration::ReDevelopedFromRaw)
     );
     assert_eq!(fuji.image_count.expect("ImageCount").value(), 1234);
     assert_eq!(fuji.sequence_number.expect("SequenceNumber").value(), 77);
-    assert_eq!(
-        fuji.internal_serial
-            .expect("InternalSerialNumber")
-            .envelope_ascii(),
-        &b"FPX20017035 592D31313034060427796060"[..]
-    );
+
+    let internal = fuji.internal_serial.expect("InternalSerialNumber");
+    let ascii = b"FPX20017035 592D31313034060427796060";
+    let mut envelope = Vec::new();
+    internal.write_envelope_field(&mut envelope);
+    assert_eq!(envelope[0], 1);
+    assert_eq!(envelope[1] as usize, ascii.len());
+    assert_eq!(&envelope[2..], ascii);
 }
 
 #[test]
 fn keeps_unrecognized_values_with_their_tag() {
     let makernote = support::build_makernote(&[
+        (0x100f, support::FujiValue::SLong(6000)),
         (0x1401, support::FujiValue::Short(0x9999)),
         (0x1400, support::FujiValue::Short(99)),
     ]);
@@ -157,6 +160,52 @@ fn keeps_unrecognized_values_with_their_tag() {
     let range = fuji.look.dynamic_range.expect("DynamicRange");
     assert_eq!(range.raw, 99);
     assert_eq!(range.value, None);
+
+    let clarity = fuji.look.clarity.expect("Clarity");
+    assert_eq!(clarity.raw, 6000);
+    assert_eq!(clarity.value, None);
+}
+
+#[test]
+fn maker_note_version_is_not_firmware() {
+    let makernote =
+        support::build_makernote(&[(0x0000, support::FujiValue::Undefined(b"0130".to_vec()))]);
+    let tiff = support::build_tiff(
+        &[(
+            0x0131,
+            support::Value::Ascii("Digital Camera X-T5 Ver1.00".into()),
+        )],
+        &[(0x927c, support::Value::Undefined(makernote))],
+        None,
+    );
+    let parsed = parse_jpeg(&support::build_jpeg(&tiff)).expect("synthetic JPEG");
+
+    assert_eq!(parsed.firmware.as_deref(), Some("1.00"));
+    assert_eq!(
+        parsed
+            .fuji
+            .as_ref()
+            .expect("makernote")
+            .maker_note_version
+            .as_deref(),
+        Some("0130")
+    );
+    assert!(software_matches_firmware(
+        parsed.exif.software.as_deref(),
+        parsed.firmware.as_deref()
+    ));
+
+    let (sanitized, _) = sanitize(&parsed);
+    assert_eq!(sanitized.firmware.as_deref(), Some("1.00"));
+}
+
+#[test]
+fn hostile_ifd_offset_is_rejected() {
+    let mut makernote = b"FUJIFILM".to_vec();
+    makernote.extend_from_slice(&u32::MAX.to_le_bytes());
+    let tiff = support::build_tiff(&[], &[(0x927c, support::Value::Undefined(makernote))], None);
+    let parsed = parse_tiff(&tiff).expect("synthetic TIFF");
+    assert!(parsed.fuji.is_none());
 }
 
 #[test]

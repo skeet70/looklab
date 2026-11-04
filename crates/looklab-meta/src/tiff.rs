@@ -79,21 +79,27 @@ impl<'a> Tiff<'a> {
     }
 
     pub(crate) fn read_ifd(&self, offset: usize) -> Result<Ifd<'a>, MetaError> {
+        let count_end = offset.checked_add(2).ok_or(MetaError::InvalidTiff)?;
         let count = self
             .endian
-            .u16(self.bytes.get(offset..).ok_or(MetaError::Truncated)?)
+            .u16(
+                self.bytes
+                    .get(offset..count_end)
+                    .ok_or(MetaError::Truncated)?,
+            )
             .ok_or(MetaError::Truncated)? as usize;
         if count > 1024 {
             return Err(MetaError::InvalidTiff);
         }
         let mut entries = Vec::with_capacity(count);
-        let mut position = offset + 2;
+        let mut position = count_end;
         for _ in 0..count {
+            let entry_end = position.checked_add(12).ok_or(MetaError::InvalidTiff)?;
             let raw = self
                 .bytes
-                .get(position..position + 12)
+                .get(position..entry_end)
                 .ok_or(MetaError::Truncated)?;
-            position += 12;
+            position = entry_end;
             let tag = self.endian.u16(raw).ok_or(MetaError::Truncated)?;
             let typ = self.endian.u16(&raw[2..]).ok_or(MetaError::Truncated)?;
             let count = self.endian.u32(&raw[4..]).ok_or(MetaError::Truncated)?;

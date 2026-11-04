@@ -19,4 +19,6 @@ pub enum MetaError {
     InvalidTiff,
     #[error("invalid RAF header")]
     InvalidRaf,
+    #[error("invalid serial number")]
+    InvalidSerial,
 }

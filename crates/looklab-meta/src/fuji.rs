@@ -89,7 +89,8 @@ impl FujiTag {
 }
 
 pub struct FujiMakernote {
-    pub firmware: Option<String>,
+    /// MakerNote `Version` (tag 0x0000); this is not the camera firmware version.
+    pub maker_note_version: Option<String>,
     pub internal_serial: Option<RawSerial>,
     pub look: LookSettings,
     pub image_generation: Option<ImageGeneration>,
@@ -419,9 +420,10 @@ impl FujiEntry<'_> {
         if self.typ != 9 || index >= self.count as usize {
             return None;
         }
-        let start = index * 4;
+        let start = index.checked_mul(4)?;
+        let end = start.checked_add(4)?;
         Some(i32::from_le_bytes(
-            self.bytes().get(start..start + 4)?.try_into().ok()?,
+            self.bytes().get(start..end)?.try_into().ok()?,
         ))
     }
 
@@ -438,15 +440,17 @@ impl FujiEntry<'_> {
 }
 
 fn read_entries(bytes: &[u8], offset: usize) -> Option<Vec<FujiEntry<'_>>> {
-    let count = u16::from_le_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?) as usize;
+    let count_end = offset.checked_add(2)?;
+    let count = u16::from_le_bytes(bytes.get(offset..count_end)?.try_into().ok()?) as usize;
     if count > 1024 {
         return None;
     }
     let mut entries = Vec::with_capacity(count);
-    let mut position = offset + 2;
+    let mut position = count_end;
     for _ in 0..count {
-        let raw = bytes.get(position..position + 12)?;
-        position += 12;
+        let entry_end = position.checked_add(12)?;
+        let raw = bytes.get(position..entry_end)?;
+        position = entry_end;
         let tag = u16::from_le_bytes(raw.get(..2)?.try_into().ok()?);
         let typ = u16::from_le_bytes(raw.get(2..4)?.try_into().ok()?);
         let count = u32::from_le_bytes(raw.get(4..8)?.try_into().ok()?);
@@ -545,7 +549,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<FujiMakernote> {
         ),
     };
 
-    let firmware = find(0x0000).and_then(firmware_string);
+    let maker_note_version = find(0x0000).and_then(version_string);
     let internal_serial = find(0x0010)
         .and_then(FujiEntry::ascii)
         .and_then(|text| RawSerial::new(text.as_bytes()));
@@ -560,7 +564,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<FujiMakernote> {
     let sequence_number = find(0x1101).and_then(FujiEntry::u16).map(ImageNumber::new);
 
     Some(FujiMakernote {
-        firmware,
+        maker_note_version,
         internal_serial,
         look,
         image_generation: image_generation.and_then(|tagged| tagged.value),
@@ -595,7 +599,7 @@ fn tagged_i32<T>(
     })
 }
 
-fn firmware_string(entry: &FujiEntry) -> Option<String> {
+fn version_string(entry: &FujiEntry) -> Option<String> {
     let bytes = match entry.typ {
         2 | 7 => entry.bytes(),
         _ => return None,
@@ -741,7 +745,7 @@ fn decode_noise_reduction_legacy(raw: u16) -> Option<NoiseReduction> {
 
 fn decode_clarity(raw: i32) -> Option<Clarity> {
     let steps = raw / 1000;
-    (raw % 1000 == 0 && (-127..=127).contains(&steps)).then_some(Clarity(steps as i8))
+    (raw % 1000 == 0 && (-5..=5).contains(&steps)).then_some(Clarity(steps as i8))
 }
 
 fn decode_tone(raw: i32) -> Option<ToneAdjustment> {
