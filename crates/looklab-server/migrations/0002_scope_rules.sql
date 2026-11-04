@@ -179,6 +179,8 @@ CREATE TABLE version_depends_on_root (
     PRIMARY KEY (look_version_id, root_admission_id)
 );
 
+CREATE INDEX version_depends_by_root ON version_depends_on_root (root_admission_id);
+
 CREATE TABLE version_regating (
     look_version_id TEXT NOT NULL PRIMARY KEY REFERENCES look_versions (id),
     reason          TEXT NOT NULL,

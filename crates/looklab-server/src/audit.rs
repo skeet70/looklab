@@ -4,7 +4,7 @@
 use looklab_trust::{Actor, AuditEvent};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sqlx::Sqlite;
+use sqlx::SqliteConnection;
 
 use crate::admin::{AdminError, local_credential};
 
@@ -14,6 +14,7 @@ pub(crate) enum AuditKind {
     GrantRevoked,
     EndorsementIssued,
     EndorsementRevoked,
+    EndorsementSuperseded,
     RootAdmitted,
     RootRevoked,
     ModerationDecision,
@@ -30,6 +31,7 @@ impl AuditKind {
             Self::GrantRevoked => "grant_revoked",
             Self::EndorsementIssued => "endorsement_issued",
             Self::EndorsementRevoked => "endorsement_revoked",
+            Self::EndorsementSuperseded => "endorsement_superseded",
             Self::RootAdmitted => "root_admitted",
             Self::RootRevoked => "root_revoked",
             Self::ModerationDecision => "moderation_decision",
@@ -47,7 +49,7 @@ impl AuditKind {
 pub(crate) struct ActorRef(String);
 
 pub(crate) async fn insert(
-    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    conn: &mut SqliteConnection,
     kind: AuditKind,
     payload: &Value,
 ) -> Result<(), sqlx::Error> {
@@ -57,7 +59,7 @@ pub(crate) async fn insert(
         .bind(kind.as_str())
         .bind(payload)
         .bind(crate::db::now_unix())
-        .execute(&mut **tx)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }

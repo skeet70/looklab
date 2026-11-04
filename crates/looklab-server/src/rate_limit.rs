@@ -26,6 +26,7 @@ pub enum Action {
 pub enum RateKey {
     Nonce,
     Registration,
+    PublicRead,
     GlobalUpload,
     GlobalSigned,
     Assertion { action: Action, id: RawCredentialId },
@@ -49,6 +50,10 @@ impl RateKey {
             Self::GlobalSigned => Quota {
                 capacity: 120.0,
                 refill_per_second: 4.0,
+            },
+            Self::PublicRead => Quota {
+                capacity: 120.0,
+                refill_per_second: 8.0,
             },
             Self::Assertion { action, .. } => match action {
                 Action::Upload => Quota {
@@ -83,6 +88,7 @@ impl core::fmt::Display for RateKey {
         match self {
             Self::Nonce => f.write_str("nonce"),
             Self::Registration => f.write_str("registration"),
+            Self::PublicRead => f.write_str("public-read"),
             Self::GlobalUpload => f.write_str("upload"),
             Self::GlobalSigned => f.write_str("signed"),
             Self::Assertion { action: a, id } => {
