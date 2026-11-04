@@ -58,7 +58,16 @@ D = 1 is required. Inputs are already D65-adapted and the display white is D65. 
   1. spectral-sensitivity-derived matrices;
   2. DNG ForwardMatrix1/2 (else inverted ColorMatrix1/2, adapted to D65) from that body;
   3. a camera database matrix (rawler / LibRaw / darktable), which may be single-illuminant. Then both X use it, with a looser prior.
-- Prior `vec(Δ_c) ~ N(0, Σ_src)`: tight for SSF or chart-anchored bodies, loose for database-only.
+- Prior `vec(Δ_c) ~ N(0, Σ_src)`: tight for SSF or chart-anchored bodies, loose for database-only. The six parameters are the free entries of `I + Δ`; `Σ_src` is isotropic in that parameterization:
+
+  | `a0_source` | standard deviation per parameter *(tentative)* |
+  |---|---|
+  | `ssf` | 0.002 |
+  | `dng` | 0.01 |
+  | `db` | 0.04 |
+  | `chart` | 0.005 |
+
+  `looklab-body` sets these as `SSF_PRIOR_SD`, `DNG_PRIOR_SD`, `DB_PRIOR_SD` and `CHART_PRIOR_SD`; an anchored body replaces `Σ_src` with the chart posterior covariance.
 - **Chart anchoring:** chart patches give `(rgb_cam, XYZ_ref)` pairs at a known (estimated) CCT. They enter as a separate likelihood term and don't pass through any Look. Only chart sessions from endorsed or seeder credentials tighten the prior and define the gauge; new-tier charts are ordinary data ([05 §5](05-trust-and-integrity.md)).
 - **v2:** a separate Δ per illuminant; a root-polynomial term, gated on chart data.
 

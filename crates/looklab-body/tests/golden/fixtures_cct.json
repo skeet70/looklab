@@ -1,0 +1,103 @@
+{
+ "fixtures": {
+  "canon-eos-60d.dng": {
+   "as_shot_wb": [
+    2.33805,
+    1.0,
+    1.41636
+   ],
+   "cct_k": 6014.639824721966,
+   "matrices": [
+    {
+     "cct_k": 2856.0,
+     "illuminant": "Illuminant A",
+     "xyz_to_camera": [
+      [
+       0.7428,
+       -0.1897,
+       -0.0491
+      ],
+      [
+       -0.3505,
+       1.0963,
+       0.2929
+      ],
+      [
+       -0.0337,
+       0.1242,
+       0.6413
+      ]
+     ]
+    },
+    {
+     "cct_k": 6504.0,
+     "illuminant": "D65",
+     "xyz_to_camera": [
+      [
+       0.6719,
+       -0.0994,
+       -0.0925
+      ],
+      [
+       -0.4408,
+       1.2426,
+       0.2211
+      ],
+      [
+       -0.0887,
+       0.2129,
+       0.6051
+      ]
+     ]
+    }
+   ],
+   "source": "libraw raw-identify -v; DNG NeutralToXY with colour-science Robertson 1968",
+   "xy": [
+    0.3213494709883648,
+    0.33773383167791676
+   ]
+  },
+  "fujifilm-x-s10.raf": {
+   "as_shot_wb": [
+    1.695364238410596,
+    1.0,
+    2.3509933774834435
+   ],
+   "cct_k": 4260.793522462867,
+   "matrices": [
+    {
+     "cct_k": 6504.0,
+     "illuminant": "D65",
+     "xyz_to_camera": [
+      [
+       1.3426,
+       -0.6334,
+       -0.1177
+      ],
+      [
+       -0.4244,
+       1.2136,
+       0.2371
+      ],
+      [
+       -0.058,
+       0.1303,
+       0.598
+      ]
+     ]
+    }
+   ],
+   "source": "libraw raw-identify -v; DNG NeutralToXY with colour-science Robertson 1968",
+   "xy": [
+    0.37696553573734454,
+    0.4030621370174505
+   ]
+  }
+ },
+ "meta": {
+  "colour_science_version": "0.4.7",
+  "generated_by": "gen_body.py",
+  "numpy_version": "2.5.3",
+  "seed": 20261104
+ }
+}

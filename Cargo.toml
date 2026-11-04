@@ -10,6 +10,7 @@ license = "AGPL-3.0-or-later"
 rust-version = "1.99"
 
 [workspace.dependencies]
+looklab-body = { path = "crates/looklab-body" }
 looklab-color = { path = "crates/looklab-color" }
 looklab-raw = { path = "crates/looklab-raw" }
 looklab-meta = { path = "crates/looklab-meta" }

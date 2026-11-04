@@ -42,6 +42,7 @@ const CORE_CRATES: &[&str] = &[
     "looklab-samples",
     "looklab-upload",
     "looklab-model",
+    "looklab-body",
     "looklab-fit",
     "looklab-match",
     "looklab-export",

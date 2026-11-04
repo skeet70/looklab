@@ -1,0 +1,24 @@
+[package]
+name = "looklab-body"
+description = "Body input-transform priors, CCT estimation and chart anchoring."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+libm.workspace = true
+looklab-color.workspace = true
+looklab-model.workspace = true
+looklab-raw.workspace = true
+looklab-samples.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

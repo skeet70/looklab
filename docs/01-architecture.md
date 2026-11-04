@@ -48,6 +48,7 @@ crates/
   looklab-prep      # align, downsample, mask, density sampling, chart/pattern detection
   looklab-prep-module # reproducible prep wasm module: plain C ABI, no imports
   looklab-model     # Look representation, evaluation, look file format, probe sets
+  looklab-body      # input-transform priors, CCT estimation, chart anchoring
   looklab-fit       # single/hierarchical/joint fits, uncertainty, outlier scoring
   looklab-match     # control schemas, control-response models, optimizer, comparison reports
   looklab-export    # interface profiles, LUT baking, writers
@@ -73,6 +74,7 @@ fuzz/               # cargo-fuzz project (its own workspace, excluded from the c
 
 **Dependency DAG:**
 - `color` ← `model`
+- `body` ← {`color`, `raw`, `samples`, `model`}
 - `samples` (independent of `model`)
 - `upload` ← {`meta`, `samples`}
 - `fit` ← {`model`, `samples`}

@@ -59,7 +59,7 @@
         };
         # Golden-vector generation (dev-time only).
         devShells.golden = pkgs.mkShell {
-          buildInputs = [ goldenPython ];
+          buildInputs = [ goldenPython pkgs.libraw ];
         };
         # cargo-fuzz needs a nightly compiler for sanitizer instrumentation.
         devShells.fuzz = pkgs.mkShell {
