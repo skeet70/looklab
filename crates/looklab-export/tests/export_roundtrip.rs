@@ -3,11 +3,16 @@
 
 mod common;
 
-use looklab_export::{BakeIlluminant, Baker, CctK, Format, read_cube, write_cube, written_bytes};
+use std::sync::LazyLock;
+
+use looklab_export::{
+    BakeIlluminant, BakeOutput, Baker, CctK, Format, Interpolation, cube_files, read_cube,
+    read_cube_1d, written_bytes,
+};
 use looklab_schema::InterfaceProfile;
 
 const ACCEPTS: &str = r#"  - type: lut3d
-    sizes: [17, 33]
+    sizes: [17, 33, 65]
     interpolation: tetrahedral
     precision: f16
     with_shaper: true
@@ -23,37 +28,54 @@ fn profile() -> InterfaceProfile {
     primaries: camera_native
     range: [0.0, 8.0]
   illuminant_handling: single"#;
-    common::profile(&common::profile_yaml(insertion, ACCEPTS, "[cube]", 1 << 22))
+    common::profile(&common::profile_yaml(insertion, ACCEPTS, "[cube]", 1 << 24))
+}
+
+fn baked() -> &'static (InterfaceProfile, BakeOutput) {
+    static BAKED: LazyLock<(InterfaceProfile, BakeOutput)> = LazyLock::new(|| {
+        let profile = profile();
+        let body = common::body();
+        let look = common::look();
+        let output = Baker::new(&profile, &look, &body)
+            .bake(BakeIlluminant::Single { cct: CctK::D65 })
+            .expect("bake");
+        (profile, output)
+    });
+    &BAKED
 }
 
 #[test]
 fn camera_linear_bake_round_trips_at_the_bake_cct() {
-    let profile = profile();
+    let (_, output) = baked();
     let body = common::body();
     let look = common::look();
-    let output = Baker::new(&profile, &look, &body)
-        .bake(BakeIlluminant::Single { cct: CctK::D65 })
-        .expect("bake");
 
-    let lut = common::lut(&output);
+    let lut = common::lut(output);
     assert!(lut.shaper.is_some(), "the accepted shaper is emitted");
     assert_eq!(output.artifacts.len(), 1);
 
-    let report = looklab_export::validate(&output, &look, &body, &common::probes(), None)
-        .expect("validation");
+    let probes = common::probes();
+    let report = looklab_export::validate(output, &look, &body, &probes, None).expect("validation");
+    let eligible = probes.probes.len() - report.primary.unsupported;
+    assert!(
+        report.primary.stats.count * 10 >= eligible * 9,
+        "evaluated {} of {eligible} supported probes",
+        report.primary.stats.count
+    );
     assert!(
         report.primary.stats.p95 <= 1.0,
         "p95 {} at the bake CCT",
         report.primary.stats.p95
     );
     assert!(!report.flagged());
-    assert!(report.primary.stats.count > 100, "{:?}", report.primary);
+    assert!(report.primary.clipped > 0);
 
     for cct in [CctK::DAYLIGHT, CctK::TUNGSTEN] {
         let other = report.at(cct).expect("other-CCT report");
         assert_eq!(
-            other.stats.count + other.unsupported + other.clipped,
-            common::probes().probes.len()
+            other.stats.count + other.unsupported,
+            probes.probes.len(),
+            "every supported probe is evaluated at {cct}"
         );
         assert!(other.stats.p95.is_finite());
     }
@@ -61,15 +83,10 @@ fn camera_linear_bake_round_trips_at_the_bake_cct() {
 
 #[test]
 fn bake_respects_the_byte_limit_and_writers_agree() {
-    let profile = profile();
-    let body = common::body();
-    let look = common::look();
-    let output = Baker::new(&profile, &look, &body)
-        .bake(BakeIlluminant::Single { cct: CctK::D65 })
-        .expect("bake");
-    assert_eq!(common::lut(&output).size, 33);
+    let (profile, output) = baked();
+    assert_eq!(common::lut(output).size, 65);
 
-    let bytes = written_bytes(&output, Format::Cube).expect("bytes");
+    let bytes = written_bytes(output, Format::Cube).expect("bytes");
     assert!(
         bytes <= profile.limits.max_bytes,
         "{bytes} > {}",
@@ -78,18 +95,33 @@ fn bake_respects_the_byte_limit_and_writers_agree() {
 }
 
 #[test]
-fn cube_artifact_round_trips_through_the_writer() {
-    let profile = profile();
-    let body = common::body();
-    let look = common::look();
-    let output = Baker::new(&profile, &look, &body)
-        .bake(BakeIlluminant::Single { cct: CctK::D65 })
-        .expect("bake");
-    let lut = common::lut(&output);
-    let text = write_cube(lut, "test", output.insertion.range);
-    let parsed = read_cube(&text).expect("cube");
-    assert_eq!(parsed.lut.data, lut.data);
-    assert_eq!(parsed.lut.size, lut.size);
+fn cube_pair_round_trips_through_the_writer() {
+    let (_, output) = baked();
+    let lut = common::lut(output);
+    let (grid_text, shaper_text) = cube_files(lut, "test", output.insertion.range);
+    let grid = read_cube(&grid_text).expect("cube");
+    assert_eq!(grid.lut.data, lut.data);
+    assert_eq!(grid.lut.size, lut.size);
+    assert_eq!(grid.domain, [0.0, 1.0]);
+
+    let shaper = read_cube_1d(&shaper_text.expect("shaper")).expect("shaper");
+    assert_eq!(shaper.domain, output.insertion.range);
+    assert_eq!(Some(&shaper.shaper), lut.shaper.as_ref());
+
+    for code in [0.1, 0.35, 0.7] {
+        let at = [code, code, code];
+        let through = grid.lut.eval(
+            [0, 1, 2].map(|channel| shaper.shaper.eval(at[channel])),
+            Interpolation::Tetrahedral,
+        );
+        let direct = lut.eval(at, Interpolation::Tetrahedral);
+        for channel in 0..3 {
+            assert!(
+                (through[channel] - direct[channel]).abs() < 1.0e-6,
+                "{through:?} vs {direct:?}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -4,9 +4,9 @@
 mod common;
 
 use looklab_export::{
-    Artifact, BakeIlluminant, BakeOutput, Baker, CctK, Format, read_cube, read_cube_1d,
-    read_haldclut, read_native_json, validate, write_cube, write_cube_1d, write_haldclut,
-    write_native_json, written_bytes,
+    Artifact, BakeIlluminant, BakeOutput, Baker, CctK, ExportError, Format, Interpolation,
+    NativeDocument, cube_files, read_cube, read_cube_1d, read_haldclut, read_native_json, validate,
+    write_haldclut, write_native_json, written_bytes,
 };
 
 const LUT_ACCEPTS: &str = r#"  - type: lut3d
@@ -44,21 +44,85 @@ fn bake_fixture() -> (looklab_schema::InterfaceProfile, BakeOutput) {
 fn cube_and_shaper_round_trip_exactly() {
     let (_, output) = bake_fixture();
     let lut = common::lut(&output);
-    let text = write_cube(lut, &output.profile_id.to_string(), output.insertion.range);
-    let parsed = read_cube(&text).expect("cube");
-    assert_eq!(parsed.lut.data, lut.data);
-    assert_eq!(parsed.domain, output.insertion.range);
+    let (grid_text, shaper_text) =
+        cube_files(lut, &output.profile_id.to_string(), output.insertion.range);
+    let grid = read_cube(&grid_text).expect("cube");
+    assert_eq!(grid.lut.data, lut.data);
+    assert_eq!(grid.domain, [0.0, 1.0]);
 
     let shaper = lut.shaper.as_ref().expect("shaper");
-    let shaper_text = write_cube_1d(shaper, "shaper", output.insertion.range);
-    let parsed_shaper = read_cube_1d(&shaper_text).expect("shaper");
+    let parsed_shaper = read_cube_1d(&shaper_text.expect("shaper file")).expect("shaper");
     assert_eq!(parsed_shaper.shaper, *shaper);
+    assert_eq!(parsed_shaper.domain, output.insertion.range);
+
+    for code in [0.2, 0.5, 0.8] {
+        let at = [code, code, code];
+        let through = grid.lut.eval(
+            [0, 1, 2].map(|channel| parsed_shaper.shaper.eval(at[channel])),
+            Interpolation::Tetrahedral,
+        );
+        let direct = lut.eval(at, Interpolation::Tetrahedral);
+        for channel in 0..3 {
+            assert!((through[channel] - direct[channel]).abs() < 1.0e-6);
+        }
+    }
+}
+
+#[test]
+fn native_json_rejects_malformed_artifacts() {
+    let (_, output) = bake_fixture();
+    let document = NativeDocument::from_output(&output);
+
+    let mut short = document.clone();
+    if let Artifact::Lut3d(lut) = &mut short.artifacts[0].artifact {
+        lut.data.clear();
+    }
+    assert!(matches!(
+        read_native_json(&serde_json::to_string(&short).expect("json")),
+        Err(ExportError::InvalidArtifact(_))
+    ));
+
+    let mut small = document.clone();
+    if let Artifact::Lut3d(lut) = &mut small.artifacts[0].artifact {
+        lut.size = 2;
+        lut.data.clear();
+    }
+    assert!(matches!(
+        read_native_json(&serde_json::to_string(&small).expect("json")),
+        Err(ExportError::InvalidArtifact(_))
+    ));
+
+    let mut broken_shaper = document.clone();
+    if let Artifact::Lut3d(lut) = &mut broken_shaper.artifacts[0].artifact
+        && let Some(shaper) = &mut lut.shaper
+    {
+        shaper.values.truncate(3);
+    }
+    assert!(matches!(
+        read_native_json(&serde_json::to_string(&broken_shaper).expect("json")),
+        Err(ExportError::InvalidArtifact(_))
+    ));
+
+    let mut empty = document.clone();
+    empty.artifacts.clear();
+    assert!(matches!(
+        read_native_json(&serde_json::to_string(&empty).expect("json")),
+        Err(ExportError::InvalidArtifact(_))
+    ));
+
+    let mut bad_range = document.clone();
+    bad_range.insertion.range = [1.0, 0.0];
+    assert!(matches!(
+        read_native_json(&serde_json::to_string(&bad_range).expect("json")),
+        Err(ExportError::Profile(_))
+    ));
 }
 
 #[test]
 fn haldclut_round_trips_within_16_bit() {
     let (_, output) = bake_fixture();
-    let lut = common::lut(&output);
+    let mut lut = common::lut(&output).clone();
+    lut.shaper = None;
     let resampled = lut.resample(64, looklab_schema::Precision::F32);
     let png = write_haldclut(&resampled).expect("haldclut");
     let back = read_haldclut(&png).expect("haldclut");

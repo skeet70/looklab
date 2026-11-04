@@ -325,6 +325,9 @@ impl TrustState {
             .credentials
             .get_mut(&subject)
             .ok_or(TrustError::UnknownCredential(subject))?;
+        if record.tier == Tier::Seeder {
+            return Err(TrustError::CannotEndorseSeeder(subject));
+        }
         if record.tier == Tier::New {
             record.tier = Tier::Endorsed;
         }

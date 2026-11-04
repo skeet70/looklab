@@ -202,6 +202,25 @@ fn endorsement_outside_the_seeder_scope_is_rejected() {
 }
 
 #[test]
+fn endorsement_rejects_a_seeder_subject() {
+    let mut state = state_with_new(&[1, 2]);
+    make_seeder(&mut state, 1);
+    make_seeder(&mut state, 2);
+    let subject = CredentialId::from_u128(2);
+    let before = state.credential(subject).expect("registered").clone();
+
+    let result = state.apply_endorsement(
+        Actor::Credential(CredentialId::from_u128(1)),
+        subject,
+        endorsement(scope(&["fujifilm/x-t5"], &[])),
+    );
+    assert!(matches!(result, Err(TrustError::CannotEndorseSeeder(_))));
+    let after = state.credential(subject).expect("registered");
+    assert_eq!(after.tier, Tier::Seeder);
+    assert_eq!(after.scope, before.scope);
+}
+
+#[test]
 fn a_non_seeder_cannot_endorse() {
     let params = TrustParams::default();
     let mut state = state_with_new(&[1, 2]);

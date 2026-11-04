@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Release gates against the previous version and the anchor.
-
-use std::collections::BTreeSet;
+//! Release gates against the previous version, the anchor and the root observations.
 
 use looklab_model::ProbeId;
 use looklab_trust::{
-    GateInput, GateReference, ProbeEstimate, TrustParams, VersionProbes, Violation,
-    convert_exposure_gauge, exposure_gauge_excluded, gate_release,
+    GateInput, GateReference, ProbeEstimate, RootObservation, TrustParams, VersionProbes,
+    Violation, convert_exposure_gauge, exposure_gauge_excluded, gate_release,
 };
 
 fn probe(id: usize, jab: [f64; 3], sigma: f64, supported: bool) -> ProbeEstimate {
@@ -18,13 +16,14 @@ fn probe(id: usize, jab: [f64; 3], sigma: f64, supported: bool) -> ProbeEstimate
     }
 }
 
-fn root_set(count: usize) -> BTreeSet<ProbeId> {
-    (0..count)
-        .map(|index| ProbeId::new(format!("p{index}")))
-        .collect()
+fn observation(id: usize, jab: [f64; 3]) -> RootObservation {
+    RootObservation {
+        id: ProbeId::new(format!("p{id}")),
+        jab,
+    }
 }
 
-/// 100 probes; the first ten are root probes.
+/// 100 probes; the first ten carry root observations at `[50, 0, 0]`.
 fn baseline() -> GateInput {
     let probes = (0..100)
         .map(|index| probe(index, [50.0, 0.0, 0.0], 0.2, true))
@@ -37,7 +36,9 @@ fn baseline() -> GateInput {
             probes: probes.clone(),
         },
         anchor: VersionProbes { probes },
-        root_probes: root_set(10),
+        root_observations: (0..10)
+            .map(|index| observation(index, [50.0, 0.0, 0.0]))
+            .collect(),
     }
 }
 
@@ -91,6 +92,56 @@ fn root_p95_rise_fails_even_with_a_flat_median() {
     assert!(!report.root_previous.pass);
     assert!(!report.root_anchor.pass);
     assert!(report.drift_previous.pass);
+}
+
+#[test]
+fn root_error_is_measured_against_the_observations() {
+    let mut input = baseline();
+    input.root_observations = (0..10)
+        .map(|index| observation(index, [51.0, 0.0, 0.0]))
+        .collect();
+    for version in [&mut input.candidate, &mut input.previous, &mut input.anchor] {
+        for probe in &mut version.probes {
+            probe.sigma = 0.3;
+        }
+    }
+    for probe in &mut input.previous.probes {
+        probe.jab = [50.4, 0.0, 0.0];
+    }
+    for probe in &mut input.anchor.probes {
+        probe.jab = [50.0, 0.0, 0.0];
+    }
+    for probe in &mut input.candidate.probes {
+        probe.jab = [49.6, 0.0, 0.0];
+    }
+
+    let report = gate_release(&TrustParams::default(), &input);
+    assert!((report.root_previous.median - 1.4).abs() < 1e-12);
+    assert!((report.root_previous.median_reference - 0.6).abs() < 1e-12);
+    assert!(!report.root_previous.pass);
+    assert!(report.drift_previous.pass);
+}
+
+#[test]
+fn a_root_improvement_passes_even_though_the_anchor_is_farther() {
+    let mut input = baseline();
+    input.root_observations = (0..10)
+        .map(|index| observation(index, [51.0, 0.0, 0.0]))
+        .collect();
+    for probe in &mut input.previous.probes {
+        probe.jab = [50.4, 0.0, 0.0];
+    }
+    for probe in &mut input.anchor.probes {
+        probe.jab = [50.0, 0.0, 0.0];
+    }
+    for probe in &mut input.candidate.probes {
+        probe.jab = [51.0, 0.0, 0.0];
+    }
+
+    let report = gate_release(&TrustParams::default(), &input);
+    assert!(report.root_previous.pass);
+    assert!(report.root_anchor.pass);
+    assert!(report.passed, "{:?}", report.violations);
 }
 
 #[test]
@@ -191,13 +242,63 @@ fn a_probe_unsupported_in_both_versions_is_outside_the_gate() {
 }
 
 #[test]
-fn no_root_probes_means_no_root_gate() {
+fn no_root_observations_means_no_root_gate() {
     let mut input = baseline();
-    input.root_probes.clear();
+    input.root_observations.clear();
     let report = gate_release(&TrustParams::default(), &input);
     assert_eq!(report.root_previous.probes, 0);
     assert!(report.root_previous.pass);
     assert!(report.root_anchor.pass);
+}
+
+#[test]
+fn an_empty_candidate_fails_closed() {
+    let mut input = baseline();
+    input.candidate.probes.clear();
+    let report = gate_release(&TrustParams::default(), &input);
+
+    assert!(!report.passed);
+    assert!(report.violations.iter().any(|violation| matches!(
+        violation,
+        Violation::MissingProbe {
+            role: looklab_trust::VersionRole::Candidate,
+            ..
+        }
+    )));
+    assert!(!report.drift_previous.pass);
+}
+
+#[test]
+fn a_duplicate_probe_fails_closed() {
+    let mut input = baseline();
+    let duplicate = input.candidate.probes[0].clone();
+    input.candidate.probes.push(duplicate);
+    let report = gate_release(&TrustParams::default(), &input);
+
+    assert!(!report.passed);
+    assert!(report.violations.iter().any(|violation| matches!(
+        violation,
+        Violation::DuplicateProbe {
+            role: looklab_trust::VersionRole::Candidate,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_missing_reference_probe_fails_closed() {
+    let mut input = baseline();
+    input.previous.probes.remove(99);
+    let report = gate_release(&TrustParams::default(), &input);
+
+    assert!(!report.passed);
+    assert!(report.violations.iter().any(|violation| matches!(
+        violation,
+        Violation::MissingProbe {
+            role: looklab_trust::VersionRole::Previous,
+            probe,
+        } if probe == &ProbeId::new("p99")
+    )));
 }
 
 #[test]

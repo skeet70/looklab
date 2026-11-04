@@ -83,6 +83,10 @@ impl Scope {
         self.looks.contains(look) || self.bodies.contains(body)
     }
 
+    pub fn covers_body(&self, body: &BodyId) -> bool {
+        self.bodies.contains(body)
+    }
+
     fn restricts(&self) -> bool {
         !(self.bodies.is_empty() && self.looks.is_empty())
     }

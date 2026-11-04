@@ -3,10 +3,26 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::ExportError;
+
 /// A correlated colour temperature in kelvin, strictly positive and finite.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "f64", into = "f64")]
 pub struct CctK(f64);
+
+impl TryFrom<f64> for CctK {
+    type Error = ExportError;
+
+    fn try_from(value: f64) -> core::result::Result<Self, Self::Error> {
+        Self::new(value).ok_or(ExportError::InvalidCct(value))
+    }
+}
+
+impl From<CctK> for f64 {
+    fn from(value: CctK) -> Self {
+        value.0
+    }
+}
 
 impl CctK {
     pub const D65: Self = Self(6500.0);

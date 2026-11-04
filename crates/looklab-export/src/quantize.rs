@@ -32,11 +32,13 @@ pub fn f16_bits(value: f32) -> u16 {
     if unbiased > 15 {
         return sign | 0x7c00;
     }
-    if unbiased < -24 {
+    if unbiased < -25 {
         return sign;
     }
     if unbiased < -14 {
-        let drop = (13 - unbiased) as u32;
+        // `q = value / 2^-24 = significand * 2^(unbiased + 1)`, dropping
+        // `-unbiased - 1` bits.
+        let drop = (-unbiased - 1) as u32;
         let significand = mantissa | 0x0080_0000;
         let mut rounded = significand >> drop;
         let remainder = significand & ((1 << drop) - 1);
@@ -105,6 +107,17 @@ mod tests {
         let smallest = f16_value(1);
         assert!((smallest - 5.960_464_5e-8).abs() < 1.0e-14);
         assert_eq!(f16_value(f16_bits(0.0)), 0.0);
+    }
+
+    #[test]
+    fn f16_encodes_subnormals() {
+        assert_eq!(f16_bits(1.0 / 32_768.0), 0x0200);
+        assert_eq!(f16_bits(1.0 / 524_288.0), 0x0020);
+        assert_eq!(f16_bits(1.0 / 16_777_216.0), 0x0001);
+        assert_eq!(f16_bits(1.0 / 33_554_432.0), 0x0000);
+        assert_eq!(f16_bits(1.5 / 33_554_432.0), 0x0001);
+        assert_eq!(f16_bits(-(1.0 / 16_777_216.0)), 0x8001);
+        assert_eq!(f16_value(0x0001), 1.0 / 16_777_216.0);
     }
 
     #[test]

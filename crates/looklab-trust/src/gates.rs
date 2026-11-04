@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Release gates against the previous version and the anchor ([docs/05 §8]).
+//!
+//! Root non-regression compares each version's ΔE to the admitted root observations,
+//! not to the anchor prediction. Every input validation failure is a violation and
+//! fails the gate: an omitted probe cannot pass.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,12 +29,27 @@ pub struct VersionProbes {
     pub probes: Vec<ProbeEstimate>,
 }
 
+/// An admitted root session's measured `J'a'b'` at one probe.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RootObservation {
+    pub id: ProbeId,
+    pub jab: [f64; 3],
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GateInput {
     pub candidate: VersionProbes,
     pub previous: VersionProbes,
     pub anchor: VersionProbes,
-    pub root_probes: BTreeSet<ProbeId>,
+    pub root_observations: Vec<RootObservation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionRole {
+    Candidate,
+    Previous,
+    Anchor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,7 +59,7 @@ pub enum GateReference {
     Anchor,
 }
 
-/// Root-probe ΔE of the candidate compared with a reference distribution.
+/// Root-probe ΔE of the candidate compared with a reference version's error.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RootGateReport {
     pub reference: GateReference,
@@ -79,6 +98,14 @@ pub struct DriftGateReport {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "criterion", rename_all = "snake_case")]
 pub enum Violation {
+    DuplicateProbe {
+        role: VersionRole,
+        probe: ProbeId,
+    },
+    MissingProbe {
+        role: VersionRole,
+        probe: ProbeId,
+    },
     RootMedian {
         reference: GateReference,
         value: f64,
@@ -130,25 +157,56 @@ pub struct GateReport {
 }
 
 pub fn gate_release(params: &TrustParams, input: &GateInput) -> GateReport {
-    let candidate = index(&input.candidate);
-    let previous = index(&input.previous);
-    let anchor = index(&input.anchor);
+    let mut violations = Vec::new();
+    let candidate = index(&input.candidate, VersionRole::Candidate, &mut violations);
+    let previous = index(&input.previous, VersionRole::Previous, &mut violations);
+    let anchor = index(&input.anchor, VersionRole::Anchor, &mut violations);
+
+    let all_ids: BTreeSet<ProbeId> = candidate
+        .keys()
+        .chain(previous.keys())
+        .chain(anchor.keys())
+        .chain(
+            input
+                .root_observations
+                .iter()
+                .map(|observation| &observation.id),
+        )
+        .cloned()
+        .collect();
+    for id in &all_ids {
+        for (role, map) in [
+            (VersionRole::Candidate, &candidate),
+            (VersionRole::Previous, &previous),
+            (VersionRole::Anchor, &anchor),
+        ] {
+            if !map.contains_key(id) {
+                violations.push(Violation::MissingProbe {
+                    role,
+                    probe: id.clone(),
+                });
+            }
+        }
+    }
+    let input_valid = violations.is_empty();
 
     let root_previous = root_gate(
         params,
         &candidate,
         &previous,
         &anchor,
-        &input.root_probes,
+        &input.root_observations,
         GateReference::Previous,
+        input_valid,
     );
     let root_anchor = root_gate(
         params,
         &candidate,
         &previous,
         &anchor,
-        &input.root_probes,
+        &input.root_observations,
         GateReference::Anchor,
+        input_valid,
     );
     let drift_previous = drift_gate(
         params,
@@ -157,6 +215,7 @@ pub fn gate_release(params: &TrustParams, input: &GateInput) -> GateReport {
         GateReference::Previous,
         params.gate_previous_floor,
         params.gate_previous_ceiling,
+        input_valid,
     );
     let drift_anchor = drift_gate(
         params,
@@ -165,6 +224,7 @@ pub fn gate_release(params: &TrustParams, input: &GateInput) -> GateReport {
         GateReference::Anchor,
         params.gate_anchor_floor,
         params.gate_anchor_ceiling,
+        input_valid,
     );
 
     let mut regressions: BTreeSet<ProbeId> = BTreeSet::new();
@@ -180,7 +240,6 @@ pub fn gate_release(params: &TrustParams, input: &GateInput) -> GateReport {
     }
     let supported_regressions: Vec<ProbeId> = regressions.into_iter().collect();
 
-    let mut violations = Vec::new();
     collect_root_violations(&root_previous, &mut violations);
     collect_root_violations(&root_anchor, &mut violations);
     collect_drift_violations(&drift_previous, &mut violations);
@@ -192,7 +251,8 @@ pub fn gate_release(params: &TrustParams, input: &GateInput) -> GateReport {
             .map(|probe| Violation::SupportedToUnsupported { probe }),
     );
 
-    let passed = root_previous.pass
+    let passed = input_valid
+        && root_previous.pass
         && root_anchor.pass
         && drift_previous.pass
         && drift_anchor.pass
@@ -209,12 +269,21 @@ pub fn gate_release(params: &TrustParams, input: &GateInput) -> GateReport {
     }
 }
 
-fn index(version: &VersionProbes) -> BTreeMap<ProbeId, &ProbeEstimate> {
-    version
-        .probes
-        .iter()
-        .map(|probe| (probe.id.clone(), probe))
-        .collect()
+fn index<'a>(
+    version: &'a VersionProbes,
+    role: VersionRole,
+    violations: &mut Vec<Violation>,
+) -> BTreeMap<ProbeId, &'a ProbeEstimate> {
+    let mut map = BTreeMap::new();
+    for probe in &version.probes {
+        if map.insert(probe.id.clone(), probe).is_some() {
+            violations.push(Violation::DuplicateProbe {
+                role,
+                probe: probe.id.clone(),
+            });
+        }
+    }
+    map
 }
 
 fn distance(a: &[f64; 3], b: &[f64; 3]) -> f64 {
@@ -229,29 +298,10 @@ fn root_gate(
     candidate: &BTreeMap<ProbeId, &ProbeEstimate>,
     previous: &BTreeMap<ProbeId, &ProbeEstimate>,
     anchor: &BTreeMap<ProbeId, &ProbeEstimate>,
-    root_probes: &BTreeSet<ProbeId>,
+    observations: &[RootObservation],
     reference: GateReference,
+    input_valid: bool,
 ) -> RootGateReport {
-    let mut values = Vec::new();
-    let mut reference_values = Vec::new();
-    for probe_id in root_probes {
-        let (Some(candidate_probe), Some(anchor_probe)) =
-            (candidate.get(probe_id), anchor.get(probe_id))
-        else {
-            continue;
-        };
-        let value = distance(&candidate_probe.jab, &anchor_probe.jab);
-        let reference_value = match reference {
-            GateReference::Anchor => 0.0,
-            GateReference::Previous => match previous.get(probe_id) {
-                Some(previous_probe) => distance(&previous_probe.jab, &anchor_probe.jab),
-                None => continue,
-            },
-        };
-        values.push(value);
-        reference_values.push(reference_value);
-    }
-
     let (median_allowance, p95_allowance) = match reference {
         GateReference::Previous => (
             params.gate_root_median_previous,
@@ -260,7 +310,23 @@ fn root_gate(
         GateReference::Anchor => (params.gate_root_median_anchor, params.gate_root_p95_anchor),
     };
 
-    if values.is_empty() {
+    let mut candidate_errors = Vec::new();
+    let mut reference_errors = Vec::new();
+    for observation in observations {
+        let (Some(candidate_probe), Some(reference_probe)) = (
+            candidate.get(&observation.id),
+            match reference {
+                GateReference::Previous => previous.get(&observation.id),
+                GateReference::Anchor => anchor.get(&observation.id),
+            },
+        ) else {
+            continue;
+        };
+        candidate_errors.push(distance(&candidate_probe.jab, &observation.jab));
+        reference_errors.push(distance(&reference_probe.jab, &observation.jab));
+    }
+
+    if observations.is_empty() {
         return RootGateReport {
             reference,
             probes: 0,
@@ -270,19 +336,21 @@ fn root_gate(
             p95: 0.0,
             p95_reference: 0.0,
             p95_allowance,
-            pass: true,
+            pass: input_valid,
         };
     }
 
-    let median = quantile(&values, 0.5);
-    let median_reference = quantile(&reference_values, 0.5);
-    let p95 = quantile(&values, 0.95);
-    let p95_reference = quantile(&reference_values, 0.95);
-    let pass =
-        median - median_reference <= median_allowance && p95 - p95_reference <= p95_allowance;
+    let median = quantile(&candidate_errors, 0.5);
+    let median_reference = quantile(&reference_errors, 0.5);
+    let p95 = quantile(&candidate_errors, 0.95);
+    let p95_reference = quantile(&reference_errors, 0.95);
+    let pass = input_valid
+        && candidate_errors.len() == observations.len()
+        && median - median_reference <= median_allowance
+        && p95 - p95_reference <= p95_allowance;
     RootGateReport {
         reference,
-        probes: values.len(),
+        probes: candidate_errors.len(),
         median,
         median_reference,
         median_allowance,
@@ -300,14 +368,18 @@ fn drift_gate(
     reference: GateReference,
     floor: f64,
     ceiling: f64,
+    input_valid: bool,
 ) -> DriftGateReport {
+    let ids: BTreeSet<&ProbeId> = candidate.keys().chain(reference_probes.keys()).collect();
     let mut gated = 0usize;
     let mut over_ceiling = Vec::new();
     let mut over_bound = Vec::new();
     let mut ratios = Vec::new();
 
-    for (probe_id, candidate_probe) in candidate {
-        let Some(reference_probe) = reference_probes.get(probe_id) else {
+    for probe_id in ids {
+        let (Some(candidate_probe), Some(reference_probe)) =
+            (candidate.get(probe_id), reference_probes.get(probe_id))
+        else {
             continue;
         };
         if !candidate_probe.supported && !reference_probe.supported {
@@ -340,7 +412,8 @@ fn drift_gate(
     } else {
         quantile(&ratios, 0.95)
     };
-    let pass = over_ceiling.is_empty()
+    let pass = input_valid
+        && over_ceiling.is_empty()
         && over_bound.len() <= allowed
         && p95_ratio <= params.gate_p95_ratio;
 

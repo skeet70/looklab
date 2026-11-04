@@ -77,9 +77,17 @@ impl ValidationReport {
         self.others.iter().find(|report| report.cct == cct)
     }
 
-    /// p95 above 1.0 at the bake CCT flags the export.
+    /// p95 above 1.0 at a bake CCT flags the export; a dual bake has two.
     pub fn flagged(&self) -> bool {
-        self.primary.stats.p95 > 1.0
+        match self.bake {
+            BakeIlluminant::Single { cct } => {
+                self.at(cct).is_some_and(|report| report.stats.p95 > 1.0)
+            }
+            BakeIlluminant::DualInterpolated => [CctK::STD_A, CctK::D65]
+                .iter()
+                .filter_map(|cct| self.at(*cct))
+                .any(|report| report.stats.p95 > 1.0),
+        }
     }
 
     pub fn clipped_fraction(&self) -> f64 {
@@ -221,7 +229,6 @@ fn evaluate_cct(
         }
         if targets[index].0.clipped {
             clipped += 1;
-            continue;
         }
         let code = codes.map(|value| value.clamp(0.0, 1.0));
         let linear = output.insertion.decode(code);

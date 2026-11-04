@@ -2312,6 +2312,7 @@ dependencies = [
 name = "looklab-fit"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "libm",
  "looklab-color",
  "looklab-model",

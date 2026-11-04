@@ -104,10 +104,32 @@ impl NativeDocument {
     }
 
     /// # Errors
-    /// [`ExportError::Profile`] for an unparsable profile id.
+    /// [`ExportError::Profile`] for a profile id or bake metadata a bake cannot
+    /// produce; [`ExportError::InvalidArtifact`] for a malformed artifact.
     pub fn into_output(self) -> Result<BakeOutput> {
         let profile_id = InterfaceId::try_from(self.profile_id.as_str())
             .map_err(|_| ExportError::Profile("invalid profile id"))?;
+        self.insertion.validate()?;
+        if self.artifacts.is_empty() {
+            return Err(ExportError::InvalidArtifact("no artifacts"));
+        }
+        for entry in &self.artifacts {
+            entry.artifact.validate()?;
+        }
+        let has_lut = self
+            .artifacts
+            .iter()
+            .any(|entry| matches!(entry.artifact, Artifact::Lut3d(_)));
+        if has_lut != self.interpolation.is_some() || has_lut != self.precision.is_some() {
+            return Err(ExportError::Profile(
+                "interpolation and precision must match the artifact kinds",
+            ));
+        }
+        for cct in self.bake.ccts() {
+            if !self.artifacts.iter().any(|entry| entry.cct == cct) {
+                return Err(ExportError::Profile("missing artifact for a bake CCT"));
+            }
+        }
         Ok(BakeOutput {
             profile_id,
             profile_version: self.profile_version,

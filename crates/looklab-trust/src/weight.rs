@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Image weights, caps and honest-duplicate merging ([docs/05 §5, §6, §12]).
+//!
+//! Every cap is applied as a multiplier `≤ 1` on the step-1 raw weight. The group
+//! cap is fixed from pre-merge raw weights; merge-dependent reductions and the
+//! contributor/group fixed point only ever scale weights down.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,26 +18,57 @@ use crate::region::{Region, RegionCoverage};
 use crate::reputation::Reputation;
 use crate::standing::Standing;
 
-/// The capture-metadata fields that make two uploads honest duplicates. Compared
-/// bytewise and only within one effective contributor.
+const MAX_CAP_ITERATIONS: usize = 64;
+
+const CAP_TOLERANCE: f64 = 1e-12;
+
+/// The capture-metadata fields that make two uploads honest duplicates.
+///
+/// One fixed slot per metadata field, each `Some` exactly when the field is present.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct CaptureTuple(Vec<u8>);
+pub struct CaptureTuple {
+    make: Option<Vec<u8>>,
+    model: Option<Vec<u8>>,
+    firmware: Option<Vec<u8>>,
+    lens_model: Option<Vec<u8>>,
+    focal_length: Option<Vec<u8>>,
+    iso: Option<Vec<u8>>,
+    shutter: Option<Vec<u8>>,
+    aperture: Option<Vec<u8>>,
+    exposure_compensation: Option<Vec<u8>>,
+    as_shot_wb: Option<Vec<u8>>,
+    capture_month: Option<Vec<u8>>,
+    software: Option<Vec<u8>>,
+    look: Option<Vec<u8>>,
+}
 
 impl CaptureTuple {
-    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
-        Self(bytes.into())
-    }
-
     pub fn from_metadata(metadata: &SanitizedMetadata) -> Result<Self> {
-        postcard::to_allocvec(metadata)
-            .map(Self)
-            .map_err(|error| TrustError::Encode(error.to_string()))
+        Ok(Self {
+            make: encode(&metadata.make)?,
+            model: encode(&metadata.model)?,
+            firmware: encode(&metadata.firmware)?,
+            lens_model: encode(&metadata.lens_model)?,
+            focal_length: encode(&metadata.focal_length)?,
+            iso: encode(&metadata.iso)?,
+            shutter: encode(&metadata.shutter)?,
+            aperture: encode(&metadata.aperture)?,
+            exposure_compensation: encode(&metadata.exposure_compensation)?,
+            as_shot_wb: encode(&metadata.as_shot_wb)?,
+            capture_month: encode(&metadata.capture_month)?,
+            software: encode(&metadata.software)?,
+            look: encode(&metadata.look)?,
+        })
     }
+}
 
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
+fn encode<T: Serialize>(value: &Option<T>) -> Result<Option<Vec<u8>>> {
+    value
+        .as_ref()
+        .map(|inner| {
+            postcard::to_allocvec(inner).map_err(|error| TrustError::Encode(error.to_string()))
+        })
+        .transpose()
 }
 
 /// One image entering a weighting pass.
@@ -53,6 +88,7 @@ pub struct WeightImage {
 }
 
 impl WeightImage {
+    /// `base(kind) × evidence × tier × reputation`, with no merge-dependent factor.
     pub fn raw_weight(&self, params: &TrustParams) -> f64 {
         params.base_weight(self.kind)
             * self.evidence
@@ -69,6 +105,7 @@ pub enum CapReason {
     DiminishingReturns { position: usize },
     NewTierGroupCap,
     ContributorCap,
+    ContributorCapsInfeasible,
 }
 
 /// One weight reduction, with the factor applied and the weight before and after.
@@ -127,10 +164,13 @@ pub struct LookWeightInput {
 pub struct LookWeightReport {
     pub images: Vec<ImageWeight>,
     pub regions: Vec<RegionWeights>,
-    /// Fewer effective contributors than the minimum, on an unrooted Look.
+    /// Fewer credentials than the minimum, on an unrooted Look.
     pub provisional: bool,
     pub contributors: usize,
     pub total: f64,
+    /// The pre-merge pool could not satisfy the per-contributor caps; only the group
+    /// cap, duplicates and diminishing returns were applied.
+    pub contributor_caps_skipped: bool,
     pub caps: CapReport,
 }
 
@@ -155,15 +195,17 @@ pub struct BodyImageWeight {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BodyWeightReport {
     pub images: Vec<BodyImageWeight>,
-    /// Fewer effective contributors than the minimum, on an unrooted body.
+    /// Fewer credentials than the minimum, on an unrooted body.
     pub provisional: bool,
     pub contributors: usize,
     pub total: f64,
+    /// The pre-merge pool could not satisfy the per-contributor caps; only the group
+    /// cap, duplicates and diminishing returns were applied.
+    pub contributor_caps_skipped: bool,
     pub caps: CapReport,
 }
 
-/// Images split by the fit stage they may enter ([docs/02 §4.3]). Recipe images never
-/// enter a Look's `θ_L`.
+/// Images split by the fit stage they may enter ([docs/02 §4.3]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StagePartition {
     pub native: Vec<ImageRef>,
@@ -185,130 +227,218 @@ struct Working<'a> {
     image: &'a WeightImage,
     raw: f64,
     duplicates: usize,
+    /// Honest-duplicate and diminishing-returns factor, always `≤ 1`.
+    merge_factor: f64,
+    /// Product of every contributor-cap and group-cap re-check factor.
     contributor_factor: f64,
 }
 
 struct Prepared<'a> {
     working: Vec<Working<'a>>,
     recipe: Vec<&'a WeightImage>,
+    credentials: usize,
 }
 
 type DuplicateGroups<'a> =
     BTreeMap<(EffectiveContributorId, CaptureTuple), Vec<(&'a WeightImage, f64)>>;
 
-impl Working<'_> {
-    fn reduction(
-        &self,
-        reason: CapReason,
-        region: Option<Region>,
-        factor: f64,
-        before: f64,
-        after: f64,
-    ) -> CapReduction {
-        CapReduction {
-            reason,
-            image: Some(self.image.id.clone()),
-            credential: Some(self.image.credential),
-            contributor: Some(self.image.contributor),
-            region,
-            factor,
-            before,
-            after,
+enum CapPlan<'a> {
+    Apply,
+    Skip,
+    Targets(&'a BTreeMap<CredentialId, f64>),
+}
+
+pub fn weight_look(params: &TrustParams, input: &LookWeightInput) -> LookWeightReport {
+    let shadow = shadow_look_input(input);
+    let (shadow_report, shadow_exhausted, credentials) =
+        compute_look(params, &shadow, CapPlan::Apply);
+    let caps_active = credentials >= params.min_look_contributors;
+
+    let (mut report, runtime_exhausted) = if !caps_active || shadow_exhausted {
+        (compute_look(params, input, CapPlan::Skip).0, false)
+    } else {
+        let (report, exhausted, _) = compute_look(params, input, CapPlan::Apply);
+        if exhausted {
+            let targets = look_targets(&shadow_report);
+            (
+                compute_look(params, input, CapPlan::Targets(&targets)).0,
+                true,
+            )
+        } else {
+            (report, false)
         }
+    };
+
+    if caps_active && (shadow_exhausted || runtime_exhausted) {
+        report.contributor_caps_skipped = true;
+        report.provisional = true;
+        report.caps.reductions.push(infeasible_marker(report.total));
+    }
+    report
+}
+
+pub fn weight_body(params: &TrustParams, input: &BodyWeightInput) -> BodyWeightReport {
+    let shadow = shadow_body_input(input);
+    let (shadow_report, shadow_exhausted, credentials) =
+        compute_body(params, &shadow, CapPlan::Apply);
+    let caps_active = credentials >= params.min_body_contributors;
+
+    let (mut report, runtime_exhausted) = if !caps_active || shadow_exhausted {
+        (compute_body(params, input, CapPlan::Skip).0, false)
+    } else {
+        let (report, exhausted, _) = compute_body(params, input, CapPlan::Apply);
+        if exhausted {
+            let targets = body_targets(&shadow_report);
+            (
+                compute_body(params, input, CapPlan::Targets(&targets)).0,
+                true,
+            )
+        } else {
+            (report, false)
+        }
+    };
+
+    if caps_active && (shadow_exhausted || runtime_exhausted) {
+        report.contributor_caps_skipped = true;
+        report.provisional = true;
+        report.caps.reductions.push(infeasible_marker(report.total));
+    }
+    report
+}
+
+fn shadow_look_input(input: &LookWeightInput) -> LookWeightInput {
+    LookWeightInput {
+        images: input
+            .images
+            .iter()
+            .map(|image| {
+                let mut shadow = image.clone();
+                shadow.contributor = EffectiveContributorId::from(image.credential);
+                shadow
+            })
+            .collect(),
+        anchored_weight: input.anchored_weight.clone(),
+        rooted: input.rooted,
     }
 }
 
-/// Look weight with per-region group caps, per-contributor caps and diminishing returns.
-pub fn weight_look(params: &TrustParams, input: &LookWeightInput) -> LookWeightReport {
+fn shadow_body_input(input: &BodyWeightInput) -> BodyWeightInput {
+    BodyWeightInput {
+        images: input
+            .images
+            .iter()
+            .map(|image| {
+                let mut shadow = image.clone();
+                shadow.contributor = EffectiveContributorId::from(image.credential);
+                shadow
+            })
+            .collect(),
+        anchored_weight: input.anchored_weight,
+        rooted: input.rooted,
+    }
+}
+
+fn look_targets(report: &LookWeightReport) -> BTreeMap<CredentialId, f64> {
+    let mut targets: BTreeMap<CredentialId, f64> = BTreeMap::new();
+    for image in &report.images {
+        *targets.entry(image.credential).or_insert(0.0) += image.total;
+    }
+    targets
+}
+
+fn body_targets(report: &BodyWeightReport) -> BTreeMap<CredentialId, f64> {
+    let mut targets: BTreeMap<CredentialId, f64> = BTreeMap::new();
+    for image in &report.images {
+        *targets.entry(image.credential).or_insert(0.0) += image.final_weight;
+    }
+    targets
+}
+
+fn infeasible_marker(total: f64) -> CapReduction {
+    CapReduction {
+        reason: CapReason::ContributorCapsInfeasible,
+        image: None,
+        credential: None,
+        contributor: None,
+        region: None,
+        factor: 1.0,
+        before: total,
+        after: total,
+    }
+}
+
+fn compute_look(
+    params: &TrustParams,
+    input: &LookWeightInput,
+    plan: CapPlan<'_>,
+) -> (LookWeightReport, bool, usize) {
     let mut caps = CapReport::default();
+    let new_raw = look_new_raw_totals(params, &input.images);
+    let mut new_scale: BTreeMap<Region, f64> =
+        new_raw.keys().map(|region| (*region, 1.0)).collect();
+
     let Prepared {
         mut working,
         recipe,
-    } = prepare(params, &input.images, &mut caps);
+        credentials,
+    } = prepare(params, &input.images, false, &mut caps);
 
-    let mut trusted_by_region: BTreeMap<Region, f64> = input.anchored_weight.clone();
-    let mut new_by_region: BTreeMap<Region, f64> = BTreeMap::new();
-    for entry in &working {
-        for (region, share) in entry.image.coverage.iter() {
-            let weight = entry.raw * share;
-            if entry.image.standing == Standing::New {
-                *new_by_region.entry(region).or_insert(0.0) += weight;
-            } else {
-                *trusted_by_region.entry(region).or_insert(0.0) += weight;
-            }
+    let anchored_total: f64 = input.anchored_weight.values().sum();
+    let exhausted = match plan {
+        CapPlan::Apply if credentials >= params.min_look_contributors => apply_look_caps(
+            params,
+            &mut working,
+            &mut new_scale,
+            &new_raw,
+            &input.anchored_weight,
+            anchored_total,
+            &mut caps,
+        ),
+        CapPlan::Targets(targets) => {
+            apply_look_targets(&mut working, targets, &mut caps);
+            enforce_look_group(
+                params,
+                &working,
+                &mut new_scale,
+                &new_raw,
+                &input.anchored_weight,
+                &mut caps,
+            );
+            false
         }
-    }
-
-    let mut new_scale: BTreeMap<Region, f64> = BTreeMap::new();
-    for (region, new) in &new_by_region {
-        let trusted = trusted_by_region.get(region).copied().unwrap_or(0.0);
-        let scale = group_cap_scale(params, trusted, *new);
-        new_scale.insert(*region, scale);
-        if scale < 1.0 {
-            for entry in &working {
-                if entry.image.standing != Standing::New {
-                    continue;
-                }
-                let share = entry.image.coverage.share(*region);
-                if share <= 0.0 {
-                    continue;
-                }
-                let before = entry.raw * share;
-                caps.reductions.push(entry.reduction(
-                    CapReason::NewTierGroupCap,
-                    Some(*region),
-                    scale,
-                    before,
-                    before * scale,
-                ));
-            }
+        _ => {
+            enforce_look_group(
+                params,
+                &working,
+                &mut new_scale,
+                &new_raw,
+                &input.anchored_weight,
+                &mut caps,
+            );
+            false
         }
-    }
+    };
 
     let pool: BTreeSet<EffectiveContributorId> = working
         .iter()
         .map(|entry| entry.image.contributor)
         .collect();
-    // Counted by credential: serial merging must not be able to lift a cap by shrinking the pool.
-    let credentials: BTreeSet<CredentialId> =
-        working.iter().map(|entry| entry.image.credential).collect();
-    let cap_base: f64 = working
-        .iter()
-        .map(|entry| look_image_total(entry, &new_scale))
-        .sum::<f64>()
-        + input.anchored_weight.values().sum::<f64>();
-
-    if credentials.len() >= params.min_look_contributors {
-        let cap = params.look_contributor_cap * cap_base;
-        cap_contributors(&mut working, &mut caps, cap, |entry| {
-            look_image_total(entry, &new_scale)
-        });
-    }
-    let total: f64 = working
-        .iter()
-        .map(|entry| look_image_total(entry, &new_scale))
-        .sum::<f64>()
-        + input.anchored_weight.values().sum::<f64>();
 
     let mut images: Vec<ImageWeight> = working
         .iter()
         .map(|entry| {
             let mut per_region = BTreeMap::new();
-            for (region, share) in entry.image.coverage.iter() {
-                let weight = entry.raw
-                    * share
-                    * region_scale(entry.image.standing, region, &new_scale)
-                    * entry.contributor_factor;
-                per_region.insert(region, weight);
+            for region in entry.image.coverage.regions() {
+                per_region.insert(region, look_weight(entry, region, &new_scale));
             }
-            let image_total: f64 = per_region.values().sum();
+            let total: f64 = per_region.values().sum();
             ImageWeight {
                 id: entry.image.id.clone(),
                 credential: entry.image.credential,
                 contributor: entry.image.contributor,
                 raw: entry.image.raw_weight(params),
                 per_region,
-                total: image_total,
+                total,
                 duplicates: entry.duplicates,
             }
         })
@@ -344,10 +474,7 @@ pub fn weight_look(params: &TrustParams, input: &LookWeightInput) -> LookWeightR
             let mut trusted = input.anchored_weight.get(&region).copied().unwrap_or(0.0);
             let mut new = 0.0;
             for entry in &working {
-                let weight = entry.raw
-                    * entry.image.coverage.share(region)
-                    * region_scale(entry.image.standing, region, &new_scale)
-                    * entry.contributor_factor;
+                let weight = look_weight(entry, region, &new_scale);
                 if entry.image.standing == Standing::New {
                     new += weight;
                 } else {
@@ -365,72 +492,77 @@ pub fn weight_look(params: &TrustParams, input: &LookWeightInput) -> LookWeightR
         })
         .collect();
 
-    LookWeightReport {
+    let total: f64 = working
+        .iter()
+        .map(|entry| look_total(entry, &new_scale))
+        .sum::<f64>()
+        + anchored_total;
+
+    let report = LookWeightReport {
         images,
         regions,
-        provisional: credentials.len() < params.min_look_contributors && !input.rooted,
+        provisional: credentials < params.min_look_contributors && !input.rooted,
         contributors: pool.len(),
         total,
+        contributor_caps_skipped: false,
         caps,
-    }
+    };
+    (report, exhausted, credentials)
 }
 
-pub fn weight_body(params: &TrustParams, input: &BodyWeightInput) -> BodyWeightReport {
+fn compute_body(
+    params: &TrustParams,
+    input: &BodyWeightInput,
+    plan: CapPlan<'_>,
+) -> (BodyWeightReport, bool, usize) {
     let mut caps = CapReport::default();
+    let new_raw = body_new_raw_total(params, &input.images);
+    let mut group_scale = 1.0;
+
     let Prepared {
         mut working,
         recipe,
-    } = prepare(params, &input.images, &mut caps);
+        credentials,
+    } = prepare(params, &input.images, true, &mut caps);
 
-    let mut trusted = input.anchored_weight;
-    let mut new = 0.0;
-    for entry in &working {
-        if entry.image.standing == Standing::New {
-            new += entry.raw;
-        } else {
-            trusted += entry.raw;
+    let exhausted = match plan {
+        CapPlan::Apply if credentials >= params.min_body_contributors => apply_body_caps(
+            params,
+            &mut working,
+            &mut group_scale,
+            new_raw,
+            input.anchored_weight,
+            &mut caps,
+        ),
+        CapPlan::Targets(targets) => {
+            apply_body_targets(&mut working, targets, &mut caps);
+            enforce_body_group(
+                params,
+                &working,
+                &mut group_scale,
+                new_raw,
+                input.anchored_weight,
+                &mut caps,
+            );
+            false
         }
-    }
-    let group_scale = group_cap_scale(params, trusted, new);
-    if group_scale < 1.0 {
-        for entry in &working {
-            if entry.image.standing != Standing::New {
-                continue;
-            }
-            let before = entry.raw;
-            caps.reductions.push(entry.reduction(
-                CapReason::NewTierGroupCap,
-                None,
-                group_scale,
-                before,
-                before * group_scale,
-            ));
+        _ => {
+            enforce_body_group(
+                params,
+                &working,
+                &mut group_scale,
+                new_raw,
+                input.anchored_weight,
+                &mut caps,
+            );
+            false
         }
-    }
+    };
 
     let pool: BTreeSet<EffectiveContributorId> = working
         .iter()
         .map(|entry| entry.image.contributor)
         .collect();
-    let credentials: BTreeSet<CredentialId> =
-        working.iter().map(|entry| entry.image.credential).collect();
-    let cap_base: f64 = working
-        .iter()
-        .map(|entry| body_image_total(entry, group_scale))
-        .sum::<f64>()
-        + input.anchored_weight;
-
-    if credentials.len() >= params.min_body_contributors {
-        let cap = params.body_contributor_cap * cap_base;
-        cap_contributors(&mut working, &mut caps, cap, |entry| {
-            body_image_total(entry, group_scale)
-        });
-    }
-    let total: f64 = working
-        .iter()
-        .map(|entry| body_image_total(entry, group_scale))
-        .sum::<f64>()
-        + input.anchored_weight;
 
     let mut images: Vec<BodyImageWeight> = working
         .iter()
@@ -439,7 +571,7 @@ pub fn weight_body(params: &TrustParams, input: &BodyWeightInput) -> BodyWeightR
             credential: entry.image.credential,
             contributor: entry.image.contributor,
             raw: entry.image.raw_weight(params),
-            final_weight: body_image_total(entry, group_scale),
+            final_weight: body_weight(entry, group_scale),
             duplicates: entry.duplicates,
         })
         .collect();
@@ -453,38 +585,53 @@ pub fn weight_body(params: &TrustParams, input: &BodyWeightInput) -> BodyWeightR
     }));
     images.sort_by(|a, b| a.id.cmp(&b.id));
 
-    BodyWeightReport {
+    let trusted: f64 = input.anchored_weight
+        + working
+            .iter()
+            .filter(|entry| entry.image.standing != Standing::New)
+            .map(|entry| body_weight(entry, group_scale))
+            .sum::<f64>();
+    let total: f64 = working
+        .iter()
+        .map(|entry| body_weight(entry, group_scale))
+        .sum::<f64>()
+        + input.anchored_weight;
+
+    let report = BodyWeightReport {
         images,
         provisional: (trusted <= 0.0)
-            || (credentials.len() < params.min_body_contributors && !input.rooted),
+            || (credentials < params.min_body_contributors && !input.rooted),
         contributors: pool.len(),
         total,
+        contributor_caps_skipped: false,
         caps,
-    }
+    };
+    (report, exhausted, credentials)
 }
 
 fn prepare<'a>(
     params: &TrustParams,
     images: &'a [WeightImage],
+    include_recipe: bool,
     caps: &mut CapReport,
 ) -> Prepared<'a> {
     let mut groups: DuplicateGroups<'a> = BTreeMap::new();
     let mut recipe = Vec::new();
+    let mut credentials = BTreeSet::new();
     for image in images {
-        if matches!(image.intent, Intent::Recipe { .. }) {
-            caps.reductions.push(CapReduction {
-                reason: CapReason::RecipeChannel,
-                image: Some(image.id.clone()),
-                credential: Some(image.credential),
-                contributor: Some(image.contributor),
-                region: None,
-                factor: 0.0,
-                before: image.raw_weight(params),
-                after: 0.0,
-            });
+        if !include_recipe && matches!(image.intent, Intent::Recipe { .. }) {
+            caps.reductions.push(cap_reduction(
+                image,
+                CapReason::RecipeChannel,
+                None,
+                0.0,
+                image.raw_weight(params),
+                0.0,
+            ));
             recipe.push(image);
             continue;
         }
+        credentials.insert(image.credential);
         let raw = image.raw_weight(params);
         groups
             .entry((image.contributor, image.capture.clone()))
@@ -499,7 +646,9 @@ fn prepare<'a>(
             let better = match best {
                 None => true,
                 Some((best_image, best_raw)) => {
-                    raw > best_raw || (raw == best_raw && image.id < best_image.id)
+                    image.standing > best_image.standing
+                        || (image.standing == best_image.standing
+                            && (raw > best_raw || (raw == best_raw && image.id < best_image.id)))
                 }
             };
             if better {
@@ -513,21 +662,20 @@ fn prepare<'a>(
             if image.id == representative.id {
                 continue;
             }
-            caps.reductions.push(CapReduction {
-                reason: CapReason::DuplicateMerge,
-                image: Some(image.id.clone()),
-                credential: Some(image.credential),
-                contributor: Some(image.contributor),
-                region: None,
-                factor: 0.0,
-                before: other_raw,
-                after: 0.0,
-            });
+            caps.reductions.push(cap_reduction(
+                image,
+                CapReason::DuplicateMerge,
+                None,
+                0.0,
+                other_raw,
+                0.0,
+            ));
         }
         working.push(Working {
             image: representative,
             raw,
             duplicates: group.len(),
+            merge_factor: 1.0,
             contributor_factor: 1.0,
         });
     }
@@ -540,84 +688,57 @@ fn prepare<'a>(
         } else {
             1.0
         };
+        let before = entry.raw * entry.merge_factor;
+        entry.merge_factor *= factor;
         if factor < 1.0 {
-            let before = entry.raw;
-            entry.raw *= factor;
-            caps.reductions.push(entry.reduction(
+            caps.reductions.push(cap_reduction(
+                entry.image,
                 CapReason::DiminishingReturns {
                     position: *position,
                 },
                 None,
                 factor,
                 before,
-                entry.raw,
+                entry.raw * entry.merge_factor,
             ));
         }
         *position += 1;
     }
 
-    Prepared { working, recipe }
-}
-
-fn cap_contributors(
-    working: &mut [Working<'_>],
-    caps: &mut CapReport,
-    cap: f64,
-    total_of: impl Fn(&Working<'_>) -> f64,
-) {
-    let mut by_contributor: BTreeMap<EffectiveContributorId, Vec<usize>> = BTreeMap::new();
-    for (index, entry) in working.iter().enumerate() {
-        by_contributor
-            .entry(entry.image.contributor)
-            .or_default()
-            .push(index);
-    }
-
-    for (_, mut indices) in by_contributor {
-        let contributor_total: f64 = indices.iter().map(|&index| total_of(&working[index])).sum();
-        if contributor_total <= cap {
-            continue;
-        }
-        let mut excess = contributor_total - cap;
-        indices.sort_by(|&a, &b| {
-            let left = &working[a].image;
-            let right = &working[b].image;
-            left.standing
-                .cmp(&right.standing)
-                .then_with(|| left.credential.cmp(&right.credential))
-                .then_with(|| left.capture.cmp(&right.capture))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        for index in indices {
-            if excess <= 0.0 {
-                break;
-            }
-            let before = total_of(&working[index]);
-            if before <= 0.0 {
-                continue;
-            }
-            let take = if excess < before { excess } else { before };
-            let factor = (before - take) / before;
-            working[index].contributor_factor *= factor;
-            excess -= take;
-            caps.reductions.push(working[index].reduction(
-                CapReason::ContributorCap,
-                None,
-                factor,
-                before,
-                before - take,
-            ));
-        }
+    Prepared {
+        working,
+        recipe,
+        credentials: credentials.len(),
     }
 }
 
-fn group_cap_scale(params: &TrustParams, trusted: f64, new: f64) -> f64 {
-    let gamma = params.new_group_cap.clamp(0.0, 0.999_999);
-    if trusted <= 0.0 || new <= 0.0 {
-        return 1.0;
-    }
-    let cap = gamma * trusted / (1.0 - gamma);
-    if new > cap { cap / new } else { 1.0 }
+fn look_weight(entry: &Working<'_>, region: Region, new_scale: &BTreeMap<Region, f64>) -> f64 {
+    entry.raw
+        * entry.image.coverage.share(region)
+        * region_scale(entry.image.standing, region, new_scale)
+        * entry.merge_factor
+        * entry.contributor_factor
+}
+
+fn look_total(entry: &Working<'_>, new_scale: &BTreeMap<Region, f64>) -> f64 {
+    entry.raw
+        * entry.merge_factor
+        * entry.contributor_factor
+        * entry
+            .image
+            .coverage
+            .iter()
+            .map(|(region, share)| share * region_scale(entry.image.standing, region, new_scale))
+            .sum::<f64>()
+}
+
+fn body_weight(entry: &Working<'_>, group_scale: f64) -> f64 {
+    let scale = if entry.image.standing == Standing::New {
+        group_scale
+    } else {
+        1.0
+    };
+    entry.raw * scale * entry.merge_factor * entry.contributor_factor
 }
 
 fn region_scale(standing: Standing, region: Region, new_scale: &BTreeMap<Region, f64>) -> f64 {
@@ -628,19 +749,430 @@ fn region_scale(standing: Standing, region: Region, new_scale: &BTreeMap<Region,
     }
 }
 
-fn look_image_total(entry: &Working<'_>, new_scale: &BTreeMap<Region, f64>) -> f64 {
-    let mut coverage = 0.0;
-    for (region, share) in entry.image.coverage.iter() {
-        coverage += share * region_scale(entry.image.standing, region, new_scale);
-    }
-    entry.raw * entry.contributor_factor * coverage
+fn gamma_ratio(params: &TrustParams) -> f64 {
+    let gamma = params.new_group_cap.clamp(0.0, 0.999_999);
+    gamma / (1.0 - gamma)
 }
 
-fn body_image_total(entry: &Working<'_>, group_scale: f64) -> f64 {
-    let scale = if entry.image.standing == Standing::New {
-        group_scale
-    } else {
-        1.0
-    };
-    entry.raw * scale * entry.contributor_factor
+/// Pre-merge new-tier raw weight per region. The group denominator uses this fixed
+/// total, so dropping a merged image cannot release headroom to another credential.
+fn look_new_raw_totals(params: &TrustParams, images: &[WeightImage]) -> BTreeMap<Region, f64> {
+    let mut new: BTreeMap<Region, f64> = BTreeMap::new();
+    for image in images {
+        if image.standing != Standing::New || matches!(image.intent, Intent::Recipe { .. }) {
+            continue;
+        }
+        let raw = image.raw_weight(params);
+        for (region, share) in image.coverage.iter() {
+            *new.entry(region).or_insert(0.0) += raw * share;
+        }
+    }
+    new
+}
+
+fn body_new_raw_total(params: &TrustParams, images: &[WeightImage]) -> f64 {
+    images
+        .iter()
+        .filter(|image| image.standing == Standing::New)
+        .map(|image| image.raw_weight(params))
+        .sum()
+}
+
+/// Bounds new-tier weight by `γ/(1−γ) × trusted` using the fixed pre-merge new total.
+///
+/// Trusted weight only falls as caps and merges apply, so the bound only tightens.
+fn enforce_look_group(
+    params: &TrustParams,
+    working: &[Working<'_>],
+    new_scale: &mut BTreeMap<Region, f64>,
+    new_raw: &BTreeMap<Region, f64>,
+    anchored: &BTreeMap<Region, f64>,
+    caps: &mut CapReport,
+) -> bool {
+    let ratio = gamma_ratio(params);
+    let mut trusted: BTreeMap<Region, f64> = anchored.clone();
+    for entry in working {
+        if entry.image.standing == Standing::New {
+            continue;
+        }
+        let weight = entry.raw * entry.merge_factor * entry.contributor_factor;
+        for (region, share) in entry.image.coverage.iter() {
+            *trusted.entry(region).or_insert(0.0) += weight * share;
+        }
+    }
+
+    let mut changed = false;
+    for (region, new_pre) in new_raw {
+        if *new_pre <= 0.0 {
+            continue;
+        }
+        let trusted_total = trusted.get(region).copied().unwrap_or(0.0);
+        if trusted_total <= 0.0 {
+            continue;
+        }
+        let bound = (ratio * trusted_total / new_pre).min(1.0);
+        let current = new_scale.get(region).copied().unwrap_or(1.0);
+        if bound >= current * (1.0 - CAP_TOLERANCE) {
+            continue;
+        }
+        let factor = bound / current;
+        new_scale.insert(*region, bound);
+        for entry in working {
+            if entry.image.standing != Standing::New {
+                continue;
+            }
+            let share = entry.image.coverage.share(*region);
+            if share <= 0.0 {
+                continue;
+            }
+            let base = entry.raw * share * entry.merge_factor * entry.contributor_factor;
+            caps.reductions.push(cap_reduction(
+                entry.image,
+                CapReason::NewTierGroupCap,
+                Some(*region),
+                factor,
+                base * current,
+                base * bound,
+            ));
+        }
+        changed = true;
+    }
+    changed
+}
+
+fn enforce_body_group(
+    params: &TrustParams,
+    working: &[Working<'_>],
+    group_scale: &mut f64,
+    new_pre: f64,
+    anchored: f64,
+    caps: &mut CapReport,
+) -> bool {
+    if new_pre <= 0.0 {
+        return false;
+    }
+    let ratio = gamma_ratio(params);
+    let mut trusted = anchored;
+    for entry in working {
+        if entry.image.standing != Standing::New {
+            trusted += body_weight(entry, *group_scale);
+        }
+    }
+    if trusted <= 0.0 {
+        return false;
+    }
+    let bound = (ratio * trusted / new_pre).min(1.0);
+    let current = *group_scale;
+    if bound >= current * (1.0 - CAP_TOLERANCE) {
+        return false;
+    }
+    let factor = bound / current;
+    *group_scale = bound;
+    for entry in working {
+        if entry.image.standing != Standing::New {
+            continue;
+        }
+        let base = entry.raw * entry.merge_factor * entry.contributor_factor;
+        caps.reductions.push(cap_reduction(
+            entry.image,
+            CapReason::NewTierGroupCap,
+            None,
+            factor,
+            base * current,
+            base * bound,
+        ));
+    }
+    true
+}
+
+fn apply_look_caps(
+    params: &TrustParams,
+    working: &mut [Working<'_>],
+    new_scale: &mut BTreeMap<Region, f64>,
+    new_raw: &BTreeMap<Region, f64>,
+    anchored: &BTreeMap<Region, f64>,
+    anchored_total: f64,
+    caps: &mut CapReport,
+) -> bool {
+    for _ in 0..MAX_CAP_ITERATIONS {
+        let mut changed = water_fill_look(params, working, new_scale, anchored_total, caps);
+        changed |= enforce_look_group(params, working, new_scale, new_raw, anchored, caps);
+        if !changed {
+            return false;
+        }
+    }
+    true
+}
+
+fn apply_body_caps(
+    params: &TrustParams,
+    working: &mut [Working<'_>],
+    group_scale: &mut f64,
+    new_raw: f64,
+    anchored: f64,
+    caps: &mut CapReport,
+) -> bool {
+    for _ in 0..MAX_CAP_ITERATIONS {
+        let mut changed = water_fill_body(params, working, *group_scale, anchored, caps);
+        changed |= enforce_body_group(params, working, group_scale, new_raw, anchored, caps);
+        if !changed {
+            return false;
+        }
+    }
+    true
+}
+
+fn apply_look_targets(
+    working: &mut [Working<'_>],
+    targets: &BTreeMap<CredentialId, f64>,
+    caps: &mut CapReport,
+) {
+    let mut by_credential: BTreeMap<CredentialId, Vec<usize>> = BTreeMap::new();
+    for (index, entry) in working.iter().enumerate() {
+        by_credential
+            .entry(entry.image.credential)
+            .or_default()
+            .push(index);
+    }
+    for (credential, mut indices) in by_credential {
+        let target = targets.get(&credential).copied().unwrap_or(f64::INFINITY);
+        reduce_contributor(
+            working,
+            &mut indices,
+            target,
+            |entry| entry.raw * entry.merge_factor * entry.contributor_factor,
+            caps,
+        );
+    }
+}
+
+fn apply_body_targets(
+    working: &mut [Working<'_>],
+    targets: &BTreeMap<CredentialId, f64>,
+    caps: &mut CapReport,
+) {
+    let mut by_credential: BTreeMap<CredentialId, Vec<usize>> = BTreeMap::new();
+    for (index, entry) in working.iter().enumerate() {
+        by_credential
+            .entry(entry.image.credential)
+            .or_default()
+            .push(index);
+    }
+    for (credential, mut indices) in by_credential {
+        let target = targets.get(&credential).copied().unwrap_or(f64::INFINITY);
+        reduce_contributor(
+            working,
+            &mut indices,
+            target,
+            |entry| entry.raw * entry.merge_factor * entry.contributor_factor,
+            caps,
+        );
+    }
+}
+
+fn water_fill_look(
+    params: &TrustParams,
+    working: &mut [Working<'_>],
+    new_scale: &BTreeMap<Region, f64>,
+    anchored_total: f64,
+    caps: &mut CapReport,
+) -> bool {
+    let mut by_contributor: BTreeMap<EffectiveContributorId, Vec<usize>> = BTreeMap::new();
+    for (index, entry) in working.iter().enumerate() {
+        by_contributor
+            .entry(entry.image.contributor)
+            .or_default()
+            .push(index);
+    }
+    let list: Vec<(EffectiveContributorId, f64)> = by_contributor
+        .iter()
+        .map(|(contributor, indices)| {
+            (
+                *contributor,
+                indices
+                    .iter()
+                    .map(|&index| look_total(&working[index], new_scale))
+                    .sum(),
+            )
+        })
+        .collect();
+    let finals = water_fill(&list, anchored_total, params.look_contributor_cap);
+    let targets: BTreeMap<EffectiveContributorId, f64> = list
+        .iter()
+        .zip(&finals)
+        .map(|((contributor, _), final_total)| (*contributor, *final_total))
+        .collect();
+
+    let mut changed = false;
+    for (contributor, mut indices) in by_contributor {
+        changed |= reduce_contributor(
+            working,
+            &mut indices,
+            targets[&contributor],
+            |entry| look_total(entry, new_scale),
+            caps,
+        );
+    }
+    changed
+}
+
+fn water_fill_body(
+    params: &TrustParams,
+    working: &mut [Working<'_>],
+    group_scale: f64,
+    anchored: f64,
+    caps: &mut CapReport,
+) -> bool {
+    let mut by_contributor: BTreeMap<EffectiveContributorId, Vec<usize>> = BTreeMap::new();
+    for (index, entry) in working.iter().enumerate() {
+        by_contributor
+            .entry(entry.image.contributor)
+            .or_default()
+            .push(index);
+    }
+    let list: Vec<(EffectiveContributorId, f64)> = by_contributor
+        .iter()
+        .map(|(contributor, indices)| {
+            (
+                *contributor,
+                indices
+                    .iter()
+                    .map(|&index| body_weight(&working[index], group_scale))
+                    .sum(),
+            )
+        })
+        .collect();
+    let finals = water_fill(&list, anchored, params.body_contributor_cap);
+    let targets: BTreeMap<EffectiveContributorId, f64> = list
+        .iter()
+        .zip(&finals)
+        .map(|((contributor, _), final_total)| (*contributor, *final_total))
+        .collect();
+
+    let mut changed = false;
+    for (contributor, mut indices) in by_contributor {
+        changed |= reduce_contributor(
+            working,
+            &mut indices,
+            targets[&contributor],
+            |entry| body_weight(entry, group_scale),
+            caps,
+        );
+    }
+    changed
+}
+
+/// Brings one contributor to `target`, taking weight from lower-standing credentials'
+/// images first.
+fn reduce_contributor(
+    working: &mut [Working<'_>],
+    indices: &mut [usize],
+    target: f64,
+    weight: impl Fn(&Working<'_>) -> f64,
+    caps: &mut CapReport,
+) -> bool {
+    let current: f64 = indices.iter().map(|&index| weight(&working[index])).sum();
+    if current <= target * (1.0 + CAP_TOLERANCE) {
+        return false;
+    }
+    indices.sort_by(|&a, &b| {
+        let left = &working[a].image;
+        let right = &working[b].image;
+        left.standing
+            .cmp(&right.standing)
+            .then_with(|| left.credential.cmp(&right.credential))
+            .then_with(|| left.capture.cmp(&right.capture))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let mut excess = current - target;
+    for &index in indices.iter() {
+        if excess <= current * CAP_TOLERANCE {
+            break;
+        }
+        let before = weight(&working[index]);
+        if before <= 0.0 {
+            continue;
+        }
+        let take = if excess < before { excess } else { before };
+        let factor = (before - take) / before;
+        working[index].contributor_factor *= factor;
+        excess -= take;
+        caps.reductions.push(cap_reduction(
+            working[index].image,
+            CapReason::ContributorCap,
+            None,
+            factor,
+            before,
+            before - take,
+        ));
+    }
+    true
+}
+
+/// Solves `v_c = min(raw_c, share × (anchored + Σ v))` for every contributor.
+///
+/// The top `k` contributors are capped at `value` and the rest keep their weight, with
+/// `total = (anchored + Σ uncapped) / (1 − k·share)`. Returns all zeros when no such
+/// allocation exists, which is the only fixed point when the caps cannot coexist.
+fn water_fill(totals: &[(EffectiveContributorId, f64)], anchored: f64, share: f64) -> Vec<f64> {
+    let n = totals.len();
+    let mut result = vec![0.0; n];
+    if share <= 0.0 {
+        return result;
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        totals[a]
+            .1
+            .total_cmp(&totals[b].1)
+            .then_with(|| totals[a].0.cmp(&totals[b].0))
+    });
+
+    let mut suffix: f64 = totals.iter().map(|(_, total)| *total).sum();
+    for k in 0..=n {
+        if k > 0 {
+            suffix -= totals[order[n - k]].1;
+        }
+        let denominator = 1.0 - k as f64 * share;
+        if denominator <= 0.0 {
+            continue;
+        }
+        let total = (anchored + suffix) / denominator;
+        let value = share * total;
+        let uncapped_ok = k == n
+            || totals[order[n - k - 1]].1 <= value * (1.0 + CAP_TOLERANCE) + f64::MIN_POSITIVE;
+        let capped_ok = k == 0 || totals[order[n - k]].1 > value * (1.0 - CAP_TOLERANCE);
+        if uncapped_ok && capped_ok {
+            for (rank, &index) in order.iter().enumerate() {
+                result[index] = if rank >= n - k {
+                    value
+                } else {
+                    totals[index].1
+                };
+            }
+            return result;
+        }
+    }
+    result
+}
+
+fn cap_reduction(
+    image: &WeightImage,
+    reason: CapReason,
+    region: Option<Region>,
+    factor: f64,
+    before: f64,
+    after: f64,
+) -> CapReduction {
+    CapReduction {
+        reason,
+        image: Some(image.id.clone()),
+        credential: Some(image.credential),
+        contributor: Some(image.contributor),
+        region,
+        factor,
+        before,
+        after,
+    }
 }

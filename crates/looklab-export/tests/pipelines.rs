@@ -7,14 +7,23 @@ use looklab_export::{BakeIlluminant, Baker, CctK, in_gamut, perceptual_clip, val
 use looklab_schema::InterfaceProfile;
 
 fn profile(point: &str, primaries: &str, handling: &str) -> InterfaceProfile {
-    let accepts = r#"  - type: lut3d
-    sizes: [45]
+    // An XYZ insertion needs a finer grid for the same accuracy: one step of the
+    // log2 grid moves all three components.
+    let size = if point == "scene_linear_xyz_d65" {
+        65
+    } else {
+        45
+    };
+    let accepts = format!(
+        r#"  - type: lut3d
+    sizes: [{size}]
     interpolation: tetrahedral
     precision: f16
-    with_shaper: false"#;
+    with_shaper: false"#
+    );
     common::profile(&common::profile_yaml(
         &common::log2_insertion(point, primaries, handling),
-        accepts,
+        &accepts,
         "[cube]",
         1 << 24,
     ))
@@ -33,6 +42,7 @@ fn insertion_points() -> [(&'static str, &'static str); 4] {
 fn single_illuminant_bakes_round_trip_at_every_bake_cct() {
     let body = common::body();
     let base_look = common::look();
+    let probes = common::probes();
     for (point, primaries) in insertion_points() {
         let profile = profile(point, primaries, "single");
         for cct in [CctK::D65, CctK::DAYLIGHT, CctK::TUNGSTEN] {
@@ -43,6 +53,12 @@ fn single_illuminant_bakes_round_trip_at_every_bake_cct() {
                 validate(&output, &base_look, &body, &common::probes(), None).expect("validation");
             assert_eq!(report.primary.cct, cct);
             assert_eq!(report.others.len(), 2, "{point}");
+            let eligible = probes.probes.len() - report.primary.unsupported;
+            assert!(
+                report.primary.stats.count * 10 >= eligible * 9,
+                "{point} at {cct}: evaluated {} of {eligible}",
+                report.primary.stats.count
+            );
             assert!(
                 report.primary.stats.p95 <= 1.0,
                 "{point} at {cct}: p95 {} over {} probes",
@@ -64,8 +80,15 @@ fn dual_illuminant_bakes_round_trip_at_both_endpoints() {
             .expect("bake");
         assert_eq!(output.artifacts.len(), 2);
         let report = validate(&output, &look, &body, &common::probes(), None).expect("validation");
+        let probes = common::probes();
         for cct in [CctK::STD_A, CctK::D65] {
             let at = report.at(cct).expect("endpoint report");
+            let eligible = probes.probes.len() - at.unsupported;
+            assert!(
+                at.stats.count * 10 >= eligible * 9,
+                "{point} at {cct}: evaluated {} of {eligible}",
+                at.stats.count
+            );
             assert!(
                 at.stats.p95 <= 1.0,
                 "{point} at {cct}: p95 {}",
@@ -146,4 +169,44 @@ fn support_mask_excludes_masked_probes() {
     let report = validate(&output, &look, &body, &probes, Some(&mask)).expect("validation");
     let dropped = probes.probes.len().div_ceil(2);
     assert!(report.primary.unsupported >= dropped);
+}
+
+#[test]
+fn post_tone_look_drops_the_residual() {
+    let mut look = common::look();
+    look.residual.values.fill(1.0);
+
+    let partial = looklab_export::baked_look(
+        &look,
+        looklab_export::InsertionPoint::DisplayEncodedPostTone,
+    );
+    assert!(partial.tone.is_colorimetric());
+    assert!(partial.residual.values.iter().all(|value| *value == 0.0));
+
+    let full = looklab_export::baked_look(&look, looklab_export::InsertionPoint::CameraRgbWbLinear);
+    assert!(full.residual.values.iter().all(|value| *value == 1.0));
+}
+
+#[test]
+fn a_coarse_dual_bake_flags_the_failing_endpoint() {
+    let body = common::body();
+    let look = common::look();
+    let accepts = "  - type: lut3d\n    sizes: [17]\n    interpolation: tetrahedral\n    precision: f16\n    with_shaper: false";
+    let profile = common::profile(&common::profile_yaml(
+        &common::log2_insertion("camera_rgb_wb_linear", "camera_native", "dual_interpolated"),
+        accepts,
+        "[cube]",
+        1 << 22,
+    ));
+    let output = Baker::new(&profile, &look, &body)
+        .bake(BakeIlluminant::DualInterpolated)
+        .expect("bake");
+    let report = validate(&output, &look, &body, &common::probes(), None).expect("validation");
+    let std_a = report.at(CctK::STD_A).expect("StdA report");
+    let d65 = report.at(CctK::D65).expect("D65 report");
+    assert_eq!(
+        report.flagged(),
+        std_a.stats.p95 > 1.0 || d65.stats.p95 > 1.0
+    );
+    assert!(report.flagged(), "a 17^3 grid is too coarse for this look");
 }

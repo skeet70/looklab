@@ -12,6 +12,7 @@ pub mod params;
 pub mod region;
 pub mod reputation;
 pub mod rollback;
+pub mod root;
 pub mod standing;
 pub mod state;
 pub mod weight;
@@ -20,8 +21,8 @@ pub use error::{Result, TrustError};
 pub use evidence::{EvidenceGrid, coverage_gain, evidence};
 pub use gates::{
     DriftGateReport, GateInput, GateReference, GateReport, GatedProbe, ProbeEstimate,
-    RootGateReport, VersionProbes, Violation, convert_exposure_gauge, exposure_gauge_excluded,
-    gate_release,
+    RootGateReport, RootObservation, VersionProbes, VersionRole, Violation, convert_exposure_gauge,
+    exposure_gauge_excluded, gate_release,
 };
 pub use ids::{
     ArtifactHash, CredentialId, EffectiveContributorId, ImageRef, SerialLink, VersionId,
@@ -33,6 +34,10 @@ pub use reputation::{
     REPUTATION_MAX, REPUTATION_MIN, REPUTATION_NEUTRAL, Reputation, ReputationUpdate,
 };
 pub use rollback::{LookVersionRecord, RevertPlan, VersionStatus, plan_revert};
+pub use root::{
+    EndorsedContributor, RootAdmission, RootDataKind, RootSession, RootTarget, admission_eligible,
+    rooted, sunset_ready, sunset_sessions,
+};
 pub use standing::{Scope, Standing, Tier};
 pub use state::{
     Actor, AuditEvent, CredentialState, Endorsement, EvidenceRef, Grant, ModerationOutcome,

@@ -24,6 +24,8 @@ pub enum TrustError {
     EmptyShares(f64),
     #[error("version {0} is not in the history")]
     UnknownVersion(VersionId),
+    #[error("credential {0} is a seeder and takes its scope only from an admin grant")]
+    CannotEndorseSeeder(CredentialId),
     #[error("identifier is not valid: {0}")]
     InvalidId(String),
     #[error("reputation value {0} is not finite")]

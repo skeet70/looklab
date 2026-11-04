@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Byte-level artifact writers and their readers: `.cube`, HaldCLUT PNG, `native_json`.
 
-use looklab_schema::{Format, Precision};
+use looklab_schema::{Format, Interpolation};
 use std::io::Cursor;
 
-use crate::artifact::{Lut3d, Shaper1d};
+use crate::artifact::{Lut3d, MAX_CURVE1D_SIZE, MAX_LUT_SIZE, Shaper1d};
 use crate::bake::BakeOutput;
 use crate::error::{ExportError, Result};
 use crate::native;
@@ -54,6 +54,22 @@ pub fn write_cube(lut: &Lut3d, title: &str, domain: [f64; 2]) -> String {
     out
 }
 
+/// The shaper reads the insertion code over `range`; the grid it feeds reads the
+/// shaper's output, so its domain is unit.
+pub fn cube_files(lut: &Lut3d, title: &str, range: [f64; 2]) -> (String, Option<String>) {
+    let grid_domain = if lut.shaper.is_some() {
+        [0.0, 1.0]
+    } else {
+        range
+    };
+    let grid = write_cube(lut, title, grid_domain);
+    let shaper = lut
+        .shaper
+        .as_ref()
+        .map(|shaper| write_cube_1d(shaper, title, range));
+    (grid, shaper)
+}
+
 /// A 1D `.cube` shaper: `LUT_1D_SIZE`, the same domain lines, then the red channel
 /// per step.
 pub fn write_cube_1d(shaper: &Shaper1d, title: &str, domain: [f64; 2]) -> String {
@@ -101,11 +117,11 @@ pub fn read_cube(text: &str) -> Result<CubeFile> {
     if parsed.size_1d.is_some() {
         return Err(ExportError::Cube("expected a 3D LUT".to_string()));
     }
-    if size < 2 {
-        return Err(ExportError::Cube("LUT_3D_SIZE below 2".to_string()));
+    if !(2..=MAX_LUT_SIZE).contains(&size) {
+        return Err(ExportError::Cube("LUT_3D_SIZE out of range".to_string()));
     }
-    let expected = (size as usize).pow(3);
-    if parsed.values.len() != expected {
+    let expected = (size as u64).pow(3);
+    if parsed.values.len() as u64 != expected {
         return Err(ExportError::Cube(format!(
             "expected {expected} nodes, found {}",
             parsed.values.len()
@@ -131,8 +147,8 @@ pub fn read_cube_1d(text: &str) -> Result<Cube1dFile> {
     if parsed.size_3d.is_some() {
         return Err(ExportError::Cube("expected a 1D LUT".to_string()));
     }
-    if size < 2 {
-        return Err(ExportError::Cube("LUT_1D_SIZE below 2".to_string()));
+    if !(2..=MAX_CURVE1D_SIZE).contains(&size) {
+        return Err(ExportError::Cube("LUT_1D_SIZE out of range".to_string()));
     }
     if parsed.values.len() != size as usize {
         return Err(ExportError::Cube(format!(
@@ -245,16 +261,13 @@ pub fn write_haldclut(lut: &Lut3d) -> Result<Vec<u8>> {
     let level = hald_level(lut.size);
     let cube = level * level;
     let side = level * cube;
-    let resampled = if cube == lut.size {
-        lut.clone()
-    } else {
-        lut.resample(cube, Precision::F32)
-    };
     let mut image = vec![0_u8; (side as usize) * (side as usize) * 6];
+    let scale = (cube - 1) as f64;
     for b in 0..cube as usize {
         for g in 0..cube as usize {
             for r in 0..cube as usize {
-                let value = resampled.data[resampled.index(r, g, b)];
+                let code = [r as f64 / scale, g as f64 / scale, b as f64 / scale];
+                let value = lut.eval(code, Interpolation::Trilinear);
                 let pixel = r + cube as usize * (g + cube as usize * b);
                 for (channel, sample) in value.iter().enumerate() {
                     let quantized = (sample.clamp(0.0, 1.0) * 65_535.0).round() as u16;
@@ -356,10 +369,8 @@ pub fn written_bytes(output: &BakeOutput, format: Format) -> Result<u64> {
                     .artifact
                     .as_lut()
                     .ok_or(ExportError::Unsupported("cube for a non-LUT artifact"))?;
-                let mut bytes = write_cube(lut, &title, domain).len();
-                if let Some(shaper) = &lut.shaper {
-                    bytes += write_cube_1d(shaper, &title, domain).len();
-                }
+                let (grid, shaper) = cube_files(lut, &title, domain);
+                let bytes = grid.len() + shaper.map_or(0, |text| text.len());
                 largest = largest.max(bytes as u64);
             }
             Ok(largest)
@@ -381,6 +392,7 @@ pub fn written_bytes(output: &BakeOutput, format: Format) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use looklab_schema::Precision;
 
     fn sample() -> Lut3d {
         Lut3d::from_fn(5, None, Precision::F32, |at| {
@@ -414,6 +426,51 @@ mod tests {
         for (a, b) in lut.data.iter().zip(back.data.iter()) {
             for channel in 0..3 {
                 assert!((a[channel] - b[channel]).abs() <= 0.5 / 65_535.0 + 1.0e-7);
+            }
+        }
+    }
+
+    #[test]
+    fn haldclut_bakes_the_shaper_into_the_grid() {
+        let shaper = Shaper1d::from_fn(1024, |code| code * code);
+        let lut = Lut3d::from_fn(64, Some(shaper), Precision::F32, |at| at);
+        let png = write_haldclut(&lut).expect("png");
+        let back = read_haldclut(&png).expect("hald");
+        assert_eq!(back.size, 64);
+        assert!(back.shaper.is_none());
+        for code in [0.1, 0.25, 0.5, 0.75, 0.9] {
+            let at = [code, code, code];
+            let expected = lut.eval(at, Interpolation::Trilinear);
+            let actual = back.eval(at, Interpolation::Trilinear);
+            for channel in 0..3 {
+                assert!(
+                    (expected[channel] - actual[channel]).abs() < 2.0e-3,
+                    "{code}: {expected:?} vs {actual:?}"
+                );
+            }
+        }
+        let faded = back.eval([0.5, 0.5, 0.5], Interpolation::Trilinear);
+        assert!((faded[0] - 0.25).abs() < 2.0e-3, "{faded:?}");
+    }
+
+    #[test]
+    fn cube_pair_declares_a_unit_grid_after_the_shaper() {
+        let shaper = Shaper1d::from_fn(9, |code| code * code);
+        let lut = Lut3d::from_fn(5, Some(shaper), Precision::F32, |at| at);
+        let (grid_text, shaper_text) = cube_files(&lut, "t", [0.0, 8.0]);
+        let grid = read_cube(&grid_text).expect("grid");
+        let shaper = read_cube_1d(&shaper_text.expect("shaper")).expect("shaper");
+        assert_eq!(grid.domain, [0.0, 1.0]);
+        assert_eq!(shaper.domain, [0.0, 8.0]);
+        for code in [0.1, 0.4, 0.75] {
+            let at = shaper.shaper.eval(code / 8.0);
+            let through = grid.lut.eval([at, at, at], Interpolation::Trilinear);
+            let direct = lut.eval(
+                [code / 8.0, code / 8.0, code / 8.0],
+                Interpolation::Trilinear,
+            );
+            for channel in 0..3 {
+                assert!((through[channel] - direct[channel]).abs() < 1.0e-5);
             }
         }
     }

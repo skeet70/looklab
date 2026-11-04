@@ -18,7 +18,7 @@ pub mod writer;
 
 mod serde_names;
 
-pub use artifact::{Artifact, Curve1d, Lut3d, Matrix3x3, Shaper1d};
+pub use artifact::{Artifact, Curve1d, Lut3d, MAX_LUT_SIZE, Matrix3x3, Shaper1d};
 pub use bake::{
     ArtifactAtCct, BakeIlluminant, BakeOutput, Baker, InsertionSpec, ShaperParams, baked_look,
 };
@@ -32,6 +32,6 @@ pub use looklab_schema::{Format, InsertionPoint, Interpolation, Precision};
 pub use native::{NativeDocument, read_native_json, write_native_json};
 pub use sim::{CctReport, DeltaStats, Support, ValidationReport, validate};
 pub use writer::{
-    Cube1dFile, CubeFile, hald_level, read_cube, read_cube_1d, read_haldclut, write_cube,
-    write_cube_1d, write_haldclut, written_bytes,
+    Cube1dFile, CubeFile, cube_files, hald_level, read_cube, read_cube_1d, read_haldclut,
+    write_cube, write_cube_1d, write_haldclut, written_bytes,
 };

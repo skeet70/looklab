@@ -61,6 +61,11 @@ pub struct TrustParams {
     /// Minimum credentials in the pool before body per-contributor caps apply.
     pub min_body_contributors: usize,
 
+    /// Root sunset: endorsed contributors and distinct bodies needed to re-derive
+    /// the root (docs/05 §7).
+    pub root_sunset_contributors: usize,
+    pub root_sunset_bodies: usize,
+
     /// Multiplier on `sqrt(σ_ref² + σ_cand²)` in the drift bound `b_p`.
     pub gate_bound_scale: f64,
     /// Bound floor and ceiling versus the previous version (docs/05 §8).
@@ -123,6 +128,8 @@ impl Default for TrustParams {
             diminishing_scale: 20.0,
             min_look_contributors: 20,
             min_body_contributors: 5,
+            root_sunset_contributors: 20,
+            root_sunset_bodies: 3,
             gate_bound_scale: 2.0,
             gate_previous_floor: 0.75,
             gate_previous_ceiling: 2.0,

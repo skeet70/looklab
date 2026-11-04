@@ -4,7 +4,35 @@
 use looklab_schema::{Interpolation, Precision};
 use serde::{Deserialize, Serialize};
 
+use crate::error::{ExportError, Result};
 use crate::quantize::quantize;
+
+/// Largest grid side a reader or a writer accepts.
+pub const MAX_LUT_SIZE: u32 = 256;
+
+/// Largest 1D table a reader or a writer accepts.
+pub const MAX_CURVE1D_SIZE: u32 = 65_536;
+
+fn check_side(size: u32) -> Result<()> {
+    if !(2..=MAX_LUT_SIZE).contains(&size) {
+        return Err(ExportError::InvalidArtifact("grid side out of range"));
+    }
+    Ok(())
+}
+
+fn check_curve(size: u32) -> Result<()> {
+    if !(2..=MAX_CURVE1D_SIZE).contains(&size) {
+        return Err(ExportError::InvalidArtifact("curve length out of range"));
+    }
+    Ok(())
+}
+
+fn check_finite(values: impl IntoIterator<Item = f32>) -> Result<()> {
+    if values.into_iter().any(|value| !value.is_finite()) {
+        return Err(ExportError::InvalidArtifact("non-finite sample"));
+    }
+    Ok(())
+}
 
 /// A 1D shaper: normalized insertion code in `[0, 1]` to the 3D LUT's grid
 /// coordinate, applied per channel.
@@ -37,6 +65,27 @@ impl Shaper1d {
         let a = self.values[lower] as f64;
         let b = self.values[lower + 1] as f64;
         a + fraction * (b - a)
+    }
+
+    /// # Errors
+    /// [`ExportError::InvalidArtifact`] when the shaper is malformed.
+    pub fn validate(&self) -> Result<()> {
+        check_curve(self.size)?;
+        if self.values.len() != self.size as usize {
+            return Err(ExportError::InvalidArtifact("shaper length mismatch"));
+        }
+        check_finite(self.values.iter().copied())?;
+        if self
+            .values
+            .windows(2)
+            .any(|pair| !(0.0..=1.0).contains(&pair[0]) || pair[1] < pair[0])
+        {
+            return Err(ExportError::InvalidArtifact("shaper is not non-decreasing"));
+        }
+        if !(0.0..=1.0).contains(&self.values[self.values.len() - 1]) {
+            return Err(ExportError::InvalidArtifact("shaper leaves the unit range"));
+        }
+        Ok(())
     }
 }
 
@@ -123,6 +172,21 @@ impl Lut3d {
         Self::from_fn(size, self.shaper.clone(), precision, |at| {
             source.eval_grid(at, Interpolation::Trilinear)
         })
+    }
+
+    /// # Errors
+    /// [`ExportError::InvalidArtifact`] when the grid is malformed.
+    pub fn validate(&self) -> Result<()> {
+        check_side(self.size)?;
+        let expected = (self.size as u64).pow(3);
+        if self.data.len() as u64 != expected {
+            return Err(ExportError::InvalidArtifact("node count mismatch"));
+        }
+        check_finite(self.data.iter().flat_map(|value| value.iter().copied()))?;
+        if let Some(shaper) = &self.shaper {
+            shaper.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -236,6 +300,12 @@ impl Matrix3x3 {
         }
         out
     }
+
+    /// # Errors
+    /// [`ExportError::InvalidArtifact`] when a coefficient is not finite.
+    pub fn validate(&self) -> Result<()> {
+        check_finite(self.rows.iter().flat_map(|row| row.iter().copied()))
+    }
 }
 
 /// A per-channel 1D curve over the decoded linear insertion RGB in `[0, domain_max]`.
@@ -267,6 +337,21 @@ impl Curve1d {
             out[channel] = value(lower) * (1.0 - fraction) + value(next) * fraction;
         }
         out
+    }
+
+    /// # Errors
+    /// [`ExportError::InvalidArtifact`] when the curve is malformed.
+    pub fn validate(&self) -> Result<()> {
+        if self.points.len() < 2 {
+            return Err(ExportError::InvalidArtifact("curve needs two knots"));
+        }
+        if self.points.len() > MAX_CURVE1D_SIZE as usize {
+            return Err(ExportError::InvalidArtifact("curve has too many knots"));
+        }
+        if !(self.domain_max.is_finite() && self.domain_max > 0.0) {
+            return Err(ExportError::InvalidArtifact("curve domain is invalid"));
+        }
+        check_finite(self.points.iter().flat_map(|point| point.iter().copied()))
     }
 }
 
@@ -302,6 +387,16 @@ impl Artifact {
             Self::Lut3d(_) => "lut3d",
             Self::Matrix3x3(_) => "matrix3x3",
             Self::Curve1d(_) => "curve1d",
+        }
+    }
+
+    /// # Errors
+    /// [`ExportError::InvalidArtifact`] when the artifact is malformed.
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Lut3d(lut) => lut.validate(),
+            Self::Matrix3x3(matrix) => matrix.validate(),
+            Self::Curve1d(curve) => curve.validate(),
         }
     }
 }

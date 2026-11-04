@@ -8,7 +8,7 @@
 
 use looklab_color::{Mat3, Rgb, RgbSpace, Xyz};
 use looklab_model::probes;
-use looklab_model::{Look, Tone};
+use looklab_model::{Look, Residual, Tone};
 use looklab_schema::{
     AcceptedArtifact, InsertionPoint, InterfaceProfile, Interpolation, Precision, Primaries,
     TransferFunction,
@@ -95,29 +95,11 @@ pub struct InsertionSpec {
 
 impl InsertionSpec {
     /// # Errors
-    /// [`ExportError::InvalidInsertion`] for a camera-native encoding outside
-    /// `camera_rgb_wb_linear`, [`ExportError::MissingCustomCurve`] for `custom_1d`.
+    /// [`ExportError::MissingCustomCurve`] for `custom_1d` without a curve, plus the
+    /// errors of [`Self::validate`].
     pub fn from_profile(profile: &InterfaceProfile, custom_curve: Option<&[f64]>) -> Result<Self> {
         let insertion = &profile.insertion;
         let encoding = &insertion.encoding;
-        if (encoding.primaries == Primaries::CameraNative)
-            != (insertion.point == InsertionPoint::CameraRgbWbLinear)
-        {
-            return Err(ExportError::InvalidInsertion {
-                point: crate::serde_names::point::name(insertion.point),
-                detail: "camera-native primaries",
-            });
-        }
-        let range = [encoding.range.min.to_f64(), encoding.range.max.to_f64()];
-        if range[1] <= range[0] || !(range[1] - range[0]).is_finite() {
-            return Err(ExportError::Profile("insertion range is empty"));
-        }
-        let shaper = encoding.shaper.as_ref().map(ShaperParams::from_schema);
-        if let Some(params) = shaper
-            && !params.is_finite()
-        {
-            return Err(ExportError::Profile("log2 shaper parameters are invalid"));
-        }
         let custom_curve = match encoding.transfer {
             TransferFunction::Custom1d => Some(
                 custom_curve
@@ -128,14 +110,53 @@ impl InsertionSpec {
             ),
             _ => None,
         };
-        Ok(Self {
+        let spec = Self {
             point: insertion.point,
             transfer: encoding.transfer,
             primaries: encoding.primaries,
-            range,
-            shaper,
+            range: [encoding.range.min.to_f64(), encoding.range.max.to_f64()],
+            shaper: encoding.shaper.as_ref().map(ShaperParams::from_schema),
             custom_curve,
-        })
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// # Errors
+    /// [`ExportError::InvalidInsertion`] for camera-native primaries outside
+    /// `camera_rgb_wb_linear`; [`ExportError::Profile`] for an empty range, invalid
+    /// shaper parameters or a custom curve outside `[0, 1]`.
+    pub fn validate(&self) -> Result<()> {
+        if (self.primaries == Primaries::CameraNative)
+            != (self.point == InsertionPoint::CameraRgbWbLinear)
+        {
+            return Err(ExportError::InvalidInsertion {
+                point: crate::serde_names::point::name(self.point),
+                detail: "camera-native primaries",
+            });
+        }
+        if self.range[1] <= self.range[0] || !(self.range[1] - self.range[0]).is_finite() {
+            return Err(ExportError::Profile("insertion range is empty"));
+        }
+        if let Some(params) = self.shaper
+            && !params.is_finite()
+        {
+            return Err(ExportError::Profile("log2 shaper parameters are invalid"));
+        }
+        if self.transfer == TransferFunction::Custom1d {
+            let curve = self
+                .custom_curve
+                .as_ref()
+                .ok_or(ExportError::MissingCustomCurve)?;
+            if curve.len() < 2
+                || curve
+                    .iter()
+                    .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+            {
+                return Err(ExportError::Profile("custom curve is outside [0, 1]"));
+            }
+        }
+        Ok(())
     }
 
     pub fn needs_camera(&self) -> bool {
@@ -345,6 +366,7 @@ pub fn baked_look(look: &Look, point: InsertionPoint) -> Look {
     if point == InsertionPoint::DisplayEncodedPostTone {
         let mut partial = look.clone();
         partial.tone = Tone::Colorimetric;
+        partial.residual = Residual::zeros();
         partial
     } else {
         look.clone()
@@ -385,8 +407,8 @@ impl<'a> Baker<'a> {
     }
 
     /// # Errors
-    /// [`ExportError::InvalidClip`] for out-of-range clip settings, and the
-    /// selection errors of [`Self::bake_with`].
+    /// [`ExportError::InvalidClip`] for out-of-range clip settings, plus the
+    /// selection errors of [`Self::bake_artifact`].
     pub fn bake(&self, illuminant: BakeIlluminant) -> Result<BakeOutput> {
         if !self.look.clip.validate() {
             return Err(ExportError::InvalidClip);
@@ -394,39 +416,16 @@ impl<'a> Baker<'a> {
         let insertion = InsertionSpec::from_profile(self.profile, self.custom_curve)?;
         let downstream = DownstreamModel::from_profile(self.profile)?;
         let look = baked_look(self.look, insertion.point);
-
-        let main = self.bake_main(&insertion, &downstream, &look, illuminant)?;
-        Ok(match main {
-            MainArtifact::Lut(plan, artifacts) => BakeOutput {
-                profile_id: self.profile.id.clone(),
-                profile_version: self.profile.version,
-                bake: illuminant,
-                insertion,
-                downstream,
-                interpolation: Some(plan.interpolation),
-                precision: Some(plan.precision),
-                artifacts,
-            },
-            MainArtifact::Fit(artifacts) => BakeOutput {
-                profile_id: self.profile.id.clone(),
-                profile_version: self.profile.version,
-                bake: illuminant,
-                insertion,
-                downstream,
-                interpolation: None,
-                precision: None,
-                artifacts,
-            },
-        })
+        self.bake_artifact(&insertion, &downstream, &look, illuminant)
     }
 
-    fn bake_main(
+    fn bake_artifact(
         &self,
         insertion: &InsertionSpec,
         downstream: &DownstreamModel,
         look: &Look,
         illuminant: BakeIlluminant,
-    ) -> Result<MainArtifact> {
+    ) -> Result<BakeOutput> {
         let luts: Vec<(&looklab_schema::Lut3d, u32)> = self
             .profile
             .accepts
@@ -439,9 +438,6 @@ impl<'a> Baker<'a> {
             .collect();
 
         if !luts.is_empty() {
-            let with_shaper = luts.iter().any(|(lut, _)| lut.with_shaper);
-            let shaper = (with_shaper && insertion.transfer != TransferFunction::Log2Shaper)
-                .then(|| insertion.shaper_params());
             let mut sizes: Vec<u32> = luts.iter().map(|(_, size)| *size).collect();
             sizes.sort_unstable_by(|a, b| b.cmp(a));
             sizes.dedup();
@@ -457,13 +453,23 @@ impl<'a> Baker<'a> {
                     size,
                     interpolation: spec.interpolation,
                     precision: spec.precision,
-                    shaper,
+                    shaper: (spec.with_shaper
+                        && insertion.transfer != TransferFunction::Log2Shaper)
+                        .then(|| insertion.shaper_params()),
                 };
                 let artifacts = self.bake_luts(&plan, insertion, downstream, look, illuminant)?;
-                let bytes = self.measure(&artifacts, insertion, illuminant, plan.precision)?;
+                let output = self.assemble(
+                    insertion,
+                    downstream,
+                    illuminant,
+                    Some(plan.interpolation),
+                    Some(plan.precision),
+                    artifacts,
+                );
+                let bytes = self.measure(&output)?;
                 needed = needed.min(bytes);
                 if bytes <= self.profile.limits.max_bytes {
-                    return Ok(MainArtifact::Lut(plan, artifacts));
+                    return Ok(output);
                 }
             }
             return Err(ExportError::ByteLimit {
@@ -494,14 +500,36 @@ impl<'a> Baker<'a> {
             .ok_or(ExportError::NoAcceptedArtifact)?;
 
         let artifacts = self.bake_fit(&kind, insertion, downstream, look, illuminant)?;
-        let bytes = self.measure(&artifacts, insertion, illuminant, Precision::F32)?;
+        let output = self.assemble(insertion, downstream, illuminant, None, None, artifacts);
+        let bytes = self.measure(&output)?;
         if bytes > self.profile.limits.max_bytes {
             return Err(ExportError::ByteLimit {
                 needed: bytes,
                 limit: self.profile.limits.max_bytes,
             });
         }
-        Ok(MainArtifact::Fit(artifacts))
+        Ok(output)
+    }
+
+    fn assemble(
+        &self,
+        insertion: &InsertionSpec,
+        downstream: &DownstreamModel,
+        illuminant: BakeIlluminant,
+        interpolation: Option<Interpolation>,
+        precision: Option<Precision>,
+        artifacts: Vec<ArtifactAtCct>,
+    ) -> BakeOutput {
+        BakeOutput {
+            profile_id: self.profile.id.clone(),
+            profile_version: self.profile.version,
+            bake: illuminant,
+            insertion: insertion.clone(),
+            downstream: *downstream,
+            interpolation,
+            precision,
+            artifacts,
+        }
     }
 
     fn bake_luts(
@@ -603,34 +631,13 @@ impl<'a> Baker<'a> {
             .ok_or(ExportError::TransformUndefined { cct: cct.kelvin() })
     }
 
-    fn measure(
-        &self,
-        artifacts: &[ArtifactAtCct],
-        insertion: &InsertionSpec,
-        illuminant: BakeIlluminant,
-        precision: Precision,
-    ) -> Result<u64> {
-        let output = BakeOutput {
-            profile_id: self.profile.id.clone(),
-            profile_version: self.profile.version,
-            bake: illuminant,
-            insertion: insertion.clone(),
-            downstream: DownstreamModel::from_profile(self.profile)?,
-            interpolation: None,
-            precision: Some(precision),
-            artifacts: artifacts.to_vec(),
-        };
+    fn measure(&self, output: &BakeOutput) -> Result<u64> {
         let mut largest = 0;
         for format in &self.profile.formats {
-            largest = largest.max(writer::written_bytes(&output, *format)?);
+            largest = largest.max(writer::written_bytes(output, *format)?);
         }
         Ok(largest)
     }
-}
-
-enum MainArtifact {
-    Lut(LutPlan, Vec<ArtifactAtCct>),
-    Fit(Vec<ArtifactAtCct>),
 }
 
 #[derive(Clone, Copy)]

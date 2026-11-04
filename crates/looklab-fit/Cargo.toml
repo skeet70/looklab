@@ -7,7 +7,26 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = []
+# `synth` is reused by the trust red-team harness and by report/export tests.
+synth = ["dep:rand_chacha"]
+
 [dependencies]
+looklab-color.workspace = true
+looklab-samples.workspace = true
+looklab-model.workspace = true
+libm.workspace = true
+thiserror.workspace = true
+rand_chacha = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "fit"
+harness = false
+required-features = ["synth"]
 
 [lints]
 workspace = true

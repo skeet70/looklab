@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use looklab_meta::SanitizedMetadata;
 use looklab_trust::{
     BodyWeightInput, CaptureTuple, CredentialId, EffectiveContributorId, ImageRef, LookWeightInput,
     Region, RegionCoverage, Reputation, Standing, TrustParams, WeightImage,
@@ -27,8 +28,28 @@ pub fn coverage(regions: &[Region]) -> RegionCoverage {
     RegionCoverage::uniform(regions.iter().copied()).expect("non-empty coverage")
 }
 
+#[derive(Clone)]
 pub struct ImageBuilder {
     image: WeightImage,
+}
+
+fn capture_from_bytes(bytes: Vec<u8>) -> CaptureTuple {
+    let metadata = SanitizedMetadata {
+        make: None,
+        model: None,
+        firmware: None,
+        lens_model: None,
+        focal_length: None,
+        iso: None,
+        shutter: None,
+        aperture: None,
+        exposure_compensation: None,
+        as_shot_wb: None,
+        capture_month: None,
+        software: Some(String::from_utf8_lossy(&bytes).into_owned()),
+        look: None,
+    };
+    CaptureTuple::from_metadata(&metadata).expect("capture tuple encodes")
 }
 
 impl ImageBuilder {
@@ -43,7 +64,7 @@ impl ImageBuilder {
                 evidence: 1.0,
                 reputation: Reputation::new(1.0).expect("valid reputation"),
                 standing: Standing::New,
-                capture: CaptureTuple::new(id.as_bytes().to_vec()),
+                capture: capture_from_bytes(id.as_bytes().to_vec()),
                 coverage: coverage(&[region()]),
             },
         }
@@ -80,7 +101,7 @@ impl ImageBuilder {
     }
 
     pub fn capture(mut self, bytes: impl Into<Vec<u8>>) -> Self {
-        self.image.capture = CaptureTuple::new(bytes);
+        self.image.capture = capture_from_bytes(bytes.into());
         self
     }
 

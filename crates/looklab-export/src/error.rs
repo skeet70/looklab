@@ -23,6 +23,10 @@ pub enum ExportError {
     SingularMatrix { cct: f64 },
     #[error("look clip settings are outside the v1 range")]
     InvalidClip,
+    #[error("invalid artifact: {0}")]
+    InvalidArtifact(&'static str),
+    #[error("invalid CCT {0}")]
+    InvalidCct(f64),
     #[error("unsupported interface profile: {0}")]
     Profile(&'static str),
     #[error("unsupported: {0}")]
