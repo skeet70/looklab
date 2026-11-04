@@ -1,0 +1,13 @@
+[package]
+name = "looklab-model"
+description = "Look representation, evaluation, look file format and probe sets."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

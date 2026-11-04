@@ -1,0 +1,13 @@
+[package]
+name = "looklab-samples"
+description = "Versioned sample blob format with bounded readers."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

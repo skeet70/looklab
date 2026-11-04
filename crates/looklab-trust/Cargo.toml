@@ -1,0 +1,13 @@
+[package]
+name = "looklab-trust"
+description = "Contribution weights, tiers, reputation, caps, release gates and the red-team harness."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

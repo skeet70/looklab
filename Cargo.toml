@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+rust-version = "1.99"
+
+[workspace.dependencies]
+looklab-color = { path = "crates/looklab-color" }
+looklab-raw = { path = "crates/looklab-raw" }
+looklab-meta = { path = "crates/looklab-meta" }
+looklab-samples = { path = "crates/looklab-samples" }
+looklab-prep = { path = "crates/looklab-prep" }
+looklab-model = { path = "crates/looklab-model" }
+looklab-fit = { path = "crates/looklab-fit" }
+looklab-match = { path = "crates/looklab-match" }
+looklab-export = { path = "crates/looklab-export" }
+looklab-trust = { path = "crates/looklab-trust" }
+looklab-schema = { path = "crates/looklab-schema" }
+looklab-report = { path = "crates/looklab-report" }
+looklab-wasm = { path = "crates/looklab-wasm" }
+
+libm = "0.2"
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+proptest = "1"
+criterion = { version = "0.7", default-features = false }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.test]
+opt-level = 1

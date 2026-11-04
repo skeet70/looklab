@@ -1,0 +1,13 @@
+[package]
+name = "looklab-match"
+description = "Control schemas, control-response models and the settings optimizer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

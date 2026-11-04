@@ -1,0 +1,26 @@
+# 10 — Open questions
+
+Decisions not yet made. Each has a default so work isn't blocked. Change a default by updating this doc and the affected docs.
+
+| # | Question | Default until decided | Affects |
+|---|---|---|---|
+| Q1 | Project name | `looklab` | crates, domain |
+| Q2 | Data license for fitted targets, body parameters and community data: CC0-1.0 vs CC-BY-4.0 | CC0-1.0. **Per-image samples aren't published under any license.** | ToS, exports, 06 §6 |
+| Q3 | Legal review: "outputs aren't AGPL-covered"; ToS; GDPR posture for pseudonymous data; **erasure path for contributors who lost their credential** (a server-keyed RAW hash would enable it but is itself a photo identifier) | Required before launch; no RAW hash until decided | 01, 03 §4, 06 §4 |
+| Q4 | ~~CAM16 reference viewing conditions~~ | **Resolved:** D65, L_A ≈ 4.07, Y_b = 20, average, D = 1 | 02 §1 |
+| Q5 | Skin reflectance dataset for the probe set (license, diversity) | ColorChecker skin patches only | 02 §6 |
+| Q6 | `fixed_illuminant` looks | Out of v1 | 02 §3.7, 04 |
+| Q7 | DR / highlight-preservation modes | Controls (`affects: [tone, exposure]`) + exposure modes for ξ | 02 §1, 03, 04 |
+| Q8 | Adobe RGB JPEG at launch | Yes | 02, prep |
+| Q9 | HEIF timing | Post-launch; decode trait ready | 01 |
+| Q10 | Retention of withdrawn data | Excluded from the next fit; blobs hard-deleted after 30 days; published coefficients remain | 03 §4, 06 §4 |
+| Q11 | LUT-defined look submissions | Any credential may propose, with a license declaration + attribution; moderator approval required | 05, 08 §4 |
+| Q12 | Trust parameter values (γ, tier factors, η, caps, gate thresholds, minimum pools, PoW difficulty) | As in 05; tune with the red-team harness | 05 |
+| Q13 | Which bodies to seed first (rentals) | Owner's body, the P1.9 spike body, then most-requested | ops |
+| Q14 | Canonical scene set + model releases | 8–12 owner-shot scenes | 08 §5 |
+| Q15 | Approach the dtsolve author about licensing | Before Phase 7 | 04 §7 |
+| Q16 | Is a shared Δ across both illuminants (and a 3×3) sufficient? | Yes for v1; revisit with chart data | 02 §2 |
+| Q17 | ~~Collect serial numbers?~~ | **Resolved:** optional, HMAC'd server-side on arrival, used only to merge credentials for caps; never transfers standing | 05 §2, 06 §3 |
+| Q18 | Outcome of the G1 premise spike (P1.9) | Pending; shared θ assumed | 02 §4.3, 09 |
+| Q19 | Default bake CCT for single-illuminant profiles | D65, with 5500 K / 3200 K selectable | 04 §7 |
+| Q20 | Threat level: when to restore the cut defenses (05 §13), e.g. server re-verification of kinds | Revisit if revert actions become frequent or a large coordinated attack is seen | 05 |

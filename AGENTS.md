@@ -1,0 +1,59 @@
+# AGENTS.md — working conventions
+
+For anyone (human or agent) implementing looklab. Read [README](README.md) and the doc(s) for your task first.
+
+## Picking up work
+- Tasks are defined in [docs/09-roadmap.md](docs/09-roadmap.md) by ID (e.g. `P1.5`). Reference the ID in branch names (`p1.5-single-body-fit`) and PR titles.
+- A task is done when its **acceptance criteria pass in CI** (or with documented manual evidence where CI can't run it), docs are updated if behavior or thresholds changed, and the PR lists what was verified.
+- If a doc is wrong or underspecified, fix it in the same PR and call it out. Don't silently diverge.
+- Thresholds marked *(tentative)* may change with evidence (data + reasoning in the PR).
+
+## Rust conventions
+- **Stable Rust**, edition 2021 (or 2024 once adopted). `cargo fmt`; `cargo clippy --all-targets -- -D warnings`.
+- SPDX header in every source file: `// SPDX-License-Identifier: AGPL-3.0-or-later`.
+- Core crates (everything except `server`, `worker`, `cli`, `web`) must build for `wasm32-unknown-unknown`: no threads, filesystem or `std::time::Instant` in core paths. Platform specifics go behind traits or features. The browser uses several **single-threaded** workers; don't design for shared-memory WASM threads.
+- **Numerics and determinism:**
+  - f64 for fitting and color math; f32 only in sample storage.
+  - **All transcendental math in core crates uses the `libm` crate.** `clippy.toml` bans **every** transcendental method on `f64` and `f32` via `disallowed_methods`: `powf, powi, exp, exp2, exp_m1, ln, log, log2, log10, ln_1p, sin, cos, tan, sin_cos, asin, acos, atan, atan2, sinh, cosh, tanh, asinh, acosh, atanh, cbrt, hypot`. CI also fails on any `f32`/`f64` method outside an allow-list (`sqrt`, `abs`, `min`, `max`, `clamp`, `floor`, `ceil`, `round`, `trunc`, `mul_add`, `signum`, `copysign`, `to_bits`, `from_bits`, `is_*`), so new std methods can't slip in. Use `libm::log1p`/`libm::expm1` for CAM16-UCS's ln(1 + c₂M) and its inverse.
+  - The Look evaluation path uses scalar code or fixed-order reductions only: no `faer`/`pulp` or other runtime-dispatched SIMD, no fast-math. Native and WASM outputs must be **bit-identical** (tested).
+- `unsafe` only with a justifying comment and a test. Prefer none.
+- Errors: `thiserror` in libraries, `anyhow` in binaries.
+- Every randomized algorithm takes an explicit seed parameter; tests use fixed seeds. **Exception (privacy):** in production, the sampling/shuffle seed is fresh CSPRNG output, never derived from server-known values, never uploaded or stored, and treated as sensitive in UI and logs ([docs/03 §2.1](docs/03-data-model.md)).
+- **Everything uploaded comes from the `looklab-wasm` module**, including the canonical upload envelope ([docs/03 §2.3](docs/03-data-model.md)). The JavaScript layer only moves bytes between the module, WebAuthn and `fetch`; it never builds, edits or adds upload content.
+- **Payload reproducibility:** the reference prep is the `looklab-wasm` prep module. It must not use WASM relaxed-SIMD (CI checks the module's target features and validates the binary without it), and no NaN may reach stored values. Don't make prep output depend on anything except inputs, the seed file and the prior-transform version (no timestamps, no host-dependent paths). `looklab-cli verify-payload` must reproduce browser payloads byte for byte under wasmtime.
+- Cite each formula's source in doc comments (paper + equation, or the colour-science function).
+
+## Color-science porting
+- Port from colour-science (BSD-3) with attribution in `NOTICE` and in module docs.
+- Every ported function gets golden vectors from `tools/golden/` (pinned colour-science version). CAM16 vectors for the reference conditions use `discount_illuminant=True`. Regenerate only via the scripts.
+- Don't copy code from dtsolve (no license) or darktable-lut-generator (license unverified). Implementations are original.
+
+## Security and trust invariants
+- Trust is designed for **hobby scale** ([docs/05](docs/05-trust-and-integrity.md)): bound what can't be verified, and make rollback cheap.
+- Contribution kinds are client-claimed. Never let a client claim, reputation or elapsed time move a credential out of the `new` tier or past the new-tier group cap. Only human decisions (an admin grant or a seeder endorsement) change tier.
+- Serial merging may only **reduce** weight (caps, diminishing returns). It must never transfer tier or reputation between credentials.
+- Grants, endorsements, root admissions, moderation actions, re-anchors and reverts always write an audit-log row. The audit log is append-only: no UPDATE/DELETE in application code.
+- Every published artifact is listed by hash in its version manifest. Clients check hashes.
+- Changes to `fit` or `trust` must pass the red-team harness.
+
+## Privacy invariants
+- Nothing derived from pixel positions may cross the `looklab-prep` → `looklab-samples` boundary. The sample type has no coordinate fields; order is shuffled with a fresh, never-uploaded CSPRNG seed. Re-render groups share one sample set; never send a RAW or content hash.
+- The sanitizer is whitelist-based. A new metadata field needs an update to [docs/06](docs/06-privacy-and-payload.md).
+- Never store IP addresses. Never publish credential public keys or serial HMACs; logs and changelogs use internal ids or display handles.
+- Raw serial numbers exist only in a type that implements neither `Serialize` nor `Debug`, and are HMAC'd on arrival. A test scans the DB and logs for raw serials.
+
+## Data and fixtures
+- Large fixtures aren't in git. `fixtures/manifest.toml` lists files, checksums, source and consent; `tools/fetch-fixtures` downloads them. A ≤ 20 MB committed subset supports CI.
+- Fixtures must be project-owned, or donated with explicit recorded consent (in-app fixture donation writes consent to the manifest).
+- Prefer synthetic tests (injected look deltas, simulated bodies, simulated attackers) for correctness. Use real fixtures for realism.
+
+## Tests that must exist
+- Unit, golden (color) and property tests (round-trips, sanitizer, monotone tone, identity Look, sample-reader limits).
+- `fit`/`trust`: synthetic recovery tests + red-team harness.
+- Native vs wasm32 bit-identity tests for `color` and Look evaluation.
+- `criterion` benchmarks for Look evaluation, the optimizer and prep; CI flags regressions above 20%.
+
+## Data files (`data/`)
+- YAML, validated by `looklab-schema` (`looklab-cli validate data/`). The same validator runs in the browser.
+- Bodies and interfaces in `data/` are **snapshots exported from the server authority**. Change them through the in-app proposal flow, not by hand-editing, except for bootstrap data before the server exists.
+- Makernote mappings need a fixture; without one they're marked `provisional`.

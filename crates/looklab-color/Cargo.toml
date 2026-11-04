@@ -1,0 +1,13 @@
+[package]
+name = "looklab-color"
+description = "Color science: colour spaces, TRCs, chromatic adaptation, CIELAB, CIEDE2000, CAM16, CAM16-UCS, chart data."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

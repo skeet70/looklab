@@ -1,0 +1,16 @@
+[package]
+name = "looklab-wasm"
+description = "wasm-bindgen facade for the browser client."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+
+[lints]
+workspace = true

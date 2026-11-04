@@ -1,0 +1,13 @@
+[package]
+name = "looklab-prep"
+description = "Pairing, alignment, masking, density sampling and shuffling of RAW+JPEG pairs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true
