@@ -7,9 +7,7 @@ use looklab_model::basis::{
     C_MAX, HUE_COEFS, RESIDUAL_COEFS, S_COEFS, S_KNOTS, TINT_COEFS, TINT_KNOTS, TONE_COEFS,
 };
 use looklab_model::solve::reference_model;
-use looklab_model::{
-    ClipSettings, ColorLayer, Look, Residual, Tint, Tone, output_encode_clip, soft_clip,
-};
+use looklab_model::{ClipSettings, ColorLayer, Look, Residual, Tint, Tone, soft_clip};
 use looklab_samples::{
     InputSpace, OutputSpace, PrepParamsHash, PrepVersion, PriorTransformVersion, SampleFlags,
     SampleHeader, SampleSet,
@@ -277,11 +275,12 @@ fn build_scenes(config: &SynthConfig) -> Vec<Scene> {
         for index in 0..config.samples_per_image {
             let neutral = index % 4 == 0;
             let colour = scene_color(&mut rng, neutral);
-            let camera = inverse.mul_vec([
-                colour.x / (gain * libm::exp(wb_log_r)),
-                colour.y / gain,
-                colour.z / (gain * libm::exp(wb_log_b)),
-            ]);
+            let camera_xyz = inverse.mul_vec([colour.x, colour.y, colour.z]);
+            let camera = [
+                camera_xyz[0] / (gain * libm::exp(wb_log_r)),
+                camera_xyz[1] / gain,
+                camera_xyz[2] / (gain * libm::exp(wb_log_b)),
+            ];
             xyz.push(colour);
             rgb.push(camera.map(|value| value.clamp(-0.4, 32.0)));
         }
@@ -346,8 +345,7 @@ fn render(
                 clean.a + jitter[1],
                 clean.b + jitter[2],
             );
-            let encoded = output_encode_clip(noisy, config.space, config.clip_k);
-            let jmh = ucs_to_jmh(encoded, UcsSpace::Ucs);
+            let jmh = ucs_to_jmh(noisy, UcsSpace::Ucs);
             let xyz = reference_model().jmh_to_xyz(jmh);
             let linear = config.space.xyz_to_rgb_linear(xyz);
             let clipped = Rgb::new(

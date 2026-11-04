@@ -263,6 +263,14 @@ fn prep_reproduces_blobs_from_the_seed_file() {
     });
     assert!(stdout.contains("pair x-s10.raf"), "{stdout}");
     assert!(stdout.contains("preselection order"), "{stdout}");
+
+    std::fs::write(folder.join("broken.raf"), b"not a raw").expect("corrupt raw");
+    let (stdout, _) = ok({
+        let mut command = looklab();
+        command.arg("prep").arg("--dir").arg(&folder);
+        command
+    });
+    assert!(stdout.contains("unreadable broken.raf"), "{stdout}");
 }
 
 fn assert_no_location_fields(value: Value) {
@@ -328,4 +336,34 @@ fn validate_exits_non_zero_and_names_the_file() {
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("broken.yaml"), "{stdout}");
+}
+
+#[test]
+fn fit_skips_an_undecodable_sample_and_keeps_going() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let samples = temp.path().join("samples");
+    synth(&samples, "33", "4", "300");
+    std::fs::write(samples.join("zzz-corrupt.llsamp"), b"LLSAMP").expect("corrupt sample");
+    let out = temp.path().join("corrupt.looklab");
+    let (stdout, stderr) = ok({
+        let mut command = looklab();
+        command
+            .args(["fit", "--samples"])
+            .arg(&samples)
+            .args([
+                "--transform",
+                "from-metadata",
+                "--look-slug",
+                "corrupt",
+                "--out",
+            ])
+            .arg(&out);
+        command
+    });
+    assert!(stdout.contains("skipped 1 undecodable file"), "{stdout}");
+    assert!(
+        stderr.contains("This file couldn't be decoded (decoder error)."),
+        "{stderr}"
+    );
+    assert!(out.exists());
 }

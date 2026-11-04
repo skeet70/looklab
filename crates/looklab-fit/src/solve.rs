@@ -120,7 +120,8 @@ pub(crate) struct GcvChoice {
 pub(crate) fn select_lambda(
     hessian: &[f64],
     penalty: &[f64],
-    rhs: &[f64],
+    gradient: &[f64],
+    theta0: &[f64],
     rss: f64,
     n: usize,
     observations: f64,
@@ -152,10 +153,17 @@ pub(crate) fn select_lambda(
         if !factor_in_place(&mut a, n) {
             continue;
         }
-        let mut delta = rhs.to_vec();
+        let mut delta = vec![0.0_f64; n];
+        for i in 0..n {
+            let mut offset = 0.0;
+            for j in 0..n {
+                offset += penalty[i * n + j] * theta0[j];
+            }
+            delta[i] = -gradient[i] - lambda * offset;
+        }
         solve_in_place(&a, n, &mut delta);
         let h_delta = dense_mat_vec(hessian, n, &delta);
-        let fitted = rss - 2.0 * dot(&delta, rhs) + dot(&delta, &h_delta);
+        let fitted = rss + 2.0 * dot(&delta, gradient) + dot(&delta, &h_delta);
         let mut dof = 0.0;
         for probe in &probe_vectors {
             let mut y = probe.clone();
@@ -183,7 +191,8 @@ pub(crate) fn select_lambda(
 pub(crate) fn select_lambda_diagonal(
     hessian_diagonal: &[f64],
     penalty_diagonal: &[f64],
-    rhs: &[f64],
+    gradient: &[f64],
+    theta0: &[f64],
     rss: f64,
     observations: f64,
 ) -> GcvChoice {
@@ -206,8 +215,8 @@ pub(crate) fn select_lambda_diagonal(
                 continue;
             }
             dof += h / a;
-            let delta = rhs[index] / a;
-            fitted += -2.0 * delta * rhs[index] + h * delta * delta;
+            let delta = (-gradient[index] - lambda * penalty_diagonal[index] * theta0[index]) / a;
+            fitted += 2.0 * delta * gradient[index] + h * delta * delta;
         }
         let dof = dof.min(observations * 0.999).max(0.0);
         let denominator = 1.0 - dof / observations;

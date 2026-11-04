@@ -17,6 +17,8 @@ jobs:
         run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: nix develop -c cargo test --workspace
+      - name: Fit acceptance tests
+        run: nix develop -c cargo test -p looklab-fit --features synth
       - name: RAW decode under Node
         run: nix develop -c cargo test -p looklab-raw --target wasm32-unknown-unknown --test wasm_node
       - name: Float method allow-list

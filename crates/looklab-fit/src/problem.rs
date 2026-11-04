@@ -108,11 +108,14 @@ pub(crate) struct PassOutput {
     pub gradient: Vec<f64>,
     pub contributor_rss: Vec<f64>,
     pub contributor_weight: Vec<f64>,
+    pub contributor_pairs: Vec<Vec<(f64, f64)>>,
     pub residuals: Vec<[f64; 3]>,
     pub image_rss: Vec<f64>,
     pub image_weight: Vec<f64>,
     pub per_image_gradient: Vec<Vec<f64>>,
     pub residual_samples: Vec<ResidualSample>,
+    pub active_samples: usize,
+    pub hessian_rows: usize,
 }
 
 fn space_of(output: OutputSpace) -> RgbSpace {
@@ -163,6 +166,8 @@ impl Problem {
             let in_rgb = image.samples.in_rgb();
             let out_rgb = image.samples.out_rgb();
             let density = image.samples.density_w();
+            let mean_density =
+                density.iter().map(|value| *value as f64).sum::<f64>() / density.len() as f64;
             let space = space_of(image.samples.header().output_space);
             for index in order {
                 let index = index as usize;
@@ -170,12 +175,20 @@ impl Problem {
                     ucs_of_xyz(space.rgb_linear_to_xyz(Rgb::from_array(
                         out_rgb[index].map(|value| value as f64),
                     )));
-                let neutral = (target.a * target.a + target.b * target.b).sqrt() < 12.0;
+                // Neutrality is an input property (docs/02 §4.1 stage 1), taken at the prior nuisance.
+                let scene = image.transform.mul_vec([
+                    in_rgb[index][0] as f64 * libm::pow(2.0, image.exposure_hint.clamp(-8.0, 8.0)),
+                    in_rgb[index][1] as f64 * libm::pow(2.0, image.exposure_hint.clamp(-8.0, 8.0)),
+                    in_rgb[index][2] as f64 * libm::pow(2.0, image.exposure_hint.clamp(-8.0, 8.0)),
+                ]);
+                let neutral = looklab_model::LookInput::new(looklab_color::Xyz::from_array(scene))
+                    .c_in
+                    < 12.0;
                 samples.push(Sample {
                     rgb: in_rgb[index].map(|value| value as f64),
                     target,
                     image: image_index as u32,
-                    weight: density[index] as f64 * trust * temper,
+                    weight: density[index] as f64 / mean_density.max(1e-12) * trust * temper,
                     density: density[index] as f64,
                     neutral,
                 });
@@ -265,6 +278,7 @@ impl Problem {
     ) -> PassOutput {
         let (look, slope) = self.look_and_slope(params);
         let clip_k = params.clip_k();
+        let clip_slope = params.clip_slope();
         let total = self.layout.total;
         let mut output = PassOutput {
             cost: 0.0,
@@ -272,6 +286,7 @@ impl Problem {
             gradient: vec![0.0_f64; total],
             contributor_rss: vec![0.0_f64; self.contributors.len()],
             contributor_weight: vec![0.0_f64; self.contributors.len()],
+            contributor_pairs: vec![Vec::new(); self.contributors.len()],
             residuals: vec![
                 [0.0_f64; 3];
                 if want_residuals {
@@ -288,6 +303,8 @@ impl Problem {
                 Vec::new()
             },
             residual_samples: Vec::new(),
+            active_samples: 0,
+            hessian_rows: 0,
         };
         let mut jac = Jac::default();
         let contexts: Vec<(ImageCtx, ColumnMap)> = self
@@ -325,6 +342,7 @@ impl Problem {
                 columns,
                 sample.rgb,
                 clip_k,
+                clip_slope,
                 &slope,
                 &mut jac,
             );
@@ -339,12 +357,17 @@ impl Problem {
             let variance = sigma[self.images[image].contributor];
             let (log_likelihood, alpha) = self.irls(squared, variance);
             let weight = sample.weight;
+            output.active_samples += 1;
+            if hessian_set[index] {
+                output.hessian_rows += 1;
+            }
             output.cost += weight * (log_likelihood + 1.5 * libm::log(variance));
             output.image_rss[image] += weight * squared;
             output.image_weight[image] += weight;
             let contributor = self.images[image].contributor;
             output.contributor_rss[contributor] += weight * squared;
             output.contributor_weight[contributor] += weight;
+            output.contributor_pairs[contributor].push((weight, squared));
             if want_residuals {
                 output.residuals[index] = residual;
             }

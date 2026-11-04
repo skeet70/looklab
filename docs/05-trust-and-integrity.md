@@ -35,11 +35,12 @@
 | Tier | How you get it | Tier factor *(tentative)* | Subject to new-tier group cap |
 |---|---|---|---|
 | `new` | First contribution | 1.0 | yes |
-| `endorsed` | A seeder endorses you (scoped to bodies/looks) | 2.0 within scope | no |
+| `endorsed` | A seeder endorses you (scoped by rules) | 2.0 within scope | no |
 | `seeder` | An admin grants it | 2.0 within scope | no |
 
 - **Roles** (separate from tiers): `moderator` and `admin`. Admins grant seeder and moderator through `looklab-cli admin …` or an admin page. Seeders endorse contributors in the app.
 - An endorsement records scope, reason and evidence (e.g. a reviewed chart session), and is revocable. **Outside its scope, an endorsed credential counts as `new`** (tier factor, group cap and all). The same applies to a seeder outside its scope.
+- A scope is a list of rules `{body, look}`, where either side may be `*`. An image `(body, look)` is in scope when any rule matches: `(B, *)` covers every Look on that body, `(*, L)` every body for that Look, and `(B, L)` only that pair. Each image gets one endorsement factor from its `(body, look)` pair, used everywhere that image appears in the fit. The default scope for chart-session evidence is `(B, *)`.
 - **Every grant, endorsement and revocation** is a database row plus an audit-log entry (§11). The lists are public, identifying credentials by internal id or chosen display handle, never by public key.
 - Seeders, moderators and admins should use hardware-backed passkeys or security keys.
 
@@ -85,8 +86,8 @@ w_img = base(kind) × evidence × tier × reputation        → then caps (§6)
   - per body, for the body parameters (input transform, ξ, ω, control-response model), because a body update moves every Look on that body.
 
   In regions or bodies with no endorsed or root data, new-tier data defines the value, and the region/body stays **provisional**.
-- **Per effective contributor:** ≤ 5% of a Look version's weight and ≤ 20% of a body input transform's weight, with diminishing returns `1/sqrt(1 + n/20)` on the n-th image. Besides limiting abuse, this keeps one camera's unit-to-unit variation from defining a body.
-- **Minimum pool:** per-contributor caps apply only once the pool can satisfy them (≥ 20 effective contributors for a Look, ≥ 5 for a body). Below that, the Look or body is labeled provisional unless it's rooted (§7).
+- **Per effective contributor:** with `n` effective contributors in the pool, at most `max(0.05, 2/n)` of a Look version's weight and `max(0.20, 2/n)` of a body input transform's weight, applied by water-filling against the final total alongside the group cap. Diminishing returns `1/sqrt(1 + n/20)` also apply on the n-th image of one contributor. The floors and the factor 2 are tentative ([10 Q12](10-open-questions.md)).
+- **Minimum pool (provisional label only):** a Look or body is labeled provisional when its pool has fewer than 20 (Look) or 5 (body) effective contributors and it is not rooted (§7). The threshold does not switch the per-contributor caps off.
 - **Fake serials** let an attacker take a larger share of the new-tier pool from honest new contributors, but never more than the group cap.
 
 ## 7. Root set
@@ -94,7 +95,7 @@ w_img = base(kind) × evidence × tier × reputation        → then caps (§6)
 - The root set is **anchored sessions from endorsed or seeder credentials, admitted by a seeder** in the app (logged):
   - for a **Look**: chart, gradient and pattern sessions;
   - for a **body's input transform**: chart sessions or published spectral sensitivity data **only**. Gradient and pattern sessions don't constrain it.
-- A Look becomes `rooted` once it has admitted root sessions covering its supported regions.
+- A Look becomes `rooted` once it has admitted root sessions covering its supported regions. A rooted Look is not provisional even when its pool has fewer than 20 effective contributors.
 - **Sunset:** once a Look has ≥ 20 endorsed contributors across ≥ 3 bodies, the root is re-derived from admitted anchored sessions of endorsed contributors. High reputation alone never qualifies.
 - **Bootstrapping (operational):**
   - One chart + gradient + pattern session per body, re-rendered in camera through every native sim, covers all of that body's native Looks.

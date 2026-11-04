@@ -70,10 +70,90 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
+/// Whether one file's decode or prep step produced a value.
+#[derive(Debug)]
+pub enum FileResult<T> {
+    Done(T),
+    Failed,
+}
+
+/// Decode or prep one file, containing a panic and reporting a decoder error.
+/// The caller decides whether the remaining files are worth processing.
+pub fn catch_file<T>(file: &Path, step: impl FnOnce() -> Result<T>) -> FileResult<T> {
+    match catch_panic(step) {
+        Ok(Ok(value)) => FileResult::Done(value),
+        Ok(Err(error)) => {
+            report_decoder_error(file);
+            eprintln!("  {error:#}");
+            FileResult::Failed
+        }
+        Err(payload) => {
+            report_decoder_error(file);
+            if let Some(message) = panic_message(payload) {
+                eprintln!("  {message}");
+            }
+            FileResult::Failed
+        }
+    }
+}
+
+pub fn catch_panic<T>(step: impl FnOnce() -> T) -> Result<T, Box<dyn std::any::Any + Send>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(step))
+}
+
+fn report_decoder_error(file: &Path) {
+    eprintln!(
+        "{}: This file couldn't be decoded (decoder error).",
+        file.display()
+    );
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> Option<String> {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+}
+
 pub fn replace_extension(path: &Path, suffix: &str, extension: &str) -> PathBuf {
     let stem = path
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| "output".to_owned());
     path.with_file_name(format!("{stem}{suffix}.{extension}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FileResult, catch_file, catch_panic};
+
+    #[test]
+    fn a_panicking_step_is_contained() {
+        let mut ran = false;
+        let outcome = catch_file(
+            std::path::Path::new("broken.raf"),
+            || -> anyhow::Result<()> {
+                ran = true;
+                panic!("decoder exploded")
+            },
+        );
+        assert!(ran);
+        assert!(matches!(outcome, FileResult::Failed));
+    }
+
+    #[test]
+    fn ordinary_errors_and_values_pass_through_the_same_wrapper() {
+        let file = std::path::Path::new("broken.raf");
+        assert!(matches!(
+            catch_file(file, || -> anyhow::Result<()> {
+                anyhow::bail!("bad header")
+            }),
+            FileResult::Failed
+        ));
+        assert!(matches!(
+            catch_file(file, || -> anyhow::Result<u32> { Ok(7) }),
+            FileResult::Done(7)
+        ));
+        assert!(catch_panic(|| 1_u32).is_ok());
+    }
 }

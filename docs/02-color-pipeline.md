@@ -91,18 +91,22 @@ A Look maps adapted scene XYZ to CAM16-UCS `J'a'b'`. Input coordinates:
 `(a'_N, b'_N) = N(J'_base)`, two smooth splines (~12 knots). With D = 1, a neutral input gives `M'_ref = 0` (§3.3), so N measures neutral tint exactly.
 
 ### 3.3 Chroma, hue and lightness relative to a colorimetric reference
-To separate tone from color, G, R and Λ are defined **relative to what a purely colorimetric rendering would produce at the output lightness**:
+To separate tone from color, G, R and Λ are defined **relative to what a purely colorimetric rendering would produce at the neutral-matched luminance**:
 
-1. `J'_base = T(s)`.
-2. Solve exactly for `Y_ref` such that the colorimetric CAM16-UCS lightness of a **D65 neutral** at luminance `Y_ref` equals `J'_base`. `J'` is monotone in `Y` for a neutral, so solve with safeguarded Newton (bisection fallback), an analytic derivative, a fixed initial guess that depends only on the inputs, and convergence to |ΔJ′| < 1e-10. The result doesn't depend on caches or call history, so outputs are deterministic and gradients are smooth.
-3. `XYZ_ref` is the input chromaticity scaled to `Y_ref`; `(J'_ref, M'_ref, h_ref)` = CAM16-UCS of `XYZ_ref`.
-4. Output:
+1. Find `Y_ref`, the luminance of the neutral whose CAM16-UCS lightness equals `T(s)` (closed form). `XYZ_ref` is the input chromaticity at luminance `Y_ref`; `(J′_ref, M′_ref, h_ref)` are its colorimetric CAM16-UCS values.
+2. Layers over `(h_in, s, √C_in)`:
+   - chroma gain `log G`;
+   - hue rotation `R` (degrees);
+   - lightness shift `Λ` (J′ units).
+3. Output:
    ```
    J'   = J'_ref + Λ(h_in, s, C_in)
    M'   = G(h_in, s, C_in) · M'_ref
    h    = h_ref + R(h_in, s, C_in)
    a'b' = N(J'_base) + polar(M', h)
    ```
+
+T is the neutral-axis tone curve. Chromatic colors keep their colorimetric lightness relative to the neutral of the same luminance.
 
 With colorimetric `T` (`T(s)` = neutral `J'` at `Y = 0.18·2^s`), `Y_ref = Y` and the output equals colorimetric CAM16-UCS of the input.
 
@@ -156,7 +160,7 @@ The total objective is:
 
 - **σ_v appears only here**, including its log term, so inflating it isn't free. It's **not** repeated as a weight factor ([05 §5](05-trust-and-integrity.md)). Prior: inverse-gamma on σ_v², centered at 1.5 ΔE.
 - **Tempering:** samples within an image are strongly correlated. The factor `n_eff/n_i` (default n_eff = 500) keeps one image from overwhelming the priors and nuisance terms. Uncertainty is still computed with the sandwich estimator (§5).
-- `ω_ip` = density weight × the image's trust weight from 05.
+- `ω_ip` = density weight × the image's trust weight from 05; the stored `density_w` is the raw inverse inclusion probability, normalized to mean 1 within each image so it reweights samples without changing the image's total weight.
 - Fitting uses up to 10k samples per image by default (a uniform draw within the stored ≤ 50k set).
 
 **Staging** (tone first, after dtsolve's practice). Each stage warm-starts the next:
@@ -271,4 +275,4 @@ Because G/R/Λ are relative to the colorimetric reference, layer differences are
   - All transcendental math in core crates goes through the `libm` crate (`pow`, `exp`, `ln`, `sin`, `cos`, `atan2`, `tanh`, …). Ban the `f64` methods with clippy `disallowed_methods`. `sqrt` (correctly rounded) and basic arithmetic are fine.
   - The Look evaluation path uses scalar code or fixed-order reductions only: no `faer`/`pulp` or other runtime-dispatched SIMD, no fast-math, no FMA contraction differences. A test compares native and WASM outputs bit for bit on fixtures.
 - Golden tests vs colour-science for every color function (1e-6 relative; CAM16 inverse 1e-5). Note: colour-science's CAM16 defaults compute D, so golden vectors must pass `discount_illuminant=True` where the reference conditions apply.
-- Look evaluation target: < 3 µs/color native for layers + residual, including the exact `Y_ref` solve (§3.3).
+- Look evaluation target: < 3 µs/color native for layers + residual, including the closed-form `Y_ref` solve (§3.3).

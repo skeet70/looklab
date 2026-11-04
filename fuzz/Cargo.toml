@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 looklab-samples = { path = "../crates/looklab-samples" }
 looklab-upload = { path = "../crates/looklab-upload" }
+looklab-raw = { path = "../crates/looklab-raw" }
 
 [workspace]
 
@@ -24,6 +25,13 @@ bench = false
 [[bin]]
 name = "envelope"
 path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "raw_decode"
+path = "fuzz_targets/raw_decode.rs"
 test = false
 doc = false
 bench = false

@@ -17,6 +17,7 @@ use looklab_samples::{PrepVersion, PriorTransformVersion};
 use serde::Serialize;
 
 use crate::body_transform::TransformFile;
+use crate::util;
 
 #[derive(Debug, Args)]
 pub struct PrepArgs {
@@ -69,7 +70,11 @@ fn prepare_one(args: &PrepArgs) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let jpeg_refs: Vec<&[u8]> = jpeg_bytes.iter().map(Vec::as_slice).collect();
 
-    let (prior, transform) = load_prior(args, &raw_bytes)?;
+    let prior_version = if args.body_prior == "from-raw" {
+        PriorTransformVersion::new(1)
+    } else {
+        PriorTransformVersion::new(TransformFile::load(Path::new(&args.body_prior))?.version)
+    };
     let seed_key = LocalImageKey::new(&file_name(raw_path))
         .with_context(|| format!("{} is not a usable image key", raw_path.display()))?;
 
@@ -83,7 +88,7 @@ fn prepare_one(args: &PrepArgs) -> Result<()> {
         looklab_prep::SeedFile::from_json(&text)
             .with_context(|| format!("parsing {}", seed_path.display()))?
     } else {
-        looklab_prep::SeedFile::new(prior.version())
+        looklab_prep::SeedFile::new(prior_version)
     };
     let seed = match seeds.seed_for(&seed_key) {
         Some(seed) => seed,
@@ -92,8 +97,16 @@ fn prepare_one(args: &PrepArgs) -> Result<()> {
     seeds.insert(seed_key.clone(), seed);
 
     let params = PrepParams::default();
-    let prepared = prepare_group(&raw_bytes, &jpeg_refs, &prior, seed, &params)
-        .context("preparing the RAW/JPEG group")?;
+    let prepared = match util::catch_file(raw_path, || {
+        let (prior, transform) = load_prior(args, &raw_bytes)?;
+        let prepared = prepare_group(&raw_bytes, &jpeg_refs, &prior, seed, &params)
+            .context("preparing the RAW/JPEG group")?;
+        Ok((prior, transform, prepared))
+    }) {
+        util::FileResult::Done(value) => value,
+        util::FileResult::Failed => bail!("no samples were written"),
+    };
+    let (prior, transform, prepared) = prepared;
 
     let raw_stem = file_stem(raw_path);
     let mut summary_images = Vec::with_capacity(prepared.len());
@@ -311,9 +324,20 @@ fn report_folder(dir: &Path) -> Result<()> {
                 continue;
             }
         };
-        let metadata = match key.kind() {
+        let parsed = util::catch_panic(|| match key.kind() {
             looklab_prep::FileKind::Jpeg => parse_jpeg(&bytes),
             _ => parse(&bytes),
+        });
+        let metadata = match parsed {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                eprintln!(
+                    "{}: This file couldn't be decoded (decoder error).",
+                    path.display()
+                );
+                unreadable.push(name);
+                continue;
+            }
         };
         match metadata {
             Ok(metadata) => files.push(PairingFile::new(key, &metadata)),
@@ -403,28 +427,22 @@ fn attach_bare_jpegs(
 fn print_preselection(dir: &Path, outcome: &PairingOutcome) -> Result<()> {
     let mut thumbnails = Vec::new();
     let mut pairs = Vec::new();
-    let mut skipped = Vec::new();
     for raw in &outcome.pairs {
         let Some(member) = raw.jpegs.first() else {
             continue;
         };
-        let bytes = match std::fs::read(dir.join(member.key.as_str())) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                skipped.push(format!("{}: {error}", raw.raw.as_str()));
-                continue;
-            }
-        };
-        match decode_jpeg(&bytes) {
-            Ok(jpeg) => {
+        let path = dir.join(member.key.as_str());
+        let decoded = util::catch_file(&path, || {
+            let bytes = std::fs::read(&path)?;
+            Ok(decode_jpeg(&bytes)?)
+        });
+        match decoded {
+            util::FileResult::Done(jpeg) => {
                 thumbnails.push(jpeg.image.downsample_area(40_000));
                 pairs.push(raw.raw.as_str().to_owned());
             }
-            Err(error) => skipped.push(format!("{}: {error}", raw.raw.as_str())),
+            util::FileResult::Failed => {}
         }
-    }
-    for message in skipped {
-        println!("preselection skipped {message}");
     }
     if thumbnails.is_empty() {
         return Ok(());

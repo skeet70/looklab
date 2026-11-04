@@ -221,8 +221,8 @@ pub struct TintRecord {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChromaReference {
-    #[serde(rename = "colorimetric_at_output_lightness")]
-    ColorimetricAtOutputLightness,
+    #[serde(rename = "colorimetric_at_neutral_matched_luminance")]
+    ColorimetricAtNeutralMatchedLuminance,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -484,7 +484,7 @@ impl LayersRecord {
                 c_knots: C_COEFS,
                 c_max: C_MAX,
                 coef_ref: BinRef::new("bin:G").expect("static bin reference"),
-                reference: ChromaReference::ColorimetricAtOutputLightness,
+                reference: ChromaReference::ColorimetricAtNeutralMatchedLuminance,
             },
             hue: HueRecord {
                 coef_ref: BinRef::new("bin:R").expect("static bin reference"),

@@ -52,7 +52,9 @@ fn y_ref_range_is_explicit() {
 #[test]
 fn colorimetric_look_matches_cam16_ucs() {
     let look = Look::colorimetric();
+    let mut groups = std::collections::BTreeSet::new();
     for probe in v1().probes {
+        groups.insert(probe.group);
         let expected = colorimetric(probe.xyz);
         let actual = look.eval(probe.xyz);
         let error = (actual.j - expected.j)
@@ -65,6 +67,42 @@ fn colorimetric_look_matches_cam16_ucs() {
             probe.id.as_str()
         );
     }
+    for group in [
+        ProbeGroup::GrayRamp,
+        ProbeGroup::ChartPatches,
+        ProbeGroup::HueGrid,
+        ProbeGroup::Skin,
+        ProbeGroup::MemoryColors,
+    ] {
+        assert!(groups.contains(&group), "identity test missed {group:?}");
+    }
+}
+
+#[test]
+fn colorimetric_identity_holds_on_chromatic_probes() {
+    let look = Look::colorimetric();
+    let mut checked = 0;
+    for probe in v1().probes {
+        if !matches!(
+            probe.group,
+            ProbeGroup::HueGrid | ProbeGroup::ChartPatches | ProbeGroup::Skin
+        ) {
+            continue;
+        }
+        let expected = colorimetric(probe.xyz);
+        let actual = look.eval(probe.xyz);
+        let error = (actual.j - expected.j)
+            .abs()
+            .max((actual.a - expected.a).abs())
+            .max((actual.b - expected.b).abs());
+        assert!(
+            error < 1e-9,
+            "probe {} expected {expected:?} actual {actual:?} error {error}",
+            probe.id.as_str()
+        );
+        checked += 1;
+    }
+    assert!(checked > 900, "checked {checked}");
 }
 
 #[test]

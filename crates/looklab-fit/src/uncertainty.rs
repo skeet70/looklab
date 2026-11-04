@@ -58,6 +58,7 @@ pub(crate) fn probe_uncertainty(
     look: &Look,
     block: &BlockAcc,
     penalty: &[f64],
+    hessian_scale: f64,
     lambdas: &crate::types::StageLambdas,
     per_image_gradient: &[Vec<f64>],
     density: &Density,
@@ -68,16 +69,22 @@ pub(crate) fn probe_uncertainty(
     let priors = prior_diagonal(options, problem, params);
     let n = block.len();
     let mut h = block.hessian.clone();
+    for value in &mut h {
+        *value *= hessian_scale;
+    }
     for entry in 0..n * n {
         h[entry] += penalty[entry];
     }
     for (local, global) in block.params.iter().enumerate() {
         h[local * n + local] += priors[*global];
     }
-    let inverse = invert(&h, n);
+    let Some(inverse) = invert(&h, n) else {
+        return Err(crate::types::FitError::SingularRegularization);
+    };
     let residual_diagonal = residual_inverse_diagonal(residual_samples, lambdas.residual);
     let residual_start = layout.residual.start;
 
+    let (_, beta_slope) = problem.look_and_slope(params);
     let probes = looklab_model::probes::v1();
     let mut jac = Jac::default();
     let mut estimates = Vec::with_capacity(probes.probes.len());
@@ -87,7 +94,7 @@ pub(crate) fn probe_uncertainty(
     let mut entries: Vec<(usize, f64)> = Vec::with_capacity(320);
 
     for probe in &probes.probes {
-        let pre = evaluate_probe(look, layout, probe.xyz, &mut jac);
+        let pre = evaluate_probe(look, layout, probe.xyz, &beta_slope, &mut jac);
         for channel in 0..3 {
             z_dense.fill(0.0);
             entries.clear();
@@ -97,14 +104,12 @@ pub(crate) fn probe_uncertainty(
                     entries.push((local as usize, derivative[channel]));
                 }
             }
-            if let Some(inverse) = &inverse {
-                for i in 0..n {
-                    let mut sum = 0.0;
-                    for (local, value) in &entries {
-                        sum += inverse[i * n + local] * value;
-                    }
-                    z_dense[block.params[i]] = sum;
+            for i in 0..n {
+                let mut sum = 0.0;
+                for (local, value) in &entries {
+                    sum += inverse[i * n + local] * value;
                 }
+                z_dense[block.params[i]] = sum;
             }
             for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
                 let index = *column as usize;
@@ -115,7 +120,13 @@ pub(crate) fn probe_uncertainty(
             }
             z_columns[channel].copy_from_slice(&z_dense);
         }
-        let mut support: Vec<usize> = jac.cols.iter().map(|column| *column as usize).collect();
+        // `z = H^-1 J_probe` is dense, so the contraction must cover every fitted coordinate.
+        let mut support: Vec<usize> = block.params.clone();
+        for index in residual_start..residual_start + RESIDUAL_COEFS {
+            if z_columns.iter().any(|z| z[index] != 0.0) {
+                support.push(index);
+            }
+        }
         support.sort_unstable();
         support.dedup();
 

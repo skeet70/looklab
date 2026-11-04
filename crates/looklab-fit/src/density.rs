@@ -19,7 +19,7 @@ fn index_of(values: [f64; 3]) -> usize {
     let s = (s.max(0.0) as usize).min(S_BINS - 1);
     let h = (values[1] / 360.0 * H_BINS as f64).floor();
     let h = (h.max(0.0) as usize) % H_BINS;
-    let c = (values[2] / C_HI * C_BINS as f64).floor();
+    let c = ((values[2] / C_HI).sqrt() * C_BINS as f64).floor();
     let c = (c.max(0.0) as usize).min(C_BINS - 1);
     (s * H_BINS + h) * C_BINS + c
 }
@@ -37,7 +37,7 @@ fn coordinates(s: f64, hue: f64, c: f64) -> [f64; 3] {
     [
         ((s - S_LO) / (S_HI - S_LO) * S_BINS as f64 - 0.5).clamp(0.0, (S_BINS - 1) as f64),
         wrap_hue((hue / 360.0 * H_BINS as f64) - 0.5),
-        ((c / C_HI * C_BINS as f64) - 0.5).clamp(0.0, (C_BINS - 1) as f64),
+        (((c / C_HI).sqrt() * C_BINS as f64) - 0.5).clamp(0.0, (C_BINS - 1) as f64),
     ]
 }
 

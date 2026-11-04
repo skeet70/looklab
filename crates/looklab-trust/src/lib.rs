@@ -38,7 +38,7 @@ pub use root::{
     EndorsedContributor, RootAdmission, RootDataKind, RootSession, RootTarget, admission_eligible,
     rooted, sunset_ready, sunset_sessions,
 };
-pub use standing::{Scope, Standing, Tier};
+pub use standing::{Scope, ScopeRule, Standing, Tier};
 pub use state::{
     Actor, AuditEvent, CredentialState, Endorsement, EvidenceRef, Grant, ModerationOutcome,
     ProposalId, Role, TrustState,
@@ -46,5 +46,6 @@ pub use state::{
 pub use weight::{
     BodyImageWeight, BodyWeightInput, BodyWeightReport, CapReason, CapReduction, CapReport,
     CaptureTuple, ImageWeight, LookWeightInput, LookWeightReport, RegionWeights, StagePartition,
-    WeightImage, partition_stages, weight_body, weight_look,
+    WeightImage, body_contributor_cap, look_contributor_cap, partition_stages, weight_body,
+    weight_look,
 };

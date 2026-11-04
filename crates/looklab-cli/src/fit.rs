@@ -47,21 +47,39 @@ pub fn run(args: &FitArgs) -> Result<()> {
     let transform = TransformFile::load(&transform_path)?;
 
     let files = util::samples_in(&args.samples)?;
-    if args.holdout >= files.len() {
-        bail!("cannot hold out {} of {} images", args.holdout, files.len());
-    }
     let mut images = Vec::with_capacity(files.len());
+    let mut skipped = 0;
     for file in &files {
         let name = file_name(file);
-        let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
-        let samples = looklab_samples::decode(&bytes)
-            .with_context(|| format!("decoding {}", file.display()))?;
-        let matrix = transform.image_matrix(&name, samples.header().wb_multipliers)?;
-        let exposure_hint = f64::from(samples.header().exposure_hint_ev);
-        let mut image = FitImage::new(samples, matrix);
-        image.exposure_hint = exposure_hint;
-        image.exposure_mode = ExposureModeId(0);
-        images.push((name, image));
+        let loaded = util::catch_file(file, || {
+            let bytes =
+                std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+            let samples = looklab_samples::decode(&bytes)
+                .with_context(|| format!("decoding {}", file.display()))?;
+            let matrix = transform.image_matrix(&name, samples.header().wb_multipliers)?;
+            let exposure_hint = f64::from(samples.header().exposure_hint_ev);
+            let mut image = FitImage::new(samples, matrix);
+            image.exposure_hint = exposure_hint;
+            image.exposure_mode = ExposureModeId(0);
+            Ok((name.clone(), image))
+        });
+        match loaded {
+            util::FileResult::Done(image) => images.push(image),
+            util::FileResult::Failed => skipped += 1,
+        }
+    }
+    if skipped > 0 {
+        println!("skipped {skipped} undecodable file(s)");
+    }
+    if images.is_empty() {
+        bail!("no decodable samples in {}", args.samples.display());
+    }
+    if args.holdout >= images.len() {
+        bail!(
+            "cannot hold out {} of {} images",
+            args.holdout,
+            images.len()
+        );
     }
 
     let split = images.len() - args.holdout;

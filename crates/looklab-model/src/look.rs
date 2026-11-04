@@ -428,20 +428,15 @@ impl Look {
         values: &LayerValues,
     ) -> [[f64; 9]; 3] {
         let solved = solve::try_solve_y_ref(values.t, input.y);
-        let y_ref = match solved {
-            Ok(y) => y,
-            Err(_) => solve::solve_y_ref(values.t, input.y),
-        };
-        let dy_dt = match solved {
-            Ok(_) => {
-                let (_, neutral_slope) = crate::deriv::reference_cam16().neutral_j_and_dj_dy(y_ref);
-                if neutral_slope.is_finite() && neutral_slope > 0.0 {
-                    1.0 / neutral_slope
-                } else {
-                    0.0
-                }
+        let (y_ref, dy_dt) = match solved {
+            Ok(y) => {
+                let derivative = crate::deriv::reference_cam16()
+                    .neutral_y_and_dy_for_j_prime(values.t)
+                    .map(|(_, derivative)| derivative)
+                    .unwrap_or(0.0);
+                (y, derivative)
             }
-            Err(_) => 0.0,
+            Err(_) => (solve::solve_y_ref(values.t, input.y), 0.0),
         };
         let (reference, derivative) = REFERENCE_CAM16.ucs_and_derivative(input.unit_xyz, y_ref);
         let d_j_ref = derivative[0] * dy_dt;

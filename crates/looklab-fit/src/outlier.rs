@@ -17,6 +17,23 @@ fn median(values: &mut [f64]) -> f64 {
     }
 }
 
+/// Trimmed root mean square of the sample residuals, dropping the worst 5% per image.
+fn robust_rms(values: &mut [(f64, f64)]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let keep = (values.len() * 95 / 100).max(1);
+    let (sum, weight) = values[..keep]
+        .iter()
+        .fold((0.0, 0.0), |acc, (w, r)| (acc.0 + w * r, acc.1 + w));
+    if weight > 0.0 {
+        (sum / weight).max(0.0).sqrt()
+    } else {
+        0.0
+    }
+}
+
 pub(crate) fn score(
     problem: &Problem,
     pass: &PassOutput,
@@ -24,13 +41,21 @@ pub(crate) fn score(
 ) -> Vec<ImageFitStats> {
     let count = problem.images.len();
     let mut rms = vec![0.0_f64; count];
+    let have_samples = pass.residuals.len() == problem.samples.len();
     for index in 0..count {
-        let weight = pass.image_weight[index];
-        rms[index] = if weight > 0.0 {
-            (pass.image_rss[index] / weight).max(0.0).sqrt()
-        } else {
-            0.0
-        };
+        let range = problem.images[index].samples.clone();
+        if have_samples && !range.is_empty() {
+            let mut values: Vec<(f64, f64)> = range
+                .map(|sample| {
+                    let residual = pass.residuals[sample];
+                    let squared = residual[0] * residual[0]
+                        + residual[1] * residual[1]
+                        + residual[2] * residual[2];
+                    (problem.samples[sample].weight, squared)
+                })
+                .collect();
+            rms[index] = robust_rms(&mut values);
+        }
     }
     let mut pool = rms.clone();
     let pool_median = median(&mut pool);

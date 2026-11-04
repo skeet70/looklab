@@ -78,9 +78,9 @@ fn held_out_scenes_are_close() {
         .map(|xyz| delta_e_ucs(result.look.eval(xyz.scale(shift)), data.truth.eval(*xyz)))
         .collect();
     let (median, p95) = percentiles(errors);
-    // docs/09 P1.5 targets p95 <= 4.0; this synthetic generator reaches 4.28.
+    println!("held-out median {median:.3} p95 {p95:.3}");
     assert!(median <= 1.5, "median {median}, p95 {p95}");
-    assert!(p95 <= 4.5, "median {median}, p95 {p95}");
+    assert!(p95 <= 4.0, "median {median}, p95 {p95}");
 }
 
 #[test]
@@ -131,9 +131,13 @@ fn tone_only_difference_leaves_the_colour_layers_alone() {
     let mut worst_lightness: f64 = 0.0;
     let left_shift = libm::pow(2.0, gauge(&a, &baseline));
     let right_shift = libm::pow(2.0, gauge(&b, &shifted));
+    // Compare where the training data reaches: at or above the median probe density.
+    let mut densities: Vec<f64> = a.probes.probes.iter().map(|p| p.density).collect();
+    densities.sort_by(f64::total_cmp);
+    let threshold = densities[densities.len() / 2];
     let mut checked = 0usize;
     for (probe, estimate) in probes_v1().probes.iter().zip(a.probes.probes.iter()) {
-        if !estimate.supported {
+        if estimate.density < threshold {
             continue;
         }
         let left = a
@@ -147,7 +151,8 @@ fn tone_only_difference_leaves_the_colour_layers_alone() {
         worst_rotation = worst_rotation.max((left.r - right.r).abs());
         worst_lightness = worst_lightness.max((left.lambda - right.lambda).abs());
     }
-    assert!(checked >= 20, "only {checked} supported probes");
+    assert!(checked >= 100, "only {checked} covered probes");
+    println!("covered probes {checked}");
     // Each layer's tolerance is 2% of its range: log G, 0.02 × 90 deg, 0.02 × 100 J'.
     let peak = |result: &looklab_fit::FitResult| {
         let mut gain: f64 = 0.0;
@@ -164,7 +169,7 @@ fn tone_only_difference_leaves_the_colour_layers_alone() {
         a.lambdas
     );
     // docs/09 targets 0.02 for every layer; this generator measures 0.02-0.07 for log G.
-    assert!(worst_gain < 0.25, "log G difference {worst_gain}");
+    assert!(worst_gain < 0.02, "log G difference {worst_gain}");
     assert!(
         worst_rotation < 1.8,
         "rotation difference {worst_rotation} deg"
@@ -190,7 +195,7 @@ fn sandwich_covers_the_true_probe_error() {
     let mut count = 0usize;
     let shift = libm::pow(2.0, gauge(&result, &data));
     for (probe, estimate) in probes.probes.iter().zip(result.probes.probes.iter()) {
-        if estimate.density < result.density.floor {
+        if !estimate.supported {
             continue;
         }
         count += 1;
@@ -206,8 +211,8 @@ fn sandwich_covers_the_true_probe_error() {
         "sandwich coverage {inside}/{count} = {fraction:.3}; sigma-supported {support}/{}",
         result.probes.probes.len()
     );
-    assert!(count > 100, "only {count} density-supported probes");
-    assert!(fraction >= 0.85, "coverage {fraction}");
+    assert!(count > 100, "only {count} supported probes");
+    assert!(fraction >= 0.90, "coverage {fraction}");
 }
 
 #[test]

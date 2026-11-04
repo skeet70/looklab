@@ -53,80 +53,28 @@ pub fn try_solve_y_ref(target: f64, guess: f64) -> Result<f64, SolveError> {
         return Err(SolveError::Unattainable { target, max });
     }
     let model = crate::deriv::reference_cam16();
-    let value = |y: f64| model.neutral_j_and_dj_dy(y).0;
-
-    let fallback = if guess > 0.0 && guess.is_finite() {
-        guess
-    } else {
-        0.18
-    };
-    let starting = model.neutral_y_for_j_prime(target).unwrap_or(fallback);
-    let starting = if starting > 0.0 && starting.is_finite() {
-        starting
-    } else {
-        fallback
-    };
-    let mut lo = 0.0_f64;
-    let mut hi = (starting * 2.0).min(f64::MAX / 4.0);
-    let mut guard = 0;
-    while value(hi) < target {
-        hi *= 2.0;
-        guard += 1;
-        if !hi.is_finite() || guard > 1024 {
-            return Err(SolveError::Unattainable { target, max });
+    match model.neutral_y_for_j_prime(target) {
+        Some(y) if y.is_finite() && y > 0.0 => Ok(y),
+        _ => {
+            let _ = guess;
+            Err(SolveError::Unattainable { target, max })
         }
-    }
-
-    let mut y = starting.clamp(f64::MIN_POSITIVE, hi);
-    let mut converged = false;
-    for _ in 0..256 {
-        let (current, derivative) = model.neutral_j_and_dj_dy(y);
-        let residual = current - target;
-        if residual.abs() < 1e-10 {
-            converged = true;
-            break;
-        }
-        if residual < 0.0 {
-            lo = y;
-        } else {
-            hi = y;
-        }
-        let newton = if derivative.is_finite() && derivative > 0.0 {
-            y - residual / derivative
-        } else {
-            f64::NAN
-        };
-        y = if newton.is_finite() && newton > lo && newton < hi {
-            newton
-        } else {
-            0.5 * (lo + hi)
-        };
-    }
-    if converged {
-        Ok(y)
-    } else {
-        Err(SolveError::Convergence)
     }
 }
 
-/// `Y` whose D65 neutral `J'` equals `target`. Targets outside the attainable
-/// range saturate at `neutral_j_prime_max() * (1 - 1e-12)`; use
-/// [`try_solve_y_ref`] to detect that.
+/// `Y` whose D65 neutral `J'` equals `target`; out-of-range targets saturate
+/// at `neutral_j_prime_max() * (1 - 1e-12)`. Use [`try_solve_y_ref`] to detect.
 pub fn solve_y_ref(target: f64, guess: f64) -> f64 {
-    match try_solve_y_ref(target, guess) {
-        Ok(y) => y,
-        Err(SolveError::Unattainable { .. }) => {
-            let saturated = neutral_j_prime_max() * (1.0 - 1e-12);
-            try_solve_y_ref(saturated, guess).unwrap_or_else(|_| {
-                let relaxed = neutral_j_prime_max() * (1.0 - 1e-9);
-                try_solve_y_ref(relaxed, guess).unwrap_or(0.18)
-            })
-        }
-        Err(SolveError::Convergence) => {
-            let relaxed = neutral_j_prime_max() * (1.0 - 1e-9);
-            try_solve_y_ref(relaxed, guess).unwrap_or(0.18)
-        }
+    if target <= 0.0 {
+        return 0.0;
     }
+    if let Ok(y) = try_solve_y_ref(target, guess) {
+        return y;
+    }
+    let saturated = neutral_j_prime_max() * (1.0 - 1e-12);
+    crate::deriv::reference_cam16()
+        .neutral_y_for_j_prime(saturated)
+        .unwrap_or(if guess > 0.0 { guess } else { 0.18 })
 }
 
 /// CAM16-UCS of `xyz` under the reference viewing conditions.

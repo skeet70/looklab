@@ -183,9 +183,9 @@ epochs:
 `id` (random internal id), `webauthn_credential` (credential id + public key, as `webauthn-rs` stores it), `display_handle?` (optional, user-chosen), `tier` (`new` | `endorsed` | `seeder`), `roles` (`moderator`, `admin`), `reputation`, `created_at`, `status` (`active` | `revoked`), `status_token_hash` (capability-token status feed; [06 §4](06-privacy-and-payload.md)). Public keys and serial HMACs are never published.
 
 ### Grant, Endorsement, RootAdmission
-- `Grant`: `id`, `subject_credential`, `role_or_tier` (`seeder` | `moderator` | `admin`), `scope?`, `granted_by` (an admin credential or `cli`), `reason`, `granted_at`, `revoked_at?`.
-- `Endorsement`: `id`, `issuer_credential` (a seeder), `subject_credential`, `scope` (bodies/looks), `reason`, `evidence_refs[]` (e.g. a reviewed chart session), `issued_at`, `revoked_at?`.
-- `RootAdmission`: `id`, `admitted_by` (a seeder), `contribution_id`, `scope` (looks/body), `reason`, `admitted_at`, `revoked_at?`.
+- `Grant`: `id`, `subject_credential`, `role_or_tier` (`seeder` | `moderator` | `admin`), `scope?: { rules: [{ body, look }] }` where either side may be `*`, `granted_by` (an admin credential or `cli`), `reason`, `granted_at`, `revoked_at?`.
+- `Endorsement`: `id`, `issuer_credential` (a seeder), `subject_credential`, `scope: { rules: [{ body, look }] }`, `reason`, `evidence_refs[]` (e.g. a reviewed chart session), `issued_at`, `revoked_at?`.
+- `RootAdmission`: `id`, `admitted_by` (a seeder), `contribution_id`, `scope: { rules: [{ body, look }] }`, `reason`, `admitted_at`, `revoked_at?`.
 - Every create/revoke writes an audit-log entry. The lists are public by internal id or display handle.
 
 ### Contribution and ContributionImage
@@ -295,7 +295,7 @@ The challenge signed by WebAuthn is `H(nonce ‖ sha256(manifest))`. The server 
   "layers": {
     "tone":      { "kind": "spline", "knots": [], "coef_ref": "bin:T" },
     "tint":      { "knots": [], "coef_ref": "bin:N" },
-    "chroma":    { "hue_knots": 24, "s_knots": [], "c_knots": 4, "c_max": 120, "coef_ref": "bin:G", "reference": "colorimetric_at_output_lightness" },
+    "chroma":    { "hue_knots": 24, "s_knots": [], "c_knots": 4, "c_max": 120, "coef_ref": "bin:G", "reference": "colorimetric_at_neutral_matched_luminance" },
     "hue":       { "coef_ref": "bin:R" },
     "lightness": { "coef_ref": "bin:Lambda" },
     "residual":  { "grid": [17,17,17], "domain": {}, "coef_ref": "bin:res" }

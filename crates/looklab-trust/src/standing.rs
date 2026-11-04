@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Tiers, scoped standing and endorsement scope ([docs/05 §3]).
 
-use std::collections::BTreeSet;
-
 use looklab_upload::{BodyId, LookSlug};
 use serde::{Deserialize, Serialize};
 
@@ -67,35 +65,157 @@ impl Standing {
     }
 }
 
-/// An endorsement or grant scope: a set of Looks and a set of bodies.
+/// One scope rule: an image is in scope when its body and Look match every field that
+/// is `Some`. `None` is the wildcard.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ScopeRule {
+    pub body: Option<BodyId>,
+    pub look: Option<LookSlug>,
+}
+
+impl ScopeRule {
+    pub fn new(body: Option<BodyId>, look: Option<LookSlug>) -> Self {
+        Self { body, look }
+    }
+
+    pub fn body_all_looks(body: BodyId) -> Self {
+        Self {
+            body: Some(body),
+            look: None,
+        }
+    }
+
+    pub fn any_body(look: LookSlug) -> Self {
+        Self {
+            body: None,
+            look: Some(look),
+        }
+    }
+
+    pub fn matches(&self, look: &LookSlug, body: &BodyId) -> bool {
+        self.body.as_ref().is_none_or(|value| value == body)
+            && self.look.as_ref().is_none_or(|value| value == look)
+    }
+
+    /// Whether every pair matched by `other` is matched by this rule.
+    fn covers(&self, other: &ScopeRule) -> bool {
+        self.body
+            .as_ref()
+            .is_none_or(|body| other.body.as_ref() == Some(body))
+            && self
+                .look
+                .as_ref()
+                .is_none_or(|look| other.look.as_ref() == Some(look))
+    }
+
+    pub fn render(&self) -> String {
+        match (&self.body, &self.look) {
+            (Some(body), None) => format!("{} · all looks", render_body(body)),
+            (None, Some(look)) => format!("{} · any body", render_look(look)),
+            (Some(body), Some(look)) => {
+                format!("{} · {}", render_body(body), render_look(look))
+            }
+            (None, None) => "any body · any look".to_owned(),
+        }
+    }
+}
+
+/// An endorsement or grant scope: a list of rules. An image `(body, look)` is in scope
+/// if any rule matches it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Scope {
-    pub bodies: BTreeSet<BodyId>,
-    pub looks: BTreeSet<LookSlug>,
+    pub rules: Vec<ScopeRule>,
 }
 
 impl Scope {
-    pub fn new(bodies: BTreeSet<BodyId>, looks: BTreeSet<LookSlug>) -> Self {
-        Self { bodies, looks }
+    pub fn new(rules: impl IntoIterator<Item = ScopeRule>) -> Self {
+        let mut rules: Vec<ScopeRule> = rules.into_iter().collect();
+        rules.sort();
+        rules.dedup();
+        Self { rules }
+    }
+
+    /// Migration from the old OR form: `(b, *)` for each body, `(*, l)` for each Look.
+    pub fn from_legacy(
+        bodies: impl IntoIterator<Item = BodyId>,
+        looks: impl IntoIterator<Item = LookSlug>,
+    ) -> Self {
+        Self::new(
+            bodies
+                .into_iter()
+                .map(ScopeRule::body_all_looks)
+                .chain(looks.into_iter().map(ScopeRule::any_body)),
+        )
     }
 
     pub fn covers(&self, look: &LookSlug, body: &BodyId) -> bool {
-        self.looks.contains(look) || self.bodies.contains(body)
+        self.rules.iter().any(|rule| rule.matches(look, body))
     }
 
+    /// Body parameters are scoped by a rule that names the body.
     pub fn covers_body(&self, body: &BodyId) -> bool {
-        self.bodies.contains(body)
+        self.rules
+            .iter()
+            .any(|rule| rule.body.as_ref() == Some(body))
     }
 
-    fn restricts(&self) -> bool {
-        !(self.bodies.is_empty() && self.looks.is_empty())
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
     }
 
-    /// An empty scope restricts nothing, so it cannot authorize a scoped endorsement.
+    /// An empty issuer scope cannot authorize a scoped endorsement.
     pub fn contains(&self, other: &Scope) -> bool {
-        if !other.restricts() {
+        if other.is_empty() || self.is_empty() {
             return false;
         }
-        other.bodies.is_subset(&self.bodies) && other.looks.is_subset(&self.looks)
+        other
+            .rules
+            .iter()
+            .all(|rule| self.rules.iter().any(|mine| mine.covers(rule)))
+    }
+
+    pub fn render(&self) -> String {
+        self.rules
+            .iter()
+            .map(ScopeRule::render)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+fn render_body(body: &BodyId) -> String {
+    let (make, model) = body.as_str().split_once('/').unwrap_or((body.as_str(), ""));
+    if model.is_empty() {
+        title_case_hyphenated(make)
+    } else {
+        format!(
+            "{} {}",
+            title_case_hyphenated(make),
+            title_case_hyphenated(model)
+        )
+    }
+}
+
+fn render_look(look: &LookSlug) -> String {
+    look.as_str()
+        .split('-')
+        .map(title_case)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn title_case_hyphenated(value: &str) -> String {
+    value
+        .split('-')
+        .map(title_case)
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn title_case(value: &str) -> String {
+    let mut characters = value.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
     }
 }

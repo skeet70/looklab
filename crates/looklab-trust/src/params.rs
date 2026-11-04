@@ -49,16 +49,17 @@ pub struct TrustParams {
 
     /// γ, the new-tier group cap (docs/05 §6).
     pub new_group_cap: f64,
-    /// Per-effective-contributor cap on a Look version's weight.
-    pub look_contributor_cap: f64,
-    /// Per-effective-contributor cap on a body input transform's weight.
-    pub body_contributor_cap: f64,
+    /// Per-contributor cap floor on a Look version's weight.
+    pub look_contributor_cap_floor: f64,
+    /// Per-contributor cap floor on a body input transform's weight.
+    pub body_contributor_cap_floor: f64,
+    /// Numerator of the continuous per-contributor cap `max(floor, factor / n)`.
+    pub contributor_cap_factor: f64,
     /// `n` scale inside the diminishing-returns factor `1/sqrt(1 + n/scale)`.
     pub diminishing_scale: f64,
-    /// Minimum credentials in the pool before Look per-contributor caps apply. Counted
-    /// by credential so serial merging cannot lift a cap.
+    /// Effective contributors needed before the Look's provisional label clears.
     pub min_look_contributors: usize,
-    /// Minimum credentials in the pool before body per-contributor caps apply.
+    /// Effective contributors needed before the body's provisional label clears.
     pub min_body_contributors: usize,
 
     /// Root sunset: endorsed contributors and distinct bodies needed to re-derive
@@ -123,8 +124,9 @@ impl Default for TrustParams {
             base_gradient: 1.0,
             base_chart: 2.0,
             new_group_cap: 0.3,
-            look_contributor_cap: 0.05,
-            body_contributor_cap: 0.2,
+            look_contributor_cap_floor: 0.05,
+            body_contributor_cap_floor: 0.2,
+            contributor_cap_factor: 2.0,
             diminishing_scale: 20.0,
             min_look_contributors: 20,
             min_body_contributors: 5,

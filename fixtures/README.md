@@ -50,3 +50,14 @@ nix develop -c cargo test -p looklab-raw --target wasm32-unknown-unknown  # Node
 ```
 
 The wasm test embeds the committed RAF and DNG with `include_bytes!` and compares the FNV-1a-64 digest of the reduced f32 image against the same constants the native tests use. The Canon DNG test also checks that DNG `ForwardMatrix1`/`ForwardMatrix2` are exposed with their calibration illuminants. `.cargo/config.toml` selects `wasm-bindgen-test-runner`, which runs under Node.
+
+## Fuzzing
+
+`fuzz/fuzz_targets/raw_decode.rs` fuzzes the decoder with these fixtures as seeds; the committed corpus is 995,764 bytes.
+
+```sh
+cd fuzz
+nix develop ..#fuzz -c cargo fuzz run raw_decode -- -max_total_time=600 -rss_limit_mb=4096 -timeout=30
+```
+
+The harness records rawler panic locations and saves the triggering input; findings are triaged in `docs/upstream/rawler-panics.md`.

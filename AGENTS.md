@@ -31,7 +31,7 @@ For anyone (human or agent) implementing looklab. Read [README](README.md) and t
 ## Security and trust invariants
 - Trust is designed for **hobby scale** ([docs/05](docs/05-trust-and-integrity.md)): bound what can't be verified, and make rollback cheap.
 - Contribution kinds are client-claimed. Never let a client claim, reputation or elapsed time move a credential out of the `new` tier or past the new-tier group cap. Only human decisions (an admin grant or a seeder endorsement) change tier.
-- Serial merging may only **reduce** weight (caps, diminishing returns). It must never transfer tier or reputation between credentials.
+- Serial merging must never increase the weight of any image belonging to the merged credentials, and must never transfer tier or reputation between credentials. Other contributors' renormalized shares may rise.
 - Grants, endorsements, root admissions, moderation actions, re-anchors and reverts always write an audit-log row. The audit log is append-only: no UPDATE/DELETE in application code.
 - Every published artifact is listed by hash in its version manifest. Clients check hashes.
 - Changes to `fit` or `trust` must pass the red-team harness.

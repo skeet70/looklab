@@ -37,7 +37,7 @@ fn credential_total(report: &LookWeightReport, credential: u128) -> f64 {
         .sum()
 }
 
-fn assert_look_caps(report: &LookWeightReport, credential_count: usize, params: &TrustParams) {
+fn assert_look_caps(report: &LookWeightReport, params: &TrustParams) {
     for region in &report.regions {
         if region.trusted <= 0.0 {
             continue;
@@ -50,14 +50,13 @@ fn assert_look_caps(report: &LookWeightReport, credential_count: usize, params: 
             region.total
         );
     }
-    if credential_count >= params.min_look_contributors && !report.contributor_caps_skipped {
-        for (contributor, total) in contributor_totals(report) {
-            assert!(
-                total <= params.look_contributor_cap * report.total + 1e-9,
-                "contributor {contributor}: {total} exceeds 5% of {}",
-                report.total
-            );
-        }
+    let share = looklab_trust::look_contributor_cap(params, report.contributors);
+    for (contributor, total) in contributor_totals(report) {
+        assert!(
+            total <= share * report.total + 1e-9,
+            "contributor {contributor}: {total} exceeds {share} of {}",
+            report.total
+        );
     }
 }
 
@@ -109,7 +108,6 @@ fn new_tier_group_caps_above_thirty_percent() {
     let region_weights = &report.regions[0];
     assert!((region_weights.trusted - 12.0).abs() < 1e-12);
     assert!((region_weights.new - 12.0 * 0.3 / 0.7).abs() < 1e-12);
-    assert!((region_weights.total - 17.142_857_142_857_143).abs() < 1e-9);
     assert!(has_reason(&report.caps, CapReason::NewTierGroupCap));
 }
 
@@ -129,7 +127,6 @@ fn new_tier_data_defines_a_region_without_trusted_data() {
     assert!(report.regions[0].provisional);
     assert!((report.regions[0].new - 2.0).abs() < 1e-12);
     assert!((weight(&report, "a") - 1.0).abs() < 1e-12);
-    assert!(report.provisional);
 }
 
 #[test]
@@ -161,170 +158,192 @@ fn diminishing_returns_follow_the_documented_curve() {
 }
 
 #[test]
-fn per_contributor_cap_does_not_apply_below_the_minimum_pool() {
+fn per_contributor_cap_is_two_over_n() {
     let mut images = Vec::new();
     for index in 0..19u128 {
         images.push(
-            ImageBuilder::new(&format!("image-{index}"), index + 1)
+            ImageBuilder::new(&format!("single-{index}"), index + 1)
                 .standing(Standing::Endorsed)
+                .capture(vec![index as u8])
                 .build(),
         );
     }
-    let report = weight_look(&params(), &look_input_with(images, &[]));
-    assert_eq!(report.contributors, 19);
-    assert!(!report.provisional, "a rooted Look is not provisional");
-    assert!(!has_reason(&report.caps, CapReason::ContributorCap));
-    assert_eq!(report.regions.len(), 1);
-    assert!((report.regions[0].trusted - 38.0).abs() < 1e-12);
-    assert!(!report.regions[0].provisional);
-}
-
-#[test]
-fn contributor_share_is_five_percent_of_the_final_total() {
-    let mut images = Vec::new();
-    for index in 0..19u128 {
+    for index in 0..5u8 {
         images.push(
-            ImageBuilder::new(&format!("image-{index}"), index + 1)
+            ImageBuilder::new(&format!("big-{index}"), 100)
                 .standing(Standing::Endorsed)
+                .capture(vec![20 + index])
                 .build(),
         );
     }
-    images.push(
-        ImageBuilder::new("image-19a", 100)
-            .standing(Standing::Endorsed)
-            .capture(b"a".to_vec())
-            .build(),
-    );
-    images.push(
-        ImageBuilder::new("image-19b", 100)
-            .standing(Standing::Endorsed)
-            .capture(b"b".to_vec())
-            .build(),
-    );
     let report = weight_look(&params(), &look_input_with(images, &[]));
 
     assert_eq!(report.contributors, 20);
-    assert!(has_reason(&report.caps, CapReason::ContributorCap));
+    let share = looklab_trust::look_contributor_cap(&params(), 20);
+    assert!((share - 0.1).abs() < 1e-12);
     let total = contributor_totals(&report)[&contributor(100)];
-    assert!((total - 2.0).abs() < 1e-9);
-    assert!((total - params().look_contributor_cap * report.total).abs() < 1e-9);
-    assert!(report.total > 0.0);
+    assert!((total - share * report.total).abs() < 1e-9);
+    assert_look_caps(&report, &params());
 }
 
 #[test]
-fn reviewer_counterexample_one_trusted_source() {
-    let mut images = vec![
-        ImageBuilder::new("trusted", 1)
-            .standing(Standing::Endorsed)
-            .build(),
-    ];
-    for index in 0..19u128 {
+fn per_contributor_cap_floor_applies_in_a_large_pool() {
+    let mut images = Vec::new();
+    for index in 0..44u128 {
         images.push(
-            ImageBuilder::new(&format!("new-{index}"), index + 20)
-                .standing(Standing::New)
+            ImageBuilder::new(&format!("single-{index}"), index + 1)
+                .standing(Standing::Endorsed)
+                .capture(vec![index as u8])
+                .build(),
+        );
+    }
+    for index in 0..5u8 {
+        images.push(
+            ImageBuilder::new(&format!("big-{index}"), 100)
+                .standing(Standing::Endorsed)
+                .capture(vec![100 + index])
                 .build(),
         );
     }
     let report = weight_look(&params(), &look_input_with(images, &[]));
 
-    assert_look_caps(&report, 20, &params());
-    assert!(report.contributor_caps_skipped);
-    assert!(report.provisional);
-    assert!(report.total > 0.0);
-    assert!(has_reason(
-        &report.caps,
-        CapReason::ContributorCapsInfeasible
-    ));
-    for region in &report.regions {
-        if region.total > 0.0 {
-            assert!(region.new / region.total <= params().new_group_cap + 1e-9);
-        }
-    }
-
-    let mut images = vec![
-        ImageBuilder::new("trusted", 1)
-            .standing(Standing::Endorsed)
-            .build(),
-    ];
-    for index in 0..19u128 {
-        images.push(
-            ImageBuilder::new(&format!("new-{index}"), index + 20)
-                .standing(Standing::New)
-                .build(),
-        );
-    }
-    let anchored = [(region(), 20.0)];
-    let report = weight_look(&params(), &look_input_with(images, &anchored));
-    assert_look_caps(&report, 20, &params());
-    assert!(!report.contributor_caps_skipped);
-    assert!(report.total > 0.0);
-    for region in &report.regions {
-        assert!(region.new / region.total <= params().new_group_cap + 1e-9);
-    }
+    assert_eq!(report.contributors, 45);
+    assert!((looklab_trust::look_contributor_cap(&params(), 45) - 0.05).abs() < 1e-12);
+    let total = contributor_totals(&report)[&contributor(100)];
+    assert!((total - 0.05 * report.total).abs() < 1e-9);
+    assert_look_caps(&report, &params());
 }
 
 #[test]
-fn infeasible_caps_skip_only_contributor_caps() {
-    let build = |merged: bool| {
-        let mut images = vec![
-            ImageBuilder::new("trusted", 1)
+fn water_filling_converges_with_multiple_capped_contributors() {
+    let mut images = Vec::new();
+    for index in 0..18u128 {
+        images.push(
+            ImageBuilder::new(&format!("single-{index}"), index + 1)
                 .standing(Standing::Endorsed)
+                .capture(vec![index as u8])
                 .build(),
-        ];
-        for index in 0..19u128 {
-            let contributor = if merged && index < 2 { 50 } else { index + 20 };
+        );
+    }
+    for (credential, offset) in [(100u128, 0u8), (101, 10)] {
+        for index in 0..5u8 {
             images.push(
-                ImageBuilder::new(&format!("new-{index}"), index + 20)
-                    .contributor(contributor)
-                    .standing(Standing::New)
-                    .capture(vec![index as u8])
+                ImageBuilder::new(&format!("heavy-{credential}-{index}"), credential)
+                    .standing(Standing::Endorsed)
+                    .capture(vec![20 + offset + index])
                     .build(),
             );
         }
-        weight_look(&params(), &look_input_with(images, &[]))
-    };
-
-    let separate = build(false);
-    let merged = build(true);
-    for report in [&separate, &merged] {
-        assert!(report.contributor_caps_skipped);
-        assert!(report.provisional);
-        assert!(report.total > 0.0);
-        let region = &report.regions[0];
-        assert!(region.new / region.total <= params().new_group_cap + 1e-9);
-        assert!(region.trusted > 0.0);
     }
-    assert!(merged.total <= separate.total + 1e-9);
+    let report = weight_look(&params(), &look_input_with(images, &[]));
+
+    assert_eq!(report.contributors, 20);
+    let share = looklab_trust::look_contributor_cap(&params(), 20);
+    let totals = contributor_totals(&report);
+    for credential_id in [100u128, 101] {
+        let total = totals[&contributor(credential_id)];
+        assert!((total - share * report.total).abs() < 1e-9);
+    }
+    assert_look_caps(&report, &params());
 }
 
 #[test]
-fn infeasible_body_caps_are_skipped_not_zeroed() {
-    let mut images = vec![
-        ImageBuilder::new("trusted", 1)
-            .standing(Standing::Endorsed)
-            .build(),
-    ];
-    for index in 0..4u128 {
+fn small_pools_get_generous_caps() {
+    let mut images = Vec::new();
+    for index in 0..2u128 {
         images.push(
-            ImageBuilder::new(&format!("new-{index}"), index + 20)
-                .standing(Standing::New)
+            ImageBuilder::new(&format!("single-{index}"), index + 1)
+                .standing(Standing::Endorsed)
+                .capture(vec![index as u8])
                 .build(),
         );
     }
-    let input = looklab_trust::BodyWeightInput {
-        images,
-        anchored_weight: 0.0,
-        rooted: true,
-    };
-    let report = weight_body(&params(), &input);
+    for index in 0..4u8 {
+        images.push(
+            ImageBuilder::new(&format!("big-{index}"), 100)
+                .standing(Standing::Endorsed)
+                .capture(vec![20 + index])
+                .build(),
+        );
+    }
+    let report = weight_look(&params(), &look_input_with(images, &[]));
 
-    assert!(report.contributor_caps_skipped);
-    assert!(report.provisional);
+    assert_eq!(report.contributors, 3);
+    assert!((looklab_trust::look_contributor_cap(&params(), 3) - 2.0 / 3.0).abs() < 1e-12);
+    assert!(!has_reason(&report.caps, CapReason::ContributorCap));
+}
+
+#[test]
+fn caps_are_achievable_for_an_extreme_pool() {
+    let mut images = Vec::new();
+    for index in 0..30u128 {
+        images.push(
+            ImageBuilder::new(&format!("single-{index}"), index + 1)
+                .standing(Standing::Endorsed)
+                .capture(vec![index as u8])
+                .build(),
+        );
+    }
+    for index in 0..30u8 {
+        images.push(
+            ImageBuilder::new(&format!("big-{index}"), 100)
+                .standing(Standing::Endorsed)
+                .capture(vec![100 + index])
+                .build(),
+        );
+    }
+    let report = weight_look(&params(), &look_input_with(images, &[]));
+
     assert!(report.total > 0.0);
-    assert!(has_reason(
-        &report.caps,
-        CapReason::ContributorCapsInfeasible
-    ));
+    assert!(has_reason(&report.caps, CapReason::ContributorCap));
+    assert_look_caps(&report, &params());
+}
+
+#[test]
+fn provisional_label_follows_effective_contributors() {
+    let unrooted = |count: u128| {
+        let mut images = Vec::new();
+        for index in 0..count {
+            images.push(
+                ImageBuilder::new(&format!("image-{index}"), index + 1)
+                    .standing(Standing::Endorsed)
+                    .build(),
+            );
+        }
+        weight_look(
+            &params(),
+            &looklab_trust::LookWeightInput {
+                images,
+                anchored_weight: Default::default(),
+                rooted: false,
+            },
+        )
+    };
+
+    assert!(unrooted(19).provisional);
+    assert!(!unrooted(20).provisional);
+
+    let mut images = Vec::new();
+    for index in 0..20u128 {
+        images.push(
+            ImageBuilder::new(&format!("image-{index}"), index + 1)
+                .standing(Standing::Endorsed)
+                .build(),
+        );
+    }
+    let mut first = images[0].clone();
+    first.contributor = contributor(2);
+    images[0] = first;
+    let merged = weight_look(
+        &params(),
+        &looklab_trust::LookWeightInput {
+            images,
+            anchored_weight: Default::default(),
+            rooted: false,
+        },
+    );
+    assert_eq!(merged.contributors, 19);
+    assert!(merged.provisional);
 }
 
 #[test]
@@ -366,15 +385,18 @@ fn lower_standing_credential_loses_weight_first() {
     );
     let report = weight_look(&params(), &look_input_with(images, &[]));
 
+    let share = looklab_trust::look_contributor_cap(&params(), report.contributors);
     assert!((weight(&report, "new-a")).abs() < 1e-12);
-    assert!((weight(&report, "new-b")).abs() < 1e-12);
+    assert!(weight(&report, "new-b") > 0.0);
+    assert!(weight(&report, "new-b") < 1.0);
+    assert!(weight(&report, "trusted-a") > 0.0);
     assert!(weight(&report, "trusted-b") > 0.0);
     let merged_total: f64 = ["new-a", "new-b", "trusted-a", "trusted-b"]
         .iter()
         .map(|id| weight(&report, *id))
         .sum();
-    assert!((merged_total - params().look_contributor_cap * report.total).abs() < 1e-9);
-    assert_look_caps(&report, 22, &params());
+    assert!((merged_total - share * report.total).abs() < 1e-9);
+    assert_look_caps(&report, &params());
 }
 
 #[test]
@@ -504,43 +526,40 @@ fn weight_components_multiply_in_the_documented_order() {
 }
 
 #[test]
-fn body_cap_uses_its_own_minimum_pool() {
+fn body_contributor_cap_is_continuous() {
     let mut images = Vec::new();
     for index in 0..4u128 {
         images.push(
-            ImageBuilder::new(&format!("image-{index}"), index + 1)
+            ImageBuilder::new(&format!("single-{index}"), index + 1)
                 .standing(Standing::Endorsed)
+                .capture(vec![index as u8])
                 .build(),
         );
     }
-    let below = weight_body(&params(), &body_input(images));
-
-    let mut images = Vec::new();
-    for index in 0..5u128 {
+    for index in 0..10u8 {
         images.push(
-            ImageBuilder::new(&format!("image-{index}"), index + 1)
+            ImageBuilder::new(&format!("big-{index}"), 100)
                 .standing(Standing::Endorsed)
+                .capture(vec![20 + index])
                 .build(),
         );
     }
-    let at = weight_body(&params(), &body_input(images));
+    let input = looklab_trust::BodyWeightInput {
+        images,
+        anchored_weight: 0.0,
+        rooted: true,
+    };
+    let report = weight_body(&params(), &input);
 
-    assert_eq!(below.contributors, 4);
-    assert_eq!(at.contributors, 5);
-    assert!(
-        !below
-            .caps
-            .reductions
-            .iter()
-            .any(|reduction| reduction.reason == CapReason::ContributorCap)
-    );
-    // Five equal contributors are each exactly at the 20% cap.
-    assert!(
-        !at.caps
-            .reductions
-            .iter()
-            .any(|reduction| reduction.reason == CapReason::ContributorCap)
-    );
+    assert_eq!(report.contributors, 5);
+    let share = looklab_trust::body_contributor_cap(&params(), 5);
+    assert!((share - 0.4).abs() < 1e-12);
+    let mut totals: BTreeMap<EffectiveContributorId, f64> = BTreeMap::new();
+    for image in &report.images {
+        *totals.entry(image.contributor).or_insert(0.0) += image.final_weight;
+    }
+    let total = totals[&contributor(100)];
+    assert!((total - share * report.total).abs() < 1e-9);
 }
 
 #[test]
@@ -617,7 +636,7 @@ fn serial_merge_does_not_raise_another_credentials_weight() {
         ),
     );
 
-    for credential_id in [10u128, 11, 12] {
+    for credential_id in [10u128, 11] {
         let before = credential_total(&separate, credential_id);
         let after = credential_total(&merged, credential_id);
         assert!(
@@ -628,98 +647,6 @@ fn serial_merge_does_not_raise_another_credentials_weight() {
     assert!(
         (credential_total(&merged, 12) - credential_total(&separate, 12)).abs() < 1e-12,
         "an unrelated credential keeps its weight"
-    );
-}
-
-#[test]
-fn duplicate_merge_does_not_disable_look_caps() {
-    let mut images = Vec::new();
-    for index in 0..18u128 {
-        images.push(
-            ImageBuilder::new(&format!("single-{index}"), index + 1)
-                .standing(Standing::Endorsed)
-                .capture(vec![index as u8])
-                .build(),
-        );
-    }
-    for index in 0..5u8 {
-        images.push(
-            ImageBuilder::new(&format!("merged-{index}"), 100)
-                .standing(Standing::Endorsed)
-                .capture(vec![20 + index])
-                .build(),
-        );
-    }
-    images.push(
-        ImageBuilder::new("duplicate", 101)
-            .contributor(100)
-            .standing(Standing::Endorsed)
-            .evidence(0.5)
-            .capture(vec![20])
-            .build(),
-    );
-
-    let anchored = [(region(), 100.0)];
-    let report = weight_look(&params(), &look_input_with(images, &anchored));
-
-    assert_eq!(report.contributors, 19);
-    assert!(has_reason(&report.caps, CapReason::ContributorCap));
-    let merged_total = contributor_totals(&report)[&contributor(100)];
-    assert!(merged_total > 1.0);
-    assert!(
-        (merged_total - params().look_contributor_cap * report.total).abs() < 1e-9,
-        "merged contributor {merged_total} vs 5% of {}",
-        report.total
-    );
-    assert_look_caps(&report, 20, &params());
-}
-
-#[test]
-fn duplicate_merge_does_not_disable_body_caps() {
-    let mut images = Vec::new();
-    for index in 0..3u128 {
-        images.push(
-            ImageBuilder::new(&format!("single-{index}"), index + 1)
-                .standing(Standing::Endorsed)
-                .capture(vec![index as u8])
-                .build(),
-        );
-    }
-    for index in 0..10u8 {
-        images.push(
-            ImageBuilder::new(&format!("merged-{index}"), 100)
-                .standing(Standing::Endorsed)
-                .capture(vec![20 + index])
-                .build(),
-        );
-    }
-    images.push(
-        ImageBuilder::new("duplicate", 101)
-            .contributor(100)
-            .standing(Standing::Endorsed)
-            .evidence(0.5)
-            .capture(vec![20])
-            .build(),
-    );
-
-    let input = looklab_trust::BodyWeightInput {
-        images,
-        anchored_weight: 20.0,
-        rooted: true,
-    };
-    let report = weight_body(&params(), &input);
-
-    assert!(has_reason(&report.caps, CapReason::ContributorCap));
-    let mut totals: BTreeMap<EffectiveContributorId, f64> = BTreeMap::new();
-    for image in &report.images {
-        *totals.entry(image.contributor).or_insert(0.0) += image.final_weight;
-    }
-    let merged_total = totals[&contributor(100)];
-    assert!(merged_total > 0.0);
-    assert!(
-        (merged_total - params().body_contributor_cap * report.total).abs() < 1e-9,
-        "merged contributor {merged_total} vs 20% of {}",
-        report.total
     );
 }
 

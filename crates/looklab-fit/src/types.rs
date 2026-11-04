@@ -64,6 +64,8 @@ pub struct FitOptions {
     /// Normal-equation rows per sweep; caps the quadrature cost, not the likelihood.
     pub hessian_samples: usize,
     pub max_sweeps: usize,
+    /// Total sample evaluations allowed for the staged solve.
+    pub sweep_budget: f64,
     pub sigma_prior: (f64, f64),
     pub clip_prior: (f64, f64),
     pub exposure_prior_sd: f64,
@@ -84,6 +86,7 @@ impl Default for FitOptions {
             max_samples_per_image: 10_000,
             hessian_samples: 8_000,
             max_sweeps: 24,
+            sweep_budget: 3_000_000.0,
             sigma_prior: (4.0, 4.5),
             clip_prior: (0.03, 0.02),
             exposure_prior_sd: 0.3,

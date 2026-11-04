@@ -20,9 +20,9 @@ pub mod synth;
 pub use looklab_color::{Mat3, RgbSpace, Xyz};
 pub use looklab_model::{Look, LookInput, Probe, ProbeId, ProbeSet};
 pub use types::{
-    Density, Diagnostics, ExposureModeId, ExposureOffset, FitError, FitImage, FitOptions,
-    FitResult, ImageFitStats, ImageNuisances, OutlierReason, ProbeEstimate, ProbeUncertainty,
-    Realization, Result, StageLambdas, Verdict,
+    ContributorId, Density, Diagnostics, ExposureModeId, ExposureOffset, FitError, FitImage,
+    FitOptions, FitResult, ImageFitStats, ImageNuisances, OutlierReason, ProbeEstimate,
+    ProbeUncertainty, Realization, Result, StageLambdas, Verdict,
 };
 
 /// Fit one body's single Look from its images.

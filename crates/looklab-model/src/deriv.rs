@@ -264,11 +264,21 @@ impl ReferenceCam16 {
     }
 
     pub(crate) fn neutral_y_for_j_prime(&self, target: f64) -> Option<f64> {
-        let j = target / (1.0 + 100.0 * 0.007 - 0.007 * target);
+        self.neutral_y_and_dy_for_j_prime(target).map(|(y, _)| y)
+    }
+
+    /// Neutral `Y` for `target = J'`, and `dY/dJ'` of the closed form.
+    pub(crate) fn neutral_y_and_dy_for_j_prime(&self, target: f64) -> Option<(f64, f64)> {
+        let denominator = 1.0 + 100.0 * 0.007 - 0.007 * target;
+        if !denominator.is_finite() || denominator <= 0.0 {
+            return None;
+        }
+        let j = target / denominator;
         if !(j > 0.0 && j.is_finite()) {
             return None;
         }
-        let ratio = libm::pow(j / 100.0, 1.0 / self.j_exp);
+        let base = j / 100.0;
+        let ratio = libm::pow(base, 1.0 / self.j_exp);
         let achromatic = ratio * self.a_w;
         let rgb_a = (achromatic / self.n_bb + 0.305) / 3.05;
         let x = rgb_a - 0.1;
@@ -276,9 +286,23 @@ impl ReferenceCam16 {
             return None;
         }
         let f = 27.13 * x / (400.0 - x);
+        if !(f > 0.0 && f.is_finite()) {
+            return None;
+        }
         let u = libm::pow(f, 1.0 / 0.42);
         let y = u / self.f_l;
-        (y > 0.0 && y.is_finite()).then_some(y)
+        if !(y > 0.0 && y.is_finite()) {
+            return None;
+        }
+        let d_j_d_j_prime = 1.7 / (denominator * denominator);
+        let d_ratio_d_j = ratio / (self.j_exp * j);
+        let d_achromatic_d_j = self.a_w * d_ratio_d_j;
+        let d_rgb_a_d_achromatic = 1.0 / (3.05 * self.n_bb);
+        let d_f_d_x = 27.13 * 400.0 / ((400.0 - x) * (400.0 - x));
+        let d_u_d_f = u / (0.42 * f);
+        let d_y_d_j_prime =
+            d_j_d_j_prime * d_achromatic_d_j * d_rgb_a_d_achromatic * d_f_d_x * d_u_d_f / self.f_l;
+        Some((y, d_y_d_j_prime))
     }
 
     /// Neutral `J'` as the stimulus luminance goes to infinity.
@@ -422,6 +446,16 @@ mod tests {
             );
             let inverted = reference.neutral_y_for_j_prime(j_prime).expect("inverse");
             assert!((inverted - y).abs() / y < 1e-9, "y {y} inverted {inverted}");
+            let (inverted, inverted_derivative) = reference
+                .neutral_y_and_dy_for_j_prime(j_prime)
+                .expect("inverse with derivative");
+            assert!((inverted - y).abs() / y < 1e-9);
+            let expected = 1.0 / derivative;
+            assert!(
+                (inverted_derivative - expected).abs() / expected.abs() < 1e-6,
+                "y {y}: {} vs {expected}",
+                inverted_derivative
+            );
         }
     }
 

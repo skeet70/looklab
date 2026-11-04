@@ -18,9 +18,9 @@ fn look(value: &str) -> LookSlug {
 }
 
 fn scope(bodies: &[&str], looks: &[&str]) -> Scope {
-    Scope::new(
-        bodies.iter().map(|value| body(value)).collect(),
-        looks.iter().map(|value| look(value)).collect(),
+    Scope::from_legacy(
+        bodies.iter().map(|value| body(value)),
+        looks.iter().map(|value| look(value)),
     )
 }
 

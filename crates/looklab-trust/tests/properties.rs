@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use common::*;
 use looklab_meta::{RawSerial, SerialHmacKey};
@@ -92,13 +92,12 @@ fn anchored_regions(value: f64) -> Vec<(Region, f64)> {
     ]
 }
 
-fn total_for(report: &looklab_trust::LookWeightReport, credential_id: u128) -> f64 {
+fn weight_by_image(report: &looklab_trust::LookWeightReport) -> BTreeMap<String, f64> {
     report
         .images
         .iter()
-        .filter(|image| image.credential == CredentialId::from_u128(credential_id))
-        .map(|image| image.total)
-        .sum()
+        .map(|image| (image.id.as_str().to_owned(), image.total))
+        .collect()
 }
 
 proptest! {
@@ -136,14 +135,18 @@ proptest! {
         let before = weight_look(&params, &look_input_with(separate, &anchored));
         let after = weight_look(&params, &look_input_with(merged, &anchored));
 
-        let credentials: BTreeSet<u128> =
-            specs.iter().map(|spec| spec.credential).collect();
-        for credential in &credentials {
-            let separate_weight = total_for(&before, *credential);
-            let merged_weight = total_for(&after, *credential);
+        let before_weights = weight_by_image(&before);
+        let after_weights = weight_by_image(&after);
+        for (index, spec) in specs.iter().enumerate() {
+            if !merge_group(spec.credential) {
+                continue;
+            }
+            let id = format!("image-{index}");
+            let separate_weight = before_weights.get(&id).copied().unwrap_or(0.0);
+            let merged_weight = after_weights.get(&id).copied().unwrap_or(0.0);
             prop_assert!(
                 merged_weight <= separate_weight + 1e-9,
-                "credential {credential}: merged {merged_weight} > separate {separate_weight}"
+                "{id}: merged {merged_weight} > separate {separate_weight}"
             );
         }
 
@@ -157,15 +160,15 @@ proptest! {
             }
             prop_assert!(region.new <= params.new_group_cap * region.total + 1e-9);
         }
-        if credentials.len() >= params.min_look_contributors && !after.contributor_caps_skipped {
-            for (contributor, total) in contributor_totals {
-                prop_assert!(
-                    total <= params.look_contributor_cap * after.total + 1e-9,
-                    "contributor {contributor}: {total} > 5% of {}",
-                    after.total
-                );
-            }
+        let share = looklab_trust::look_contributor_cap(&params, after.contributors);
+        for (contributor, total) in contributor_totals {
+            prop_assert!(
+                total <= share * after.total + 1e-9,
+                "contributor {contributor}: {total} > {share} of {}",
+                after.total
+            );
         }
+        prop_assert!(!(before.provisional && !after.provisional));
     }
 
     #[test]

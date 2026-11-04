@@ -114,7 +114,7 @@ fn clip_derivative(x: f64, k: f64) -> f64 {
 fn clip_k_derivative(x: f64, k: f64) -> f64 {
     if x > 1.0 - k {
         let t = libm::tanh((x - (1.0 - k)) / k);
-        let du = -(x - 1.0 + 2.0 * k) / (k * k);
+        let du = (1.0 - x) / (k * k);
         -1.0 + t + k * (1.0 - t * t) * du
     } else if x < k {
         let t = libm::tanh((k - x) / k);
@@ -282,6 +282,7 @@ pub(crate) fn evaluate_sample(
     columns: &ColumnMap,
     rgb: [f64; 3],
     clip_k: f64,
+    clip_slope: f64,
     beta_slope: &[f64; TONE_COEFS],
     jac: &mut Jac,
 ) -> EvalOutput {
@@ -438,7 +439,7 @@ pub(crate) fn evaluate_sample(
 
     jac.apply(&clip_jacobian);
     if let Some(index) = columns.clip {
-        jac.push(index, dk);
+        jac.push(index, scale(dk, clip_slope));
     }
 
     EvalOutput {
@@ -559,13 +560,27 @@ fn d_out_d_xyz(
 }
 
 /// Pre-clip `J'a'b'` of one probe and `dJ'a'b'/dθ`, for the sandwich estimator.
-pub(crate) fn evaluate_probe(look: &Look, layout: &Layout, xyz: Xyz, jac: &mut Jac) -> Ucs {
+pub(crate) fn evaluate_probe(
+    look: &Look,
+    layout: &Layout,
+    xyz: Xyz,
+    beta_slope: &[f64; TONE_COEFS],
+    jac: &mut Jac,
+) -> Ucs {
     jac.clear();
     let input = LookInput::new(xyz);
     let values = look.layer_values(&input);
     let pre = look.eval_from_layer_values(&input, &values);
     let d_layer = look.d_output_d_layer_values(&input, &values);
-    push_look_columns(jac, look, layout, &input, &values, &d_layer, None);
+    push_look_columns(
+        jac,
+        look,
+        layout,
+        &input,
+        &values,
+        &d_layer,
+        Some(beta_slope),
+    );
     pre
 }
 
@@ -573,49 +588,54 @@ pub(crate) fn evaluate_probe(look: &Look, layout: &Layout, xyz: Xyz, jac: &mut J
 mod tests {
     use super::*;
     use crate::layout::{Params, softplus_slope};
-    use crate::types::ContributorId;
     use looklab_color::RgbSpace;
 
-    fn setup() -> (Layout, Params) {
-        let layout = Layout::new(2, 0, 1);
-        let params = Params::initial(layout.clone(), 1);
-        let _ = ContributorId(0);
-        (layout, params)
-    }
-
-    fn prediction(params: &Params, image: &ImageCtx, rgb: [f64; 3], columns: &ColumnMap) -> Ucs {
-        let look = params.look();
+    fn context(params: &Params, transform: Mat3, space: RgbSpace) -> ImageCtx {
         let nuisance = params.image(0);
-        let sized = ImageCtx {
-            transform: image.transform,
-            space: image.space,
+        ImageCtx {
+            transform,
+            space,
             exposure: nuisance[0],
             wb_r: libm::exp(nuisance[1]),
             wb_b: libm::exp(nuisance[2]),
-        };
-        let mut slope = [0.0; TONE_COEFS];
-        for k in 0..TONE_COEFS {
-            slope[k] = softplus_slope(params.theta[params.layout.tone_beta.start + k]);
         }
+    }
+
+    fn slopes(params: &Params) -> [f64; TONE_COEFS] {
+        let mut slope = [0.0; TONE_COEFS];
+        for (k, value) in slope.iter_mut().enumerate() {
+            *value = softplus_slope(params.theta[params.layout.tone_beta.start + k]);
+        }
+        slope
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prediction(
+        params: &Params,
+        transform: Mat3,
+        space: RgbSpace,
+        rgb: [f64; 3],
+        columns: &ColumnMap,
+    ) -> Ucs {
         let mut jac = Jac::default();
         evaluate_sample(
-            &look,
+            &params.look(),
             &params.layout,
-            &sized,
+            &context(params, transform, space),
             columns,
             rgb,
             params.clip_k(),
-            &slope,
+            params.clip_slope(),
+            &slopes(params),
             &mut jac,
         )
         .prediction
     }
 
-    // Known gap: the a'/b' tone column is up to ~30% off on this neutral sample; see the fit report.
     #[test]
-    #[ignore = "analytic tone column for a'/b' differs from finite differences by up to 30%"]
-    fn analysis_columns_match_central_differences() {
-        let (layout, mut params) = setup();
+    fn analytic_columns_match_central_differences() {
+        let layout = Layout::new(2, 0, 1);
+        let mut params = Params::initial(layout.clone(), 1);
         let mut state = 0x1234_5678_9abc_def0_u64;
         let mut next = || {
             state ^= state << 13;
@@ -633,14 +653,6 @@ mod tests {
             params.theta[index] += 0.01 * (next() - 0.5);
         }
         params.theta[layout.clip] = crate::layout::zeta_from_clip(0.05);
-        let image = ImageCtx {
-            transform: Mat3::IDENTITY,
-            space: RgbSpace::Srgb,
-            exposure: 0.1,
-            wb_r: 1.01,
-            wb_b: 0.99,
-        };
-        let rgb = [0.35, 0.35, 0.35];
         let columns = ColumnMap {
             image: Some(layout.image(0).start),
             mode: None,
@@ -648,53 +660,62 @@ mod tests {
             wb_b: Some(layout.image(0).start + 2),
             clip: Some(layout.clip),
         };
-        let look = params.look();
-        let mut slope = [0.0; TONE_COEFS];
-        for k in 0..TONE_COEFS {
-            slope[k] = softplus_slope(params.theta[layout.tone_beta.start + k]);
-        }
-        let mut jac = Jac::default();
-        let _ = evaluate_sample(
-            &look,
-            &layout,
-            &image,
-            &columns,
-            rgb,
-            params.clip_k(),
-            &slope,
-            &mut jac,
-        );
-        let analytic: Vec<(u32, [f64; 3])> = jac
-            .cols
-            .iter()
-            .copied()
-            .zip(jac.derivs.iter().copied())
-            .collect();
-        assert!(!analytic.is_empty());
-        for (index, derivative) in analytic {
-            let index = index as usize;
-            let step = 1e-5 * params.theta[index].abs().max(1.0);
-            let mut plus = params.clone();
-            let mut minus = params.clone();
-            plus.theta[index] += step;
-            minus.theta[index] -= step;
-            let a = prediction(&plus, &image, rgb, &columns);
-            let b = prediction(&minus, &image, rgb, &columns);
-            let numerical = [
-                (a.j - b.j) / (2.0 * step),
-                (a.a - b.a) / (2.0 * step),
-                (a.b - b.b) / (2.0 * step),
-            ];
-            for channel in 0..3 {
-                let scale = numerical[channel].abs().max(1e-3);
-                assert!(
-                    // 2% accommodates the first-order clip linearization on this deliberately clipped sample.
-                    (derivative[channel] - numerical[channel]).abs() / scale < 2e-2,
-                    "index {index} channel {channel}: {} vs {}",
-                    derivative[channel],
-                    numerical[channel]
-                );
+        let white = Xyz::new(0.950_455_927_051_671_6, 1.0, 1.089_057_750_759_878_4);
+        let cases = [
+            (white.scale(0.18).to_array(), Mat3::IDENTITY),
+            ([0.2, 0.1, 0.6], Mat3::IDENTITY),
+            ([0.9, 0.9, 0.9], Mat3::IDENTITY),
+            ([0.02, 0.02, 0.02], Mat3::IDENTITY),
+        ];
+        let mut checked = 0usize;
+        for (rgb, transform) in cases {
+            let mut jac = Jac::default();
+            let _ = evaluate_sample(
+                &params.look(),
+                &layout,
+                &context(&params, transform, RgbSpace::Srgb),
+                &columns,
+                rgb,
+                params.clip_k(),
+                params.clip_slope(),
+                &slopes(&params),
+                &mut jac,
+            );
+            let analytic: Vec<(usize, [f64; 3])> = jac
+                .cols
+                .iter()
+                .map(|index| *index as usize)
+                .zip(jac.derivs.iter().copied())
+                .collect();
+            assert!(!analytic.is_empty());
+            for (index, derivative) in analytic {
+                let step = 1e-6 * params.theta[index].abs().max(1.0);
+                let mut plus = params.clone();
+                let mut minus = params.clone();
+                plus.theta[index] += step;
+                minus.theta[index] -= step;
+                let a = prediction(&plus, transform, RgbSpace::Srgb, rgb, &columns);
+                let b = prediction(&minus, transform, RgbSpace::Srgb, rgb, &columns);
+                let numerical = [
+                    (a.j - b.j) / (2.0 * step),
+                    (a.a - b.a) / (2.0 * step),
+                    (a.b - b.b) / (2.0 * step),
+                ];
+                for channel in 0..3 {
+                    let scale = numerical[channel]
+                        .abs()
+                        .max(derivative[channel].abs())
+                        .max(1e-3);
+                    assert!(
+                        (derivative[channel] - numerical[channel]).abs() / scale < 2e-3,
+                        "rgb {rgb:?} index {index} channel {channel}: {} vs {}",
+                        derivative[channel],
+                        numerical[channel]
+                    );
+                    checked += 1;
+                }
             }
         }
+        assert!(checked > 500, "only {checked} derivatives checked");
     }
 }
