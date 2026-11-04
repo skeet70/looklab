@@ -12,7 +12,7 @@ use looklab_match::{
     optimize, settings_card, verify_once,
 };
 use looklab_model::ProbeSetVersion;
-use looklab_model::realization::{ControlResponseModel, decode_crm};
+use looklab_model::realization::{ControlResponseModel, Settings, decode_crm, encode_crm};
 use looklab_schema::ControlSchema;
 
 use crate::body_transform::TransformFile;
@@ -34,12 +34,15 @@ pub struct MatchArgs {
     pub emphasis: String,
     #[arg(long, default_value_t = 1)]
     pub epoch: u32,
-    /// Base realization Look for the sim; defaults to the target Look.
+    /// Base realization Look for the sim. Required unless --synthetic.
     #[arg(long)]
     pub base_look: Option<PathBuf>,
-    /// Body input transform YAML; identity when absent.
+    /// Body input transform YAML. Required unless --synthetic.
     #[arg(long)]
     pub transform: Option<PathBuf>,
+    /// Use synthetic defaults: the target Look as base and the identity transform.
+    #[arg(long)]
+    pub synthetic: bool,
     /// Control-response covariance JSON for the predicted-variance term.
     #[arg(long)]
     pub covariance: Option<PathBuf>,
@@ -77,13 +80,31 @@ pub struct VerifyArgs {
     pub transform: Option<PathBuf>,
     #[arg(long)]
     pub covariance: Option<PathBuf>,
-    #[arg(long, default_value_t = 0x5eed_1234)]
-    pub seed: u64,
+    /// Allow synthetic defaults: the target Look as base and the identity transform.
+    #[arg(long)]
+    pub synthetic: bool,
+    /// Updated local CRM; defaults beside the input permalink.
+    #[arg(long)]
+    pub out_crm: Option<PathBuf>,
+    /// Updated permalink; defaults beside the input permalink.
+    #[arg(long)]
+    pub out_permalink: Option<PathBuf>,
+    /// Replay information for the next iteration; defaults beside the input permalink.
+    #[arg(long)]
+    pub out_result: Option<PathBuf>,
 }
 
 pub fn run_match(args: &MatchArgs) -> Result<()> {
     let emphasis = Emphasis::parse(&args.emphasis)
         .ok_or_else(|| anyhow::anyhow!("unknown emphasis {:?}", args.emphasis))?;
+    if !args.synthetic {
+        if args.base_look.is_none() {
+            bail!("--base-look is required unless --synthetic is given");
+        }
+        if args.transform.is_none() {
+            bail!("--transform is required unless --synthetic is given");
+        }
+    }
     let document = util::load_document(&args.look)?;
     let schema = load_schema(&args.body)?;
     let crm = load_crm(&args.crm)?;
@@ -189,6 +210,7 @@ pub fn run_match(args: &MatchArgs) -> Result<()> {
         probe_set: document.file.probe_set,
         optimizer: looklab_match::OPTIMIZER_VERSION.to_string(),
         emphasis,
+        seed: args.seed,
         sources: PermalinkSources {
             target_look: Some(relative_source(&args.look, base_dir)),
             base_look: args
@@ -221,8 +243,26 @@ pub fn run_match(args: &MatchArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct Replay<'a> {
+    permalink: &'a str,
+    seed: u64,
+    sim: String,
+    settings: &'a Settings,
+    predicted_median_delta_e: f64,
+    predicted_p95_delta_e: f64,
+    first_measured_median: f64,
+}
+
 pub fn run_verify(args: &VerifyArgs) -> Result<()> {
     let (permalink, permalink_path) = resolve_permalink(&args.permalink)?;
+    if permalink.optimizer != looklab_match::OPTIMIZER_VERSION {
+        bail!(
+            "permalink optimizer {:?} is not supported by {}",
+            permalink.optimizer,
+            looklab_match::OPTIMIZER_VERSION
+        );
+    }
     let emphasis = permalink.emphasis;
     let look_path = resolve_source(
         &permalink_path,
@@ -257,17 +297,25 @@ pub fn run_verify(args: &VerifyArgs) -> Result<()> {
         permalink.sources.covariance.as_deref(),
         args.covariance.clone(),
     );
+    if !args.synthetic {
+        if base_path.is_none() {
+            bail!("--base-look is required unless --synthetic is given");
+        }
+        if transform_path.is_none() {
+            bail!("--transform is required unless --synthetic is given");
+        }
+    }
 
     let document = util::load_document(&look_path)?;
     let schema = load_schema(&body_path)?;
     let crm = load_crm(&crm_path)?;
-    let base_document = match base_path {
-        Some(path) => util::load_document(&path)?,
+    let base_document = match &base_path {
+        Some(path) => util::load_document(path)?,
         None => document.clone(),
     };
-    let (transform, transform_version) = match transform_path {
+    let (transform, transform_version) = match &transform_path {
         Some(path) => {
-            let file = TransformFile::load(&path)?;
+            let file = TransformFile::load(path)?;
             (body_transform(&file)?, file.version)
         }
         None => (Mat3::IDENTITY, permalink.input_transform_version),
@@ -278,8 +326,8 @@ pub fn run_verify(args: &VerifyArgs) -> Result<()> {
             permalink.input_transform_version
         );
     }
-    let covariance = match covariance_path {
-        Some(path) => Some(load_covariance(&path)?),
+    let covariance = match &covariance_path {
+        Some(path) => Some(load_covariance(path)?),
         None => None,
     };
     check_identity(
@@ -296,6 +344,22 @@ pub fn run_verify(args: &VerifyArgs) -> Result<()> {
         &permalink.base_version,
         "base Look",
     )?;
+    if document.file.probe_set != permalink.probe_set {
+        bail!("probe set does not match the permalink");
+    }
+    let epoch_map_version = document
+        .file
+        .provenance
+        .bodies
+        .first()
+        .map(|body| body.epoch_map_version)
+        .unwrap_or(0);
+    if epoch_map_version != permalink.epoch_map_version {
+        bail!(
+            "epoch map version {epoch_map_version} does not match the permalink {}",
+            permalink.epoch_map_version
+        );
+    }
     if crm.body.to_string() != permalink.body
         || crm.epoch != permalink.epoch
         || crm.base_sim.to_string() != permalink.sim
@@ -331,7 +395,7 @@ pub fn run_verify(args: &VerifyArgs) -> Result<()> {
         observed.push(ObservedRender { samples });
     }
     let options = MatchOptions {
-        seed: args.seed,
+        seed: permalink.seed,
         ..MatchOptions::default()
     };
     let request = VerifyRequest {
@@ -344,6 +408,57 @@ pub fn run_verify(args: &VerifyArgs) -> Result<()> {
         truth: None,
     };
     let outcome = verify_once(&request, &ScaleFitter)?;
+    let mut updated = outcome.updated.clone();
+    updated.crm.version = updated.crm.version.saturating_add(1);
+    let card = settings_card(&target, &plan, &updated, &outcome.second)?;
+
+    let crm_out = args
+        .out_crm
+        .clone()
+        .unwrap_or_else(|| sibling(&permalink_path, "updated.crm.json"));
+    let permalink_out = args
+        .out_permalink
+        .clone()
+        .unwrap_or_else(|| sibling(&permalink_path, "updated.permalink"));
+    let result_out = args
+        .out_result
+        .clone()
+        .unwrap_or_else(|| sibling(&permalink_path, "updated.result.json"));
+    let base_dir = permalink_out
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let crm_bytes = encode_crm(&updated.crm)?;
+    crate::write(&crm_out, &crm_bytes)?;
+    let mut next = permalink.clone();
+    next.crm_version = updated.crm.version;
+    next.sources.target_look = Some(relative_source(&look_path, base_dir));
+    next.sources.base_look = Some(relative_source(
+        base_path.as_deref().unwrap_or(&look_path),
+        base_dir,
+    ));
+    next.sources.body = Some(relative_source(&body_path, base_dir));
+    next.sources.crm = Some(relative_source(&crm_out, base_dir));
+    next.sources.transform = transform_path
+        .as_ref()
+        .map(|path| relative_source(path, base_dir));
+    next.sources.covariance = covariance_path
+        .as_ref()
+        .map(|path| relative_source(path, base_dir));
+    let canonical = next.canonical();
+    crate::write(&permalink_out, canonical.as_bytes())?;
+    let replay = Replay {
+        permalink: &canonical,
+        seed: next.seed,
+        sim: outcome.second.sim.to_string(),
+        settings: &outcome.second.settings,
+        predicted_median_delta_e: outcome.second.median_delta_e,
+        predicted_p95_delta_e: outcome.second.p95_delta_e,
+        first_measured_median: outcome.first_measured.median,
+    };
+    let replay_bytes = serde_json::to_vec_pretty(&replay)?;
+    crate::write(&result_out, &replay_bytes)?;
+
     println!(
         "verify: first suggestion {}, measured median ΔE {:.2} on {} observed render(s)",
         outcome.first.sim,
@@ -357,14 +472,28 @@ pub fn run_verify(args: &VerifyArgs) -> Result<()> {
     if let Some(reduction) = outcome.reduction {
         println!("  measured reduction {:.0}%", reduction * 100.0);
     } else {
-        println!("  re-render at the second suggestion to measure the reduction");
+        println!("  re-render at the second settings to measure the reduction");
     }
+    println!("second settings:");
+    print!("{}", card.render_text());
+    println!("  updated CRM version {}", updated.version());
+    println!("wrote {}", crm_out.display());
+    println!("wrote {}", permalink_out.display());
+    println!("wrote {}", result_out.display());
     println!(
-        "  updated CRM version {}; permalink {}",
-        outcome.updated.version(),
-        permalink.optimizer
+        "  re-render at the second settings, then run verify --permalink {}",
+        permalink_out.display()
     );
     Ok(())
+}
+
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("match");
+    path.with_file_name(format!("{name}.{suffix}"))
 }
 
 fn load_schema(path: &Path) -> Result<ControlSchema> {

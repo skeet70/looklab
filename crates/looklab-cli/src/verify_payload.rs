@@ -9,16 +9,21 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use looklab_meta::{ParsedMetadata, RawSerial};
 use looklab_prep::{LocalImageKey, PrepParams, RawFormat, SeedFile};
 use looklab_prep_module::{
     BuildManifestRequest, BuildManifestResponse, Function, ManifestImageInput, ModuleError,
     PrepareRequest, PrepareResponse, PriorTransformSpec, Response, VersionResponse,
 };
+use looklab_schema::{Control, ControlType, Epoch, NativeSim};
+use looklab_server::body_schema::{Bodies, resolve_epoch, validate_settings};
 use looklab_upload::{
-    BatchManifest, BlobKind, Envelope, EnvelopeParts, ExpectedAssertion, Limits, ManifestImage,
-    ManifestMetadata, PowParams, RawSerial as UploadSerial, SignatureAlgorithm, StructuralVerdict,
+    BatchManifest, BlobKind, BodyId, ContributionKind, ControlEntry, ControlKey, ControlSettings,
+    DynamicRangeSetting, EffectStrength, Envelope, EnvelopeParts, ExpectedAssertion,
+    FirmwareVersionString, GrainRoughness, Intent, Limits, LookSettings, LookSlug, ManifestImage,
+    ManifestMetadata, NoiseReduction, PowParams, RawSerial as UploadSerial, Saturation,
+    SignatureAlgorithm, SimKey, StepIndex, StructuralVerdict, Tagged, TopOriginReview,
     check_structure, encode_envelope, parse_envelope_strict, verify as verify_pow,
 };
 use serde::Deserialize;
@@ -31,6 +36,7 @@ const NONCE_PATH: &str = "/api/nonce";
 const REGISTER_START_PATH: &str = "/api/passkey/register/start";
 const REGISTER_FINISH_PATH: &str = "/api/passkey/register/finish";
 const STATUS_PREFIX: &str = "/status/";
+const FILM_MODE_TAG: &str = "FilmMode";
 
 /// The residual channels [docs/06 §5](../../../docs/06-privacy-and-payload.md)
 /// documents as not closed.
@@ -41,6 +47,33 @@ const RESIDUAL_CHANNELS: &[&str] = &[
     "- the credential ID chosen at passkey registration: a forged-key site picks it once (≤ 255 bytes, a one-time leak; it's then fixed by the identical-ID check);",
     "- timing.",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DeclaredKind {
+    Library,
+    Rerender,
+    Pattern,
+    Gradient,
+    Chart,
+}
+
+impl From<DeclaredKind> for ContributionKind {
+    fn from(value: DeclaredKind) -> Self {
+        match value {
+            DeclaredKind::Library => Self::Library,
+            DeclaredKind::Rerender => Self::Rerender,
+            DeclaredKind::Pattern => Self::Pattern,
+            DeclaredKind::Gradient => Self::Gradient,
+            DeclaredKind::Chart => Self::Chart,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DeclaredIntent {
+    Native,
+    Recipe,
+}
 
 #[derive(Debug, Args)]
 pub struct VerifyPayloadArgs {
@@ -59,6 +92,18 @@ pub struct VerifyPayloadArgs {
     /// The site's WebAuthn relying-party ID, the registrable domain.
     #[arg(long = "rp-id", value_name = "DOMAIN")]
     pub rp_id: String,
+    /// The source-built `data/` snapshot used to resolve bodies and controls.
+    #[arg(long, value_name = "DIR", default_value = "data")]
+    pub data: PathBuf,
+    /// The contribution kind you declared to the site.
+    #[arg(long, value_enum, value_name = "KIND")]
+    pub kind: DeclaredKind,
+    /// The fit intent you declared to the site.
+    #[arg(long, value_enum, value_name = "INTENT")]
+    pub intent: DeclaredIntent,
+    /// The recipe's target look, required with `--intent recipe`.
+    #[arg(long = "target-look", value_name = "SLUG")]
+    pub target_look: Option<String>,
     /// Where the credential id is recorded between runs. Defaults to
     /// `$XDG_STATE_HOME/looklab/verify.json`, else `~/.local/state/looklab/verify.json`.
     #[arg(long, value_name = "FILE")]
@@ -161,6 +206,15 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
     if args.rp_id.trim().is_empty() {
         bail!("--rp-id must not be empty");
     }
+    let intent = declared_intent(args.intent, args.target_look.as_deref())?;
+    let bodies = Bodies::load(&args.data.join("bodies"))
+        .with_context(|| format!("loading bodies from {}", args.data.display()))?;
+    if bodies.is_empty() {
+        bail!(
+            "{} has no body entities",
+            args.data.join("bodies").display()
+        );
+    }
 
     let seeds_text = std::fs::read_to_string(&args.seeds)
         .with_context(|| format!("reading {}", args.seeds.display()))?;
@@ -201,6 +255,16 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         .collect();
 
     let reproduced = reproduce(&groups, &seeds, &module, &mut findings);
+    let derived = derive_batch(&reproduced, &bodies, &mut findings);
+    let declared = DeclaredFields {
+        kind: args.kind.into(),
+        intent: intent.clone(),
+    };
+    print_batch_fields(derived.as_ref(), &declared, &mut findings);
+    let expected = derived
+        .as_ref()
+        .map(|fields| expected_manifest(fields, &declared, &reproduced));
+
     let service = Service {
         origin: &origin,
         rp_id: &args.rp_id,
@@ -208,6 +272,7 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         reproduced: &reproduced,
         serials: &serials,
         pow: pow_params(args),
+        expected: expected.as_ref(),
     };
 
     let mut credentials: Vec<(String, Vec<u8>)> = Vec::new();
@@ -240,6 +305,9 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
                 RequestClass::Upload => uploads.push(entry),
                 _ => {}
             }
+            if UrlParts::parse(&entry.request.url).is_some_and(|parts| parts.origin() == origin.0) {
+                audit_request(&entry.request, class, &mut findings);
+            }
         }
         if uploads.is_empty() {
             findings.fail(format!(
@@ -269,6 +337,475 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
     Ok(findings)
 }
 
+fn declared_intent(intent: DeclaredIntent, target_look: Option<&str>) -> Result<Intent> {
+    match intent {
+        DeclaredIntent::Native => {
+            if target_look.is_some() {
+                bail!("--target-look is only meaningful with --intent recipe");
+            }
+            Ok(Intent::Native)
+        }
+        DeclaredIntent::Recipe => {
+            let slug = target_look.context("--intent recipe needs --target-look")?;
+            let target_look = LookSlug::new(slug)
+                .with_context(|| format!("--target-look {slug:?} is not a look slug"))?;
+            Ok(Intent::Recipe { target_look })
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DeclaredFields {
+    kind: ContributionKind,
+    intent: Intent,
+}
+
+/// The batch fields the files determine, with the makernote each came from.
+#[derive(Debug, Clone, PartialEq)]
+struct BatchFields {
+    body: BodyId,
+    firmware: FirmwareVersionString,
+    sim: SimKey,
+    settings: ControlSettings,
+    sources: Vec<(ControlKey, StepIndex, &'static str)>,
+}
+
+fn derive_batch(
+    reproduced: &[ReproducedImage],
+    bodies: &Bodies,
+    findings: &mut Findings,
+) -> Option<BatchFields> {
+    let first = reproduced.first()?;
+    let fields = match derive_one(&first.metadata, bodies) {
+        Ok(fields) => fields,
+        Err(reason) => {
+            findings.fail(format!(
+                "the files do not determine the batch fields: {reason}"
+            ));
+            return None;
+        }
+    };
+    for image in &reproduced[1..] {
+        match derive_one(&image.metadata, bodies) {
+            Ok(other) if other == fields => {}
+            Ok(_) => {
+                findings.fail(
+                    "the images disagree on the batch fields; they must come from one body and one camera setting",
+                );
+                return None;
+            }
+            Err(reason) => {
+                findings.fail(format!(
+                    "the files do not determine the batch fields: {reason}"
+                ));
+                return None;
+            }
+        }
+    }
+    Some(fields)
+}
+
+fn derive_one(metadata: &ManifestMetadata, bodies: &Bodies) -> Result<BatchFields, String> {
+    let make = metadata
+        .make
+        .as_deref()
+        .ok_or("the image carries no EXIF make")?;
+    let model = metadata
+        .model
+        .as_deref()
+        .ok_or("the image carries no EXIF model")?;
+    let body = match_body(bodies, make, model)?;
+    let record = bodies
+        .get(&body)
+        .ok_or_else(|| format!("the data snapshot has no control schema for {body}"))?;
+    let firmware_text = metadata
+        .firmware
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .ok_or("the image carries no EXIF firmware")?;
+    let firmware = FirmwareVersionString::new(firmware_text)
+        .map_err(|error| format!("EXIF firmware {firmware_text:?}: {error}"))?;
+    let look = metadata
+        .look
+        .as_ref()
+        .ok_or("the image carries no Fujifilm makernote settings")?;
+    let epoch = resolve_epoch(&record.schema, firmware_text)
+        .ok_or_else(|| format!("no epoch covers firmware {firmware_text}"))?;
+    let sim = derive_sim(look, epoch)?;
+
+    let mut sources = Vec::new();
+    for control in &epoch.controls {
+        match derive_setting(control, metadata, look) {
+            Some(Ok((step, source))) => {
+                sources.push((control.key.clone(), StepIndex::new(step), source))
+            }
+            Some(Err(reason)) => return Err(reason),
+            None => {}
+        }
+    }
+    let entries: Vec<ControlEntry> = sources
+        .iter()
+        .map(|(key, step, _)| ControlEntry {
+            key: key.clone(),
+            step: *step,
+        })
+        .collect();
+    let settings = ControlSettings::new(entries).map_err(|error| error.to_string())?;
+    validate_settings(record, firmware_text, &sim, &settings)
+        .map_err(|problem| format!("the derived settings are not valid for {body}: {problem:?}"))?;
+
+    Ok(BatchFields {
+        body,
+        firmware,
+        sim,
+        settings,
+        sources,
+    })
+}
+
+fn match_body(bodies: &Bodies, make: &str, model: &str) -> Result<BodyId, String> {
+    let make = make.trim();
+    let model = model.trim();
+    let mut matches = Vec::new();
+    for (id, record) in bodies.records() {
+        if record.make.eq_ignore_ascii_case(make)
+            && (record.model.eq_ignore_ascii_case(model)
+                || record
+                    .exif_aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(model)))
+        {
+            matches.push(id);
+        }
+    }
+    match matches.as_slice() {
+        [] => Err(format!(
+            "no body in the data snapshot matches EXIF make {make:?} and model {model:?}"
+        )),
+        [id] => BodyId::new(id).map_err(|error| error.to_string()),
+        _ => Err(format!(
+            "several bodies in the data snapshot match EXIF make {make:?} and model {model:?}: {matches:?}"
+        )),
+    }
+}
+
+fn derive_sim(look: &LookSettings, epoch: &Epoch) -> Result<SimKey, String> {
+    let film_mode = look
+        .film_mode
+        .as_ref()
+        .ok_or("the image carries no FilmMode makernote")?;
+    let raw = u64::try_from(film_mode.raw)
+        .map_err(|_| format!("FilmMode raw value {} is negative", film_mode.raw))?;
+    let mut matches: Vec<&NativeSim> = epoch
+        .native_sims
+        .iter()
+        .filter(|sim| sim.makernote.tag.as_str() == FILM_MODE_TAG && sim.makernote.value.0 == raw)
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.remove(0).key.clone()),
+        0 => Err(format!(
+            "{FILM_MODE_TAG}={raw} is not a native simulation of this body"
+        )),
+        _ => Err(format!(
+            "{FILM_MODE_TAG}={raw} maps to several native simulations"
+        )),
+    }
+}
+
+fn derive_setting(
+    control: &Control,
+    metadata: &ManifestMetadata,
+    look: &LookSettings,
+) -> Option<Result<(i64, &'static str), String>> {
+    match control.key.as_str() {
+        "dynamic_range" => Some(derive_dynamic_range(control, look)),
+        "highlight_tone" => Some(derive_tone(
+            control,
+            look.highlight_tone.as_ref(),
+            "HighlightTone",
+        )),
+        "shadow_tone" => Some(derive_tone(
+            control,
+            look.shadow_tone.as_ref(),
+            "ShadowTone",
+        )),
+        "color" => Some(derive_color(control, look)),
+        "color_chrome_effect" => Some(derive_effect(
+            control,
+            look.color_chrome_effect.as_ref(),
+            "ColorChromeEffect",
+        )),
+        "color_chrome_fx_blue" => Some(derive_effect(
+            control,
+            look.color_chrome_fx_blue.as_ref(),
+            "ColorChromeFxBlue",
+        )),
+        "wb_shift_r" => Some(derive_wb_shift(control, look, WbShift::Red)),
+        "wb_shift_b" => Some(derive_wb_shift(control, look, WbShift::Blue)),
+        "exposure_compensation" => Some(derive_exposure_compensation(control, metadata)),
+        "grain" => Some(derive_grain(control, look)),
+        "clarity" => Some(derive_clarity(control, look)),
+        "noise_reduction" => Some(derive_noise_reduction(control, look)),
+        _ => None,
+    }
+}
+
+fn derive_dynamic_range(
+    control: &Control,
+    look: &LookSettings,
+) -> Result<(i64, &'static str), String> {
+    let label = if let Some(percent) = look
+        .development_dynamic_range
+        .as_ref()
+        .and_then(|tag| tag.value)
+    {
+        format!("dr{percent}")
+    } else if let Some(setting) = look
+        .dynamic_range_setting
+        .as_ref()
+        .and_then(|tag| tag.value)
+    {
+        match setting {
+            DynamicRangeSetting::Standard100 => "dr100".to_owned(),
+            DynamicRangeSetting::Wide1_230 => "dr200".to_owned(),
+            DynamicRangeSetting::Wide2_400 => "dr400".to_owned(),
+            _ => return Err("the DynamicRangeSetting makernote is not a fixed value".to_owned()),
+        }
+    } else {
+        return Err("the image carries no dynamic range makernote".to_owned());
+    };
+    enum_step(control, &label, "DevelopmentDynamicRange")
+}
+
+fn derive_tone(
+    control: &Control,
+    tag: Option<&Tagged<f64>>,
+    source: &'static str,
+) -> Result<(i64, &'static str), String> {
+    let value = tag
+        .and_then(|tag| tag.value)
+        .ok_or_else(|| format!("the image carries no {source} makernote"))?;
+    numeric_step(control, value, source)
+}
+
+fn derive_color(control: &Control, look: &LookSettings) -> Result<(i64, &'static str), String> {
+    let value = look
+        .saturation
+        .as_ref()
+        .and_then(|tag| tag.value)
+        .ok_or("the image carries no Saturation makernote")?;
+    match value {
+        Saturation::Step(step) => numeric_step(control, f64::from(step), "Saturation"),
+        _ => Err("the Saturation makernote is not expressed as a step".to_owned()),
+    }
+}
+
+fn derive_effect(
+    control: &Control,
+    tag: Option<&Tagged<EffectStrength>>,
+    source: &'static str,
+) -> Result<(i64, &'static str), String> {
+    let value = tag
+        .and_then(|tag| tag.value)
+        .ok_or_else(|| format!("the image carries no {source} makernote"))?;
+    let label = match value {
+        EffectStrength::Off => "off",
+        EffectStrength::Weak => "weak",
+        EffectStrength::Strong => "strong",
+    };
+    enum_step(control, label, source)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WbShift {
+    Red,
+    Blue,
+}
+
+fn derive_wb_shift(
+    control: &Control,
+    look: &LookSettings,
+    which: WbShift,
+) -> Result<(i64, &'static str), String> {
+    let fine_tune = look
+        .white_balance_fine_tune
+        .as_ref()
+        .ok_or("the image carries no WhiteBalanceFineTune makernote")?;
+    let shift = fine_tune
+        .shift
+        .ok_or("the WhiteBalanceFineTune makernote does not decode")?;
+    let value = match which {
+        WbShift::Red => f64::from(shift.red) / 20.0,
+        WbShift::Blue => f64::from(shift.blue) / 20.0,
+    };
+    numeric_step(control, value, "WhiteBalanceFineTune")
+}
+
+fn derive_exposure_compensation(
+    control: &Control,
+    metadata: &ManifestMetadata,
+) -> Result<(i64, &'static str), String> {
+    let value = metadata
+        .exposure_compensation_ev
+        .ok_or("the image carries no exposure compensation")?;
+    numeric_step(control, value, "ExposureCompensation")
+}
+
+fn derive_grain(control: &Control, look: &LookSettings) -> Result<(i64, &'static str), String> {
+    let value = look
+        .grain_roughness
+        .as_ref()
+        .and_then(|tag| tag.value)
+        .ok_or("the image carries no GrainEffectRoughness makernote")?;
+    let label = match value {
+        GrainRoughness::Off => "off",
+        GrainRoughness::WeakSmall | GrainRoughness::Weak => "weak",
+        GrainRoughness::StrongSmall | GrainRoughness::Strong => "strong",
+    };
+    enum_step(control, label, "GrainEffectRoughness")
+}
+
+fn derive_clarity(control: &Control, look: &LookSettings) -> Result<(i64, &'static str), String> {
+    let value = look
+        .clarity
+        .as_ref()
+        .and_then(|tag| tag.value)
+        .ok_or("the image carries no Clarity makernote")?;
+    numeric_step(control, f64::from(value), "Clarity")
+}
+
+fn derive_noise_reduction(
+    control: &Control,
+    look: &LookSettings,
+) -> Result<(i64, &'static str), String> {
+    let value = look
+        .noise_reduction
+        .as_ref()
+        .and_then(|tag| tag.value)
+        .ok_or("the image carries no NoiseReduction makernote")?;
+    match value {
+        NoiseReduction::Step(step) => numeric_step(control, f64::from(step), "NoiseReduction"),
+        _ => Err("the NoiseReduction makernote is not expressed as a step".to_owned()),
+    }
+}
+
+fn numeric_step(
+    control: &Control,
+    value: f64,
+    source: &'static str,
+) -> Result<(i64, &'static str), String> {
+    if !value.is_finite() {
+        return Err(format!("{source} is not finite"));
+    }
+    if !matches!(control.kind, ControlType::Int | ControlType::Decimal) {
+        return Err(format!(
+            "{source} is a number but control {} is not numeric",
+            control.key
+        ));
+    }
+    for step in control.steps() {
+        if control
+            .value_at(step)
+            .is_some_and(|candidate| candidate.to_f64() == value)
+        {
+            return Ok((step, source));
+        }
+    }
+    Err(format!(
+        "{source} value {value} is not a step of control {}",
+        control.key
+    ))
+}
+
+fn enum_step(
+    control: &Control,
+    label: &str,
+    source: &'static str,
+) -> Result<(i64, &'static str), String> {
+    let values = control.values.as_ref().ok_or_else(|| {
+        format!(
+            "the {source} makernote is an enum but control {} has no values",
+            control.key
+        )
+    })?;
+    let index = values
+        .iter()
+        .position(|value| value.as_str() == label)
+        .ok_or_else(|| {
+            format!(
+                "{source} value {label:?} is not a value of control {}",
+                control.key
+            )
+        })?;
+    Ok((i64::try_from(index).unwrap_or(i64::MAX), source))
+}
+
+fn print_batch_fields(
+    derived: Option<&BatchFields>,
+    declared: &DeclaredFields,
+    findings: &mut Findings,
+) {
+    findings.note("");
+    findings.note("batch fields");
+    match derived {
+        Some(fields) => {
+            findings.note(format!(
+                "  body: {} (reproduced from EXIF make/model)",
+                fields.body
+            ));
+            findings.note(format!(
+                "  firmware: {} (reproduced from EXIF)",
+                fields.firmware
+            ));
+            findings.note(format!(
+                "  sim: {} (reproduced from the {FILM_MODE_TAG} makernote)",
+                fields.sim
+            ));
+            findings.note(format!(
+                "  settings: {} controls (reproduced from makernotes)",
+                fields.sources.len()
+            ));
+            for (key, step, source) in &fields.sources {
+                findings.note(format!("    {key} = {} (from {source})", step.get()));
+            }
+        }
+        None => findings.note("  body, firmware, sim, settings: not reproduced (see FAIL)"),
+    }
+    findings.note(format!("  kind: {:?} (declared)", declared.kind));
+    match &declared.intent {
+        Intent::Native => findings.note("  intent: native (declared)"),
+        Intent::Recipe { target_look } => findings.note(format!(
+            "  intent: recipe (declared), target look: {target_look} (declared)"
+        )),
+    }
+}
+
+fn expected_manifest(
+    fields: &BatchFields,
+    declared: &DeclaredFields,
+    reproduced: &[ReproducedImage],
+) -> BatchManifest {
+    BatchManifest {
+        kind: declared.kind,
+        intent: declared.intent.clone(),
+        body: fields.body.clone(),
+        firmware_version: fields.firmware.clone(),
+        sim_key: fields.sim.clone(),
+        settings: fields.settings.clone(),
+        images: reproduced
+            .iter()
+            .map(|image| ManifestImage {
+                meta: image.metadata.clone(),
+                rerender_group: image
+                    .rerender_group
+                    .map(looklab_upload::RerenderGroupId::new),
+                blob_sha256: sha256(&image.blob),
+                blob_kind: BlobKind::Samples,
+            })
+            .collect(),
+    }
+}
+
 struct Service<'a> {
     origin: &'a Origin,
     rp_id: &'a str,
@@ -276,6 +813,7 @@ struct Service<'a> {
     reproduced: &'a [ReproducedImage],
     serials: &'a [(&'a str, &'a UploadSerial)],
     pow: PowParams,
+    expected: Option<&'a BatchManifest>,
 }
 
 #[derive(Debug)]
@@ -325,55 +863,27 @@ fn verify_upload(
         envelope.nonce.as_bytes().len()
     ));
 
-    let reproduced = check_images(&envelope, service, findings);
+    check_images(&envelope, service, findings);
     check_webauthn(&envelope, service, findings);
     check_pow(&envelope, service, findings);
-    if reproduced {
-        check_serial(&envelope, service, &body, findings);
-    }
+    check_serial(&envelope, service, &body, findings);
 
     Some(envelope.assertion.credential_id)
 }
 
-fn check_images(envelope: &Envelope, service: &Service<'_>, findings: &mut Findings) -> bool {
-    let site = &envelope.manifest;
-    if site.images.len() != service.reproduced.len() {
-        findings.fail(format!(
-            "the upload has {} image(s) but the files reproduce {}",
-            site.images.len(),
-            service.reproduced.len()
-        ));
-    }
-
-    let images: Vec<ManifestImage> = service
-        .reproduced
-        .iter()
-        .map(|image| ManifestImage {
-            meta: image.metadata.clone(),
-            rerender_group: image
-                .rerender_group
-                .map(looklab_upload::RerenderGroupId::new),
-            blob_sha256: sha256(&image.blob),
-            blob_kind: BlobKind::Samples,
-        })
-        .collect();
-    let rebuilt = BatchManifest {
-        kind: site.kind,
-        intent: site.intent.clone(),
-        body: site.body.clone(),
-        firmware_version: site.firmware_version.clone(),
-        sim_key: site.sim_key.clone(),
-        settings: site.settings.clone(),
-        images,
+fn check_images(envelope: &Envelope, service: &Service<'_>, findings: &mut Findings) {
+    let Some(expected) = service.expected else {
+        findings.fail("the manifest cannot be reproduced: the batch fields are not determined");
+        return;
     };
 
     let request = BuildManifestRequest {
-        kind: rebuilt.kind,
-        intent: rebuilt.intent.clone(),
-        body: rebuilt.body.clone(),
-        firmware: rebuilt.firmware_version.clone(),
-        sim: rebuilt.sim_key.clone(),
-        settings: rebuilt.settings.clone(),
+        kind: expected.kind,
+        intent: expected.intent.clone(),
+        body: expected.body.clone(),
+        firmware: expected.firmware_version.clone(),
+        sim: expected.sim_key.clone(),
+        settings: expected.settings.clone(),
         images: service
             .reproduced
             .iter()
@@ -386,14 +896,19 @@ fn check_images(envelope: &Envelope, service: &Service<'_>, findings: &mut Findi
             .collect(),
         nonce: envelope.nonce,
     };
-    let mut manifest_matches = false;
     match service.module.build_manifest(&request) {
         Ok(response) => {
-            if response.manifest_bytes == envelope.manifest_bytes {
-                manifest_matches = true;
-                findings.note("  manifest: reproduced field for field through the prep module");
+            if response.manifest_bytes == envelope.manifest_bytes && envelope.manifest == *expected
+            {
+                findings.note("  manifest: reproduced and declared fields match, byte for byte");
             } else {
-                for difference in manifest_differences(site, &rebuilt) {
+                findings.fail(format!(
+                    "the manifest does not match the reproduced and declared manifest ({} bytes, {} expected)",
+                    envelope.manifest_bytes.len(),
+                    response.manifest_bytes.len()
+                ));
+                let differences = manifest_differences(&envelope.manifest, expected);
+                for difference in differences {
                     findings.fail(format!("manifest: {difference}"));
                 }
             }
@@ -421,49 +936,92 @@ fn check_images(envelope: &Envelope, service: &Service<'_>, findings: &mut Findi
             service.reproduced.len()
         ));
     }
-    manifest_matches && blobs_match
 }
 
-fn manifest_differences(site: &BatchManifest, rebuilt: &BatchManifest) -> Vec<String> {
+fn manifest_differences(site: &BatchManifest, expected: &BatchManifest) -> Vec<String> {
     let mut differences = Vec::new();
-    if site.kind != rebuilt.kind {
+    if site.kind != expected.kind {
         differences.push(format!(
-            "kind is {:?}, reproduced {:?}",
-            site.kind, rebuilt.kind
+            "kind is {:?}, declared {:?}",
+            site.kind, expected.kind
         ));
     }
-    if site.intent != rebuilt.intent {
-        differences.push("intent differs".to_owned());
+    if site.intent != expected.intent {
+        differences.push(format!(
+            "intent is {:?}, declared {:?}",
+            site.intent, expected.intent
+        ));
     }
-    if site.body != rebuilt.body {
+    if site.body != expected.body {
         differences.push(format!(
             "body is {}, reproduced {}",
-            site.body, rebuilt.body
+            site.body, expected.body
         ));
     }
-    if site.firmware_version != rebuilt.firmware_version {
+    if site.firmware_version != expected.firmware_version {
         differences.push(format!(
             "firmware version is {}, reproduced {}",
-            site.firmware_version, rebuilt.firmware_version
+            site.firmware_version, expected.firmware_version
         ));
     }
-    if site.sim_key != rebuilt.sim_key {
+    if site.sim_key != expected.sim_key {
         differences.push(format!(
             "sim key is {}, reproduced {}",
-            site.sim_key, rebuilt.sim_key
+            site.sim_key, expected.sim_key
         ));
     }
-    if site.settings != rebuilt.settings {
-        differences.push("control settings differ".to_owned());
+    if site.settings != expected.settings {
+        differences.push(format!(
+            "control settings are {} entries, reproduced {}",
+            site.settings.entries().len(),
+            expected.settings.entries().len()
+        ));
+        for entry in site.settings.entries() {
+            let reproduced = expected
+                .settings
+                .entries()
+                .iter()
+                .find(|candidate| candidate.key == entry.key);
+            match reproduced {
+                None => differences.push(format!(
+                    "setting {} = {} is not reproduced from a makernote",
+                    entry.key,
+                    entry.step.get()
+                )),
+                Some(reproduced) if reproduced.step != entry.step => {
+                    differences.push(format!(
+                        "setting {} = {}, reproduced {}",
+                        entry.key,
+                        entry.step.get(),
+                        reproduced.step.get()
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        for entry in expected.settings.entries() {
+            if !site
+                .settings
+                .entries()
+                .iter()
+                .any(|candidate| candidate.key == entry.key)
+            {
+                differences.push(format!(
+                    "setting {} = {} is missing",
+                    entry.key,
+                    entry.step.get()
+                ));
+            }
+        }
     }
-    if site.images.len() != rebuilt.images.len() {
+    if site.images.len() != expected.images.len() {
         differences.push(format!(
             "{} image(s), reproduced {}",
             site.images.len(),
-            rebuilt.images.len()
+            expected.images.len()
         ));
     }
-    for (index, (a, b)) in site.images.iter().zip(&rebuilt.images).enumerate() {
+    for (index, (a, b)) in site.images.iter().zip(&expected.images).enumerate() {
         if a.meta != b.meta {
             differences.push(format!("image {index} metadata differs"));
         }
@@ -486,6 +1044,7 @@ fn check_webauthn(envelope: &Envelope, service: &Service<'_>, findings: &mut Fin
         origin: service.origin.0.as_str(),
         rp_id: service.rp_id,
         algorithm: SignatureAlgorithm::Ecdsa,
+        top_origin: None,
     };
     let mut failures = BTreeSet::new();
     for algorithm in [
@@ -502,21 +1061,38 @@ fn check_webauthn(envelope: &Envelope, service: &Service<'_>, findings: &mut Fin
         );
         match verdict {
             StructuralVerdict::Pass => {
-                findings.note(webauthn_line(service, algorithm, false));
+                findings.note(webauthn_line(service, algorithm));
                 findings.note("  challenge: H(nonce ‖ manifest hash) matches client_data_json");
                 return;
             }
             StructuralVerdict::ReviewNeeded {
                 unknown_client_data_keys,
+                non_canonical_client_data,
+                top_origin,
                 extensions,
             } => {
-                findings.note(webauthn_line(service, algorithm, extensions.is_some()));
+                findings.note(webauthn_line(service, algorithm));
                 findings.note("  challenge: H(nonce ‖ manifest hash) matches client_data_json");
                 for extra in unknown_client_data_keys {
                     findings.review(format!(
                         "client_data_json key {:?} appears in full: {}",
                         extra.key, extra.raw_json
                     ));
+                }
+                if let Some(raw) = non_canonical_client_data {
+                    findings.review(format!(
+                        "client_data_json is not the WebAuthn serialization, bytes in full: {raw:?}"
+                    ));
+                }
+                match top_origin {
+                    Some(TopOriginReview::Unexpected(origin)) => findings.review(format!(
+                        "client_data_json topOrigin {:?} has no expected value",
+                        origin
+                    )),
+                    Some(TopOriginReview::Missing) => {
+                        findings.review("client_data_json has no expected topOrigin")
+                    }
+                    None => {}
                 }
                 if let Some(extensions) = extensions {
                     for entry in extensions.entries {
@@ -539,19 +1115,14 @@ fn check_webauthn(envelope: &Envelope, service: &Service<'_>, findings: &mut Fin
     ));
 }
 
-fn webauthn_line(service: &Service<'_>, algorithm: SignatureAlgorithm, extensions: bool) -> String {
+fn webauthn_line(service: &Service<'_>, algorithm: SignatureAlgorithm) -> String {
     let signature = match algorithm {
         SignatureAlgorithm::Ecdsa => "ECDSA (DER)",
         SignatureAlgorithm::Ed25519 => "Ed25519 (64 bytes)",
         SignatureAlgorithm::Rsa => "RSA (key size)",
     };
-    let extensions = if extensions {
-        ", authenticator extensions decoded for review"
-    } else {
-        ""
-    };
     format!(
-        "  webauthn: type webauthn.get, origin {}, crossOrigin false, rpIdHash sha256({}), user present, attested credential data absent, {signature} signature well formed{extensions}",
+        "  webauthn: type webauthn.get, origin {}, crossOrigin false, rpIdHash sha256({}), user present, attested credential data absent, {signature} signature well formed",
         service.origin, service.rp_id
     )
 }
@@ -596,9 +1167,7 @@ fn check_serial(envelope: &Envelope, service: &Service<'_>, body: &[u8], finding
         Some(Some(name)) => {
             findings.note(format!("  serial: matches the EXIF serial of {name}"));
         }
-        None => findings.fail(
-            "the envelope does not reproduce byte for byte: its serial matches no input file's EXIF serial",
-        ),
+        None => findings.fail("the serial matches no input file's EXIF serial"),
     }
 }
 
@@ -997,7 +1566,15 @@ struct HarRequest {
     method: String,
     url: String,
     #[serde(default)]
+    headers: Vec<HarHeader>,
+    #[serde(default)]
     post_data: Option<HarPostData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HarHeader {
+    name: String,
+    value: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1022,14 +1599,12 @@ impl Har {
 impl HarRequest {
     /// The bytes sent: base64 when the exporter says so, otherwise the text itself.
     fn body(&self) -> Result<Vec<u8>> {
-        let post = self
-            .post_data
-            .as_ref()
-            .context("the upload request records no body (HAR request.postData is absent)")?;
-        let text = post
-            .text
-            .as_deref()
-            .context("the upload request records no body text")?;
+        let Some(post) = self.post_data.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let Some(text) = post.text.as_deref() else {
+            return Ok(Vec::new());
+        };
         match post.encoding.as_deref() {
             Some("base64") => decode_base64(text),
             Some(other) => bail!("the recorded body uses the unsupported HAR encoding {other:?}"),
@@ -1046,6 +1621,122 @@ fn decode_base64(text: &str) -> Result<Vec<u8>> {
         .decode(text)
         .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(text))
         .context("the recorded body is not base64")
+}
+
+/// A request header outside this list can carry data off the site.
+fn is_browser_header(name: &str) -> bool {
+    const ALLOWED: &[&str] = &[
+        "accept",
+        "accept-encoding",
+        "accept-language",
+        "cache-control",
+        "connection",
+        "content-length",
+        "content-type",
+        "cookie",
+        "dnt",
+        "expect",
+        "host",
+        "if-match",
+        "if-modified-since",
+        "if-none-match",
+        "if-range",
+        "if-unmodified-since",
+        "origin",
+        "pragma",
+        "priority",
+        "range",
+        "referer",
+        "te",
+        "upgrade-insecure-requests",
+        "user-agent",
+    ];
+    let name = name.to_ascii_lowercase();
+    name.starts_with("sec-") || ALLOWED.contains(&name.as_str())
+}
+
+fn audit_request(request: &HarRequest, class: RequestClass, findings: &mut Findings) {
+    for header in &request.headers {
+        if !is_browser_header(&header.name) {
+            findings.review(format!(
+                "request {} {} carries header {:?}: {:?}",
+                request.method, request.url, header.name, header.value
+            ));
+        }
+    }
+    match class {
+        RequestClass::Nonce | RequestClass::Status => match request.body() {
+            Ok(body) if body.is_empty() => {}
+            Ok(body) => findings.fail(format!(
+                "request {} {} carries a body, but this endpoint takes none: {:?}",
+                request.method,
+                request.url,
+                String::from_utf8_lossy(&body)
+            )),
+            Err(error) => findings.fail(format!(
+                "request {} {} body: {error}",
+                request.method, request.url
+            )),
+        },
+        RequestClass::RegisterStart => {
+            audit_registration(request, &["display_handle"], findings);
+        }
+        RequestClass::RegisterFinish => {
+            audit_registration(request, &["handle", "credential"], findings);
+        }
+        RequestClass::Upload | RequestClass::Unexpected => {}
+    }
+}
+
+fn audit_registration(request: &HarRequest, allowed: &[&str], findings: &mut Findings) {
+    let body = match request.body() {
+        Ok(body) => body,
+        Err(error) => {
+            findings.fail(format!(
+                "request {} {} body: {error}",
+                request.method, request.url
+            ));
+            return;
+        }
+    };
+    findings.note(format!(
+        "  {} {} body: {}",
+        request.method,
+        request.url,
+        String::from_utf8_lossy(&body)
+    ));
+    if body.is_empty() {
+        findings.fail(format!(
+            "request {} {} has no JSON body",
+            request.method, request.url
+        ));
+        return;
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            findings.fail(format!(
+                "request {} {} body is not JSON: {error}",
+                request.method, request.url
+            ));
+            return;
+        }
+    };
+    let Some(object) = value.as_object() else {
+        findings.fail(format!(
+            "request {} {} body is not a JSON object",
+            request.method, request.url
+        ));
+        return;
+    };
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            findings.fail(format!(
+                "request {} {} body carries an unaccounted key {key:?}",
+                request.method, request.url
+            ));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

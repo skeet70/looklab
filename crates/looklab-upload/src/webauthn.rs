@@ -47,6 +47,8 @@ pub struct ExpectedAssertion<'a> {
     pub origin: &'a str,
     pub rp_id: &'a str,
     pub algorithm: SignatureAlgorithm,
+    /// The top-level origin expected inside `client_data_json`, when one is.
+    pub top_origin: Option<&'a str>,
 }
 
 /// A `client_data_json` key the checks do not know, kept for a person to read.
@@ -85,9 +87,19 @@ pub enum StructuralVerdict {
     Pass,
     ReviewNeeded {
         unknown_client_data_keys: Vec<ClientDataExtra>,
+        /// The raw `client_data_json` when it is not the WebAuthn serialization.
+        non_canonical_client_data: Option<String>,
+        top_origin: Option<TopOriginReview>,
         extensions: Option<Extensions>,
     },
     Fail(StructuralError),
+}
+
+/// A `topOrigin` in `client_data_json` that no expected value accounts for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopOriginReview {
+    Unexpected(String),
+    Missing,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -245,8 +257,8 @@ pub fn check_structure(
         Ok(()) => {}
         Err(error) => return StructuralVerdict::Fail(error),
     }
-    let unknown = match check_client_data(assertion, expected) {
-        Ok(unknown) => unknown,
+    let client = match check_client_data(assertion, expected) {
+        Ok(client) => client,
         Err(error) => return StructuralVerdict::Fail(error),
     };
     let extensions = match check_authenticator_data(assertion, expected) {
@@ -256,11 +268,17 @@ pub fn check_structure(
     if let Err(error) = check_signature(&assertion.signature, expected.algorithm) {
         return StructuralVerdict::Fail(error);
     }
-    if unknown.is_empty() && extensions.is_none() {
+    if client.unknown.is_empty()
+        && client.non_canonical.is_none()
+        && client.top_origin.is_none()
+        && extensions.is_none()
+    {
         StructuralVerdict::Pass
     } else {
         StructuralVerdict::ReviewNeeded {
-            unknown_client_data_keys: unknown,
+            unknown_client_data_keys: client.unknown,
+            non_canonical_client_data: client.non_canonical,
+            top_origin: client.top_origin,
             extensions,
         }
     }
@@ -302,10 +320,16 @@ fn check_lengths(assertion: &WebAuthnAssertion) -> Result<(), StructuralError> {
     Ok(())
 }
 
+struct ClientDataCheck {
+    unknown: Vec<ClientDataExtra>,
+    non_canonical: Option<String>,
+    top_origin: Option<TopOriginReview>,
+}
+
 fn check_client_data(
     assertion: &WebAuthnAssertion,
     expected: &ExpectedAssertion<'_>,
-) -> Result<Vec<ClientDataExtra>, StructuralError> {
+) -> Result<ClientDataCheck, StructuralError> {
     let mut duplicate = None;
     let mut deserializer = serde_json::Deserializer::from_slice(&assertion.client_data_json);
     let scanned = DuplicateScan {
@@ -338,19 +362,75 @@ fn check_client_data(
     if client.cross_origin.unwrap_or(false) {
         return Err(StructuralError::CrossOriginSet);
     }
-    let _ = client.top_origin;
 
     let mut unknown = Vec::new();
-    for (key, value) in client.extras {
+    for (key, value) in &client.extras {
         if key == "other_keys_can_be_added_here" && value.as_str() == Some(OTHER_KEYS_TEXT) {
             continue;
         }
         unknown.push(ClientDataExtra {
-            key,
+            key: key.clone(),
             raw_json: value.to_string(),
         });
     }
-    Ok(unknown)
+
+    let canonical = canonical_client_data(&client);
+    let non_canonical = (canonical.as_bytes() != assertion.client_data_json.as_slice())
+        .then(|| String::from_utf8_lossy(&assertion.client_data_json).into_owned());
+    let top_origin = match (client.top_origin.as_deref(), expected.top_origin) {
+        (None, None) => None,
+        (Some(actual), Some(want)) if actual == want => None,
+        (Some(actual), _) => Some(TopOriginReview::Unexpected(actual.to_owned())),
+        (None, Some(_)) => Some(TopOriginReview::Missing),
+    };
+    Ok(ClientDataCheck {
+        unknown,
+        non_canonical,
+        top_origin,
+    })
+}
+
+/// The serialization WebAuthn specifies for `client_data_json`
+/// (WebAuthn L3 §5.8.1.1): fixed key order, no whitespace, JSON string escapes.
+fn canonical_client_data(client: &ClientData) -> String {
+    let mut out = String::from("{\"type\":");
+    push_json_string(&mut out, &client.kind);
+    out.push_str(",\"challenge\":");
+    push_json_string(&mut out, &client.challenge);
+    out.push_str(",\"origin\":");
+    push_json_string(&mut out, &client.origin);
+    out.push_str(",\"crossOrigin\":");
+    out.push_str(if client.cross_origin.unwrap_or(false) {
+        "true"
+    } else {
+        "false"
+    });
+    if let Some(top_origin) = &client.top_origin {
+        out.push_str(",\"topOrigin\":");
+        push_json_string(&mut out, top_origin);
+    }
+    out.push('}');
+    out
+}
+
+fn push_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            character if (character as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => out.push(character),
+        }
+    }
+    out.push('"');
 }
 
 fn check_authenticator_data(

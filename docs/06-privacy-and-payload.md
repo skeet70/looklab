@@ -48,23 +48,25 @@
 - Subresource Integrity and published build hashes protect against a tampered CDN. They **can't** protect against a malicious origin, because the hashes come from the same origin. Say so on `/about/privacy`, publish reproducible-build hashes in the audit log, and **point privacy-sensitive users to the CLI**, which they can build from source. Sampling is random, so payloads differ between runs. To check that the web client sent only what it should:
   1. **Open devtools and turn on "Preserve log" before loading the site**, so requests sent on page load are recorded. Then export the **request body actually sent** (HAR export). Don't use the inspector's "Download payload", because a malicious client could offer a clean download while uploading something else.
   2. Export the local **seed file** from the inspector. It contains a seed per image or re-render group, plus the prior-transform version.
-  3. Run `looklab-cli verify-payload --seeds seeds.json --har upload.har --module looklab_prep_module.wasm --origin https://site.example --rp-id site.example <files>`. Export the HAR with the network panel filtered to the upload session's API requests; any other request in it is flagged. It runs the source-built prep module under wasmtime ([03 §2.1](03-data-model.md)), then:
+  3. Run `looklab-cli verify-payload --seeds seeds.json --har upload.har --module looklab_prep_module.wasm --origin https://site.example --rp-id site.example --data data --kind library --intent native <files>`. Export the HAR with the network panel filtered to the upload session's API requests; any other request in it is flagged. It runs the source-built prep module under wasmtime ([03 §2.1](03-data-model.md)), then:
      - **parses the upload body strictly** as the canonical envelope ([03 §2.3](03-data-model.md)) and rejects any deviation or trailing bytes;
      - checks that the **manifest and every sample blob reproduce byte for byte**. There's no tolerance, since a tolerance could hide data in low-order bits;
-     - checks that the remaining fields are exactly the expected set:
+     - requires the **batch fields the files determine** to equal the manifest's: body from EXIF make/model against the `--data` snapshot, firmware from EXIF, sim and settings from the makernotes through the body's control schema. `--kind` and `--intent` supply what only you declare; every batch field is printed with its source, and anything neither reproduced nor declared fails;
+     - checks that the remaining fields are the expected set:
        - **nonce:** 32 bytes;
        - **challenge:** the one inside `client_data_json`, which must equal H(nonce ‖ manifest hash);
        - **WebAuthn fields**, checked **structurally**. No check relies on a key served by the site, because a malicious site could generate its own keypair in JavaScript and sign anything:
          - **`client_data_json`** (≤ 1024 bytes), parsed as JSON:
            - required: `type` = `webauthn.get`; `challenge` = the recomputed H(nonce ‖ manifest hash); `origin` = the site's origin; `crossOrigin` false (absent counts as false);
-           - accepted extras: `topOrigin`, and Chrome's `other_keys_can_be_added_here` with its fixed text;
+           - accepted extras: `topOrigin`, and Chrome's `other_keys_can_be_added_here` with its fixed text. `topOrigin` must equal an expected top origin when one is declared, else it is printed for review;
+           - the bytes must be the WebAuthn serialization (fixed key order, no whitespace, JSON string escapes). Any deviation is printed in full and marked **"review needed"**;
            - **any other key:** printed in full and the result marked **"review needed"** rather than pass/fail. Browsers may legitimately add keys, and data in a JSON key can't be hidden from a person reading it.
          - **`authenticator_data`**, fixed layout per the WebAuthn spec: `rpIdHash` = sha256 of the site's RP ID, then the flags byte and a 4-byte sign count. The attested-credential-data flag must be clear (an assertion carries none). If the extension flag is set, the extensions are decoded and printed for review.
          - **`credential_id`:** identical across all of your uploads. verify-payload records it locally on first use (in its own state file, not anything the site provides) and compares on later runs, or across several HARs given at once.
          - **signature:** must be well-formed for a supported algorithm (Ed25519 64 bytes; ECDSA as valid DER; RSA at the key size). There's no fixed length rule. An optional check against the credential key, if you have it from your own records, is a sanity check for an honest site only; the guarantee doesn't rest on it.
        - **proof-of-work:** k solutions, each verified;
        - **serial:** equal to your files' EXIF serial, or absent;
-     - lists **every other request** in the HAR to the site's origin or elsewhere, and flags any that aren't part of the expected API (nonce, upload, status, passkey registration).
+     - lists **every request** in the HAR, flags any that aren't part of the expected API (nonce, upload, status, passkey registration), and audits what was recorded: a body on an endpoint that takes none, a passkey registration body with keys outside its schema (printed), or a request header outside the browser's own set (printed) is reported.
 
      **Residual channels (documented, not closed):**
      - a client can choose *which* valid proof-of-work solutions it sends, leaking a few bits per batch at exponentially more work;

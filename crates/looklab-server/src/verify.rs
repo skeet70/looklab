@@ -51,6 +51,7 @@ pub fn verify_assertion(
         origin,
         rp_id,
         algorithm,
+        top_origin: None,
     };
     match check_structure(assertion, &expected) {
         StructuralVerdict::Pass | StructuralVerdict::ReviewNeeded { .. } => {}

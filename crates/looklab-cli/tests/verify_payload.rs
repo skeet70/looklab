@@ -10,15 +10,15 @@ use assert_cmd::Command;
 use base64::Engine as _;
 use jpeg_encoder::{ColorType, Encoder};
 use looklab_color::RgbSpace;
-use looklab_prep::{Image3, PrepParams};
+use looklab_prep::{Image3, PrepParams, decode_jpeg};
 use looklab_prep_module::{
     Function, ModuleError, PrepareRequest, PreparedImageView, PriorTransformSpec, Response,
 };
-use looklab_raw::{DecodedRaw, Orientation, RawDecoder, RawlerDecoder};
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, Challenge, ContributionKind, ControlSettings, EnvelopeParts,
-    FirmwareVersionString, Intent, ManifestImage, Nonce, PowParams, RawSerial, RerenderGroupId,
-    SimKey, WebAuthnAssertion, encode_envelope, manifest_hash, solve,
+    BatchManifest, BlobKind, BodyId, Challenge, ContributionKind, ControlEntry, ControlKey,
+    ControlSettings, EnvelopeParts, FirmwareVersionString, Intent, ManifestImage, Nonce, PowParams,
+    RawSerial, RerenderGroupId, SimKey, StepIndex, Tagged, WebAuthnAssertion, encode_envelope,
+    manifest_hash, solve,
 };
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use serde_json::{Value, json};
@@ -31,6 +31,9 @@ const SEED: [u8; 32] = [0x10; 32];
 const PRIOR_VERSION: u32 = 3;
 const CREDENTIAL: &[u8] = b"credential-alpha";
 const OTHER_CREDENTIAL: &[u8] = b"credential-beta";
+const BODY: &str = "fujifilm/x-s10";
+const FIRMWARE: &str = "1.00";
+const SIM: &str = "provia";
 const POW: PowParams = PowParams {
     memory_kib: 8,
     iterations: 1,
@@ -39,6 +42,7 @@ const POW: PowParams = PowParams {
 
 struct Fixture {
     dir: PathBuf,
+    data: PathBuf,
     module: PathBuf,
     raw: PathBuf,
     jpegs: Vec<PathBuf>,
@@ -62,9 +66,12 @@ fn build_fixture() -> Fixture {
     let raw_path = dir.join("fujifilm-x-s10.raf");
     std::fs::write(&raw_path, &raw).expect("RAW copy");
 
-    let decoded = RawlerDecoder.decode(&raw).expect("fixture decodes");
-    let image = raw_image(&decoded);
-    let renders = vec![jpeg_from_image(&image, 1.0), jpeg_from_image(&image, 0.7)];
+    let embedded = raf_jpeg(&raw);
+    let decoded = decode_jpeg(&embedded).expect("the embedded JPEG decodes");
+    let renders = vec![
+        embedded.clone(),
+        splice_exif(&embedded, &jpeg_from_image(&decoded.image, 0.7)),
+    ];
     let jpegs: Vec<PathBuf> = ["render-a.jpg", "render-b.jpg"]
         .iter()
         .map(|name| dir.join(name))
@@ -72,6 +79,19 @@ fn build_fixture() -> Fixture {
     for (path, bytes) in jpegs.iter().zip(&renders) {
         std::fs::write(path, bytes).expect("JPEG copy");
     }
+
+    let data = dir.join("data");
+    std::fs::create_dir_all(data.join("bodies")).expect("data directory");
+    let body = std::fs::read_to_string(workspace.join("data/bodies/fujifilm-x-t5.body.yaml"))
+        .expect("body entity")
+        .replace("id: fujifilm/x-t5", "id: fujifilm/x-s10")
+        .replace("model: X-T5", "model: X-S10")
+        .replace("exif_aliases: [X-T5]", "exif_aliases: [X-S10]");
+    std::fs::write(data.join("bodies/fujifilm-x-s10.body.yaml"), body).expect("body copy");
+    let schema = std::fs::read_to_string(workspace.join("data/bodies/fujifilm-x-t5.yaml"))
+        .expect("control schema")
+        .replace("body: fujifilm/x-t5", "body: fujifilm/x-s10");
+    std::fs::write(data.join("bodies/fujifilm-x-s10.yaml"), schema).expect("schema copy");
 
     let seeds = dir.join("seeds.json");
     let seed_text = format!(
@@ -84,6 +104,7 @@ fn build_fixture() -> Fixture {
     let images = prepare(&module, &raw, &renders);
     Fixture {
         dir,
+        data,
         module,
         raw: raw_path,
         jpegs,
@@ -138,6 +159,43 @@ fn build_module() -> PathBuf {
     wasm
 }
 
+/// The JPEG preview embedded in a RAF: offset at 0x54, length at 0x58, big-endian.
+fn raf_jpeg(raw: &[u8]) -> Vec<u8> {
+    let offset = u32::from_be_bytes(raw[0x54..0x58].try_into().expect("offset")) as usize;
+    let length = u32::from_be_bytes(raw[0x58..0x5c].try_into().expect("length")) as usize;
+    raw[offset..offset + length].to_vec()
+}
+
+fn exif_segment(jpeg: &[u8]) -> Option<&[u8]> {
+    let mut index = 2;
+    while index + 4 <= jpeg.len() {
+        if jpeg[index] != 0xff {
+            return None;
+        }
+        let marker = jpeg[index + 1];
+        if marker == 0xda || marker == 0xd9 {
+            return None;
+        }
+        let length = usize::from(u16::from_be_bytes([jpeg[index + 2], jpeg[index + 3]]));
+        if marker == 0xe1 && jpeg.get(index + 4..index + 10)? == b"Exif\0\0" {
+            return Some(&jpeg[index..index + 2 + length]);
+        }
+        index += 2 + length;
+    }
+    None
+}
+
+fn splice_exif(original: &[u8], render: &[u8]) -> Vec<u8> {
+    let Some(segment) = exif_segment(original) else {
+        return render.to_vec();
+    };
+    let mut out = Vec::with_capacity(render.len() + segment.len());
+    out.extend_from_slice(&render[..2]);
+    out.extend_from_slice(segment);
+    out.extend_from_slice(&render[2..]);
+    out
+}
+
 fn jpeg_from_image(image: &Image3, exposure: f64) -> Vec<u8> {
     let codes: Vec<u8> = image
         .data
@@ -159,39 +217,6 @@ fn jpeg_from_image(image: &Image3, exposure: f64) -> Vec<u8> {
         )
         .expect("JPEG encodes");
     bytes
-}
-
-fn raw_image(decoded: &DecodedRaw) -> Image3 {
-    let wb = decoded.as_shot_wb;
-    let data = decoded
-        .rgb
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .map(|pixel| {
-            [
-                (f64::from(pixel[0]) * wb[0]) as f32,
-                (f64::from(pixel[1]) * wb[1]) as f32,
-                (f64::from(pixel[2]) * wb[2]) as f32,
-            ]
-        })
-        .collect();
-    Image3::new(decoded.width as u32, decoded.height as u32, data)
-        .expect("dimensions match")
-        .apply_orientation(meta_orientation(decoded.orientation))
-}
-
-fn meta_orientation(orientation: Orientation) -> looklab_meta::Orientation {
-    match orientation {
-        Orientation::Normal => looklab_meta::Orientation::Normal,
-        Orientation::HorizontalFlip => looklab_meta::Orientation::FlipHorizontal,
-        Orientation::Rotate180 => looklab_meta::Orientation::Rotate180,
-        Orientation::VerticalFlip => looklab_meta::Orientation::FlipVertical,
-        Orientation::Transpose => looklab_meta::Orientation::Transpose,
-        Orientation::Rotate90 => looklab_meta::Orientation::Rotate90Clockwise,
-        Orientation::Transverse => looklab_meta::Orientation::Transverse,
-        Orientation::Rotate270 => looklab_meta::Orientation::Rotate270Clockwise,
-    }
 }
 
 fn prepare(module: &Path, raw: &[u8], jpegs: &[Vec<u8>]) -> Vec<PreparedImageView> {
@@ -255,6 +280,32 @@ fn call_module(module_path: &Path, fn_id: u32, input: &[u8]) -> Vec<u8> {
     output
 }
 
+/// The fixture's makernotes: DR100, neutral tones, Saturation 0, WB shift 0/0, EC 0,
+/// grain off, clarity 0, noise reduction 0, FilmMode provia.
+fn settings() -> ControlSettings {
+    let entries = [
+        "dynamic_range",
+        "highlight_tone",
+        "shadow_tone",
+        "color",
+        "color_chrome_effect",
+        "color_chrome_fx_blue",
+        "wb_shift_r",
+        "wb_shift_b",
+        "exposure_compensation",
+        "grain",
+        "clarity",
+        "noise_reduction",
+    ]
+    .into_iter()
+    .map(|key| ControlEntry {
+        key: ControlKey::new(key).expect("control key"),
+        step: StepIndex::new(0),
+    })
+    .collect();
+    ControlSettings::new(entries).expect("unique settings")
+}
+
 struct Site {
     manifest: BatchManifest,
     blobs: Vec<Vec<u8>>,
@@ -284,10 +335,10 @@ impl Site {
             manifest: BatchManifest {
                 kind: ContributionKind::Library,
                 intent: Intent::Native,
-                body: BodyId::new("fujifilm/x-s10").expect("body id"),
-                firmware_version: FirmwareVersionString::new("1.00").expect("firmware"),
-                sim_key: SimKey::new("provia").expect("sim key"),
-                settings: ControlSettings::new(Vec::new()).expect("settings"),
+                body: BodyId::new(BODY).expect("body id"),
+                firmware_version: FirmwareVersionString::new(FIRMWARE).expect("firmware"),
+                sim_key: SimKey::new(SIM).expect("sim key"),
+                settings: settings(),
                 images,
             },
             blobs: fixture
@@ -340,6 +391,36 @@ impl Site {
         self
     }
 
+    fn with_firmware(mut self, firmware: &str) -> Self {
+        self.manifest.firmware_version = FirmwareVersionString::new(firmware).expect("firmware");
+        self
+    }
+
+    fn with_serial(mut self, serial: &[u8]) -> Self {
+        self.serial = Some(serial.to_vec());
+        self
+    }
+
+    fn with_hidden_setting(mut self) -> Self {
+        let mut entries = self.manifest.settings.entries().to_vec();
+        entries.push(ControlEntry {
+            key: ControlKey::new("hidden").expect("control key"),
+            step: StepIndex::new(12_345),
+        });
+        self.manifest.settings = ControlSettings::new(entries).expect("unique settings");
+        self
+    }
+
+    fn with_positive_zero_tone(mut self) -> Self {
+        if let Some(look) = self.manifest.images[0].meta.look.as_mut() {
+            look.highlight_tone = Some(Tagged {
+                raw: 0,
+                value: Some(0.0),
+            });
+        }
+        self
+    }
+
     fn reversed(mut self) -> Self {
         self.manifest.images.reverse();
         self.blobs.reverse();
@@ -386,18 +467,19 @@ fn assertion(
     extra: Option<&(String, Value)>,
     extensions: Option<&[(String, i64)]>,
 ) -> WebAuthnAssertion {
-    let mut client_data = serde_json::Map::new();
-    client_data.insert("type".to_owned(), json!("webauthn.get"));
-    client_data.insert(
-        "challenge".to_owned(),
-        json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge.as_bytes())),
+    let mut client_data_json = format!(
+        "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":{},\"crossOrigin\":false",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge.as_bytes()),
+        serde_json::to_string(origin).expect("origin quotes")
     );
-    client_data.insert("origin".to_owned(), json!(origin));
-    client_data.insert("crossOrigin".to_owned(), json!(false));
     if let Some((key, value)) = extra {
-        client_data.insert(key.clone(), value.clone());
+        client_data_json.push(',');
+        client_data_json.push_str(&serde_json::to_string(key).expect("key quotes"));
+        client_data_json.push(':');
+        client_data_json.push_str(&value.to_string());
     }
-    let client_data_json = serde_json::to_vec(&client_data).expect("client data encodes");
+    client_data_json.push('}');
+    let client_data_json = client_data_json.into_bytes();
 
     let mut authenticator_data = Vec::new();
     authenticator_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
@@ -436,8 +518,14 @@ fn default_har(site: &Site) -> HarBuilder {
         .post("https://looklab.test/api/nonce")
         .upload(site.body())
         .get("https://looklab.test/status/abc123")
-        .post("https://looklab.test/api/passkey/register/start")
-        .post("https://looklab.test/api/passkey/register/finish")
+        .post_body(
+            "https://looklab.test/api/passkey/register/start",
+            br#"{"display_handle":"alice"}"#,
+        )
+        .post_body(
+            "https://looklab.test/api/passkey/register/finish",
+            br#"{"handle":"registration-handle","credential":{"id":"Y3JlZA"}}"#,
+        )
 }
 
 struct HarBuilder {
@@ -461,12 +549,28 @@ impl HarBuilder {
         self
     }
 
+    fn post_body(mut self, url: &str, body: &[u8]) -> Self {
+        self.entries.push(entry("POST", url, Some(body)));
+        self
+    }
+
     fn upload(mut self, body: Vec<u8>) -> Self {
         self.entries.push(entry(
             "POST",
             "https://looklab.test/api/upload",
             Some(&body),
         ));
+        self
+    }
+
+    fn header(mut self, name: &str, value: &str) -> Self {
+        let Some(last) = self.entries.last_mut() else {
+            panic!("a header needs a request");
+        };
+        last["request"]["headers"]
+            .as_array_mut()
+            .expect("headers are an array")
+            .push(json!({"name": name, "value": value}));
         self
     }
 
@@ -483,7 +587,15 @@ impl HarBuilder {
 }
 
 fn entry(method: &str, url: &str, body: Option<&[u8]>) -> Value {
-    let mut request = json!({"method": method, "url": url});
+    let mut request = json!({
+        "method": method,
+        "url": url,
+        "headers": [
+            {"name": "Host", "value": "looklab.test"},
+            {"name": "Accept", "value": "*/*"},
+            {"name": "Sec-Fetch-Site", "value": "same-origin"}
+        ],
+    });
     if let Some(body) = body {
         request["postData"] = json!({
             "mimeType": "application/octet-stream",
@@ -505,7 +617,10 @@ fn run(fixture: &Fixture, hars: &[&Path], state: &Path) -> (bool, String) {
     command
         .arg("--module")
         .arg(&fixture.module)
-        .args(["--origin", ORIGIN, "--rp-id", RP_ID, "--state"])
+        .args(["--origin", ORIGIN, "--rp-id", RP_ID, "--data"])
+        .arg(&fixture.data)
+        .args(["--kind", "library", "--intent", "native"])
+        .arg("--state")
         .arg(state)
         .args([
             "--pow-memory-kib",
@@ -567,17 +682,79 @@ fn reproduces_an_upload_and_passes() {
     assert!(output.contains("PASS"), "{output}");
     assert!(output.contains("reproduced byte for byte"), "{output}");
     assert!(
-        output.contains("Residual channels (documented, not closed):"),
+        output.contains("reproduced and declared fields match"),
         "{output}"
     );
     assert!(
-        output.contains("credential ID chosen at passkey registration"),
+        output.contains("body: fujifilm/x-s10 (reproduced"),
+        "{output}"
+    );
+    assert!(output.contains("firmware: 1.00 (reproduced"), "{output}");
+    assert!(output.contains("sim: provia (reproduced"), "{output}");
+    assert!(output.contains("kind: Library (declared)"), "{output}");
+    assert!(output.contains("intent: native (declared)"), "{output}");
+    assert!(output.contains("display_handle"), "{output}");
+    assert!(output.contains("registration-handle"), "{output}");
+    assert!(
+        output.contains("Residual channels (documented, not closed):"),
         "{output}"
     );
 
     let recorded: Value =
         serde_json::from_str(&std::fs::read_to_string(&state).expect("state file")).expect("json");
     assert_eq!(recorded["credentials"][0]["credential_id"], hex(CREDENTIAL));
+}
+
+#[test]
+fn fails_on_a_fabricated_batch_field() {
+    let fixture = fixture();
+    let site = Site::new().with_firmware("1.01");
+    let har = har_path("firmware", &default_har(&site).json());
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("firmware"));
+
+    assert!(!success, "{output}");
+    assert!(output.contains("firmware version is 1.01"), "{output}");
+    assert!(output.contains("reproduced 1.00"), "{output}");
+}
+
+#[test]
+fn fails_on_a_setting_outside_the_schema() {
+    let fixture = fixture();
+    let site = Site::new().with_hidden_setting();
+    let har = har_path("hidden-setting", &default_har(&site).json());
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("hidden-setting"));
+
+    assert!(!success, "{output}");
+    assert!(output.contains("hidden"), "{output}");
+    assert!(output.contains("not reproduced"), "{output}");
+}
+
+#[test]
+fn fails_on_signed_zero_manifest_bytes() {
+    let fixture = fixture();
+    let site = Site::new().with_positive_zero_tone();
+    let har = har_path("signed-zero", &default_har(&site).json());
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("signed-zero"));
+
+    assert!(!success, "{output}");
+    assert!(
+        output.contains("the manifest does not match the reproduced and declared manifest"),
+        "{output}"
+    );
+}
+
+#[test]
+fn fails_on_an_unrelated_serial() {
+    let fixture = fixture();
+    let site = Site::new().with_serial(b"SERIAL999");
+    let har = har_path("serial", &default_har(&site).json());
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("serial"));
+
+    assert!(!success, "{output}");
+    assert!(
+        output.contains("matches no input file's EXIF serial"),
+        "{output}"
+    );
 }
 
 #[test]
@@ -660,6 +837,36 @@ fn fails_on_an_unexpected_request() {
 }
 
 #[test]
+fn fails_on_a_body_in_a_nonce_request() {
+    let fixture = fixture();
+    let site = Site::new();
+    let har = HarBuilder::new()
+        .post_body("https://looklab.test/api/nonce", b"{\"hidden\":1}")
+        .upload(site.body())
+        .json();
+    let har = har_path("nonce-body", &har);
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("nonce-body"));
+
+    assert!(!success, "{output}");
+    assert!(output.contains("carries a body"), "{output}");
+    assert!(output.contains("hidden"), "{output}");
+}
+
+#[test]
+fn marks_a_custom_header_for_review() {
+    let fixture = fixture();
+    let site = Site::new();
+    let har = default_har(&site).header("X-Secret", "hidden-value").json();
+    let har = har_path("header", &har);
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("header"));
+
+    assert!(success, "{output}");
+    assert!(output.contains("REVIEW NEEDED"), "{output}");
+    assert!(output.contains("X-Secret"), "{output}");
+    assert!(output.contains("hidden-value"), "{output}");
+}
+
+#[test]
 fn fails_on_a_wrong_challenge() {
     let fixture = fixture();
     let site = Site::new().with_challenge(Challenge::from_bytes([0x11; 32]));
@@ -738,6 +945,63 @@ fn marks_an_unknown_client_data_key_for_review() {
     assert!(output.contains("REVIEW NEEDED"), "{output}");
     assert!(output.contains("\"animal\""), "{output}");
     assert!(output.contains("\"cat\""), "{output}");
+}
+
+#[test]
+fn marks_an_unexpected_top_origin_for_review() {
+    let fixture = fixture();
+    let site = Site::new().with_extra_key("topOrigin", json!("https://top.test"));
+    let har = har_path("top-origin", &default_har(&site).json());
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("top-origin"));
+
+    assert!(success, "{output}");
+    assert!(output.contains("REVIEW NEEDED"), "{output}");
+    assert!(output.contains("topOrigin"), "{output}");
+    assert!(output.contains("https://top.test"), "{output}");
+}
+
+#[test]
+fn marks_a_non_canonical_client_data_json_for_review() {
+    let fixture = fixture();
+    let site = Site::new();
+    let assertion = site.body();
+    let har = default_har(&site);
+    // Re-encode the same client_data_json with whitespace and a Unicode escape.
+    let body = rewrite_client_data(&assertion, |json| {
+        json.replacen("{\"type\"", "{ \"type\"", 1)
+            .replace("https://looklab.test", "https:\\u002f\\u002flooklab.test")
+    });
+    let mut har = har;
+    har.entries[1] = entry("POST", "https://looklab.test/api/upload", Some(&body));
+    let har = har_path("non-canonical", &har.json());
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("non-canonical"));
+
+    assert!(success, "{output}");
+    assert!(output.contains("REVIEW NEEDED"), "{output}");
+    assert!(
+        output.contains("not the WebAuthn serialization"),
+        "{output}"
+    );
+}
+
+fn rewrite_client_data(body: &[u8], rewrite: impl Fn(String) -> String) -> Vec<u8> {
+    let mut out = body.to_vec();
+    let manifest_len =
+        u32::from_le_bytes(out[40..44].try_into().expect("manifest length")) as usize;
+    let mut index = 44 + manifest_len;
+    let credential_len = usize::from(out[index]);
+    index += 1 + credential_len;
+    let authenticator_len = usize::from(u16::from_le_bytes([out[index], out[index + 1]]));
+    index += 2 + authenticator_len;
+    let client_start = index + 2;
+    let client_len = usize::from(u16::from_le_bytes([out[index], out[index + 1]]));
+    let client_end = client_start + client_len;
+    let client = String::from_utf8(out[client_start..client_end].to_vec()).expect("client data");
+    let replacement = rewrite(client).into_bytes();
+    assert!(replacement.len() <= 1024, "client_data_json stays in limit");
+    out.splice(client_start..client_end, replacement.iter().copied());
+    out[index..index + 2].copy_from_slice(&(replacement.len() as u16).to_le_bytes());
+    out
 }
 
 #[test]

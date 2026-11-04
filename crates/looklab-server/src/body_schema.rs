@@ -14,6 +14,7 @@ use looklab_upload::{BodyId, ControlSettings, SimKey};
 pub struct BodyRecord {
     pub make: String,
     pub model: String,
+    pub exif_aliases: Vec<String>,
     pub schema: ControlSchema,
 }
 
@@ -38,7 +39,7 @@ pub enum BodiesError {
 
 impl Bodies {
     pub fn load(dir: &Path) -> Result<Self, BodiesError> {
-        let mut entities: BTreeMap<String, (String, String)> = BTreeMap::new();
+        let mut entities: BTreeMap<String, (String, String, Vec<String>)> = BTreeMap::new();
         let mut schemas: BTreeMap<String, ControlSchema> = BTreeMap::new();
 
         let mut entries = std::fs::read_dir(dir)?
@@ -59,7 +60,11 @@ impl Bodies {
                     Ok(body) => {
                         entities.insert(
                             body.id.as_str().to_owned(),
-                            (body.make.clone(), body.model.clone()),
+                            (
+                                body.make.clone(),
+                                body.model.clone(),
+                                body.exif_aliases.clone(),
+                            ),
                         );
                     }
                     Err(errors) => {
@@ -89,7 +94,7 @@ impl Bodies {
 
         let mut records = BTreeMap::new();
         for (id, schema) in schemas {
-            let Some((make, model)) = entities.get(&id) else {
+            let Some((make, model, exif_aliases)) = entities.get(&id) else {
                 return Err(BodiesError::MissingBodyEntity { body: id });
             };
             records.insert(
@@ -97,6 +102,7 @@ impl Bodies {
                 BodyRecord {
                     make: make.clone(),
                     model: model.clone(),
+                    exif_aliases: exif_aliases.clone(),
                     schema,
                 },
             );
@@ -106,6 +112,10 @@ impl Bodies {
 
     pub fn get(&self, body: &BodyId) -> Option<&BodyRecord> {
         self.records.get(body.as_str())
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = (&String, &BodyRecord)> {
+        self.records.iter()
     }
 
     pub fn len(&self) -> usize {
@@ -273,6 +283,7 @@ epochs:
         BodyRecord {
             make: "Fujifilm".to_owned(),
             model: "X-T5".to_owned(),
+            exif_aliases: Vec::new(),
             schema: validate_control_schema(SCHEMA).expect("test schema"),
         }
     }

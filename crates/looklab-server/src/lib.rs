@@ -5,7 +5,7 @@ pub mod admin;
 mod api;
 mod audit;
 mod blob;
-mod body_schema;
+pub mod body_schema;
 mod config;
 mod db;
 mod error;

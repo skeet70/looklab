@@ -40,5 +40,6 @@ pub use nonce::{Challenge, ManifestHash, Nonce};
 pub use pow::{POW_K, PowError, PowParams, PowSolutions, solve, verify};
 pub use webauthn::{
     ClientDataExtra, ExpectedAssertion, ExtensionEntry, Extensions, ReviewValue,
-    SignatureAlgorithm, StructuralError, StructuralVerdict, WebAuthnAssertion, check_structure,
+    SignatureAlgorithm, StructuralError, StructuralVerdict, TopOriginReview, WebAuthnAssertion,
+    check_structure,
 };

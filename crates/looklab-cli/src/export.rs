@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 use looklab_export::{
     Artifact, BakeIlluminant, Baker, CctK, InsertionSpec, ValidationReport, cube_files, validate,
-    write_haldclut, write_native_json,
+    write_binary_f16, write_haldclut, write_native_json,
 };
 use looklab_model::LookDocument;
 use looklab_model::probes;
@@ -21,6 +21,7 @@ pub enum FormatChoice {
     Cube,
     Haldclut,
     NativeJson,
+    BinaryF16,
 }
 
 impl FormatChoice {
@@ -29,6 +30,7 @@ impl FormatChoice {
             Self::Cube => Format::Cube,
             Self::Haldclut => Format::Haldclut,
             Self::NativeJson => Format::NativeJson,
+            Self::BinaryF16 => Format::BinaryF16,
         }
     }
 
@@ -37,6 +39,7 @@ impl FormatChoice {
             Self::Cube => "cube",
             Self::Haldclut => "haldclut",
             Self::NativeJson => "native_json",
+            Self::BinaryF16 => "binary_f16",
         }
     }
 }
@@ -155,7 +158,7 @@ fn write_output(
             let written = crate::write(&args.out, text.as_bytes())?;
             println!("wrote {} ({} bytes)", args.out.display(), written);
         }
-        Format::Cube | Format::Haldclut => {
+        Format::Cube | Format::Haldclut | Format::BinaryF16 => {
             let published = match output.bake {
                 BakeIlluminant::Single { .. } => vec![(None, output.primary_artifact())],
                 BakeIlluminant::DualInterpolated => output
@@ -217,6 +220,11 @@ fn write_artifact(
             let written = crate::write(path, &bytes)?;
             println!("wrote {} ({} bytes)", path.display(), written);
         }
+        Format::BinaryF16 => {
+            let bytes = write_binary_f16(lut)?;
+            let written = crate::write(path, &bytes)?;
+            println!("wrote {} ({} bytes)", path.display(), written);
+        }
         Format::NativeJson => unreachable!("native_json is written from the whole output"),
     }
     Ok(())
@@ -227,5 +235,6 @@ fn extension(format: Format) -> &'static str {
         Format::Cube => "cube",
         Format::Haldclut => "png",
         Format::NativeJson => "json",
+        Format::BinaryF16 => "lut",
     }
 }

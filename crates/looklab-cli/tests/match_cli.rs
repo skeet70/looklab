@@ -29,6 +29,25 @@ fn write_document(path: &Path, slug: &str, look: &looklab_model::Look) {
 }
 
 #[test]
+fn match_requires_a_base_look_and_transform_without_synthetic() {
+    let output = looklab()
+        .args([
+            "match",
+            "--look",
+            "missing.looklab",
+            "--body",
+            "missing.yaml",
+            "--crm",
+            "missing.crm.json",
+        ])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("--base-look"), "{stderr}");
+}
+
+#[test]
 fn match_prints_a_card_and_verify_runs_one_iteration() {
     let temp = tempfile::tempdir().expect("tempdir");
     let body = synth::body(9).expect("synthetic body");
@@ -104,4 +123,34 @@ fn match_prints_a_card_and_verify_runs_one_iteration() {
     });
     assert!(stdout.contains("verify:"), "{stdout}");
     assert!(stdout.contains("second suggestion"), "{stdout}");
+    assert!(stdout.contains("second settings:"), "{stdout}");
+    let updated_crm = temp.path().join("match.updated.crm.json");
+    let updated_permalink = temp.path().join("match.updated.permalink");
+    let updated_result = temp.path().join("match.updated.result.json");
+    assert!(updated_crm.exists());
+    assert!(updated_permalink.exists());
+    assert!(updated_result.exists());
+
+    let result: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&updated_result).expect("result"))
+            .expect("result json");
+    let settings: looklab_model::realization::Settings =
+        serde_json::from_value(result["settings"].clone()).expect("settings");
+    let observed_dir = temp.path().join("observed2");
+    std::fs::create_dir_all(&observed_dir).expect("observed2 dir");
+    let samples = synth::observed(&body.model, &settings, &probes, 200).expect("observed2");
+    let bytes = looklab_samples::encode(&samples).expect("encode samples");
+    std::fs::write(observed_dir.join("observed.llsamp"), bytes).expect("write samples");
+
+    let stdout = ok({
+        let mut command = looklab();
+        command
+            .arg("verify")
+            .arg("--permalink")
+            .arg(&updated_permalink)
+            .arg("--observed")
+            .arg(&observed_dir);
+        command
+    });
+    assert!(stdout.contains("verify:"), "{stdout}");
 }

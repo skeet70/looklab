@@ -4,7 +4,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use looklab_upload::{
     Challenge, ExpectedAssertion, ManifestHash, Nonce, SignatureAlgorithm, StructuralError,
-    StructuralVerdict, WebAuthnAssertion, check_structure,
+    StructuralVerdict, TopOriginReview, WebAuthnAssertion, check_structure,
 };
 use sha2::{Digest, Sha256};
 
@@ -21,7 +21,7 @@ fn challenge() -> Challenge {
 
 fn client_data_json(challenge: &Challenge, extra: &str) -> Vec<u8> {
     format!(
-        r#"{{"type":"webauthn.get","challenge":"{}","origin":"{ORIGIN}"{extra}}}"#,
+        r#"{{"type":"webauthn.get","challenge":"{}","origin":"{ORIGIN}","crossOrigin":false{extra}}}"#,
         URL_SAFE_NO_PAD.encode(challenge.as_bytes())
     )
     .into_bytes()
@@ -56,6 +56,7 @@ fn expected(algorithm: SignatureAlgorithm) -> ExpectedAssertion<'static> {
         origin: ORIGIN,
         rp_id: RP_ID,
         algorithm,
+        top_origin: None,
     }
 }
 
@@ -118,13 +119,12 @@ fn wrong_origin_fails() {
 
 #[test]
 fn cross_origin_fails() {
-    let assertion = assertion(
-        &challenge(),
-        r#","crossOrigin":true"#,
-        0x01,
-        &[],
-        vec![0xab; 64],
-    );
+    let mut assertion = valid();
+    assertion.client_data_json = format!(
+        r#"{{"type":"webauthn.get","challenge":"{}","origin":"{ORIGIN}","crossOrigin":true}}"#,
+        URL_SAFE_NO_PAD.encode(challenge().as_bytes())
+    )
+    .into_bytes();
     assert!(matches!(
         failure(&assertion, SignatureAlgorithm::Ed25519),
         StructuralError::CrossOriginSet
@@ -133,15 +133,8 @@ fn cross_origin_fails() {
 
 #[test]
 fn cross_origin_false_is_accepted() {
-    let assertion = assertion(
-        &challenge(),
-        r#","crossOrigin":false"#,
-        0x01,
-        &[],
-        vec![0xab; 64],
-    );
     assert!(matches!(
-        check_structure(&assertion, &expected(SignatureAlgorithm::Ed25519)),
+        check_structure(&valid(), &expected(SignatureAlgorithm::Ed25519)),
         StructuralVerdict::Pass
     ));
 }
@@ -158,9 +151,13 @@ fn unknown_client_data_keys_need_review_sorted() {
     match check_structure(&assertion, &expected(SignatureAlgorithm::Ed25519)) {
         StructuralVerdict::ReviewNeeded {
             unknown_client_data_keys,
+            non_canonical_client_data,
+            top_origin,
             extensions,
         } => {
             assert!(extensions.is_none());
+            assert!(top_origin.is_none());
+            assert!(non_canonical_client_data.is_some());
             let keys: Vec<_> = unknown_client_data_keys
                 .iter()
                 .map(|extra| extra.key.as_str())
@@ -173,7 +170,32 @@ fn unknown_client_data_keys_need_review_sorted() {
 }
 
 #[test]
-fn top_origin_is_accepted() {
+fn non_canonical_client_data_needs_review() {
+    let mut assertion = valid();
+    assertion.client_data_json = format!(
+        r#"{{ "type": "webauthn.get", "challenge": "{}", "origin": "{ORIGIN}", "crossOrigin": false }}"#,
+        URL_SAFE_NO_PAD.encode(challenge().as_bytes())
+    )
+    .into_bytes();
+    match check_structure(&assertion, &expected(SignatureAlgorithm::Ed25519)) {
+        StructuralVerdict::ReviewNeeded {
+            unknown_client_data_keys,
+            non_canonical_client_data,
+            top_origin,
+            extensions,
+        } => {
+            assert!(unknown_client_data_keys.is_empty());
+            assert!(top_origin.is_none());
+            assert!(extensions.is_none());
+            let raw = non_canonical_client_data.expect("the bytes are reported");
+            assert!(raw.contains("\"type\": \"webauthn.get\""));
+        }
+        other => panic!("expected review, got {other:?}"),
+    }
+}
+
+#[test]
+fn unexpected_top_origin_needs_review() {
     let assertion = assertion(
         &challenge(),
         r#","topOrigin":"https://looklab.example""#,
@@ -181,14 +203,62 @@ fn top_origin_is_accepted() {
         &[],
         vec![0xab; 64],
     );
+    match check_structure(&assertion, &expected(SignatureAlgorithm::Ed25519)) {
+        StructuralVerdict::ReviewNeeded {
+            unknown_client_data_keys,
+            non_canonical_client_data,
+            top_origin,
+            extensions,
+        } => {
+            assert!(unknown_client_data_keys.is_empty());
+            assert!(non_canonical_client_data.is_none());
+            assert!(extensions.is_none());
+            assert_eq!(
+                top_origin,
+                Some(TopOriginReview::Unexpected(
+                    "https://looklab.example".to_owned()
+                ))
+            );
+        }
+        other => panic!("expected review, got {other:?}"),
+    }
+}
+
+#[test]
+fn expected_top_origin_passes() {
+    let assertion = assertion(
+        &challenge(),
+        r#","topOrigin":"https://looklab.example""#,
+        0x01,
+        &[],
+        vec![0xab; 64],
+    );
+    let expected = ExpectedAssertion {
+        top_origin: Some(ORIGIN),
+        ..expected(SignatureAlgorithm::Ed25519)
+    };
     assert!(matches!(
-        check_structure(&assertion, &expected(SignatureAlgorithm::Ed25519)),
+        check_structure(&assertion, &expected),
         StructuralVerdict::Pass
     ));
 }
 
 #[test]
-fn chrome_extra_key_is_accepted_with_its_fixed_text() {
+fn missing_expected_top_origin_needs_review() {
+    let expected = ExpectedAssertion {
+        top_origin: Some(ORIGIN),
+        ..expected(SignatureAlgorithm::Ed25519)
+    };
+    match check_structure(&valid(), &expected) {
+        StructuralVerdict::ReviewNeeded { top_origin, .. } => {
+            assert_eq!(top_origin, Some(TopOriginReview::Missing));
+        }
+        other => panic!("expected review, got {other:?}"),
+    }
+}
+
+#[test]
+fn chrome_extra_key_needs_review_as_non_canonical() {
     let assertion = assertion(
         &challenge(),
         &format!(r#","other_keys_can_be_added_here":"{OTHER_KEYS}""#),
@@ -196,10 +266,20 @@ fn chrome_extra_key_is_accepted_with_its_fixed_text() {
         &[],
         vec![0xab; 64],
     );
-    assert!(matches!(
-        check_structure(&assertion, &expected(SignatureAlgorithm::Ed25519)),
-        StructuralVerdict::Pass
-    ));
+    match check_structure(&assertion, &expected(SignatureAlgorithm::Ed25519)) {
+        StructuralVerdict::ReviewNeeded {
+            unknown_client_data_keys,
+            non_canonical_client_data,
+            top_origin,
+            extensions,
+        } => {
+            assert!(unknown_client_data_keys.is_empty());
+            assert!(non_canonical_client_data.is_some());
+            assert!(top_origin.is_none());
+            assert!(extensions.is_none());
+        }
+        other => panic!("expected review, got {other:?}"),
+    }
 }
 
 #[test]
@@ -309,6 +389,7 @@ fn extensions_need_review() {
         StructuralVerdict::ReviewNeeded {
             unknown_client_data_keys,
             extensions,
+            ..
         } => {
             assert!(unknown_client_data_keys.is_empty());
             let extensions = extensions.expect("extensions are decoded");
