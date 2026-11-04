@@ -48,6 +48,9 @@ fn prior_diagonal(options: &FitOptions, problem: &Problem, params: &Params) -> V
     }
     let slope = params.clip_slope();
     diagonal[layout.clip] = slope * slope / (options.clip_prior.1 * options.clip_prior.1);
+    for index in layout.response.clone() {
+        diagonal[index] = RESPONSE_PRIOR_PRECISION;
+    }
     diagonal
 }
 
@@ -78,7 +81,28 @@ pub(crate) fn probe_uncertainty(
     for (local, global) in block.params.iter().enumerate() {
         h[local * n + local] += priors[*global];
     }
-    let Some(inverse) = invert(&h, n) else {
+    let ridge = (0..n)
+        .map(|index| h[index * n + index])
+        .fold(0.0_f64, f64::max)
+        .max(1.0)
+        * 1e-6;
+    for index in 0..n {
+        h[index * n + index] += ridge;
+    }
+    let mut inverse = None;
+    let mut bump = ridge;
+    for _ in 0..14 {
+        let mut attempt = h.clone();
+        for index in 0..n {
+            attempt[index * n + index] += bump;
+        }
+        if let Some(found) = invert(&attempt, n) {
+            inverse = Some(found);
+            break;
+        }
+        bump *= 10.0;
+    }
+    let Some(inverse) = inverse else {
         return Err(crate::types::FitError::SingularRegularization);
     };
     let residual_diagonal = residual_inverse_diagonal(residual_samples, lambdas.residual);
@@ -250,8 +274,13 @@ pub(crate) fn response_covariance(
             }
         }
     }
+    for index in 0..n {
+        covariance[index * n + index] += 1.0 / RESPONSE_PRIOR_PRECISION;
+    }
     (problem.parameter_ids.clone(), covariance)
 }
+
+const RESPONSE_PRIOR_PRECISION: f64 = 10.0;
 
 fn response_lambda(
     lambdas: &crate::types::StageLambdas,

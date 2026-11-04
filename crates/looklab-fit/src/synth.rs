@@ -449,7 +449,11 @@ pub fn random_control_model(
                 let b = gaussian(&mut rng) / 3.0;
                 let c = gaussian(&mut rng) / 6.0;
                 let mut delta = Delta::default();
-                for feature in 0..layer.feature_count() {
+                let features = match layer {
+                    LayerKind::Tone | LayerKind::Tint => layer.feature_count(),
+                    _ => 6,
+                };
+                for feature in 0..features {
                     let jitter = 0.2 * gaussian(&mut rng);
                     delta.add(
                         *layer,
@@ -489,6 +493,33 @@ pub fn random_control_model(
     model
 }
 
+pub fn localized_hue_model(
+    schema: &ControlSchema,
+    epoch: u32,
+    base_sim: &SimKey,
+    feature: u32,
+    strength: f64,
+) -> ControlResponseModel {
+    let mut model = ControlResponseModel::zeroed(schema, epoch, base_sim, 1)
+        .expect("synthetic schemas are validated before generation");
+    for control in &mut model.controls {
+        if control.key.as_str() != "color_chrome_fx_blue" {
+            continue;
+        }
+        for value in &mut control.values {
+            let amount = match &value.value {
+                ControlValue::Enum(name) if name.as_str() == "strong" => strength,
+                ControlValue::Enum(name) if name.as_str() == "weak" => 0.5 * strength,
+                _ => 0.0,
+            };
+            let mut delta = Delta::default();
+            delta.add(LayerKind::Chroma, feature, amount);
+            value.delta.layers = delta.layers;
+        }
+    }
+    model
+}
+
 /// Random settings over a model's declared non-default values.
 pub fn random_settings(
     model: &ControlResponseModel,
@@ -523,6 +554,20 @@ pub fn random_settings(
 }
 
 pub fn controlled_dataset(config: &ControlSynthConfig) -> ControlledDataset {
+    let truth_model = random_control_model(
+        &config.schema,
+        config.epoch,
+        &config.base_sim,
+        config.truth_seed,
+        config.response_scale,
+    );
+    controlled_dataset_with(config, truth_model)
+}
+
+pub fn controlled_dataset_with(
+    config: &ControlSynthConfig,
+    truth_model: ControlResponseModel,
+) -> ControlledDataset {
     let n = config.settings.len();
     let mut base = config.base;
     base.images = n;
@@ -538,13 +583,6 @@ pub fn controlled_dataset(config: &ControlSynthConfig) -> ControlledDataset {
         }
     }
     let truth_look = truth_look(config.truth_seed);
-    let truth_model = random_control_model(
-        &config.schema,
-        config.epoch,
-        &config.base_sim,
-        config.truth_seed,
-        config.response_scale,
-    );
     let mut rng = ChaCha12Rng::seed_from_u64(config.truth_seed ^ 0x5a_11_ed_00_00_00_00_01);
     let mut images = Vec::with_capacity(n);
     for (index, scene) in scenes.iter().enumerate() {

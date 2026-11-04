@@ -17,9 +17,59 @@ use crate::error::{ModelError, Result};
 use crate::look::{GRL_COEFS, Look};
 
 pub const CRM_FORMAT: &str = "looklab-crm/1";
+const MAX_CRM_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CONTROLS: usize = 256;
+const MAX_VALUES: usize = 1024;
+const MAX_INTERACTIONS: usize = 1024;
+const MAX_EXPOSURE_ROWS: usize = 256;
 
 /// Unit-norm feature expansions for the chroma, hue and lightness layers.
-pub const GRL_FEATURES: u32 = 6;
+pub const GRL_FEATURES: u32 = 10;
+
+const HUE_BUMP_CENTERS: [f64; 4] = [45.0, 135.0, 225.0, 315.0];
+const HUE_BUMP_SIGMA: f64 = 40.0;
+
+/// Orthonormal hue patterns: constant, cosine, sine and four Gaussian bumps.
+#[allow(clippy::needless_range_loop)]
+static HUE_PATTERNS: std::sync::LazyLock<[[f64; HUE_COEFS]; 7]> = std::sync::LazyLock::new(|| {
+    let mut raw = [[0.0_f64; HUE_COEFS]; 7];
+    for hue in 0..HUE_COEFS {
+        let angle = 2.0 * PI * hue as f64 / HUE_COEFS as f64;
+        raw[0][hue] = 1.0;
+        raw[1][hue] = libm::cos(angle);
+        raw[2][hue] = libm::sin(angle);
+    }
+    for (bump, center) in HUE_BUMP_CENTERS.iter().enumerate() {
+        for hue in 0..HUE_COEFS {
+            let mut distance = (hue as f64 * 360.0 / HUE_COEFS as f64 - center).abs();
+            if distance > 180.0 {
+                distance = 360.0 - distance;
+            }
+            raw[3 + bump][hue] =
+                libm::exp(-0.5 * distance * distance / (HUE_BUMP_SIGMA * HUE_BUMP_SIGMA));
+        }
+    }
+    let mut basis = [[0.0_f64; HUE_COEFS]; 7];
+    for (index, row) in raw.iter().enumerate() {
+        let mut vector = *row;
+        for prior in &basis[..index] {
+            let projection: f64 = vector.iter().zip(prior.iter()).map(|(a, b)| a * b).sum();
+            for (slot, value) in vector.iter_mut().zip(prior.iter()) {
+                *slot -= projection * value;
+            }
+        }
+        let norm: f64 = vector
+            .iter()
+            .map(|value| value * value * S_COEFS as f64 * 3.0)
+            .sum::<f64>()
+            .sqrt();
+        let scale = 1.0 / norm.max(1e-12);
+        for (slot, value) in vector.iter_mut().enumerate() {
+            basis[index][slot] = *value * scale;
+        }
+    }
+    basis
+});
 
 /// Numeric controls store the integer multiple of their schema step, so `1/3`
 /// EV is `Step(1)`.
@@ -353,79 +403,23 @@ fn grl_feature_coefficient(feature: u32, index: usize) -> f64 {
     let s = (node / 3) % S_COEFS;
     let hue = node / (3 * S_COEFS);
     match feature {
-        1 => 1.0 / (volume_len as f64).sqrt(),
-        2 | 3 => {
-            let angle = 2.0 * PI * hue as f64 / HUE_COEFS as f64;
-            let scale = 1.0 / (0.5 * volume_len as f64).sqrt();
-            scale
-                * if feature == 2 {
-                    libm::cos(angle)
-                } else {
-                    libm::sin(angle)
-                }
-        }
+        1 => HUE_PATTERNS[0][hue],
+        2 => HUE_PATTERNS[1][hue],
+        3 => HUE_PATTERNS[2][hue],
         4 => {
             let variance = (S_COEFS as f64 * S_COEFS as f64 - 1.0) / 12.0;
             let scale = 1.0 / (variance * volume_len as f64).sqrt();
             (s as f64 - (S_COEFS as f64 - 1.0) / 2.0) * scale
         }
         5 => ((c as f64) - 1.0) / ((2.0 / 3.0) * volume_len as f64).sqrt(),
+        6..=9 => HUE_PATTERNS[3 + (feature - 6) as usize][hue],
         _ => 0.0,
     }
 }
 
 fn grl_feature_into(out: &mut [f64], feature: u32) {
-    let volume_len = HUE_COEFS * S_COEFS * 3;
-    match feature {
-        0 => {
-            let scale = 1.0 / (S_COEFS as f64).sqrt();
-            out[..S_COEFS].fill(scale);
-        }
-        1 => {
-            let scale = 1.0 / (volume_len as f64).sqrt();
-            out[S_COEFS..].fill(scale);
-        }
-        2 | 3 => {
-            let scale = 1.0 / (0.5 * volume_len as f64).sqrt();
-            for hue in 0..HUE_COEFS {
-                let angle = 2.0 * PI * hue as f64 / HUE_COEFS as f64;
-                let weight = scale
-                    * if feature == 2 {
-                        libm::cos(angle)
-                    } else {
-                        libm::sin(angle)
-                    };
-                for s in 0..S_COEFS {
-                    for c in 0..3 {
-                        out[S_COEFS + (hue * S_COEFS + s) * 3 + c] = weight;
-                    }
-                }
-            }
-        }
-        4 => {
-            let variance = (S_COEFS as f64 * S_COEFS as f64 - 1.0) / 12.0;
-            let scale = 1.0 / (variance * volume_len as f64).sqrt();
-            let middle = (S_COEFS as f64 - 1.0) / 2.0;
-            for hue in 0..HUE_COEFS {
-                for s in 0..S_COEFS {
-                    let weight = (s as f64 - middle) * scale;
-                    for c in 0..3 {
-                        out[S_COEFS + (hue * S_COEFS + s) * 3 + c] = weight;
-                    }
-                }
-            }
-        }
-        5 => {
-            let scale = 1.0 / ((2.0 / 3.0) * volume_len as f64).sqrt();
-            for hue in 0..HUE_COEFS {
-                for s in 0..S_COEFS {
-                    for c in 0..3 {
-                        out[S_COEFS + (hue * S_COEFS + s) * 3 + c] = (c as f64 - 1.0) * scale;
-                    }
-                }
-            }
-        }
-        _ => {}
+    for (index, slot) in out.iter_mut().enumerate() {
+        *slot = grl_feature_coefficient(feature, index);
     }
 }
 
@@ -863,18 +857,18 @@ impl ControlResponseModel {
         out
     }
 
-    /// The additive layer delta and camera-space WB log gain for `settings`.
+    /// The additive layer delta and WB control increments (`ω` excluded).
     pub fn delta(&self, settings: &Settings) -> (Delta, [f64; 2]) {
         let ids = self.parameter_ids();
         let mut delta = Delta::default();
-        let mut wb = self.wb.omega;
+        let mut wb = [0.0_f64; 2];
         for (index, weight) in self.active_parameters(settings) {
             let Some(id) = ids.get(index) else {
                 continue;
             };
             match id.component {
-                ResponseComponent::WbR => wb[0] += self.wb_value(&id.control, &id.value) * weight,
-                ResponseComponent::WbB => wb[1] += self.wb_value(&id.control, &id.value) * weight,
+                ResponseComponent::WbR => wb[0] += self.wb_gain(&id.control, &id.value)[0] * weight,
+                ResponseComponent::WbB => wb[1] += self.wb_gain(&id.control, &id.value)[1] * weight,
                 _ => {
                     if let Some(layer) = id.component.layer() {
                         let value = self.delta_value(&id.control, &id.value, layer, id.feature);
@@ -925,17 +919,69 @@ impl ControlResponseModel {
             .unwrap_or(0.0)
     }
 
-    fn wb_value(&self, control: &ControlKey, value: &ControlValue) -> f64 {
+    fn wb_gain(&self, control: &ControlKey, value: &ControlValue) -> [f64; 2] {
         self.wb
             .controls
             .iter()
             .find(|entry| &entry.key == control)
             .and_then(|entry| entry.values.iter().find(|entry| &entry.value == value))
-            .map(|entry| entry.log_gain.iter().sum::<f64>() / 2.0)
-            .unwrap_or(0.0)
+            .map(|entry| entry.log_gain)
+            .unwrap_or([0.0; 2])
     }
 
     pub fn validate(&self) -> core::result::Result<(), RealizationError> {
+        if self.controls.len() > MAX_CONTROLS
+            || self.wb.controls.len() > MAX_CONTROLS
+            || self.interactions.len() > MAX_INTERACTIONS
+            || self.exposure.modes.len() > MAX_EXPOSURE_ROWS
+            || self.exposure.steps.len() > MAX_EXPOSURE_ROWS
+            || self
+                .controls
+                .iter()
+                .any(|control| control.values.len() > MAX_VALUES)
+            || self
+                .wb
+                .controls
+                .iter()
+                .any(|control| control.values.len() > MAX_VALUES)
+        {
+            return Err(RealizationError::Invalid(
+                "control response model exceeds its size limits".to_string(),
+            ));
+        }
+        for (index, control) in self.controls.iter().enumerate() {
+            if self.controls[..index]
+                .iter()
+                .any(|other| other.key == control.key)
+            {
+                return Err(RealizationError::Invalid(format!(
+                    "duplicate control {}",
+                    control.key
+                )));
+            }
+            for (position, value) in control.values.iter().enumerate() {
+                if control.values[..position]
+                    .iter()
+                    .any(|other| other.value == value.value)
+                {
+                    return Err(RealizationError::Invalid(format!(
+                        "duplicate value on {}",
+                        control.key
+                    )));
+                }
+            }
+        }
+        for (index, control) in self.wb.controls.iter().enumerate() {
+            if self.wb.controls[..index]
+                .iter()
+                .any(|other| other.key == control.key)
+            {
+                return Err(RealizationError::Invalid(format!(
+                    "duplicate WB control {}",
+                    control.key
+                )));
+            }
+        }
         for control in &self.controls {
             if control
                 .values
@@ -1222,6 +1268,9 @@ pub fn encode_crm(model: &ControlResponseModel) -> Result<Vec<u8>> {
 }
 
 pub fn decode_crm(bytes: &[u8]) -> Result<ControlResponseModel> {
+    if bytes.len() > MAX_CRM_BYTES {
+        return Err(ModelError::Invalid("crm.json is too large".to_string()));
+    }
     let file: CrmFile = serde_json::from_slice(bytes)?;
     if file.format != CRM_FORMAT {
         return Err(ModelError::Format(file.format));
@@ -1231,4 +1280,60 @@ pub fn decode_crm(bytes: &[u8]) -> Result<ControlResponseModel> {
         other => ModelError::Invalid(other.to_string()),
     })?;
     Ok(file.model)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Look;
+
+    fn model() -> ControlResponseModel {
+        let key = ControlKey::new("wb_shift_r").expect("key");
+        ControlResponseModel {
+            body: BodyId::new("test/body").expect("body"),
+            epoch: 1,
+            base_sim: SimKey::new("sim").expect("sim"),
+            version: 1,
+            controls: Vec::new(),
+            interactions: Vec::new(),
+            wb: WbEffect {
+                controls: vec![WbControlResponse {
+                    key,
+                    default: ControlValue::Step(0),
+                    values: vec![WbValueResponse {
+                        value: ControlValue::Step(1),
+                        log_gain: [0.1, -0.1],
+                    }],
+                }],
+                omega: [-0.02, 0.03],
+            },
+            exposure: ExposureEffect::default(),
+            support: Support::default(),
+        }
+    }
+
+    #[test]
+    fn wb_channels_stay_independent_and_omega_is_applied_once() {
+        let model = model();
+        let look = Look::colorimetric();
+        let mut settings = Settings::new();
+        settings.set(
+            ControlKey::new("wb_shift_r").expect("key"),
+            ControlValue::Step(1),
+        );
+        let realized = realize(&look, &model, &settings).expect("realizes");
+        assert!((realized.wb_gain[0] - libm::exp(0.08)).abs() < 1e-12);
+        assert!((realized.wb_gain[2] - libm::exp(-0.07)).abs() < 1e-12);
+        let neutral = realize(&look, &model, &Settings::new()).expect("realizes");
+        assert!((neutral.wb_gain[0] - libm::exp(-0.02)).abs() < 1e-12);
+        assert!((neutral.wb_gain[2] - libm::exp(0.03)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn crm_validation_rejects_duplicate_controls() {
+        let mut model = model();
+        let duplicate = model.wb.controls[0].clone();
+        model.wb.controls.push(duplicate);
+        assert!(model.validate().is_err());
+    }
 }

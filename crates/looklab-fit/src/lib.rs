@@ -60,5 +60,9 @@ pub fn refit_responses(
     model: &ControlResponseModel,
     options: &FitOptions,
 ) -> Result<ControlResponseFit> {
-    fit::run_responses(look, images, schema, epoch, base_sim, model, options)
+    let (kept, _excluded) = fit::filter_spatial(images, schema, epoch)?;
+    if kept.is_empty() {
+        return Err(FitError::NoSamples);
+    }
+    fit::run_responses(look, &kept, schema, epoch, base_sim, model, options)
 }

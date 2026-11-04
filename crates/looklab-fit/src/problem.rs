@@ -7,7 +7,7 @@ use looklab_color::{Mat3, Rgb, RgbSpace};
 use looklab_model::Look;
 use looklab_model::basis::TONE_COEFS;
 use looklab_model::realization::{
-    ControlResponseModel, Delta, ResponseComponent, ResponseParamId, Settings,
+    ControlResponseModel, ControlValue, Delta, ResponseComponent, ResponseParamId, Settings,
 };
 use looklab_model::solve::ucs_of_xyz;
 use looklab_samples::OutputSpace;
@@ -65,6 +65,7 @@ pub(crate) struct Problem {
     pub parameter_ids: Vec<ResponseParamId>,
     pub terms: Vec<Vec<ResponseTerm>>,
     pub settings: Vec<Settings>,
+    pub defaults: Vec<(looklab_schema::ControlKey, ControlValue)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -292,6 +293,20 @@ impl Problem {
             parameter_ids.len(),
         );
         let settings = images.iter().map(|image| image.settings.clone()).collect();
+        let defaults = model.map_or_else(Vec::new, |model| {
+            model
+                .controls
+                .iter()
+                .map(|control| (control.key.clone(), control.default.clone()))
+                .chain(
+                    model
+                        .wb
+                        .controls
+                        .iter()
+                        .map(|control| (control.key.clone(), control.default.clone())),
+                )
+                .collect()
+        });
         Ok(Self {
             layout,
             images: entries,
@@ -303,6 +318,7 @@ impl Problem {
             parameter_ids,
             terms,
             settings,
+            defaults,
         })
     }
 

@@ -3,7 +3,7 @@
 
 use looklab_model::basis::{RESIDUAL_COEFS, S_COEFS, TONE_COEFS};
 use looklab_model::realization::{
-    ControlResponseModel, LayerKind, ResponseComponent, ResponseParamId,
+    ControlResponseModel, ControlValue, LayerKind, ResponseComponent, ResponseParamId,
 };
 use looklab_schema::{Control, ControlDefault, ControlSchema, ScalarValue, Tolerated};
 
@@ -228,6 +228,30 @@ pub(crate) fn run_with(
     let mut lambdas = StageLambdas::default();
     let mut evaluations = 0usize;
 
+    if model.is_some() {
+        let reference: Vec<FitImage> = native
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| problem.terms[*index].is_empty())
+            .map(|(_, image)| image.clone())
+            .collect();
+        if reference.len() >= 4 && reference.len() < native.len() {
+            let reference_fit = run_with(&reference, options, None, Vec::new())?;
+            evaluations += reference_fit.diagnostics.evaluations;
+            apply_look(&problem, &mut params, &reference_fit.look);
+        }
+        if !problem.layout.response.is_empty() {
+            run_frozen_responses(
+                &problem,
+                &mut params,
+                options,
+                &mut lambdas,
+                &mut evaluations,
+                IntentFilter::NativeOnly,
+            )?;
+        }
+    }
+
     // Total sample evaluations are bounded so a large batch cannot run unbounded.
     let allowed_sweeps =
         (options.sweep_budget / problem.samples.len().max(1) as f64).clamp(8.0, 64.0) as usize;
@@ -243,6 +267,7 @@ pub(crate) fn run_with(
             .iter()
             .copied()
             .filter(|kind| options.fit_residual || *kind != BlockKind::Residual)
+            .filter(|kind| !is_response_kind(*kind))
             .collect();
         let mut blocks: Vec<BlockAcc> = kinds
             .iter()
@@ -340,6 +365,17 @@ pub(crate) fn run_with(
             update_sigma(&problem, &mut params, &pass, options);
             damping = (damping * 0.3).max(1e-6);
         }
+    }
+
+    if model.is_some() && !problem.layout.response.is_empty() {
+        run_frozen_responses(
+            &problem,
+            &mut params,
+            options,
+            &mut lambdas,
+            &mut evaluations,
+            IntentFilter::NativeOnly,
+        )?;
     }
 
     if images
@@ -483,11 +519,13 @@ pub(crate) fn run_with(
     let density = density::build(&problem, &params, options.density_floor_fraction);
     let image_stats = outlier::score(&problem, &final_pass, options);
     let uncertainty_penalty = double(combined_look_penalty(
+        &problem,
         &layout,
         &lambdas,
         uncertainty_blocks[0].len(),
+        true,
     ));
-    let probe_result = uncertainty::probe_uncertainty(
+    let joint = uncertainty::probe_uncertainty(
         &problem,
         &params,
         &look,
@@ -499,7 +537,53 @@ pub(crate) fn run_with(
         &density,
         &uncertainty_pass.residual_samples,
         options,
-    )?;
+    );
+    let probe_result = match joint {
+        Ok(result) => result,
+        Err(crate::types::FitError::SingularRegularization) => {
+            let look_params: Vec<usize> = uncertainty_blocks[0]
+                .params
+                .iter()
+                .copied()
+                .filter(|index| !layout.response.contains(index))
+                .collect();
+            let mut blocks = vec![
+                BlockAcc::new(BlockKind::Tone, look_params, layout.total),
+                make_block(&problem, BlockKind::Residual, ActiveColumns::ALL),
+            ];
+            let fallback_pass = problem.pass(
+                &params,
+                ActiveColumns::ALL,
+                &mut blocks,
+                false,
+                true,
+                false,
+                IntentFilter::All,
+            );
+            let penalty = double(combined_look_penalty(
+                &problem,
+                &layout,
+                &lambdas,
+                blocks[0].len(),
+                false,
+            ));
+            uncertainty::probe_uncertainty(
+                &problem,
+                &params,
+                &look,
+                &blocks[0],
+                &penalty,
+                fallback_pass.active_samples.max(1) as f64
+                    / fallback_pass.hessian_rows.max(1) as f64,
+                &lambdas,
+                &fallback_pass.per_image_gradient,
+                &density,
+                &fallback_pass.residual_samples,
+                options,
+            )?
+        }
+        Err(error) => return Err(error),
+    };
 
     let hessian_scale =
         final_pass.active_samples.max(1) as f64 / final_pass.hessian_rows.max(1) as f64;
@@ -631,6 +715,74 @@ fn carry_params(
     params
 }
 
+fn run_frozen_responses(
+    problem: &Problem,
+    params: &mut Params,
+    options: &FitOptions,
+    lambdas: &mut StageLambdas,
+    evaluations: &mut usize,
+    intents: IntentFilter,
+) -> Result<()> {
+    let kinds = [
+        BlockKind::Nuisance,
+        BlockKind::ResponseTone,
+        BlockKind::ResponseTint,
+        BlockKind::ResponseChroma,
+        BlockKind::ResponseHue,
+        BlockKind::ResponseLightness,
+        BlockKind::ResponseWb,
+    ];
+    for kind in &kinds[1..] {
+        let value = lam(lambdas, *kind).max(RESPONSE_LAMBDA_FLOOR);
+        set_lam(lambdas, *kind, value);
+    }
+    let mut blocks: Vec<BlockAcc> = kinds
+        .iter()
+        .map(|kind| make_block(problem, *kind, ActiveColumns::ALL))
+        .collect();
+    let penalties: Vec<Vec<f64>> = blocks
+        .iter()
+        .map(|block| block_penalty(problem, block))
+        .collect();
+    let layout = problem.layout.clone();
+    let roles = prior_roles(problem, &layout);
+    let mut damping = 1e-3;
+    for _ in 0..options.recipe_sweeps.max(1) {
+        for block in &mut blocks {
+            block.reset();
+        }
+        let pass = problem.pass(
+            params,
+            ActiveColumns::ALL,
+            &mut blocks,
+            false,
+            false,
+            false,
+            intents,
+        );
+        *evaluations += 1;
+        let mut step = vec![0.0_f64; layout.total];
+        for (index, block) in blocks.iter().enumerate() {
+            let (prior_gradient, prior_curvature) =
+                prior_terms(problem, &roles, params, options, block);
+            solve_block(
+                block,
+                &mut step,
+                &penalties[index],
+                &prior_gradient,
+                &prior_curvature,
+                params,
+                lambdas,
+                damping,
+            );
+        }
+        apply_step(params, &step);
+        update_sigma(problem, params, &pass, options);
+        damping = (damping * 0.3).max(1e-6);
+    }
+    Ok(())
+}
+
 pub(crate) fn run_responses(
     look: &looklab_model::Look,
     images: &[FitImage],
@@ -735,6 +887,11 @@ pub(crate) fn run_responses(
 
 fn params_from_look(problem: &Problem, look: &looklab_model::Look) -> Params {
     let mut params = Params::initial(problem.layout.clone(), problem.contributors.len());
+    apply_look(problem, &mut params, look);
+    params
+}
+
+fn apply_look(problem: &Problem, params: &mut Params, look: &looklab_model::Look) {
     let layout = look.layout();
     let coef = look.coef_vector();
     if let looklab_model::Tone::Spline { c0, beta } = look.tone {
@@ -751,7 +908,6 @@ fn params_from_look(problem: &Problem, look: &looklab_model::Look) -> Params {
     params.theta[problem.layout.lambda.clone()].copy_from_slice(&coef[layout.lambda.clone()]);
     params.theta[problem.layout.residual.clone()].copy_from_slice(&coef[layout.residual.clone()]);
     params.theta[problem.layout.clip] = crate::layout::zeta_from_clip(look.clip.k);
-    params
 }
 
 fn seed_response_params(problem: &Problem, params: &mut Params, model: &ControlResponseModel) {
@@ -1011,6 +1167,18 @@ fn make_block(problem: &Problem, kind: BlockKind, active: ActiveColumns) -> Bloc
     BlockAcc::new(kind, params, layout.total)
 }
 
+fn is_response_kind(kind: BlockKind) -> bool {
+    matches!(
+        kind,
+        BlockKind::ResponseTone
+            | BlockKind::ResponseTint
+            | BlockKind::ResponseChroma
+            | BlockKind::ResponseHue
+            | BlockKind::ResponseLightness
+            | BlockKind::ResponseWb
+    )
+}
+
 fn response_component(kind: BlockKind) -> Option<ResponseComponent> {
     match kind {
         BlockKind::ResponseTone => Some(ResponseComponent::Tone),
@@ -1048,11 +1216,20 @@ fn make_look_block(layout: &Layout, active: ActiveColumns) -> BlockAcc {
     if active.clip {
         params.push(layout.clip);
     }
+    if active.response {
+        params.extend(layout.response.clone());
+    }
     BlockAcc::new(BlockKind::Tone, params, layout.total)
 }
 
 /// Block-diagonal penalty over the joint block, with each section's λ folded in.
-fn combined_look_penalty(layout: &Layout, lambdas: &StageLambdas, n: usize) -> Vec<f64> {
+fn combined_look_penalty(
+    problem: &Problem,
+    layout: &Layout,
+    lambdas: &StageLambdas,
+    n: usize,
+    include_response: bool,
+) -> Vec<f64> {
     let mut out = vec![0.0_f64; n * n];
     let tone = penalty_for(BlockKind::Tone);
     place(&mut out, n, &tone, 1 + TONE_COEFS, 0, lambdas.tone);
@@ -1083,6 +1260,17 @@ fn combined_look_penalty(layout: &Layout, lambdas: &StageLambdas, n: usize) -> V
         layout.lambda.start,
         lambdas.grl,
     );
+    if include_response && !layout.response.is_empty() {
+        let response = response_penalty_all(problem, lambdas, layout.response.len());
+        place(
+            &mut out,
+            n,
+            &response,
+            layout.response.len(),
+            n - layout.response.len(),
+            1.0,
+        );
+    }
     out
 }
 
@@ -1209,51 +1397,67 @@ fn penalty_for(kind: BlockKind) -> Vec<f64> {
     }
 }
 
-/// Shrinkage plus second differences over adjacent steps, per control and feature.
-fn response_penalty(problem: &Problem, block: &BlockAcc, component_is_wb: bool) -> Vec<f64> {
-    let n = block.len();
+type ResponseGroup = (
+    looklab_schema::ControlKey,
+    ResponseComponent,
+    Vec<(u32, i64, usize)>,
+);
+
+const RESPONSE_LAMBDA_FLOOR: f64 = 100.0;
+
+/// Shrinkage plus second differences over adjacent steps, per control, component and feature.
+fn response_penalty(
+    problem: &Problem,
+    params: &[usize],
+    wb_only: bool,
+    component: Option<ResponseComponent>,
+) -> Vec<f64> {
+    let n = params.len();
     let mut out = vec![0.0_f64; n * n];
     for local in 0..n {
         out[local * n + local] += 1.0;
     }
-    for control in &problem.parameter_ids {
-        if component_is_wb
-            != matches!(
-                control.component,
-                ResponseComponent::WbR | ResponseComponent::WbB
-            )
-        {
+    let mut groups: Vec<ResponseGroup> = Vec::new();
+    for (local, global) in params.iter().enumerate() {
+        let Some(id) = problem
+            .parameter_ids
+            .get(*global - problem.layout.response.start)
+        else {
+            continue;
+        };
+        let is_wb = matches!(
+            id.component,
+            ResponseComponent::WbR | ResponseComponent::WbB
+        );
+        if is_wb != wb_only || component.is_some_and(|value| value != id.component) {
             continue;
         }
-        let mut by_feature: Vec<(u32, Vec<(i64, usize)>)> = Vec::new();
-        for (local, global) in block.params.iter().enumerate() {
-            let Some(id) = problem
-                .parameter_ids
-                .get(*global - problem.layout.response.start)
-            else {
-                continue;
-            };
-            if id.control != control.control || id.component != control.component {
-                continue;
-            }
-            let Some(offset) = value_offset(&id.value) else {
-                continue;
-            };
-            match by_feature
-                .iter_mut()
-                .find(|(feature, _)| *feature == id.feature)
-            {
-                Some((_, entries)) => entries.push((offset, local)),
-                None => by_feature.push((id.feature, vec![(offset, local)])),
-            }
+        let Some(offset) = offset_from_default(problem, id) else {
+            continue;
+        };
+        match groups
+            .iter_mut()
+            .find(|(key, entry, _)| key == &id.control && *entry == id.component)
+        {
+            Some((_, _, entries)) => entries.push((id.feature, offset, local)),
+            None => groups.push((
+                id.control.clone(),
+                id.component,
+                vec![(id.feature, offset, local)],
+            )),
         }
-        for (_, mut entries) in by_feature {
-            entries.sort_by_key(|(offset, _)| *offset);
+    }
+    for (_, _, entries) in groups {
+        let mut features: Vec<u32> = entries.iter().map(|(feature, _, _)| *feature).collect();
+        features.sort_unstable();
+        features.dedup();
+        for feature in features {
             let mut points: Vec<(i64, Option<usize>)> = vec![(0, None)];
             points.extend(
                 entries
                     .iter()
-                    .map(|(offset, local)| (*offset, Some(*local))),
+                    .filter(|(candidate, _, _)| *candidate == feature)
+                    .map(|(_, offset, local)| (*offset, Some(*local))),
             );
             points.sort_by_key(|(offset, _)| *offset);
             points.dedup_by_key(|(offset, _)| *offset);
@@ -1276,11 +1480,18 @@ fn response_penalty(problem: &Problem, block: &BlockAcc, component_is_wb: bool) 
     out
 }
 
-fn value_offset(value: &looklab_model::realization::ControlValue) -> Option<i64> {
-    match value {
-        looklab_model::realization::ControlValue::Step(step) => Some(*step),
-        _ => None,
-    }
+fn offset_from_default(problem: &Problem, id: &ResponseParamId) -> Option<i64> {
+    let ControlValue::Step(step) = &id.value else {
+        return None;
+    };
+    let (_, default) = problem
+        .defaults
+        .iter()
+        .find(|(key, _)| key == &id.control)?;
+    let ControlValue::Step(default) = default else {
+        return None;
+    };
+    Some(step - default)
 }
 
 fn block_penalty(problem: &Problem, block: &BlockAcc) -> Vec<f64> {
@@ -1292,10 +1503,67 @@ fn block_penalty(problem: &Problem, block: &BlockAcc) -> Vec<f64> {
         | BlockKind::ResponseHue
         | BlockKind::ResponseLightness
         | BlockKind::ResponseWb => {
-            response_penalty(problem, block, block.kind == BlockKind::ResponseWb)
+            let component = response_component(block.kind);
+            double(response_penalty(
+                problem,
+                &block.params,
+                block.kind == BlockKind::ResponseWb,
+                component,
+            ))
         }
         kind => double(embed(penalty_for(kind), block.len())),
     }
+}
+
+fn response_penalty_all(problem: &Problem, lambdas: &StageLambdas, n: usize) -> Vec<f64> {
+    let mut out = vec![0.0_f64; n * n];
+    let all: Vec<usize> = problem.layout.response.clone().collect();
+    let sections = [
+        (Some(ResponseComponent::Tone), lambdas.response_tone, false),
+        (Some(ResponseComponent::Tint), lambdas.response_tint, false),
+        (
+            Some(ResponseComponent::Chroma),
+            lambdas.response_chroma,
+            false,
+        ),
+        (Some(ResponseComponent::Hue), lambdas.response_hue, false),
+        (
+            Some(ResponseComponent::Lightness),
+            lambdas.response_lightness,
+            false,
+        ),
+        (None, lambdas.response_wb, true),
+    ];
+    for (component, lambda, wb_only) in sections {
+        let params: Vec<usize> = all
+            .iter()
+            .copied()
+            .filter(|global| {
+                problem
+                    .parameter_ids
+                    .get(*global - problem.layout.response.start)
+                    .is_some_and(|id| {
+                        let is_wb = matches!(
+                            id.component,
+                            ResponseComponent::WbR | ResponseComponent::WbB
+                        );
+                        is_wb == wb_only && component.is_none_or(|value| value == id.component)
+                    })
+            })
+            .collect();
+        if params.is_empty() {
+            continue;
+        }
+        let section = response_penalty(problem, &params, wb_only, component);
+        for (a, global_a) in params.iter().enumerate() {
+            for (b, global_b) in params.iter().enumerate() {
+                out[(*global_a - problem.layout.response.start) * n
+                    + (*global_b - problem.layout.response.start)] +=
+                    lambda * section[a * params.len() + b];
+            }
+        }
+    }
+    out
 }
 
 /// Embeds a square penalty into a larger block as its leading submatrix.
@@ -1509,7 +1777,7 @@ fn choose_lambdas(
                 | BlockKind::ResponseLightness
                 | BlockKind::ResponseWb
         ) {
-            value = value.max(10.0);
+            value = value.max(RESPONSE_LAMBDA_FLOOR);
         }
         set_lam(lambdas, block.kind, value);
     }

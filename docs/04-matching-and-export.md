@@ -125,6 +125,8 @@ formats: [cube, native_json]
 limits: { max_bytes: 262144 }
 ```
 
+**`formats` (v1):** `cube`, `haldclut` (16-bit PNG), `binary_f16` (packed half floats, layout in §7), `native_json`.
+
 **`insertion.point` (v1):**
 - `camera_rgb_wb_linear`: after demosaic + WB, before any color matrix.
 - `scene_linear_rec2020`: after the camera's color matrix.
@@ -146,7 +148,11 @@ F = Downstream⁻¹ ∘ OutputEncode ∘ CAM16UCS⁻¹ ∘ L ∘ ToSceneXYZ_{P,B
 
 **Validation (required before export):** evaluate the artifact through a software model of the declared pipeline on the probe set and report ΔE vs. target (median, p95, max, plus the per-CCT results above). Exports with p95 > 1.0 ΔE outside unsupported regions are flagged.
 
-**Writers:** `.cube` (with DOMAIN_MIN/MAX; shaper as a separate 1D file where needed, variant documented per profile), HaldCLUT (16-bit PNG), `native_json`. Later: darktable `.dtstyle` (darktable as a software body) and RawTherapee profiles.
+**Writers:** `.cube` (with DOMAIN_MIN/MAX; shaper as a separate 1D file where needed, variant documented per profile), HaldCLUT (16-bit PNG), `binary_f16`, `native_json`.
+
+`binary_f16` is what a firmware with `precision: f16` loads: 16 bytes of little-endian header (magic `LLLUT`, version, flags with a shaper-present bit, grid side as `u32`, shaper length as `u32`), then the shaper as half floats when present, then `size³ × 3` half floats in `.cube` order. A 33³ grid is about 1.0 MB and a 65³ grid about 1.6 MB, against 1.0 MB and 7.9 MB as `.cube` text.
+
+Later: darktable `.dtstyle` (darktable as a software body) and RawTherapee profiles.
 
 ## 8. Reference implementation
 

@@ -4,7 +4,8 @@
 
 use looklab_color::{Rgb, RgbSpace};
 use looklab_fit::synth::{
-    ControlSynthConfig, SynthConfig, controlled_dataset, random_control_model, random_settings,
+    ControlSynthConfig, SynthConfig, controlled_dataset, controlled_dataset_with,
+    localized_hue_model, random_control_model, random_settings,
 };
 use looklab_fit::{ControlValue, FitImage, FitOptions, ImageIntent, Settings, fit_controlled};
 use looklab_model::output_encode_clip;
@@ -231,6 +232,45 @@ fn predicts_held_out_rerenders_at_unseen_settings() {
 }
 
 #[test]
+fn hue_localized_blue_response_is_predicted() {
+    use looklab_model::realization::GRL_FEATURES;
+
+    let config = config();
+    let truth = localized_hue_model(&config.schema, 1, &sim(), GRL_FEATURES - 2, 0.12);
+    let dataset = controlled_dataset_with(&config, truth);
+    let library = library_settings();
+    let result = fit_controlled(
+        &dataset.images[..library.len()],
+        &dataset.schema,
+        1,
+        &sim(),
+        &options(),
+    )
+    .expect("localized fit");
+    let model = result
+        .control_response
+        .as_ref()
+        .expect("model")
+        .model
+        .clone();
+    let mut errors = Vec::new();
+    for (index, settings) in group_settings().iter().enumerate() {
+        let image = &dataset.images[library.len() + index];
+        errors.extend(prediction_error(
+            &result.look,
+            &model,
+            image,
+            settings,
+            image.exposure_hint,
+            [0.0, 0.0],
+        ));
+    }
+    let error_median = median(errors);
+    println!("hue-localized blue median {error_median:.3}");
+    assert!(error_median <= 1.5);
+}
+
+#[test]
 fn refit_recovers_responses_with_theta_fixed() {
     let dataset = controlled_dataset(&config());
     let library = library_settings();
@@ -309,7 +349,10 @@ fn non_default_images_reduce_theta_uncertainty() {
     let base_trace = trace(&base.probes);
     let extended_trace = trace(&extended.probes);
     println!("theta probe covariance trace: {base_trace:.4} -> {extended_trace:.4}");
-    assert!(extended_trace < base_trace);
+    assert!(
+        extended_trace < 0.9 * base_trace,
+        "trace {base_trace} -> {extended_trace}"
+    );
 }
 
 #[test]
@@ -334,7 +377,14 @@ fn recipe_images_do_not_move_theta() {
     .expect("native fit");
     let with = fit_controlled(&all, &native.schema, 1, &sim(), &options()).expect("recipe fit");
     println!("recipe images: {recipe_count}");
-    assert_eq!(without.look.coef_vector(), with.look.coef_vector());
+    assert!(
+        without
+            .look
+            .coef_vector()
+            .iter()
+            .zip(with.look.coef_vector().iter())
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+    );
 }
 
 #[test]
