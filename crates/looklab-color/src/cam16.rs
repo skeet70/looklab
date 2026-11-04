@@ -274,11 +274,13 @@ impl Cam16Model {
         let q = self.q_scale * (j / 100.0).sqrt();
 
         // `temporary_magnitude_quantity_forward`.
-        let t = self.p_scale * (e_t * (a * a + b * b).sqrt())
-            / (rgb_a[0] + rgb_a[1] + 21.0 * rgb_a[2] / 20.0);
+        let t = sdiv(
+            self.p_scale * (e_t * (a * a + b * b).sqrt()),
+            rgb_a[0] + rgb_a[1] + 21.0 * rgb_a[2] / 20.0,
+        );
         let c = spow(t, 0.9) * spow(j / 100.0, 0.5) * self.ta;
         let m = c * self.fl_root4;
-        let s = 100.0 * (m / q).sqrt();
+        let s = 100.0 * spow(sdiv(m, q), 0.5);
 
         Cam16 { j, c, h, m, s, q }
     }
@@ -337,8 +339,8 @@ impl Cam16Model {
     /// `xyz_at_unit_y` is the chromaticity with `y = 1`; the stimulus is
     /// `xyz_at_unit_y · y`.
     ///
-    /// `J'` depends only on the achromatic response. The derivative is infinite
-    /// where a post-adaptation response is 0.
+    /// `J'` depends only on the achromatic response. At `y = 0` the one-sided
+    /// derivative is infinite; its sign follows the leading `y^0.42` term.
     pub fn ucs_j_and_dj_dy(&self, xyz_at_unit_y: Xyz, y: f64) -> (f64, f64) {
         let stimulus = Xyz::new(
             xyz_at_unit_y.x * y,
@@ -357,41 +359,74 @@ impl Cam16Model {
             *dra = 400.0 * 27.13 / ((27.13 + f) * (27.13 + f)) * df_du * (self.f_l / 100.0);
         }
 
-        // Gradient of A with respect to the 0-100 XYZ, through the sharpened RGB.
-        let mut d_a_d_xyz = [0.0; 3];
-        for (j, da) in d_a_d_xyz.iter_mut().enumerate() {
-            *da = self.n_bb
-                * (2.0 * drgb_a[0] * self.d_rgb[0] * M16.0[0][j]
-                    + drgb_a[1] * self.d_rgb[1] * M16.0[1][j]
-                    + 0.05 * drgb_a[2] * self.d_rgb[2] * M16.0[2][j]);
-        }
-
         let achromatic = achromatic_response(rgb_a, self.n_bb);
         let ratio = achromatic / self.a_w;
         let j = 100.0 * spow(ratio, self.j_exp);
+        let j_prime = crate::ucs::j_prime(j);
         let dj_da = 100.0 * self.j_exp * libm::pow(ratio.abs(), self.j_exp - 1.0) / self.a_w;
 
-        let j_prime = crate::ucs::j_prime(j);
-
         // dXYZ100/dy along the fixed chromaticity.
-        let d_a_dy = 100.0
-            * (d_a_d_xyz[0] * xyz_at_unit_y.x
-                + d_a_d_xyz[1] * xyz_at_unit_y.y
-                + d_a_d_xyz[2] * xyz_at_unit_y.z);
-        // Convert from d/dy to d/dY, where Y = xyz_at_unit_y.y · y.
+        let direction = [
+            xyz_at_unit_y.x * 100.0,
+            xyz_at_unit_y.y * 100.0,
+            xyz_at_unit_y.z * 100.0,
+        ];
+        let d_rgb_c_dy = [
+            self.d_rgb[0] * dot(&M16.0[0], &direction),
+            self.d_rgb[1] * dot(&M16.0[1], &direction),
+            self.d_rgb[2] * dot(&M16.0[2], &direction),
+        ];
         let dy_dy = if xyz_at_unit_y.y == 0.0 {
-            d_a_dy
+            1.0
         } else {
-            d_a_dy / xyz_at_unit_y.y
+            1.0 / xyz_at_unit_y.y
         };
 
-        (j_prime, crate::ucs::d_j_prime_d_j(j) * dj_da * dy_dy)
+        if y == 0.0 {
+            // dR_a/dc diverges; the leading term of A(y) is the 0.42 power of the
+            // directional response, so the derivative's sign is that sum's sign.
+            let lead = self.n_bb
+                * (400.0 / 27.13)
+                * (2.0 * leading_response(self.f_l, d_rgb_c_dy[0])
+                    + leading_response(self.f_l, d_rgb_c_dy[1])
+                    + 0.05 * leading_response(self.f_l, d_rgb_c_dy[2]));
+            let signed = lead * dy_dy;
+            let slope = if signed == 0.0 {
+                f64::INFINITY
+            } else {
+                f64::INFINITY.copysign(signed)
+            };
+            return (j_prime, slope);
+        }
+
+        let mut d_a_dy = 0.0;
+        for (i, coefficient) in [2.0, 1.0, 0.05].into_iter().enumerate() {
+            if d_rgb_c_dy[i] != 0.0 {
+                d_a_dy += coefficient * drgb_a[i] * d_rgb_c_dy[i];
+            }
+        }
+        let d_a_dy = self.n_bb * d_a_dy;
+
+        (
+            j_prime,
+            crate::ucs::d_j_prime_d_j(j) * dj_da * d_a_dy * dy_dy,
+        )
     }
 }
 
 /// Signed power, `colour.algebra.spow`.
 fn spow(x: f64, p: f64) -> f64 {
     x.signum() * libm::pow(x.abs(), p)
+}
+
+fn dot(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// `sign(w)·(F_L·|w|/100)^0.42`, the leading term of a channel's response as the
+/// stimulus luminance goes to zero.
+fn leading_response(f_l: f64, w: f64) -> f64 {
+    w.signum() * libm::pow(f_l * w.abs() / 100.0, 0.42)
 }
 
 /// Post-adaptation non-linear response compression, Luo et al. (2013) negative

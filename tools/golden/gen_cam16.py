@@ -132,6 +132,8 @@ def main() -> None:
         np.array([0.05, 0.4, 0.05]),
         np.array([0.02, 0.02, 0.02]),
         np.array([0.2, 0.25, 0.6]),
+        # Negative colourfulness: exercises the signed power in saturation.
+        np.array([0.0, 0.1, -1.0]),
     ]
 
     forward = []

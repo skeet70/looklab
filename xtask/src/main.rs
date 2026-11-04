@@ -117,15 +117,12 @@ fn float_methods() -> Result<()> {
             })?;
             methods.extend(parse_stable_inherent_methods(&source, ty));
         }
-        for method in methods {
-            if FLOAT_METHOD_ALLOW.contains(&method.as_str()) {
-                continue;
-            }
-            let path = format!("{ty}::{method}");
-            if !disallowed.contains(&path) {
-                missing.insert(path);
-            }
-        }
+        let stable = methods
+            .into_iter()
+            .filter(|method| !FLOAT_METHOD_ALLOW.contains(&method.as_str()))
+            .map(|method| format!("{ty}::{method}"))
+            .collect();
+        missing.extend(missing_stable_methods(stable, &disallowed));
     }
     if !missing.is_empty() {
         let list = missing.into_iter().collect::<Vec<_>>().join("\n  ");
@@ -156,18 +153,39 @@ fn rust_sysroot() -> Result<PathBuf> {
 
 fn read_disallowed_float_paths(path: &Path) -> Result<BTreeSet<String>> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(parse_quoted_paths(&text)
+    Ok(parse_disallowed_paths(&text)?
         .into_iter()
         .filter(|path| path.starts_with("f64::") || path.starts_with("f32::"))
         .collect())
 }
 
-fn parse_quoted_paths(text: &str) -> Vec<String> {
-    text.lines()
-        .filter_map(|line| {
-            let rest = &line[line.find("path = \"")? + "path = \"".len()..];
-            Some(rest[..rest.find('"')?].to_string())
+fn parse_disallowed_paths(text: &str) -> Result<BTreeSet<String>> {
+    let config: toml::Value = toml::from_str(text).context("parsing clippy.toml")?;
+    let entries = config
+        .get("disallowed-methods")
+        .and_then(toml::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            toml::Value::String(path) => Some(path),
+            toml::Value::Table(table) => table
+                .get("path")
+                .and_then(toml::Value::as_str)
+                .map(str::to_string),
+            _ => None,
         })
+        .collect())
+}
+
+fn missing_stable_methods(
+    stable: BTreeSet<String>,
+    disallowed: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    stable
+        .into_iter()
+        .filter(|path| !disallowed.contains(path))
         .collect()
 }
 
@@ -457,7 +475,9 @@ fn wasm_core() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_stable_inherent_methods;
+    use std::collections::BTreeSet;
+
+    use super::{missing_stable_methods, parse_disallowed_paths, parse_stable_inherent_methods};
 
     #[test]
     fn parser_reads_only_stable_inherent_methods() {
@@ -507,6 +527,23 @@ impl f64 {
                 "to_int_unchecked",
                 "outside_any_allow_list"
             ]
+        );
+    }
+
+    #[test]
+    fn commented_out_ban_is_reported_missing() {
+        let config = "\
+disallowed-methods = [
+  # { path = \"f64::recip\", reason = \"commented out\" },
+  { path = \"f64::ln\", reason = \"transcendental\" },
+]
+";
+        let disallowed = parse_disallowed_paths(config).expect("valid clippy.toml");
+        assert!(disallowed.contains("f64::ln"));
+        let stable = ["f64::recip".to_string()].into_iter().collect();
+        assert_eq!(
+            missing_stable_methods(stable, &disallowed),
+            BTreeSet::from(["f64::recip".to_string()])
         );
     }
 }

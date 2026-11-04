@@ -176,7 +176,7 @@ fn forward_matches_colour_science() {
             entry.q
         );
         // Chroma, saturation and hue are rounding noise on a neutral.
-        if entry.c > 1e-3 {
+        if entry.c.abs() > 1e-3 {
             assert!(
                 close(cam.c, entry.c, FORWARD_TOL),
                 "C {label}: {} vs {}",
@@ -370,6 +370,20 @@ fn ucs_j_derivative_matches_central_difference() {
                 xyz_at_unit_y
             );
         }
+    }
+}
+
+#[test]
+fn ucs_j_derivative_at_zero_is_infinite() {
+    let model = Cam16Model::new(&ViewingConditions::reference());
+    for chromaticity in [
+        ViewingConditions::reference().white,
+        Xyz::new(0.3, 1.0, 0.5),
+        Xyz::new(0.0, 1.0, -1.0),
+    ] {
+        let (j_prime, slope) = model.ucs_j_and_dj_dy(chromaticity, 0.0);
+        assert!(j_prime.is_finite(), "J' = {j_prime}");
+        assert!(slope.is_infinite() && slope > 0.0, "dJ'/dY = {slope}");
     }
 }
 

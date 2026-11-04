@@ -2,11 +2,12 @@
 //! Native vs wasm32 bit-identity workload for the colour-space basics.
 //!
 //! Prints one `<function> <hex FNV-1a-64>` line per function over 10^5
-//! fixed-seed inputs. `cargo xtask bitid` compares the native and
-//! `wasm32-wasip1` runs.
+//! fixed-seed inputs, plus one line per chart table. `cargo xtask bitid`
+//! compares the native and `wasm32-wasip1` runs.
 
 use looklab_color::Xyy;
 use looklab_color::cat::{Cat, adapt, adaptation_matrix};
+use looklab_color::chart::{colorchecker24, colorchecker24_d65};
 use looklab_color::ciede2000::delta_e_ciede2000;
 use looklab_color::lab::{Lab, lab_to_lchab, lab_to_xyz, lchab_to_lab, xyz_to_lab};
 use looklab_color::spaces::RgbSpace;
@@ -29,7 +30,11 @@ impl Fnv1a {
     }
 
     fn push(&mut self, value: f64) {
-        for byte in value.to_le_bytes() {
+        self.push_bytes(&value.to_le_bytes());
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
             self.0 ^= u64::from(byte);
             self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
         }
@@ -114,6 +119,23 @@ fn space_digests() {
             hash.push(out.g);
             hash.push(out.b);
         });
+        digest!(format!("rgb_encoded_to_xyz_{name}"), 600, |rng, hash| {
+            let encoded = Rgb::new(
+                rng.next_f64(-0.25, 1.5),
+                rng.next_f64(-0.25, 1.5),
+                rng.next_f64(-0.25, 1.5),
+            );
+            let out = space.rgb_encoded_to_xyz(encoded);
+            hash.push(out.x);
+            hash.push(out.y);
+            hash.push(out.z);
+        });
+        digest!(format!("xyz_to_rgb_encoded_{name}"), 700, |rng, hash| {
+            let out = space.xyz_to_rgb_encoded(xyz(&mut rng));
+            hash.push(out.r);
+            hash.push(out.g);
+            hash.push(out.b);
+        });
     }
 }
 
@@ -135,6 +157,26 @@ fn cat_digests() {
             hash.push(out.z);
         });
     }
+}
+
+fn chart_digests() {
+    let mut hash = Fnv1a::new();
+    for patch in colorchecker24() {
+        hash.push_bytes(patch.name.as_bytes());
+        hash.push(patch.xyz.x);
+        hash.push(patch.xyz.y);
+        hash.push(patch.xyz.z);
+    }
+    println!("colorchecker24 {:016x}", hash.0);
+
+    let mut hash = Fnv1a::new();
+    for patch in colorchecker24_d65() {
+        hash.push_bytes(patch.name.as_bytes());
+        hash.push(patch.xyz.x);
+        hash.push(patch.xyz.y);
+        hash.push(patch.xyz.z);
+    }
+    println!("colorchecker24_d65 {:016x}", hash.0);
 }
 
 fn main() {
@@ -180,6 +222,7 @@ fn main() {
 
     space_digests();
     cat_digests();
+    chart_digests();
 
     digest!("xyz_to_lab", 500, |rng, hash| {
         let out = xyz_to_lab(xyz(&mut rng), white(&mut rng));

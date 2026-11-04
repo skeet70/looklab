@@ -35,10 +35,13 @@ ruzstd = { version = "0.8", default-features = false, features = ["std"] }
 proptest = "1"
 criterion = { version = "0.7", default-features = false }
 
+zip = { version = "2", default-features = false }
+
 rawler = "0.8"
 uuid = { version = "1", features = ["js"] }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 wasm-bindgen-test = "=0.3.79"
+toml = "0.8"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
