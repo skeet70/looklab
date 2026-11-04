@@ -2,8 +2,8 @@
 //! Validation tests for the shipped data files and each schema rule.
 
 use looklab_schema::{
-    ErrorKind, MappingStatus, Rational, validate_body, validate_control_schema,
-    validate_interface_profile,
+    ControlDefault, ErrorKind, MappingStatus, Rational, ScalarValue, Tolerated, validate_body,
+    validate_control_schema, validate_interface_profile,
 };
 
 const HEADER: &str =
@@ -57,6 +57,51 @@ fn exposure_compensation_steps_are_thirds() {
         .unwrap();
     assert_eq!(control.steps(), -9..=9);
     assert_eq!(control.value_at(1), Some(Rational::new(1, 3).unwrap()));
+}
+
+#[test]
+fn preserves_exact_yaml_decimals() {
+    let yaml = schema_with(
+        "      - key: n\n        type: decimal\n        range: [0.0, 9007199254740993.0]\n        step: 1\n        default: 9007199254740993.0\n",
+    );
+    let schema = validate_control_schema(&yaml).unwrap();
+    let control = &schema.epochs[0].controls[0];
+    let exact = Rational::parse("9007199254740993").unwrap();
+    assert_eq!(control.range.as_ref().unwrap().max, exact);
+    assert_eq!(control.default, ControlDefault::Number(exact));
+
+    let yaml = schema_with(
+        "      - key: n\n        type: decimal\n        range: [0.0, 1.0]\n        step: 0.00000000000000001\n        default: 0.10000000000000001\n",
+    );
+    let schema = validate_control_schema(&yaml).unwrap();
+    let control = &schema.epochs[0].controls[0];
+    assert_eq!(
+        control.step,
+        Some(Rational::parse("0.00000000000000001").unwrap())
+    );
+    assert_eq!(
+        control.default,
+        ControlDefault::Number(Rational::parse("0.10000000000000001").unwrap())
+    );
+    assert_ne!(
+        control.default,
+        ControlDefault::Number(Rational::new(1, 10).unwrap())
+    );
+}
+
+#[test]
+fn preserves_exact_tolerated_values() {
+    let yaml = schema_with(
+        "      - key: n\n        type: int\n        range: [0, 9007199254740993]\n        step: 1\n        default: 0\n        spatial: true\n        tolerated: [9007199254740993.0]\n",
+    );
+    let schema = validate_control_schema(&yaml).unwrap();
+    let control = &schema.epochs[0].controls[0];
+    assert_eq!(
+        control.tolerated,
+        Some(Tolerated::Values(vec![ScalarValue::Number(
+            Rational::parse("9007199254740993").unwrap()
+        )]))
+    );
 }
 
 #[test]

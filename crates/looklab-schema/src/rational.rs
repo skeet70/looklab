@@ -8,8 +8,8 @@ use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::str::FromStr;
 
-use serde::de::{self, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
+use serde::de;
 
 /// Constructors reduce the fraction; equality and ordering compare values.
 #[derive(Debug, Clone, Copy)]
@@ -134,11 +134,18 @@ impl Rational {
     }
 
     pub fn checked_mul_i64(&self, factor: i64) -> Option<Self> {
-        let num = (self.num as i128).checked_mul(factor as i128)?;
-        if num < i64::MIN as i128 || num > i64::MAX as i128 {
+        if self.den == 0 {
             return None;
         }
-        Self::new(num as i64, self.den).ok()
+        let self_gcd = gcd(self.num.unsigned_abs() as u128, self.den as u128);
+        let num = self.num as i128 / self_gcd as i128;
+        let den = self.den as u128 / self_gcd;
+        let factor_gcd = gcd(factor.unsigned_abs() as u128, den);
+        let product = num.checked_mul(factor as i128 / factor_gcd as i128)?;
+        if product < i64::MIN as i128 || product > i64::MAX as i128 {
+            return None;
+        }
+        Self::new(product as i64, (den / factor_gcd) as u64).ok()
     }
 
     /// For display and fitting only.
@@ -194,37 +201,9 @@ impl FromStr for Rational {
 }
 
 impl<'de> Deserialize<'de> for Rational {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(RationalVisitor)
-    }
-}
-
-struct RationalVisitor;
-
-impl Visitor<'_> for RationalVisitor {
-    type Value = Rational;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("an exact decimal or fraction")
-    }
-
-    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-        Rational::parse(&v.to_string()).map_err(E::custom)
-    }
-
-    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-        Rational::parse(&v.to_string()).map_err(E::custom)
-    }
-
-    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-        if !v.is_finite() {
-            return Err(E::custom("number is not finite"));
-        }
-        Rational::parse(&format!("{v}")).map_err(E::custom)
-    }
-
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-        Rational::parse(v).map_err(E::custom)
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(de::Error::custom)
     }
 }
 
@@ -264,5 +243,15 @@ mod tests {
         assert_eq!(Rational::parse("0.1/3"), Err(RationalError::InvalidDigits));
         assert_eq!(Rational::parse_step("0"), Err(RationalError::ZeroStep));
         assert_eq!(Rational::parse("1/0"), Err(RationalError::ZeroDenominator));
+    }
+
+    #[test]
+    fn multiplies_large_step_after_cancelling() {
+        let step = Rational::parse("9223372036854775807/3").unwrap();
+        assert_eq!(
+            step.checked_mul_i64(3),
+            Some(Rational::from_integer(9223372036854775807))
+        );
+        assert_eq!(step.checked_mul_i64(6), None);
     }
 }

@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde::de::{self, Visitor};
 
 use crate::control::{
-    Affects, Constraints, Control, ControlDefault, ControlType, Range, Tolerated,
+    Affects, Constraints, Control, ControlDefault, ControlType, Range, ScalarValue, Tolerated,
 };
 use crate::error::{ErrorKind, ValidationError};
 use crate::ids::{
@@ -220,7 +220,7 @@ struct RawControl {
     kind: ControlType,
     range: Option<Vec<Rational>>,
     step: Option<Rational>,
-    default: Option<RawValue>,
+    default: Option<ScalarValue>,
     values: Option<Vec<EnumValue>>,
     #[serde(default)]
     look_affecting: bool,
@@ -230,14 +230,6 @@ struct RawControl {
     spatial: bool,
     tolerated: Option<Tolerated>,
     constraints: Option<Constraints>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawValue {
-    Bool(bool),
-    Number(Rational),
-    Text(String),
 }
 
 pub fn validate_control_schema(yaml: &str) -> Result<ControlSchema, Vec<ValidationError>> {
@@ -390,7 +382,7 @@ fn validate_control(control: &RawControl, path: &str, errors: &mut Vec<Validatio
             }
             match &control.values {
                 Some(values) if !values.is_empty() => match &control.default {
-                    Some(RawValue::Text(default)) => {
+                    Some(ScalarValue::Text(default)) => {
                         if !values.iter().any(|value| value.as_str() == default) {
                             errors.push(ValidationError::new(
                                 field("default"),
@@ -439,7 +431,7 @@ fn validate_control(control: &RawControl, path: &str, errors: &mut Vec<Validatio
                 }
             }
             match &control.default {
-                Some(RawValue::Bool(_)) => {}
+                Some(ScalarValue::Bool(_)) => {}
                 Some(_) => errors.push(ValidationError::new(
                     field("default"),
                     ErrorKind::InvalidValue {
@@ -514,7 +506,7 @@ fn validate_numeric(
         }
     }
     match &control.default {
-        Some(RawValue::Number(default)) => {
+        Some(ScalarValue::Number(default)) => {
             if *default < min || *default > max {
                 errors.push(ValidationError::new(
                     format!("{path}.default"),
@@ -594,9 +586,9 @@ fn build_control(raw: RawControl) -> Control {
         _ => None,
     });
     let default = match raw.default {
-        Some(RawValue::Number(value)) => ControlDefault::Number(value),
-        Some(RawValue::Text(value)) => ControlDefault::Enum(EnumValue::from_unchecked(value)),
-        Some(RawValue::Bool(value)) => ControlDefault::Bool(value),
+        Some(ScalarValue::Number(value)) => ControlDefault::Number(value),
+        Some(ScalarValue::Text(value)) => ControlDefault::Enum(EnumValue::from_unchecked(value)),
+        Some(ScalarValue::Bool(value)) => ControlDefault::Bool(value),
         None => ControlDefault::Bool(false),
     };
     Control {

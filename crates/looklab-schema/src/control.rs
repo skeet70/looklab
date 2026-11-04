@@ -99,13 +99,30 @@ impl From<(Rational, Rational)> for Range {
     }
 }
 
-/// A literal value allowed by `spatial` tolerance.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(untagged)]
+/// A YAML scalar classified from its written text.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScalarValue {
     Bool(bool),
     Number(Rational),
     Text(String),
+}
+
+impl ScalarValue {
+    pub(crate) fn from_raw(value: &str) -> Self {
+        match value {
+            "true" | "True" | "TRUE" => Self::Bool(true),
+            "false" | "False" | "FALSE" => Self::Bool(false),
+            _ => Rational::parse(value)
+                .map(Self::Number)
+                .unwrap_or_else(|_| Self::Text(value.to_owned())),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ScalarValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|raw| Self::from_raw(&raw))
+    }
 }
 
 /// Values of `spatial` controls that an image may carry.
