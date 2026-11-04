@@ -74,8 +74,8 @@ while IFS=$'\t' read -r file url sha size committed; do
       continue
     fi
     echo "corrupt  $file" >&2
-    status=1
     if [[ $check_only == 1 ]]; then
+      status=1
       continue
     fi
   elif [[ $check_only == 1 ]]; then

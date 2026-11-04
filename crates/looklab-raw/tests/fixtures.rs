@@ -5,7 +5,7 @@
 // Integration tests read fixture files; the library itself has no I/O.
 #![allow(clippy::disallowed_methods)]
 
-use looklab_raw::{DecodedRaw, RawDecoder, RawlerDecoder, digest_f32};
+use looklab_raw::{DecodedRaw, Illuminant, RawDecoder, RawlerDecoder, digest_f32};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -151,6 +151,27 @@ fn canon_eos_60d_digest() {
     assert_eq!(img.as_shot_wb[1], 1.0);
     assert!(img.color_matrices.is_some());
     assert_eq!(digest_f32(&img.rgb), 0xc62f_5221_0dca_b14d);
+}
+
+#[test]
+fn canon_forward_matrices_are_exposed() {
+    let img = decode_committed("canon-eos-60d.dng");
+    let matrices = img.color_matrices.as_ref().expect("colour matrices");
+    let forward = matrices.forward_matrices();
+    assert_eq!(forward.len(), 2);
+
+    let a = matrices
+        .forward_for_illuminant(Illuminant::A)
+        .expect("illuminant A");
+    assert!((a.camera_to_xyz.0[0][0] - 0.7550).abs() < 1e-4);
+    assert!((a.camera_to_xyz.0[1][1] - 0.8936).abs() < 1e-4);
+    assert!((a.camera_to_xyz.0[2][2] - 1.2562).abs() < 1e-4);
+
+    let d65 = matrices
+        .forward_for_illuminant(Illuminant::D65)
+        .expect("D65");
+    assert!((d65.camera_to_xyz.0[0][0] - 0.7286).abs() < 1e-4);
+    assert!((d65.camera_to_xyz.0[2][0] - 0.0093).abs() < 1e-4);
 }
 
 #[test]

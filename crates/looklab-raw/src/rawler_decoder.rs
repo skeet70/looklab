@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! rawler-backed decoder.
 
-use crate::demosaic::{self, Crop, Levels, Pixels};
+use crate::demosaic::{self, BlackOrigin, Crop, Levels, Pixels};
+use crate::dng;
 use crate::exif_orientation;
 use crate::matrices::ColorMatrices;
 use crate::orientation::Orientation;
@@ -20,28 +21,41 @@ impl RawDecoder for RawlerDecoder {
             return Err(RawError::EmptyInput);
         }
         let source = rawler::rawsource::RawSource::new_from_slice(bytes);
-        let image = rawler::decode(&source, &RawDecodeParams::default())
-            .map_err(|err| RawError::Decode(err.to_string()))?;
+        let image =
+            rawler::decode(&source, &RawDecodeParams::default()).map_err(|err| match err {
+                rawler::RawlerError::Unsupported {
+                    what,
+                    make,
+                    model,
+                    mode,
+                } => RawError::UnsupportedCamera {
+                    what,
+                    make,
+                    model,
+                    mode,
+                },
+                rawler::RawlerError::DecoderFailed(detail) => RawError::DecodeFailed { detail },
+            })?;
 
         if image.cpp != 1 {
-            return Err(RawError::Unsupported(
-                "multi-component RAW data is not reduced",
-            ));
+            return Err(RawError::MultiComponent { cpp: image.cpp });
         }
         let cfa = match &image.photometric {
             RawPhotometricInterpretation::Cfa(config) => &config.cfa,
-            _ => {
-                return Err(RawError::Unsupported(
-                    "photometric interpretation is not a CFA",
-                ));
-            }
+            _ => return Err(RawError::NotCfa),
         };
         let crop = crop_of(&image);
         let pixels = match &image.data {
-            RawImageData::Integer(values) => Pixels::U16(values),
-            RawImageData::Float(values) => Pixels::F32(values),
+            RawImageData::Integer(values) => Pixels::U16(values.as_slice()),
+            RawImageData::Float(values) => Pixels::F32(values.as_slice()),
         };
-        let levels = levels_of(&image)?;
+        let dng = dng::inspect(bytes);
+        let black_origin = if dng.is_dng {
+            BlackOrigin::ActiveArea
+        } else {
+            BlackOrigin::Sensor
+        };
+        let levels = levels_of(&image, black_origin)?;
         let reduced = demosaic::reduce(pixels, image.width, image.height, cfa, crop, &levels)?;
 
         Ok(DecodedRaw {
@@ -52,7 +66,7 @@ impl RawDecoder for RawlerDecoder {
             orientation: orientation_of(bytes, image.orientation),
             make: image.make,
             model: image.model,
-            color_matrices: ColorMatrices::from_rawler(&image.color_matrix),
+            color_matrices: ColorMatrices::new(&image.color_matrix, dng.forward_matrices),
         })
     }
 }
@@ -75,7 +89,7 @@ fn crop_of(image: &RawImage) -> Crop {
     }
 }
 
-fn levels_of(image: &RawImage) -> Result<Levels, RawError> {
+fn levels_of(image: &RawImage, black_origin: BlackOrigin) -> Result<Levels, RawError> {
     let black = image.blacklevel.as_vec();
     let (black_width, black_height) = black_tile(&image.blacklevel, black.len());
     let white = image.whitelevel.as_vec();
@@ -84,6 +98,7 @@ fn levels_of(image: &RawImage) -> Result<Levels, RawError> {
         black,
         black_width,
         black_height,
+        black_origin,
         white,
         white_width,
         white_height,
@@ -115,8 +130,7 @@ fn white_tile(levels: &WhiteLevel, image: &RawImage) -> (usize, usize) {
 
 fn as_shot_wb(coeffs: [f32; 4]) -> [f64; 3] {
     let green = coeffs[1];
-    let usable =
-        green.is_normal() && green != 0.0 && coeffs[0].is_finite() && coeffs[2].is_finite();
+    let usable = green.is_normal() && coeffs[0].is_finite() && coeffs[2].is_finite();
     if !usable {
         return [1.0, 1.0, 1.0];
     }
@@ -128,7 +142,8 @@ fn as_shot_wb(coeffs: [f32; 4]) -> [f64; 3] {
 }
 
 fn orientation_of(bytes: &[u8], reported: rawler::Orientation) -> Orientation {
-    exif_orientation::read_exif_orientation(bytes)
+    exif_orientation::main_orientation(bytes)
+        .or_else(|| exif_orientation::embedded_exif_orientation(bytes))
         .and_then(Orientation::from_exif)
         .unwrap_or_else(|| orientation_from_rawler(reported))
 }
@@ -167,6 +182,40 @@ mod tests {
         assert_eq!(
             orientation_from_rawler(rawler::Orientation::Unknown),
             Orientation::Normal
+        );
+    }
+
+    fn tiff_with_orientation(value: u16) -> Vec<u8> {
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&value.to_le_bytes());
+        tiff.extend_from_slice(&0u16.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff
+    }
+
+    #[test]
+    fn main_tiff_orientation_beats_a_preview_block() {
+        let mut bytes = tiff_with_orientation(6);
+        bytes.extend_from_slice(b"Exif\0\0");
+        bytes.extend_from_slice(&tiff_with_orientation(3));
+        assert_eq!(
+            orientation_of(&bytes, rawler::Orientation::Normal),
+            Orientation::Rotate90
+        );
+    }
+
+    #[test]
+    fn raf_uses_the_embedded_preview_orientation() {
+        let mut bytes = b"FUJIFILMCCD-RAW".to_vec();
+        bytes.extend_from_slice(b"junk Exif\0\0");
+        bytes.extend_from_slice(&tiff_with_orientation(3));
+        assert_eq!(
+            orientation_of(&bytes, rawler::Orientation::Normal),
+            Orientation::Rotate180
         );
     }
 }

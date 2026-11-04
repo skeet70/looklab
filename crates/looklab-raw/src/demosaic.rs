@@ -25,11 +25,21 @@ impl Pixels<'_> {
     }
 }
 
+/// Where a repeating black-level table starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlackOrigin {
+    /// DNG: the pattern is anchored at the active area's top-left pixel.
+    ActiveArea,
+    /// Other formats: the pattern is anchored at the sensor origin.
+    Sensor,
+}
+
 /// Black and white levels as samples per repeating tile.
 pub(crate) struct Levels {
     black: Vec<f32>,
     black_width: usize,
     black_height: usize,
+    black_origin: BlackOrigin,
     white: Vec<f32>,
     white_width: usize,
     white_height: usize,
@@ -40,39 +50,44 @@ impl Levels {
         black: Vec<f32>,
         black_width: usize,
         black_height: usize,
+        black_origin: BlackOrigin,
         white: Vec<f32>,
         white_width: usize,
         white_height: usize,
     ) -> Result<Self, RawError> {
         if black.is_empty() || white.is_empty() {
-            return Err(RawError::Levels("empty level table".into()));
+            return Err(RawError::EmptyLevels);
         }
         if black.len() != 1 && black.len() != black_width * black_height {
-            return Err(RawError::Levels(format!(
-                "{} black levels for a {black_width}x{black_height} tile",
-                black.len()
-            )));
+            return Err(RawError::BlackLevelCount {
+                levels: black.len(),
+                width: black_width,
+                height: black_height,
+            });
         }
         if white.len() != 1 && white.len() != white_width * white_height {
-            return Err(RawError::Levels(format!(
-                "{} white levels for a {white_width}x{white_height} tile",
-                white.len()
-            )));
+            return Err(RawError::WhiteLevelCount {
+                levels: white.len(),
+                width: white_width,
+                height: white_height,
+            });
         }
         if black.iter().chain(&white).any(|v| !v.is_finite()) {
-            return Err(RawError::Levels("non-finite level".into()));
+            return Err(RawError::NonFiniteLevel);
         }
         let max_black = black.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let min_white = white.iter().copied().fold(f32::INFINITY, f32::min);
         if min_white <= max_black {
-            return Err(RawError::Levels(format!(
-                "white level {min_white} is not above black level {max_black}"
-            )));
+            return Err(RawError::WhiteNotAboveBlack {
+                white: min_white,
+                black: max_black,
+            });
         }
         Ok(Self {
             black,
             black_width,
             black_height,
+            black_origin,
             white,
             white_width,
             white_height,
@@ -129,36 +144,41 @@ pub(crate) fn reduce(
     let tile = match (cfa.width, cfa.height) {
         (2, 2) => 2,
         (6, 6) => 6,
-        _ => {
-            return Err(RawError::Unsupported(
-                "CFA tile is neither Bayer 2x2 nor X-Trans 6x6",
-            ));
+        (width, height) => {
+            return Err(RawError::UnsupportedCfa { width, height });
         }
     };
-    if width == 0 || height == 0 || crop.width == 0 || crop.height == 0 {
-        return Err(RawError::Geometry(format!(
-            "{width}x{height} image, {}x{} crop",
-            crop.width, crop.height
-        )));
+    if width == 0 || height == 0 {
+        return Err(RawError::EmptyImage { width, height });
+    }
+    if crop.width == 0 || crop.height == 0 {
+        return Err(RawError::CropTooSmall {
+            width: crop.width,
+            height: crop.height,
+            tile,
+        });
     }
     if crop.x + crop.width > width || crop.y + crop.height > height {
-        return Err(RawError::Geometry(format!(
-            "{}x{} crop at {},{} exceeds {width}x{height}",
-            crop.width, crop.height, crop.x, crop.y
-        )));
+        return Err(RawError::CropOutside {
+            x: crop.x,
+            y: crop.y,
+            crop_width: crop.width,
+            crop_height: crop.height,
+            image_width: width,
+            image_height: height,
+        });
     }
     if pixels.len() < width * height {
-        return Err(RawError::Geometry(format!(
-            "{} samples for {width}x{height}",
-            pixels.len()
-        )));
+        return Err(RawError::SampleCount {
+            samples: pixels.len(),
+            width,
+            height,
+        });
     }
     for y in 0..cfa.height {
         for x in 0..cfa.width {
             if cfa.color_at(y, x) > 2 {
-                return Err(RawError::Unsupported(
-                    "CFA has colours other than R, G and B",
-                ));
+                return Err(RawError::NonRgbCfa);
             }
         }
     }
@@ -166,10 +186,11 @@ pub(crate) fn reduce(
     let out_width = crop.width / tile;
     let out_height = crop.height / tile;
     if out_width == 0 || out_height == 0 {
-        return Err(RawError::Geometry(format!(
-            "crop {}x{} is smaller than one {tile}x{tile} tile",
-            crop.width, crop.height
-        )));
+        return Err(RawError::CropTooSmall {
+            width: crop.width,
+            height: crop.height,
+            tile,
+        });
     }
 
     let mut rgb = Vec::with_capacity(out_width * out_height * 3);
@@ -183,7 +204,11 @@ pub(crate) fn reduce(
                 let row = y * width;
                 for x in x0..x0 + tile {
                     let color = cfa.color_at(y, x);
-                    let black = levels.black_at(x, y);
+                    let (black_x, black_y) = match levels.black_origin {
+                        BlackOrigin::ActiveArea => (x - crop.x, y - crop.y),
+                        BlackOrigin::Sensor => (x, y),
+                    };
+                    let black = levels.black_at(black_x, black_y);
                     let white = levels.white_at(x, y);
                     let value = (pixels.at(row + x) - black) / (white - black);
                     sums[color] += value.max(0.0);
@@ -212,7 +237,16 @@ mod tests {
     use super::*;
 
     fn bayer_levels() -> Levels {
-        Levels::new(vec![0.0, 0.0, 0.0, 0.0], 2, 2, vec![16.0], 1, 1).expect("levels")
+        Levels::new(
+            vec![0.0, 0.0, 0.0, 0.0],
+            2,
+            2,
+            BlackOrigin::Sensor,
+            vec![16.0],
+            1,
+            1,
+        )
+        .expect("levels")
     }
 
     #[test]
@@ -235,7 +269,8 @@ mod tests {
     #[test]
     fn black_level_is_subtracted_before_normalizing() {
         // RGGB with a 4 count black on every position and a white of 20.
-        let levels = Levels::new(vec![4.0], 1, 1, vec![20.0], 1, 1).expect("levels");
+        let levels =
+            Levels::new(vec![4.0], 1, 1, BlackOrigin::Sensor, vec![20.0], 1, 1).expect("levels");
         let pixels = vec![4u16, 8, 12, 24];
         let cfa = CFA::new("RGGB");
         let crop = Crop {
@@ -275,6 +310,49 @@ mod tests {
         };
         let err =
             reduce(Pixels::U16(&pixels), 2, 2, &cfa, crop, &bayer_levels()).expect_err("crop");
-        assert!(matches!(err, RawError::Geometry(_)));
+        assert!(matches!(err, RawError::CropOutside { .. }));
+    }
+
+    #[test]
+    fn black_table_is_indexed_from_the_active_area_origin() {
+        // 2x2 black table [1, 2, 3, 4]; the active area starts at column 1, so its first
+        // pixel must use black 1, not the second table entry.
+        let levels = Levels::new(
+            vec![1.0, 2.0, 3.0, 4.0],
+            2,
+            2,
+            BlackOrigin::ActiveArea,
+            vec![100.0],
+            1,
+            1,
+        )
+        .expect("levels");
+        let pixels = vec![5u16; 3 * 3];
+        let cfa = CFA::new("RGGB");
+        let crop = Crop {
+            x: 1,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let reduced = reduce(Pixels::U16(&pixels), 3, 3, &cfa, crop, &levels).expect("reduce");
+        let red = 3.0f32 / 98.0;
+        let green = (4.0f32 / 99.0 + 1.0 / 96.0) / 2.0;
+        let blue = 2.0f32 / 97.0;
+        assert!(
+            (reduced.rgb[0] - red).abs() < 1e-6,
+            "red {}",
+            reduced.rgb[0]
+        );
+        assert!(
+            (reduced.rgb[1] - green).abs() < 1e-6,
+            "green {}",
+            reduced.rgb[1]
+        );
+        assert!(
+            (reduced.rgb[2] - blue).abs() < 1e-6,
+            "blue {}",
+            reduced.rgb[2]
+        );
     }
 }

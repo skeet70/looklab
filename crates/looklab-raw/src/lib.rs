@@ -17,6 +17,7 @@
 //! The reduced decode path spawns no rayon threads; the Node test fails if it does.
 
 mod demosaic;
+mod dng;
 mod error;
 mod exif_orientation;
 mod matrices;
@@ -24,7 +25,7 @@ mod orientation;
 mod rawler_decoder;
 
 pub use error::RawError;
-pub use matrices::{CameraMatrix, ColorMatrices, Illuminant};
+pub use matrices::{CameraMatrix, ColorMatrices, ForwardMatrix, Illuminant};
 pub use orientation::Orientation;
 pub use rawler_decoder::RawlerDecoder;
 

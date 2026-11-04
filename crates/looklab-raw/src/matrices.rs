@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Camera colour matrices, as rawler reports them.
+//! Camera colour matrices from rawler and from the file's DNG tags.
 
 use looklab_color::Mat3;
 use std::collections::HashMap;
@@ -89,10 +89,18 @@ pub struct CameraMatrix {
     pub xyz_to_camera: Mat3,
 }
 
-/// Every camera matrix rawler found, ordered by illuminant code.
+/// Camera RGB to XYZ under D50, the DNG `ForwardMatrix` direction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForwardMatrix {
+    pub illuminant: Illuminant,
+    pub camera_to_xyz: Mat3,
+}
+
+/// Camera matrices found in the file, ordered by illuminant code.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColorMatrices {
     matrices: Vec<CameraMatrix>,
+    forward_matrices: Vec<ForwardMatrix>,
 }
 
 impl ColorMatrices {
@@ -104,8 +112,19 @@ impl ColorMatrices {
         self.matrices.iter().find(|m| m.illuminant == illuminant)
     }
 
-    pub(crate) fn from_rawler(
+    pub fn forward_matrices(&self) -> &[ForwardMatrix] {
+        &self.forward_matrices
+    }
+
+    pub fn forward_for_illuminant(&self, illuminant: Illuminant) -> Option<&ForwardMatrix> {
+        self.forward_matrices
+            .iter()
+            .find(|m| m.illuminant == illuminant)
+    }
+
+    pub(crate) fn new(
         source: &HashMap<rawler::imgop::xyz::Illuminant, Vec<f32>>,
+        mut forward_matrices: Vec<ForwardMatrix>,
     ) -> Option<Self> {
         let mut matrices: Vec<CameraMatrix> = source
             .iter()
@@ -117,7 +136,14 @@ impl ColorMatrices {
             })
             .collect();
         matrices.sort_by_key(|m| m.illuminant);
-        (!matrices.is_empty()).then_some(Self { matrices })
+        forward_matrices.sort_by_key(|m| m.illuminant);
+        if matrices.is_empty() && forward_matrices.is_empty() {
+            return None;
+        }
+        Some(Self {
+            matrices,
+            forward_matrices,
+        })
     }
 }
 
