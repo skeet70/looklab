@@ -71,6 +71,9 @@ fn LookPageView(page: LookPage) -> impl IntoView {
     let index = RwSignal::new(Load::<SiteIndex>::Loading);
     let other = RwSignal::new(String::new());
     let other_lut = RwSignal::new(Load::<Arc<Vec<u8>>>::Loading);
+    let version_generation = RwSignal::new(0_u32);
+    let scene_generation = RwSignal::new(0_u32);
+    let other_generation = RwSignal::new(0_u32);
 
     Effect::new(move |_| {
         let slug = params.read().get("look").unwrap_or_default();
@@ -78,9 +81,15 @@ fn LookPageView(page: LookPage) -> impl IntoView {
         if slug.is_empty() || chosen.is_empty() {
             return;
         }
+        let mine = version_generation.get_untracked() + 1;
+        version_generation.set(mine);
         version.set(Load::Loading);
         wasm_bindgen_futures::spawn_local(async move {
-            version.set(match data::version(&slug, &chosen).await {
+            let loaded = data::version(&slug, &chosen).await;
+            if version_generation.get_untracked() != mine {
+                return;
+            }
+            version.set(match loaded {
                 Ok(loaded) => Load::Ready(Arc::new(loaded)),
                 Err(error) => Load::Failed(error),
             });
@@ -103,12 +112,19 @@ fn LookPageView(page: LookPage) -> impl IntoView {
 
     Effect::new(move |_| {
         let name = scene_name.get();
+        let mine = scene_generation.get_untracked() + 1;
+        scene_generation.set(mine);
         if name.is_empty() {
+            scene.set(Load::Loading);
             return;
         }
         scene.set(Load::Loading);
         wasm_bindgen_futures::spawn_local(async move {
-            scene.set(match data::scene(&name).await {
+            let loaded = data::scene(&name).await;
+            if scene_generation.get_untracked() != mine {
+                return;
+            }
+            scene.set(match loaded {
                 Ok(scene) => Load::Ready(Arc::new(scene)),
                 Err(error) => Load::Failed(error),
             });
@@ -126,7 +142,10 @@ fn LookPageView(page: LookPage) -> impl IntoView {
 
     Effect::new(move |_| {
         let slug = other.get();
+        let mine = other_generation.get_untracked() + 1;
+        other_generation.set(mine);
         if slug.is_empty() {
+            other_lut.set(Load::Loading);
             return;
         }
         let Some(index) = index.get().ready().cloned() else {
@@ -136,17 +155,17 @@ fn LookPageView(page: LookPage) -> impl IntoView {
             other_lut.set(Load::Failed(format!("unknown look `{slug}`")));
             return;
         };
-        let Some(version) = look
-            .versions
-            .last()
-            .map(|version| version.version.to_string())
-        else {
+        let Some(version) = look.latest().map(|version| version.version.to_string()) else {
             other_lut.set(Load::Failed(format!("{slug} has no published version")));
             return;
         };
         other_lut.set(Load::Loading);
         wasm_bindgen_futures::spawn_local(async move {
-            other_lut.set(match data::preview(&slug, &version).await {
+            let loaded = data::preview(&slug, &version).await;
+            if other_generation.get_untracked() != mine {
+                return;
+            }
+            other_lut.set(match loaded {
                 Ok(lut) => Load::Ready(lut),
                 Err(error) => Load::Failed(error),
             });

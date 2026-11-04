@@ -14,9 +14,9 @@ use looklab_model::file::{
 };
 use looklab_model::{Density, LookDocument, ProbeCovariance, UncertaintyData};
 use looklab_publish::{
-    ArtifactBlob, ArtifactName, AuditEntry, AuditEvent, AuditLog, BodyExtras, BodyPage, BodyUse,
-    CredentialRef, CredentialTier, Decision, GateCheck, GateSummary, InputTransformPage,
-    LicensePage, LookArtifact, LookPage, LookRef, LookStatus, LookVersionPage, ProposalRef,
+    ArtifactBlob, ArtifactHash, ArtifactName, AuditEntry, AuditEvent, AuditLog, BodyExtras,
+    BodyPage, BodyUse, CredentialRef, CredentialTier, Decision, GateCheck, GateSummary,
+    InputTransformPage, LicensePage, LookPage, LookRef, LookStatus, LookVersionPage, ProposalRef,
     ProvenanceSummary, RealizationNote, Role, Scene, SceneName, SiteData, SitePath, Timestamp,
     TransformSource, VersionNotes, VersionRef, WeakSpot, bake_preview_lut, write_site,
 };
@@ -81,11 +81,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut seq = audit.len() as u64;
     for look in &looks {
         for version in &look.versions {
-            let artifact = version
-                .artifacts()
-                .iter()
-                .find(|entry| matches!(LookArtifact::of(&entry.name), LookArtifact::Document))
-                .ok_or("look version has no document artifact")?;
+            let manifest = version.manifest.to_json()?;
             seq += 1;
             audit.push(AuditEntry {
                 seq,
@@ -93,7 +89,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 event: AuditEvent::Release {
                     look: LookRef::new(look.slug.as_str())?,
                     version: VersionRef::new(version.version().as_str())?,
-                    manifest_sha256: artifact.sha256.clone(),
+                    manifest_sha256: ArtifactHash::of(&manifest),
                 },
             });
         }
@@ -113,7 +109,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         fs::write(full, bytes)
     };
-    write_site(&mut sink, &site)?;
+    let root = write_site(&mut sink, &site)?;
+    fs::write(out.join("site-root.txt"), root.as_str())?;
     println!(
         "wrote {}/data ({} bytes of index)",
         out.display(),

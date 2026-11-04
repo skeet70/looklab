@@ -43,7 +43,7 @@ pub fn LooksPage() -> impl IntoView {
                             || look.slug.as_str().contains(&needle)
                     })
                     .map(|look| {
-                        let version = look.versions.last().map(|version| version.version.to_string());
+                        let version = look.latest().map(|version| version.version.to_string());
                         view! {
                             <li class="card">
                                 <h2>

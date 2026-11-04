@@ -14,6 +14,44 @@ pub const LUT_SIZE: usize = 33;
 /// `LUT_SIZE³` RGB entries of `f32`.
 pub const LUT_BYTES: usize = LUT_SIZE * LUT_SIZE * LUT_SIZE * 3 * 4;
 
+/// Scene-linear value the shaper centres on: middle grey.
+pub const PREVIEW_PIVOT: f64 = 0.18;
+/// Negative extent of the shaper, in stops below the pivot.
+pub const PREVIEW_LOW_EV: f64 = 12.0;
+/// Positive extent of the shaper, in stops above the pivot.
+pub const PREVIEW_HIGH_EV: f64 = 6.0;
+
+/// `0..1` grid coordinate of a scene-linear value in -EV..+EV around the pivot.
+pub fn preview_shaper(value: f64) -> f64 {
+    if value >= 0.0 {
+        let stops = libm::log2(1.0 + value / PREVIEW_PIVOT)
+            / libm::log2(1.0 + libm::pow(2.0, PREVIEW_HIGH_EV));
+        0.5 + 0.5 * stops.clamp(0.0, 1.0)
+    } else {
+        let stops = libm::log2(1.0 - value / PREVIEW_PIVOT)
+            / libm::log2(1.0 + libm::pow(2.0, PREVIEW_LOW_EV));
+        0.5 - 0.5 * stops.clamp(0.0, 1.0)
+    }
+}
+
+/// Inverse of [`preview_shaper`].
+pub fn preview_unshaper(coordinate: f64) -> f64 {
+    let coordinate = coordinate.clamp(0.0, 1.0);
+    if coordinate >= 0.5 {
+        PREVIEW_PIVOT
+            * (libm::pow(
+                2.0,
+                (coordinate - 0.5) * 2.0 * libm::log2(1.0 + libm::pow(2.0, PREVIEW_HIGH_EV)),
+            ) - 1.0)
+    } else {
+        -PREVIEW_PIVOT
+            * (libm::pow(
+                2.0,
+                (0.5 - coordinate) * 2.0 * libm::log2(1.0 + libm::pow(2.0, PREVIEW_LOW_EV)),
+            ) - 1.0)
+    }
+}
+
 /// Encoded-sRGB output of [`bake_preview_lut`], little-endian `f32`, red slowest.
 pub fn bake_preview_lut(document: &LookDocument) -> Vec<u8> {
     let model = Cam16Model::new(&ViewingConditions::reference());
@@ -22,10 +60,10 @@ pub fn bake_preview_lut(document: &LookDocument) -> Vec<u8> {
     for r in 0..LUT_SIZE {
         for g in 0..LUT_SIZE {
             for b in 0..LUT_SIZE {
-                let input = RgbSpace::Srgb.rgb_encoded_to_xyz(Rgb::new(
-                    r as f64 * scale,
-                    g as f64 * scale,
-                    b as f64 * scale,
+                let input = RgbSpace::Rec2020.rgb_linear_to_xyz(Rgb::new(
+                    preview_unshaper(r as f64 * scale),
+                    preview_unshaper(g as f64 * scale),
+                    preview_unshaper(b as f64 * scale),
                 ));
                 let clipped = document
                     .look
@@ -109,15 +147,15 @@ pub fn render_preview(lut: &[u8], scene: &PreparedScene) -> Result<Vec<u8>, Publ
 }
 
 fn sample(xyz: [f32; 3]) -> Sample {
-    let rgb = RgbSpace::Srgb.xyz_to_rgb_encoded(Xyz::new(
+    let linear = RgbSpace::Rec2020.xyz_to_rgb_linear(Xyz::new(
         f64::from(xyz[0]),
         f64::from(xyz[1]),
         f64::from(xyz[2]),
     ));
     let rgb = [
-        (rgb.r as f32).clamp(0.0, 1.0),
-        (rgb.g as f32).clamp(0.0, 1.0),
-        (rgb.b as f32).clamp(0.0, 1.0),
+        preview_shaper(linear.r) as f32,
+        preview_shaper(linear.g) as f32,
+        preview_shaper(linear.b) as f32,
     ];
     let max = (LUT_SIZE - 1) as f32;
     let pos = [rgb[0] * max, rgb[1] * max, rgb[2] * max];
@@ -209,6 +247,20 @@ mod tests {
         assert!((f64::from(rgba[1]) / 255.0 - expected.g).abs() < 0.02);
         assert!((f64::from(rgba[2]) / 255.0 - expected.b).abs() < 0.02);
         assert_eq!(rgba[3], 255);
+    }
+
+    #[test]
+    fn shaper_round_trips_and_covers_the_supported_range() {
+        for value in [0.0, 0.001, 0.18, 1.0, 5.0, -0.001, -1.0] {
+            let back = preview_unshaper(preview_shaper(value));
+            assert!(
+                (back - value).abs() <= value.abs() * 1.0e-9,
+                "{value} -> {back}"
+            );
+        }
+        assert!(preview_shaper(0.18 * 8.0) > preview_shaper(0.18 * 4.0));
+        assert!(preview_shaper(-0.18 * 8.0) < preview_shaper(-0.18 * 4.0));
+        assert_eq!(preview_shaper(0.0), 0.5);
     }
 
     #[test]

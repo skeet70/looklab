@@ -48,7 +48,7 @@
 - Subresource Integrity and published build hashes protect against a tampered CDN. They **can't** protect against a malicious origin, because the hashes come from the same origin. Say so on `/about/privacy`, publish reproducible-build hashes in the audit log, and **point privacy-sensitive users to the CLI**, which they can build from source. Sampling is random, so payloads differ between runs. To check that the web client sent only what it should:
   1. **Open devtools and turn on "Preserve log" before loading the site**, so requests sent on page load are recorded. Then export the **request body actually sent** (HAR export). Don't use the inspector's "Download payload", because a malicious client could offer a clean download while uploading something else.
   2. Export the local **seed file** from the inspector. It contains a seed per image or re-render group, plus the prior-transform version.
-  3. Run `looklab-cli verify-payload --seeds seeds.json --har upload.har <files>`. It runs the source-built `looklab-wasm` prep module under wasmtime ([03 §2.1](03-data-model.md)), then:
+  3. Run `looklab-cli verify-payload --seeds seeds.json --har upload.har --module looklab_prep_module.wasm --origin https://site.example --rp-id site.example <files>`. Export the HAR with the network panel filtered to the upload session's API requests; any other request in it is flagged. It runs the source-built prep module under wasmtime ([03 §2.1](03-data-model.md)), then:
      - **parses the upload body strictly** as the canonical envelope ([03 §2.3](03-data-model.md)) and rejects any deviation or trailing bytes;
      - checks that the **manifest and every sample blob reproduce byte for byte**. There's no tolerance, since a tolerance could hide data in low-order bits;
      - checks that the remaining fields are exactly the expected set:
@@ -64,7 +64,7 @@
          - **signature:** must be well-formed for a supported algorithm (Ed25519 64 bytes; ECDSA as valid DER; RSA at the key size). There's no fixed length rule. An optional check against the credential key, if you have it from your own records, is a sanity check for an honest site only; the guarantee doesn't rest on it.
        - **proof-of-work:** k solutions, each verified;
        - **serial:** equal to your files' EXIF serial, or absent;
-     - lists **every other request** in the HAR to the site's origin or elsewhere, and flags any that aren't part of the expected API (nonce, upload, status).
+     - lists **every other request** in the HAR to the site's origin or elsewhere, and flags any that aren't part of the expected API (nonce, upload, status, passkey registration).
 
      **Residual channels (documented, not closed):**
      - a client can choose *which* valid proof-of-work solutions it sends, leaking a few bits per batch at exponentially more work;

@@ -1,0 +1,3 @@
+# The site entry package is not a core crate: the root float/std bans do not apply.
+disallowed-methods = []
+disallowed-types = []

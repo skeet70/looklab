@@ -47,6 +47,7 @@ fn BodyDetailView(body: BodyPage) -> impl IntoView {
                 .cloned()
         }
     };
+    let initial_epoch = body.epochs.first().map(|epoch| epoch.id);
 
     view! {
         <h1>{format!("{} {}", body.make, body.model)}</h1>
@@ -108,7 +109,7 @@ fn BodyDetailView(body: BodyPage) -> impl IntoView {
                 {body.epochs.iter().map(|epoch| {
                     let id = epoch.id;
                     view! {
-                        <option value=id.to_string() selected=Some(id) == Some(epoch.id)>
+                        <option value=id.to_string() selected=Some(id) == initial_epoch>
                             {format!("Epoch {id} · firmware {}–{}", epoch.firmware_from, epoch.firmware_to)}
                         </option>
                     }

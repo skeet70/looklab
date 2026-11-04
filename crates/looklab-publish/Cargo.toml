@@ -8,6 +8,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+libm.workspace = true
 looklab-color.workspace = true
 looklab-model.workspace = true
 looklab-schema.workspace = true

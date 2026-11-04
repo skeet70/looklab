@@ -62,6 +62,8 @@ pub struct SceneSummary {
     pub width: u32,
     pub height: u32,
     pub path: SitePath,
+    pub sha256: crate::ArtifactHash,
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

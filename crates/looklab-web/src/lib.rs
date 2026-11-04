@@ -3,11 +3,25 @@
 
 pub mod app;
 pub mod data;
+pub mod diagnostics;
 pub mod pages;
 pub mod preview;
 pub mod ui;
 
+use std::sync::OnceLock;
+
 pub use app::App;
+
+static SITE_ROOT: OnceLock<&'static str> = OnceLock::new();
+
+pub fn mount_with_root(root: &'static str) {
+    let _ = SITE_ROOT.set(root);
+    mount();
+}
+
+pub(crate) fn site_root() -> &'static str {
+    SITE_ROOT.get().copied().unwrap_or("")
+}
 
 pub fn mount() {
     console_error_panic_hook::set_once();

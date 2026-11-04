@@ -26,13 +26,16 @@ pub use manifest::{
     LookArtifact, LookStatus, PREVIEW_LUT_ARTIFACT, ProvenanceSummary, VersionManifest,
     verify_artifact,
 };
-pub use preview::{LUT_BYTES, LUT_SIZE, PreparedScene, bake_preview_lut, render_preview};
+pub use preview::{
+    LUT_BYTES, LUT_SIZE, PREVIEW_HIGH_EV, PREVIEW_LOW_EV, PREVIEW_PIVOT, PreparedScene,
+    bake_preview_lut, preview_shaper, preview_unshaper, render_preview,
+};
 pub use scene::{SCENE_FORMAT, Scene, SceneIndex, SceneName, SceneSummary, f16_to_f32, f32_to_f16};
 pub use site::{
     AUDIT_LOG_PATH, BodySummary, INDEX_PATH, LicensePage, LookPage, LookSummary, LookVersionPage,
     MANIFEST_NAME, SCENE_INDEX_PATH, SITE_FORMAT, SiteData, SiteIndex, SiteSink, VersionNotes,
-    VersionSummary, WeakSpot, audit_log_path, body_path, index_path, look_path, manifest_path,
-    scene_index_path, scene_path, version_dir, write_site,
+    VersionSummary, WeakSpot, audit_log_path, body_path, compare_versions, index_path, look_path,
+    manifest_path, scene_index_path, scene_path, version_dir, write_site,
 };
 
 #[derive(Debug, thiserror::Error)]

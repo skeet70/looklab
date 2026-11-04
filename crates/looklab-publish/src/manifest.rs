@@ -156,6 +156,12 @@ impl VersionManifest {
     pub fn artifact(&self, name: &ArtifactName) -> Option<&ArtifactEntry> {
         self.artifacts.iter().find(|entry| &entry.name == name)
     }
+
+    /// # Errors
+    /// Propagates a serializer failure.
+    pub fn to_json(&self) -> Result<Vec<u8>, PublishError> {
+        Ok(serde_json::to_vec_pretty(self)?)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

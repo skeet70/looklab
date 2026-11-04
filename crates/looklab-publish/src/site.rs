@@ -100,8 +100,29 @@ impl LookPage {
     pub fn latest(&self) -> Option<&LookVersionPage> {
         self.versions
             .iter()
-            .max_by(|left, right| left.version().cmp(right.version()))
+            .max_by(|left, right| compare_versions(left.version(), right.version()))
     }
+}
+
+/// Orders versions by their numeric dotted segments, then by their text.
+pub fn compare_versions(left: &LookVersion, right: &LookVersion) -> core::cmp::Ordering {
+    version_parts(left)
+        .cmp(&version_parts(right))
+        .then_with(|| left.as_str().cmp(right.as_str()))
+}
+
+fn version_parts(version: &LookVersion) -> Vec<u64> {
+    version
+        .as_str()
+        .split('.')
+        .map(|part| {
+            part.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +130,8 @@ pub struct VersionSummary {
     pub version: LookVersion,
     pub status: LookStatus,
     pub manifest: SitePath,
+    pub manifest_sha256: ArtifactHash,
+    pub manifest_bytes: u64,
     pub artifact: ArtifactName,
     pub sha256: ArtifactHash,
     pub bytes: u64,
@@ -121,6 +144,14 @@ pub struct LookSummary {
     pub kind: LookKind,
     pub wb_policy: WbPolicy,
     pub versions: Vec<VersionSummary>,
+}
+
+impl LookSummary {
+    pub fn latest(&self) -> Option<&VersionSummary> {
+        self.versions
+            .iter()
+            .max_by(|left, right| compare_versions(&left.version, &right.version))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,7 +247,10 @@ pub fn manifest_path(slug: &Slug, version: &LookVersion) -> Result<SitePath, Pub
 ///
 /// # Errors
 /// Rejects duplicate ids and unsafe paths, and propagates sink failures.
-pub fn write_site<S: SiteSink + ?Sized>(sink: &mut S, site: &SiteData) -> Result<(), PublishError> {
+pub fn write_site<S: SiteSink + ?Sized>(
+    sink: &mut S,
+    site: &SiteData,
+) -> Result<ArtifactHash, PublishError> {
     validate(site)?;
 
     for body in &site.bodies {
@@ -243,7 +277,7 @@ pub fn write_site<S: SiteSink + ?Sized>(sink: &mut S, site: &SiteData) -> Result
             }
             sink.put(
                 &manifest_path(&look.slug, &version.manifest.version)?,
-                &json(&version.manifest)?,
+                &version.manifest.to_json()?,
             )?;
         }
     }
@@ -253,8 +287,9 @@ pub fn write_site<S: SiteSink + ?Sized>(sink: &mut S, site: &SiteData) -> Result
     }
     sink.put(&scene_index_path(), &json(&scene_index(site)?)?)?;
     sink.put(&audit_log_path(), &json(&site.audit_log)?)?;
-    sink.put(&index_path(), &json(&site_index(site)?)?)?;
-    Ok(())
+    let index = json(&site_index(site)?)?;
+    sink.put(&index_path(), &index)?;
+    Ok(ArtifactHash::of(&index))
 }
 
 fn json<T: Serialize>(value: &T) -> Result<Vec<u8>, PublishError> {
@@ -266,11 +301,14 @@ fn scene_index(site: &SiteData) -> Result<SceneIndex, PublishError> {
         .scenes
         .iter()
         .map(|scene| {
+            let bytes = scene.to_f16_bytes();
             Ok(SceneSummary {
                 name: scene.name.clone(),
                 width: scene.width,
                 height: scene.height,
                 path: scene_path(&scene.name)?,
+                sha256: ArtifactHash::of(&bytes),
+                bytes: bytes.len() as u64,
             })
         })
         .collect::<Result<Vec<_>, PublishError>>()?;
@@ -318,10 +356,13 @@ fn site_index(site: &SiteData) -> Result<SiteIndex, PublishError> {
                                 version: version.version().as_str().to_owned(),
                             }
                         })?;
+                        let manifest = version.manifest.to_json()?;
                         Ok(VersionSummary {
                             version: version.version().clone(),
                             status: version.manifest.status,
                             manifest: manifest_path(&look.slug, version.version())?,
+                            manifest_sha256: ArtifactHash::of(&manifest),
+                            manifest_bytes: manifest.len() as u64,
                             artifact: first.name.clone(),
                             sha256: first.sha256.clone(),
                             bytes: first.bytes,

@@ -13,6 +13,8 @@ use crate::ui;
 
 #[derive(Clone, Debug)]
 struct CompareReady {
+    a_slug: String,
+    b_slug: String,
     a_name: String,
     b_name: String,
     a_version: String,
@@ -27,6 +29,7 @@ pub fn ComparePage() -> impl IntoView {
     let state = RwSignal::new(Load::<CompareReady>::Loading);
     let choice_a = RwSignal::new(String::new());
     let choice_b = RwSignal::new(String::new());
+    let generation = RwSignal::new(0_u32);
 
     Effect::new(move |_| {
         wasm_bindgen_futures::spawn_local(async move {
@@ -40,12 +43,22 @@ pub fn ComparePage() -> impl IntoView {
     Effect::new(move |_| {
         let a = query.read().get("a").unwrap_or_default();
         let b = query.read().get("b").unwrap_or_default();
+        let mine = generation.get_untracked() + 1;
+        generation.set(mine);
         state.set(Load::Loading);
         wasm_bindgen_futures::spawn_local(async move {
-            state.set(match load_pair(a, b).await {
-                Ok(ready) => Load::Ready(ready),
-                Err(error) => Load::Failed(error),
-            });
+            let loaded = load_pair(a, b).await;
+            if generation.get_untracked() != mine {
+                return;
+            }
+            match loaded {
+                Ok(ready) => {
+                    choice_a.set(ready.a_slug.clone());
+                    choice_b.set(ready.b_slug.clone());
+                    state.set(Load::Ready(ready));
+                }
+                Err(error) => state.set(Load::Failed(error)),
+            }
         });
     });
 
@@ -64,7 +77,7 @@ pub fn ComparePage() -> impl IntoView {
                 <div class="picker-grid">
                     <section class="panel">
                         <label for="compare-a">"Look A"</label>
-                        <select id="compare-a" on:change=move |event| choice_a.set(event_target_value(&event))>
+                        <select id="compare-a" prop:value=move || choice_a.get() on:change=move |event| choice_a.set(event_target_value(&event))>
                             {index.looks.iter().map(|look| {
                                 view! { <option value=look.slug.to_string()>{look.name.clone()}</option> }
                             }).collect_view()}
@@ -72,7 +85,7 @@ pub fn ComparePage() -> impl IntoView {
                     </section>
                     <section class="panel">
                         <label for="compare-b">"Look B"</label>
-                        <select id="compare-b" on:change=move |event| choice_b.set(event_target_value(&event))>
+                        <select id="compare-b" prop:value=move || choice_b.get() on:change=move |event| choice_b.set(event_target_value(&event))>
                             {index.looks.iter().map(|look| {
                                 view! { <option value=look.slug.to_string()>{look.name.clone()}</option> }
                             }).collect_view()}
@@ -131,16 +144,20 @@ async fn load_pair(a: String, b: String) -> Result<CompareReady, String> {
     let a_loaded = data::version(&a_slug, &a_version).await?;
     let b_loaded = data::version(&b_slug, &b_version).await?;
     let probes = looklab_model::probes::v1();
+    let a_look = crate::diagnostics::DocumentLook::new(&a_loaded.document, &probes);
+    let b_look = crate::diagnostics::DocumentLook::new(&b_loaded.document, &probes);
     let a_name = FunctionName::new(a_page.name.clone());
     let b_name = FunctionName::new(b_page.name.clone());
     let comparison = compare(&ComparisonInput {
-        a: &a_loaded.document.look,
-        b: &b_loaded.document.look,
+        a: &a_look,
+        b: &b_look,
         probes: &probes,
         a_name: &a_name,
         b_name: &b_name,
     });
     Ok(CompareReady {
+        a_slug,
+        b_slug,
         a_name: a_page.name,
         b_name: b_page.name,
         a_version,

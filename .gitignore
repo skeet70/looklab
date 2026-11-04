@@ -4,3 +4,4 @@ target/
 __pycache__/
 site/data/
 site/dist/
+site/site-root.txt
