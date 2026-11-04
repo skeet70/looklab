@@ -1,0 +1,1163 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! `looklab verify-payload`: reproduce a browser upload from a HAR under
+//! wasmtime and compare it byte for byte.
+//!
+//! The flow is [docs/06 §5](../../../docs/06-privacy-and-payload.md) steps 1-4.
+//! Nothing the site served beyond the HAR itself is consulted, and no keys.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow, bail};
+use clap::Args;
+use looklab_meta::{ParsedMetadata, RawSerial};
+use looklab_prep::{LocalImageKey, PrepParams, RawFormat, SeedFile};
+use looklab_prep_module::{
+    BuildManifestRequest, BuildManifestResponse, Function, ManifestImageInput, ModuleError,
+    PrepareRequest, PrepareResponse, PriorTransformSpec, Response, VersionResponse,
+};
+use looklab_upload::{
+    BatchManifest, BlobKind, Envelope, EnvelopeParts, ExpectedAssertion, Limits, ManifestImage,
+    ManifestMetadata, PowParams, RawSerial as UploadSerial, SignatureAlgorithm, StructuralVerdict,
+    check_structure, encode_envelope, parse_envelope_strict, verify as verify_pow,
+};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use wasmtime::{Engine, Instance, Module, Store};
+
+const STATE_FORMAT: &str = "looklab-verify-state/1";
+const UPLOAD_PATH: &str = "/api/upload";
+const NONCE_PATH: &str = "/api/nonce";
+const REGISTER_START_PATH: &str = "/api/passkey/register/start";
+const REGISTER_FINISH_PATH: &str = "/api/passkey/register/finish";
+const STATUS_PREFIX: &str = "/status/";
+
+/// The residual channels [docs/06 §5](../../../docs/06-privacy-and-payload.md)
+/// documents as not closed.
+const RESIDUAL_CHANNELS: &[&str] = &[
+    "Residual channels (documented, not closed):",
+    "- a client can choose which valid proof-of-work solutions it sends, leaking a few bits per batch at exponentially more work;",
+    "- the signature itself: a site that forges keys can choose signature bytes freely (tens to hundreds of bytes per batch, depending on algorithm);",
+    "- the credential ID chosen at passkey registration: a forged-key site picks it once (≤ 255 bytes, a one-time leak; it's then fixed by the identical-ID check);",
+    "- timing.",
+];
+
+#[derive(Debug, Args)]
+pub struct VerifyPayloadArgs {
+    /// The local seed file exported by the client. SENSITIVE: it reveals sampling order.
+    #[arg(long, value_name = "FILE")]
+    pub seeds: PathBuf,
+    /// HAR files exported from the browser request log; repeat for several sessions.
+    #[arg(long = "har", value_name = "FILE", required = true)]
+    pub har: Vec<PathBuf>,
+    /// The source-built `looklab-prep-module` wasm binary.
+    #[arg(long, value_name = "FILE")]
+    pub module: PathBuf,
+    /// The site's origin, for example `https://looklab.example`.
+    #[arg(long, value_name = "URL")]
+    pub origin: String,
+    /// The site's WebAuthn relying-party ID, the registrable domain.
+    #[arg(long = "rp-id", value_name = "DOMAIN")]
+    pub rp_id: String,
+    /// Where the credential id is recorded between runs. Defaults to
+    /// `$XDG_STATE_HOME/looklab/verify.json`, else `~/.local/state/looklab/verify.json`.
+    #[arg(long, value_name = "FILE")]
+    pub state: Option<PathBuf>,
+    /// Proof-of-work memory in KiB. Defaults to the server default, 16 MiB.
+    #[arg(long = "pow-memory-kib", value_name = "KIB")]
+    pub pow_memory_kib: Option<u32>,
+    /// Proof-of-work iterations. Defaults to the server default, 1.
+    #[arg(long = "pow-iterations", value_name = "N")]
+    pub pow_iterations: Option<u32>,
+    /// Proof-of-work difficulty in bits per image. Defaults to the server default, 8.
+    #[arg(long = "pow-difficulty", value_name = "BITS")]
+    pub pow_difficulty: Option<f64>,
+    /// The RAW and JPEG files that went into the upload, each RAW before its JPEGs.
+    #[arg(value_name = "FILES", required = true)]
+    pub files: Vec<PathBuf>,
+}
+
+pub fn run(args: &VerifyPayloadArgs) -> Result<()> {
+    let findings = verify(args)?;
+    print_report(&findings);
+    if findings.status() == Status::Fail {
+        bail!("payload verification failed");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Status {
+    Pass,
+    Review,
+    Fail,
+}
+
+#[derive(Debug, Default)]
+struct Findings {
+    lines: Vec<String>,
+    review: Vec<String>,
+    failures: Vec<String>,
+}
+
+impl Findings {
+    fn note(&mut self, line: impl Into<String>) {
+        self.lines.push(line.into());
+    }
+
+    fn fail(&mut self, reason: impl Into<String>) {
+        self.failures.push(reason.into());
+    }
+
+    fn review(&mut self, item: impl Into<String>) {
+        self.review.push(item.into());
+    }
+
+    fn status(&self) -> Status {
+        if !self.failures.is_empty() {
+            Status::Fail
+        } else if !self.review.is_empty() {
+            Status::Review
+        } else {
+            Status::Pass
+        }
+    }
+}
+
+fn print_report(findings: &Findings) {
+    for line in &findings.lines {
+        println!("{line}");
+    }
+    match findings.status() {
+        Status::Pass => println!("\nPASS"),
+        Status::Review => {
+            println!("\nREVIEW NEEDED");
+            for item in &findings.review {
+                println!("  - {item}");
+            }
+        }
+        Status::Fail => {
+            println!("\nFAIL");
+            for reason in &findings.failures {
+                println!("  - {reason}");
+            }
+            if !findings.review.is_empty() {
+                println!("\nREVIEW NEEDED");
+                for item in &findings.review {
+                    println!("  - {item}");
+                }
+            }
+        }
+    }
+    println!();
+    for line in RESIDUAL_CHANNELS {
+        println!("{line}");
+    }
+}
+
+fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
+    let origin = Origin::parse(&args.origin)
+        .with_context(|| format!("--origin {:?} is not an origin", args.origin))?;
+    if args.rp_id.trim().is_empty() {
+        bail!("--rp-id must not be empty");
+    }
+
+    let seeds_text = std::fs::read_to_string(&args.seeds)
+        .with_context(|| format!("reading {}", args.seeds.display()))?;
+    let seeds = SeedFile::from_json(&seeds_text)
+        .with_context(|| format!("parsing {}", args.seeds.display()))?;
+    let module = ModuleHost::open(&args.module)?;
+    let groups = load_groups(&args.files)?;
+    let state_path = state_path(args.state.as_deref())?;
+    let mut state = VerifyState::load(&state_path)?;
+
+    let mut findings = Findings::default();
+    findings.note("looklab verify-payload");
+    findings.note(format!("origin: {origin}"));
+    findings.note(format!("rp id: {}", args.rp_id));
+    let version = module.version()?;
+    findings.note(format!(
+        "module: {} (prep version {}, build id {})",
+        args.module.display(),
+        version.prep_version,
+        hex(&version.build_id)
+    ));
+    findings.note(format!(
+        "seeds: {} (prior-transform version {})",
+        args.seeds.display(),
+        seeds.prior_transform_version().get()
+    ));
+    findings.note(format!("state: {}", state_path.display()));
+    findings.note(format!(
+        "files: {} in {} group(s)",
+        args.files.len(),
+        groups.len()
+    ));
+
+    let serials: Vec<(&str, &RawSerial)> = groups
+        .iter()
+        .flat_map(Group::files)
+        .filter_map(|file| file.serial().map(|serial| (file.name.as_str(), serial)))
+        .collect();
+
+    let reproduced = reproduce(&groups, &seeds, &module, &mut findings);
+    let service = Service {
+        origin: &origin,
+        rp_id: &args.rp_id,
+        module: &module,
+        reproduced: &reproduced,
+        serials: &serials,
+        pow: pow_params(args),
+    };
+
+    let mut credentials: Vec<(String, Vec<u8>)> = Vec::new();
+    for path in &args.har {
+        let har = Har::load(path)?;
+        findings.note("");
+        findings.note(format!(
+            "har: {} ({} requests)",
+            path.display(),
+            har.log.entries.len()
+        ));
+        let mut uploads = Vec::new();
+        for entry in &har.log.entries {
+            let class = classify(&entry.request, &origin);
+            let marker = match class {
+                RequestClass::Unexpected => "[UNEXPECTED]",
+                _ => "[expected]",
+            };
+            findings.note(format!(
+                "  {marker} {} {}",
+                entry.request.method, entry.request.url
+            ));
+            match class {
+                RequestClass::Unexpected => findings.fail(format!(
+                    "unexpected request in {}: {} {}",
+                    path.display(),
+                    entry.request.method,
+                    entry.request.url
+                )),
+                RequestClass::Upload => uploads.push(entry),
+                _ => {}
+            }
+        }
+        if uploads.is_empty() {
+            findings.fail(format!(
+                "{} has no POST {UPLOAD_PATH} request",
+                path.display()
+            ));
+        }
+        for (index, entry) in uploads.iter().enumerate() {
+            let label = format!("upload {} of {}", index + 1, file_name(path));
+            findings.note("");
+            findings.note(label.clone());
+            if let Some(credential) = verify_upload(&entry.request, &service, &mut findings) {
+                credentials.push((label, credential));
+            }
+        }
+    }
+
+    record_credential(
+        &mut state,
+        &credentials,
+        &state_path,
+        &origin,
+        &args.rp_id,
+        &mut findings,
+    )?;
+
+    Ok(findings)
+}
+
+struct Service<'a> {
+    origin: &'a Origin,
+    rp_id: &'a str,
+    module: &'a ModuleHost,
+    reproduced: &'a [ReproducedImage],
+    serials: &'a [(&'a str, &'a UploadSerial)],
+    pow: PowParams,
+}
+
+#[derive(Debug)]
+struct ReproducedImage {
+    metadata: ManifestMetadata,
+    rerender_group: Option<[u8; 16]>,
+    blob: Vec<u8>,
+}
+
+fn verify_upload(
+    request: &HarRequest,
+    service: &Service<'_>,
+    findings: &mut Findings,
+) -> Option<Vec<u8>> {
+    if let Some(mime_type) = request
+        .post_data
+        .as_ref()
+        .and_then(|post| post.mime_type.as_deref())
+        && !mime_type.starts_with("application/octet-stream")
+    {
+        findings.fail(format!(
+            "the upload request's content type is {mime_type:?}, expected application/octet-stream"
+        ));
+    }
+    let body = match request.body() {
+        Ok(body) => body,
+        Err(error) => {
+            findings.fail(format!("the upload body could not be extracted: {error}"));
+            return None;
+        }
+    };
+    let envelope = match parse_envelope_strict(&body, &Limits::default()) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            findings.fail(format!(
+                "the upload body is not the canonical envelope: {error}"
+            ));
+            return None;
+        }
+    };
+    findings.note(format!(
+        "  envelope: canonical LLUPLD version 1, {} bytes, no trailing bytes",
+        body.len()
+    ));
+    findings.note(format!(
+        "  nonce: {} bytes",
+        envelope.nonce.as_bytes().len()
+    ));
+
+    let reproduced = check_images(&envelope, service, findings);
+    check_webauthn(&envelope, service, findings);
+    check_pow(&envelope, service, findings);
+    if reproduced {
+        check_serial(&envelope, service, &body, findings);
+    }
+
+    Some(envelope.assertion.credential_id)
+}
+
+fn check_images(envelope: &Envelope, service: &Service<'_>, findings: &mut Findings) -> bool {
+    let site = &envelope.manifest;
+    if site.images.len() != service.reproduced.len() {
+        findings.fail(format!(
+            "the upload has {} image(s) but the files reproduce {}",
+            site.images.len(),
+            service.reproduced.len()
+        ));
+    }
+
+    let images: Vec<ManifestImage> = service
+        .reproduced
+        .iter()
+        .map(|image| ManifestImage {
+            meta: image.metadata.clone(),
+            rerender_group: image
+                .rerender_group
+                .map(looklab_upload::RerenderGroupId::new),
+            blob_sha256: sha256(&image.blob),
+            blob_kind: BlobKind::Samples,
+        })
+        .collect();
+    let rebuilt = BatchManifest {
+        kind: site.kind,
+        intent: site.intent.clone(),
+        body: site.body.clone(),
+        firmware_version: site.firmware_version.clone(),
+        sim_key: site.sim_key.clone(),
+        settings: site.settings.clone(),
+        images,
+    };
+
+    let request = BuildManifestRequest {
+        kind: rebuilt.kind,
+        intent: rebuilt.intent.clone(),
+        body: rebuilt.body.clone(),
+        firmware: rebuilt.firmware_version.clone(),
+        sim: rebuilt.sim_key.clone(),
+        settings: rebuilt.settings.clone(),
+        images: service
+            .reproduced
+            .iter()
+            .map(|image| ManifestImageInput {
+                metadata: image.metadata.clone(),
+                rerender_group: image.rerender_group,
+                blob: image.blob.clone(),
+                kind: BlobKind::Samples,
+            })
+            .collect(),
+        nonce: envelope.nonce,
+    };
+    let mut manifest_matches = false;
+    match service.module.build_manifest(&request) {
+        Ok(response) => {
+            if response.manifest_bytes == envelope.manifest_bytes {
+                manifest_matches = true;
+                findings.note("  manifest: reproduced field for field through the prep module");
+            } else {
+                for difference in manifest_differences(site, &rebuilt) {
+                    findings.fail(format!("manifest: {difference}"));
+                }
+            }
+        }
+        Err(error) => {
+            findings.fail(format!(
+                "the prep module could not rebuild the manifest: {error}"
+            ));
+        }
+    }
+
+    let mut blobs_match = envelope.blobs.len() == service.reproduced.len();
+    for (index, (site_blob, ours)) in envelope.blobs.iter().zip(service.reproduced).enumerate() {
+        if site_blob != &ours.blob {
+            blobs_match = false;
+            findings.fail(format!(
+                "blob {index} differs from the reproduced sample blob"
+            ));
+        }
+    }
+    if blobs_match {
+        findings.note(format!(
+            "  blobs: {} of {} reproduced byte for byte",
+            envelope.blobs.len(),
+            service.reproduced.len()
+        ));
+    }
+    manifest_matches && blobs_match
+}
+
+fn manifest_differences(site: &BatchManifest, rebuilt: &BatchManifest) -> Vec<String> {
+    let mut differences = Vec::new();
+    if site.kind != rebuilt.kind {
+        differences.push(format!(
+            "kind is {:?}, reproduced {:?}",
+            site.kind, rebuilt.kind
+        ));
+    }
+    if site.intent != rebuilt.intent {
+        differences.push("intent differs".to_owned());
+    }
+    if site.body != rebuilt.body {
+        differences.push(format!(
+            "body is {}, reproduced {}",
+            site.body, rebuilt.body
+        ));
+    }
+    if site.firmware_version != rebuilt.firmware_version {
+        differences.push(format!(
+            "firmware version is {}, reproduced {}",
+            site.firmware_version, rebuilt.firmware_version
+        ));
+    }
+    if site.sim_key != rebuilt.sim_key {
+        differences.push(format!(
+            "sim key is {}, reproduced {}",
+            site.sim_key, rebuilt.sim_key
+        ));
+    }
+    if site.settings != rebuilt.settings {
+        differences.push("control settings differ".to_owned());
+    }
+    if site.images.len() != rebuilt.images.len() {
+        differences.push(format!(
+            "{} image(s), reproduced {}",
+            site.images.len(),
+            rebuilt.images.len()
+        ));
+    }
+    for (index, (a, b)) in site.images.iter().zip(&rebuilt.images).enumerate() {
+        if a.meta != b.meta {
+            differences.push(format!("image {index} metadata differs"));
+        }
+        if a.rerender_group != b.rerender_group {
+            differences.push(format!("image {index} re-render group differs"));
+        }
+        if a.blob_sha256 != b.blob_sha256 {
+            differences.push(format!("image {index} blob hash differs"));
+        }
+        if a.blob_kind != b.blob_kind {
+            differences.push(format!("image {index} blob kind differs"));
+        }
+    }
+    differences
+}
+
+fn check_webauthn(envelope: &Envelope, service: &Service<'_>, findings: &mut Findings) {
+    let expected = ExpectedAssertion {
+        challenge: envelope.challenge(),
+        origin: service.origin.0.as_str(),
+        rp_id: service.rp_id,
+        algorithm: SignatureAlgorithm::Ecdsa,
+    };
+    let mut failures = BTreeSet::new();
+    for algorithm in [
+        SignatureAlgorithm::Ecdsa,
+        SignatureAlgorithm::Ed25519,
+        SignatureAlgorithm::Rsa,
+    ] {
+        let verdict = check_structure(
+            &envelope.assertion,
+            &ExpectedAssertion {
+                algorithm,
+                ..expected
+            },
+        );
+        match verdict {
+            StructuralVerdict::Pass => {
+                findings.note(webauthn_line(service, algorithm, false));
+                findings.note("  challenge: H(nonce ‖ manifest hash) matches client_data_json");
+                return;
+            }
+            StructuralVerdict::ReviewNeeded {
+                unknown_client_data_keys,
+                extensions,
+            } => {
+                findings.note(webauthn_line(service, algorithm, extensions.is_some()));
+                findings.note("  challenge: H(nonce ‖ manifest hash) matches client_data_json");
+                for extra in unknown_client_data_keys {
+                    findings.review(format!(
+                        "client_data_json key {:?} appears in full: {}",
+                        extra.key, extra.raw_json
+                    ));
+                }
+                if let Some(extensions) = extensions {
+                    for entry in extensions.entries {
+                        findings.review(format!(
+                            "authenticator extension {:?}: {:?}",
+                            entry.key, entry.value
+                        ));
+                    }
+                }
+                return;
+            }
+            StructuralVerdict::Fail(error) => {
+                failures.insert(error.to_string());
+            }
+        }
+    }
+    findings.fail(format!(
+        "webauthn: {}",
+        failures.into_iter().collect::<Vec<_>>().join("; ")
+    ));
+}
+
+fn webauthn_line(service: &Service<'_>, algorithm: SignatureAlgorithm, extensions: bool) -> String {
+    let signature = match algorithm {
+        SignatureAlgorithm::Ecdsa => "ECDSA (DER)",
+        SignatureAlgorithm::Ed25519 => "Ed25519 (64 bytes)",
+        SignatureAlgorithm::Rsa => "RSA (key size)",
+    };
+    let extensions = if extensions {
+        ", authenticator extensions decoded for review"
+    } else {
+        ""
+    };
+    format!(
+        "  webauthn: type webauthn.get, origin {}, crossOrigin false, rpIdHash sha256({}), user present, attested credential data absent, {signature} signature well formed{extensions}",
+        service.origin, service.rp_id
+    )
+}
+
+fn check_pow(envelope: &Envelope, service: &Service<'_>, findings: &mut Findings) {
+    let n_images = u32::try_from(envelope.manifest.images.len()).unwrap_or(u32::MAX);
+    match verify_pow(&envelope.challenge(), n_images, &service.pow, &envelope.pow) {
+        Ok(()) => {
+            let bits = service.pow.difficulty_bits(n_images).unwrap_or(0);
+            findings.note(format!(
+                "  proof of work: {} of {} sub-puzzles verified at {bits} leading zero bits",
+                envelope.pow.iter().count(),
+                looklab_upload::POW_K
+            ));
+        }
+        Err(error) => findings.fail(format!("proof of work: {error}")),
+    }
+}
+
+fn check_serial(envelope: &Envelope, service: &Service<'_>, body: &[u8], findings: &mut Findings) {
+    let mut candidates = vec![(None, None)];
+    for &(name, serial) in service.serials {
+        candidates.push((Some(name), Some(serial)));
+    }
+    let mut matched = None;
+    for (name, serial) in &candidates {
+        let parts = EnvelopeParts {
+            nonce: envelope.nonce,
+            manifest: &envelope.manifest,
+            assertion: &envelope.assertion,
+            pow: &envelope.pow,
+            serial: *serial,
+            blobs: &envelope.blobs,
+        };
+        if encode_envelope(&parts).as_slice() == body {
+            matched = Some(*name);
+            break;
+        }
+    }
+    match matched {
+        Some(None) => findings.note("  serial: absent"),
+        Some(Some(name)) => {
+            findings.note(format!("  serial: matches the EXIF serial of {name}"));
+        }
+        None => findings.fail(
+            "the envelope does not reproduce byte for byte: its serial matches no input file's EXIF serial",
+        ),
+    }
+}
+
+fn reproduce(
+    groups: &[Group],
+    seeds: &SeedFile,
+    module: &ModuleHost,
+    findings: &mut Findings,
+) -> Vec<ReproducedImage> {
+    let version = seeds.prior_transform_version().get();
+    let mut images = Vec::new();
+    for group in groups {
+        findings.note("");
+        findings.note(group.raw.name.clone());
+        let Some(key) = LocalImageKey::new(&group.raw.name) else {
+            findings.fail(format!("{} is not a usable seed-file key", group.raw.name));
+            continue;
+        };
+        let Some(seed) = seeds.seed_for(&key) else {
+            findings.fail(format!("the seed file has no entry for {}", group.raw.name));
+            continue;
+        };
+        let request = PrepareRequest {
+            raw: group.raw.bytes.clone(),
+            jpegs: group.jpegs.iter().map(|file| file.bytes.clone()).collect(),
+            prior: PriorTransformSpec::CameraMatrices { version },
+            seed: *seed.as_bytes(),
+            params: PrepParams::default(),
+        };
+        match module.prepare(&request) {
+            Ok(response) => {
+                findings.note(format!("  prepared {} image(s)", response.images.len()));
+                for image in response.images {
+                    images.push(ReproducedImage {
+                        metadata: image.metadata,
+                        rerender_group: image.rerender_group,
+                        blob: image.blob,
+                    });
+                }
+            }
+            Err(error) => findings.fail(undecodable(&group.raw.name, &error)),
+        }
+    }
+    images
+}
+
+fn undecodable(name: &str, failure: &ModuleFailure) -> String {
+    match failure {
+        ModuleFailure::Trapped => format!("{name}: undecodable (the prep module trapped)"),
+        other => format!("{name}: the prep module failed: {other}"),
+    }
+}
+
+fn record_credential(
+    state: &mut Option<VerifyState>,
+    credentials: &[(String, Vec<u8>)],
+    state_path: &Path,
+    origin: &Origin,
+    rp_id: &str,
+    findings: &mut Findings,
+) -> Result<()> {
+    let Some((_, first)) = credentials.first() else {
+        return Ok(());
+    };
+    let id = hex(first);
+    for (label, credential) in &credentials[1..] {
+        if credential != first {
+            findings.fail(format!(
+                "the credential id differs between uploads: {label} carries {}",
+                hex(credential)
+            ));
+            return Ok(());
+        }
+    }
+    let existing = state.as_ref().and_then(|state| {
+        state
+            .credentials
+            .iter()
+            .find(|record| record.origin == origin.0 && record.rp_id == rp_id)
+    });
+    let record = existing.is_none();
+    findings.note("");
+    match existing {
+        None => findings.note(format!(
+            "credential id: {id} recorded in {} on first use",
+            state_path.display()
+        )),
+        Some(existing) if existing.credential_id == id => findings.note(format!(
+            "credential id: {id} matches the value {} recorded earlier",
+            state_path.display()
+        )),
+        Some(existing) => {
+            findings.fail(format!(
+                "the credential id {id} differs from {}, which {} records for this site",
+                existing.credential_id,
+                state_path.display()
+            ));
+            return Ok(());
+        }
+    }
+    if record && findings.status() != Status::Fail {
+        let state = state.get_or_insert_with(VerifyState::default);
+        state.credentials.push(CredentialRecord {
+            rp_id: rp_id.to_owned(),
+            origin: origin.0.clone(),
+            credential_id: id,
+        });
+        state
+            .credentials
+            .sort_by(|a, b| (&a.rp_id, &a.origin).cmp(&(&b.rp_id, &b.origin)));
+        let json = serde_json::to_string_pretty(state).context("serialising the state file")?;
+        crate::write(state_path, json.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn pow_params(args: &VerifyPayloadArgs) -> PowParams {
+    let defaults = PowParams::default();
+    PowParams {
+        memory_kib: args.pow_memory_kib.unwrap_or(defaults.memory_kib),
+        iterations: args.pow_iterations.unwrap_or(defaults.iterations),
+        difficulty_bits_per_image: args
+            .pow_difficulty
+            .unwrap_or(defaults.difficulty_bits_per_image),
+    }
+}
+
+fn state_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(dir).join("looklab/verify.json"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join(".local/state/looklab/verify.json"));
+    }
+    bail!("set --state, or XDG_STATE_HOME or HOME so the credential id has somewhere to live")
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct VerifyState {
+    format: String,
+    #[serde(default)]
+    credentials: Vec<CredentialRecord>,
+}
+
+impl Default for VerifyState {
+    fn default() -> Self {
+        Self {
+            format: STATE_FORMAT.to_owned(),
+            credentials: Vec::new(),
+        }
+    }
+}
+
+impl VerifyState {
+    fn load(path: &Path) -> Result<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let state: Self =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        if state.format != STATE_FORMAT {
+            bail!("{} is not a verify-payload state file", path.display());
+        }
+        Ok(Some(state))
+    }
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct CredentialRecord {
+    rp_id: String,
+    origin: String,
+    credential_id: String,
+}
+
+struct ModuleHost {
+    engine: Engine,
+    module: Module,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ModuleFailure {
+    #[error("the prep module trapped")]
+    Trapped,
+    #[error("{0}")]
+    Wasmtime(wasmtime::Error),
+    #[error("the module reported: {0}")]
+    Reported(ModuleError),
+    #[error("{0}")]
+    Protocol(String),
+}
+
+fn wasm_failure(error: wasmtime::Error) -> ModuleFailure {
+    if error.downcast_ref::<wasmtime::Trap>().is_some() {
+        ModuleFailure::Trapped
+    } else {
+        ModuleFailure::Wasmtime(error)
+    }
+}
+
+impl ModuleHost {
+    fn open(path: &Path) -> Result<Self> {
+        let engine = Engine::default();
+        let module = Module::from_file(&engine, path)
+            .map_err(|error| anyhow!("loading the prep module {}: {error}", path.display()))?;
+        Ok(Self { engine, module })
+    }
+
+    fn version(&self) -> Result<VersionResponse, ModuleFailure> {
+        match self.invoke(Function::Version, &[])? {
+            Response::Version(response) => Ok(response),
+            other => Err(ModuleFailure::Protocol(format!(
+                "the module answered a version request with {other:?}"
+            ))),
+        }
+    }
+
+    fn prepare(&self, request: &PrepareRequest) -> Result<PrepareResponse, ModuleFailure> {
+        let input = postcard::to_allocvec(request)
+            .map_err(|error| ModuleFailure::Protocol(error.to_string()))?;
+        match self.invoke(Function::Prepare, &input)? {
+            Response::Prepare(response) => Ok(response),
+            other => Err(ModuleFailure::Protocol(format!(
+                "the module answered a prepare request with {other:?}"
+            ))),
+        }
+    }
+
+    fn build_manifest(
+        &self,
+        request: &BuildManifestRequest,
+    ) -> Result<BuildManifestResponse, ModuleFailure> {
+        let input = postcard::to_allocvec(request)
+            .map_err(|error| ModuleFailure::Protocol(error.to_string()))?;
+        match self.invoke(Function::BuildManifest, &input)? {
+            Response::BuildManifest(response) => Ok(response),
+            other => Err(ModuleFailure::Protocol(format!(
+                "the module answered a manifest request with {other:?}"
+            ))),
+        }
+    }
+
+    /// A fresh instance per file (docs/06 §5).
+    fn invoke(&self, function: Function, input: &[u8]) -> Result<Response, ModuleFailure> {
+        let mut store = Store::new(&self.engine, ());
+        let instance = Instance::new(&mut store, &self.module, &[]).map_err(wasm_failure)?;
+        let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
+            ModuleFailure::Protocol("the prep module exports no memory".to_owned())
+        })?;
+        let alloc = instance
+            .get_typed_func::<u32, u32>(&mut store, "ll_alloc")
+            .map_err(wasm_failure)?;
+        let free = instance
+            .get_typed_func::<(u32, u32), ()>(&mut store, "ll_free")
+            .map_err(wasm_failure)?;
+        let call = instance
+            .get_typed_func::<(u32, u32, u32), u64>(&mut store, "ll_call")
+            .map_err(wasm_failure)?;
+
+        let len = u32::try_from(input.len())
+            .map_err(|_| ModuleFailure::Protocol("the request exceeds 4 GiB".to_owned()))?;
+        let in_ptr = alloc.call(&mut store, len).map_err(wasm_failure)?;
+        memory
+            .write(&mut store, in_ptr as usize, input)
+            .map_err(|error| ModuleFailure::Protocol(error.to_string()))?;
+        let packed = call
+            .call(&mut store, (function.id(), in_ptr, len))
+            .map_err(wasm_failure)?;
+        free.call(&mut store, (in_ptr, len)).map_err(wasm_failure)?;
+        let out_ptr = (packed >> 32) as u32;
+        let out_len = (packed & u64::from(u32::MAX)) as u32;
+        let mut output = vec![0u8; out_len as usize];
+        memory
+            .read(&store, out_ptr as usize, &mut output)
+            .map_err(|error| ModuleFailure::Protocol(error.to_string()))?;
+        free.call(&mut store, (out_ptr, out_len))
+            .map_err(wasm_failure)?;
+
+        let (result, rest) = postcard::take_from_bytes::<Result<Response, ModuleError>>(&output)
+            .map_err(|error| ModuleFailure::Protocol(error.to_string()))?;
+        if !rest.is_empty() {
+            return Err(ModuleFailure::Protocol(format!(
+                "the module's response has {} trailing bytes",
+                rest.len()
+            )));
+        }
+        result.map_err(ModuleFailure::Reported)
+    }
+}
+
+struct Group {
+    raw: InputFile,
+    jpegs: Vec<InputFile>,
+}
+
+impl Group {
+    fn files(&self) -> impl Iterator<Item = &InputFile> {
+        std::iter::once(&self.raw).chain(&self.jpegs)
+    }
+}
+
+struct InputFile {
+    name: String,
+    bytes: Vec<u8>,
+    parsed: Option<ParsedMetadata>,
+}
+
+impl InputFile {
+    fn load(path: &Path) -> Result<Self> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let parsed = looklab_meta::parse(&bytes).ok();
+        Ok(Self {
+            name: file_name(path),
+            bytes,
+            parsed,
+        })
+    }
+
+    fn serial(&self) -> Option<&RawSerial> {
+        self.parsed.as_ref().and_then(ParsedMetadata::body_serial)
+    }
+}
+
+fn load_groups(files: &[PathBuf]) -> Result<Vec<Group>> {
+    let mut groups: Vec<Group> = Vec::new();
+    for path in files {
+        match file_kind(path)? {
+            FileKind::Raw => groups.push(Group {
+                raw: InputFile::load(path)?,
+                jpegs: Vec::new(),
+            }),
+            FileKind::Jpeg => {
+                let Some(group) = groups.last_mut() else {
+                    bail!(
+                        "{} is a JPEG before any RAW; give each group's RAW first",
+                        path.display()
+                    );
+                };
+                group.jpegs.push(InputFile::load(path)?);
+            }
+        }
+    }
+    if groups.is_empty() {
+        bail!("no RAW file was given");
+    }
+    for group in &groups {
+        if group.jpegs.is_empty() {
+            bail!("{} has no JPEG in its group", group.raw.name);
+        }
+    }
+    Ok(groups)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileKind {
+    Raw,
+    Jpeg,
+}
+
+fn file_kind(path: &Path) -> Result<FileKind> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if RawFormat::from_extension(extension).is_some() {
+        return Ok(FileKind::Raw);
+    }
+    if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
+        return Ok(FileKind::Jpeg);
+    }
+    bail!("{} is not a RAW or JPEG file name", path.display());
+}
+
+#[derive(Debug, Deserialize)]
+struct Har {
+    log: HarLog,
+}
+
+#[derive(Debug, Deserialize)]
+struct HarLog {
+    entries: Vec<HarEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HarEntry {
+    request: HarRequest,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HarRequest {
+    method: String,
+    url: String,
+    #[serde(default)]
+    post_data: Option<HarPostData>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HarPostData {
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    encoding: Option<String>,
+}
+
+impl Har {
+    fn load(path: &Path) -> Result<Self> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+}
+
+impl HarRequest {
+    /// The bytes sent: base64 when the exporter says so, otherwise the text itself.
+    fn body(&self) -> Result<Vec<u8>> {
+        let post = self
+            .post_data
+            .as_ref()
+            .context("the upload request records no body (HAR request.postData is absent)")?;
+        let text = post
+            .text
+            .as_deref()
+            .context("the upload request records no body text")?;
+        match post.encoding.as_deref() {
+            Some("base64") => decode_base64(text),
+            Some(other) => bail!("the recorded body uses the unsupported HAR encoding {other:?}"),
+            None => Ok(text.as_bytes().to_vec()),
+        }
+    }
+}
+
+fn decode_base64(text: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+
+    let text = text.trim();
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(text))
+        .context("the recorded body is not base64")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestClass {
+    Nonce,
+    Upload,
+    Status,
+    RegisterStart,
+    RegisterFinish,
+    Unexpected,
+}
+
+fn classify(request: &HarRequest, origin: &Origin) -> RequestClass {
+    let Some(parts) = UrlParts::parse(&request.url) else {
+        return RequestClass::Unexpected;
+    };
+    if parts.origin() != origin.0 {
+        return RequestClass::Unexpected;
+    }
+    match (request.method.as_str(), parts.path()) {
+        ("POST", NONCE_PATH) => RequestClass::Nonce,
+        ("POST", UPLOAD_PATH) => RequestClass::Upload,
+        ("POST", REGISTER_START_PATH) => RequestClass::RegisterStart,
+        ("POST", REGISTER_FINISH_PATH) => RequestClass::RegisterFinish,
+        ("GET", path) if status_token(path).is_some() => RequestClass::Status,
+        _ => RequestClass::Unexpected,
+    }
+}
+
+fn status_token(path: &str) -> Option<&str> {
+    let token = path.strip_prefix(STATUS_PREFIX)?;
+    (!token.is_empty() && !token.contains('/')).then_some(token)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Origin(String);
+
+impl Origin {
+    fn parse(origin: &str) -> Result<Self> {
+        let parts = UrlParts::parse(origin).context("not a URL")?;
+        if !parts.path_and_query.is_empty() {
+            bail!("an origin has no path; drop the trailing slash or path");
+        }
+        if parts.scheme != "https" && parts.scheme != "http" {
+            bail!("an origin starts with http:// or https://");
+        }
+        Ok(Self(parts.origin()))
+    }
+}
+
+impl std::fmt::Display for Origin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UrlParts {
+    scheme: String,
+    authority: String,
+    path_and_query: String,
+}
+
+impl UrlParts {
+    fn parse(url: &str) -> Option<Self> {
+        let (scheme, rest) = url.split_once("://")?;
+        if scheme.is_empty() {
+            return None;
+        }
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let authority = &rest[..end];
+        if authority.is_empty() {
+            return None;
+        }
+        Some(Self {
+            scheme: scheme.to_ascii_lowercase(),
+            authority: authority.to_ascii_lowercase(),
+            path_and_query: rest[end..].to_owned(),
+        })
+    }
+
+    fn origin(&self) -> String {
+        format!("{}://{}", self.scheme, self.authority)
+    }
+
+    fn path(&self) -> &str {
+        self.path_and_query
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default()
+    }
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(bytes);
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&digest);
+    output
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(DIGITS[(byte >> 4) as usize] as char);
+        text.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    text
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}

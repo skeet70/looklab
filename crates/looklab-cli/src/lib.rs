@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Native command-line tool: prep, fit, report, compare, export, validate, synth.
+//! Native command-line tool: prep, fit, report, compare, export, validate,
+//! synth, verify-payload, admin.
 //! Commands and formats follow docs/01 "The CLI", docs/03 §2-§3, docs/04 §7.
 
+mod admin;
 mod body_transform;
 mod compare;
 mod export;
 mod fit;
+mod match_cmd;
 mod prep;
 mod report;
 mod synth;
 mod util;
 mod validate;
+mod verify_payload;
 
 pub use body_transform::{BodyTransform, TransformFile};
 
@@ -30,6 +34,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Grant, revoke or list tiers and roles without the server.
+    Admin(admin::AdminArgs),
     /// Pair a RAW with its JPEGs (or a folder), prepare samples and write blobs.
     Prep(prep::PrepArgs),
     /// Fit one Look from a directory of `.llsamp` blobs.
@@ -44,6 +50,12 @@ pub enum Command {
     Validate(validate::ValidateArgs),
     /// Write a synthetic dataset so the whole flow runs without fixtures.
     Synth(synth::SynthArgs),
+    /// Reproduce a browser upload from a HAR under wasmtime and compare it byte for byte.
+    VerifyPayload(verify_payload::VerifyPayloadArgs),
+    /// Recommend camera settings for a target Look and print the settings card.
+    Match(match_cmd::MatchArgs),
+    /// Run one verification-loop iteration from observed re-renders.
+    Verify(match_cmd::VerifyArgs),
 }
 
 pub fn run() -> Result<()> {
@@ -52,6 +64,7 @@ pub fn run() -> Result<()> {
 
 pub fn run_with(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Admin(args) => admin::run(&args),
         Command::Prep(args) => prep::run(&args),
         Command::Fit(args) => fit::run(&args),
         Command::Report(args) => report::run(&args),
@@ -59,6 +72,9 @@ pub fn run_with(cli: Cli) -> Result<()> {
         Command::Export(args) => export::run(&args),
         Command::Validate(args) => validate::run(&args),
         Command::Synth(args) => synth::run(&args),
+        Command::VerifyPayload(args) => verify_payload::run(&args),
+        Command::Match(args) => match_cmd::run_match(&args),
+        Command::Verify(args) => match_cmd::run_verify(&args),
     }
 }
 

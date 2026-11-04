@@ -158,12 +158,59 @@ impl DownstreamModel {
         solve::ucs_of_xyz(xyz)
     }
 
+    /// `ucs` compressed smoothly into the gamut: first lightness, then
+    /// colourfulness, each over a band that starts inside its in-gamut ceiling.
+    ///
+    /// Lightness has to move for colours whose neutral at the target `J'` is
+    /// already outside the output cube; compressing `M'` alone would collapse
+    /// them onto white with a jump.
+    fn gamut_map(&self, ucs: Ucs) -> Ucs {
+        let jmh = ucs_to_jmh(ucs, UcsSpace::Ucs);
+        let linear = self.space.linear_from_xyz(ucs_to_xyz(ucs));
+        let safe = in_gamut(ucs, self.space)
+            && linear
+                .iter()
+                .all(|value| value.is_finite() && *value <= 0.9);
+        if safe {
+            return ucs;
+        }
+        let lightness = lightness_ceiling(jmh.j, self.space);
+        let start = (lightness - LIGHTNESS_BAND).max(0.0);
+        let j = if jmh.j <= start || lightness <= start {
+            jmh.j.min(lightness)
+        } else {
+            let band = lightness - start;
+            start + band * libm::tanh((jmh.j - start) / band)
+        };
+        let base = looklab_color::cam16::Jmh {
+            j,
+            m: jmh.m.max(0.0),
+            h: jmh.h,
+        };
+        let m = base.m;
+        let inside = in_gamut(chroma_at(base, m), self.space);
+        let ceiling = if inside {
+            upper_boundary(base, m, self.space)
+        } else {
+            lower_boundary(base, m, self.space)
+        };
+        let start = GAMUT_START * ceiling;
+        if m <= start {
+            return chroma_at(base, m);
+        }
+        let band = ceiling - start;
+        if band <= 0.0 {
+            return chroma_at(base, start);
+        }
+        chroma_at(base, start + band * libm::tanh((m - start) / band))
+    }
+
     /// The output codes that reproduce `look` at `xyz`.
     pub fn target(&self, look: &Look, xyz: Xyz) -> TargetOutput {
         let ucs = look.eval(xyz);
         let clipped = self.hard_clip && !in_gamut(ucs, self.space);
-        let ucs = if clipped {
-            perceptual_clip(ucs, self.space)
+        let ucs = if self.hard_clip {
+            self.gamut_map(ucs)
         } else {
             ucs
         };
@@ -205,27 +252,105 @@ pub fn perceptual_clip(ucs: Ucs, space: OutputSpace) -> Ucs {
         return ucs;
     }
     let jmh = ucs_to_jmh(ucs, UcsSpace::Ucs);
-    let chroma = |m: f64| {
-        ucs_from_jmh(looklab_color::cam16::Jmh {
-            j: jmh.j,
-            m,
-            h: jmh.h,
-        })
-    };
+    let ceiling = lower_boundary(jmh, jmh.m.max(0.0), space);
+    chroma_at(jmh, ceiling)
+}
+
+/// Fraction of the in-gamut `M'` ceiling that passes through unchanged.
+const GAMUT_START: f64 = 0.85;
+
+/// Width of the lightness compression band, in CAM16-UCS `J'` units.
+const LIGHTNESS_BAND: f64 = 4.0;
+
+/// The largest `J'` whose neutral is inside the output cube.
+fn lightness_ceiling(j: f64, space: OutputSpace) -> f64 {
+    let neutral = |j: f64| ucs_from_jmh(looklab_color::cam16::Jmh { j, m: 0.0, h: 0.0 });
     let mut inside = 0.0_f64;
-    let mut outside = jmh.m.max(0.0);
-    if !in_gamut(chroma(inside), space) {
-        return chroma(inside);
+    let mut outside = j.max(0.0);
+    if !in_gamut(neutral(outside), space) {
+        for _ in 0..32 {
+            let middle = 0.5 * (inside + outside);
+            if in_gamut(neutral(middle), space) {
+                inside = middle;
+            } else {
+                outside = middle;
+            }
+        }
+        return inside;
+    }
+    inside = outside;
+    outside = (2.0 * inside).max(inside + LIGHTNESS_BAND);
+    for _ in 0..16 {
+        if !in_gamut(neutral(outside), space) {
+            for _ in 0..32 {
+                let middle = 0.5 * (inside + outside);
+                if in_gamut(neutral(middle), space) {
+                    inside = middle;
+                } else {
+                    outside = middle;
+                }
+            }
+            return inside;
+        }
+        inside = outside;
+        outside *= 2.0;
+    }
+    inside
+}
+
+fn chroma_at(jmh: looklab_color::cam16::Jmh, m: f64) -> Ucs {
+    ucs_from_jmh(looklab_color::cam16::Jmh {
+        j: jmh.j,
+        m,
+        h: jmh.h,
+    })
+}
+
+/// The largest colourfulness in gamut at `jmh`'s lightness and hue, at or below
+/// `m`. `m` itself must be out of gamut.
+fn lower_boundary(jmh: looklab_color::cam16::Jmh, m: f64, space: OutputSpace) -> f64 {
+    let mut inside = 0.0_f64;
+    let mut outside = m;
+    if !in_gamut(chroma_at(jmh, inside), space) {
+        return inside;
     }
     for _ in 0..32 {
         let middle = 0.5 * (inside + outside);
-        if in_gamut(chroma(middle), space) {
+        if in_gamut(chroma_at(jmh, middle), space) {
             inside = middle;
         } else {
             outside = middle;
         }
     }
-    chroma(inside)
+    inside
+}
+
+/// The largest colourfulness in gamut at `jmh`'s lightness and hue, at or above
+/// `m`. `m` itself must be in gamut.
+fn upper_boundary(jmh: looklab_color::cam16::Jmh, m: f64, space: OutputSpace) -> f64 {
+    let mut inside = m;
+    let mut outside = (2.0 * m).max(m + 10.0);
+    let mut found = false;
+    for _ in 0..16 {
+        if !in_gamut(chroma_at(jmh, outside), space) {
+            found = true;
+            break;
+        }
+        inside = outside;
+        outside *= 2.0;
+    }
+    if !found {
+        return inside;
+    }
+    for _ in 0..32 {
+        let middle = 0.5 * (inside + outside);
+        if in_gamut(chroma_at(jmh, middle), space) {
+            inside = middle;
+        } else {
+            outside = middle;
+        }
+    }
+    inside
 }
 
 fn ucs_from_jmh(jmh: looklab_color::cam16::Jmh) -> Ucs {

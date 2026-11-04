@@ -5,6 +5,7 @@ use looklab_schema::{Format, Interpolation};
 use std::io::Cursor;
 
 use crate::artifact::{Lut3d, MAX_CURVE1D_SIZE, MAX_LUT_SIZE, Shaper1d};
+use crate::quantize::{f16_bits, f16_value};
 use crate::bake::BakeOutput;
 use crate::error::{ExportError, Result};
 use crate::native;
@@ -352,6 +353,119 @@ fn cube_root(value: u32) -> Option<u32> {
     (level * level * level == value).then_some(level)
 }
 
+
+/// Magic of the packed half-float LUT.
+pub const BINARY_MAGIC: [u8; 5] = *b"LLLUT";
+
+/// Version byte of the packed half-float LUT.
+pub const BINARY_VERSION: u8 = 1;
+
+const BINARY_HEADER: usize = 16;
+
+/// A packed half-float LUT: a 16-byte header, the shaper as half floats when
+/// present, then `size^3 * 3` half floats in `.cube` order.
+///
+/// Header layout (little endian): magic `LLLUT`, version, flags (`bit 0` = shaper
+/// present), a reserved byte, the grid side as `u32`, the shaper length as `u32`.
+///
+/// # Errors
+/// [`ExportError::InvalidArtifact`] when the LUT itself is malformed.
+pub fn write_binary_f16(lut: &Lut3d) -> Result<Vec<u8>> {
+    lut.validate()?;
+    let shaper = lut.shaper.as_ref();
+    let shaper_size = shaper.map_or(0, |shaper| shaper.size);
+    let capacity = BINARY_HEADER
+        + shaper_size as usize * 2
+        + (lut.size as usize).pow(3) * 6;
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(&BINARY_MAGIC);
+    out.push(BINARY_VERSION);
+    out.push(u8::from(shaper.is_some()));
+    out.push(0);
+    out.extend_from_slice(&lut.size.to_le_bytes());
+    out.extend_from_slice(&shaper_size.to_le_bytes());
+    if let Some(shaper) = shaper {
+        for value in &shaper.values {
+            out.extend_from_slice(&f16_bits(*value).to_le_bytes());
+        }
+    }
+    for value in &lut.data {
+        for channel in value {
+            out.extend_from_slice(&f16_bits(*channel).to_le_bytes());
+        }
+    }
+    Ok(out)
+}
+
+/// # Errors
+/// [`ExportError::Cube`] when the header or length is wrong, plus
+/// [`ExportError::InvalidArtifact`] when the decoded grid is malformed.
+pub fn read_binary_f16(bytes: &[u8]) -> Result<Lut3d> {
+    if bytes.len() < BINARY_HEADER {
+        return Err(ExportError::Cube("binary LUT is shorter than its header".to_string()));
+    }
+    if bytes[0..5] != BINARY_MAGIC {
+        return Err(ExportError::Cube("not a binary LUT".to_string()));
+    }
+    if bytes[5] != BINARY_VERSION {
+        return Err(ExportError::Cube(format!(
+            "unsupported binary LUT version {}",
+            bytes[5]
+        )));
+    }
+    let flags = bytes[6];
+    let size = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let shaper_size = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    let has_shaper = flags & 1 != 0;
+    if has_shaper != (shaper_size != 0) {
+        return Err(ExportError::Cube(
+            "binary LUT shaper flag disagrees with its length".to_string(),
+        ));
+    }
+    if !(2..=MAX_LUT_SIZE).contains(&size) {
+        return Err(ExportError::Cube("binary LUT side out of range".to_string()));
+    }
+    if has_shaper && !(2..=MAX_CURVE1D_SIZE).contains(&shaper_size) {
+        return Err(ExportError::Cube("binary LUT shaper length out of range".to_string()));
+    }
+    let expected = BINARY_HEADER as u64
+        + shaper_size as u64 * 2
+        + (size as u64).pow(3) * 6;
+    if bytes.len() as u64 != expected {
+        return Err(ExportError::Cube(format!(
+            "expected {expected} bytes, found {}",
+            bytes.len()
+        )));
+    }
+    let mut cursor = BINARY_HEADER;
+    let shaper = has_shaper.then(|| {
+        let mut values = Vec::with_capacity(shaper_size as usize);
+        for _ in 0..shaper_size {
+            values.push(f16_value(u16::from_le_bytes([
+                bytes[cursor],
+                bytes[cursor + 1],
+            ])));
+            cursor += 2;
+        }
+        Shaper1d {
+            size: shaper_size,
+            values,
+        }
+    });
+    let mut data = Vec::with_capacity((size as usize).pow(3));
+    for _ in 0..(size as usize).pow(3) {
+        let mut value = [0.0_f32; 3];
+        for channel in &mut value {
+            *channel = f16_value(u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]));
+            cursor += 2;
+        }
+        data.push(value);
+    }
+    let lut = Lut3d { size, data, shaper };
+    lut.validate()?;
+    Ok(lut)
+}
+
 /// Bytes the writer produces for `output` in `format`; the largest single file when
 /// the bake has one artifact per illuminant.
 ///
@@ -383,6 +497,17 @@ pub fn written_bytes(output: &BakeOutput, format: Format) -> Result<u64> {
                     .as_lut()
                     .ok_or(ExportError::Unsupported("HaldCLUT for a non-LUT artifact"))?;
                 largest = largest.max(write_haldclut(lut)?.len() as u64);
+            }
+            Ok(largest)
+        }
+        Format::BinaryF16 => {
+            let mut largest = 0;
+            for entry in &output.artifacts {
+                let lut = entry
+                    .artifact
+                    .as_lut()
+                    .ok_or(ExportError::Unsupported("binary_f16 for a non-LUT artifact"))?;
+                largest = largest.max(write_binary_f16(lut)?.len() as u64);
             }
             Ok(largest)
         }
@@ -428,6 +553,30 @@ mod tests {
                 assert!((a[channel] - b[channel]).abs() <= 0.5 / 65_535.0 + 1.0e-7);
             }
         }
+    }
+
+    #[test]
+    fn binary_lut_round_trips_exactly() {
+        let shaper = Shaper1d::from_fn(64, |code| code * code);
+        let lut = Lut3d::from_fn(5, Some(shaper), Precision::F16, |at| {
+            [at[0], at[1] * 0.5, 1.0 - at[2]]
+        });
+        let bytes = write_binary_f16(&lut).expect("binary");
+        assert_eq!(bytes.len(), 16 + 64 * 2 + 125 * 6);
+        assert_eq!(&bytes[0..5], b"LLLUT");
+        let back = read_binary_f16(&bytes).expect("binary");
+        assert_eq!(back, lut);
+    }
+
+    #[test]
+    fn binary_lut_rejects_a_truncated_file() {
+        let lut = sample();
+        let mut bytes = write_binary_f16(&lut).expect("binary");
+        bytes.truncate(bytes.len() - 2);
+        assert!(matches!(
+            read_binary_f16(&bytes),
+            Err(ExportError::Cube(_))
+        ));
     }
 
     #[test]

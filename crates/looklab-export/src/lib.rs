@@ -32,6 +32,7 @@ pub use looklab_schema::{Format, InsertionPoint, Interpolation, Precision};
 pub use native::{NativeDocument, read_native_json, write_native_json};
 pub use sim::{CctReport, DeltaStats, Support, ValidationReport, validate};
 pub use writer::{
-    Cube1dFile, CubeFile, cube_files, hald_level, read_cube, read_cube_1d, read_haldclut,
-    write_cube, write_cube_1d, write_haldclut, written_bytes,
+    BINARY_MAGIC, BINARY_VERSION, Cube1dFile, CubeFile, cube_files, hald_level, read_binary_f16,
+    read_cube, read_cube_1d, read_haldclut, write_binary_f16, write_cube, write_cube_1d,
+    write_haldclut, written_bytes,
 };

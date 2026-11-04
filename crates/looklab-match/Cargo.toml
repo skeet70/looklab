@@ -8,6 +8,17 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+looklab-color.workspace = true
+looklab-fit = { workspace = true, features = ["synth"] }
+looklab-model.workspace = true
+looklab-report.workspace = true
+looklab-samples.workspace = true
+looklab-schema.workspace = true
+libm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rand_chacha.workspace = true
 
 [lints]
 workspace = true

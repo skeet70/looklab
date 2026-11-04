@@ -200,6 +200,8 @@ pub enum Format {
     NativeJson,
     #[serde(rename = "haldclut")]
     Haldclut,
+    #[serde(rename = "binary_f16")]
+    BinaryF16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

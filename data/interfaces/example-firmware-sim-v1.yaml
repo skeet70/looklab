@@ -12,7 +12,7 @@ insertion:
   illuminant_handling: single
 accepts:
   - type: lut3d
-    sizes: [17, 33]
+    sizes: [17, 33, 65]
     interpolation: tetrahedral
     precision: f16
     with_shaper: true
@@ -24,4 +24,4 @@ downstream:
   - output_transform: { primaries: srgb, transfer: srgb }
   - gamut_clip: hard
 formats: [cube, native_json]
-limits: { max_bytes: 262144 }
+limits: { max_bytes: 2097152 }

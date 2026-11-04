@@ -130,24 +130,25 @@ fn synthetic_flow_fits_reports_compares_exports_and_validates() {
         }
         command.output().expect("run export")
     };
-    let first = export(false);
-    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    let forced_refusal = export(false);
+    let first_stdout = String::from_utf8_lossy(&forced_refusal.stdout);
     assert!(first_stdout.contains("median"), "{first_stdout}");
-    if !first.status.success() {
-        let stderr = String::from_utf8_lossy(&first.stderr);
-        assert!(stderr.contains("flagged"), "{stderr}");
-        assert!(
-            !cube.exists(),
-            "a flagged export wrote {} anyway",
-            cube.display()
-        );
-        let forced = export(true);
-        assert!(
-            forced.status.success(),
-            "forced export failed: {}",
-            String::from_utf8_lossy(&forced.stderr)
-        );
-    }
+    assert!(first_stdout.contains("flagged: yes"), "{first_stdout}");
+    assert!(
+        !forced_refusal.status.success(),
+        "a flagged export wrote {} anyway",
+        cube.display()
+    );
+    let stderr = String::from_utf8_lossy(&forced_refusal.stderr);
+    assert!(stderr.contains("flagged"), "{stderr}");
+    assert!(!cube.exists(), "a flagged export wrote {}", cube.display());
+
+    let forced = export(true);
+    assert!(
+        forced.status.success(),
+        "forced export failed: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
     let text = std::fs::read_to_string(&cube).expect("cube");
     assert!(text.contains("LUT_3D_SIZE"));
     assert!(text.contains("TITLE"));
@@ -367,3 +368,4 @@ fn fit_skips_an_undecodable_sample_and_keeps_going() {
     );
     assert!(out.exists());
 }
+

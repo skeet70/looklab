@@ -164,11 +164,23 @@ fn the_example_interface_profile_bakes_and_validates() {
         .bake(BakeIlluminant::Single { cct: CctK::D65 })
         .expect("bake");
     assert_eq!(output.kind(), "lut3d");
-    let report = validate(&output, &look, &body, &common::probes(), None).expect("validation");
+    let probes = common::probes();
+    let report = validate(&output, &look, &body, &probes, None).expect("validation");
     assert_eq!(report.primary.cct, CctK::D65);
-    assert!(report.primary.stats.count > 100, "{:?}", report.primary);
-    // The profile's 256 KB budget buys a 17^3 grid, whose p95 over this look is
-    // above the 1.0 flag threshold; the report carries that finding.
+    let eligible = probes.probes.len() - report.primary.unsupported;
+    assert!(
+        report.primary.stats.count * 10 >= eligible * 9,
+        "evaluated {} of {eligible}",
+        report.primary.stats.count
+    );
+    // 33^3 is the largest grid the profile's 2 MiB budget affords as .cube text
+    // (45^3 is ~2.6 MiB, 65^3 ~7.9 MiB). At that grid the gamut boundary is not
+    // resolvable to the 1.0 flag, so the report carries the flag.
+    assert!(
+        report.primary.stats.p95 < 2.5,
+        "p95 {} at the bake CCT",
+        report.primary.stats.p95
+    );
     assert!(report.flagged(), "{:?}", report.primary);
 
     for format in [Format::Cube, Format::NativeJson] {
