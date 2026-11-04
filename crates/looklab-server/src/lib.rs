@@ -1,6 +1,79 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Upload intake and moderation API.
 
-pub fn run() -> anyhow::Result<()> {
+mod api;
+mod blob;
+mod body_schema;
+mod config;
+mod db;
+mod error;
+mod ids;
+mod preparse;
+mod rate_limit;
+mod state;
+mod store;
+mod trust;
+mod verify;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use axum::extract::MatchedPath;
+use axum::routing::{get, post};
+use axum::{Router, middleware};
+use tokio::net::TcpListener;
+use tracing::Instrument as _;
+
+pub use config::{Config, PowConfig};
+pub use state::AppState;
+pub use trust::{CredentialStanding, DefaultTrustPolicy, Tier, TrustPolicy};
+
+pub fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/api/nonce", post(api::passkey::nonce))
+        .route(
+            "/api/passkey/register/start",
+            post(api::passkey::register_start),
+        )
+        .route(
+            "/api/passkey/register/finish",
+            post(api::passkey::register_finish),
+        )
+        .route("/api/upload", post(api::upload::upload))
+        .route("/api/status/reissue", post(api::status::reissue))
+        .route("/api/withdraw", post(api::withdraw::withdraw))
+        .route("/status/{token}", get(api::status::status))
+        .with_state(state)
+        .layer(middleware::from_fn(request_span))
+}
+
+async fn request_span(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let method = request.method().clone();
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".to_owned());
+    let span = tracing::info_span!("request", %method, %route);
+    let response = next.run(request).instrument(span).await;
+    tracing::info!(status = response.status().as_u16(), "request");
+    response
+}
+
+pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .init();
+    let config = Config::load(config_path.as_deref())?;
+    let bind = config.bind;
+    let state = Arc::new(AppState::new(config).await?);
+    let app = router(state);
+    let listener = TcpListener::bind(bind).await?;
+    tracing::info!("listening");
+    axum::serve(listener, app).await?;
     Ok(())
 }
