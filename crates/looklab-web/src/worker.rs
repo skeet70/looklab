@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Browser side of the single-threaded workers ([docs/01](../../../docs/01-architecture.md)).
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
@@ -13,6 +16,11 @@ use looklab_wasm::{
 };
 
 pub const FILE_TIMEOUT_MS: i32 = 60_000;
+
+const TIMEOUT_MARKER: &str = "__looklab_timeout__";
+const TYPE: &str = "type";
+const MESSAGE: &str = "message";
+const TRAP: &str = "trap";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkerReply {
@@ -30,55 +38,193 @@ pub enum WorkerFailure {
 impl WorkerFailure {
     pub fn message(&self) -> String {
         match self {
-            Self::Timeout => "This file couldn't be decoded (decoder error).".to_owned(),
-            Self::Trap => "This file couldn't be decoded (decoder error).".to_owned(),
+            Self::Timeout | Self::Trap => {
+                "This file couldn't be decoded (decoder error).".to_owned()
+            }
             Self::Module(message) => message.clone(),
         }
+    }
+
+    fn kills_worker(&self) -> bool {
+        matches!(self, Self::Timeout | Self::Trap)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MatchFailure(pub String);
 
-pub struct PrepWorker {
+/// One worker and the single reply slot its `onmessage` handler resolves.
+/// The worker posts `ready` before the first reply, so the handler outlives any one call.
+struct WorkerLink {
     worker: Worker,
+    pending: Rc<RefCell<Option<Function>>>,
+    _onmessage: Closure<dyn FnMut(MessageEvent)>,
+    _onerror: Closure<dyn FnMut(web_sys::ErrorEvent)>,
+}
+
+impl WorkerLink {
+    fn spawn(script: &str) -> Result<Self, String> {
+        let options = WorkerOptions::new();
+        options.set_type(WorkerType::Module);
+        let worker = Worker::new_with_options(script, &options)
+            .map_err(|error| format!("{script}: {error:?}"))?;
+
+        let pending: Rc<RefCell<Option<Function>>> = Rc::new(RefCell::new(None));
+        let message_slot = Rc::clone(&pending);
+        let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            if let Some(reply) = reply_from(&event.data()) {
+                settle(&message_slot, reply);
+            }
+        });
+        let error_slot = Rc::clone(&pending);
+        let onerror =
+            Closure::<dyn FnMut(web_sys::ErrorEvent)>::new(move |event: web_sys::ErrorEvent| {
+                if let Some(reply) = failure_reply(&event.message(), false) {
+                    settle(&error_slot, reply);
+                }
+            });
+        worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+        Ok(Self {
+            worker,
+            pending,
+            _onmessage: onmessage,
+            _onerror: onerror,
+        })
+    }
+
+    fn post(&self, fields: &[(&str, &str)]) -> Result<(), String> {
+        let message = Object::new();
+        for (key, value) in fields {
+            Reflect::set(&message, &JsValue::from_str(key), &JsValue::from_str(value))
+                .map_err(|error| format!("{error:?}"))?;
+        }
+        self.worker
+            .post_message(&message.into())
+            .map_err(|error| format!("worker message: {error:?}"))
+    }
+
+    async fn call(
+        &self,
+        function: u32,
+        bytes: &[u8],
+        timeout_ms: i32,
+    ) -> Result<WorkerReply, WorkerFailure> {
+        let promise = Promise::new(&mut |resolve, reject| {
+            *self.pending.borrow_mut() = Some(resolve.clone());
+            let message = Object::new();
+            let _ = Reflect::set(
+                &message,
+                &JsValue::from_str(TYPE),
+                &JsValue::from_str("call"),
+            );
+            let _ = Reflect::set(
+                &message,
+                &JsValue::from_str("fn"),
+                &JsValue::from_f64(f64::from(function)),
+            );
+            let _ = Reflect::set(
+                &message,
+                &JsValue::from_str("bytes"),
+                &Uint8Array::from(bytes),
+            );
+            if let Err(error) = self.worker.post_message(&message.into()) {
+                self.pending.borrow_mut().take();
+                let _ = reject.call1(&JsValue::NULL, &error);
+            }
+        });
+
+        let deadline = Deadline::start(timeout_ms);
+        let raced = Promise::race(&Array::of2(&promise, &deadline.promise));
+        let outcome = JsFuture::from(raced).await;
+        deadline.cancel();
+        self.pending.borrow_mut().take();
+
+        let value =
+            outcome.map_err(|_| WorkerFailure::Module("worker request failed".to_owned()))?;
+        if value.as_string().as_deref() == Some(TIMEOUT_MARKER) {
+            return Err(WorkerFailure::Timeout);
+        }
+        if let Some(message) = field_string(&value, "error") {
+            return Err(if field_bool(&value, TRAP) {
+                WorkerFailure::Trap
+            } else {
+                WorkerFailure::Module(message)
+            });
+        }
+        let bytes = Reflect::get(&value, &JsValue::from_str("bytes"))
+            .ok()
+            .and_then(|bytes| bytes.dyn_into::<Uint8Array>().ok())
+            .ok_or_else(|| WorkerFailure::Module("the worker reply has no bytes".to_owned()))?
+            .to_vec();
+        let memory = Reflect::get(&value, &JsValue::from_str("memory"))
+            .ok()
+            .and_then(|memory| memory.as_f64())
+            .unwrap_or(0.0) as u64;
+        Ok(WorkerReply { bytes, memory })
+    }
+
+    fn terminate(&self) {
+        self.worker.terminate();
+    }
+}
+
+impl Drop for WorkerLink {
+    fn drop(&mut self) {
+        self.worker.terminate();
+    }
+}
+
+pub struct PrepWorker {
+    link: WorkerLink,
     files: u64,
     memory: u64,
+    dead: bool,
 }
 
 impl PrepWorker {
     /// # Errors
     /// Reports a browser that cannot start a module worker.
     pub fn spawn() -> Result<Self, String> {
-        let worker = spawn_worker("/workers/prep-worker.js")?;
-        send(
-            &worker,
-            &[
-                ("type", "init".into()),
-                (
-                    "url",
-                    "/generated/wasm/looklab_prep_module.wasm".into(),
-                ),
-            ],
-        )?;
+        let link = WorkerLink::spawn("/workers/prep-worker.js")?;
+        link.post(&[
+            ("type", "init"),
+            ("url", "/generated/wasm/looklab_prep_module.wasm"),
+        ])?;
         Ok(Self {
-            worker,
+            link,
             files: 0,
             memory: 0,
+            dead: false,
         })
     }
 
     /// # Errors
     /// Reports a worker that trapped, timed out or answered with an error.
-    pub async fn call(&mut self, function: u32, bytes: Vec<u8>) -> Result<WorkerReply, WorkerFailure> {
-        let reply = call_worker(&self.worker, function, bytes, FILE_TIMEOUT_MS).await?;
-        self.files += 1;
-        self.memory = reply.memory;
-        Ok(reply)
+    pub async fn call(
+        &mut self,
+        function: u32,
+        bytes: Vec<u8>,
+    ) -> Result<WorkerReply, WorkerFailure> {
+        match self.link.call(function, &bytes, FILE_TIMEOUT_MS).await {
+            Ok(reply) => {
+                self.files += 1;
+                self.memory = reply.memory;
+                Ok(reply)
+            }
+            Err(failure) => {
+                if failure.kills_worker() {
+                    self.dead = true;
+                    self.link.terminate();
+                }
+                Err(failure)
+            }
+        }
     }
 
     pub fn should_recycle(&self) -> bool {
-        self.files >= RECYCLE_AFTER_FILES
+        self.dead
+            || self.files >= RECYCLE_AFTER_FILES
             || (self.memory as f64) > WORKER_BUDGET_BYTES as f64 * RECYCLE_MEMORY_FRACTION
     }
 
@@ -87,39 +233,31 @@ impl PrepWorker {
     }
 
     pub fn terminate(&self) {
-        self.worker.terminate();
-    }
-}
-
-impl Drop for PrepWorker {
-    fn drop(&mut self) {
-        self.worker.terminate();
+        self.link.terminate();
     }
 }
 
 pub struct MatchWorker {
-    worker: Worker,
+    link: WorkerLink,
 }
 
 impl MatchWorker {
     /// # Errors
     /// Reports a browser that cannot start a module worker.
     pub fn spawn() -> Result<Self, String> {
-        let worker = spawn_worker("/workers/match-worker.js")?;
-        send(
-            &worker,
-            &[
-                ("type", "init".into()),
-                ("url", "/generated/wasm/looklab_match.wasm".into()),
-            ],
-        )?;
-        Ok(Self { worker })
+        let link = WorkerLink::spawn("/workers/match-worker.js")?;
+        link.post(&[
+            ("type", "init"),
+            ("url", "/generated/wasm/looklab_match.wasm"),
+        ])?;
+        Ok(Self { link })
     }
 
     /// # Errors
     /// Reports a worker that trapped, timed out or answered with an error.
     pub async fn run_match(&self, request: &[u8]) -> Result<Vec<u8>, MatchFailure> {
-        call_worker(&self.worker, WORKER_FN_MATCH, request.to_vec(), FILE_TIMEOUT_MS)
+        self.link
+            .call(WORKER_FN_MATCH, request, FILE_TIMEOUT_MS)
             .await
             .map(|reply| reply.bytes)
             .map_err(|error| MatchFailure(error.message()))
@@ -128,128 +266,78 @@ impl MatchWorker {
     /// # Errors
     /// Reports a worker that trapped, timed out or answered with an error.
     pub async fn run_verify(&self, request: &[u8]) -> Result<Vec<u8>, MatchFailure> {
-        call_worker(&self.worker, WORKER_FN_VERIFY, request.to_vec(), FILE_TIMEOUT_MS)
+        self.link
+            .call(WORKER_FN_VERIFY, request, FILE_TIMEOUT_MS)
             .await
             .map(|reply| reply.bytes)
             .map_err(|error| MatchFailure(error.message()))
     }
 }
 
-impl Drop for MatchWorker {
-    fn drop(&mut self) {
-        self.worker.terminate();
-    }
+struct Deadline {
+    promise: Promise,
+    handle: Rc<Cell<i32>>,
 }
 
-fn spawn_worker(script: &str) -> Result<Worker, String> {
-    let options = WorkerOptions::new();
-    options.set_type(WorkerType::Module);
-    Worker::new_with_options(script, &options).map_err(|error| format!("{script}: {error:?}"))
-}
-
-fn send(worker: &Worker, fields: &[(&str, String)]) -> Result<(), String> {
-    let message = Object::new();
-    for (key, value) in fields {
-        Reflect::set(&message, &JsValue::from_str(key), &JsValue::from_str(value))
-            .map_err(|error| format!("{error:?}"))?;
-    }
-    worker
-        .post_message(&message.into())
-        .map_err(|error| format!("worker message: {error:?}"))
-}
-
-async fn call_worker(
-    worker: &Worker,
-    function: u32,
-    bytes: Vec<u8>,
-    timeout_ms: i32,
-) -> Result<WorkerReply, WorkerFailure> {
-    let worker = worker.clone();
-    let promise = Promise::new(&mut move |resolve, reject| {
-        let resolve_message = resolve.clone();
-        let onmessage = Closure::once_into_js(move |event: MessageEvent| {
-            let data = event.data();
-            let kind = Reflect::get(&data, &JsValue::from_str("type"))
-                .ok()
-                .and_then(|value| value.as_string());
-            match kind.as_deref() {
-                Some("result") => {
-                    if let Some(reply) = read_reply(&data) {
-                        let _ = resolve_message.call1(&JsValue::NULL, &reply);
-                    }
-                }
-                Some("error") => {
-                    let message = Reflect::get(&data, &JsValue::from_str("message"))
-                        .ok()
-                        .and_then(|value| value.as_string())
-                        .unwrap_or_else(|| "worker error".to_owned());
-                    let trap = Reflect::get(&data, &JsValue::from_str("trap"))
-                        .ok()
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(false);
-                    if let Some(reply) = failure_reply(&message, trap) {
-                        let _ = resolve_message.call1(&JsValue::NULL, &reply);
-                    }
-                }
-                _ => {}
+impl Deadline {
+    fn start(timeout_ms: i32) -> Self {
+        let handle = Rc::new(Cell::new(0));
+        let timer_handle = Rc::clone(&handle);
+        let promise = Promise::new(&mut move |resolve, _reject| {
+            let resolve = resolve.clone();
+            let callback = Closure::once_into_js(move || {
+                let _ = resolve.call1(&JsValue::NULL, &JsValue::from_str(TIMEOUT_MARKER));
+            });
+            if let Some(window) = web_sys::window()
+                && let Ok(id) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    callback.unchecked_ref::<Function>(),
+                    timeout_ms,
+                )
+            {
+                timer_handle.set(id);
             }
         });
-        worker.set_onmessage(Some(onmessage.unchecked_ref()));
-        let resolve_error = resolve.clone();
-        let worker_for_error = worker.clone();
-        let onerror = Closure::once_into_js(move |event: web_sys::ErrorEvent| {
-            let reply = failure_reply(&event.message(), false);
-            if let Some(reply) = reply {
-                let _ = resolve_error.call1(&JsValue::NULL, &reply);
-            }
-            worker_for_error.set_onerror(None);
-        });
-        worker.set_onerror(Some(onerror.unchecked_ref()));
+        Self { promise, handle }
+    }
 
-        let message = Object::new();
-        let _ = Reflect::set(&message, &JsValue::from_str("type"), &JsValue::from_str("call"));
-        let _ = Reflect::set(&message, &JsValue::from_str("fn"), &JsValue::from_f64(f64::from(function)));
-        let _ = Reflect::set(&message, &JsValue::from_str("id"), &JsValue::from_f64(1.0));
-        let array = Uint8Array::from(bytes.as_slice());
-        let _ = Reflect::set(&message, &JsValue::from_str("bytes"), &array);
-        if let Err(error) = worker.post_message(&message.into()) {
-            let _ = reject.call1(&JsValue::NULL, &error);
+    fn cancel(&self) {
+        let id = self.handle.get();
+        if id != 0
+            && let Some(window) = web_sys::window()
+        {
+            window.clear_timeout_with_handle(id);
         }
-    });
+    }
+}
 
-    let timeout = timeout_promise(timeout_ms);
-    let raced = Promise::race(&Array::of2(&promise, &timeout));
-    let value = JsFuture::from(raced)
-        .await
-        .map_err(|_| WorkerFailure::Module("worker request failed".to_owned()))?;
-    if value.as_string().as_deref() == Some("__looklab_timeout__") {
-        return Err(WorkerFailure::Timeout);
+fn settle(slot: &Rc<RefCell<Option<Function>>>, reply: JsValue) {
+    if let Some(resolve) = slot.borrow_mut().take() {
+        let _ = resolve.call1(&JsValue::NULL, &reply);
     }
-    let error = Reflect::get(&value, &JsValue::from_str("error"))
-        .ok()
-        .filter(|error| !error.is_undefined() && !error.is_null())
-        .and_then(|error| error.as_string());
-    if let Some(error) = error {
-        let trap = Reflect::get(&value, &JsValue::from_str("trap"))
-            .ok()
-            .and_then(|trap| trap.as_bool())
-            .unwrap_or(false);
-        return Err(if trap {
-            WorkerFailure::Trap
-        } else {
-            WorkerFailure::Module(error)
-        });
+}
+
+fn reply_from(data: &JsValue) -> Option<JsValue> {
+    match field_string(data, TYPE).as_deref() {
+        Some("result") => read_reply(data),
+        Some("error") => failure_reply(
+            &field_string(data, MESSAGE).unwrap_or_else(|| "worker error".to_owned()),
+            field_bool(data, TRAP),
+        ),
+        _ => None,
     }
-    let bytes = Reflect::get(&value, &JsValue::from_str("bytes"))
+}
+
+fn field_string(value: &JsValue, key: &str) -> Option<String> {
+    Reflect::get(value, &JsValue::from_str(key))
         .ok()
-        .and_then(|bytes| bytes.dyn_into::<Uint8Array>().ok())
-        .ok_or_else(|| WorkerFailure::Module("the worker reply has no bytes".to_owned()))?
-        .to_vec();
-    let memory = Reflect::get(&value, &JsValue::from_str("memory"))
+        .and_then(|value| value.as_string())
+}
+
+fn field_bool(value: &JsValue, key: &str) -> bool {
+    Reflect::get(value, &JsValue::from_str(key))
         .ok()
-        .and_then(|memory| memory.as_f64())
-        .unwrap_or(0.0) as u64;
-    Ok(WorkerReply { bytes, memory })
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 fn read_reply(value: &JsValue) -> Option<JsValue> {
@@ -261,30 +349,25 @@ fn read_reply(value: &JsValue) -> Option<JsValue> {
         .unwrap_or(0.0) as u64;
     let reply = Object::new();
     Reflect::set(&reply, &JsValue::from_str("bytes"), &bytes).ok()?;
-    Reflect::set(&reply, &JsValue::from_str("memory"), &JsValue::from_f64(memory as f64)).ok()?;
+    Reflect::set(
+        &reply,
+        &JsValue::from_str("memory"),
+        &JsValue::from_f64(memory as f64),
+    )
+    .ok()?;
     Some(reply.into())
 }
 
 fn failure_reply(message: &str, trap: bool) -> Option<JsValue> {
     let reply = Object::new();
-    Reflect::set(&reply, &JsValue::from_str("error"), &JsValue::from_str(message)).ok()?;
-    Reflect::set(&reply, &JsValue::from_str("trap"), &JsValue::from_bool(trap)).ok()?;
+    Reflect::set(
+        &reply,
+        &JsValue::from_str("error"),
+        &JsValue::from_str(message),
+    )
+    .ok()?;
+    Reflect::set(&reply, &JsValue::from_str(TRAP), &JsValue::from_bool(trap)).ok()?;
     Some(reply.into())
-}
-
-fn timeout_promise(timeout_ms: i32) -> Promise {
-    Promise::new(&mut move |resolve, _reject| {
-        let resolve = resolve.clone();
-        let callback = Closure::once_into_js(move || {
-            let _ = resolve.call1(&JsValue::NULL, &JsValue::from_str("__looklab_timeout__"));
-        });
-        if let Some(window) = web_sys::window() {
-            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                callback.unchecked_ref::<Function>(),
-                timeout_ms,
-            );
-        }
-    })
 }
 
 /// `N` from the device-memory budget rule.
@@ -294,7 +377,8 @@ pub fn default_worker_count() -> u32 {
         Some(gib) => (gib / 4.0).min(2.0),
         None => 1.0,
     };
-    ((total_budget * 1024.0 * 1024.0 * 1024.0 / WORKER_BUDGET_BYTES as f64).floor() as u32).clamp(1, 2)
+    ((total_budget * 1024.0 * 1024.0 * 1024.0 / WORKER_BUDGET_BYTES as f64).floor() as u32)
+        .clamp(1, 2)
 }
 
 /// The ceiling for a user-raised worker count.

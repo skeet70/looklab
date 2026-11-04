@@ -3,10 +3,10 @@
 
 pub mod app;
 pub mod data;
+pub mod diagnostics;
 pub mod files;
 pub mod idb;
 pub mod match_data;
-pub mod diagnostics;
 pub mod pages;
 pub mod preview;
 pub mod ui;

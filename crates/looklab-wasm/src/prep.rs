@@ -2,13 +2,13 @@
 //! Postcard requests for the prep module ([docs/03 §2.3](../../../docs/03-data-model.md)).
 
 use looklab_meta::RawSerial;
+use looklab_prep::PrepParams;
 use looklab_prep_module::{
     AssertionFields, BuildManifestRequest, BuildManifestResponse, EncodeEnvelopeRequest,
     EncodeEnvelopeResponse, Function, ManifestImageInput, ModuleError, ParseEnvelopeRequest,
     ParseEnvelopeResponse, PowParamsSpec, PrepareRequest, PrepareResponse, PreparedImageView,
     PriorTransformSpec, Response, SolvePowRequest, SolvePowResponse,
 };
-use looklab_prep::PrepParams;
 use looklab_upload::{
     BlobKind, BodyId, Challenge, ContributionKind, ControlEntry, ControlSettings, Intent, Limits,
     LookSlug, ManifestHash, Nonce, SimKey, StepIndex,
@@ -39,7 +39,8 @@ impl IntentChoice {
         match self {
             Self::Native => Ok(Intent::Native),
             Self::Recipe(slug) => Ok(Intent::Recipe {
-                target_look: LookSlug::new(&slug).map_err(|error| FacadeError::Id(error.to_string()))?,
+                target_look: LookSlug::new(&slug)
+                    .map_err(|error| FacadeError::Id(error.to_string()))?,
             }),
         }
     }
@@ -104,8 +105,7 @@ impl ModuleFunction {
 }
 
 pub fn version_request() -> Vec<u8> {
-    postcard::to_allocvec(&looklab_prep_module::VersionRequest)
-        .expect("unit request is encodable")
+    postcard::to_allocvec(&looklab_prep_module::VersionRequest).expect("unit request is encodable")
 }
 
 pub fn prepare_request(
@@ -163,7 +163,8 @@ pub fn build_manifest_request(
                 kind: BlobKind::Samples,
             })
             .collect(),
-        nonce: Nonce::from_slice(&nonce).ok_or_else(|| FacadeError::Input("nonce is not 32 bytes".to_owned()))?,
+        nonce: Nonce::from_slice(&nonce)
+            .ok_or_else(|| FacadeError::Input("nonce is not 32 bytes".to_owned()))?,
     };
     Ok(postcard::to_allocvec(&request).expect("manifest request is encodable"))
 }

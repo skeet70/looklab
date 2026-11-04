@@ -5,9 +5,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_query_map;
 use looklab_match::Permalink;
-use looklab_wasm::{
-    MatchInputs, VerifyRequestMessage, decode_verify_reply, encode_verify_request,
-};
+use looklab_wasm::{MatchInputs, VerifyRequestMessage, decode_verify_reply, encode_verify_request};
 use wasm_bindgen::JsCast;
 use web_sys::HtmlInputElement;
 
@@ -125,7 +123,9 @@ pub fn VerifyPage() -> impl IntoView {
             .await;
             match result {
                 Ok(value) => {
-                    message.set(Some("One verification iteration finished locally.".to_owned()));
+                    message.set(Some(
+                        "One verification iteration finished locally.".to_owned(),
+                    ));
                     outcome.set(Some(value));
                 }
                 Err(failure) => error.set(Some(failure)),
@@ -152,7 +152,7 @@ pub fn VerifyPage() -> impl IntoView {
                 on:change=on_files/>
             <button on:click=run disabled=move || busy.get()>"Run one iteration"</button>
         </section>
-        {move || busy.get().then(|| ui::loading())}
+        {move || busy.get().then(ui::loading)}
         {move || outcome.get().map(|reply| view! {
             <section class="step">
                 <h2>"Result"</h2>
@@ -174,7 +174,7 @@ pub fn VerifyPage() -> impl IntoView {
                 <h3>"Second settings card"</h3>
                 <crate::pages::match_page::Card card=reply.card/>
                 <p>
-                    <a href=format!("/contribute")>"Contribute the re-renders"</a>
+                    <a href="/contribute".to_string()>"Contribute the re-renders"</a>
                     " (this creates a passkey if you do not have one)."
                 </p>
                 <p class="muted">

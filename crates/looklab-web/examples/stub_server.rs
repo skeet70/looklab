@@ -24,8 +24,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use webauthn_rs::prelude::{
-    CreationChallengeResponse, Passkey, PasskeyRegistration, RegisterPublicKeyCredential,
-    Url, Uuid, Webauthn, WebauthnBuilder,
+    CreationChallengeResponse, Passkey, PasskeyRegistration, RegisterPublicKeyCredential, Url,
+    Uuid, Webauthn, WebauthnBuilder,
 };
 
 const POW_MEMORY_KIB: u32 = 8;
@@ -163,8 +163,7 @@ async fn nonce(State(state): State<Arc<Mutex<Stub>>>) -> Response {
     stub.nonces.retain(|_, expires| *expires > now);
     let mut bytes = [0u8; 32];
     fill_random(&mut bytes);
-    stub.nonces
-        .insert(bytes, now + Duration::from_secs(300));
+    stub.nonces.insert(bytes, now + Duration::from_secs(300));
     Json(NonceResponse {
         nonce: URL_SAFE_NO_PAD.encode(bytes),
         expires_in_seconds: 300,
@@ -224,16 +223,15 @@ async fn upload(State(state): State<Arc<Mutex<Stub>>>, body: Bytes) -> Response 
         Some(expires) if expires > now => {}
         _ => return error_response(StatusCode::BAD_REQUEST, "nonce unknown or expired"),
     }
-    let Some(passkey) = stub
-        .passkeys
-        .iter()
-        .find(|passkey| passkey.cred_id().as_slice() == envelope.assertion.credential_id.as_slice())
-    else {
+    let Some(passkey) = stub.passkeys.iter().find(|passkey| {
+        passkey.cred_id().as_slice() == envelope.assertion.credential_id.as_slice()
+    }) else {
         return error_response(StatusCode::UNAUTHORIZED, "credential unknown");
     };
     let algorithm = match passkey.cred_algorithm() {
-        webauthn_rs::prelude::COSEAlgorithm::ES256
-        | webauthn_rs::prelude::COSEAlgorithm::ES384 => SignatureAlgorithm::Ecdsa,
+        webauthn_rs::prelude::COSEAlgorithm::ES256 | webauthn_rs::prelude::COSEAlgorithm::ES384 => {
+            SignatureAlgorithm::Ecdsa
+        }
         webauthn_rs::prelude::COSEAlgorithm::RS256 => SignatureAlgorithm::Rsa,
         _ => return error_response(StatusCode::BAD_REQUEST, "algorithm unsupported"),
     };
@@ -242,6 +240,7 @@ async fn upload(State(state): State<Arc<Mutex<Stub>>>, body: Bytes) -> Response 
         origin: &stub.origin,
         rp_id: &stub.rp_id,
         algorithm,
+        top_origin: None,
     };
     match check_structure(&envelope.assertion, &expected) {
         StructuralVerdict::Pass | StructuralVerdict::ReviewNeeded { .. } => {}
@@ -287,7 +286,10 @@ async fn upload(State(state): State<Arc<Mutex<Stub>>>, body: Bytes) -> Response 
     .into_response()
 }
 
-async fn status(State(state): State<Arc<Mutex<Stub>>>, AxumPath(token): AxumPath<String>) -> Response {
+async fn status(
+    State(state): State<Arc<Mutex<Stub>>>,
+    AxumPath(token): AxumPath<String>,
+) -> Response {
     let stub = state.lock().expect("stub lock");
     let Some((credential, contribution)) = stub.tokens.get(&token) else {
         return error_response(StatusCode::NOT_FOUND, "unknown token");

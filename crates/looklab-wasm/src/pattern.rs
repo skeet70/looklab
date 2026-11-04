@@ -15,11 +15,15 @@ pub struct PatternImage {
 /// # Errors
 /// Rejects a seed that is not 64 hexadecimal characters, and a size the layout
 /// rejects.
-pub fn render_pattern(seed_hex: &str, width: u32, height: u32) -> Result<PatternImage, FacadeError> {
-    let seed = PatternSeed::parse_hex(seed_hex)
-        .map_err(|error| FacadeError::Input(error.to_string()))?;
-    let image = render(&seed, width, height)
-        .map_err(|error| FacadeError::Input(error.to_string()))?;
+pub fn render_pattern(
+    seed_hex: &str,
+    width: u32,
+    height: u32,
+) -> Result<PatternImage, FacadeError> {
+    let seed =
+        PatternSeed::parse_hex(seed_hex).map_err(|error| FacadeError::Input(error.to_string()))?;
+    let image =
+        render(&seed, width, height).map_err(|error| FacadeError::Input(error.to_string()))?;
     let mut rgba = Vec::with_capacity(image.data.len() * 4);
     for pixel in &image.data {
         for channel in pixel {

@@ -25,10 +25,11 @@ pub fn coverage_map(blobs: &[Vec<u8>]) -> Result<CoverageMap, FacadeError> {
     let mut counts = vec![0_u32; bins * bins];
     let mut samples = 0_u64;
     for blob in blobs {
-        let set = looklab_samples::decode(blob).map_err(|error| FacadeError::Reply(error.to_string()))?;
+        let set =
+            looklab_samples::decode(blob).map_err(|error| FacadeError::Reply(error.to_string()))?;
         for rgb in set.out_rgb() {
             let sum = rgb[0] + rgb[1] + rgb[2];
-            if !(sum > 0.0) || !sum.is_finite() {
+            if !(sum.is_finite() && sum > 0.0) {
                 continue;
             }
             let x = (rgb[0] / sum).clamp(0.0, 1.0);

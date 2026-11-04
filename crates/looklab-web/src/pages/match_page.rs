@@ -237,7 +237,7 @@ pub fn MatchResultPage() -> impl IntoView {
 
     view! {
         <h1>"Match result"</h1>
-        {move || running.get().then(|| ui::loading())}
+        {move || running.get().then(ui::loading)}
         {move || error.get().map(|message| ui::failure(&message))}
         {move || reply.get().map(|reply| view! {
             <div>

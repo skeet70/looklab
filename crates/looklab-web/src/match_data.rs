@@ -7,8 +7,6 @@ use looklab_wasm::match_api::SourceNames;
 
 use crate::data::{self, LoadedVersion};
 
-const DEFAULT_SEED: u64 = 0x5eed_1234;
-
 pub fn inputs_from_version(
     version: &LoadedVersion,
     emphasis: &str,
@@ -63,20 +61,28 @@ pub async fn inputs_from_permalink(permalink: &Permalink) -> Result<MatchInputs,
         )
         .await?
     };
-    let target_look = source_bytes(&target, permalink.sources.target_look.as_deref(), "target look")?;
-    let base_look = source_bytes(&base, permalink.sources.base_look.as_deref(), "base look")?;
-    let body_yaml = String::from_utf8(source_bytes(
+    let target_look = source_bytes(
         &target,
-        permalink.sources.body.as_deref(),
-        "body schema",
-    )?
-    .to_vec())
+        permalink.sources.target_look.as_deref(),
+        "target look",
+    )?;
+    let base_look = source_bytes(&base, permalink.sources.base_look.as_deref(), "base look")?;
+    let body_yaml = String::from_utf8(
+        source_bytes(&target, permalink.sources.body.as_deref(), "body schema")?.to_vec(),
+    )
     .map_err(|_| "body schema is not UTF-8".to_owned())?;
-    let crm = source_bytes(&target, permalink.sources.crm.as_deref(), "control-response model")?;
+    let crm = source_bytes(
+        &target,
+        permalink.sources.crm.as_deref(),
+        "control-response model",
+    )?;
     let transform_yaml = match permalink.sources.transform.as_deref() {
         Some(name) => {
             let bytes = artifact(&target, name)?;
-            Some(String::from_utf8(bytes.to_vec()).map_err(|_| "transform is not UTF-8".to_owned())?)
+            Some(
+                String::from_utf8(bytes.to_vec())
+                    .map_err(|_| "transform is not UTF-8".to_owned())?,
+            )
         }
         None => None,
     };
@@ -95,7 +101,7 @@ pub async fn inputs_from_permalink(permalink: &Permalink) -> Result<MatchInputs,
         epoch: permalink.epoch,
         input_transform_version: permalink.input_transform_version,
         realization_version: permalink.realization_params_version,
-        seed: DEFAULT_SEED,
+        seed: permalink.seed,
         sources: SourceNames {
             target_look: permalink.sources.target_look.clone(),
             base_look: permalink.sources.base_look.clone(),

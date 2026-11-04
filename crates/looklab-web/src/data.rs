@@ -118,7 +118,6 @@ pub async fn scene(name: &str) -> Result<PreparedScene, String> {
     Ok(PreparedScene::new(scene))
 }
 
-
 pub fn artifact<'a>(version: &'a LoadedVersion, name: &str) -> Option<&'a [u8]> {
     version
         .artifacts

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::match_api::{MatchRequest, VerifyRequestMessage, run_match, run_verify};
 
 use crate::{
-    WORKER_FN_MATCH as FN_MATCH, WORKER_FN_VERSION as FN_VERSION, WORKER_FN_VERIFY as FN_VERIFY,
+    WORKER_FN_MATCH as FN_MATCH, WORKER_FN_VERIFY as FN_VERIFY, WORKER_FN_VERSION as FN_VERSION,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,12 +26,14 @@ pub fn dispatch(fn_id: u32, input: &[u8]) -> Vec<u8> {
             optimizer: looklab_match::OPTIMIZER_VERSION.to_owned(),
             abi: crate::MODULE_ABI_VERSION,
         })),
-        FN_MATCH => reply(decode::<MatchRequest>(input).and_then(|request| {
-            run_match(&request).map_err(|error| error.to_string())
-        })),
-        FN_VERIFY => reply(decode::<VerifyRequestMessage>(input).and_then(|request| {
-            run_verify(&request).map_err(|error| error.to_string())
-        })),
+        FN_MATCH => reply(
+            decode::<MatchRequest>(input)
+                .and_then(|request| run_match(&request).map_err(|error| error.to_string())),
+        ),
+        FN_VERIFY => reply(
+            decode::<VerifyRequestMessage>(input)
+                .and_then(|request| run_verify(&request).map_err(|error| error.to_string())),
+        ),
         other => reply::<WorkerVersion>(Err(format!("unknown worker function {other}"))),
     }
 }

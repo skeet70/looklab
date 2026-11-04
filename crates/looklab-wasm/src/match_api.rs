@@ -169,6 +169,7 @@ impl Case {
             probe_set: self.target.file.probe_set,
             optimizer: looklab_match::OPTIMIZER_VERSION.to_owned(),
             emphasis: self.emphasis,
+            seed: self.inputs.seed,
             sources: PermalinkSources {
                 target_look: self.sources.target_look.clone(),
                 base_look: self.sources.base_look.clone(),
@@ -244,7 +245,10 @@ pub fn run_verify(message: &VerifyRequestMessage) -> Result<VerifyReply, FacadeE
         first: SuggestionDto::from_suggestion(&outcome.first),
         second: SuggestionDto::from_suggestion(&outcome.second),
         first_measured: DeltaStatsDto::from_stats(&outcome.first_measured),
-        second_measured: outcome.second_measured.as_ref().map(DeltaStatsDto::from_stats),
+        second_measured: outcome
+            .second_measured
+            .as_ref()
+            .map(DeltaStatsDto::from_stats),
         reduction: outcome.reduction,
         updated_crm_version: outcome.updated.version(),
         card: CardDto::from_card(&card),
@@ -275,7 +279,10 @@ fn decode_postcard<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, St
     let (reply, rest) =
         postcard::take_from_bytes::<Result<T, String>>(bytes).map_err(|error| error.to_string())?;
     if !rest.is_empty() {
-        return Err(format!("{} trailing bytes after the worker reply", rest.len()));
+        return Err(format!(
+            "{} trailing bytes after the worker reply",
+            rest.len()
+        ));
     }
     reply
 }
@@ -299,7 +306,11 @@ fn parse_transform(yaml: &str) -> Result<Mat3, FacadeError> {
         return Err(FacadeError::Input("transform version is zero".to_owned()));
     }
     file.camera_to_xyz
-        .or_else(|| file.forward_matrices.first().map(|entry| entry.camera_to_xyz))
+        .or_else(|| {
+            file.forward_matrices
+                .first()
+                .map(|entry| entry.camera_to_xyz)
+        })
         .or_else(|| file.per_image.first().map(|entry| entry.camera_to_xyz))
         .ok_or_else(|| FacadeError::Input("transform file has no camera-to-XYZ matrix".to_owned()))
 }

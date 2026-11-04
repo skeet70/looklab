@@ -66,7 +66,9 @@ async fn open() -> Result<IdbDatabase, String> {
         .indexed_db()
         .map_err(|error| format!("{error:?}"))?
         .ok_or_else(|| "IndexedDB is unavailable".to_owned())?;
-    let request: IdbOpenDbRequest = factory.open(DATABASE).map_err(|error| format!("{error:?}"))?;
+    let request: IdbOpenDbRequest = factory
+        .open(DATABASE)
+        .map_err(|error| format!("{error:?}"))?;
     let upgrade = Closure::once_into_js(move |event: IdbVersionChangeEvent| {
         let Some(target) = event.target() else {
             return;
@@ -101,7 +103,10 @@ fn request_success(request: &IdbRequest) -> Promise {
         });
         request.set_onsuccess(Some(onsuccess.unchecked_ref()));
         let onerror = Closure::once_into_js(move |_event: Event| {
-            let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("IndexedDB request failed"));
+            let _ = reject.call1(
+                &JsValue::NULL,
+                &JsValue::from_str("IndexedDB request failed"),
+            );
         });
         request.set_onerror(Some(onerror.unchecked_ref()));
     })

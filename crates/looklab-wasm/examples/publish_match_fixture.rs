@@ -84,7 +84,9 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-fn diagonal_covariance(crm: &looklab_model::realization::ControlResponseModel) -> ControlCovariance {
+fn diagonal_covariance(
+    crm: &looklab_model::realization::ControlResponseModel,
+) -> ControlCovariance {
     let ids = crm.parameter_ids();
     let n = ids.len();
     let mut covariance = vec![0.0_f64; n * n];

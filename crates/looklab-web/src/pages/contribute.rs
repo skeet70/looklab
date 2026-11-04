@@ -7,13 +7,12 @@ use leptos::task::spawn_local;
 use looklab_prep::LocalImageKey;
 use looklab_upload::ContributionKind;
 use looklab_wasm::coverage::{CoverageMap, coverage_map, sample_points};
-use looklab_wasm::prep::{default_pow, ModuleFunction};
+use looklab_wasm::prep::{ModuleFunction, default_pow};
 use looklab_wasm::{
     GroupSettings, IntentChoice, PairingPlan, PowParamsSpec, PrepSummary, PreparedImageView,
-    build_manifest_request,
-    decode_build_manifest_reply, decode_encode_reply, decode_pow_reply, decode_prepare_reply,
-    encode_envelope_request, module_fn_id, prepare_request, serial_ascii_for_file,
-    solve_pow_request,
+    build_manifest_request, decode_build_manifest_reply, decode_encode_reply, decode_pow_reply,
+    decode_prepare_reply, encode_envelope_request, module_fn_id, prepare_request,
+    serial_ascii_for_file, solve_pow_request,
 };
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlInputElement};
@@ -112,7 +111,9 @@ pub fn ContributePage() -> impl IntoView {
         let files = all_files.get();
         let count = worker_count.get().max(1);
         busy.set(true);
-        message.set(Some("Processing locally. Nothing leaves this page yet.".to_owned()));
+        message.set(Some(
+            "Processing locally. Nothing leaves this page yet.".to_owned(),
+        ));
         spawn_local(async move {
             let result = run_files(&pairing, &files, count).await;
             match result {
@@ -209,9 +210,7 @@ pub fn ContributePage() -> impl IntoView {
         let entries = seeds
             .get()
             .into_iter()
-            .filter_map(|row| {
-                LocalImageKey::new(&row.name).map(|key| (key, row.seed))
-            })
+            .filter_map(|row| LocalImageKey::new(&row.name).map(|key| (key, row.seed)))
             .collect::<Vec<_>>();
         match looklab_wasm::build_seed_file(PRIOR_VERSION, &entries) {
             Ok(json) => {
@@ -480,12 +479,7 @@ fn CoverageMapView(map: CoverageMap) -> impl IntoView {
                 };
                 let value = (40.0 + level * 180.0) as u8;
                 context.set_fill_style_str(&format!("rgb({value}, {value}, {value})"));
-                context.fill_rect(
-                    f64::from(x * 6),
-                    f64::from(y * 6),
-                    6.0,
-                    6.0,
-                );
+                context.fill_rect(f64::from(x * 6), f64::from(y * 6), 6.0, 6.0);
             }
         }
     });
@@ -554,7 +548,12 @@ fn draw_points(node: &NodeRef<Canvas>, points: &[[f32; 3]], projection: Projecti
             let x = (index as u32 % side) * pixel;
             let y = (index as u32 / side) * pixel;
             context.set_fill_style_str(&colour(*rgb));
-            context.fill_rect(f64::from(x), f64::from(y), f64::from(pixel), f64::from(pixel));
+            context.fill_rect(
+                f64::from(x),
+                f64::from(y),
+                f64::from(pixel),
+                f64::from(pixel),
+            );
         }
         return;
     }
@@ -570,9 +569,7 @@ fn draw_points(node: &NodeRef<Canvas>, points: &[[f32; 3]], projection: Projecti
 }
 
 fn colour(rgb: [f32; 3]) -> String {
-    let channel = |value: f32| -> u8 {
-        (value.clamp(0.0, 1.0) * 255.0).round() as u8
-    };
+    let channel = |value: f32| -> u8 { (value.clamp(0.0, 1.0) * 255.0).round() as u8 };
     format!(
         "rgb({}, {}, {})",
         channel(rgb[0]),
@@ -611,7 +608,11 @@ fn group_settings(
     target: &str,
 ) -> Result<GroupSettings, String> {
     let mut entries = Vec::new();
-    for line in controls.lines().map(str::trim).filter(|line| !line.is_empty()) {
+    for line in controls
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
         let (key, step) = line
             .split_once('=')
             .ok_or_else(|| format!("{line}: expected key=step"))?;
@@ -710,12 +711,7 @@ pub(crate) async fn run_files(
             .ok_or_else(|| "crypto.getRandomValues is unavailable".to_owned())?
             .get_random_values_with_u8_array(&mut seed)
             .map_err(|error| format!("{error:?}"))?;
-        let request = prepare_request(
-            raw.bytes.clone(),
-            jpegs.clone(),
-            PRIOR_VERSION,
-            seed,
-        );
+        let request = prepare_request(raw.bytes.clone(), jpegs.clone(), PRIOR_VERSION, seed);
         let bytes_in =
             raw.bytes.len() as u64 + jpegs.iter().map(|jpeg| jpeg.len() as u64).sum::<u64>();
         let start = performance_now();
@@ -733,7 +729,11 @@ pub(crate) async fn run_files(
                     groups.push(ProcessedGroup {
                         raw: group.raw.clone(),
                         images: looklab_wasm::prep::summarize(&response.images),
-                        blobs: response.images.iter().map(|image| image.blob.clone()).collect(),
+                        blobs: response
+                            .images
+                            .iter()
+                            .map(|image| image.blob.clone())
+                            .collect(),
                         bytes_in,
                         millis,
                         memory: reply.memory,
@@ -802,8 +802,7 @@ async fn upload_batch(
         iterations: defaults.iterations,
         difficulty_bits_per_image: defaults.difficulty_bits_per_image,
     });
-    let n_images =
-        u32::try_from(images.len()).map_err(|_| "too many images".to_owned())?;
+    let n_images = u32::try_from(images.len()).map_err(|_| "too many images".to_owned())?;
     let pow_request = solve_pow_request(
         challenge,
         n_images,

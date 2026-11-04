@@ -51,8 +51,6 @@ struct PowWire {
 pub async fn fetch_nonce() -> Result<NonceReply, String> {
     let response = Request::post("/api/nonce")
         .header("Content-Type", "application/json")
-        .body(Some(JsValue::from_str("{}")))
-        .map_err(|error| error.to_string())?
         .send()
         .await
         .map_err(|error| error.to_string())?;
@@ -60,8 +58,7 @@ pub async fn fetch_nonce() -> Result<NonceReply, String> {
         return Err(format!("nonce: HTTP {}", response.status()));
     }
     let wire: NonceWire = response.json().await.map_err(|error| error.to_string())?;
-    let bytes = decode_base64url(&wire.nonce)
-        .ok_or_else(|| "nonce: not base64url".to_owned())?;
+    let bytes = decode_base64url(&wire.nonce).ok_or_else(|| "nonce: not base64url".to_owned())?;
     let nonce: [u8; 32] = bytes
         .try_into()
         .map_err(|_| "nonce: not 32 bytes".to_owned())?;
@@ -100,7 +97,8 @@ pub async fn create_passkey() -> Result<Vec<u8>, String> {
     let options = start
         .get("options")
         .ok_or_else(|| "passkey start: no options".to_owned())?;
-    let options = JsValue::from_str(&options.to_string());
+    let options = js_sys::JSON::parse(&options.to_string())
+        .map_err(|error| format!("passkey start options: {error:?}"))?;
     patch_creation_options(&options)?;
 
     let credential = call_credentials(CredentialMethod::Create, &options).await?;
@@ -134,7 +132,11 @@ pub async fn sign_batch(
     let public_key = Object::new();
     set(&public_key, "challenge", &Uint8Array::from(challenge))?;
     set(&public_key, "rpId", &JsValue::from_str(&rp_id()))?;
-    set(&public_key, "userVerification", &JsValue::from_str("preferred"))?;
+    set(
+        &public_key,
+        "userVerification",
+        &JsValue::from_str("preferred"),
+    )?;
     set(&public_key, "timeout", &JsValue::from_f64(60_000.0))?;
     if let Some(credential_id) = credential_id {
         let allow = Array::new();
@@ -283,7 +285,9 @@ fn patch_descriptors(public_key: &JsValue, key: &str) -> Result<(), String> {
     if !value.is_array() {
         return Ok(());
     }
-    let descriptors = value.dyn_into::<Array>().map_err(|_| "descriptors".to_owned())?;
+    let descriptors = value
+        .dyn_into::<Array>()
+        .map_err(|_| "descriptors".to_owned())?;
     for descriptor in descriptors.iter() {
         replace_string_with_bytes(&descriptor, "id")?;
     }
@@ -291,8 +295,8 @@ fn patch_descriptors(public_key: &JsValue, key: &str) -> Result<(), String> {
 }
 
 fn replace_string_with_bytes(object: &JsValue, key: &str) -> Result<(), String> {
-    let value = Reflect::get(object, &JsValue::from_str(key))
-        .map_err(|error| format!("{error:?}"))?;
+    let value =
+        Reflect::get(object, &JsValue::from_str(key)).map_err(|error| format!("{error:?}"))?;
     let Some(text) = value.as_string() else {
         return Ok(());
     };
@@ -335,7 +339,12 @@ fn credential_to_json(credential: &JsValue) -> Result<Value, String> {
     let response = Reflect::get(credential, &JsValue::from_str("response"))
         .map_err(|error| format!("{error:?}"))?;
     let mut response_json = serde_json::Map::new();
-    for key in ["clientDataJSON", "attestationObject", "authenticatorData", "signature"] {
+    for key in [
+        "clientDataJSON",
+        "attestationObject",
+        "authenticatorData",
+        "signature",
+    ] {
         if let Ok(bytes) = bytes_field(&response, key) {
             response_json.insert(key.to_owned(), Value::String(encode_base64url(&bytes)));
         }
@@ -356,8 +365,8 @@ fn string_field(object: &JsValue, key: &str) -> Result<String, String> {
 }
 
 fn bytes_field(object: &JsValue, key: &str) -> Result<Vec<u8>, String> {
-    let value = Reflect::get(object, &JsValue::from_str(key))
-        .map_err(|error| format!("{error:?}"))?;
+    let value =
+        Reflect::get(object, &JsValue::from_str(key)).map_err(|error| format!("{error:?}"))?;
     if value.is_undefined() || value.is_null() {
         return Err(format!("{key} is absent"));
     }

@@ -19,8 +19,8 @@ mod ui;
 #[cfg(all(target_arch = "wasm32", feature = "worker"))]
 pub mod worker_abi;
 
-pub use error::FacadeError;
 pub use dto::{MatchReply, VerifyReply};
+pub use error::FacadeError;
 pub use looklab_prep_module::{
     AlignmentSummary, AssertionFields, PowParamsSpec, PreparedImageView,
 };
@@ -28,12 +28,12 @@ pub use match_api::{
     MatchInputs, MatchRequest, VerifyRequestMessage, decode_match_reply, decode_verify_reply,
     run_match, run_verify,
 };
+pub use match_api::{encode_match_request, encode_verify_request};
 pub use pairing::{PairGroup, PairingPlan, UnpairedEntry, inspect_files};
 pub use pattern::{PatternImage, render_pattern};
-pub use match_api::{encode_match_request, encode_verify_request};
 pub use prep::{
     GroupSettings, IntentChoice, PrepSummary, build_manifest_request, decode_build_manifest_reply,
-    decode_encode_reply, decode_parse_reply, decode_prepare_reply, decode_pow_reply,
+    decode_encode_reply, decode_parse_reply, decode_pow_reply, decode_prepare_reply,
     encode_envelope_request, module_fn_id, parse_envelope_request, prepare_request, serial_ascii,
     serial_ascii_for_file, solve_pow_request, version_request,
 };

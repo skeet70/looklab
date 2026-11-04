@@ -26,7 +26,7 @@ pub fn PatternPage() -> impl IntoView {
             draw(&seed_clone, &canvas_clone, error);
         });
         if let Some(window) = web_sys::window() {
-            let _ = window.set_onresize(Some(callback.as_ref().unchecked_ref()));
+            window.set_onresize(Some(callback.as_ref().unchecked_ref()));
         }
         callback.forget();
     });
@@ -45,7 +45,11 @@ fn draw(seed: &str, canvas: &HtmlCanvasElement, error: RwSignal<Option<String>>)
     let Some(window) = web_sys::window() else {
         return;
     };
-    let width = window.inner_width().ok().and_then(|value| value.as_f64()).unwrap_or(0.0) as u32;
+    let width = window
+        .inner_width()
+        .ok()
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0) as u32;
     let height = window
         .inner_height()
         .ok()

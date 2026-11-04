@@ -72,7 +72,13 @@ fn main() -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     std::fs::write(&out, &jpeg).map_err(|error| error.to_string())?;
-    println!("{}×{} -> {} ({} bytes)", width, height, out.display(), jpeg.len());
+    println!(
+        "{}×{} -> {} ({} bytes)",
+        width,
+        height,
+        out.display(),
+        jpeg.len()
+    );
     Ok(())
 }
 

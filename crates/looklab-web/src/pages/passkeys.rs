@@ -22,7 +22,9 @@ pub fn PasskeysPage() -> impl IntoView {
                 Ok(token) => {
                     let _ = idb::put(idb::StorageKey::STATUS_TOKEN, &token).await;
                     link.set(Some(format!("/status/{token}")));
-                    message.set(Some("A new status link was issued; the old one is revoked.".to_owned()));
+                    message.set(Some(
+                        "A new status link was issued; the old one is revoked.".to_owned(),
+                    ));
                 }
                 Err(error) => message.set(Some(error)),
             }
