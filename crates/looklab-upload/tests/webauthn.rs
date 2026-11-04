@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 
 const ORIGIN: &str = "https://looklab.example";
 const RP_ID: &str = "looklab.example";
-const OTHER_KEYS: &str = "Do not compare, do not measure. No other keys can be added here.";
+const OTHER_KEYS: &str =
+    "do not compare clientDataJSON against a template. See https://goo.gl/yabPex";
 
 fn challenge() -> Challenge {
     Challenge::new(
@@ -258,7 +259,7 @@ fn missing_expected_top_origin_needs_review() {
 }
 
 #[test]
-fn chrome_extra_key_needs_review_as_non_canonical() {
+fn chrome_extra_key_passes() {
     let assertion = assertion(
         &challenge(),
         &format!(r#","other_keys_can_be_added_here":"{OTHER_KEYS}""#),
@@ -266,20 +267,10 @@ fn chrome_extra_key_needs_review_as_non_canonical() {
         &[],
         vec![0xab; 64],
     );
-    match check_structure(&assertion, &expected(SignatureAlgorithm::Ed25519)) {
-        StructuralVerdict::ReviewNeeded {
-            unknown_client_data_keys,
-            non_canonical_client_data,
-            top_origin,
-            extensions,
-        } => {
-            assert!(unknown_client_data_keys.is_empty());
-            assert!(non_canonical_client_data.is_some());
-            assert!(top_origin.is_none());
-            assert!(extensions.is_none());
-        }
-        other => panic!("expected review, got {other:?}"),
-    }
+    assert!(matches!(
+        check_structure(&assertion, &expected(SignatureAlgorithm::Ed25519)),
+        StructuralVerdict::Pass
+    ));
 }
 
 #[test]
@@ -291,10 +282,42 @@ fn chrome_extra_key_with_other_text_needs_review() {
         &[],
         vec![0xab; 64],
     );
-    assert!(matches!(
-        check_structure(&assertion, &expected(SignatureAlgorithm::Ed25519)),
-        StructuralVerdict::ReviewNeeded { .. }
-    ));
+    match check_structure(&assertion, &expected(SignatureAlgorithm::Ed25519)) {
+        StructuralVerdict::ReviewNeeded {
+            unknown_client_data_keys,
+            non_canonical_client_data,
+            ..
+        } => {
+            assert_eq!(unknown_client_data_keys.len(), 1);
+            assert_eq!(
+                unknown_client_data_keys[0].key,
+                "other_keys_can_be_added_here"
+            );
+            assert!(non_canonical_client_data.is_some());
+        }
+        other => panic!("expected review, got {other:?}"),
+    }
+}
+
+#[test]
+fn chrome_extra_key_out_of_position_needs_review() {
+    let mut assertion = valid();
+    assertion.client_data_json = format!(
+        r#"{{"type":"webauthn.get","challenge":"{}","origin":"{ORIGIN}","other_keys_can_be_added_here":"{OTHER_KEYS}","crossOrigin":false}}"#,
+        URL_SAFE_NO_PAD.encode(challenge().as_bytes())
+    )
+    .into_bytes();
+    match check_structure(&assertion, &expected(SignatureAlgorithm::Ed25519)) {
+        StructuralVerdict::ReviewNeeded {
+            unknown_client_data_keys,
+            non_canonical_client_data,
+            ..
+        } => {
+            assert!(unknown_client_data_keys.is_empty());
+            assert!(non_canonical_client_data.is_some());
+        }
+        other => panic!("expected review, got {other:?}"),
+    }
 }
 
 #[test]

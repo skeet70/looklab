@@ -24,7 +24,13 @@ const FLAG_ATTESTED_CREDENTIAL_DATA: u8 = 0x40;
 const FLAG_EXTENSION_DATA: u8 = 0x80;
 
 const CLIENT_DATA_TYPE: &str = "webauthn.get";
-const OTHER_KEYS_TEXT: &str = "Do not compare, do not measure. No other keys can be added here.";
+
+/// Chromium appends this key, with [`OTHER_KEYS_TEXT`], last before the closing
+/// brace, after `crossOrigin`/`topOrigin`, on roughly one assertion in five
+/// (`components/webauthn/core/browser/client_data_json.cc`).
+const OTHER_KEYS_KEY: &str = "other_keys_can_be_added_here";
+const OTHER_KEYS_TEXT: &str =
+    "do not compare clientDataJSON against a template. See https://goo.gl/yabPex";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebAuthnAssertion {
@@ -365,7 +371,7 @@ fn check_client_data(
 
     let mut unknown = Vec::new();
     for (key, value) in &client.extras {
-        if key == "other_keys_can_be_added_here" && value.as_str() == Some(OTHER_KEYS_TEXT) {
+        if key == OTHER_KEYS_KEY && value.as_str() == Some(OTHER_KEYS_TEXT) {
             continue;
         }
         unknown.push(ClientDataExtra {
@@ -408,6 +414,17 @@ fn canonical_client_data(client: &ClientData) -> String {
     if let Some(top_origin) = &client.top_origin {
         out.push_str(",\"topOrigin\":");
         push_json_string(&mut out, top_origin);
+    }
+    if client
+        .extras
+        .get(OTHER_KEYS_KEY)
+        .and_then(JsonValue::as_str)
+        == Some(OTHER_KEYS_TEXT)
+    {
+        out.push(',');
+        push_json_string(&mut out, OTHER_KEYS_KEY);
+        out.push(':');
+        push_json_string(&mut out, OTHER_KEYS_TEXT);
     }
     out.push('}');
     out
