@@ -211,6 +211,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
+
+[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3171,6 +3177,7 @@ dependencies = [
  "looklab-server",
  "looklab-trust",
  "looklab-upload",
+ "looklab-worker",
  "p256",
  "postcard",
  "serde",
@@ -3364,12 +3371,14 @@ dependencies = [
 name = "looklab-schema"
 version = "0.1.0"
 dependencies = [
+ "saphyr-parser",
  "serde",
  "serde_json",
  "serde_norway",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -3477,6 +3486,28 @@ name = "looklab-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
+ "looklab-color",
+ "looklab-fit",
+ "looklab-meta",
+ "looklab-model",
+ "looklab-publish",
+ "looklab-samples",
+ "looklab-schema",
+ "looklab-server",
+ "looklab-trust",
+ "looklab-upload",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -4829,6 +4860,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "saphyr-parser"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48cf5a82d41247a625f040af08e91008fec945bce3b0bffba992c44af092caa2"
+dependencies = [
+ "arraydeque",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

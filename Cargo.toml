@@ -29,6 +29,7 @@ looklab-prep-module = { path = "crates/looklab-prep-module" }
 looklab-publish = { path = "crates/looklab-publish" }
 looklab-web = { path = "crates/looklab-web" }
 looklab-server = { path = "crates/looklab-server" }
+looklab-worker = { path = "crates/looklab-worker" }
 
 libm = "0.2"
 thiserror = "2"
@@ -36,6 +37,7 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
+saphyr-parser = "0.3"
 postcard = { version = "1", features = ["alloc"] }
 ruzstd = { version = "0.9", default-features = false, features = ["std"] }
 proptest = "1"

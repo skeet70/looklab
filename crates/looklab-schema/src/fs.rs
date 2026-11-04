@@ -50,13 +50,13 @@ pub fn validate_dir(root: impl AsRef<Path>) -> io::Result<Vec<FileErrors>> {
     Ok(failures)
 }
 
-enum Kind {
+pub(crate) enum Kind {
     Body,
     Schema,
     Interface,
 }
 
-fn classify(path: &Path) -> Option<Kind> {
+pub(crate) fn classify(path: &Path) -> Option<Kind> {
     let name = path.file_name()?.to_str()?;
     let dir = path.parent()?.file_name()?.to_str()?;
     if !name.ends_with(".yaml") {

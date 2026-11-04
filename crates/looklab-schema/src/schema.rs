@@ -42,7 +42,7 @@ pub struct FirmwareRange {
     pub to: FirmwareVersion,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeSim {
     pub key: SimKey,
@@ -50,7 +50,7 @@ pub struct NativeSim {
     pub makernote: Makernote,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Makernote {
     pub tag: MakernoteTag,
@@ -233,6 +233,7 @@ struct RawControl {
 }
 
 pub fn validate_control_schema(yaml: &str) -> Result<ControlSchema, Vec<ValidationError>> {
+    crate::yaml::check(yaml)?;
     let raw: RawSchema = serde_norway::from_str(yaml).map_err(ValidationError::syntax)?;
     let mut errors = Vec::new();
     validate_schema(&raw, &mut errors);
@@ -241,6 +242,59 @@ pub fn validate_control_schema(yaml: &str) -> Result<ControlSchema, Vec<Validati
     } else {
         Err(errors)
     }
+}
+
+/// Inserts or replaces the native-sim entry a mapping adds, then re-validates
+/// the document it produced.
+///
+/// # Errors
+/// The document does not validate, the epoch is absent, or the mapping's
+/// firmware range differs from the epoch's.
+pub fn apply_sim_mapping(
+    yaml: &str,
+    epoch: u32,
+    firmware_from: &FirmwareVersion,
+    firmware_to: Option<&FirmwareVersion>,
+    sim: &NativeSim,
+) -> Result<String, Vec<ValidationError>> {
+    let schema = validate_control_schema(yaml)?;
+    let invalid = |path: &str, expected: &'static str| {
+        vec![ValidationError::new(
+            path,
+            ErrorKind::InvalidValue { expected },
+        )]
+    };
+    let index = schema
+        .epochs
+        .iter()
+        .position(|candidate| candidate.id == epoch)
+        .ok_or_else(|| invalid("epoch", "an epoch the body's control schema declares"))?;
+    if schema.epochs[index].firmware.from != *firmware_from {
+        return Err(invalid("firmware_from", "the epoch's firmware range start"));
+    }
+    if let Some(to) = firmware_to
+        && schema.epochs[index].firmware.to != *to
+    {
+        return Err(invalid("firmware_to", "the epoch's firmware range end"));
+    }
+    let mut document: serde_norway::Value =
+        serde_norway::from_str(yaml).map_err(ValidationError::syntax)?;
+    let sims = document
+        .get_mut("epochs")
+        .and_then(|epochs| epochs.get_mut(index))
+        .and_then(|epoch| epoch.get_mut("native_sims"))
+        .and_then(serde_norway::Value::as_sequence_mut)
+        .ok_or_else(|| invalid("native_sims", "the epoch's list of native sims"))?;
+    let entry = serde_norway::to_value(sim).map_err(ValidationError::syntax)?;
+    match sims.iter_mut().find(|existing| {
+        existing.get("key").and_then(serde_norway::Value::as_str) == Some(sim.key.as_str())
+    }) {
+        Some(slot) => *slot = entry,
+        None => sims.push(entry),
+    }
+    let updated = serde_norway::to_string(&document).map_err(ValidationError::syntax)?;
+    validate_control_schema(&updated)?;
+    Ok(updated)
 }
 
 fn validate_schema(raw: &RawSchema, errors: &mut Vec<ValidationError>) {

@@ -1935,6 +1935,38 @@ impl TestServer {
         post_json(&self.app, "/api/proposals", &body).await
     }
 
+    async fn moderator_token(&mut self) -> String {
+        self.set_credential_tier_roles(&self.credential_id, "new", "[\"moderator\"]")
+            .await;
+        let signed = self.signed_fields("mod-session", &[]).await;
+        let (status, session) = post_json(&self.app, "/api/mod/session", &signed).await;
+        assert_eq!(status, StatusCode::OK, "session: {session}");
+        session["session_token"]
+            .as_str()
+            .expect("session token")
+            .to_owned()
+    }
+
+    async fn decide(&self, token: &str, proposal: &str, reason: &str) -> (StatusCode, Value) {
+        let decision = json!({
+            "proposal_id": proposal,
+            "decision": "approve",
+            "reason": reason,
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/mod/decision")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::to_vec(&decision).expect("decision json"),
+            ))
+            .expect("request");
+        let (status, _, body) = send(&self.app, request).await;
+        let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        (status, value)
+    }
+
     async fn confirm_proposal(
         &mut self,
         proposal: &str,
@@ -2111,7 +2143,12 @@ async fn proposal_decision_writes_a_validated_snapshot() {
     )
     .expect("manifest json");
     assert_eq!(manifest["content_hash"], hash);
-    assert!(snapshot.join("bodies/fujifilm-x-t5.body.yaml").is_file());
+    let body = looklab_schema::validate_body(body_yaml).expect("body");
+    assert!(
+        snapshot
+            .join(looklab_schema::body_export_path(&body.id))
+            .is_file()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2122,20 +2159,20 @@ async fn fixture_donations_export_and_interface_profiles_carry_a_report() {
 
     let mapping = "\
 body: fujifilm/x-t5
-epoch: 2
+epoch: 1
 sim_key: reala_ace
 look: reala-ace
-firmware_from: \"2.00\"
+firmware_from: \"1.00\"
 makernote: { tag: FilmMode, value: 1792 }
 ";
     let fixture = FixtureDonation {
-        file: "fujifilm-x-t5-2.00.raf".to_owned(),
-        description: "X-T5 firmware 2.00, Reala Ace".to_owned(),
+        file: "fujifilm-x-t5-1.00.raf".to_owned(),
+        description: "X-T5 firmware 1.00, Reala Ace".to_owned(),
         make: "Fujifilm".to_owned(),
         model: "X-T5".to_owned(),
         sha256: Sha256Hex::parse(&"ab".repeat(32)).expect("sha256"),
         size: 24_000_000,
-        source_url: None,
+        source_url: Some("https://example.com/fujifilm-x-t5-1.00.raf".to_owned()),
         donator: Some("tester".to_owned()),
         donated_on: Date::parse("2026-11-04").expect("date"),
         license: FixtureLicense::Cc0_1_0,
@@ -2147,7 +2184,7 @@ makernote: { tag: FilmMode, value: 1792 }
     assert_eq!(status, StatusCode::CREATED, "mapping: {body}");
     assert_eq!(
         body["view"]["summary"]["headline"],
-        "adds Reala Ace to X-T5 firmware 2.00+"
+        "adds Reala Ace to X-T5 firmware 1.00+"
     );
     let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
 
@@ -2182,13 +2219,212 @@ makernote: { tag: FilmMode, value: 1792 }
     let (status, _, body) = send(&server.app, request).await;
     assert_eq!(status, StatusCode::OK, "decision: {body:?}");
     let decided: Value = serde_json::from_slice(&body).expect("decision json");
-    assert!(decided["snapshot"].is_null(), "a mapping is not a document");
+    assert_eq!(decided["snapshot"]["version"], 1);
+
+    let snapshot = server.dir.path().join("community/v1");
+    let failures = looklab_schema::validate_snapshot_dir(&snapshot).expect("snapshot walk");
+    assert!(failures.is_empty(), "{failures:?}");
+    let schema = looklab_schema::validate_control_schema(
+        &std::fs::read_to_string(snapshot.join(looklab_schema::schema_export_path(
+            &"fujifilm/x-t5".try_into().expect("body id"),
+        )))
+        .expect("updated schema"),
+    )
+    .expect("valid schema");
+    let reala = schema.epochs[0]
+        .native_sims
+        .iter()
+        .find(|sim| sim.key.as_str() == "reala_ace")
+        .expect("the mapping was applied");
+    assert_eq!(reala.look.as_str(), "reala-ace");
+    assert_eq!(reala.makernote.tag.as_str(), "FilmMode");
+    assert_eq!(reala.makernote.value, looklab_schema::MakernoteValue(1792));
 
     let (status, _, body) = server.get("/api/fixtures/manifest.toml").await;
     assert_eq!(status, StatusCode::OK);
     let manifest = String::from_utf8(body.to_vec()).expect("toml");
     assert!(manifest.contains("[[fixture]]"), "{manifest}");
-    assert!(manifest.contains("file = \"fujifilm-x-t5-2.00.raf\""));
+    assert!(manifest.contains("file = \"fujifilm-x-t5-1.00.raf\""));
     assert!(manifest.contains("license = \"CC0-1.0\""));
     assert!(manifest.contains("Donated by tester on 2026-11-04"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mapping_approval_without_a_body_schema_is_not_committed() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let mapping = "\
+body: fujifilm/x-unknown
+epoch: 1
+sim_key: reala_ace
+look: reala-ace
+firmware_from: \"1.00\"
+makernote: { tag: FilmMode, value: 1792 }
+";
+    let (status, body) = server.submit_proposal("mapping", mapping, &[], true).await;
+    assert_eq!(status, StatusCode::CREATED, "mapping: {body}");
+    let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+
+    let token = server.moderator_token().await;
+    let (status, body) = server.decide(&token, &proposal, "the body is known").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "decision: {body}");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM proposals WHERE id = ?")
+            .bind(&proposal)
+            .fetch_one(&server.db)
+            .await
+            .expect("proposal status"),
+        "pending"
+    );
+    assert!(!server.dir.path().join("community/v1").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pending_publication_is_retried_before_the_next_decision() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let actor = server.add_credential().await;
+
+    let body_yaml = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
+    let body = looklab_schema::validate_body(body_yaml).expect("body");
+    let files = vec![
+        (
+            looklab_schema::body_export_path(&body.id),
+            body_yaml.as_bytes().to_vec(),
+        ),
+        (
+            looklab_schema::FIXTURE_MANIFEST.to_owned(),
+            looklab_schema::fixture_manifest_toml(&[]).into_bytes(),
+        ),
+    ];
+    let hash = looklab_schema::content_hash(&files);
+    let unpublished = looklab_server::ProposalId::new();
+    sqlx::query(
+        "INSERT INTO proposals
+         (id, credential_id, type, payload, human_summary, evidence, status, created_at,
+          publication, published_version, published_hash)
+         VALUES (?, ?, 'body', ?, 'adds a body', '[]', 'approved', 0, 'pending', 1, ?)",
+    )
+    .bind(unpublished.as_str())
+    .bind(&actor)
+    .bind(body_yaml)
+    .bind(&hash)
+    .execute(&server.db)
+    .await
+    .expect("pending publication");
+
+    let (status, body) = server.submit_proposal("body", body_yaml, &[], true).await;
+    assert_eq!(status, StatusCode::CREATED, "submit: {body}");
+    let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    let token = server.moderator_token().await;
+    let (status, body) = server.decide(&token, &proposal, "validated locally").await;
+    assert_eq!(status, StatusCode::OK, "decision: {body}");
+    assert_eq!(body["snapshot"]["version"], 2);
+
+    for version in [1, 2] {
+        let dir = server.dir.path().join(format!("community/v{version}"));
+        let failures = looklab_schema::validate_snapshot_dir(&dir).expect("snapshot walk");
+        assert!(failures.is_empty(), "v{version}: {failures:?}");
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT publication FROM proposals WHERE id = ?")
+            .bind(unpublished.as_str())
+            .fetch_one(&server.db)
+            .await
+            .expect("publication state"),
+        "published"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fixture_backed_body_needs_a_fixture_donation() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let body_yaml = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml").replace(
+        "mapping_status: provisional",
+        "mapping_status: fixture_backed",
+    );
+    let (status, body) = server.submit_proposal("body", &body_yaml, &[], true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "claimed status: {body}");
+
+    let donation = FixtureDonation {
+        file: "fujifilm-x-s10-1.00.raf".to_owned(),
+        description: "X-S10 firmware 1.00".to_owned(),
+        make: "Fujifilm".to_owned(),
+        model: "X-S10".to_owned(),
+        sha256: Sha256Hex::parse(&"cd".repeat(32)).expect("sha256"),
+        size: 24_000_000,
+        source_url: Some("https://example.com/fujifilm-x-s10-1.00.raf".to_owned()),
+        donator: None,
+        donated_on: Date::parse("2026-11-04").expect("date"),
+        license: FixtureLicense::Cc0_1_0,
+        committed: false,
+    };
+    let (status, body) = server
+        .submit_proposal("body", &body_yaml, std::slice::from_ref(&donation), true)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "another body: {body}");
+
+    let donation = FixtureDonation {
+        file: "fujifilm-x-t5-1.00.raf".to_owned(),
+        model: "X-T5".to_owned(),
+        ..donation
+    };
+    let (status, body) = server
+        .submit_proposal("body", &body_yaml, std::slice::from_ref(&donation), true)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "matching donation: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interface_profile_with_unbounded_lut_grids_is_rejected() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let profile = include_str!("../../../data/interfaces/example-firmware-sim-v1.yaml");
+
+    let oversized = profile.replace("sizes: [17, 33, 65]", "sizes: [70000]");
+    let (status, body) = server
+        .submit_proposal("interface_profile", &oversized, &[], true)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "oversized side: {body}");
+
+    let over_budget = profile.replace("sizes: [17, 33, 65]", "sizes: [256, 256, 256, 256]");
+    let (status, body) = server
+        .submit_proposal("interface_profile", &over_budget, &[], true)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "node budget: {body}");
+
+    let (status, body) = server
+        .submit_proposal("interface_profile", profile, &[], true)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "accepted profile: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn yaml_anchors_and_aliases_are_rejected_at_intake() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let anchored = "\
+id: fujifilm/x-t9
+make: Fujifilm
+model: X-T9
+exif_aliases: *names
+kind: camera
+capabilities:
+  in_camera_raw_conversion: true
+  jpeg_color_spaces: &names [srgb]
+  heif: false
+status: proposed
+mapping_status: provisional
+";
+    let (status, body) = server.submit_proposal("body", anchored, &[], true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "aliased body: {body}");
 }

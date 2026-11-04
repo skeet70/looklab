@@ -2,7 +2,8 @@
 //! Validation tests for the shipped data files and each schema rule.
 
 use looklab_schema::{
-    ControlDefault, ErrorKind, MappingStatus, Rational, ScalarValue, Tolerated, validate_body,
+    ControlDefault, ErrorKind, FirmwareVersion, Makernote, MakernoteValue, MappingStatus,
+    NativeSim, Rational, ScalarValue, Tolerated, apply_sim_mapping, validate_body,
     validate_control_schema, validate_interface_profile,
 };
 
@@ -43,7 +44,7 @@ fn shipped_files_validate() {
     ))
     .unwrap();
     assert_eq!(profile.id.as_str(), "example-firmware/sim-v1");
-    assert_eq!(profile.limits.max_bytes, 262_144);
+    assert_eq!(profile.limits.max_bytes, 2_097_152);
 }
 
 #[test]
@@ -307,8 +308,10 @@ fn rejects_unknown_fields() {
         .is_err()
     );
 
-    let profile = include_str!("../../../data/interfaces/example-firmware-sim-v1.yaml")
-        .replace("    sizes: [17, 33]", "    sizes: [17, 33]\n    bogus: 1");
+    let profile = include_str!("../../../data/interfaces/example-firmware-sim-v1.yaml").replace(
+        "    sizes: [17, 33, 65]",
+        "    sizes: [17, 33, 65]\n    bogus: 1",
+    );
     assert!(validate_interface_profile(&profile).is_err());
 }
 
@@ -318,4 +321,94 @@ fn shipped_directory_validates() {
     let errors =
         looklab_schema::validate_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data")).unwrap();
     assert!(errors.is_empty(), "{errors:?}");
+}
+
+const INTERFACE: &str = include_str!("../../../data/interfaces/example-firmware-sim-v1.yaml");
+
+#[test]
+fn interface_lut_sides_and_node_counts_are_bounded() {
+    let errors =
+        validate_interface_profile(&INTERFACE.replace("sizes: [17, 33, 65]", "sizes: [70000]"))
+            .unwrap_err();
+    assert_eq!(errors[0].path, "accepts[0].sizes[0]");
+
+    let errors = validate_interface_profile(
+        &INTERFACE.replace("sizes: [17, 33, 65]", "sizes: [256, 256, 256, 256]"),
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].path, "accepts[0].sizes");
+
+    let errors =
+        validate_interface_profile(&INTERFACE.replace("points_max: 256", "points_max: 70000"))
+            .unwrap_err();
+    assert_eq!(errors[0].path, "accepts[2].points_max");
+
+    validate_interface_profile(INTERFACE).expect("the shipped profile");
+}
+
+#[test]
+fn yaml_anchors_are_rejected_at_every_entry_point() {
+    let body = "id: a/b\nmake: A\nmodel: B\nexif_aliases: &names [B]\nkind: camera\ncapabilities: { in_camera_raw_conversion: true, jpeg_color_spaces: [srgb], heif: false }\nstatus: active\nmapping_status: provisional\n";
+    assert!(validate_body(body).is_err());
+
+    let schema = schema_with(
+        "      - key: n\n        type: int\n        range: [0, 4]\n        step: 1\n        default: &d 0\n",
+    );
+    assert!(validate_control_schema(&schema).is_err());
+
+    let profile = INTERFACE.replace("max_bytes: 2097152", "max_bytes: &limit 2097152");
+    assert!(validate_interface_profile(&profile).is_err());
+}
+
+#[test]
+fn a_collection_over_the_node_bound_is_rejected() {
+    let aliases: Vec<String> = (0..4100).map(|index| format!("a{index}")).collect();
+    let body = format!(
+        "id: a/b\nmake: A\nmodel: B\nexif_aliases: [{}]\nkind: camera\ncapabilities: {{ in_camera_raw_conversion: true, jpeg_color_spaces: [srgb], heif: false }}\nstatus: active\nmapping_status: provisional\n",
+        aliases.join(", ")
+    );
+    assert!(validate_body(&body).is_err());
+}
+
+#[test]
+fn a_mapping_applies_into_its_epoch_and_the_document_still_validates() {
+    let schema = include_str!("../../../data/bodies/fujifilm-x-t5.yaml");
+    let from: FirmwareVersion = "1.00".parse().expect("firmware");
+    let sim = NativeSim {
+        key: "reala_ace".try_into().expect("sim key"),
+        look: "reala-ace".try_into().expect("look"),
+        makernote: Makernote {
+            tag: "FilmMode".try_into().expect("tag"),
+            value: MakernoteValue(1792),
+        },
+    };
+    let updated = apply_sim_mapping(schema, 1, &from, None, &sim).expect("applied");
+    let parsed = validate_control_schema(&updated).expect("the updated document validates");
+    let reala = parsed.epochs[0]
+        .native_sims
+        .iter()
+        .find(|candidate| candidate.key.as_str() == "reala_ace")
+        .expect("the new sim");
+    assert_eq!(reala.look.as_str(), "reala-ace");
+    assert_eq!(reala.makernote.value, MakernoteValue(1792));
+    assert_eq!(parsed.epochs[0].native_sims.len(), 3);
+}
+
+#[test]
+fn a_mapping_for_another_firmware_range_is_rejected() {
+    let schema = include_str!("../../../data/bodies/fujifilm-x-t5.yaml");
+    let from: FirmwareVersion = "2.00".parse().expect("firmware");
+    let sim = NativeSim {
+        key: "reala_ace".try_into().expect("sim key"),
+        look: "reala-ace".try_into().expect("look"),
+        makernote: Makernote {
+            tag: "FilmMode".try_into().expect("tag"),
+            value: MakernoteValue(1792),
+        },
+    };
+    let errors = apply_sim_mapping(schema, 1, &from, None, &sim).unwrap_err();
+    assert_eq!(errors[0].path, "firmware_from");
+
+    let errors = apply_sim_mapping(schema, 9, &from, None, &sim).unwrap_err();
+    assert_eq!(errors[0].path, "epoch");
 }

@@ -30,6 +30,7 @@ looklab-schema = { workspace = true, features = ["fs"] }
 looklab-server.workspace = true
 looklab-trust.workspace = true
 looklab-upload.workspace = true
+looklab-worker.workspace = true
 postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true

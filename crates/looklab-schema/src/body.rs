@@ -73,6 +73,14 @@ pub enum MappingStatus {
     FixtureBacked,
 }
 
+impl Body {
+    pub fn matches_fixture(&self, make: &str, model: &str) -> bool {
+        self.make.trim().eq_ignore_ascii_case(make.trim())
+            && self.model.trim().eq_ignore_ascii_case(model.trim())
+    }
+}
+
 pub fn validate_body(yaml: &str) -> Result<Body, Vec<ValidationError>> {
+    crate::yaml::check(yaml)?;
     serde_norway::from_str(yaml).map_err(ValidationError::syntax)
 }

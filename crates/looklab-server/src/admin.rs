@@ -1643,12 +1643,30 @@ impl ModDecision {
     }
 }
 
+/// The snapshot an approval publishes, recorded in the approval's transaction.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Publication<'a> {
+    pub version: u64,
+    pub content_hash: &'a str,
+}
+
 pub async fn decide(
     db: &SqlitePool,
     moderator: &CredentialId,
     proposal: &ProposalId,
     decision: ModDecision,
     reason: &str,
+) -> Result<(), AdminError> {
+    decide_recording(db, moderator, proposal, decision, reason, None).await
+}
+
+pub(crate) async fn decide_recording(
+    db: &SqlitePool,
+    moderator: &CredentialId,
+    proposal: &ProposalId,
+    decision: ModDecision,
+    reason: &str,
+    publication: Option<Publication<'_>>,
 ) -> Result<(), AdminError> {
     let reason = normalize_reason(reason)?;
     let mut conn = begin_write(db).await?;
@@ -1684,6 +1702,19 @@ pub async fn decide(
             .bind(proposal.as_str())
             .execute(&mut *conn)
             .await?;
+        if let Some(publication) = publication {
+            let version = i64::try_from(publication.version).map_err(|_| AdminError::Corrupt)?;
+            sqlx::query(
+                "UPDATE proposals
+                 SET publication = 'pending', published_version = ?, published_hash = ?
+                 WHERE id = ?",
+            )
+            .bind(version)
+            .bind(publication.content_hash)
+            .bind(proposal.as_str())
+            .execute(&mut *conn)
+            .await?;
+        }
         let payload = json!({
             "event": "moderation_decision",
             "actor": moderator,

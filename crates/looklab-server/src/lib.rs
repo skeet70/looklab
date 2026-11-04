@@ -112,6 +112,9 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let config = Config::load(config_path.as_deref())?;
     let bind = config.bind;
     let state = Arc::new(AppState::new(config).await?);
+    if let Err(error) = proposals::publish_pending(&state).await {
+        tracing::warn!(%error, "a pending snapshot publication did not complete");
+    }
     let app = router(state);
     let listener = TcpListener::bind(bind).await?;
     tracing::info!("listening");

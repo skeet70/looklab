@@ -36,6 +36,7 @@ impl From<ProposalError> for ApiError {
             }
             ProposalError::UnknownProposal => ErrorCode::NotFound,
             ProposalError::Closed => ErrorCode::Conflict,
+            ProposalError::RoundTripTimeout => ErrorCode::RequestTimeout,
             ProposalError::RoundTrip(_) | ProposalError::Snapshot(_) => ErrorCode::SchemaInvalid,
         };
         Self::new(code)

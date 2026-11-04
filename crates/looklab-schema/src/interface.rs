@@ -4,7 +4,7 @@
 use serde::Deserialize;
 
 use crate::control::Range;
-use crate::error::ValidationError;
+use crate::error::{ErrorKind::InvalidValue, ValidationError};
 use crate::ids::{BodyId, InterfaceId};
 use crate::rational::Rational;
 
@@ -211,5 +211,90 @@ pub struct Limits {
 }
 
 pub fn validate_interface_profile(yaml: &str) -> Result<InterfaceProfile, Vec<ValidationError>> {
-    serde_norway::from_str(yaml).map_err(ValidationError::syntax)
+    crate::yaml::check(yaml)?;
+    let profile: InterfaceProfile =
+        serde_norway::from_str(yaml).map_err(ValidationError::syntax)?;
+    let mut errors = Vec::new();
+    validate_accepts(&profile.accepts, &mut errors);
+    if errors.is_empty() {
+        Ok(profile)
+    } else {
+        Err(errors)
+    }
+}
+
+/// Largest grid side the bake and the artifact readers accept.
+pub const MAX_LUT_SIDE: u32 = 256;
+
+/// Largest 3D LUT the bake allocates across every accepted grid side.
+pub const MAX_LUT_NODES: u64 = 1 << 22;
+
+const MAX_LUT_SIDES: usize = 4;
+const MAX_ACCEPTED_ARTIFACTS: usize = 8;
+const MAX_CURVE_POINTS: u32 = 65_536;
+
+fn validate_accepts(accepts: &[AcceptedArtifact], errors: &mut Vec<ValidationError>) {
+    if accepts.len() > MAX_ACCEPTED_ARTIFACTS {
+        errors.push(ValidationError::new(
+            "accepts",
+            InvalidValue {
+                expected: "at most 8 accepted artifacts",
+            },
+        ));
+    }
+    let mut nodes = 0u64;
+    for (index, accepted) in accepts.iter().enumerate() {
+        let path = format!("accepts[{index}]");
+        match accepted {
+            AcceptedArtifact::Lut3d(lut) => {
+                if lut.sizes.is_empty() {
+                    errors.push(ValidationError::new(
+                        format!("{path}.sizes"),
+                        InvalidValue {
+                            expected: "at least one grid side",
+                        },
+                    ));
+                }
+                if lut.sizes.len() > MAX_LUT_SIDES {
+                    errors.push(ValidationError::new(
+                        format!("{path}.sizes"),
+                        InvalidValue {
+                            expected: "at most 4 grid sides",
+                        },
+                    ));
+                }
+                for (side_index, side) in lut.sizes.iter().enumerate() {
+                    if (2..=MAX_LUT_SIDE).contains(side) {
+                        nodes += u64::from(*side).pow(3);
+                    } else {
+                        errors.push(ValidationError::new(
+                            format!("{path}.sizes[{side_index}]"),
+                            InvalidValue {
+                                expected: "a grid side from 2 to 256",
+                            },
+                        ));
+                    }
+                }
+                if nodes > MAX_LUT_NODES {
+                    errors.push(ValidationError::new(
+                        format!("{path}.sizes"),
+                        InvalidValue {
+                            expected: "3D LUTs under 4194304 nodes in total",
+                        },
+                    ));
+                }
+            }
+            AcceptedArtifact::Curve1d(curve) => {
+                if !(2..=MAX_CURVE_POINTS).contains(&curve.points_max) {
+                    errors.push(ValidationError::new(
+                        format!("{path}.points_max"),
+                        InvalidValue {
+                            expected: "between 2 and 65536 points",
+                        },
+                    ));
+                }
+            }
+            AcceptedArtifact::Matrix3x3(_) => {}
+        }
+    }
 }

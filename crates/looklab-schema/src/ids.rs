@@ -77,6 +77,19 @@ fn validate_generic(value: &str) -> Result<(), IdError> {
     Ok(())
 }
 
+pub const MAX_INTERFACE_ID_LEN: usize = 128;
+
+fn validate_interface_id(value: &str) -> Result<(), IdError> {
+    validate_generic(value)?;
+    if value.len() > MAX_INTERFACE_ID_LEN {
+        return Err(IdError::TooLong {
+            len: value.len(),
+            max: MAX_INTERFACE_ID_LEN,
+        });
+    }
+    Ok(())
+}
+
 macro_rules! id_type {
     ($(#[$meta:meta])* $name:ident) => {
         id_type!($(#[$meta])* $name, validate_generic);
@@ -151,7 +164,8 @@ id_type!(LookId);
 id_type!(ProposalRef);
 id_type!(
     /// Interface profile id, for example `example-firmware/sim-v1`.
-    InterfaceId
+    InterfaceId,
+    validate_interface_id
 );
 id_type!(ControlKey, validate_slug);
 id_type!(SimKey, validate_slug);

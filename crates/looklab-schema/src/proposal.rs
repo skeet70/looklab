@@ -7,18 +7,17 @@ use std::str::FromStr;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::body::{Body, validate_body};
+use crate::body::{Body, MappingStatus, validate_body};
 use crate::control::{Control, ControlType};
 use crate::error::{ErrorKind, ValidationError};
 use crate::ids::{BodyId, LookId, MakernoteTag, ProposalRef, SimKey};
 use crate::interface::{InterfaceProfile, validate_interface_profile};
 use crate::rational::Rational;
 use crate::schema::{
-    ControlSchema, FirmwareVersion, Makernote, MakernoteValue, validate_control_schema,
+    ControlSchema, FirmwareVersion, Makernote, MakernoteValue, NativeSim, validate_control_schema,
 };
 use crate::summary::{ProposalSummary, summarize};
 
-const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_NAME_CHARS: usize = 200;
 const MAX_ATTRIBUTION_CHARS: usize = 500;
 const MAX_JUSTIFICATION_CHARS: usize = 2000;
@@ -98,7 +97,7 @@ impl ProposalKind {
     pub const fn contributes_document(self) -> bool {
         matches!(
             self,
-            Self::Body | Self::SchemaChange | Self::InterfaceProfile
+            Self::Body | Self::SchemaChange | Self::Mapping | Self::InterfaceProfile
         )
     }
 }
@@ -166,14 +165,7 @@ pub fn validate_proposal(
     kind: ProposalKind,
     payload: &str,
 ) -> Result<ValidatedPayload, Vec<ValidationError>> {
-    if payload.len() > MAX_PAYLOAD_BYTES {
-        return Err(vec![ValidationError::new(
-            "",
-            ErrorKind::InvalidValue {
-                expected: "a payload under 256 KiB",
-            },
-        )]);
-    }
+    crate::yaml::check(payload)?;
     match kind {
         ProposalKind::Body => validate_body(payload).map(ValidatedPayload::Body),
         ProposalKind::SchemaChange => {
@@ -254,6 +246,21 @@ impl MappingProposal {
             Err(errors)
         }
     }
+
+    pub fn native_sim(&self) -> NativeSim {
+        NativeSim {
+            key: self.sim_key.clone(),
+            look: self.look.clone(),
+            makernote: self.makernote.clone(),
+        }
+    }
+}
+
+pub fn mapping_status_supported(body: &Body, fixtures: &[FixtureDonation]) -> bool {
+    body.mapping_status == MappingStatus::Provisional
+        || fixtures
+            .iter()
+            .any(|fixture| body.matches_fixture(&fixture.make, &fixture.model))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -533,6 +540,12 @@ impl FixtureDonation {
         match &self.source_url {
             Some(url) if !url.starts_with("https://") => {
                 errors.extend(invalid("source_url", "an https URL"));
+            }
+            None if !self.committed => {
+                errors.extend(invalid(
+                    "source_url",
+                    "an https URL for a fixture that is not committed",
+                ));
             }
             _ => {}
         }

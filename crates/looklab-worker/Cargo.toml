@@ -13,6 +13,31 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
+looklab-color.workspace = true
+looklab-fit.workspace = true
+looklab-meta.workspace = true
+looklab-model.workspace = true
+looklab-publish.workspace = true
+looklab-samples.workspace = true
+looklab-schema = { workspace = true, features = ["fs"] }
+looklab-server.workspace = true
+looklab-trust.workspace = true
+looklab-upload.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+looklab-fit = { workspace = true, features = ["synth"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true

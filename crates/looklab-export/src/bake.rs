@@ -15,7 +15,7 @@ use looklab_schema::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::artifact::{Artifact, Curve1d, Lut3d, Matrix3x3, Shaper1d};
+use crate::artifact::{Artifact, Curve1d, Lut3d, MAX_LUT_SIZE, Matrix3x3, Shaper1d};
 use crate::camera::InputTransform;
 use crate::cct::{BAKE_CCTS, CctK};
 use crate::downstream::DownstreamModel;
@@ -547,12 +547,13 @@ impl<'a> Baker<'a> {
                     .clamp(0.0, 1.0)
             })
         });
+        let capacity = lut_nodes(plan.size)?;
         let mut out = Vec::new();
         for cct in illuminant.ccts() {
             let camera = self.camera(insertion, cct)?;
             let mut lut = Lut3d {
                 size: plan.size,
-                data: Vec::with_capacity((plan.size as usize).pow(3)),
+                data: Vec::with_capacity(capacity),
                 shaper: shaper.clone(),
             };
             for b in 0..plan.size {
@@ -644,6 +645,14 @@ impl<'a> Baker<'a> {
 enum ArtifactKind {
     Matrix,
     Curve { per_channel: bool, points_max: u32 },
+}
+
+fn lut_nodes(side: u32) -> Result<usize> {
+    if !(2..=MAX_LUT_SIZE).contains(&side) {
+        return Err(ExportError::InvalidArtifact("grid side out of range"));
+    }
+    let nodes = u64::from(side).pow(3);
+    usize::try_from(nodes).map_err(|_| ExportError::InvalidArtifact("too many grid nodes"))
 }
 
 /// Least squares over the probe samples: `output = M · linear`.

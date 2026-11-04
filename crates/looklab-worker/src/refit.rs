@@ -1,0 +1,530 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use looklab_fit::{FitOptions, FitResult, fit};
+use looklab_model::{Density, Look, LookDocument, ProbeCovariance, ProbeId, UncertaintyData};
+use looklab_publish::{BodyUse, GateCheck, GateSummary, ProvenanceSummary};
+use looklab_server::admin::{self, ManifestArtifact};
+use looklab_trust::{
+    GateInput, GateReport, ReputationUpdate, TrustParams, VersionId, VersionProbes, gate_release,
+};
+use looklab_upload::{BodyId, LookSlug};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::SqlitePool;
+
+use crate::body::epoch_for;
+use crate::clock::{now_unix, rfc3339};
+use crate::config::WorkerConfig;
+use crate::db::{self, ContributionStatus, LookVersionStatus};
+use crate::error::{Result, WorkerError};
+use crate::pool::{self, LookPool};
+use crate::weights::{self, WeightedPool};
+
+pub const LOOK_ARTIFACT: &str = "look.looklab";
+pub const RELEASE_ARTIFACT: &str = "release.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredProbe {
+    pub id: ProbeId,
+    pub sigma: f64,
+    pub supported: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseRecord {
+    pub version: u32,
+    pub gauge: f64,
+    pub anchor: u32,
+    pub probes: Vec<StoredProbe>,
+    pub gate: GateReport,
+    pub provenance: ProvenanceSummary,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefitOutcome {
+    Published(u32),
+    Held(u32),
+    Skipped,
+}
+
+/// Single-body native stage: each body's Looks are refitted independently. A hierarchical
+/// fit replaces the outer body loop once bodies share a Look.
+pub async fn run(
+    db_pool: &SqlitePool,
+    config: &WorkerConfig,
+    bodies: &[BodyId],
+) -> Result<Vec<(BodyId, LookSlug, RefitOutcome)>> {
+    let explicit = !bodies.is_empty();
+    let targets: Vec<BodyId> = if explicit {
+        bodies.to_vec()
+    } else {
+        dirty_bodies(db_pool, config).await?
+    };
+
+    let mut outcomes = Vec::new();
+    for body in targets {
+        for look in pool::looks_for_body(db_pool, config, &body).await? {
+            let outcome = refit_look(db_pool, config, &body, &look).await?;
+            if outcome != RefitOutcome::Skipped {
+                outcomes.push((body.clone(), look, outcome));
+            }
+        }
+    }
+    Ok(outcomes)
+}
+
+async fn dirty_bodies(db_pool: &SqlitePool, config: &WorkerConfig) -> Result<Vec<BodyId>> {
+    let contributions = db::all_contributions(db_pool).await?;
+    let mut bodies: BTreeSet<BodyId> = contributions
+        .iter()
+        .filter(|contribution| contribution.status != ContributionStatus::Withdrawn)
+        .map(|contribution| contribution.body.clone())
+        .collect();
+    let mut dirty = Vec::new();
+    for body in std::mem::take(&mut bodies) {
+        for look in pool::looks_for_body(db_pool, config, &body).await? {
+            if is_dirty(db_pool, config, &body, &look).await? {
+                dirty.push(body);
+                break;
+            }
+        }
+    }
+    Ok(dirty)
+}
+
+async fn is_dirty(
+    db_pool: &SqlitePool,
+    config: &WorkerConfig,
+    body: &BodyId,
+    look: &LookSlug,
+) -> Result<bool> {
+    let pool = pool::build(db_pool, config, body, look).await?;
+    if pool.images.is_empty() {
+        return Ok(false);
+    }
+    let versions = db::look_versions(db_pool, look.as_str()).await?;
+    let latest = versions
+        .iter()
+        .filter(|version| {
+            matches!(
+                version.status,
+                LookVersionStatus::Published | LookVersionStatus::Rooted
+            )
+        })
+        .max_by_key(|version| version.version);
+    let Some(latest) = latest else {
+        return Ok(true);
+    };
+    let newest = pool
+        .images
+        .iter()
+        .map(|image| image.contribution.created_at)
+        .max()
+        .unwrap_or(0);
+    Ok(newest > latest.created_at)
+}
+
+async fn refit_look(
+    db_pool: &SqlitePool,
+    config: &WorkerConfig,
+    body: &BodyId,
+    look: &LookSlug,
+) -> Result<RefitOutcome> {
+    let pool = pool::build(db_pool, config, body, look).await?;
+    if pool.images.is_empty() {
+        return Ok(RefitOutcome::Skipped);
+    }
+    let params = TrustParams::default();
+    let weighted = weights::weigh(&pool, &params)?;
+    let contributors = weights::contributor_index(&pool);
+    let fit_images = weights::fit_images(&pool, &weighted, &contributors);
+    if fit_images.is_empty() {
+        return Ok(RefitOutcome::Skipped);
+    }
+
+    let versions = db::look_versions(db_pool, look.as_str()).await?;
+    let next_version = versions
+        .iter()
+        .map(|version| version.version)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| WorkerError::Data("version overflow".to_owned()))?;
+    if db::gate_failure_pending(db_pool, look.as_str(), next_version).await? {
+        return Ok(RefitOutcome::Held(next_version));
+    }
+
+    let options = FitOptions {
+        seed: config.seed,
+        max_samples_per_image: config.max_samples_per_image,
+        ..FitOptions::default()
+    };
+    let result = fit(&fit_images, &options)?;
+    let gauge = gauge(&pool, &weighted, &result);
+    let candidate_probes = candidate_probes(&result);
+
+    let published: Vec<_> = versions
+        .iter()
+        .filter(|version| {
+            matches!(
+                version.status,
+                LookVersionStatus::Published | LookVersionStatus::Rooted
+            )
+        })
+        .collect();
+    let previous = match published.iter().max_by_key(|version| version.version) {
+        Some(version) => Some(load_snapshot(db_pool, config, look, version.version).await?),
+        None => None,
+    };
+    let anchor = match published.iter().min_by_key(|version| version.version) {
+        Some(version) => Some(load_snapshot(db_pool, config, look, version.version).await?),
+        None => None,
+    };
+    let anchor_version = anchor
+        .as_ref()
+        .map(|snapshot| snapshot.record.version)
+        .unwrap_or(next_version);
+    let anchor_gauge = anchor.as_ref().map(|snapshot| snapshot.record.gauge);
+
+    let candidate = canonical_probes(
+        &result.look,
+        gauge,
+        anchor_gauge.unwrap_or(gauge),
+        &candidate_probes,
+    );
+    let previous_probes = match &previous {
+        Some(snapshot) => canonical_probes(
+            &snapshot.look,
+            snapshot.record.gauge,
+            anchor_gauge.unwrap_or(gauge),
+            &snapshot.record.probes,
+        ),
+        None => candidate.clone(),
+    };
+    let anchor_probes = match &anchor {
+        Some(snapshot) => canonical_probes(
+            &snapshot.look,
+            snapshot.record.gauge,
+            anchor_gauge.unwrap_or(gauge),
+            &snapshot.record.probes,
+        ),
+        None => candidate.clone(),
+    };
+
+    let gate = gate_release(
+        &params,
+        &GateInput {
+            candidate,
+            previous: previous_probes,
+            anchor: anchor_probes,
+            root_observations: Vec::new(),
+        },
+    );
+
+    let now = now_unix();
+    let provenance = provenance(&pool, &weighted, anchor_version, now)?;
+    if !gate.passed {
+        db::insert_gate_failure(
+            db_pool,
+            look.as_str(),
+            next_version,
+            &serde_json::to_string(&gate)?,
+            now,
+        )
+        .await?;
+        return Ok(RefitOutcome::Held(next_version));
+    }
+
+    let document = look_document(look, next_version, &result)?;
+    let release = ReleaseRecord {
+        version: next_version,
+        gauge,
+        anchor: anchor_version,
+        probes: candidate_probes,
+        gate: gate.clone(),
+        provenance: provenance.clone(),
+        created_at: now,
+    };
+    let artifacts = vec![
+        store_artifact(config, LOOK_ARTIFACT, &document)?,
+        store_artifact(config, RELEASE_ARTIFACT, &serde_json::to_vec(&release)?)?,
+    ];
+    admin::write_version_manifest(db_pool, look, VersionId::new(next_version), &artifacts, &[])
+        .await?;
+    update_reputation(db_pool, &pool, &previous, now).await?;
+    Ok(RefitOutcome::Published(next_version))
+}
+
+struct Snapshot {
+    look: Look,
+    record: ReleaseRecord,
+}
+
+async fn load_snapshot(
+    db_pool: &SqlitePool,
+    config: &WorkerConfig,
+    look: &LookSlug,
+    version: u32,
+) -> Result<Snapshot> {
+    let artifacts = db::manifest_artifacts(db_pool, look.as_str(), version)
+        .await?
+        .ok_or_else(|| WorkerError::Data(format!("{} {version} has no manifest", look)))?;
+    let document = read_artifact(config, &artifacts, LOOK_ARTIFACT)?;
+    let record = read_artifact(config, &artifacts, RELEASE_ARTIFACT)?;
+    Ok(Snapshot {
+        look: LookDocument::decode(&document)?.look,
+        record: serde_json::from_slice(&record)?,
+    })
+}
+
+fn read_artifact(
+    config: &WorkerConfig,
+    artifacts: &[ManifestArtifact],
+    name: &str,
+) -> Result<Vec<u8>> {
+    let artifact = artifacts
+        .iter()
+        .find(|artifact| artifact.name == name)
+        .ok_or_else(|| WorkerError::Data(format!("manifest has no `{name}` artifact")))?;
+    Ok(std::fs::read(config.blobs.join(&artifact.sha256))?)
+}
+
+fn store_artifact(config: &WorkerConfig, name: &str, bytes: &[u8]) -> Result<ManifestArtifact> {
+    let digest = Sha256::digest(bytes);
+    let sha256 = db::hex(&digest);
+    let path = config.blobs.join(&sha256);
+    if !path.exists() {
+        std::fs::write(&path, bytes)?;
+    }
+    Ok(ManifestArtifact {
+        name: name.to_owned(),
+        sha256,
+    })
+}
+
+fn look_document(look: &LookSlug, version: u32, result: &FitResult) -> Result<Vec<u8>> {
+    let identity = looklab_model::file::identity(look.as_str(), &format!("{version}.0.0"))?;
+    let mut document = LookDocument::from_look(identity, result.look.clone())?;
+    let mut covariance = Vec::with_capacity(result.probes.probes.len() * 9);
+    let mut density = Vec::with_capacity(result.probes.probes.len());
+    for probe in &result.probes.probes {
+        for row in &probe.covariance {
+            covariance.extend_from_slice(row);
+        }
+        density.push(probe.density);
+    }
+    document = document.with_uncertainty(UncertaintyData {
+        probe_cov: Some(ProbeCovariance::new(
+            result.probes.probes.len(),
+            covariance,
+        )?),
+        density: Some(Density::new(density)?),
+    })?;
+    Ok(document.encode()?)
+}
+
+fn candidate_probes(result: &FitResult) -> Vec<StoredProbe> {
+    result
+        .probes
+        .ids
+        .iter()
+        .zip(&result.probes.probes)
+        .map(|(id, probe)| StoredProbe {
+            id: id.clone(),
+            sigma: probe.sigma_de,
+            supported: probe.supported,
+        })
+        .collect()
+}
+
+fn canonical_probes(
+    look: &Look,
+    gauge: f64,
+    anchor_gauge: f64,
+    stored: &[StoredProbe],
+) -> VersionProbes {
+    let by_id: BTreeMap<&ProbeId, &StoredProbe> =
+        stored.iter().map(|probe| (&probe.id, probe)).collect();
+    let scale = 2.0_f64.powf(gauge - anchor_gauge);
+    let probes = looklab_model::probes::v1()
+        .probes
+        .into_iter()
+        .map(|probe| {
+            let stored = by_id.get(&probe.id);
+            looklab_trust::ProbeEstimate {
+                id: probe.id.clone(),
+                jab: look.eval(probe.xyz.scale(scale)).to_array(),
+                sigma: stored.map_or(1.0, |probe| probe.sigma),
+                supported: stored.is_none_or(|probe| probe.supported),
+            }
+        })
+        .collect();
+    VersionProbes { probes }
+}
+
+fn gauge(pool: &LookPool, weighted: &WeightedPool, result: &FitResult) -> f64 {
+    let mut offsets: Vec<f64> = weighted
+        .fit_entries(pool)
+        .into_iter()
+        .zip(&result.images)
+        .map(|((index, _weight), nuisances)| {
+            nuisances.exposure - f64::from(pool.images[index].samples.header().exposure_hint_ev)
+        })
+        .collect();
+    if offsets.is_empty() {
+        return 0.0;
+    }
+    offsets.sort_by(f64::total_cmp);
+    offsets[offsets.len() / 2]
+}
+
+fn provenance(
+    pool: &LookPool,
+    weighted: &WeightedPool,
+    anchor_version: u32,
+    now: i64,
+) -> Result<ProvenanceSummary> {
+    let mut prep_versions: Vec<u32> = pool
+        .images
+        .iter()
+        .map(|image| image.samples.header().prep_version.get())
+        .collect();
+    prep_versions.sort_unstable();
+    prep_versions.dedup();
+    let credentials: BTreeSet<String> = pool
+        .images
+        .iter()
+        .map(|image| image.credential.id.as_str().to_owned())
+        .collect();
+    let mut epochs: Vec<u32> = pool
+        .images
+        .iter()
+        .map(|image| {
+            epoch_for(&pool.resources.schema, &image.contribution.firmware).map(|epoch| epoch.id)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    epochs.sort_unstable();
+    epochs.dedup();
+    Ok(ProvenanceSummary {
+        bodies: vec![BodyUse {
+            body: pool.body.as_str().to_owned(),
+            epochs,
+            images: u32::try_from(weighted.fit_entries(pool).len()).unwrap_or(u32::MAX),
+            credentials: u32::try_from(credentials.len()).unwrap_or(u32::MAX),
+        }],
+        root_admissions: Vec::new(),
+        anchor_version: format!("{anchor_version}.0.0"),
+        community_snapshot_version: 0,
+        prep_versions,
+        created: rfc3339(now),
+        software: format!("looklab-worker {}", env!("CARGO_PKG_VERSION")),
+    })
+}
+
+pub fn gate_summary(report: &GateReport) -> GateSummary {
+    GateSummary {
+        checks: vec![
+            GateCheck {
+                name: "root_previous".to_owned(),
+                passed: report.root_previous.pass,
+                detail: None,
+            },
+            GateCheck {
+                name: "root_anchor".to_owned(),
+                passed: report.root_anchor.pass,
+                detail: None,
+            },
+            GateCheck {
+                name: "drift_previous".to_owned(),
+                passed: report.drift_previous.pass,
+                detail: None,
+            },
+            GateCheck {
+                name: "drift_anchor".to_owned(),
+                passed: report.drift_anchor.pass,
+                detail: None,
+            },
+            GateCheck {
+                name: "supported_regions".to_owned(),
+                passed: report.supported_regressions.is_empty(),
+                detail: None,
+            },
+        ],
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReputationCounts {
+    total: u32,
+    accepted: u32,
+    quarantined: u32,
+    passing_charts: u32,
+}
+
+async fn update_reputation(
+    db_pool: &SqlitePool,
+    pool: &LookPool,
+    previous: &Option<Snapshot>,
+    now: i64,
+) -> Result<()> {
+    let params = TrustParams::default();
+    let days = previous.as_ref().map_or(0.0, |snapshot| {
+        (now - snapshot.record.created_at).max(0) as f64 / 86_400.0
+    });
+    let mut counts: BTreeMap<String, ReputationCounts> = BTreeMap::new();
+    for id in pool.contribution_ids() {
+        let contribution = db::contribution(db_pool, &id).await?;
+        let statuses: Vec<String> =
+            sqlx::query_scalar("SELECT status FROM contribution_images WHERE contribution_id = ?")
+                .bind(id.as_str())
+                .fetch_all(db_pool)
+                .await?;
+        let entry = counts
+            .entry(contribution.credential.as_str().to_owned())
+            .or_default();
+        let mut all_accepted = !statuses.is_empty();
+        for status in &statuses {
+            entry.total += 1;
+            match db::ImageOutcome::parse(status) {
+                Some(db::ImageOutcome::Accepted) => entry.accepted += 1,
+                Some(db::ImageOutcome::DownWeighted) => all_accepted = false,
+                Some(db::ImageOutcome::Quarantined) => {
+                    entry.quarantined += 1;
+                    all_accepted = false;
+                }
+                None => all_accepted = false,
+            }
+        }
+        if contribution.kind == looklab_upload::ContributionKind::Chart && all_accepted {
+            entry.passing_charts += 1;
+        }
+    }
+    for (credential, counts) in counts {
+        if counts.total == 0 {
+            continue;
+        }
+        let id = looklab_server::CredentialId::try_from(credential.clone())
+            .map_err(|_| WorkerError::Data("credential id is not a UUID".to_owned()))?;
+        let row: Option<f64> =
+            sqlx::query_scalar("SELECT reputation FROM credentials WHERE id = ?")
+                .bind(id.as_str())
+                .fetch_optional(db_pool)
+                .await?;
+        let current = looklab_trust::Reputation::saturating(row.unwrap_or(0.5));
+        let updated = current.updated(
+            &params,
+            ReputationUpdate {
+                accepted_fraction: f64::from(counts.accepted) / f64::from(counts.total),
+                deliberate_quarantines: 0,
+                automatic_quarantines: counts.quarantined,
+                passing_chart_sessions: counts.passing_charts,
+                days_elapsed: days,
+            },
+        );
+        db::update_reputation(db_pool, &id, updated.value()).await?;
+    }
+    Ok(())
+}

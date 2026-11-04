@@ -210,3 +210,23 @@ fn a_coarse_dual_bake_flags_the_failing_endpoint() {
     );
     assert!(report.flagged(), "a 17^3 grid is too coarse for this look");
 }
+
+#[test]
+fn an_oversized_lut_side_is_refused_before_the_grid_is_allocated() {
+    let mut profile = profile("camera_rgb_wb_linear", "camera_native", "single");
+    profile.accepts = vec![looklab_schema::AcceptedArtifact::Lut3d(
+        looklab_schema::Lut3d {
+            sizes: vec![100_000],
+            interpolation: looklab_schema::Interpolation::Tetrahedral,
+            precision: looklab_schema::Precision::F16,
+            with_shaper: false,
+        },
+    )];
+    let error = Baker::new(&profile, &common::look(), &common::body())
+        .bake(BakeIlluminant::Single { cct: CctK::D65 })
+        .expect_err("an unbounded grid side");
+    assert!(matches!(
+        error,
+        looklab_export::ExportError::InvalidArtifact(_)
+    ));
+}

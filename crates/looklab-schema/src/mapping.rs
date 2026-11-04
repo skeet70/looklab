@@ -52,10 +52,22 @@ pub struct MappingInference {
 }
 
 impl MappingInference {
+    /// The one tag that separates the labels; `None` when none does or when
+    /// several do.
     pub fn best(&self) -> Option<&MappingCandidate> {
+        let mut consistent = self.consistent();
+        let first = consistent.next()?;
+        consistent.next().is_none().then_some(first)
+    }
+
+    pub fn consistent(&self) -> impl Iterator<Item = &MappingCandidate> {
         self.candidates
             .iter()
-            .find(|candidate| candidate.consistent)
+            .filter(|candidate| candidate.consistent)
+    }
+
+    pub fn is_ambiguous(&self) -> bool {
+        self.consistent().count() > 1
     }
 }
 
@@ -200,6 +212,24 @@ mod tests {
         let inference = infer_mapping(&files).expect("inference");
         assert!(inference.best().is_none());
         assert_eq!(inference.candidates[0].confidence, 0.5);
+    }
+
+    #[test]
+    fn two_consistent_tags_are_ambiguous_and_not_a_recommendation() {
+        let files = vec![
+            file(
+                "classic_chrome",
+                &[("FilmMode", 0x0700), ("ColorChromeEffect", 0x2)],
+            ),
+            file(
+                "provia",
+                &[("FilmMode", 0x0000), ("ColorChromeEffect", 0x0)],
+            ),
+        ];
+        let inference = infer_mapping(&files).expect("inference");
+        assert!(inference.is_ambiguous());
+        assert!(inference.best().is_none());
+        assert_eq!(inference.consistent().count(), 2);
     }
 
     #[test]

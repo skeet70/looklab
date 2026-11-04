@@ -36,7 +36,7 @@ There are **no user accounts**. Identity is a passkey credential ([05 §2](05-tr
   4. Splits are proposed (automatically, [02 §4.5](02-color-pipeline.md), or manually) and approved through moderation.
 
 ### ControlSchema
-YAML, versioned per epoch. The server store is the authority; `data/bodies/` holds exported snapshots. A body's control schema is `data/bodies/<slug>.yaml`; its Body entity is `data/bodies/<slug>.body.yaml`. Example (the makernote tags and values are **placeholders** that must be verified against fixtures):
+YAML, versioned per epoch. The server store is the authority; `data/bodies/` holds exported snapshots. A body's control schema is `data/bodies/<slug>.yaml`; its Body entity is `data/bodies/<slug>.body.yaml`. An approved mapping proposal inserts or replaces its `native_sims` entry in the epoch it names, and the updated schema is published in the next snapshot. Example (the makernote tags and values are **placeholders** that must be verified against fixtures):
 
 ```yaml
 body: fujifilm/x-t5
@@ -231,9 +231,10 @@ The model serializes as `crm.json`:
 ### AuditLogEntry, Job, CommunityDataSnapshot
 - `AuditLogEntry`: `seq` (autoincrement), `type`, `payload` (JSON text), `ts`. Append-only (no UPDATE/DELETE in application code). Published as a page and JSON ([05 §11](05-trust-and-integrity.md)).
 - `Job`: `id`, `kind`, `payload`, `status`, `attempts`, `run_after`, `locked_until`. The worker polls this table.
-- `CommunityDataSnapshot`: `version`, `content_hash`, export of approved bodies/schemas/interfaces.
-  A snapshot lives in `data/community/v<version>/` with `bodies/`, `interfaces/` and `snapshot.json` (`{version, content_hash}`);
-  the hash covers each file's relative path and bytes in path order, and `looklab validate-snapshot <dir>` checks both the files and the hash.
+- `CommunityDataSnapshot`: `version`, `content_hash`, export of approved bodies/schemas/interfaces plus the fixture consent list.
+  A snapshot lives in `data/community/v<version>/` with `bodies/`, `interfaces/`, `fixtures/manifest.toml` and `snapshot.json` (`{version, content_hash}`);
+  the hash covers each file's relative path and bytes in path order, and `looklab validate-snapshot <dir>` checks the files, the hash, each document's id against its path, and that every `fixture_backed` body has a manifest entry.
+- An approval records the version it publishes before the directory rename; a failed rename leaves a `pending` publication that the server retries rather than an approval without its export.
 
 ## 2. Samples: preparation and format
 
@@ -389,3 +390,5 @@ data/scenes/<name>.f16                   scene-linear D65 XYZ, little-endian hal
 **Canonical scenes** are scene-linear XYZ at the D65 white point, stored as `f16` triples with dimensions in `SceneIndex`. The sample site generates a neutral and hue gradient, a hue wheel, and skin, foliage and sky patches. Real photographic scenes replace them when project-owned releases exist.
 
 **Sample data.** `cargo run -p looklab-publish --example site_data` fits three synthetic Looks with `looklab-fit`'s `synth` feature, builds the bodies, scenes and audit log, and writes the tree above plus `site/site-root.txt` to `site/`. `trunk build --release` in `site/` then embeds the root digest and produces a site that renders with no server.
+
+`looklab publish --db <sqlite> --blobs <dir> --out site/data` writes the same tree from the server database: published Look versions and their manifested artifacts, body pages from `data/bodies/`, the release entries of the audit log, and `site/site-root.txt`.

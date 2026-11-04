@@ -192,12 +192,55 @@ fn donation() -> FixtureDonation {
         model: "X-T5".to_owned(),
         sha256: Sha256Hex::parse(&"ab".repeat(32)).expect("sha256"),
         size: 24_000_000,
-        source_url: None,
+        source_url: Some("https://example.com/fujifilm-x-t5-2.00.raf".to_owned()),
         donator: Some("a_handle".to_owned()),
         donated_on: Date::parse("2026-11-04").expect("date"),
         license: FixtureLicense::Cc0_1_0,
         committed: false,
     }
+}
+
+#[test]
+fn a_download_only_fixture_needs_a_source_url() {
+    let committed = FixtureDonation {
+        source_url: None,
+        committed: true,
+        ..donation()
+    };
+    committed
+        .validate()
+        .expect("a committed fixture needs no URL");
+    assert!(!fixture_manifest_toml(std::slice::from_ref(&committed)).contains("source_url"));
+
+    let download_only = FixtureDonation {
+        source_url: None,
+        ..donation()
+    };
+    let errors = download_only.validate().unwrap_err();
+    assert_eq!(errors[0].path, "source_url");
+}
+
+#[test]
+fn a_fixture_backed_body_needs_a_matching_donation() {
+    let body = looklab_schema::validate_body(BODY).expect("body");
+    assert!(looklab_schema::mapping_status_supported(&body, &[]));
+
+    let mut backed = body.clone();
+    backed.mapping_status = looklab_schema::MappingStatus::FixtureBacked;
+    assert!(!looklab_schema::mapping_status_supported(&backed, &[]));
+
+    let other = FixtureDonation {
+        model: "X-S10".to_owned(),
+        ..donation()
+    };
+    assert!(!looklab_schema::mapping_status_supported(
+        &backed,
+        std::slice::from_ref(&other)
+    ));
+    assert!(looklab_schema::mapping_status_supported(
+        &backed,
+        std::slice::from_ref(&donation())
+    ));
 }
 
 #[test]

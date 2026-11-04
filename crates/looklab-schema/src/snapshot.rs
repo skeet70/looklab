@@ -4,7 +4,39 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::ids::{BodyId, InterfaceId};
+
 pub const SNAPSHOT_MANIFEST: &str = "snapshot.json";
+
+/// The fixture consent list a snapshot carries.
+pub const FIXTURE_MANIFEST: &str = "fixtures/manifest.toml";
+
+pub fn body_export_path(id: &BodyId) -> String {
+    format!("bodies/{}.body.yaml", export_stem(id.as_str()))
+}
+
+pub fn schema_export_path(id: &BodyId) -> String {
+    format!("bodies/{}.yaml", export_stem(id.as_str()))
+}
+
+pub fn interface_export_path(id: &InterfaceId) -> String {
+    format!("interfaces/{}.yaml", export_stem(id.as_str()))
+}
+
+/// Encodes an identifier into one file-name component: every byte outside
+/// `[a-z0-9._-]` becomes `%XX`, so the mapping is injective.
+fn export_stem(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for byte in id.bytes() {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,26 +70,50 @@ mod dir {
 
     use std::fs;
     use std::io;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
+    use serde::Deserialize;
+
+    use crate::body::{MappingStatus, validate_body};
     use crate::error::{ErrorKind, ValidationError};
-    use crate::fs::{FileErrors, classified_yaml_files, validate_dir};
+    use crate::fs::{FileErrors, Kind, classified_yaml_files, classify, validate_dir};
+    use crate::interface::validate_interface_profile;
+    use crate::schema::validate_control_schema;
 
-    use super::{SNAPSHOT_MANIFEST, SnapshotManifest, content_hash};
+    use super::{
+        FIXTURE_MANIFEST, SNAPSHOT_MANIFEST, SnapshotManifest, body_export_path, content_hash,
+        interface_export_path, schema_export_path,
+    };
+
+    #[derive(Deserialize)]
+    struct FixtureManifest {
+        #[serde(default)]
+        fixture: Vec<FixtureEntry>,
+    }
+
+    #[derive(Deserialize)]
+    struct FixtureEntry {
+        make: String,
+        model: String,
+        #[serde(default)]
+        source_url: Option<String>,
+        #[serde(default)]
+        committed: bool,
+    }
 
     /// # Errors
     /// I/O failures while walking the snapshot.
     pub fn validate_snapshot_dir(root: &Path) -> io::Result<Vec<FileErrors>> {
         let mut failures = validate_dir(root)?;
         let paths = classified_yaml_files(root)?;
-        let mut files = Vec::with_capacity(paths.len());
+        let mut files = Vec::with_capacity(paths.len() + 1);
         for path in &paths {
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            files.push((relative, fs::read(path)?));
+            files.push((relative(root, path), fs::read(path)?));
+        }
+        check_ownership(root, &paths, &mut failures)?;
+        check_fixtures(root, &paths, &mut failures)?;
+        if let Ok(bytes) = fs::read(root.join(FIXTURE_MANIFEST)) {
+            files.push((FIXTURE_MANIFEST.to_owned(), bytes));
         }
         let manifest = match fs::read_to_string(root.join(SNAPSHOT_MANIFEST)) {
             Ok(text) => match serde_json::from_str::<SnapshotManifest>(&text) {
@@ -86,6 +142,155 @@ mod dir {
             });
         }
         Ok(failures)
+    }
+
+    fn relative(root: &Path, path: &Path) -> String {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    fn check_ownership(
+        root: &Path,
+        paths: &[PathBuf],
+        failures: &mut Vec<FileErrors>,
+    ) -> io::Result<()> {
+        for path in paths {
+            let text = fs::read_to_string(path)?;
+            let declared = match classify(path) {
+                Some(Kind::Body) => validate_body(&text)
+                    .ok()
+                    .map(|body| body_export_path(&body.id)),
+                Some(Kind::Schema) => validate_control_schema(&text)
+                    .ok()
+                    .map(|schema| schema_export_path(&schema.body)),
+                Some(Kind::Interface) => validate_interface_profile(&text)
+                    .ok()
+                    .map(|profile| interface_export_path(&profile.id)),
+                None => None,
+            };
+            let Some(expected) = declared else {
+                continue;
+            };
+            let actual = relative(root, path);
+            if expected != actual {
+                failures.push(FileErrors {
+                    file: path.clone(),
+                    errors: vec![ValidationError::new(
+                        "",
+                        ErrorKind::DocumentOwner {
+                            declared: expected,
+                            path: actual,
+                        },
+                    )],
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_fixtures(
+        root: &Path,
+        paths: &[PathBuf],
+        failures: &mut Vec<FileErrors>,
+    ) -> io::Result<()> {
+        let manifest_path = root.join(FIXTURE_MANIFEST);
+        let entries = match fs::read_to_string(&manifest_path) {
+            Ok(text) => match toml::from_str::<FixtureManifest>(&text) {
+                Ok(manifest) => {
+                    let errors = fixture_entry_errors(&manifest);
+                    if !errors.is_empty() {
+                        failures.push(FileErrors {
+                            file: PathBuf::from(FIXTURE_MANIFEST),
+                            errors,
+                        });
+                    }
+                    Some(manifest)
+                }
+                Err(error) => {
+                    failures.push(fixture_error(format!("not valid TOML: {error}")));
+                    None
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                failures.push(fixture_error(format!("unreadable: {error}")));
+                None
+            }
+        };
+        for path in paths {
+            if !matches!(classify(path), Some(Kind::Body)) {
+                continue;
+            }
+            let text = fs::read_to_string(path)?;
+            let Ok(body) = validate_body(&text) else {
+                continue;
+            };
+            if body.mapping_status == MappingStatus::Provisional {
+                continue;
+            }
+            let covered = entries.as_ref().is_some_and(|manifest| {
+                manifest
+                    .fixture
+                    .iter()
+                    .any(|fixture| body.matches_fixture(&fixture.make, &fixture.model))
+            });
+            if !covered {
+                failures.push(FileErrors {
+                    file: path.clone(),
+                    errors: vec![ValidationError::new(
+                        "mapping_status",
+                        ErrorKind::FixtureEvidenceMissing {
+                            entity: body.id.to_string(),
+                        },
+                    )],
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn fixture_entry_errors(manifest: &FixtureManifest) -> Vec<ValidationError> {
+        let mut errors = Vec::new();
+        for (index, entry) in manifest.fixture.iter().enumerate() {
+            if entry.make.trim().is_empty() || entry.model.trim().is_empty() {
+                errors.push(fixture_entry_error(
+                    index,
+                    "make and model, so the fixture names a body",
+                ));
+            }
+            match &entry.source_url {
+                Some(url) if !entry.committed && !url.starts_with("https://") => {
+                    errors.push(fixture_entry_error(index, "an https source URL"));
+                }
+                None if !entry.committed => {
+                    errors.push(fixture_entry_error(
+                        index,
+                        "a source URL for a fixture that is not committed",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        errors
+    }
+
+    fn fixture_entry_error(index: usize, detail: &'static str) -> ValidationError {
+        ValidationError::new(
+            format!("fixture[{index}]"),
+            ErrorKind::FixtureManifest(detail.to_owned()),
+        )
+    }
+
+    fn fixture_error(message: String) -> FileErrors {
+        FileErrors {
+            file: PathBuf::from(FIXTURE_MANIFEST),
+            errors: vec![ValidationError::new(
+                "",
+                ErrorKind::FixtureManifest(message),
+            )],
+        }
     }
 
     fn manifest_error(message: String) -> FileErrors {

@@ -3,19 +3,22 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::time::Duration;
 
 use looklab_color::Mat3;
 use looklab_export::{BakeIlluminant, Baker, CctK, InputTransform, ValidationReport, validate};
 use looklab_model::Look;
 use looklab_model::probes;
 use looklab_schema::{
-    Evidence, FixtureDonation, LabeledTag, ProposalKind, ProposalStatus, ProposalView,
-    SNAPSHOT_MANIFEST, SnapshotManifest, ValidatedPayload, content_hash, fixture_manifest_toml,
-    validate_confirmation, validate_proposal,
+    AcceptedArtifact, Evidence, FIXTURE_MANIFEST, FixtureDonation, LabeledTag, ProposalKind,
+    ProposalStatus, ProposalView, SNAPSHOT_MANIFEST, SnapshotManifest, ValidatedPayload,
+    apply_sim_mapping, body_export_path, content_hash, fixture_manifest_toml,
+    interface_export_path, mapping_status_supported, schema_export_path, validate_confirmation,
+    validate_proposal,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
+use tokio::sync::Mutex;
 
 use crate::admin::{self, AdminError, ModDecision};
 use crate::db::now_unix;
@@ -24,8 +27,11 @@ use crate::state::AppState;
 
 const MAX_MESSAGE_CHARS: usize = 2000;
 const SNAPSHOT_MANIFEST_MAX_BYTES: u64 = 4096;
+const MAX_EXPORT_NAME_BYTES: usize = 200;
+const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_ROUND_TRIP_LUT_NODES: u64 = 2_000_000;
 
-static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
+static SNAPSHOT_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProposalError {
@@ -43,6 +49,8 @@ pub enum ProposalError {
     Closed,
     #[error("the interface profile cannot be baked: {0}")]
     RoundTrip(String),
+    #[error("the round-trip simulation timed out")]
+    RoundTripTimeout,
     #[error("snapshot: {0}")]
     Snapshot(String),
     #[error("the stored record is not readable")]
@@ -128,6 +136,21 @@ pub fn round_trip_report(payload: &str) -> Result<RoundTripReport, ProposalError
     };
     let look = Look::colorimetric();
     let transform = ReferenceTransform(Mat3::IDENTITY);
+    let nodes: u64 = profile
+        .accepts
+        .iter()
+        .filter_map(|accepted| match accepted {
+            AcceptedArtifact::Lut3d(lut) => Some(lut),
+            AcceptedArtifact::Matrix3x3(_) | AcceptedArtifact::Curve1d(_) => None,
+        })
+        .flat_map(|lut| lut.sizes.iter())
+        .map(|side| u64::from(*side).pow(3))
+        .sum();
+    if nodes > MAX_ROUND_TRIP_LUT_NODES {
+        return Err(ProposalError::RoundTrip(
+            "the profile's LUT grids exceed the simulation's node budget".to_owned(),
+        ));
+    }
     let illuminant = match profile.insertion.illuminant_handling {
         looklab_schema::IlluminantHandling::Single => BakeIlluminant::Single { cct: CctK::D65 },
         looklab_schema::IlluminantHandling::DualInterpolated => BakeIlluminant::DualInterpolated,
@@ -148,6 +171,14 @@ fn join_errors(errors: &[looklab_schema::ValidationError]) -> String {
         .join("; ")
 }
 
+async fn round_trip(payload: String) -> Result<RoundTripReport, ProposalError> {
+    let task = tokio::task::spawn_blocking(move || round_trip_report(&payload));
+    match tokio::time::timeout(ROUND_TRIP_TIMEOUT, task).await {
+        Ok(joined) => joined.map_err(|_| ProposalError::Corrupt)?,
+        Err(_) => Err(ProposalError::RoundTripTimeout),
+    }
+}
+
 pub async fn submit(
     db: &SqlitePool,
     credential: &CredentialId,
@@ -160,6 +191,13 @@ pub async fn submit(
             .validate()
             .map_err(|errors| ProposalError::InvalidFixture(join_errors(&errors)))?;
     }
+    if let ValidatedPayload::Body(body) = &validated
+        && !mapping_status_supported(body, &submission.fixtures)
+    {
+        return Err(ProposalError::InvalidPayload(
+            "mapping_status: a fixture-backed body needs a fixture donation for it".to_owned(),
+        ));
+    }
     let summary = validated.summary();
     let evidence: Vec<Evidence> = submission
         .fixtures
@@ -169,7 +207,9 @@ pub async fn submit(
         })
         .collect();
     let round_trip = match &validated {
-        ValidatedPayload::InterfaceProfile(_) => Some(round_trip_report(&submission.payload)?),
+        ValidatedPayload::InterfaceProfile(_) => {
+            Some(round_trip(submission.payload.clone()).await?)
+        }
         _ => None,
     };
     let evidence_json = serde_json::to_string(&evidence).map_err(|_| ProposalError::Corrupt)?;
@@ -434,6 +474,10 @@ pub async fn moderator_view(
 }
 
 pub async fn fixture_manifest(db: &SqlitePool) -> Result<String, ProposalError> {
+    Ok(fixture_manifest_toml(&approved_donations(db).await?))
+}
+
+async fn approved_donations(db: &SqlitePool) -> Result<Vec<FixtureDonation>, ProposalError> {
     let rows = sqlx::query(
         "SELECT evidence FROM proposals WHERE status = 'approved' ORDER BY created_at, id",
     )
@@ -444,13 +488,19 @@ pub async fn fixture_manifest(db: &SqlitePool) -> Result<String, ProposalError> 
         let evidence: Vec<Evidence> =
             serde_json::from_str(row.get::<String, _>("evidence").as_str())
                 .map_err(|_| ProposalError::Corrupt)?;
-        for item in evidence {
-            if let Evidence::Fixture { donation } = item {
-                donations.push(donation);
-            }
-        }
+        donations.extend(evidence_donations(&evidence));
     }
-    Ok(fixture_manifest_toml(&donations))
+    Ok(donations)
+}
+
+fn evidence_donations(evidence: &[Evidence]) -> Vec<FixtureDonation> {
+    evidence
+        .iter()
+        .filter_map(|item| match item {
+            Evidence::Fixture { donation } => Some(donation.clone()),
+            Evidence::Confirmation { .. } | Evidence::Worker { .. } => None,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -460,6 +510,24 @@ pub struct SnapshotRecord {
     pub files: usize,
 }
 
+struct PreparedSnapshot {
+    version: u64,
+    content_hash: String,
+    files: usize,
+    staging: PathBuf,
+    target: PathBuf,
+}
+
+impl PreparedSnapshot {
+    fn record(&self) -> SnapshotRecord {
+        SnapshotRecord {
+            version: self.version,
+            content_hash: self.content_hash.clone(),
+            files: self.files,
+        }
+    }
+}
+
 pub async fn record_decision(
     state: &AppState,
     moderator: &CredentialId,
@@ -467,44 +535,125 @@ pub async fn record_decision(
     decision: ModDecision,
     reason: &str,
 ) -> Result<Option<SnapshotRecord>, ProposalError> {
-    let row: Option<(String, String)> =
-        sqlx::query_as("SELECT type, payload FROM proposals WHERE id = ?")
+    let row: Option<(String, String, String)> =
+        sqlx::query_as("SELECT type, payload, evidence FROM proposals WHERE id = ?")
             .bind(proposal.as_str())
             .fetch_optional(&state.db)
             .await?;
-    let Some((kind, payload)) = row else {
+    let Some((kind, payload, evidence)) = row else {
         return Err(ProposalError::UnknownProposal);
     };
     let kind = kind
         .parse::<ProposalKind>()
         .map_err(|_| ProposalError::Corrupt)?;
-    if decision != ModDecision::Approve {
+    if decision != ModDecision::Approve || !kind.contributes_document() {
         admin::decide(&state.db, moderator, proposal, decision, reason).await?;
         return Ok(None);
     }
-    if !kind.contributes_document() {
-        admin::decide(&state.db, moderator, proposal, decision, reason).await?;
-        return Ok(None);
-    }
-    validate_proposal(kind, &payload)
-        .map_err(|errors| ProposalError::InvalidPayload(join_errors(&errors)))?;
-    admin::decide(&state.db, moderator, proposal, decision, reason).await?;
-    write_snapshot(&state.config.snapshot_dir, kind, &payload).map(Some)
+    let evidence: Vec<Evidence> =
+        serde_json::from_str(&evidence).map_err(|_| ProposalError::Corrupt)?;
+    let _guard = SNAPSHOT_LOCK.lock().await;
+    publish_pending_locked(state).await?;
+    let prepared = prepare_snapshot(state, kind, &payload, &evidence_donations(&evidence)).await?;
+    admin::decide_recording(
+        &state.db,
+        moderator,
+        proposal,
+        decision,
+        reason,
+        Some(admin::Publication {
+            version: prepared.version,
+            content_hash: &prepared.content_hash,
+        }),
+    )
+    .await?;
+    publish_prepared(state, proposal, &prepared).await?;
+    Ok(Some(prepared.record()))
 }
 
-fn write_snapshot(
-    dir: &Path,
+/// # Errors
+/// A pending publication that cannot be reproduced, or a filesystem failure.
+pub(crate) async fn publish_pending(state: &AppState) -> Result<(), ProposalError> {
+    let _guard = SNAPSHOT_LOCK.lock().await;
+    publish_pending_locked(state).await
+}
+
+async fn publish_pending_locked(state: &AppState) -> Result<(), ProposalError> {
+    loop {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, type FROM proposals WHERE publication = 'pending'
+             ORDER BY published_version, created_at LIMIT 1",
+        )
+        .fetch_optional(&state.db)
+        .await?;
+        let Some((id, kind)) = row else {
+            return Ok(());
+        };
+        let proposal = ProposalId::try_from(id).map_err(|_| ProposalError::Corrupt)?;
+        let kind = kind
+            .parse::<ProposalKind>()
+            .map_err(|_| ProposalError::Corrupt)?;
+        let (payload, evidence, version, hash): (String, String, i64, String) = sqlx::query_as(
+            "SELECT payload, evidence, published_version, published_hash
+             FROM proposals WHERE id = ?",
+        )
+        .bind(proposal.as_str())
+        .fetch_one(&state.db)
+        .await?;
+        let evidence: Vec<Evidence> =
+            serde_json::from_str(&evidence).map_err(|_| ProposalError::Corrupt)?;
+        let prepared =
+            prepare_snapshot(state, kind, &payload, &evidence_donations(&evidence)).await?;
+        if i64::try_from(prepared.version).ok() != Some(version) || prepared.content_hash != hash {
+            return Err(ProposalError::Snapshot(
+                "a pending publication cannot be reproduced".to_owned(),
+            ));
+        }
+        publish_prepared(state, &proposal, &prepared).await?;
+    }
+}
+
+async fn publish_prepared(
+    state: &AppState,
+    proposal: &ProposalId,
+    prepared: &PreparedSnapshot,
+) -> Result<(), ProposalError> {
+    std::fs::rename(&prepared.staging, &prepared.target)
+        .map_err(|error| ProposalError::Snapshot(error.to_string()))?;
+    sqlx::query("UPDATE proposals SET publication = 'published' WHERE id = ?")
+        .bind(proposal.as_str())
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+async fn prepare_snapshot(
+    state: &AppState,
     kind: ProposalKind,
     payload: &str,
-) -> Result<SnapshotRecord, ProposalError> {
+    extra: &[FixtureDonation],
+) -> Result<PreparedSnapshot, ProposalError> {
     let validated = validate_proposal(kind, payload)
         .map_err(|errors| ProposalError::InvalidPayload(join_errors(&errors)))?;
-    let (path, bytes) = document(&validated, payload)?;
-    let _guard = SNAPSHOT_LOCK
-        .lock()
-        .map_err(|_| ProposalError::Snapshot("the snapshot lock is poisoned".to_owned()))?;
+    if let ValidatedPayload::Body(body) = &validated
+        && !mapping_status_supported(body, extra)
+    {
+        return Err(ProposalError::InvalidPayload(
+            "mapping_status: a fixture-backed body needs a fixture donation for it".to_owned(),
+        ));
+    }
+    let dir = &state.config.snapshot_dir;
     let (previous_version, mut documents) = previous_snapshot(dir)?;
-    documents.insert(path, bytes);
+    for (path, bytes) in documents_for(state, &validated, payload, &documents)? {
+        documents.insert(path, bytes);
+    }
+    let mut donations = approved_donations(&state.db).await?;
+    donations.extend(extra.iter().cloned());
+    dedupe_donations(&mut donations);
+    documents.insert(
+        FIXTURE_MANIFEST.to_owned(),
+        fixture_manifest_toml(&donations).into_bytes(),
+    );
     let version = previous_version + 1;
     let staging = dir.join(format!("v{version}.tmp"));
     let target = dir.join(format!("v{version}"));
@@ -512,6 +661,17 @@ fn write_snapshot(
         std::fs::remove_dir_all(&staging)
             .map_err(|error| ProposalError::Snapshot(error.to_string()))?;
     }
+    let files: Vec<(String, Vec<u8>)> = documents
+        .iter()
+        .map(|(path, bytes)| (path.clone(), bytes.clone()))
+        .collect();
+    let manifest = SnapshotManifest {
+        version,
+        content_hash: content_hash(&files),
+    };
+    let manifest_json = serde_json::to_string(&manifest).map_err(|_| ProposalError::Corrupt)?;
+    std::fs::create_dir_all(&staging)
+        .map_err(|error| ProposalError::Snapshot(error.to_string()))?;
     for (relative, bytes) in &documents {
         let file = staging.join(relative);
         if let Some(parent) = file.parent() {
@@ -520,7 +680,9 @@ fn write_snapshot(
         }
         std::fs::write(&file, bytes).map_err(|error| ProposalError::Snapshot(error.to_string()))?;
     }
-    let failures = looklab_schema::validate_dir(&staging)
+    std::fs::write(staging.join(SNAPSHOT_MANIFEST), manifest_json)
+        .map_err(|error| ProposalError::Snapshot(error.to_string()))?;
+    let failures = looklab_schema::validate_snapshot_dir(&staging)
         .map_err(|error| ProposalError::Snapshot(error.to_string()))?;
     if !failures.is_empty() {
         let _ = std::fs::remove_dir_all(&staging);
@@ -528,44 +690,94 @@ fn write_snapshot(
             "the approved documents do not validate: {failures:?}"
         )));
     }
-    let files: Vec<(String, Vec<u8>)> = documents.into_iter().collect();
-    let manifest = SnapshotManifest {
-        version,
-        content_hash: content_hash(&files),
-    };
-    let manifest_json = serde_json::to_string(&manifest).map_err(|_| ProposalError::Corrupt)?;
-    std::fs::write(staging.join(SNAPSHOT_MANIFEST), manifest_json)
-        .map_err(|error| ProposalError::Snapshot(error.to_string()))?;
-    std::fs::rename(&staging, &target)
-        .map_err(|error| ProposalError::Snapshot(error.to_string()))?;
-    Ok(SnapshotRecord {
+    Ok(PreparedSnapshot {
         version,
         content_hash: manifest.content_hash,
         files: files.len(),
+        staging,
+        target,
     })
 }
 
-fn document(
+fn dedupe_donations(donations: &mut Vec<FixtureDonation>) {
+    let mut seen = std::collections::HashSet::new();
+    donations.retain(|donation| seen.insert((donation.file.clone(), donation.sha256.to_string())));
+}
+
+fn documents_for(
+    state: &AppState,
     validated: &ValidatedPayload,
     payload: &str,
-) -> Result<(String, Vec<u8>), ProposalError> {
-    let relative = match validated {
-        ValidatedPayload::Body(body) => {
-            format!("bodies/{}.body.yaml", body.id.as_str().replace('/', "-"))
+    base: &BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<(String, Vec<u8>)>, ProposalError> {
+    let document = match validated {
+        ValidatedPayload::Body(body) => vec![(
+            export_name(body_export_path(&body.id))?,
+            payload.as_bytes().to_vec(),
+        )],
+        ValidatedPayload::SchemaChange(schema) => vec![(
+            export_name(schema_export_path(&schema.body))?,
+            payload.as_bytes().to_vec(),
+        )],
+        ValidatedPayload::InterfaceProfile(profile) => vec![(
+            export_name(interface_export_path(&profile.id))?,
+            payload.as_bytes().to_vec(),
+        )],
+        ValidatedPayload::Mapping(mapping) => {
+            let path = export_name(schema_export_path(&mapping.body))?;
+            let schema = match base.get(&path) {
+                Some(bytes) => {
+                    String::from_utf8(bytes.clone()).map_err(|_| ProposalError::Corrupt)?
+                }
+                None => {
+                    let file = state
+                        .config
+                        .bodies_dir
+                        .join(format!("{}.yaml", mapping.body.as_str().replace('/', "-")));
+                    let text = std::fs::read_to_string(&file).map_err(|_| {
+                        ProposalError::Snapshot(format!("no control schema for {}", mapping.body))
+                    })?;
+                    let shipped = looklab_schema::validate_control_schema(&text)
+                        .map_err(|errors| ProposalError::InvalidPayload(join_errors(&errors)))?;
+                    if shipped.body != mapping.body {
+                        return Err(ProposalError::Snapshot(format!(
+                            "{} belongs to another body",
+                            file.display()
+                        )));
+                    }
+                    text
+                }
+            };
+            let updated = apply_sim_mapping(
+                &schema,
+                mapping.epoch,
+                &mapping.firmware_from,
+                mapping.firmware_to.as_ref(),
+                &mapping.native_sim(),
+            )
+            .map_err(|errors| ProposalError::InvalidPayload(join_errors(&errors)))?;
+            vec![(path, updated.into_bytes())]
         }
-        ValidatedPayload::SchemaChange(schema) => {
-            format!("bodies/{}.yaml", schema.body.as_str().replace('/', "-"))
-        }
-        ValidatedPayload::InterfaceProfile(profile) => {
-            format!("interfaces/{}.yaml", profile.id.as_str().replace('/', "-"))
-        }
-        _ => {
+        ValidatedPayload::LutLook(_)
+        | ValidatedPayload::EpochSplit(_)
+        | ValidatedPayload::LookSplit(_)
+        | ValidatedPayload::GateOverride(_) => {
             return Err(ProposalError::Snapshot(
                 "this proposal kind has no document".to_owned(),
             ));
         }
     };
-    Ok((relative, payload.as_bytes().to_vec()))
+    Ok(document)
+}
+
+fn export_name(path: String) -> Result<String, ProposalError> {
+    let name = path.rsplit('/').next().unwrap_or(&path);
+    if name.len() > MAX_EXPORT_NAME_BYTES {
+        return Err(ProposalError::Snapshot(
+            "the export file name is too long".to_owned(),
+        ));
+    }
+    Ok(path)
 }
 
 fn previous_snapshot(dir: &Path) -> Result<(u64, BTreeMap<String, Vec<u8>>), ProposalError> {
@@ -613,6 +825,9 @@ fn previous_snapshot(dir: &Path) -> Result<(u64, BTreeMap<String, Vec<u8>>), Pro
     for sub in ["bodies", "interfaces"] {
         collect_documents(&path.join(sub), sub, &mut documents)?;
     }
+    if let Ok(bytes) = std::fs::read(path.join(FIXTURE_MANIFEST)) {
+        documents.insert(FIXTURE_MANIFEST.to_owned(), bytes);
+    }
     let files: Vec<(String, Vec<u8>)> = documents
         .iter()
         .map(|(path, bytes)| (path.clone(), bytes.clone()))
@@ -621,6 +836,13 @@ fn previous_snapshot(dir: &Path) -> Result<(u64, BTreeMap<String, Vec<u8>>), Pro
         return Err(ProposalError::Snapshot(
             "the previous snapshot does not match its content hash".to_owned(),
         ));
+    }
+    let failures = looklab_schema::validate_snapshot_dir(&path)
+        .map_err(|error| ProposalError::Snapshot(error.to_string()))?;
+    if !failures.is_empty() {
+        return Err(ProposalError::Snapshot(format!(
+            "the previous snapshot does not validate: {failures:?}"
+        )));
     }
     Ok((version, documents))
 }

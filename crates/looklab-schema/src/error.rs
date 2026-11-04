@@ -7,6 +7,8 @@ use crate::control::ControlType;
 pub enum ErrorKind {
     #[error("YAML: {0}")]
     Syntax(String),
+    #[error("YAML document rejected: {0}")]
+    YamlRejected(String),
     #[error("missing `{field}`")]
     MissingField { field: &'static str },
     #[error("expected {expected}")]
@@ -48,6 +50,12 @@ pub enum ErrorKind {
     SnapshotManifest(String),
     #[error("snapshot content hash is {found}, the manifest declares {declared}")]
     SnapshotHashMismatch { declared: String, found: String },
+    #[error("the document declares `{declared}`, which does not match its path `{path}`")]
+    DocumentOwner { declared: String, path: String },
+    #[error("`fixture_backed` needs a fixture donation for {entity}")]
+    FixtureEvidenceMissing { entity: String },
+    #[error("the fixture manifest is invalid: {0}")]
+    FixtureManifest(String),
 }
 
 /// A rule violation at a YAML path such as `epochs[0].controls[3].default`.

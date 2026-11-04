@@ -10,6 +10,7 @@ mod export;
 mod fit;
 mod match_cmd;
 mod prep;
+mod publish;
 mod report;
 mod synth;
 mod util;
@@ -58,6 +59,8 @@ pub enum Command {
     Match(match_cmd::MatchArgs),
     /// Run one verification-loop iteration from observed re-renders.
     Verify(match_cmd::VerifyArgs),
+    /// Render the static site from the server database.
+    Publish(publish::PublishArgs),
 }
 
 pub fn run() -> Result<()> {
@@ -78,6 +81,7 @@ pub fn run_with(cli: Cli) -> Result<()> {
         Command::VerifyPayload(args) => verify_payload::run(&args),
         Command::Match(args) => match_cmd::run_match(&args),
         Command::Verify(args) => match_cmd::run_verify(&args),
+        Command::Publish(args) => publish::run(&args),
     }
 }
 
