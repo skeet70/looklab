@@ -149,6 +149,18 @@ pub async fn issue_nonce(
         .bind(now - 3600)
         .execute(db)
         .await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nonces")
+        .fetch_one(db)
+        .await?;
+    if count >= 10_000 {
+        sqlx::query(
+            "DELETE FROM nonces WHERE nonce IN
+             (SELECT nonce FROM nonces ORDER BY issued_at ASC LIMIT ?)",
+        )
+        .bind(count - 9_000)
+        .execute(db)
+        .await?;
+    }
     sqlx::query("INSERT INTO nonces (nonce, issued_at, expires_at) VALUES (?, ?, ?)")
         .bind(hex(nonce.as_bytes()))
         .bind(now)
@@ -212,6 +224,14 @@ pub async fn find_credential(
         passkey,
         standing,
     }))
+}
+
+pub async fn credential_exists(db: &SqlitePool, raw_id: &[u8]) -> Result<bool, sqlx::Error> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credentials WHERE credential_id = ?")
+        .bind(raw_id)
+        .fetch_one(db)
+        .await?;
+    Ok(count > 0)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -306,6 +326,31 @@ pub async fn insert_credential(
     Ok(())
 }
 
+pub async fn update_credential_passkey_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    credential_id: &CredentialId,
+    passkey: &Passkey,
+) -> Result<(), sqlx::Error> {
+    let passkey_json = serde_json::to_string(passkey)
+        .map_err(|_| sqlx::Error::Protocol("passkey does not serialize".to_owned()))?;
+    sqlx::query("UPDATE credentials SET webauthn_credential = ? WHERE id = ?")
+        .bind(passkey_json)
+        .bind(credential_id.as_str())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+pub async fn update_credential_passkey(
+    db: &SqlitePool,
+    credential_id: &CredentialId,
+    passkey: &Passkey,
+) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin().await?;
+    update_credential_passkey_tx(&mut tx, credential_id, passkey).await?;
+    tx.commit().await
+}
+
 pub struct NewImage {
     pub samples_hash: [u8; 32],
     pub n_samples: i64,
@@ -358,6 +403,13 @@ pub async fn insert_contribution(
     .await?;
 
     for image in &contribution.images {
+        sqlx::query(
+            "INSERT INTO blobs (hash, ref_count) VALUES (?, 1)
+             ON CONFLICT(hash) DO UPDATE SET ref_count = ref_count + 1",
+        )
+        .bind(image.samples_hash.as_slice())
+        .execute(&mut **tx)
+        .await?;
         let id = ContributionImageId::new();
         sqlx::query(
             "INSERT INTO contribution_images

@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use sqlx::SqlitePool;
+use tokio::sync::Semaphore;
 use webauthn_rs::prelude::{Passkey, PasskeyRegistration, Url, Webauthn, WebauthnBuilder};
 
 use crate::blob::{BlobError, BlobStore, FsBlobStore};
@@ -47,6 +48,12 @@ enum PendingStage {
 }
 
 const MAX_PENDING_REGISTRATIONS: usize = 1024;
+const UPLOAD_MEMORY_BUDGET: u64 = 1 << 30;
+
+fn upload_slots(max_body_bytes: usize) -> usize {
+    let per_upload = 2 * max_body_bytes.max(1) as u64;
+    usize::try_from((UPLOAD_MEMORY_BUDGET / per_upload).clamp(1, 16)).unwrap_or(1)
+}
 
 pub struct AppState {
     pub config: Config,
@@ -57,6 +64,7 @@ pub struct AppState {
     pub bodies: Bodies,
     pub rate_limiter: RateLimiter,
     pub trust: Arc<dyn TrustPolicy>,
+    pub upload_slots: Arc<Semaphore>,
     pending: Mutex<HashMap<RegistrationHandle, PendingRegistration>>,
 }
 
@@ -71,7 +79,8 @@ impl core::fmt::Debug for AppState {
 }
 
 impl AppState {
-    pub async fn new(config: Config) -> Result<Self, StateError> {
+    pub async fn new(mut config: Config) -> Result<Self, StateError> {
+        config.normalize_origin()?;
         config.validate()?;
         let db = open(&config.db_path).await?;
         let blobs: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(&config.blob_dir)?);
@@ -83,6 +92,7 @@ impl AppState {
             .and_then(|builder| builder.rp_name("looklab").build())
             .map_err(|error| StateError::Webauthn(error.to_string()))?;
         let trust = Arc::new(DefaultTrustPolicy::new(config.pow));
+        let slots = upload_slots(config.limits.max_body_bytes);
         Ok(Self {
             config,
             db,
@@ -92,6 +102,7 @@ impl AppState {
             bodies,
             rate_limiter: RateLimiter::default(),
             trust,
+            upload_slots: Arc::new(Semaphore::new(slots)),
             pending: Mutex::new(HashMap::new()),
         })
     }
@@ -153,11 +164,20 @@ impl AppState {
         handle: RegistrationHandle,
         passkey: Passkey,
         display_handle: Option<String>,
-    ) {
+    ) -> bool {
         let Ok(mut pending) = self.pending.lock() else {
-            return;
+            return false;
         };
         self.purge_locked(&mut pending);
+        let duplicate = pending.values().any(|entry| match &entry.stage {
+            PendingStage::Credential {
+                passkey: existing, ..
+            } => existing.cred_id().as_slice() == passkey.cred_id().as_slice(),
+            PendingStage::Challenge { .. } => false,
+        });
+        if duplicate {
+            return false;
+        }
         pending.insert(
             handle,
             PendingRegistration {
@@ -168,6 +188,7 @@ impl AppState {
                 },
             },
         );
+        true
     }
 
     pub fn pending_credential(&self, credential_id: &[u8]) -> Option<(Passkey, Option<String>)> {

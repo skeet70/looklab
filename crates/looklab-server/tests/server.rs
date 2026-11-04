@@ -2,9 +2,12 @@
 //! End-to-end tests of the axum app against an in-process router, a temporary
 //! SQLite file and a temporary blob directory.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
+
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -64,7 +67,7 @@ static LOGS: LazyLock<Arc<Mutex<Vec<u8>>>> = LazyLock::new(|| {
     let subscriber = tracing_subscriber::fmt()
         .with_writer(move || BufferWriter(writer.clone()))
         .with_ansi(false)
-        .with_max_level(tracing::Level::TRACE)
+        .with_max_level(tracing::Level::INFO)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
     buffer
@@ -81,6 +84,7 @@ fn log_bytes() -> Vec<u8> {
 struct TestServer {
     dir: TempDir,
     app: Router,
+    state: Arc<AppState>,
     db: SqlitePool,
     blob_dir: PathBuf,
     soft: SoftPasskey,
@@ -103,6 +107,7 @@ impl TestServer {
             bodies_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies"),
             nonce_ttl: Duration::from_secs(300),
             registration_ttl: Duration::from_secs(300),
+            body_timeout: Duration::from_secs(30),
             blob_retention_days: 30,
             pow: PowConfig {
                 memory_kib: 8,
@@ -119,7 +124,7 @@ impl TestServer {
         let db_path = config.db_path.clone();
         let blob_dir = config.blob_dir.clone();
         let state = Arc::new(AppState::new(config).await.expect("state"));
-        let app = router(state);
+        let app = router(state.clone());
         let db = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&db_path))
             .await
             .expect("test db");
@@ -128,6 +133,7 @@ impl TestServer {
         Self {
             dir,
             app,
+            state,
             db,
             blob_dir,
             soft,
@@ -151,7 +157,16 @@ impl TestServer {
     }
 
     async fn assertion(&mut self, challenge: &Challenge) -> WebAuthnAssertion {
-        let options = request_options(challenge.as_bytes(), &self.credential_id).public_key;
+        self.assertion_with_verification(challenge, true).await
+    }
+
+    async fn assertion_with_verification(
+        &mut self,
+        challenge: &Challenge,
+        required: bool,
+    ) -> WebAuthnAssertion {
+        let options =
+            request_options(challenge.as_bytes(), &self.credential_id, required).public_key;
         let client_data_json = format!(
             r#"{{"type":"webauthn.get","challenge":"{}","origin":"{ORIGIN}"}}"#,
             URL_SAFE_NO_PAD.encode(challenge.as_bytes())
@@ -170,10 +185,12 @@ impl TestServer {
     }
 
     async fn upload_bytes(&self, bytes: Vec<u8>) -> (StatusCode, Value) {
+        let length = bytes.len();
         let request = Request::builder()
             .method("POST")
             .uri("/api/upload")
             .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, length)
             .body(Body::from(bytes))
             .expect("request");
         let (status, _, body) = send(&self.app, request).await;
@@ -211,6 +228,67 @@ impl TestServer {
             .expect("request");
         send(&self.app, request).await
     }
+
+    async fn listen(&self) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("listener address");
+        let app = router(self.state.clone());
+        tokio::spawn(async move {
+            let service = app.into_make_service_with_connect_info::<SocketAddr>();
+            let _ = axum::serve(listener, service).await;
+        });
+        addr
+    }
+}
+
+async fn tcp_nonce(addr: SocketAddr) -> (u16, Vec<u8>) {
+    tcp_request(addr, "POST", "/api/nonce", None, &[]).await
+}
+
+async fn tcp_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         X-Forwarded-For: {SENTINEL}\r\nX-Real-IP: {SENTINEL}\r\n\
+         Forwarded: for={SENTINEL}\r\nCF-Connecting-IP: {SENTINEL}\r\n"
+    );
+    if let Some(content_type) = content_type {
+        request.push_str(&format!("Content-Type: {content_type}\r\n"));
+    }
+    request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    let mut bytes = request.into_bytes();
+    bytes.extend_from_slice(body);
+    stream.write_all(&bytes).await.expect("write request");
+    stream.flush().await.expect("flush request");
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .await
+        .expect("read response");
+    parse_response(&response)
+}
+
+fn parse_response(response: &[u8]) -> (u16, Vec<u8>) {
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("response headers");
+    let head = std::str::from_utf8(&response[..split]).expect("response head");
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("status code");
+    (status, response[split + 4..].to_vec())
 }
 
 async fn send(app: &Router, request: Request<Body>) -> (StatusCode, HeaderMap, Bytes) {
@@ -263,7 +341,16 @@ async fn register(app: &Router, soft: &mut SoftPasskey) -> Vec<u8> {
     raw_id
 }
 
-fn request_options(challenge: &[u8], credential_id: &[u8]) -> RequestChallengeResponse {
+fn request_options(
+    challenge: &[u8],
+    credential_id: &[u8],
+    verification_required: bool,
+) -> RequestChallengeResponse {
+    let verification = if verification_required {
+        "required"
+    } else {
+        "discouraged"
+    };
     serde_json::from_value(json!({
         "publicKey": {
             "challenge": URL_SAFE_NO_PAD.encode(challenge),
@@ -272,7 +359,7 @@ fn request_options(challenge: &[u8], credential_id: &[u8]) -> RequestChallengeRe
                 "type": "public-key",
                 "id": URL_SAFE_NO_PAD.encode(credential_id),
             }],
-            "userVerification": "discouraged",
+            "userVerification": verification,
         },
     }))
     .expect("request options")
@@ -497,6 +584,15 @@ async fn happy_path_and_status_feed() {
         .expect("blob dir")
         .count();
     assert_eq!(blobs, 2);
+
+    let credential_json: String = sqlx::query_scalar("SELECT webauthn_credential FROM credentials")
+        .fetch_one(&server.db)
+        .await
+        .expect("credential");
+    let passkey: webauthn_rs::prelude::Passkey =
+        serde_json::from_str(&credential_json).expect("stored passkey");
+    let credential: webauthn_rs::prelude::Credential = passkey.into();
+    assert!(credential.counter > 0, "assertion counter was not stored");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -507,6 +603,43 @@ async fn invalid_signature_is_rejected() {
     let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
     let mut assertion = server.assertion(&challenge).await;
     assertion.signature[0] ^= 0xff;
+    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
+    let (status, body) = server.upload_bytes(bytes).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "SIGNATURE_INVALID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_token_is_issued_only_once() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = body["status_token"].as_str().expect("token").to_owned();
+
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body["status_token"].is_null(), "second token: {body}");
+
+    let (status, _, body) = server.get(&format!("/status/{token}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let feed: Value = serde_json::from_slice(&body).expect("status json");
+    assert_eq!(
+        feed["contributions"]
+            .as_array()
+            .expect("contributions")
+            .len(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_user_verification_is_rejected() {
+    let mut server = TestServer::start().await;
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let assertion = server.assertion_with_verification(&challenge, false).await;
     let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
     let bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     let (status, body) = server.upload_bytes(bytes).await;
@@ -662,39 +795,107 @@ async fn audit_log_is_append_only() {
         .execute(&server.db)
         .await;
     assert!(delete.is_err(), "audit log accepted a delete");
+    let replace = sqlx::query(
+        "INSERT OR REPLACE INTO audit_log (seq, type, payload, ts) VALUES (1, 'test', '{}', 0)",
+    )
+    .execute(&server.db)
+    .await;
+    assert!(replace.is_err(), "audit log accepted a replace");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn nothing_sensitive_reaches_disk_or_logs() {
-    let mut server = TestServer::start().await;
-    let serial = RawSerial::new(SERIAL.as_bytes()).expect("serial");
+async fn upload_requires_content_length() {
+    let server = TestServer::start().await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/upload")
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, body) = send(&server.app, request).await;
+    assert_eq!(status, StatusCode::LENGTH_REQUIRED);
+    let value: Value = serde_json::from_slice(&body).expect("error json");
+    assert_eq!(value["error"], "LENGTH_REQUIRED");
+}
 
-    let (status, body) = server.upload_valid(Some(&serial)).await;
-    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+const SENTINEL: &str = "203.0.113.77";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_sensitive_reaches_disk_logs_or_responses() {
+    let mut server = TestServer::start().await;
+    let addr = server.listen().await;
+    let serial = RawSerial::new(SERIAL.as_bytes()).expect("serial");
+    let mut responses: Vec<Vec<u8>> = Vec::new();
+
+    let (status, body) = tcp_nonce(addr).await;
+    assert_eq!(status, 201, "nonce: {body:?}");
+    responses.push(body.clone());
+    let nonce = nonce_from_json(&body);
 
     let (manifest, blobs) = manifest(valid_settings());
-    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let assertion = server.assertion(&challenge).await;
+    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let bytes = envelope(nonce, &manifest, &blobs, Some(&serial), &assertion, &pow);
+    let (status, body) = tcp_request(
+        addr,
+        "POST",
+        "/api/upload",
+        Some("application/octet-stream"),
+        &bytes,
+    )
+    .await;
+    assert_eq!(status, 201, "upload: {body:?}");
+    responses.push(body.clone());
+    let value: Value = serde_json::from_slice(&body).expect("upload json");
+    let token = value["status_token"].as_str().expect("token").to_owned();
+
+    let (status, body) = tcp_request(addr, "GET", &format!("/status/{token}"), None, &[]).await;
+    assert_eq!(status, 200);
+    responses.push(body);
+    let (status, body) = tcp_request(addr, "GET", &format!("/status/{token}.rss"), None, &[]).await;
+    assert_eq!(status, 200);
+    responses.push(body);
+
+    let (status, body) = tcp_nonce(addr).await;
+    assert_eq!(status, 201);
+    responses.push(body.clone());
+    let nonce = nonce_from_json(&body);
     let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
     let mut assertion = server.assertion(&challenge).await;
     assertion.signature[0] ^= 0xff;
     let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
-    let (status, _) = server
-        .upload_bytes(envelope(nonce, &manifest, &blobs, None, &assertion, &pow))
-        .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = tcp_request(
+        addr,
+        "POST",
+        "/api/upload",
+        Some("application/octet-stream"),
+        &envelope(nonce, &manifest, &blobs, None, &assertion, &pow),
+    )
+    .await;
+    assert_eq!(status, 401);
+    responses.push(body);
 
-    let nonce = server.nonce().await;
+    let (status, body) = tcp_nonce(addr).await;
+    assert_eq!(status, 201);
+    responses.push(body.clone());
+    let nonce = nonce_from_json(&body);
     let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
     let assertion = server.assertion(&challenge).await;
     let pow = bad_pow(&challenge, 2);
-    let (status, _) = server
-        .upload_bytes(envelope(nonce, &manifest, &blobs, None, &assertion, &pow))
-        .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = tcp_request(
+        addr,
+        "POST",
+        "/api/upload",
+        Some("application/octet-stream"),
+        &envelope(nonce, &manifest, &blobs, None, &assertion, &pow),
+    )
+    .await;
+    assert_eq!(status, 400);
+    responses.push(body);
 
     let hmac = serial.hmac(&SerialHmacKey::new([9; 32]), "Fujifilm", "X-T5");
     let hmac_bytes = hmac.as_bytes().to_vec();
-    let hmac_hex = hex(&hmac_bytes);
 
     let credential_json: String = sqlx::query_scalar("SELECT webauthn_credential FROM credentials")
         .fetch_one(&server.db)
@@ -702,9 +903,24 @@ async fn nothing_sensitive_reaches_disk_or_logs() {
         .expect("credential");
     let passkey: webauthn_rs::prelude::Passkey =
         serde_json::from_str(&credential_json).expect("stored passkey");
-    let needles = public_key_needles(&passkey);
+    let mut key_needles = public_key_needles(&passkey);
+    let mut key_file_needles = Vec::new();
+    if let webauthn_rs::prelude::COSEKeyType::EC_EC2(ec) = &passkey.get_public_key().key {
+        let mut xy = ec.x.clone();
+        xy.extend_from_slice(&ec.y);
+        key_file_needles.push(ec.x.clone());
+        key_file_needles.push(ec.y.clone());
+        key_file_needles.push(xy);
+        let debug = vec![
+            format!("{ec:?}").into_bytes(),
+            format!("{:?}", ec.x).into_bytes(),
+            format!("{:?}", ec.y).into_bytes(),
+        ];
+        key_file_needles.extend(debug.clone());
+        key_needles.extend(debug);
+    }
     assert!(
-        needles
+        key_needles
             .iter()
             .any(|needle| contains(credential_json.as_bytes(), needle)),
         "the stored credential does not contain the public key encoding"
@@ -717,30 +933,35 @@ async fn nothing_sensitive_reaches_disk_or_logs() {
             .expect("serial hmac");
     assert_eq!(stored_serial_hmac, hmac_bytes);
 
+    let serial_needles = encoded_needles(SERIAL.as_bytes());
+    let hmac_needles = encoded_needles(&hmac_bytes);
+    let sentinel_needles = vec![SENTINEL.as_bytes().to_vec(), b"127.0.0.1".to_vec()];
+
     let log_bytes = log_bytes();
     assert!(!log_bytes.is_empty(), "no log output was captured");
-    let log_text = String::from_utf8_lossy(&log_bytes).into_owned();
-    assert!(!log_text.contains(SERIAL), "raw serial in logs");
-    assert!(!log_text.contains(&hmac_hex), "serial HMAC in logs");
-    for needle in &needles {
-        assert!(!contains(&log_bytes, needle), "public key material in logs");
-        assert!(
-            !log_text.contains(String::from_utf8_lossy(needle).as_ref()),
-            "public key text in logs"
-        );
+    assert_absent("logs", &log_bytes, &serial_needles);
+    assert_absent("logs", &log_bytes, &hmac_needles);
+    assert_absent("logs", &log_bytes, &key_needles);
+    assert_absent("logs", &log_bytes, &sentinel_needles);
+    for run in text_runs(&log_bytes) {
+        assert!(!contains_ipv4(&run), "IPv4 address in logs: {run}");
+        assert!(!contains_ipv6(&run), "IPv6 address in logs: {run}");
+    }
+
+    for response in &responses {
+        assert_absent("responses", response, &serial_needles);
+        assert_absent("responses", response, &hmac_needles);
+        assert_absent("responses", response, &key_needles);
+        assert_absent("responses", response, &sentinel_needles);
     }
 
     let db_files = database_files(server.dir.path());
     assert!(!db_files.is_empty());
     for file in &db_files {
         let bytes = std::fs::read(file).expect("read database file");
-        assert!(
-            !bytes.contains_subslice(SERIAL.as_bytes()),
-            "serial in database"
-        );
-        for needle in needles.iter().take(3) {
-            assert!(!contains(&bytes, needle), "public key bytes in database");
-        }
+        assert_absent("database", &bytes, &serial_needles);
+        assert_absent("database", &bytes, &key_file_needles);
+        assert_absent("database", &bytes, &sentinel_needles);
     }
     for run in text_runs(&database_bytes(&db_files)) {
         assert!(!contains_ipv4(&run), "IPv4 address in database: {run}");
@@ -750,16 +971,10 @@ async fn nothing_sensitive_reaches_disk_or_logs() {
     for entry in std::fs::read_dir(&server.blob_dir).expect("blob dir") {
         let path = entry.expect("entry").path();
         let bytes = std::fs::read(&path).expect("blob");
-        assert!(
-            !bytes.contains_subslice(SERIAL.as_bytes()),
-            "serial in blob"
-        );
-        for needle in &needles {
-            assert!(
-                !contains(bytes.as_slice(), needle),
-                "public key material in blob"
-            );
-        }
+        assert_absent("blobs", &bytes, &serial_needles);
+        assert_absent("blobs", &bytes, &hmac_needles);
+        assert_absent("blobs", &bytes, &key_needles);
+        assert_absent("blobs", &bytes, &sentinel_needles);
         for run in text_runs(&bytes) {
             assert!(!contains_ipv4(&run), "IPv4 address in blob: {run}");
             assert!(!contains_ipv6(&run), "IPv6 address in blob: {run}");
@@ -770,12 +985,38 @@ async fn nothing_sensitive_reaches_disk_or_logs() {
         if table == "credentials" && column == "webauthn_credential" {
             continue;
         }
-        for needle in &needles {
-            assert!(
-                !contains(&value, needle),
-                "public key material in {table}.{column}"
-            );
-        }
+        assert_absent(&format!("{table}.{column}"), &value, &key_needles);
+        assert_absent(&format!("{table}.{column}"), &value, &serial_needles);
+        assert_absent(&format!("{table}.{column}"), &value, &sentinel_needles);
+    }
+}
+
+fn nonce_from_json(body: &[u8]) -> Nonce {
+    let value: Value = serde_json::from_slice(body).expect("nonce json");
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value["nonce"].as_str().expect("nonce string"))
+        .expect("nonce base64");
+    Nonce::from_slice(&bytes).expect("nonce length")
+}
+
+fn encoded_needles(value: &[u8]) -> Vec<Vec<u8>> {
+    vec![
+        value.to_vec(),
+        hex(value).into_bytes(),
+        hex(value).to_uppercase().into_bytes(),
+        STANDARD.encode(value).into_bytes(),
+        URL_SAFE_NO_PAD.encode(value).into_bytes(),
+        format!("{value:?}").into_bytes(),
+    ]
+}
+
+fn assert_absent(context: &str, haystack: &[u8], needles: &[Vec<u8>]) {
+    for needle in needles {
+        assert!(
+            !contains(haystack, needle),
+            "{context} contains {:?}",
+            String::from_utf8_lossy(needle)
+        );
     }
 }
 
@@ -809,16 +1050,6 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack
             .windows(needle.len())
             .any(|window| window == needle)
-}
-
-trait ContainsSubslice {
-    fn contains_subslice(&self, needle: &[u8]) -> bool;
-}
-
-impl ContainsSubslice for [u8] {
-    fn contains_subslice(&self, needle: &[u8]) -> bool {
-        contains(self, needle)
-    }
 }
 
 fn database_files(dir: &Path) -> Vec<PathBuf> {

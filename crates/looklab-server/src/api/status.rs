@@ -14,7 +14,7 @@ use serde::Serialize;
 use crate::api::consume_nonce;
 use crate::error::{ApiError, ApiResult, ErrorCode};
 use crate::ids::{CredentialId, RawCredentialId, StatusToken};
-use crate::rate_limit::{Action, CREDENTIAL_SIGNED_QUOTA, RateKey};
+use crate::rate_limit::{Action, RateKey};
 use crate::state::AppState;
 use crate::store::{self, ContributionFeed};
 use crate::verify::{RequestDomain, SignedRequestPayload, request_digest, verify_assertion};
@@ -126,23 +126,17 @@ pub async fn reissue(
     let Json(payload) = payload.map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
     let (assertion, nonce) = payload.decode()?;
     let raw_id = RawCredentialId::new(assertion.credential_id.clone());
-    if !state.rate_limiter.check(
-        &RateKey::Assertion {
-            action: Action::StatusReissue,
-            id: raw_id.clone(),
-        },
-        CREDENTIAL_SIGNED_QUOTA,
-    ) {
+    consume_nonce(&state, &nonce).await?;
+    if !state.rate_limiter.check(&RateKey::GlobalSigned) {
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
-    consume_nonce(&state, &nonce).await?;
 
     let credential = store::find_credential(&state.db, raw_id.as_slice())
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?
         .ok_or_else(|| ApiError::new(ErrorCode::CredentialUnknown))?;
     let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::StatusReissue, &[]));
-    verify_assertion(
+    let passkey = verify_assertion(
         &credential.passkey,
         &assertion,
         challenge,
@@ -150,9 +144,16 @@ pub async fn reissue(
         &state.config.rp_id,
     )
     .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
+    if !state.rate_limiter.check(&RateKey::Assertion {
+        action: Action::StatusReissue,
+        id: raw_id,
+    }) {
+        return Err(ApiError::new(ErrorCode::RateLimited));
+    }
 
     let token = StatusToken::generate().map_err(|_| ApiError::new(ErrorCode::Internal))?;
     let mut tx = state.db.begin().await?;
+    store::update_credential_passkey_tx(&mut tx, &credential.id, &passkey).await?;
     store::revoke_tokens(&mut tx, &credential.id).await?;
     store::insert_status_token(&mut tx, &credential.id, &token.hash()).await?;
     tx.commit().await?;

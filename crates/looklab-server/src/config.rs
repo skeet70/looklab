@@ -50,6 +50,7 @@ struct FileConfig {
     bodies_dir: PathBuf,
     nonce_ttl_seconds: u64,
     registration_ttl_seconds: u64,
+    body_timeout_seconds: u64,
     blob_retention_days: u32,
     pow: PowConfig,
     limits: LimitsFile,
@@ -97,8 +98,9 @@ impl Default for FileConfig {
             origin: "https://looklab.example".to_owned(),
             server_secret_path: PathBuf::from("server-secret"),
             bodies_dir: PathBuf::from("data/bodies"),
-            nonce_ttl_seconds: 300,
-            registration_ttl_seconds: 300,
+            nonce_ttl_seconds: 0,
+            registration_ttl_seconds: 0,
+            body_timeout_seconds: 30,
             blob_retention_days: 30,
             pow: PowConfig::default(),
             limits: LimitsFile::default(),
@@ -117,6 +119,7 @@ pub struct Config {
     pub bodies_dir: PathBuf,
     pub nonce_ttl: Duration,
     pub registration_ttl: Duration,
+    pub body_timeout: Duration,
     pub blob_retention_days: u32,
     pub pow: PowConfig,
     pub limits: Limits,
@@ -142,7 +145,20 @@ impl Config {
         };
         let mut config = file.params()?;
         config.apply_env()?;
+        config.normalize_origin()?;
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Stores the ASCII serialization of the configured URL origin.
+    pub fn normalize_origin(&mut self) -> Result<(), ConfigError> {
+        let url =
+            webauthn_rs::prelude::Url::parse(&self.origin).map_err(|_| ConfigError::Value {
+                name: "origin",
+                value: self.origin.clone(),
+            })?;
+        self.origin = url.origin().ascii_serialization();
+        Ok(())
     }
 
     fn apply_env(&mut self) -> Result<(), ConfigError> {
@@ -174,6 +190,10 @@ impl Config {
             self.registration_ttl =
                 Duration::from_secs(parse_value("LOOKLAB_REGISTRATION_TTL_SECONDS", &value)?);
         }
+        if let Some(value) = env("LOOKLAB_BODY_TIMEOUT_SECONDS") {
+            self.body_timeout =
+                Duration::from_secs(parse_value("LOOKLAB_BODY_TIMEOUT_SECONDS", &value)?);
+        }
         if let Some(value) = env("LOOKLAB_BLOB_RETENTION_DAYS") {
             self.blob_retention_days = parse_value("LOOKLAB_BLOB_RETENTION_DAYS", &value)?;
         }
@@ -199,6 +219,30 @@ impl Config {
             return Err(ConfigError::Value {
                 name: "rp_id",
                 value: self.rp_id.clone(),
+            });
+        }
+        if self.nonce_ttl < Duration::from_secs(60) {
+            return Err(ConfigError::Range {
+                name: "nonce_ttl_seconds",
+                value: self.nonce_ttl.as_secs().to_string(),
+            });
+        }
+        if self.registration_ttl < Duration::from_secs(60) {
+            return Err(ConfigError::Range {
+                name: "registration_ttl_seconds",
+                value: self.registration_ttl.as_secs().to_string(),
+            });
+        }
+        if self.limits.max_body_bytes == 0 {
+            return Err(ConfigError::Range {
+                name: "limits.max_body_bytes",
+                value: "0".to_owned(),
+            });
+        }
+        if self.body_timeout < Duration::from_secs(1) {
+            return Err(ConfigError::Range {
+                name: "body_timeout_seconds",
+                value: self.body_timeout.as_secs().to_string(),
             });
         }
         if self.pow.memory_kib < 8 {
@@ -227,7 +271,19 @@ impl Config {
 
 impl FileConfig {
     fn params(self) -> Result<Config, ConfigError> {
-        let config = Config {
+        let limits = self.limits.to_limits();
+        let derived_ttl = 300 + 10 * u64::try_from(limits.max_images).unwrap_or(u64::MAX / 10);
+        let nonce_ttl = if self.nonce_ttl_seconds == 0 {
+            derived_ttl
+        } else {
+            self.nonce_ttl_seconds
+        };
+        let registration_ttl = if self.registration_ttl_seconds == 0 {
+            derived_ttl
+        } else {
+            self.registration_ttl_seconds
+        };
+        Ok(Config {
             bind: parse_value("bind", &self.bind)?,
             db_path: self.db_path,
             blob_dir: self.blob_dir,
@@ -235,14 +291,13 @@ impl FileConfig {
             origin: self.origin,
             server_secret_path: self.server_secret_path,
             bodies_dir: self.bodies_dir,
-            nonce_ttl: Duration::from_secs(self.nonce_ttl_seconds),
-            registration_ttl: Duration::from_secs(self.registration_ttl_seconds),
+            nonce_ttl: Duration::from_secs(nonce_ttl),
+            registration_ttl: Duration::from_secs(registration_ttl),
+            body_timeout: Duration::from_secs(self.body_timeout_seconds),
             blob_retention_days: self.blob_retention_days,
             pow: self.pow,
-            limits: self.limits.to_limits(),
-        };
-        config.validate()?;
-        Ok(config)
+            limits,
+        })
     }
 }
 

@@ -6,7 +6,7 @@ use looklab_upload::{
     StructuralVerdict, WebAuthnAssertion, check_structure,
 };
 use sha2::{Digest, Sha256};
-use webauthn_rs::prelude::{COSEAlgorithm, Passkey};
+use webauthn_rs::prelude::{COSEAlgorithm, Credential, Passkey};
 
 use crate::error::{ApiError, ErrorCode};
 
@@ -20,6 +20,14 @@ pub enum VerifyError {
     Structure(#[from] StructuralError),
     #[error("the assertion signature does not verify")]
     Signature,
+    #[error("the assertion does not set the user-verified flag")]
+    UserVerification,
+    #[error("the assertion's backup-eligibility flag changed")]
+    BackupEligibility,
+    #[error("the assertion reports a backup state without backup eligibility")]
+    BackupState,
+    #[error("the assertion counter did not increase")]
+    CounterReplay,
 }
 
 pub fn verify_assertion(
@@ -28,7 +36,7 @@ pub fn verify_assertion(
     challenge: Challenge,
     origin: &str,
     rp_id: &str,
-) -> Result<(), VerifyError> {
+) -> Result<Passkey, VerifyError> {
     if passkey.cred_id().as_slice() != assertion.credential_id.as_slice() {
         return Err(VerifyError::CredentialMismatch);
     }
@@ -58,7 +66,42 @@ pub fn verify_assertion(
     if !verified {
         return Err(VerifyError::Signature);
     }
-    Ok(())
+
+    let authenticator_data = &assertion.authenticator_data;
+    if authenticator_data.len() < 37 {
+        return Err(VerifyError::Structure(
+            StructuralError::AuthenticatorDataTooShort {
+                len: authenticator_data.len(),
+            },
+        ));
+    }
+    let flags = authenticator_data[32];
+    let user_verified = flags & 0x04 != 0;
+    let backup_eligible = flags & 0x08 != 0;
+    let backup_state = flags & 0x10 != 0;
+    if !user_verified {
+        return Err(VerifyError::UserVerification);
+    }
+
+    let counter = u32::from_be_bytes([
+        authenticator_data[33],
+        authenticator_data[34],
+        authenticator_data[35],
+        authenticator_data[36],
+    ]);
+    let mut credential: Credential = passkey.clone().into();
+    if credential.backup_eligible != backup_eligible {
+        return Err(VerifyError::BackupEligibility);
+    }
+    if backup_state && !credential.backup_eligible {
+        return Err(VerifyError::BackupState);
+    }
+    if counter != 0 && counter <= credential.counter {
+        return Err(VerifyError::CounterReplay);
+    }
+    credential.counter = credential.counter.max(counter);
+    credential.backup_state = backup_state;
+    Ok(credential.into())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

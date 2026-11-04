@@ -88,6 +88,11 @@ CREATE TABLE contribution_images (
 
 CREATE INDEX contribution_images_by_contribution ON contribution_images (contribution_id);
 
+CREATE TABLE blobs (
+    hash      BLOB NOT NULL PRIMARY KEY,
+    ref_count INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE proposals (
     id             TEXT NOT NULL PRIMARY KEY,
     credential_id  TEXT NOT NULL REFERENCES credentials (id),
@@ -116,6 +121,14 @@ CREATE TABLE audit_log (
     payload TEXT NOT NULL,
     ts      INTEGER NOT NULL
 );
+
+CREATE TRIGGER audit_log_no_replace
+BEFORE INSERT ON audit_log
+WHEN NEW.seq > 0
+ AND NEW.seq <= (SELECT COALESCE(MAX(seq), 0) FROM audit_log)
+BEGIN
+    SELECT RAISE(ABORT, 'audit_log is append-only');
+END;
 
 CREATE TRIGGER audit_log_no_update
 BEFORE UPDATE ON audit_log

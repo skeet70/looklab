@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug, thiserror::Error)]
 pub enum BlobError {
     #[error("blob storage: {0}")]
@@ -103,14 +105,35 @@ impl BlobStore for FsBlobStore {
         if path.exists() {
             return Ok(());
         }
-        let temporary = self.root.join(format!(".{}.tmp", hash.to_hex()));
-        std::fs::write(&temporary, bytes)?;
+        let unique = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temporary = self.root.join(format!(
+            ".{}.{}.{}.tmp",
+            hash.to_hex(),
+            std::process::id(),
+            unique
+        ));
+        let mut file = std::fs::File::create(&temporary)?;
+        {
+            use std::io::Write as _;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        drop(file);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
         }
-        std::fs::rename(&temporary, &path)?;
+        match std::fs::rename(&temporary, &path) {
+            Ok(()) => {}
+            Err(_) if path.exists() => {
+                let _ = std::fs::remove_file(&temporary);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if let Ok(directory) = std::fs::File::open(&self.root) {
+            let _ = directory.sync_all();
+        }
         Ok(())
     }
 

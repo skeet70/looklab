@@ -13,7 +13,7 @@ use crate::api::consume_nonce;
 use crate::db::now_unix;
 use crate::error::{ApiError, ApiResult, ErrorCode};
 use crate::ids::{ContributionId, RawCredentialId};
-use crate::rate_limit::{Action, CREDENTIAL_SIGNED_QUOTA, RateKey};
+use crate::rate_limit::{Action, RateKey};
 use crate::state::AppState;
 use crate::store;
 use crate::verify::{RequestDomain, SignedRequestPayload, request_digest, verify_assertion};
@@ -46,16 +46,10 @@ pub async fn withdraw(
     let contribution_id = ContributionId::try_from(payload.contribution_id)
         .map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
     let raw_id = RawCredentialId::new(assertion.credential_id.clone());
-    if !state.rate_limiter.check(
-        &RateKey::Assertion {
-            action: Action::Withdraw,
-            id: raw_id.clone(),
-        },
-        CREDENTIAL_SIGNED_QUOTA,
-    ) {
+    consume_nonce(&state, &nonce).await?;
+    if !state.rate_limiter.check(&RateKey::GlobalSigned) {
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
-    consume_nonce(&state, &nonce).await?;
 
     let credential = store::find_credential(&state.db, raw_id.as_slice())
         .await
@@ -63,7 +57,7 @@ pub async fn withdraw(
         .ok_or_else(|| ApiError::new(ErrorCode::CredentialUnknown))?;
     let digest = request_digest(RequestDomain::Withdraw, contribution_id.as_str().as_bytes());
     let challenge = Challenge::new(&nonce, &digest);
-    verify_assertion(
+    let passkey = verify_assertion(
         &credential.passkey,
         &assertion,
         challenge,
@@ -71,6 +65,15 @@ pub async fn withdraw(
         &state.config.rp_id,
     )
     .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
+    if !state.rate_limiter.check(&RateKey::Assertion {
+        action: Action::Withdraw,
+        id: raw_id,
+    }) {
+        return Err(ApiError::new(ErrorCode::RateLimited));
+    }
+    store::update_credential_passkey(&state.db, &credential.id, &passkey)
+        .await
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
 
     let delete_after = now_unix() + i64::from(state.config.blob_retention_days) * 86_400;
     let delete_after = store::withdraw(&state.db, &contribution_id, &credential.id, delete_after)

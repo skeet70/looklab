@@ -43,8 +43,8 @@ macro_rules! uuid_id {
             type Error = InvalidId;
 
             fn try_from(value: String) -> Result<Self, Self::Error> {
-                uuid::Uuid::parse_str(&value).map_err(|_| InvalidId)?;
-                Ok(Self(value))
+                let uuid = uuid::Uuid::parse_str(&value).map_err(|_| InvalidId)?;
+                Ok(Self(uuid.hyphenated().to_string()))
             }
         }
 

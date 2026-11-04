@@ -24,6 +24,7 @@ looklab-schema = { path = "crates/looklab-schema" }
 looklab-report = { path = "crates/looklab-report" }
 looklab-upload = { path = "crates/looklab-upload" }
 looklab-wasm = { path = "crates/looklab-wasm" }
+looklab-prep-module = { path = "crates/looklab-prep-module" }
 
 libm = "0.2"
 thiserror = "2"
@@ -54,7 +55,8 @@ jpeg-encoder = "0.6"
 zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 roxmltree = "0.21"
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "matched-path", "tokio"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+http-body-util = "0.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
@@ -62,6 +64,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 webauthn-rs = "0.6"
 webauthn-authenticator-rs = { version = "0.6", features = ["softpasskey"] }
 tempfile = "3"
+wasmtime = "50"
+clap = { version = "4", features = ["derive"] }
+assert_cmd = "2"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

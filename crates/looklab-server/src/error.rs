@@ -10,6 +10,9 @@ use serde::Serialize;
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
     PayloadTooLarge,
+    LengthRequired,
+    RequestTimeout,
+    Busy,
     MalformedEnvelope,
     NonceUnknown,
     NonceExpired,
@@ -32,6 +35,9 @@ impl ErrorCode {
     pub const fn status(self) -> StatusCode {
         match self {
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::LengthRequired => StatusCode::LENGTH_REQUIRED,
+            Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
+            Self::Busy => StatusCode::SERVICE_UNAVAILABLE,
             Self::MalformedEnvelope => StatusCode::BAD_REQUEST,
             Self::NonceUnknown | Self::NonceExpired => StatusCode::BAD_REQUEST,
             Self::NonceReplayed => StatusCode::CONFLICT,
@@ -52,6 +58,9 @@ impl ErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::PayloadTooLarge => "PAYLOAD_TOO_LARGE",
+            Self::LengthRequired => "LENGTH_REQUIRED",
+            Self::RequestTimeout => "REQUEST_TIMEOUT",
+            Self::Busy => "BUSY",
             Self::MalformedEnvelope => "MALFORMED_ENVELOPE",
             Self::NonceUnknown => "NONCE_UNKNOWN",
             Self::NonceExpired => "NONCE_EXPIRED",

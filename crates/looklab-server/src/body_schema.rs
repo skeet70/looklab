@@ -157,13 +157,8 @@ pub fn validate_settings(
             .iter()
             .find(|control| control.key.as_str() == entry.key.as_str())
             .ok_or(SettingsProblem::UnknownControl)?;
-        if let Some(step_value) = control.step.as_ref()
-            && *step_value != looklab_schema::Rational::from_integer(0)
-        {
-            let steps = control.steps();
-            if !steps.contains(&entry.step.get()) {
-                return Err(SettingsProblem::StepOutOfRange);
-            }
+        if !step_in_range(control, entry.step.get()) {
+            return Err(SettingsProblem::StepOutOfRange);
         }
         if control.spatial
             && let Some(Tolerated::Values(allowed)) = control.tolerated.as_ref()
@@ -187,6 +182,20 @@ pub fn validate_settings(
         }
     }
     Ok(())
+}
+
+fn step_in_range(control: &Control, step: i64) -> bool {
+    match control.kind {
+        ControlType::Enum => control
+            .values
+            .as_ref()
+            .is_some_and(|values| usize::try_from(step).is_ok_and(|index| index < values.len())),
+        ControlType::Bool => step == 0 || step == 1,
+        ControlType::Int | ControlType::Decimal => {
+            let steps = control.steps();
+            !steps.is_empty() && steps.contains(&step)
+        }
+    }
 }
 
 fn scalar_at(control: &Control, step: i64) -> Option<ScalarValue> {
@@ -251,6 +260,10 @@ epochs:
         look_affecting: false
         spatial: true
         tolerated: [off]
+      - key: paused
+        type: bool
+        default: false
+        look_affecting: false
     solve_plan:
       - stage: tone
         controls: [highlight_tone]
@@ -329,6 +342,24 @@ epochs:
         assert_eq!(
             validate_settings(&record, "1.50", &sim, &settings(vec![("color", 0)])),
             Err(SettingsProblem::UnknownControl)
+        );
+        assert_eq!(
+            validate_settings(
+                &record,
+                "1.50",
+                &sim,
+                &settings(vec![("highlight_tone", 0), ("grain", 2)])
+            ),
+            Err(SettingsProblem::StepOutOfRange)
+        );
+        assert_eq!(
+            validate_settings(
+                &record,
+                "1.50",
+                &sim,
+                &settings(vec![("highlight_tone", 0), ("paused", 7)])
+            ),
+            Err(SettingsProblem::StepOutOfRange)
         );
     }
 }

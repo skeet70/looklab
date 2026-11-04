@@ -15,7 +15,7 @@ use webauthn_rs::prelude::{CreationChallengeResponse, RegisterPublicKeyCredentia
 
 use crate::error::{ApiError, ApiResult, ErrorCode};
 use crate::ids::{RegistrationHandle, random_bytes};
-use crate::rate_limit::{NONCE_QUOTA, RateKey};
+use crate::rate_limit::RateKey;
 use crate::state::AppState;
 use crate::store;
 
@@ -26,7 +26,7 @@ pub struct NonceResponse {
 }
 
 pub async fn nonce(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
-    if !state.rate_limiter.check(&RateKey::Nonce, NONCE_QUOTA) {
+    if !state.rate_limiter.check(&RateKey::Nonce) {
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
     let nonce =
@@ -65,7 +65,7 @@ pub async fn register_start(
         Some(_) => return Err(ApiError::new(ErrorCode::MalformedEnvelope)),
         None => None,
     };
-    if !state.rate_limiter.check(&RateKey::Nonce, NONCE_QUOTA) {
+    if !state.rate_limiter.check(&RateKey::Registration) {
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
 
@@ -120,14 +120,15 @@ pub async fn register_finish(
         .finish_passkey_registration(&payload.credential, &registration)
         .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
     let raw_id = passkey.cred_id().as_slice();
-    if store::find_credential(&state.db, raw_id)
+    if store::credential_exists(&state.db, raw_id)
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?
-        .is_some()
     {
         return Err(ApiError::new(ErrorCode::CredentialConflict));
     }
-    state.insert_credential(handle, passkey, display_handle);
+    if !state.insert_credential(handle, passkey, display_handle) {
+        return Err(ApiError::new(ErrorCode::CredentialConflict));
+    }
     Ok((
         StatusCode::OK,
         Json(RegisterFinishResponse {

@@ -16,6 +16,7 @@ anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
 getrandom.workspace = true
+http-body-util.workspace = true
 looklab-samples.workspace = true
 looklab-schema.workspace = true
 looklab-upload.workspace = true
@@ -30,7 +31,7 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid = { workspace = true, features = ["v4"] }
-webauthn-rs.workspace = true
+webauthn-rs = { workspace = true, features = ["danger-credential-internals"] }
 
 [dev-dependencies]
 tempfile.workspace = true

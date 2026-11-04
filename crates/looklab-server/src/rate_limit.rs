@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! In-memory token buckets. Never keyed by an address.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
 use sha2::Digest as _;
 
 use crate::ids::RawCredentialId;
+
+const MAX_BUCKETS: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -19,8 +21,43 @@ pub enum Action {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RateKey {
     Nonce,
+    Registration,
     GlobalUpload,
+    GlobalSigned,
     Assertion { action: Action, id: RawCredentialId },
+}
+
+impl RateKey {
+    const fn quota(&self) -> Quota {
+        match self {
+            Self::Nonce => Quota {
+                capacity: 300.0,
+                refill_per_second: 5.0,
+            },
+            Self::Registration => Quota {
+                capacity: 60.0,
+                refill_per_second: 1.0,
+            },
+            Self::GlobalUpload => Quota {
+                capacity: 60.0,
+                refill_per_second: 2.0,
+            },
+            Self::GlobalSigned => Quota {
+                capacity: 120.0,
+                refill_per_second: 4.0,
+            },
+            Self::Assertion { action, .. } => match action {
+                Action::Upload => Quota {
+                    capacity: 30.0,
+                    refill_per_second: 0.2,
+                },
+                Action::StatusReissue | Action::Withdraw => Quota {
+                    capacity: 20.0,
+                    refill_per_second: 0.1,
+                },
+            },
+        }
+    }
 }
 
 impl core::fmt::Display for RateKey {
@@ -32,7 +69,9 @@ impl core::fmt::Display for RateKey {
         };
         match self {
             Self::Nonce => f.write_str("nonce"),
+            Self::Registration => f.write_str("registration"),
             Self::GlobalUpload => f.write_str("upload"),
+            Self::GlobalSigned => f.write_str("signed"),
             Self::Assertion { action: a, id } => {
                 let digest = sha2::Sha256::digest(id.as_slice());
                 write!(f, "{}:assertion:{}", action(*a), hex(&digest[..8]))
@@ -50,62 +89,73 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct Quota {
-    pub capacity: f64,
-    pub refill_per_second: f64,
+struct Quota {
+    capacity: f64,
+    refill_per_second: f64,
 }
-
-pub const NONCE_QUOTA: Quota = Quota {
-    capacity: 60.0,
-    refill_per_second: 1.0,
-};
-pub const GLOBAL_UPLOAD_QUOTA: Quota = Quota {
-    capacity: 600.0,
-    refill_per_second: 10.0,
-};
-pub const CREDENTIAL_UPLOAD_QUOTA: Quota = Quota {
-    capacity: 30.0,
-    refill_per_second: 0.2,
-};
-pub const CREDENTIAL_SIGNED_QUOTA: Quota = Quota {
-    capacity: 20.0,
-    refill_per_second: 0.1,
-};
 
 #[derive(Debug)]
 struct Bucket {
     tokens: f64,
     last: Instant,
+    quota: Quota,
 }
 
 #[derive(Debug, Default)]
 pub struct RateLimiter {
-    buckets: Mutex<HashMap<String, Bucket>>,
+    buckets: Mutex<Buckets>,
+}
+
+#[derive(Debug, Default)]
+struct Buckets {
+    buckets: HashMap<String, Bucket>,
+    order: VecDeque<String>,
 }
 
 impl RateLimiter {
-    pub fn check(&self, key: &RateKey, quota: Quota) -> bool {
+    pub fn check(&self, key: &RateKey) -> bool {
+        let quota = key.quota();
         let now = Instant::now();
-        let Ok(mut buckets) = self.buckets.lock() else {
+        let Ok(mut state) = self.buckets.lock() else {
             return false;
         };
-        if buckets.len() > 4096 {
-            buckets.retain(|_, bucket| {
-                bucket.tokens + bucket.last.elapsed().as_secs_f64() * quota.refill_per_second
-                    < quota.capacity
-            });
+        let name = key.to_string();
+        if !state.buckets.contains_key(&name) {
+            state.evict_one();
+            state.buckets.insert(
+                name.clone(),
+                Bucket {
+                    tokens: quota.capacity,
+                    last: now,
+                    quota,
+                },
+            );
+            state.order.push_back(name.clone());
         }
-        let bucket = buckets.entry(key.to_string()).or_insert_with(|| Bucket {
-            tokens: quota.capacity,
-            last: now,
-        });
+        let bucket = state
+            .buckets
+            .get_mut(&name)
+            .expect("bucket inserted or present");
         let elapsed = now.duration_since(bucket.last).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * quota.refill_per_second).min(quota.capacity);
+        bucket.tokens =
+            (bucket.tokens + elapsed * bucket.quota.refill_per_second).min(bucket.quota.capacity);
         bucket.last = now;
         if bucket.tokens < 1.0 {
             return false;
         }
         bucket.tokens -= 1.0;
         true
+    }
+}
+
+impl Buckets {
+    fn evict_one(&mut self) {
+        while self.buckets.len() >= MAX_BUCKETS {
+            let Some(oldest) = self.order.pop_front() else {
+                self.buckets.clear();
+                return;
+            };
+            self.buckets.remove(&oldest);
+        }
     }
 }
