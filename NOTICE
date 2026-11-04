@@ -24,6 +24,12 @@ Portions of looklab-color are ported from colour-science 0.4.7, and the
 golden test vectors under crates/looklab-color/tests/golden are generated
 with it.
 
+The ColorChecker 24 reflectances in data/charts/colorchecker24_spectral.json
+are the BabelColor Average dataset:
+
+BabelColor ColorChecker data: Copyright (C) 2004-2012 Danny Pascale
+(www.babelcolor.com); used by permission
+
 Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
 
 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.

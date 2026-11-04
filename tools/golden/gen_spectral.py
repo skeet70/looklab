@@ -46,6 +46,10 @@ def main() -> None:
                 "BabelColor/X-Rite reflectances, CIE 1931 2 degree observer, "
                 "CIE illuminants A and D65"
             ),
+            "notice": (
+                "BabelColor ColorChecker data: Copyright (C) 2004-2012 Danny "
+                "Pascale (www.babelcolor.com); used by permission"
+            ),
             "grid_step_nm": float(GRID[1] - GRID[0]),
         },
         "grid_nm": common.floats(GRID),

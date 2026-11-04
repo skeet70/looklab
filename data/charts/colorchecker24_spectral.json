@@ -446,6 +446,7 @@
   "colour_science_version": "0.4.7",
   "generated_by": "gen_spectral.py",
   "grid_step_nm": 5.0,
+  "notice": "BabelColor ColorChecker data: Copyright (C) 2004-2012 Danny Pascale (www.babelcolor.com); used by permission",
   "numpy_version": "2.5.3",
   "seed": 20261104,
   "source": "colour-science SDS_COLOURCHECKERS, MSDS_CMFS and SDS_ILLUMINANTS; BabelColor/X-Rite reflectances, CIE 1931 2 degree observer, CIE illuminants A and D65"

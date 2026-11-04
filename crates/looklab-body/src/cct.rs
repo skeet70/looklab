@@ -208,19 +208,16 @@ impl CameraProfile {
         self.color.iter().map(|entry| entry.illuminant)
     }
 
-    /// Camera-to-XYZ(D65) at `target`'s white, adapted from its calibration
-    /// illuminant. Without a `target` entry the lowest-temperature entry
-    /// serves both endpoints.
+    /// Camera-to-XYZ(D65) at `target`'s white for white-balanced camera RGB.
+    /// Interpolation follows DNG 1.6 chapter 6.
     pub fn matrix_at(&self, target: CalibrationIlluminant) -> Result<Mat3> {
-        let entry = self
-            .color
-            .iter()
-            .find(|entry| entry.illuminant == target)
-            .or_else(|| self.color.first())
-            .ok_or(BodyError::NoMatrices)?;
-        Ok(self
-            .spec
-            .camera_to_xyz_d65_at_white(entry.illuminant.xy())?)
+        let white = match self.color.as_slice() {
+            [] => return Err(BodyError::NoMatrices),
+            [single] => single.illuminant.xy(),
+            _ => target.xy(),
+        };
+        let matrix = self.spec.camera_to_xyz_d65_at_white(white)?;
+        balanced_input_matrix(matrix)
     }
 
     /// The profile's matrices for the two transformer endpoints.
@@ -230,6 +227,16 @@ impl CameraProfile {
             self.matrix_at(CalibrationIlluminant::D65)?,
         ))
     }
+}
+
+/// `m · diag(m⁻¹ · D65)` for white-balanced camera RGB; `DngInputTransform`
+/// in `looklab-export` applies the same conversion.
+fn balanced_input_matrix(m: Mat3) -> Result<Mat3> {
+    let inverse = m.inverse().ok_or(BodyError::Singular {
+        what: "camera profile",
+    })?;
+    let neutral = inverse.mul_vec(Illuminant::D65.xyz().to_array());
+    Ok(m.mul(&Mat3::diag(neutral)))
 }
 
 /// Camera-neutral tristimulus values from as-shot multipliers.
@@ -314,5 +321,31 @@ mod tests {
         let (a, d65) = profile.endpoints().expect("endpoints");
         assert_eq!(a, d65);
         assert_eq!(profile.color_illuminants().count(), 1);
+    }
+
+    #[test]
+    fn a_dual_illuminant_profile_without_a_or_d65_keeps_both_calibrations() {
+        let first = Mat3([[1.2, 0.1, 0.0], [0.05, 1.1, 0.02], [0.0, 0.1, 1.3]]);
+        let second = Mat3([[1.3, 0.0, 0.1], [0.0, 1.2, 0.05], [0.1, 0.0, 1.1]]);
+        let illuminants = [
+            (CalibrationIlluminant::D50, CalibrationIlluminant::D55),
+            (CalibrationIlluminant::A, CalibrationIlluminant::D55),
+        ];
+        for (cooler, warmer) in illuminants {
+            let profile = CameraProfile::new(vec![(cooler, first), (warmer, second)], Vec::new())
+                .expect("two colour matrices");
+            let (a, d65) = profile.endpoints().expect("endpoints");
+            assert_ne!(a, d65, "{cooler:?}/{warmer:?} repeats one calibration");
+            for (endpoint, matrix) in [("A", a), ("D65", d65)] {
+                let mapped = matrix.mul_vec([1.0; 3]);
+                let expected = Illuminant::D65.xyz().to_array();
+                for channel in 0..3 {
+                    assert!(
+                        (mapped[channel] - expected[channel]).abs() < 1e-9,
+                        "{cooler:?}/{warmer:?} {endpoint}: equal channels map to {mapped:?}"
+                    );
+                }
+            }
+        }
     }
 }

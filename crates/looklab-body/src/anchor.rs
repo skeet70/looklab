@@ -6,6 +6,8 @@
 //! Gauss-Newton Hessian for the fit to add to its objective;
 //! [`anchor_from_charts`] solves the posterior from endorsed sessions only.
 
+use looklab_color::xyy::xyz_to_xy;
+use looklab_model::solve::reference_white;
 use looklab_samples::{PatchId, PatchTable};
 use serde::{Deserialize, Serialize};
 
@@ -109,6 +111,12 @@ impl ChartSession {
                 f64::from(row.in_mean[2]),
             ]);
         }
+        let gain = exposure_gain(&rgb, &ids, &reference);
+        for value in &mut rgb {
+            for channel in value {
+                *channel *= gain;
+            }
+        }
         Ok(Self {
             cct,
             rgb,
@@ -143,6 +151,44 @@ impl ChartSession {
         self.rgb.iter().zip(&self.ids).filter_map(move |(rgb, id)| {
             self.reference.patch(*id).map(|xyz| (*rgb, xyz.to_array()))
         })
+    }
+}
+
+/// Chromaticity distance from the reference white that still counts as neutral.
+const NEUTRAL_CHROMA_TOLERANCE: f64 = 0.02;
+
+/// Scalar gain putting the neutral patches on the reference's perfect-diffuser
+/// scale. Homogeneous of degree -1 in `rgb`.
+fn exposure_gain(rgb: &[[f64; 3]], ids: &[PatchId], reference: &ChartReference) -> f64 {
+    let (white_x, white_y) = xyz_to_xy(reference_white());
+    let mut numerator = 0.0;
+    let mut denominator = 0.0;
+    let mut brightest = (0.0_f64, 0.0_f64);
+    for (value, id) in rgb.iter().zip(ids) {
+        let Some(xyz) = reference.patch(*id) else {
+            continue;
+        };
+        let measured = (value[0] + value[1] + value[2]) / 3.0;
+        let (x, y) = xyz_to_xy(xyz);
+        if (x - white_x).abs() + (y - white_y).abs() <= NEUTRAL_CHROMA_TOLERANCE {
+            numerator += measured * xyz.y;
+            denominator += measured * measured;
+        }
+        if xyz.y > brightest.1 {
+            brightest = (measured, xyz.y);
+        }
+    }
+    let gain = if denominator > 0.0 {
+        numerator / denominator
+    } else if brightest.0 > 0.0 {
+        brightest.1 / brightest.0
+    } else {
+        1.0
+    };
+    if gain.is_finite() && gain > 0.0 {
+        gain
+    } else {
+        1.0
     }
 }
 
@@ -249,17 +295,21 @@ pub fn anchor_from_charts(
         return Err(BodyError::NoEndorsedSessions);
     }
     let precision = prior.covariance().precision()?;
+    let prior_params = prior.delta().params();
     let evaluate = |delta: Delta6| {
         let transform = prior.with_delta(delta, prior.covariance());
         let mut terms = terms_over(&transform, &endorsed, options);
-        let params = delta.params();
+        let mut difference = [0.0_f64; PARAMETERS];
+        for (index, value) in delta.params().iter().enumerate() {
+            difference[index] = value - prior_params[index];
+        }
         let mut precision_times = [0.0_f64; PARAMETERS];
         let mut quadratic = 0.0;
         for row in 0..PARAMETERS {
             for column in 0..PARAMETERS {
-                precision_times[row] += precision[row][column] * params[column];
+                precision_times[row] += precision[row][column] * difference[column];
             }
-            quadratic += params[row] * precision_times[row];
+            quadratic += difference[row] * precision_times[row];
         }
         terms.value += 0.5 * quadratic;
         for index in 0..PARAMETERS {
@@ -363,6 +413,16 @@ mod tests {
         cct: Cct,
         endorsed: bool,
     ) -> ChartSession {
+        session_with(ssf, cct, 1.0, 1.0, endorsed)
+    }
+
+    fn session_with(
+        ssf: &crate::spectral::SpectralSensitivity,
+        cct: Cct,
+        exposure: f64,
+        weight: f64,
+        endorsed: bool,
+    ) -> ChartSession {
         let data = training_data();
         let responses = camera_responses(ssf, SsfIlluminant::D65, data).expect("positive white");
         let rows: Vec<PatchRow> = responses
@@ -370,7 +430,11 @@ mod tests {
             .enumerate()
             .map(|(index, rgb)| PatchRow {
                 id: PatchId::new(index as u16),
-                in_mean: [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32],
+                in_mean: [
+                    (rgb[0] * exposure) as f32,
+                    (rgb[1] * exposure) as f32,
+                    (rgb[2] * exposure) as f32,
+                ],
                 in_std: [0.0; 3],
                 out_mean: [0.0; 3],
                 out_std: [0.0; 3],
@@ -391,7 +455,7 @@ mod tests {
         } else {
             ChartReference::colorchecker24(cct)
         };
-        ChartSession::from_patch_table(&table, cct, reference, 1.0, endorsed)
+        ChartSession::from_patch_table(&table, cct, reference, weight, endorsed)
             .expect("reference covers every patch")
     }
 
@@ -413,10 +477,48 @@ mod tests {
         let session = session_for(&true_sensitivity(), Cct::D65, true);
         let solution =
             anchor_from_charts(&transform, &[session], &AnchorOptions::default()).expect("solves");
+        println!(
+            "anchoring: median {:.3} -> {:.3} dE",
+            solution.before.median, solution.after.median
+        );
         assert!(solution.after.median < solution.before.median);
         assert!(solution.after.median < 0.75 * solution.before.median);
         assert_eq!(solution.delta.matrix().mul_vec([1.0; 3]), [0.0; 3]);
         assert_eq!(solution.patches, training_data().patch_count());
+    }
+
+    #[test]
+    fn exposure_scaling_does_not_change_the_delta() {
+        let data = training_data();
+        let misspecified = synthetic_sensitivity(data.grid(), [610.0, 545.0, 455.0], 55.0);
+        let prior = prior_from_ssf(&misspecified, data).expect("well-formed");
+        let transform = InputTransform::prior(body(), TransformVersion::new(1), prior);
+        let unscaled = session_with(&true_sensitivity(), Cct::D65, 1.0, 1.0, true);
+        let scaled = session_with(&true_sensitivity(), Cct::D65, 2.5, 1.0, true);
+        let base =
+            anchor_from_charts(&transform, &[unscaled], &AnchorOptions::default()).expect("solves");
+        let exposed =
+            anchor_from_charts(&transform, &[scaled], &AnchorOptions::default()).expect("solves");
+        let base_params = base.delta.params();
+        let exposed_params = exposed.delta.params();
+        for (base, exposed) in base_params.iter().zip(exposed_params) {
+            assert!(
+                (base - exposed).abs() < 1e-9,
+                "{base_params:?} vs {exposed_params:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn re_anchoring_with_zero_weight_sessions_keeps_the_delta() {
+        let prior = prior_from_ssf(&true_sensitivity(), training_data()).expect("well-formed");
+        let delta = Delta6::new([0.02, -0.01, 0.015, -0.02, 0.01, 0.005]).expect("in range");
+        let transform = InputTransform::prior(body(), TransformVersion::new(1), prior)
+            .with_delta(delta, prior_covariance(A0Source::Dng));
+        let session = session_with(&true_sensitivity(), Cct::D65, 1.0, 0.0, true);
+        let solution =
+            anchor_from_charts(&transform, &[session], &AnchorOptions::default()).expect("solves");
+        assert_eq!(solution.delta, delta);
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! (docs/09 P4.1). Fixtures are CC0 samples from raw.pixls.us.
 #![allow(clippy::disallowed_methods)]
 
-use looklab_body::{CameraProfile, Cct, estimate_cct};
+use looklab_body::{CameraProfile, Cct, estimate_cct, prior_from_dng};
+use looklab_color::xyy::Illuminant;
 use looklab_raw::{DecodedRaw, RawDecoder, RawlerDecoder};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -68,6 +69,17 @@ fn check(name: &str) {
     assert!(Cct::from_kelvin(cct.kelvin()).is_ok());
 }
 
+fn assert_neutral_to_d65(name: &str, endpoint: &str, matrix: &looklab_color::Mat3) {
+    let mapped = matrix.mul_vec([1.0; 3]);
+    let expected = Illuminant::D65.xyz().to_array();
+    for channel in 0..3 {
+        assert!(
+            (mapped[channel] - expected[channel]).abs() < 1e-9,
+            "{name} {endpoint}: equal channels map to {mapped:?}, expected {expected:?}"
+        );
+    }
+}
+
 #[test]
 fn canon_eos_60d_cct_matches_the_reference() {
     check("canon-eos-60d.dng");
@@ -76,4 +88,17 @@ fn canon_eos_60d_cct_matches_the_reference() {
 #[test]
 fn fujifilm_x_s10_cct_matches_the_reference() {
     check("fujifilm-x-s10.raf");
+}
+
+#[test]
+fn dng_prior_maps_equal_camera_channels_to_d65() {
+    for name in ["canon-eos-60d.dng", "fujifilm-x-s10.raf"] {
+        let image = decode(name);
+        let profile =
+            CameraProfile::from_raw(image.color_matrices.as_ref().expect("colour matrices"))
+                .expect("supported calibration illuminants");
+        let prior = prior_from_dng(&profile).expect("dng prior");
+        assert_neutral_to_d65(name, "A", &prior.a0_a);
+        assert_neutral_to_d65(name, "D65", &prior.a0_d65);
+    }
 }
