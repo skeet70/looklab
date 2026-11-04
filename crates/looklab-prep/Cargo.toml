@@ -14,6 +14,7 @@ test-seeds = []
 [dependencies]
 looklab-color.workspace = true
 looklab-meta.workspace = true
+looklab-model.workspace = true
 looklab-raw.workspace = true
 looklab-samples.workspace = true
 getrandom.workspace = true

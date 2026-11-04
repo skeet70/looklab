@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Density sampling in CAM16 `(s, h, √C)` and the shuffle, [docs/03 §2.1 steps 6 and 8](../../../docs/03-data-model.md). A re-render group calls [`select_pixels`] once on its RAW.
+//! Density sampling in the model's `(s, h_in, √C_in)` coordinates and the shuffle, [docs/03 §2.1 steps 6 and 8](../../../docs/03-data-model.md). A re-render group calls [`select_pixels`] once on its RAW.
 
 use looklab_color::Xyz;
-use looklab_color::cam16::{Cam16Model, ViewingConditions};
 use looklab_color::linalg::Mat3;
+use looklab_model::LookInput;
 use rand_chacha::ChaCha20Rng;
 use rand_chacha::rand_core::RngCore;
 use serde::{Deserialize, Serialize};
@@ -14,33 +14,32 @@ use crate::mask::Mask;
 
 pub const MAX_DENSITY_SAMPLES: u32 = 50_000;
 
-/// CAM16 saturation range used for binning; correlates above 100 clamp to the
-/// last bin.
-const SATURATION_MAX: f64 = 100.0;
-/// CAM16 hue runs `[0, 360)` degrees.
+const EXPOSURE_MIN: f64 = -12.0;
+const EXPOSURE_MAX: f64 = 6.0;
+/// CAM16-UCS hue runs `[0, 360)` degrees.
 const HUE_MAX: f64 = 360.0;
-/// `√C` for CAM16 chroma `C` in `0..=100`.
+/// `√C_in` for UCS chroma `C_in` in `0..=100`.
 const ROOT_CHROMA_MAX: f64 = 10.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SampleParams {
     /// At most [`MAX_DENSITY_SAMPLES`].
     pub max_samples: u32,
-    pub saturation_bins: u32,
+    pub exposure_bins: u32,
     pub hue_bins: u32,
     pub root_chroma_bins: u32,
-    /// Lower bound on a bin's sampling weight.
-    pub bin_weight_floor: f32,
+    /// Upper cap on a pixel's inverse-occupancy sampling weight, in `(0, 1]`.
+    pub max_bin_weight: f32,
 }
 
 impl Default for SampleParams {
     fn default() -> Self {
         Self {
             max_samples: MAX_DENSITY_SAMPLES,
-            saturation_bins: 20,
+            exposure_bins: 18,
             hue_bins: 36,
             root_chroma_bins: 20,
-            bin_weight_floor: 0.1,
+            max_bin_weight: 0.5,
         }
     }
 }
@@ -53,20 +52,20 @@ impl SampleParams {
             });
         }
         for (field, bins) in [
-            ("saturation_bins", self.saturation_bins),
+            ("exposure_bins", self.exposure_bins),
             ("hue_bins", self.hue_bins),
             ("root_chroma_bins", self.root_chroma_bins),
         ] {
-            if bins == 0 || bins > 512 {
+            if bins == 0 || bins > 256 {
                 return Err(PrepError::InvalidParams { field });
             }
         }
-        if !(self.bin_weight_floor.is_finite()
-            && self.bin_weight_floor > 0.0
-            && self.bin_weight_floor <= 1.0)
+        if !(self.max_bin_weight.is_finite()
+            && self.max_bin_weight > 0.0
+            && self.max_bin_weight <= 1.0)
         {
             return Err(PrepError::InvalidParams {
-                field: "bin_weight_floor",
+                field: "max_bin_weight",
             });
         }
         Ok(())
@@ -94,14 +93,14 @@ impl PixelSelection {
         &self.indices
     }
 
-    /// Inverse selection probability, normalised to mean 1 over the selection.
+    /// Inverse inclusion probability of each selected pixel, at least 1.
     pub fn density_w(&self) -> &[f32] {
         &self.density_w
     }
 }
 
 struct Grid {
-    saturation: u32,
+    exposure: u32,
     hue: u32,
     root_chroma: u32,
 }
@@ -109,26 +108,26 @@ struct Grid {
 impl Grid {
     fn new(params: &SampleParams) -> Self {
         Self {
-            saturation: params.saturation_bins,
+            exposure: params.exposure_bins,
             hue: params.hue_bins,
             root_chroma: params.root_chroma_bins,
         }
     }
 
     fn len(&self) -> usize {
-        (self.saturation * self.hue * self.root_chroma) as usize
+        (self.exposure * self.hue * self.root_chroma) as usize
     }
 
-    fn index(&self, saturation: f64, hue: f64, root_chroma: f64) -> usize {
-        let s = bin(saturation, SATURATION_MAX, self.saturation);
-        let h = bin(hue, HUE_MAX, self.hue);
-        let c = bin(root_chroma, ROOT_CHROMA_MAX, self.root_chroma);
+    fn index(&self, exposure: f64, hue: f64, root_chroma: f64) -> usize {
+        let s = bin(exposure, EXPOSURE_MIN, EXPOSURE_MAX, self.exposure);
+        let h = bin(hue, 0.0, HUE_MAX, self.hue);
+        let c = bin(root_chroma, 0.0, ROOT_CHROMA_MAX, self.root_chroma);
         (s * self.hue as usize + h) * self.root_chroma as usize + c
     }
 }
 
-fn bin(value: f64, max: f64, count: u32) -> usize {
-    let scaled = value / max * f64::from(count);
+fn bin(value: f64, min: f64, max: f64, count: u32) -> usize {
+    let scaled = (value - min) / (max - min) * f64::from(count);
     let index = scaled.floor();
     if !index.is_finite() || index <= 0.0 {
         0
@@ -139,7 +138,7 @@ fn bin(value: f64, max: f64, count: u32) -> usize {
     }
 }
 
-/// Samples up to `max_samples` kept pixels with probability proportional to the inverse occupancy of their `(s, h, √C)` bin, then shuffles. `xyz_from_camera` is the prior transform at the image's CCT.
+/// Includes each candidate independently, with probability proportional to the inverse occupancy of its `(s, h_in, √C_in)` bin capped at `max_bin_weight`.
 pub fn select_pixels(
     image: &Image3,
     mask: &Mask,
@@ -151,11 +150,10 @@ pub fn select_pixels(
     debug_assert_eq!(mask.keep().len(), image.data.len());
 
     let grid = Grid::new(params);
-    let model = Cam16Model::new(&ViewingConditions::reference());
     let mut occupancy = vec![0u32; grid.len()];
     let mut candidates: Vec<(usize, usize)> = Vec::new();
     for index in mask.indices() {
-        let Some(bin) = bin_of(&image.data[index], xyz_from_camera, &model, &grid) else {
+        let Some(bin) = bin_of(&image.data[index], xyz_from_camera, &grid) else {
             continue;
         };
         occupancy[bin] += 1;
@@ -165,40 +163,43 @@ pub fn select_pixels(
         return Err(PrepError::NoSamples);
     }
 
-    let mut keys: Vec<(f64, usize, usize)> = Vec::with_capacity(candidates.len());
-    for (index, bin) in candidates {
-        let weight = (1.0 / f64::from(occupancy[bin])).max(f64::from(params.bin_weight_floor));
-        // Efraimidis-Spirakis weighted sampling without replacement, IPL 97(5), 2006.
-        let key = libm::pow(uniform_open_closed(rng), 1.0 / weight);
-        keys.push((key, index, bin));
-    }
-    keys.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    keys.truncate(params.max_samples as usize);
-    keys.sort_by_key(|(_, index, _)| *index);
+    let cap = f64::from(params.max_bin_weight);
+    let weight_of = |bin: usize| (1.0 / f64::from(occupancy[bin])).min(cap);
+    let total: f64 = candidates.iter().map(|(_, bin)| weight_of(*bin)).sum();
 
-    let mut mean = 0.0;
-    for (_, _, bin) in &keys {
-        mean += f64::from(occupancy[*bin]);
+    let max_samples = params.max_samples as usize;
+    let mut selected: Vec<(usize, f32)> = Vec::new();
+    if candidates.len() <= max_samples {
+        selected.extend(candidates.iter().map(|(index, _)| (*index, 1.0)));
+    } else {
+        let budget = max_samples as f64;
+        for (index, bin) in &candidates {
+            let probability = (budget * weight_of(*bin) / total).clamp(f64::MIN_POSITIVE, 1.0);
+            if uniform_open_closed(rng) < probability {
+                let weight = (1.0 / probability) as f32;
+                selected.push((
+                    *index,
+                    weight.clamp(1.0, looklab_samples::MAX_DENSITY_WEIGHT),
+                ));
+            }
+        }
     }
-    mean /= keys.len() as f64;
-    let mut indices = Vec::with_capacity(keys.len());
-    let mut density_w = Vec::with_capacity(keys.len());
-    for (_, index, bin) in keys {
+    if selected.is_empty() {
+        return Err(PrepError::NoSamples);
+    }
+    selected.sort_by_key(|(index, _)| *index);
+
+    let mut indices = Vec::with_capacity(selected.len());
+    let mut density_w = Vec::with_capacity(selected.len());
+    for (index, weight) in selected {
         indices.push(index);
-        let weight = (f64::from(occupancy[bin]) / mean) as f32;
-        density_w.push(weight.clamp(f32::MIN_POSITIVE, looklab_samples::MAX_DENSITY_WEIGHT));
+        density_w.push(weight);
     }
-
     shuffle(&mut indices, &mut density_w, rng);
     Ok(PixelSelection { indices, density_w })
 }
 
-fn bin_of(
-    rgb: &[f32; 3],
-    xyz_from_camera: &Mat3,
-    model: &Cam16Model,
-    grid: &Grid,
-) -> Option<usize> {
+fn bin_of(rgb: &[f32; 3], xyz_from_camera: &Mat3, grid: &Grid) -> Option<usize> {
     if !rgb.iter().all(|channel| channel.is_finite()) {
         return None;
     }
@@ -207,11 +208,11 @@ fn bin_of(
     if ![xyz.x, xyz.y, xyz.z].iter().all(|value| value.is_finite()) {
         return None;
     }
-    let cam = model.xyz_to_cam16(xyz);
-    if !cam.s.is_finite() || !cam.h.is_finite() || !cam.c.is_finite() || cam.c < 0.0 {
+    let input = LookInput::new(xyz);
+    if !input.s.is_finite() || !input.h_in.is_finite() || !input.c_in.is_finite() {
         return None;
     }
-    Some(grid.index(cam.s, cam.h, cam.c.sqrt()))
+    Some(grid.index(input.s, input.h_in, input.c_in.sqrt()))
 }
 
 /// Uniform in `(0, 1]`.

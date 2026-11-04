@@ -122,11 +122,26 @@ impl Alignment {
         jpeg_w: u32,
         jpeg_h: u32,
     ) -> (f64, f64) {
+        let (sin, cos) = (libm::sin(self.rotation_rad), libm::cos(self.rotation_rad));
+        self.raw_to_jpeg_with(x, y, raw_w, raw_h, jpeg_w, jpeg_h, sin, cos)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn raw_to_jpeg_with(
+        &self,
+        x: f64,
+        y: f64,
+        raw_w: u32,
+        raw_h: u32,
+        jpeg_w: u32,
+        jpeg_h: u32,
+        sin: f64,
+        cos: f64,
+    ) -> (f64, f64) {
         let (raw_cx, raw_cy) = centre(raw_w, raw_h);
         let (u, v) = (ratio(x, raw_cx, raw_w), ratio(y, raw_cy, raw_h));
         let (a, b) = self.undistort(u, v);
         let (qx, qy) = (a - self.tx, b - self.ty);
-        let (sin, cos) = (libm::sin(self.rotation_rad), libm::cos(self.rotation_rad));
         let inverse_scale = if self.scale.abs() > 1e-12 {
             1.0 / self.scale
         } else {
@@ -194,11 +209,12 @@ pub fn align(
     alignment.gain = fit_gain(&gain_samples(raw_wb_linear, jpeg, &alignment));
 
     let (u, v) = normalized_coords(grid, grid);
-    let (central_correlation, central_count) =
+    let (central_correlation, central_count, central_eligible) =
         correlation_at(raw_wb_linear, &jpeg_luma, &alignment, &u, &v)
             .ok_or(PrepError::AlignNoOverlap)?;
-    let total = u.len();
-    if central_count == 0 || (central_count as f64) < params.min_overlap_fraction * total as f64 {
+    if central_count == 0
+        || (central_count as f64) < params.min_overlap_fraction * central_eligible as f64
+    {
         return Err(PrepError::AlignNoOverlap);
     }
     if central_correlation < params.min_central_correlation {
@@ -421,7 +437,7 @@ fn seed_alignment(
             central_correlation: f64::NEG_INFINITY,
             residual_px: 0.0,
         };
-        if let Some((correlation, count)) = correlation_at(raw, &jpeg_coarse, &candidate, &u, &v)
+        if let Some((correlation, count, _)) = correlation_at(raw, &jpeg_coarse, &candidate, &u, &v)
             && count > 0
             && correlation > best.central_correlation
         {
@@ -548,15 +564,17 @@ fn correlation_at(
     alignment: &Alignment,
     u: &[f64],
     v: &[f64],
-) -> Option<(f64, usize)> {
+) -> Option<(f64, usize, usize)> {
     let (cx, cy) = centre(raw.width, raw.height);
     let (max_x, max_y) = (f64::from(raw.width - 1), f64::from(raw.height - 1));
     let mut raw_values = Vec::new();
     let mut jpeg_values = Vec::new();
+    let mut eligible = 0usize;
     for index in 0..u.len() {
         if u[index].abs() > 0.5 || v[index].abs() > 0.5 {
             continue;
         }
+        eligible += 1;
         let (a, b) = alignment.linear(u[index], v[index]);
         let (ad, bd) = alignment.distort(a, b);
         let x = cx + ad * cx;
@@ -589,7 +607,7 @@ fn correlation_at(
     if var_raw <= 0.0 || var_jpeg <= 0.0 {
         return None;
     }
-    Some((covariance / (var_raw * var_jpeg).sqrt(), count))
+    Some((covariance / (var_raw * var_jpeg).sqrt(), count, eligible))
 }
 
 fn parameter_step(parameter: usize, alignment: Alignment) -> f64 {
@@ -1047,11 +1065,11 @@ fn fit_gain_with_tone(samples: &[GainSample]) -> ([f64; 3], Option<ToneMap>) {
     if samples.len() < 64 {
         return ([0.0_f64; 3], None);
     }
-    let reduced: Vec<GainSample> = samples.iter().step_by(4).copied().collect();
+    let reduced: Vec<GainSample> = samples.iter().step_by(8).copied().collect();
     let mut gain = [0.0_f64; 3];
     let mut best = spline_tone_sse(&reduced, &gain);
     let mut step = 0.2_f64;
-    for _ in 0..60 {
+    for _ in 0..30 {
         let mut improved = false;
         for index in 0..3 {
             for sign in [1.0_f64, -1.0] {
@@ -1067,7 +1085,7 @@ fn fit_gain_with_tone(samples: &[GainSample]) -> ([f64; 3], Option<ToneMap>) {
         }
         if !improved {
             step *= 0.5;
-            if step < 1e-4 {
+            if step < 1e-3 {
                 break;
             }
         }
@@ -1232,12 +1250,15 @@ fn solve3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
 }
 
 fn block_residual(raw: &Image3, jpeg: &Image3, alignment: &Alignment) -> f64 {
-    const BLOCK: usize = 32;
-    const STEP: usize = 24;
+    const BLOCK: usize = 64;
+    const STEP: usize = 64;
     let width = raw.width as usize;
     let height = raw.height as usize;
-    let mut sum = 0.0;
-    let mut count = 0usize;
+    let mut shifts: Vec<f64> = Vec::new();
+    let (sin, cos) = (
+        libm::sin(alignment.rotation_rad),
+        libm::cos(alignment.rotation_rad),
+    );
     let mut y = 0;
     while y + BLOCK <= height {
         let mut x = 0;
@@ -1252,13 +1273,15 @@ fn block_residual(raw: &Image3, jpeg: &Image3, alignment: &Alignment) -> f64 {
                     let raw_pixel = raw
                         .pixel((x + px) as u32, (y + py) as u32)
                         .expect("block is inside the image");
-                    let (jx, jy) = alignment.raw_to_jpeg(
+                    let (jx, jy) = alignment.raw_to_jpeg_with(
                         sx,
                         sy,
                         raw.width,
                         raw.height,
                         jpeg.width,
                         jpeg.height,
+                        sin,
+                        cos,
                     );
                     let Some(jpeg_pixel) = jpeg.sample_bilinear(jx, jy) else {
                         valid = false;
@@ -1276,13 +1299,36 @@ fn block_residual(raw: &Image3, jpeg: &Image3, alignment: &Alignment) -> f64 {
                 }
             }
             if valid {
-                let variance_a = variance(&a);
-                let variance_b = variance(&b);
-                if variance_a > 1e-10 && variance_b > 1e-10 {
-                    let (dx, dy, quality) = phase_correlation(&a, &b, BLOCK, BLOCK);
-                    if quality > 0.02 && dx.abs() <= 4.0 && dy.abs() <= 4.0 {
-                        sum += dx * dx + dy * dy;
-                        count += 1;
+                let mean_a = mean(&a);
+                let mean_b = mean(&b);
+                let std_a = variance(&a).sqrt();
+                let std_b = variance(&b).sqrt();
+                if std_a > 1e-6 && std_b > 1e-6 {
+                    let mut normal = [[0.0_f64; 2]; 2];
+                    let mut gradient = [0.0_f64; 2];
+                    for py in 1..BLOCK - 1 {
+                        for px in 1..BLOCK - 1 {
+                            let index = py * BLOCK + px;
+                            let ix = (a[index + 1] - a[index - 1]) * 0.5 / std_a;
+                            let iy = (a[index + BLOCK] - a[index - BLOCK]) * 0.5 / std_a;
+                            let it = (b[index] - mean_b) / std_b - (a[index] - mean_a) / std_a;
+                            normal[0][0] += ix * ix;
+                            normal[0][1] += ix * iy;
+                            normal[1][1] += iy * iy;
+                            gradient[0] -= ix * it;
+                            gradient[1] -= iy * it;
+                        }
+                    }
+                    let determinant = normal[0][0] * normal[1][1] - normal[0][1] * normal[0][1];
+                    if determinant > 1e-6 {
+                        let dx =
+                            (gradient[0] * normal[1][1] - gradient[1] * normal[0][1]) / determinant;
+                        let dy =
+                            (normal[0][0] * gradient[1] - normal[0][1] * gradient[0]) / determinant;
+                        let shift = libm::hypot(dx, dy);
+                        if shift.is_finite() && shift < 2.0 {
+                            shifts.push(shift);
+                        }
                     }
                 }
             }
@@ -1290,10 +1336,11 @@ fn block_residual(raw: &Image3, jpeg: &Image3, alignment: &Alignment) -> f64 {
         }
         y += STEP;
     }
-    if count == 0 {
+    if shifts.is_empty() {
         0.0
     } else {
-        (sum / count as f64).sqrt()
+        shifts.sort_unstable_by(f64::total_cmp);
+        shifts[shifts.len() / 2]
     }
 }
 
@@ -1307,8 +1354,8 @@ mod tests {
 
     const RAW_WIDTH: u32 = 900;
     const RAW_HEIGHT: u32 = 600;
-    const JPEG_WIDTH: u32 = 720;
-    const JPEG_HEIGHT: u32 = 480;
+    const JPEG_WIDTH: u32 = 900;
+    const JPEG_HEIGHT: u32 = 600;
     const TRUE_GAIN: [f64; 3] = [0.25, 0.05, 0.0];
 
     fn scene(u: f64, v: f64) -> [f64; 3] {
@@ -1377,8 +1424,8 @@ mod tests {
         }
         let raw = Image3::new(width, height, raw_data).expect("raw image");
 
-        let jpeg_width = width * 4 / 5;
-        let jpeg_height = height * 4 / 5;
+        let jpeg_width = width;
+        let jpeg_height = height;
         let mut linear = Vec::with_capacity((jpeg_width * jpeg_height) as usize);
         for y in 0..jpeg_height {
             for x in 0..jpeg_width {
@@ -1435,18 +1482,16 @@ mod tests {
         decode_jpeg(&encoded).expect("decode JPEG")
     }
 
-    fn mapping_error(fit: &Alignment) -> f64 {
+    fn mapping_error(fit: &Alignment, jpeg_w: u32, jpeg_h: u32, raw_w: u32, raw_h: u32) -> f64 {
         let truth = ground_truth();
         let mut sum = 0.0;
         let mut count = 0usize;
         for iy in 2..=14 {
             for ix in 2..=14 {
-                let x = f64::from(ix) * f64::from(JPEG_WIDTH - 1) / 16.0;
-                let y = f64::from(iy) * f64::from(JPEG_HEIGHT - 1) / 16.0;
-                let (tx, ty) =
-                    truth.jpeg_to_raw(x, y, JPEG_WIDTH, JPEG_HEIGHT, RAW_WIDTH, RAW_HEIGHT);
-                let (ax, ay) =
-                    fit.jpeg_to_raw(x, y, JPEG_WIDTH, JPEG_HEIGHT, RAW_WIDTH, RAW_HEIGHT);
+                let x = f64::from(ix) * f64::from(jpeg_w - 1) / 16.0;
+                let y = f64::from(iy) * f64::from(jpeg_h - 1) / 16.0;
+                let (tx, ty) = truth.jpeg_to_raw(x, y, jpeg_w, jpeg_h, raw_w, raw_h);
+                let (ax, ay) = fit.jpeg_to_raw(x, y, jpeg_w, jpeg_h, raw_w, raw_h);
                 sum += (tx - ax) * (tx - ax) + (ty - ay) * (ty - ay);
                 count += 1;
             }
@@ -1475,10 +1520,10 @@ mod tests {
     fn recovers_geometry_and_gain_from_a_synthetic_pair() {
         let (raw, jpeg) = make_pair(RAW_WIDTH, RAW_HEIGHT, true);
         let alignment = align(&raw, &jpeg, &AlignParams::default()).expect("alignment");
+        let error = mapping_error(&alignment, JPEG_WIDTH, JPEG_HEIGHT, RAW_WIDTH, RAW_HEIGHT);
         assert!(
-            mapping_error(&alignment) < 0.3,
-            "mapping error {}, alignment {alignment:?}",
-            mapping_error(&alignment)
+            error < 0.3,
+            "mapping error {error}, alignment {alignment:?}"
         );
         assert!(alignment.central_correlation >= 0.98);
         assert!((alignment.gain[0] - TRUE_GAIN[0]).abs() < 0.08);
@@ -1529,10 +1574,12 @@ mod tests {
         let started = std::time::Instant::now();
         let alignment = align(&raw, &jpeg, &AlignParams::default()).expect("alignment");
         let elapsed = started.elapsed();
+        let error = mapping_error(&alignment, 1200, 800, 1500, 1000);
         println!(
-            "align 1.5 MP: {elapsed:?}, correlation {}, residual {} px",
+            "align 1.5 MP: {elapsed:?}, correlation {}, residual {} px, mapping error {error} px",
             alignment.central_correlation, alignment.residual_px
         );
         assert!(alignment.central_correlation >= 0.98);
+        assert!(error < 0.3);
     }
 }

@@ -288,25 +288,49 @@ impl DngColorSpec {
         Self::matrix_at(&self.forward_matrices, self.interpolation_fraction(cct))
     }
 
-    /// Camera RGB to XYZ adapted to D65 at `cct`.
-    ///
-    /// A single-matrix profile uses its own calibration temperature, because it
-    /// carries no second illuminant to interpolate towards.
+    /// The Planckian white at `cct` is used for adaptation.
     pub fn camera_to_xyz_d65(&self, cct: f64) -> Result<Mat3, DngError> {
-        let effective_cct = if self.color_matrices.len() == 1 {
-            self.color_matrices[0].cct
-        } else {
-            cct
-        };
-        if !effective_cct.is_finite() || effective_cct <= 0.0 {
+        if !cct.is_finite() || cct <= 0.0 {
             return Err(DngError::InvalidTemperature);
         }
-        let color_matrix = self
-            .xyz_to_camera(effective_cct)
-            .ok_or(DngError::NoMatrices)?;
-        let source_white = xy_to_xyz(cct_to_xy_robertson(effective_cct));
-        if let Some(forward) = self.forward_matrix(effective_cct) {
-            let reference = color_matrix.mul_vec(source_white.to_array());
+        self.camera_to_xyz_d65_at_white(cct_to_xy_robertson(cct))
+    }
+
+    /// `cct` interpolates the matrices only; adaptation uses `xy`, so tinted
+    /// neutrals are preserved.
+    pub fn camera_to_xyz_d65_at_white(&self, xy: (f64, f64)) -> Result<Mat3, DngError> {
+        self.camera_to_xyz_d65_inner(xy, None)
+    }
+
+    /// Camera RGB to XYZ(D65) adapted from the solved white `xy`, scaling the
+    /// forward-matrix path by the measured camera `neutral`.
+    pub fn camera_to_xyz_d65_from_neutral(
+        &self,
+        neutral: [f64; 3],
+        xy: (f64, f64),
+    ) -> Result<Mat3, DngError> {
+        if !neutral.iter().all(|value| value.is_finite()) {
+            return Err(DngError::InvalidTemperature);
+        }
+        self.camera_to_xyz_d65_inner(xy, Some(neutral))
+    }
+
+    fn camera_to_xyz_d65_inner(
+        &self,
+        xy: (f64, f64),
+        neutral: Option<[f64; 3]>,
+    ) -> Result<Mat3, DngError> {
+        if !xy.0.is_finite() || !xy.1.is_finite() {
+            return Err(DngError::InvalidTemperature);
+        }
+        let cct = xy_to_cct_robertson(xy.0, xy.1);
+        let color_matrix = self.xyz_to_camera(cct).ok_or(DngError::NoMatrices)?;
+        let source_white = xy_to_xyz(xy);
+        if let Some(forward) = self.forward_matrix(cct) {
+            let reference = match neutral {
+                Some(neutral) => normalize_neutral(neutral),
+                None => color_matrix.mul_vec(source_white.to_array()),
+            };
             let mut scale = [1.0_f64; 3];
             for index in 0..3 {
                 if reference[index].abs() > 1e-12 {
@@ -351,13 +375,30 @@ impl DngColorSpec {
     }
 
     /// Neutral solve followed by the camera-to-XYZ(D65) transform at the
-    /// solved CCT.
+    /// solved white, scaling the forward path by `neutral`.
     pub fn from_neutral(&self, neutral: [f64; 3]) -> Result<CameraToXyzD65, DngError> {
         let xy = self.neutral_to_xy(neutral)?;
         let cct = xy_to_cct_robertson(xy.0, xy.1);
-        let matrix = self.camera_to_xyz_d65(cct)?;
+        let matrix = self.camera_to_xyz_d65_from_neutral(neutral, xy)?;
         Ok(CameraToXyzD65 { cct, xy, matrix })
     }
+}
+
+fn normalize_neutral(mut neutral: [f64; 3]) -> [f64; 3] {
+    let reference = if neutral[1].abs() > 1e-12 {
+        neutral[1]
+    } else {
+        neutral
+            .iter()
+            .copied()
+            .fold(0.0_f64, |max, value| max.max(value.abs()))
+    };
+    if reference.abs() > 1e-12 {
+        for value in &mut neutral {
+            *value /= reference;
+        }
+    }
+    neutral
 }
 
 fn add_scaled(a: Mat3, b: Mat3, wa: f64, wb: f64) -> Mat3 {
@@ -423,6 +464,32 @@ mod tests {
     }
 
     #[test]
+    fn tinted_neutrals_with_the_same_cct_use_their_solved_xy() {
+        let spec = x_s10();
+        let base = cct_to_xy_robertson(5_000.0);
+        let tinted = (base.0 + 0.003, base.1 + 0.002);
+        let mut matrices = Vec::new();
+        for xy in [base, tinted] {
+            let cct = xy_to_cct_robertson(xy.0, xy.1);
+            let color = spec.xyz_to_camera(cct).expect("matrix");
+            let neutral = color.mul_vec(xy_to_xyz(xy).to_array());
+            matrices.push(
+                spec.camera_to_xyz_d65_from_neutral(neutral, xy)
+                    .expect("transform"),
+            );
+        }
+        assert_ne!(matrices[0], matrices[1]);
+        for (matrix, xy) in matrices.iter().zip([base, tinted]) {
+            let cct = xy_to_cct_robertson(xy.0, xy.1);
+            let color = spec.xyz_to_camera(cct).expect("matrix");
+            let camera = color.mul_vec(xy_to_xyz(xy).to_array());
+            let white = xyz_to_xy(Xyz::from_array(matrix.mul_vec(camera)));
+            assert!((white.0 - Illuminant::D65.xy().0).abs() < 2.0e-3);
+            assert!((white.1 - Illuminant::D65.xy().1).abs() < 2.0e-3);
+        }
+    }
+
+    #[test]
     fn camera_to_xyz_is_invertible_and_d65_relative() {
         let spec = x_s10();
         let matrix = spec.camera_to_xyz_d65(6_500.0).expect("matrix");
@@ -446,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn single_matrix_falls_back_to_its_calibration_white() {
+    fn single_matrix_follows_scene_white() {
         let matrix = Mat3([[1.4, -0.6, -0.1], [-0.4, 1.2, 0.2], [-0.05, 0.13, 0.6]]);
         let spec = DngColorSpec::new(
             vec![CalibrationMatrix::new(6_500.0, matrix).expect("temperature")],

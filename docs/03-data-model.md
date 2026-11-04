@@ -219,7 +219,7 @@ epochs:
 3. **Align.** Similarity + radial distortion via multi-scale phase correlation, then LM refinement on normalized cross-correlation. Reject if central correlation < 0.98.
 4. **Downsample** to ~1.5 MP (area average).
 5. **Mask:** clipped RAW channels (≥ 0.98 of white), local gradient above the 90th percentile, 3% border, chart/pattern regions (handled separately).
-6. **Density sampling** in `(s, h_in, √C_in)` using the body's prior transform at the image's CCT. Up to N = 50,000 samples, probability ∝ 1/bin_count (capped). Store `density_w`.
+6. **Density sampling** in `(s, h_in, √C_in)` using the body's prior transform at the image's CCT, where `s = log2(Y/0.18)` clamped to [−12, +6] and `(h_in, √C_in)` come from CAM16-UCS of the chromaticity scaled to Y = 0.18 ([02 §3](02-color-pipeline.md)). Up to N = 50,000 samples, inclusion probability ∝ 1/bin_count (capped). Store `density_w`, the inverse inclusion probability of the actual selection (1.0 when every candidate is selected); the fit consumes it as a sample weight.
 7. **Re-render groups:** for JPEGs rendered in camera from the same RAW, sample **one shared pixel set** and apply **one shared shuffle**. The members' `in_rgb` columns are then identical. That gives the control-response fit exactly matched inputs, and lets a future server-side check confirm groups without any RAW hash.
 8. **Shuffle.** No spatial information leaves.
 

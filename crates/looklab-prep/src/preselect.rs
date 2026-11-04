@@ -4,13 +4,15 @@
 use std::borrow::Cow;
 
 use looklab_color::Xyz;
-use looklab_color::cam16::{Cam16Model, ViewingConditions};
 use looklab_color::spaces::RgbSpace;
+use looklab_model::LookInput;
 use serde::{Deserialize, Serialize};
 
+use crate::error::PrepError;
 use crate::image::Image3;
 
-const SATURATION_MAX: f64 = 100.0;
+const EXPOSURE_MIN: f64 = -12.0;
+const EXPOSURE_MAX: f64 = 6.0;
 const HUE_MAX: f64 = 360.0;
 const ROOT_CHROMA_MAX: f64 = 10.0;
 
@@ -18,7 +20,7 @@ const ROOT_CHROMA_MAX: f64 = 10.0;
 pub struct PreselectOptions {
     /// Default 100 per body/sim group.
     pub max_selected: usize,
-    pub saturation_bins: u32,
+    pub exposure_bins: u32,
     pub hue_bins: u32,
     pub root_chroma_bins: u32,
     /// Larger thumbnails are area-averaged down to this many pixels first.
@@ -31,13 +33,59 @@ impl Default for PreselectOptions {
     fn default() -> Self {
         Self {
             max_selected: 100,
-            saturation_bins: 10,
-            hue_bins: 12,
-            root_chroma_bins: 10,
+            exposure_bins: 18,
+            hue_bins: 36,
+            root_chroma_bins: 20,
             thumbnail_max_pixels: 4096,
             preview_space: RgbSpace::Srgb,
         }
     }
+}
+
+impl PreselectOptions {
+    pub fn validate(&self) -> Result<(), PrepError> {
+        if self.max_selected > 65_536 {
+            return Err(PrepError::InvalidParams {
+                field: "max_selected",
+            });
+        }
+        for (field, bins) in [
+            ("exposure_bins", self.exposure_bins),
+            ("hue_bins", self.hue_bins),
+            ("root_chroma_bins", self.root_chroma_bins),
+        ] {
+            if bins == 0 || bins > 256 {
+                return Err(PrepError::InvalidParams { field });
+            }
+        }
+        total_bins(self)?;
+        if self.thumbnail_max_pixels == 0 {
+            return Err(PrepError::InvalidParams {
+                field: "thumbnail_max_pixels",
+            });
+        }
+        Ok(())
+    }
+}
+
+fn total_bins(options: &PreselectOptions) -> Result<usize, PrepError> {
+    let total = usize::try_from(options.exposure_bins)
+        .ok()
+        .and_then(|exposure| {
+            usize::try_from(options.hue_bins)
+                .ok()
+                .and_then(|hue| exposure.checked_mul(hue))
+        })
+        .and_then(|partial| {
+            usize::try_from(options.root_chroma_bins)
+                .ok()
+                .and_then(|chroma| partial.checked_mul(chroma))
+        })
+        .filter(|total| *total <= 1 << 20)
+        .ok_or(PrepError::InvalidParams {
+            field: "preselect_bins",
+        })?;
+    Ok(total)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,11 +95,12 @@ pub struct CoveragePool {
 }
 
 impl CoveragePool {
-    pub fn new(options: PreselectOptions) -> Self {
-        Self {
-            occupied: vec![false; total_bins(&options)],
+    pub fn new(options: PreselectOptions) -> Result<Self, PrepError> {
+        options.validate()?;
+        Ok(Self {
+            occupied: vec![false; total_bins(&options)?],
             options,
-        }
+        })
     }
 
     pub fn total_bins(&self) -> usize {
@@ -64,7 +113,7 @@ impl CoveragePool {
 
     /// Expected reduction in empty coverage bins, in `0.0..=1.0`.
     pub fn gain(&self, thumbnail: &Image3) -> f64 {
-        histogram(thumbnail, &self.options)
+        histogram(thumbnail, &self.options, self.occupied.len())
             .iter()
             .filter(|(bin, _)| !self.occupied[*bin])
             .map(|(_, weight)| weight)
@@ -72,7 +121,7 @@ impl CoveragePool {
     }
 
     pub fn add(&mut self, thumbnail: &Image3) {
-        for (bin, _) in histogram(thumbnail, &self.options) {
+        for (bin, _) in histogram(thumbnail, &self.options, self.occupied.len()) {
             self.occupied[bin] = true;
         }
     }
@@ -80,12 +129,17 @@ impl CoveragePool {
 
 /// Selects up to `options.max_selected` indices in selection order, taking the
 /// best marginal gain against the bins chosen so far.
-pub fn preselect(thumbnails: &[Image3], options: PreselectOptions) -> Vec<usize> {
+pub fn preselect(
+    thumbnails: &[Image3],
+    options: PreselectOptions,
+) -> Result<Vec<usize>, PrepError> {
+    options.validate()?;
+    let total = total_bins(&options)?;
     let histograms: Vec<Vec<(usize, f64)>> = thumbnails
         .iter()
-        .map(|thumbnail| histogram(thumbnail, &options))
+        .map(|thumbnail| histogram(thumbnail, &options, total))
         .collect();
-    let mut pool = CoveragePool::new(options);
+    let mut pool = CoveragePool::new(options)?;
     let mut available: Vec<usize> = (0..thumbnails.len()).collect();
     let mut chosen = Vec::new();
     while chosen.len() < pool.options.max_selected && !available.is_empty() {
@@ -118,29 +172,24 @@ pub fn preselect(thumbnails: &[Image3], options: PreselectOptions) -> Vec<usize>
         }
         chosen.push(candidate);
     }
-    chosen
+    Ok(chosen)
 }
 
-fn total_bins(options: &PreselectOptions) -> usize {
-    options.saturation_bins as usize * options.hue_bins as usize * options.root_chroma_bins as usize
-}
-
-fn histogram(image: &Image3, options: &PreselectOptions) -> Vec<(usize, f64)> {
+fn histogram(image: &Image3, options: &PreselectOptions, total_bins: usize) -> Vec<(usize, f64)> {
     let thumbnail = if image.data.len() as u64 > u64::from(options.thumbnail_max_pixels) {
         Cow::Owned(image.downsample_area(options.thumbnail_max_pixels))
     } else {
         Cow::Borrowed(image)
     };
-    let model = Cam16Model::new(&ViewingConditions::reference());
     let to_xyz = options.preview_space.to_xyz_matrix();
-    let bins = |saturation: f64, hue: f64, root_chroma: f64| {
-        let s = bin(saturation, SATURATION_MAX, options.saturation_bins);
-        let h = bin(hue, HUE_MAX, options.hue_bins);
-        let c = bin(root_chroma, ROOT_CHROMA_MAX, options.root_chroma_bins);
+    let bins = |exposure: f64, hue: f64, root_chroma: f64| {
+        let s = bin(exposure, EXPOSURE_MIN, EXPOSURE_MAX, options.exposure_bins);
+        let h = bin(hue, 0.0, HUE_MAX, options.hue_bins);
+        let c = bin(root_chroma, 0.0, ROOT_CHROMA_MAX, options.root_chroma_bins);
         (s * options.hue_bins as usize + h) * options.root_chroma_bins as usize + c
     };
 
-    let mut counts = vec![0u32; total_bins(options)];
+    let mut counts = vec![0u32; total_bins];
     let mut touched = Vec::new();
     let mut total = 0u32;
     for rgb in &thumbnail.data {
@@ -152,11 +201,11 @@ fn histogram(image: &Image3, options: &PreselectOptions) -> Vec<(usize, f64)> {
         if ![xyz.x, xyz.y, xyz.z].iter().all(|value| value.is_finite()) {
             continue;
         }
-        let cam = model.xyz_to_cam16(xyz);
-        if !cam.s.is_finite() || !cam.h.is_finite() || !cam.c.is_finite() || cam.c < 0.0 {
+        let input = LookInput::new(xyz);
+        if !input.s.is_finite() || !input.h_in.is_finite() || !input.c_in.is_finite() {
             continue;
         }
-        let index = bins(cam.s, cam.h, cam.c.sqrt());
+        let index = bins(input.s, input.h_in, input.c_in.sqrt());
         if counts[index] == 0 {
             touched.push(index);
         }
@@ -173,8 +222,8 @@ fn histogram(image: &Image3, options: &PreselectOptions) -> Vec<(usize, f64)> {
         .collect()
 }
 
-fn bin(value: f64, max: f64, count: u32) -> usize {
-    let scaled = value / max * f64::from(count);
+fn bin(value: f64, min: f64, max: f64, count: u32) -> usize {
+    let scaled = (value - min) / (max - min) * f64::from(count);
     let index = scaled.floor();
     if !index.is_finite() || index <= 0.0 {
         0

@@ -12,8 +12,6 @@ const LUMA: [f64; 3] = [0.2126, 0.7152, 0.0722];
 pub struct MaskOptions {
     /// Fraction of each image dimension excluded at every edge.
     pub border_fraction: f64,
-    /// A pixel whose RAW channel reaches this fraction of white is excluded.
-    pub clip_level: f32,
     /// Gradient magnitude percentile above which a pixel is excluded, in
     /// `0.0..=1.0`.
     pub gradient_percentile: f64,
@@ -23,7 +21,6 @@ impl Default for MaskOptions {
     fn default() -> Self {
         Self {
             border_fraction: 0.03,
-            clip_level: 0.98,
             gradient_percentile: 0.90,
         }
     }
@@ -32,14 +29,16 @@ impl Default for MaskOptions {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MaskCounts {
     pub border: usize,
+    /// Counted by [`Mask::exclude_clipped`] for pixels still kept when it runs.
     pub clipped: usize,
+    /// Above the gradient percentile, or a non-finite gradient neighbourhood.
     pub gradient: usize,
-    /// A non-finite luminance or channel.
+    /// A non-finite channel or luminance.
     pub invalid: usize,
 }
 
-/// Per-pixel keep bits for one image. Reasons are exclusive: a pixel is counted
-/// under the first rule that excludes it, in [`MaskCounts`] field order.
+/// Per-pixel keep bits for one image. Reasons are exclusive: border and
+/// non-finite channels first, then gradient, then clipping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mask {
     width: u32,
@@ -84,6 +83,15 @@ impl Mask {
             .filter(|(_, keep)| **keep)
             .map(|(index, _)| index)
     }
+
+    pub fn exclude_clipped(&mut self, clipped: &[bool]) {
+        for (index, excluded) in clipped.iter().enumerate() {
+            if *excluded && self.keep.get(index).copied().unwrap_or(false) {
+                self.keep[index] = false;
+                self.counts.clipped += 1;
+            }
+        }
+    }
 }
 
 pub fn build_mask(image: &Image3, options: &MaskOptions) -> Mask {
@@ -108,17 +116,11 @@ pub fn build_mask(image: &Image3, options: &MaskOptions) -> Mask {
 
     let mut luma = vec![f64::NAN; n];
     for (index, px) in image.data.iter().enumerate() {
-        if is_border[index] {
-            continue;
-        }
         let value =
             f64::from(px[0]) * LUMA[0] + f64::from(px[1]) * LUMA[1] + f64::from(px[2]) * LUMA[2];
-        let finite = value.is_finite() && px.iter().all(|channel| channel.is_finite());
-        if finite && px.iter().all(|channel| *channel < options.clip_level) {
+        if value.is_finite() && px.iter().all(|channel| channel.is_finite()) {
             luma[index] = value;
-        } else if finite {
-            counts.clipped += 1;
-        } else {
+        } else if !is_border[index] {
             counts.invalid += 1;
         }
     }
@@ -128,7 +130,17 @@ pub fn build_mask(image: &Image3, options: &MaskOptions) -> Mask {
     for y in 1..height.saturating_sub(1) {
         for x in 1..width.saturating_sub(1) {
             let index = y * width + x;
-            if is_border[index] || !luma[index].is_finite() {
+            if is_border[index] {
+                continue;
+            }
+            let neighbours = [
+                luma[index],
+                luma[index - 1],
+                luma[index + 1],
+                luma[index - width],
+                luma[index + width],
+            ];
+            if !neighbours.iter().all(|value| value.is_finite()) {
                 continue;
             }
             let gx = (luma[index + 1] - luma[index - 1]) * 0.5;
@@ -142,13 +154,10 @@ pub fn build_mask(image: &Image3, options: &MaskOptions) -> Mask {
     let threshold = percentile(&interior_magnitudes, options.gradient_percentile);
 
     for index in 0..n {
-        if is_border[index] {
+        if is_border[index] || !luma[index].is_finite() {
             continue;
         }
-        if !luma[index].is_finite() {
-            continue;
-        }
-        if magnitude[index].is_finite() && magnitude[index] > threshold {
+        if !magnitude[index].is_finite() || magnitude[index] > threshold {
             counts.gradient += 1;
             continue;
         }
@@ -163,11 +172,11 @@ pub fn build_mask(image: &Image3, options: &MaskOptions) -> Mask {
     }
 }
 
-/// The value at `percentile`, interpolated between the two neighbouring
-/// order statistics. `NaN` when `values` is empty.
+/// The value at `percentile`, interpolated between the two neighbouring order
+/// statistics; `+inf` when `values` is empty.
 fn percentile(values: &[f64], percentile: f64) -> f64 {
     if values.is_empty() {
-        return f64::NAN;
+        return f64::INFINITY;
     }
     let position = percentile.clamp(0.0, 1.0) * (values.len() - 1) as f64;
     let lower = position.floor() as usize;

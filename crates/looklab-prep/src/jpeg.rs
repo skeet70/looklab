@@ -108,11 +108,10 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<DecodedJpeg, PrepError> {
     })
 }
 
-/// Collects EXIF, ICC and Adobe markers from the JPEG segment list.
+/// Collects EXIF and ICC colour-space hints from the JPEG segment list.
 fn detect_space(bytes: &[u8]) -> (OutputSpace, bool) {
     let mut exif_colorspace = None;
     let mut icc = Vec::new();
-    let mut adobe_transform = None;
     let mut index = 2_usize;
     while index + 4 <= bytes.len() {
         if bytes[index] != 0xFF {
@@ -149,9 +148,6 @@ fn detect_space(bytes: &[u8]) -> (OutputSpace, bool) {
                     icc.extend_from_slice(profile);
                 }
             }
-            0xEE if payload.starts_with(b"Adobe") && payload.len() >= 12 => {
-                adobe_transform = Some(payload[11]);
-            }
             _ => {}
         }
         index = next + length;
@@ -168,12 +164,6 @@ fn detect_space(bytes: &[u8]) -> (OutputSpace, bool) {
             1 => (OutputSpace::Srgb, false),
             2 => (OutputSpace::AdobeRgb, false),
             _ => (OutputSpace::Srgb, true),
-        }
-    } else if let Some(transform) = adobe_transform {
-        if transform == 0 {
-            (OutputSpace::AdobeRgb, false)
-        } else {
-            (OutputSpace::Srgb, false)
         }
     } else {
         (OutputSpace::Srgb, true)

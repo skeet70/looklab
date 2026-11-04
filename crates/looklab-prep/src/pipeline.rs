@@ -3,7 +3,8 @@
 
 use looklab_color::linalg::Mat3;
 use looklab_meta::{
-    ParsedMetadata, RemovedFields, SanitizedMetadata, WhiteBalanceMultipliers, parse, sanitize,
+    ParsedMetadata, RemovedField, RemovedFields, SanitizedMetadata, WhiteBalanceMultipliers, parse,
+    sanitize,
 };
 use looklab_raw::{DecodedRaw, RawDecoder, RawlerDecoder};
 use looklab_samples::{
@@ -14,7 +15,7 @@ use rand_chacha::rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::align::{AlignParams, align};
+use crate::align::{AlignParams, Alignment, align};
 use crate::error::PrepError;
 use crate::image::Image3;
 use crate::jpeg::{DecodedJpeg, decode_jpeg};
@@ -27,7 +28,14 @@ pub const PREP_VERSION: u32 = 1;
 
 const DEFAULT_DOWNSAMPLE_MAX_PIXELS: u32 = 1_500_000;
 
-/// Camera-to-XYZ at the image's CCT, with the input-transform version used.
+/// RAW channels at or above this fraction of white are clipped.
+const RAW_CLIP_LEVEL: f32 = 0.98;
+
+/// Integration points per axis when averaging the JPEG over a sample's footprint.
+const JPEG_FOOTPRINT_TAPS: u32 = 3;
+
+/// Camera-to-XYZ for white-balanced linear camera RGB, with the CCT and the
+/// version of the body input transform it came from.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PriorTransform {
     xyz_from_camera: Mat3,
@@ -49,8 +57,7 @@ impl PriorTransform {
         Self::new(xyz_from_camera, 0.0, version)
     }
 
-    /// Camera-to-XYZ at the as-shot neutral through the file's DNG profile,
-    /// [DNG 1.6 chapter 6](https://www.adobe.com/go/dng_spec).
+    /// Camera-to-XYZ at the as-shot neutral through the file's DNG profile, for white-balanced RGB ([DNG 1.6 chapter 6](https://www.adobe.com/go/dng_spec)).
     pub fn from_camera_matrices(
         matrices: &looklab_raw::ColorMatrices,
         as_shot_wb: [f64; 3],
@@ -58,6 +65,12 @@ impl PriorTransform {
     ) -> Result<Self, PrepError> {
         use looklab_color::dng::{CalibrationMatrix, DngColorSpec, calibration_temperature};
 
+        if !as_shot_wb
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0)
+        {
+            return Err(PrepError::InvalidWbMultipliers);
+        }
         let mut color = Vec::new();
         for camera in matrices.matrices() {
             if let Some(cct) = calibration_temperature(camera.illuminant.code())
@@ -79,7 +92,12 @@ impl PriorTransform {
         let d65 = spec
             .from_neutral(neutral)
             .map_err(|_| PrepError::PriorTransform)?;
-        Ok(Self::new(d65.matrix, d65.cct, version))
+        let balance = Mat3::diag([
+            1.0 / as_shot_wb[0],
+            1.0 / as_shot_wb[1],
+            1.0 / as_shot_wb[2],
+        ]);
+        Ok(Self::new(d65.matrix.mul(&balance), d65.cct, version))
     }
 
     pub fn matrix(&self) -> &Mat3 {
@@ -130,7 +148,7 @@ impl PrepParams {
 pub struct PreparedImage {
     pub samples: SampleSet,
     pub sanitized: SanitizedMetadata,
-    pub removed: RemovedFields,
+    pub removed: Vec<RemovedField>,
 }
 
 /// Prepares one RAW/JPEG pair from file bytes.
@@ -158,31 +176,42 @@ pub fn prepare_group(
     }
     let metadata: ParsedMetadata = parse(raw_bytes)?;
     let decoded = RawlerDecoder.decode(raw_bytes)?;
-    let (mut sanitized, removed) = sanitize(&metadata);
-    sanitized.set_as_shot_wb(WhiteBalanceMultipliers {
-        r: decoded.as_shot_wb[0],
-        g: decoded.as_shot_wb[1],
-        b: decoded.as_shot_wb[2],
-    });
+    let (mut raw_sanitized, raw_removed) = sanitize(&metadata);
+    raw_sanitized.set_as_shot_wb(white_balance(decoded.as_shot_wb));
+
     let mut decoded_jpegs = Vec::with_capacity(jpegs.len());
+    let mut rendering = Vec::with_capacity(jpegs.len());
     for bytes in jpegs {
         let mut jpeg = decode_jpeg(bytes)?;
-        if let Ok(jpeg_metadata) = looklab_meta::parse_jpeg(bytes)
-            && let Some(orientation) = jpeg_metadata.exif.orientation
-        {
-            jpeg = jpeg.apply_orientation(orientation);
+        let mut jpeg_metadata = None;
+        if let Ok(parsed) = looklab_meta::parse_jpeg(bytes) {
+            if let Some(orientation) = parsed.exif.orientation {
+                jpeg = jpeg.apply_orientation(orientation);
+            }
+            jpeg_metadata = Some(sanitize(&parsed));
         }
         decoded_jpegs.push(jpeg);
+        rendering.push(jpeg_metadata);
     }
+
     let members: Vec<&DecodedJpeg> = decoded_jpegs.iter().collect();
     let exposure_hint = exposure_hint_ev(&metadata);
     let sets = prepare_sets(&decoded, &members, prior, exposure_hint, seed, params)?;
     Ok(sets
         .into_iter()
-        .map(|samples| PreparedImage {
-            samples,
-            sanitized: sanitized.clone(),
-            removed: removed.clone(),
+        .zip(rendering)
+        .map(|(samples, rendering)| {
+            let sanitized = match &rendering {
+                Some((jpeg_sanitized, _)) => merge_rendering(&raw_sanitized, jpeg_sanitized),
+                None => raw_sanitized.clone(),
+            };
+            let removed =
+                removed_union(&raw_removed, rendering.as_ref().map(|(_, removed)| removed));
+            PreparedImage {
+                samples,
+                sanitized,
+                removed,
+            }
         })
         .collect())
 }
@@ -210,6 +239,32 @@ pub fn prepare_decoded(
         return Err(PrepError::NoJpeg);
     }
     prepare_sets(raw, jpegs, prior, 0.0, seed, params)
+}
+
+/// RAW capture fields with the JPEG's rendering fields.
+fn merge_rendering(raw: &SanitizedMetadata, jpeg: &SanitizedMetadata) -> SanitizedMetadata {
+    let mut merged = raw.clone();
+    merged.look = jpeg.look.clone();
+    merged.software = jpeg.software.clone();
+    if merged.make.is_none() {
+        merged.make = jpeg.make.clone();
+    }
+    if merged.model.is_none() {
+        merged.model = jpeg.model.clone();
+    }
+    merged
+}
+
+fn removed_union(raw: &RemovedFields, jpeg: Option<&RemovedFields>) -> Vec<RemovedField> {
+    let mut removed: Vec<RemovedField> = raw.iter().collect();
+    if let Some(jpeg) = jpeg {
+        for field in jpeg.iter() {
+            if !removed.contains(&field) {
+                removed.push(field);
+            }
+        }
+    }
+    removed
 }
 
 fn meta_orientation(orientation: looklab_raw::Orientation) -> looklab_meta::Orientation {
@@ -244,12 +299,19 @@ fn prepare_sets(
         }
     }
 
-    let raw_image = raw_linear_image(raw)?.apply_orientation(meta_orientation(raw.orientation));
+    let orientation = meta_orientation(raw.orientation);
+    let raw_image = raw_linear_image(raw)?.apply_orientation(orientation);
+    let clip_marker = raw_clip_marker(raw)?.apply_orientation(orientation);
     let reference = jpegs[0];
     let alignment = align(&raw_image, reference, &params.align)?;
     let gain_corrected = apply_gain(&raw_image, &alignment);
     let downsampled = gain_corrected.downsample_area(params.downsample_max_pixels);
-    let mask = build_mask(&downsampled, &params.mask);
+    let clipped = clip_marker.downsample_area(params.downsample_max_pixels);
+    debug_assert_eq!(clipped.data.len(), downsampled.data.len());
+    let clipped_flags: Vec<bool> = clipped.data.iter().map(|px| px[0] > 0.0).collect();
+
+    let mut mask = build_mask(&downsampled, &params.mask);
+    mask.exclude_clipped(&clipped_flags);
 
     let mut rng = seed.rng();
     let mut group_bytes = [0u8; 16];
@@ -300,32 +362,20 @@ fn prepare_sets(
             let y = (index / downsampled.width as usize) as f64;
             let x_raw = ((x + 0.5) * scale_x - 0.5).clamp(0.0, raw_image.width as f64 - 1.0);
             let y_raw = ((y + 0.5) * scale_y - 0.5).clamp(0.0, raw_image.height as f64 - 1.0);
-            let (jx, jy) = alignment.raw_to_jpeg(
-                x_raw,
-                y_raw,
+            let (rgb, near_clip) = jpeg_footprint(
+                jpeg,
+                &alignment,
+                (x_raw, y_raw),
+                (scale_x, scale_y),
                 raw_image.width,
                 raw_image.height,
-                jpeg.image.width,
-                jpeg.image.height,
-            );
-            let Some(rgb) = jpeg.image.sample_bilinear(jx, jy) else {
-                return Err(PrepError::SampleOutsideJpeg);
-            };
-            if !rgb.iter().all(|channel| channel.is_finite()) {
-                return Err(PrepError::NonFiniteSample);
-            }
+            )?;
             out_rgb.push(clamp_rgb(rgb));
-            let pixel = nearest_pixel(jx, jy, jpeg.image.width, jpeg.image.height);
-            if jpeg
-                .code_values_near_clip
-                .get(pixel)
-                .copied()
-                .unwrap_or(false)
-            {
-                flags.push(SampleFlags::NEAR_CLIP_OUTPUT);
+            flags.push(if near_clip {
+                SampleFlags::NEAR_CLIP_OUTPUT
             } else {
-                flags.push(SampleFlags::NONE);
-            }
+                SampleFlags::NONE
+            });
         }
         let mut header = header_base.clone();
         header.output_space = jpeg.space;
@@ -361,15 +411,34 @@ fn raw_linear_image(raw: &DecodedRaw) -> Result<Image3, PrepError> {
             (f64::from(raw.rgb[base + 2]) * raw.as_shot_wb[2]) as f32,
         ]);
     }
-    Ok(Image3 {
-        width: raw.width as u32,
-        height: raw.height as u32,
-        data,
-    })
+    Image3::new(raw.width as u32, raw.height as u32, data)
+}
+
+fn raw_clip_marker(raw: &DecodedRaw) -> Result<Image3, PrepError> {
+    let pixels = raw
+        .width
+        .checked_mul(raw.height)
+        .ok_or(PrepError::InvalidParams {
+            field: "raw_dimensions",
+        })?;
+    if raw.rgb.len() < pixels * 3 {
+        return Err(PrepError::InvalidParams {
+            field: "raw_rgb_len",
+        });
+    }
+    let mut data = Vec::with_capacity(pixels);
+    for index in 0..pixels {
+        let base = index * 3;
+        let clipped = raw.rgb[base..base + 3]
+            .iter()
+            .any(|channel| *channel >= RAW_CLIP_LEVEL);
+        data.push([if clipped { 1.0 } else { 0.0 }; 3]);
+    }
+    Image3::new(raw.width as u32, raw.height as u32, data)
 }
 
 /// Applies the alignment's radial gain on normalized radius from the centre.
-fn apply_gain(image: &Image3, alignment: &crate::align::Alignment) -> Image3 {
+fn apply_gain(image: &Image3, alignment: &Alignment) -> Image3 {
     let width = image.width as usize;
     let height = image.height as usize;
     let center_x = (width as f64 - 1.0) * 0.5;
@@ -392,6 +461,61 @@ fn apply_gain(image: &Image3, alignment: &crate::align::Alignment) -> Image3 {
     }
 }
 
+/// Area-averages the JPEG over the footprint of one RAW sample.
+fn jpeg_footprint(
+    jpeg: &DecodedJpeg,
+    alignment: &Alignment,
+    center: (f64, f64),
+    footprint: (f64, f64),
+    raw_width: u32,
+    raw_height: u32,
+) -> Result<([f32; 3], bool), PrepError> {
+    let taps = f64::from(JPEG_FOOTPRINT_TAPS);
+    let mut sum = [0.0f64; 3];
+    let mut count = 0.0f64;
+    let mut near_clip = false;
+    for ty in 0..JPEG_FOOTPRINT_TAPS {
+        for tx in 0..JPEG_FOOTPRINT_TAPS {
+            let fx = (f64::from(tx) + 0.5) / taps - 0.5;
+            let fy = (f64::from(ty) + 0.5) / taps - 0.5;
+            let x = center.0 + fx * footprint.0;
+            let y = center.1 + fy * footprint.1;
+            let (jx, jy) = alignment.raw_to_jpeg(
+                x,
+                y,
+                raw_width,
+                raw_height,
+                jpeg.image.width,
+                jpeg.image.height,
+            );
+            let Some(rgb) = jpeg.image.sample_bilinear(jx, jy) else {
+                return Err(PrepError::SampleOutsideJpeg);
+            };
+            if !rgb.iter().all(|channel| channel.is_finite()) {
+                return Err(PrepError::NonFiniteSample);
+            }
+            for (total, value) in sum.iter_mut().zip(rgb) {
+                *total += f64::from(value);
+            }
+            count += 1.0;
+            let pixel = nearest_pixel(jx, jy, jpeg.image.width, jpeg.image.height);
+            near_clip |= jpeg
+                .code_values_near_clip
+                .get(pixel)
+                .copied()
+                .unwrap_or(false);
+        }
+    }
+    Ok((
+        [
+            (sum[0] / count) as f32,
+            (sum[1] / count) as f32,
+            (sum[2] / count) as f32,
+        ],
+        near_clip,
+    ))
+}
+
 fn clamp_rgb(rgb: [f32; 3]) -> [f32; 3] {
     rgb.map(|channel| channel.clamp(looklab_samples::MIN_RGB, looklab_samples::MAX_RGB))
 }
@@ -403,6 +527,14 @@ fn wb_multipliers(wb: [f64; 3]) -> [f32; 3] {
             looklab_samples::MAX_WB_MULTIPLIER,
         )
     })
+}
+
+fn white_balance(wb: [f64; 3]) -> WhiteBalanceMultipliers {
+    WhiteBalanceMultipliers {
+        r: wb[0],
+        g: wb[1],
+        b: wb[2],
+    }
 }
 
 fn nearest_pixel(x: f64, y: f64, width: u32, height: u32) -> usize {
@@ -429,4 +561,47 @@ fn exposure_hint_ev(metadata: &ParsedMetadata) -> f32 {
         -f64::from(looklab_samples::MAX_EXPOSURE_HINT_EV),
         f64::from(looklab_samples::MAX_EXPOSURE_HINT_EV),
     ) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use looklab_meta::{FilmMode, FujiTag, Iso, LookSettings, ParsedTag};
+
+    use super::{SanitizedMetadata, merge_rendering};
+
+    fn sanitized(film: Option<FilmMode>, iso: Option<u32>) -> SanitizedMetadata {
+        SanitizedMetadata {
+            make: Some("FUJIFILM".to_owned()),
+            model: Some("X-S10".to_owned()),
+            firmware: Some("1.00".to_owned()),
+            lens_model: None,
+            focal_length: None,
+            iso: iso.and_then(Iso::new),
+            shutter: None,
+            aperture: None,
+            exposure_compensation: None,
+            as_shot_wb: None,
+            capture_month: None,
+            software: None,
+            look: film.map(|value| LookSettings {
+                film_mode: Some(ParsedTag {
+                    tag: FujiTag::FilmMode,
+                    raw: 0x0100,
+                    value: Some(value),
+                }),
+                ..LookSettings::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn rendering_metadata_comes_from_the_jpeg() {
+        let raw = sanitized(Some(FilmMode::Provia), Some(200));
+        let jpeg = sanitized(Some(FilmMode::ClassicChrome), Some(800));
+        let merged = merge_rendering(&raw, &jpeg);
+
+        assert_eq!(merged.look, jpeg.look);
+        assert_eq!(merged.iso, raw.iso);
+        assert_eq!(merged.firmware, raw.firmware);
+    }
 }

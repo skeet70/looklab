@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use looklab_prep::{
-    CoveragePool, Image3, MaskOptions, PreselectOptions, SampleParams, build_mask, select_pixels,
+    CoveragePool, Image3, MaskOptions, PreselectOptions, SampleParams, build_mask, preselect,
+    select_pixels,
 };
 use rand_chacha::ChaCha20Rng;
 use rand_chacha::rand_core::SeedableRng;
@@ -23,18 +24,21 @@ fn rng(seed: u8) -> ChaCha20Rng {
 #[test]
 fn mask_excludes_borders_clipping_and_non_finite_pixels() {
     let mut pixels: Vec<[f32; 3]> = vec![[0.5, 0.5, 0.5]; 100 * 100];
-    pixels[50 * 100 + 50] = [0.99, 0.4, 0.4];
-    pixels[50 * 100 + 51] = [f32::NAN, 0.4, 0.4];
+    pixels[40 * 100 + 40] = [0.99, 0.4, 0.4];
+    pixels[60 * 100 + 60] = [f32::NAN, 0.4, 0.4];
     let image = Image3::new(100, 100, pixels).expect("dimensions match");
 
-    let mask = build_mask(&image, &MaskOptions::default());
+    let mut mask = build_mask(&image, &MaskOptions::default());
     assert_eq!(mask.counts().border, 100 * 100 - 94 * 94);
-    assert_eq!(mask.counts().clipped, 1);
     assert_eq!(mask.counts().invalid, 1);
-    assert!(!mask.is_kept(50, 50));
-    assert!(!mask.is_kept(51, 50));
-    assert!(!mask.is_kept(0, 0));
-    assert!(mask.is_kept(52, 50));
+    assert!(!mask.is_kept(60, 60));
+
+    let mut clipped = vec![false; 100 * 100];
+    clipped[40 * 100 + 40] = true;
+    mask.exclude_clipped(&clipped);
+    assert_eq!(mask.counts().clipped, 1);
+    assert!(!mask.is_kept(40, 40));
+    assert!(mask.is_kept(30, 30));
 }
 
 #[test]
@@ -49,6 +53,18 @@ fn mask_excludes_high_gradient_pixels() {
     let mask = build_mask(&image, &MaskOptions::default());
     assert!(mask.counts().gradient > 0);
     assert!(mask.kept() < 60 * 60);
+}
+
+#[test]
+fn a_non_finite_neighbourhood_does_not_poison_the_percentile() {
+    let mut pixels: Vec<[f32; 3]> = vec![[0.5, 0.5, 0.5]; 32 * 32];
+    pixels[16 * 32 + 16] = [f32::NAN, f32::NAN, f32::NAN];
+    let image = Image3::new(32, 32, pixels).expect("dimensions match");
+    let mask = build_mask(&image, &MaskOptions::default());
+
+    assert_eq!(mask.counts().invalid, 1);
+    assert_eq!(mask.counts().gradient, 4);
+    assert!(mask.kept() > 800);
 }
 
 #[test]
@@ -91,7 +107,7 @@ fn sampling_is_deterministic_per_seed() {
 }
 
 #[test]
-fn sampling_stores_a_usable_density_weight() {
+fn selecting_every_candidate_gives_uniform_weights() {
     let image = image(48, 48, |x, y| {
         [0.1 + x as f32 / 100.0, 0.2, 0.3 + y as f32 / 100.0]
     });
@@ -106,31 +122,50 @@ fn sampling_stores_a_usable_density_weight() {
     )
     .expect("samples");
 
-    assert!(!selection.is_empty());
-    let mean: f64 = selection
-        .density_w()
-        .iter()
-        .map(|weight| f64::from(*weight))
-        .sum::<f64>()
-        / selection.len() as f64;
-    assert!((mean - 1.0).abs() < 1e-3);
+    assert_eq!(selection.len(), mask.kept());
     for weight in selection.density_w() {
-        assert!(weight.is_finite() && *weight > 0.0);
-        assert!(*weight <= looklab_samples::MAX_DENSITY_WEIGHT);
+        assert_eq!(*weight, 1.0);
     }
+}
+
+#[test]
+fn a_capped_selection_stays_within_budget_and_records_inclusion_weights() {
+    let image = image(96, 96, |x, y| {
+        let ramp = (x + y) as f32 / 190.0;
+        [0.9 - ramp, 0.2 + ramp, 0.35]
+    });
+    let mask = build_mask(&image, &MaskOptions::default());
+    let matrix = looklab_color::spaces::RgbSpace::Srgb.to_xyz_matrix();
+    let params = SampleParams {
+        max_samples: 200,
+        ..SampleParams::default()
+    };
+    let selection = select_pixels(&image, &mask, &matrix, &params, &mut rng(4)).expect("samples");
+
+    assert!(!selection.is_empty());
+    assert!(selection.len() <= 200);
+    assert!(selection.len() < mask.kept());
+    let mut above_one = false;
+    for weight in selection.density_w() {
+        assert!(weight.is_finite() && *weight >= 1.0);
+        assert!(*weight <= looklab_samples::MAX_DENSITY_WEIGHT);
+        above_one |= *weight > 1.0;
+    }
+    assert!(above_one);
 }
 
 #[test]
 fn sampling_with_every_pixel_clipped_has_no_candidates() {
     let image = image(32, 32, |_, _| [1.0, 1.0, 1.0]);
-    let mask = build_mask(&image, &MaskOptions::default());
+    let mut mask = build_mask(&image, &MaskOptions::default());
+    mask.exclude_clipped(&[true; 32 * 32]);
     let matrix = looklab_color::spaces::RgbSpace::Srgb.to_xyz_matrix();
     let result = select_pixels(
         &image,
         &mask,
         &matrix,
         &SampleParams::default(),
-        &mut rng(4),
+        &mut rng(5),
     );
     assert!(matches!(result, Err(looklab_prep::PrepError::NoSamples)));
 }
@@ -154,14 +189,14 @@ fn coverage_gain_orders_distinct_images_before_duplicates() {
     });
 
     let options = PreselectOptions::default();
-    let mut pool = CoveragePool::new(options);
+    let mut pool = CoveragePool::new(options).expect("valid options");
     assert!(pool.gain(&red) > 0.0);
     assert_eq!(pool.gain(&red), pool.gain(&duplicate));
     pool.add(&red);
     assert_eq!(pool.gain(&duplicate), 0.0);
     assert!(pool.gain(&blue) > 0.0);
 
-    let chosen = looklab_prep::preselect(&[red, duplicate, blue], options);
+    let chosen = preselect(&[red, duplicate, blue], options).expect("selects");
     assert_eq!(chosen, vec![0, 2]);
 }
 
@@ -179,12 +214,29 @@ fn coverage_gain_respects_the_selection_cap() {
             })
         })
         .collect();
-    let chosen = looklab_prep::preselect(&thumbnails, options);
+    let chosen = preselect(&thumbnails, options).expect("selects");
     assert_eq!(chosen.len(), 2);
 }
 
 #[test]
-fn sample_params_reject_out_of_range_bins() {
+fn preselection_rejects_degenerate_grids() {
+    let options = PreselectOptions {
+        hue_bins: 0,
+        ..PreselectOptions::default()
+    };
+    assert!(matches!(
+        CoveragePool::new(options),
+        Err(looklab_prep::PrepError::InvalidParams { field: "hue_bins" })
+    ));
+    let options = PreselectOptions {
+        exposure_bins: 1024,
+        ..PreselectOptions::default()
+    };
+    assert!(CoveragePool::new(options).is_err());
+}
+
+#[test]
+fn sample_params_reject_out_of_range_values() {
     let params = SampleParams {
         max_samples: 0,
         ..SampleParams::default()
@@ -193,6 +245,16 @@ fn sample_params_reject_out_of_range_bins() {
         params.validate(),
         Err(looklab_prep::PrepError::InvalidParams {
             field: "max_samples"
+        })
+    ));
+    let params = SampleParams {
+        max_bin_weight: 0.0,
+        ..SampleParams::default()
+    };
+    assert!(matches!(
+        params.validate(),
+        Err(looklab_prep::PrepError::InvalidParams {
+            field: "max_bin_weight"
         })
     ));
 }

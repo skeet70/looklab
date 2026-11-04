@@ -113,7 +113,7 @@ fn all_samples_in_limits(samples: &looklab_samples::SampleSet) {
         }
     }
     for weight in samples.density_w() {
-        assert!(weight.is_finite() && *weight > 0.0 && *weight <= MAX_DENSITY_WEIGHT);
+        assert!(weight.is_finite() && *weight >= 1.0 && *weight <= MAX_DENSITY_WEIGHT);
     }
 }
 
@@ -276,6 +276,122 @@ fn meta_orientation(orientation: Orientation) -> looklab_meta::Orientation {
         Orientation::Rotate90 => looklab_meta::Orientation::Rotate90Clockwise,
         Orientation::Transverse => looklab_meta::Orientation::Transverse,
         Orientation::Rotate270 => looklab_meta::Orientation::Rotate270Clockwise,
+    }
+}
+
+#[test]
+fn the_dng_prior_takes_white_balanced_input() {
+    let decoded = RawlerDecoder.decode(X_S10_RAF).expect("fixture decodes");
+    let matrices = decoded
+        .color_matrices
+        .as_ref()
+        .expect("the fixture reports colour matrices");
+    let prior = PriorTransform::from_camera_matrices(
+        matrices,
+        decoded.as_shot_wb,
+        PriorTransformVersion::new(1),
+    )
+    .expect("prior transform");
+    let white = prior.matrix().mul_vec([1.0, 1.0, 1.0]);
+    let sum = white[0] + white[1] + white[2];
+    let (x, y) = (white[0] / sum, white[1] / sum);
+    assert!((x - 0.3127).abs() < 0.01, "white x {x}");
+    assert!((y - 0.3290).abs() < 0.01, "white y {y}");
+}
+
+fn flat_raw(pixel: impl Fn(usize) -> [f32; 3], wb: [f64; 3]) -> DecodedRaw {
+    let mut rgb = Vec::with_capacity((WIDTH * HEIGHT * 3) as usize);
+    for index in 0..(WIDTH * HEIGHT) as usize {
+        rgb.extend_from_slice(&pixel(index));
+    }
+    DecodedRaw {
+        width: WIDTH as usize,
+        height: HEIGHT as usize,
+        rgb,
+        as_shot_wb: wb,
+        orientation: Orientation::Normal,
+        make: "FUJIFILM".to_owned(),
+        model: "X-S10".to_owned(),
+        color_matrices: None,
+    }
+}
+
+fn wb_image(raw: &DecodedRaw) -> Image3 {
+    let (pixels, _) = raw.rgb.as_chunks::<3>();
+    let data = pixels
+        .iter()
+        .map(|px| {
+            [
+                (f64::from(px[0]) * raw.as_shot_wb[0]) as f32,
+                (f64::from(px[1]) * raw.as_shot_wb[1]) as f32,
+                (f64::from(px[2]) * raw.as_shot_wb[2]) as f32,
+            ]
+        })
+        .collect();
+    Image3::new(raw.width as u32, raw.height as u32, data).expect("dimensions match")
+}
+
+#[test]
+fn raw_clipping_is_judged_before_white_balance() {
+    let target = 40 * WIDTH as usize + 40;
+    let raw = flat_raw(
+        |index| {
+            if index == target {
+                [0.6, 0.05, 0.05]
+            } else {
+                [0.1, 0.1, 0.1]
+            }
+        },
+        [2.0, 1.0, 1.0],
+    );
+    let jpeg = jpeg_from(wb_image(&raw));
+    let samples =
+        prepare_pair_decoded(&raw, &jpeg, &prior(), fixed_seed(0x21), &params()).expect("prepares");
+    assert!(
+        samples
+            .in_rgb()
+            .iter()
+            .any(|rgb| rgb[0] > 1.1 && rgb[1] < 0.1)
+    );
+
+    let target = 40 * WIDTH as usize + 40;
+    let raw = flat_raw(
+        |index| {
+            if index == target {
+                [0.99, 0.01, 0.01]
+            } else {
+                [0.2, 0.2, 0.2]
+            }
+        },
+        [0.5, 1.0, 1.0],
+    );
+    let jpeg = jpeg_from(wb_image(&raw));
+    let samples =
+        prepare_pair_decoded(&raw, &jpeg, &prior(), fixed_seed(0x22), &params()).expect("prepares");
+    assert!(
+        !samples
+            .in_rgb()
+            .iter()
+            .any(|rgb| { (0.47..0.52).contains(&rgb[0]) && (0.005..0.015).contains(&rgb[1]) })
+    );
+}
+
+#[test]
+fn samples_average_the_jpeg_over_the_raw_footprint() {
+    let scene = scene();
+    let raw = raw_from(&scene, [1.0, 1.0, 1.0]);
+    let jpeg = jpeg_from(scene);
+    let params = PrepParams {
+        downsample_max_pixels: 2_000,
+        ..params()
+    };
+    let samples =
+        prepare_pair_decoded(&raw, &jpeg, &prior(), fixed_seed(0x23), &params).expect("prepares");
+    assert!(samples.n() > 10);
+    for (in_rgb, out_rgb) in samples.in_rgb().iter().zip(samples.out_rgb()) {
+        for (a, b) in in_rgb.iter().zip(out_rgb) {
+            assert!((a - b).abs() < 0.08, "{in_rgb:?} vs {out_rgb:?}");
+        }
     }
 }
 
