@@ -16,9 +16,10 @@ pub use compare::{
     CURVE_MAX_S, CURVE_MIN_S, CURVE_STEP_S, Comparison, ComparisonInput, Covariance3,
     DeltaEDistribution, DistributionMetric, FunctionName, GRL_S_VALUES, GrlComponentKind, GrlPlot,
     GrlSeries, GrlValue, HUE_BIN_COUNT, HUE_BIN_WIDTH, HistogramBin, HueBin, LayerContribution,
-    LayerId, LookDiagnostics, LookFunction, NO_DIFFERENCE_DE, RegionCell, RegionMap, Support,
-    TintComparison, TintCurve, TintPoint, TintSample, ToneComparison, ToneCurve, TonePoint,
-    ToneSample, WorstProbe, compare, hue_bin_index, hue_bins, look_diagnostics,
+    LayerCovariance, LayerId, LookDiagnostics, LookFunction, NO_DIFFERENCE_DE, RegionCell,
+    RegionMap, Support, TintComparison, TintCurve, TintPoint, TintSample, ToneComparison,
+    ToneCurve, TonePoint, ToneSample, WorstProbe, compare, hue_bin_index, hue_bins,
+    look_diagnostics,
 };
 pub use html::{ReportSource, comparison_page, look_page};
 pub use summary::{HueRegion, summary_line};

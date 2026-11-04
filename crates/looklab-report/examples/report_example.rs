@@ -14,7 +14,8 @@ use looklab_model::file::{
 use looklab_model::probes::{Probe, ProbeGroup, ProbeId, ProbeSet};
 use looklab_model::{ColorLayer, Look, LookDocument, LookFile, ProbeSetVersion, Tone};
 use looklab_report::compare::{
-    Comparison, ComparisonInput, Covariance3, FunctionName, LookFunction, Support, compare,
+    Comparison, ComparisonInput, Covariance3, FunctionName, LayerCovariance, LookFunction, Support,
+    compare,
 };
 use looklab_report::{ArtifactHash, ReportSource, comparison_page};
 
@@ -43,6 +44,18 @@ impl LookFunction for SyntheticLook {
 
     fn layer_values(&self, input: &looklab_model::LookInput) -> Option<looklab_model::LayerValues> {
         Some(looklab_model::Look::layer_values(&self.look, input))
+    }
+
+    fn layer_covariance(&self, input: &looklab_model::LookInput) -> Option<LayerCovariance> {
+        let hue = input.h_in * core::f64::consts::PI / 180.0;
+        Some(LayerCovariance {
+            t: 0.04,
+            n_a: 0.02,
+            n_b: 0.02,
+            log_g: 0.004 + 0.002 * libm::sin(hue),
+            r: 0.5,
+            lambda: 0.02,
+        })
     }
 
     fn look(&self) -> Option<&Look> {

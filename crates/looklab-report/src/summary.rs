@@ -4,8 +4,8 @@
 use serde::Serialize;
 
 use crate::compare::{
-    DeltaEDistribution, FunctionName, GrlComponentKind, GrlPlot, GrlSeries, GrlValue,
-    LayerContribution, LayerId, NO_DIFFERENCE_DE, TintComparison, ToneComparison,
+    DeltaEDistribution, FunctionName, GrlComponentKind, GrlPlot, GrlValue, LayerContribution,
+    LayerId, NO_DIFFERENCE_DE, TintComparison, ToneComparison,
 };
 
 /// Named hue regions, grouped from the 24-bin hue grid.
@@ -94,6 +94,11 @@ pub fn summary_line(
     delta_e: &DeltaEDistribution,
     attribution: &[LayerContribution],
 ) -> String {
+    if delta_e.count == 0 {
+        return format!(
+            "{b} cannot be compared with {a}: no supported probes carry either function."
+        );
+    }
     if delta_e.max <= NO_DIFFERENCE_DE {
         return format!(
             "{b} is indistinguishable from {a}: no meaningful difference on the probe set."
@@ -226,19 +231,19 @@ fn tint_phrase(tint: &TintComparison) -> Option<String> {
     }
 }
 
-fn series_at(grl: &GrlPlot, component: GrlComponentKind) -> Option<&GrlSeries> {
-    grl.series
-        .iter()
-        .find(|series| series.component == component && series.s == 0.0)
-}
-
-fn dominant(first: &[Option<GrlValue>], second: &[Option<GrlValue>]) -> Option<(f64, usize)> {
+fn dominant(
+    first: &[Option<GrlValue>],
+    second: &[Option<GrlValue>],
+    delta: impl Fn(f64, f64) -> Option<f64>,
+) -> Option<(f64, usize)> {
     let mut best: Option<(f64, usize)> = None;
     for (bin, (first, second)) in first.iter().zip(second.iter()).enumerate() {
         let (Some(first), Some(second)) = (first, second) else {
             continue;
         };
-        let delta = second.value - first.value;
+        let Some(delta) = delta(first.value, second.value) else {
+            continue;
+        };
         match best {
             None => best = Some((delta, bin)),
             Some((current, _)) if delta.abs() > current.abs() => best = Some((delta, bin)),
@@ -248,48 +253,106 @@ fn dominant(first: &[Option<GrlValue>], second: &[Option<GrlValue>]) -> Option<(
     best
 }
 
+fn draw_ratio(first: f64, second: f64) -> Option<f64> {
+    if first > 0.0 && second > 0.0 {
+        Some(libm::log(second / first))
+    } else {
+        None
+    }
+}
+
+/// The largest layer difference in each sampled lightness slice.
+fn slice_effects(grl: &GrlPlot, component: GrlComponentKind) -> Vec<(f64, f64, usize)> {
+    let delta: fn(f64, f64) -> Option<f64> = match component {
+        GrlComponentKind::ChromaGain => draw_ratio,
+        _ => |first, second| Some(second - first),
+    };
+    grl.series
+        .iter()
+        .filter(|series| series.component == component)
+        .filter_map(|series| {
+            let (value, bin) = dominant(&series.a, &series.b, delta)?;
+            Some((series.s, value, bin))
+        })
+        .collect()
+}
+
+fn lightness_span(effects: &[(f64, f64, usize)], peak: f64, bin: usize) -> (f64, f64) {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for (s, delta, candidate) in effects {
+        if *candidate == bin && delta.abs() >= peak.abs() / 2.0 {
+            min = min.min(*s);
+            max = max.max(*s);
+        }
+    }
+    (min, max)
+}
+
+fn lightness_suffix(min: f64, max: f64) -> String {
+    if !min.is_finite() || !max.is_finite() {
+        String::new()
+    } else if (max - min).abs() < 1e-9 {
+        format!(" at s = {min:.0}")
+    } else {
+        format!(" over s = {min:.0} to {max:.0}")
+    }
+}
+
 fn chroma_phrase(grl: &GrlPlot) -> Option<String> {
-    let series = series_at(grl, GrlComponentKind::ChromaGain)?;
-    let (delta, bin) = dominant(&series.a, &series.b)?;
+    let effects = slice_effects(grl, GrlComponentKind::ChromaGain);
+    let (s, delta, bin) = *effects
+        .iter()
+        .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))?;
     if delta.abs() < crate::compare::CHROMA_EFFECT_FLOOR {
         return None;
     }
     let percent = (libm::exp(delta) - 1.0) * 100.0;
     let direction = if percent > 0.0 { "more" } else { "less" };
     let region = grl.hue_bins.get(bin)?.region;
+    let (min, max) = lightness_span(&effects, delta, bin);
     Some(format!(
-        "{direction} saturated in {} ({percent:+.0}% chroma, {})",
+        "{direction} saturated in {} ({percent:+.0}% chroma, {}){}",
         region.name(),
-        region.range_label()
+        region.range_label(),
+        lightness_suffix(min, max.max(s))
     ))
 }
 
 fn hue_phrase(grl: &GrlPlot) -> Option<String> {
-    let series = series_at(grl, GrlComponentKind::HueRotation)?;
-    let (delta, bin) = dominant(&series.a, &series.b)?;
+    let effects = slice_effects(grl, GrlComponentKind::HueRotation);
+    let (s, delta, bin) = *effects
+        .iter()
+        .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))?;
     if delta.abs() < crate::compare::HUE_EFFECT_FLOOR {
         return None;
     }
     let region = grl.hue_bins.get(bin)?.region;
+    let (min, max) = lightness_span(&effects, delta, bin);
     Some(format!(
-        "hue rotated by {delta:+.0}° in {} ({})",
+        "hue rotated by {delta:+.0}° in {} ({}){}",
         region.name(),
-        region.range_label()
+        region.range_label(),
+        lightness_suffix(min, max.max(s))
     ))
 }
 
 fn lightness_phrase(grl: &GrlPlot) -> Option<String> {
-    let series = series_at(grl, GrlComponentKind::LightnessShift)?;
-    let (delta, bin) = dominant(&series.a, &series.b)?;
+    let effects = slice_effects(grl, GrlComponentKind::LightnessShift);
+    let (s, delta, bin) = *effects
+        .iter()
+        .max_by(|left, right| left.1.abs().total_cmp(&right.1.abs()))?;
     if delta.abs() < crate::compare::LIGHTNESS_EFFECT_FLOOR {
         return None;
     }
     let direction = if delta > 0.0 { "lighter" } else { "darker" };
     let region = grl.hue_bins.get(bin)?.region;
+    let (min, max) = lightness_span(&effects, delta, bin);
     Some(format!(
-        "{direction} in {} ({delta:+.1} J′, {})",
+        "{direction} in {} ({delta:+.1} J′, {}){}",
         region.name(),
-        region.range_label()
+        region.range_label(),
+        lightness_suffix(min, max.max(s))
     ))
 }
 

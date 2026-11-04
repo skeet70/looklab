@@ -179,16 +179,23 @@ fn tone_section(curve: &ToneCurve) -> String {
 }
 
 fn stats_table(dist: &DeltaEDistribution) -> String {
+    let value = |stat: f64| {
+        if dist.count == 0 {
+            "unavailable".to_string()
+        } else {
+            number(stat, 2)
+        }
+    };
     let mut out = String::from("<table class=\"kv\">\n");
     out.push_str(&row("Metric", dist.metric.label()));
     out.push_str(&row("Supported probes", &dist.count.to_string()));
     out.push_str(&row("Excluded probes", &dist.excluded.to_string()));
-    out.push_str(&row("Median", &number(dist.median, 2)));
-    out.push_str(&row("p95", &number(dist.p95, 2)));
-    out.push_str(&row("Max", &number(dist.max, 2)));
-    out.push_str(&row("Mean", &number(dist.mean, 2)));
-    out.push_str(&row("Weighted mean", &number(dist.weighted_mean, 2)));
-    out.push_str(&row("Weighted median", &number(dist.weighted_median, 2)));
+    out.push_str(&row("Median", &value(dist.median)));
+    out.push_str(&row("p95", &value(dist.p95)));
+    out.push_str(&row("Max", &value(dist.max)));
+    out.push_str(&row("Mean", &value(dist.mean)));
+    out.push_str(&row("Weighted mean", &value(dist.weighted_mean)));
+    out.push_str(&row("Weighted median", &value(dist.weighted_median)));
     out.push_str("</table>\n");
     out
 }
@@ -198,7 +205,7 @@ fn worst_table(dist: &DeltaEDistribution) -> String {
         return "<p class=\"muted\">No supported probes.</p>\n".to_string();
     }
     let mut out = String::from(
-        "<table>\n<thead><tr><th>Probe</th><th>ΔE</th><th>σ</th></tr></thead>\n<tbody>\n",
+        "<table>\n<thead><tr><th>Probe</th><th>ΔE</th><th>σ (UCS)</th></tr></thead>\n<tbody>\n",
     );
     for probe in &dist.worst {
         out.push_str(&format!(
@@ -214,11 +221,12 @@ fn worst_table(dist: &DeltaEDistribution) -> String {
 
 fn distribution_section(dist: &DeltaEDistribution) -> String {
     format!(
-        "<section>\n<h2>{}</h2>\n{}\n<div class=\"columns\">\n<div>\n<h3>Statistics</h3>\n{}</div>\n<div>\n<h3>Worst probes</h3>\n{}</div>\n</div>\n</section>\n",
+        "<section>\n<h2>{}</h2>\n{}\n<div class=\"columns\">\n<div>\n<h3>Statistics</h3>\n{}</div>\n<div>\n<h3>Worst probes</h3>\n{}</div>\n</div>\n<p class=\"muted\">ΔE in {}; σ is the combined prediction uncertainty in CAM16-UCS units and is not transformed by the metric.</p>\n</section>\n",
         escape(dist.metric.label()),
         svg::delta_e_histogram_svg(dist),
         stats_table(dist),
         worst_table(dist),
+        escape(dist.metric.label()),
     )
 }
 

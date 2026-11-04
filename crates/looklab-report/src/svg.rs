@@ -43,14 +43,14 @@ const STYLE_B: Style = Style {
     dash: "7 4",
 };
 
-type Pixels = Vec<(f64, f64)>;
+type Points = Vec<Option<(f64, f64)>>;
 type BandPixels = Vec<Option<(f64, f64, f64)>>;
 
 #[derive(Clone)]
 struct LineSeries {
     label: String,
     style: Style,
-    points: Pixels,
+    points: Points,
     band: BandPixels,
 }
 
@@ -59,10 +59,14 @@ impl LineSeries {
         Self {
             label: label.into(),
             style,
-            points,
+            points: points.into_iter().map(Some).collect(),
             band: Vec::new(),
         }
     }
+}
+
+fn band_of(x: f64, y: f64, sigma: Option<f64>) -> Option<(f64, f64, f64)> {
+    sigma.map(|sigma| (x, y - sigma, y + sigma))
 }
 
 #[derive(Clone, Copy)]
@@ -182,6 +186,8 @@ struct AxesSpec<'a> {
     y_ticks: Vec<f64>,
     x_label: &'a str,
     y_label: &'a str,
+    clip_id: String,
+    reference: Option<f64>,
 }
 
 fn panel(out: &mut String, panel: Panel, axes: &AxesSpec<'_>, series: &[LineSeries]) {
@@ -240,6 +246,31 @@ fn panel(out: &mut String, panel: Panel, axes: &AxesSpec<'_>, series: &[LineSeri
         ));
     }
 
+    if let Some(reference) = axes.reference
+        && reference > y_min
+        && reference < y_max
+    {
+        let y = panel.map_y(reference, y_min, y_max);
+        out.push_str(&format!(
+            "<line x1=\"{x1}\" y1=\"{y}\" x2=\"{x2}\" y2=\"{y}\" stroke=\"{AXIS_COLOR}\" stroke-width=\"1\" stroke-dasharray=\"2 3\"/>\n",
+            x1 = num(panel.x, 1),
+            x2 = num(panel.x + panel.width, 1),
+            y = num(y, 1),
+        ));
+    }
+
+    out.push_str(&format!(
+        "<defs><clipPath id=\"{}\"><rect x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\"/></clipPath></defs>\n",
+        escape(&axes.clip_id),
+        x = num(panel.x, 1),
+        y = num(panel.y, 1),
+        w = num(panel.width, 1),
+        h = num(panel.height, 1),
+    ));
+    out.push_str(&format!(
+        "<g clip-path=\"url(#{})\">\n",
+        escape(&axes.clip_id)
+    ));
     for line in series {
         if let Some(path) = band_path(&line.band, panel, axes.x_domain, axes.y_domain) {
             out.push_str(&format!(
@@ -249,12 +280,18 @@ fn panel(out: &mut String, panel: Panel, axes: &AxesSpec<'_>, series: &[LineSeri
                 num(BAND_OPACITY, 2),
             ));
         }
-        let points = map_points(&line.points, panel, axes.x_domain, axes.y_domain);
-        out.push_str(&format!(
-            "<polyline points=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"1.8\" stroke-dasharray=\"{}\" stroke-linejoin=\"round\"/>\n",
-            points, line.style.color, line.style.dash,
-        ));
-        if let Some(last) = line.points.last() {
+        for segment in polyline_segments(&line.points, panel, axes.x_domain, axes.y_domain) {
+            out.push_str(&format!(
+                "<polyline points=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"1.8\" stroke-dasharray=\"{}\" stroke-linejoin=\"round\"/>\n",
+                segment, line.style.color, line.style.dash,
+            ));
+        }
+    }
+    out.push_str("</g>\n");
+
+    for line in series {
+        let last = line.points.iter().rev().flatten().next();
+        if let Some(last) = last {
             let x = panel.map_x(last.0, x_min, x_max) + 6.0;
             let y = panel.map_y(last.1, y_min, y_max);
             out.push_str(&format!(
@@ -268,24 +305,43 @@ fn panel(out: &mut String, panel: Panel, axes: &AxesSpec<'_>, series: &[LineSeri
     }
 }
 
-fn map_points(
-    points: &[(f64, f64)],
+fn polyline_segments(
+    points: &[Option<(f64, f64)>],
     panel: Panel,
     x_domain: (f64, f64),
     y_domain: (f64, f64),
-) -> String {
-    let mut out = String::new();
-    for (index, (x, y)) in points.iter().enumerate() {
-        if index > 0 {
-            out.push(' ');
+) -> Vec<String> {
+    let mut runs: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut current = Vec::new();
+    for point in points {
+        match point {
+            Some(point) => current.push(*point),
+            None => {
+                if !current.is_empty() {
+                    runs.push(std::mem::take(&mut current));
+                }
+            }
         }
-        out.push_str(&format!(
-            "{},{}",
-            num(panel.map_x(*x, x_domain.0, x_domain.1), 1),
-            num(panel.map_y(*y, y_domain.0, y_domain.1), 1)
-        ));
     }
-    out
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs.into_iter()
+        .map(|run| {
+            let mut out = String::new();
+            for (index, (x, y)) in run.iter().enumerate() {
+                if index > 0 {
+                    out.push(' ');
+                }
+                out.push_str(&format!(
+                    "{},{}",
+                    num(panel.map_x(*x, x_domain.0, x_domain.1), 1),
+                    num(panel.map_y(*y, y_domain.0, y_domain.1), 1)
+                ));
+            }
+            out
+        })
+        .collect()
 }
 
 fn band_path(
@@ -365,6 +421,7 @@ fn chart_frame(
     width: f64,
     height: f64,
     series: &[LineSeries],
+    note: Option<&str>,
     body: impl FnOnce(&mut String),
 ) -> String {
     let mut out = String::new();
@@ -376,21 +433,53 @@ fn chart_frame(
     if !entries.is_empty() {
         legend(&mut out, 56.0, 18.0, &entries);
     }
+    if let Some(note) = note {
+        out.push_str(&format!(
+            "<text x=\"{x}\" y=\"18.0\" font-family=\"sans-serif\" font-size=\"11\" fill=\"{MUTED_COLOR}\" text-anchor=\"end\" dominant-baseline=\"middle\">{}</text>\n",
+            escape(note),
+            x = num(width - 16.0, 1),
+        ));
+    }
     body(&mut out);
     close_svg(&mut out);
     out
 }
 
+fn domain_with_bands<'a>(
+    values: impl Iterator<Item = f64> + 'a,
+    bands: impl Iterator<Item = &'a BandPixels>,
+    include_zero: bool,
+) -> (f64, f64) {
+    let band_values = bands.flat_map(|band| {
+        band.iter()
+            .flatten()
+            .flat_map(|(_, low, high)| [*low, *high])
+    });
+    padded_domain(values.chain(band_values), include_zero)
+}
+
 pub fn tone_curve_svg(curve: &ToneCurve) -> String {
     let points: Vec<(f64, f64)> = curve.points.iter().map(|p| (p.s, p.j)).collect();
-    let y_domain = padded_domain(points.iter().map(|p| p.1), true);
-    let series = vec![LineSeries::new("J′", STYLE_A, points)];
+    let band: BandPixels = curve
+        .points
+        .iter()
+        .map(|p| band_of(p.s, p.j, p.sigma))
+        .collect();
+    let y_domain = domain_with_bands(points.iter().map(|p| p.1), std::iter::once(&band), true);
+    let has_uncertainty = curve.points.iter().any(|p| p.sigma.is_some());
+    let series = vec![LineSeries {
+        label: "J′".to_string(),
+        style: STYLE_A,
+        points: points.iter().map(|p| Some(*p)).collect(),
+        band,
+    }];
     chart_frame(
         "Tone curve: J′ against s",
         "tone-single",
         720.0,
         260.0,
         &series,
+        (!has_uncertainty).then_some("layer uncertainty unavailable"),
         |out| {
             panel(
                 out,
@@ -407,6 +496,8 @@ pub fn tone_curve_svg(curve: &ToneCurve) -> String {
                     y_ticks: ticks(y_domain.0, y_domain.1, 5),
                     x_label: "s (stops from 18% gray)",
                     y_label: "J′",
+                    clip_id: "tone-single-clip".to_string(),
+                    reference: None,
                 },
                 &series,
             );
@@ -419,12 +510,40 @@ pub fn tone_comparison_svg(plot: &ToneComparison) -> String {
     let a: Vec<(f64, f64)> = plot.points.iter().map(|p| (p.s, p.a)).collect();
     let b: Vec<(f64, f64)> = plot.points.iter().map(|p| (p.s, p.b)).collect();
     let differences: Vec<(f64, f64)> = plot.points.iter().map(|p| (p.s, p.delta)).collect();
-    let top_domain = padded_domain(a.iter().chain(b.iter()).map(|p| p.1), true);
+    let band_a: BandPixels = plot
+        .points
+        .iter()
+        .map(|p| band_of(p.s, p.a, p.sigma[0]))
+        .collect();
+    let band_b: BandPixels = plot
+        .points
+        .iter()
+        .map(|p| band_of(p.s, p.b, p.sigma[1]))
+        .collect();
+    let top_domain = domain_with_bands(
+        a.iter().chain(b.iter()).map(|p| p.1),
+        [&band_a, &band_b].into_iter(),
+        true,
+    );
     let diff_domain = padded_domain(differences.iter().map(|p| p.1), true);
     let x_domain = (crate::compare::CURVE_MIN_S, crate::compare::CURVE_MAX_S);
+    let has_uncertainty = plot
+        .points
+        .iter()
+        .any(|p| p.sigma[0].is_some() || p.sigma[1].is_some());
     let series = vec![
-        LineSeries::new("A", STYLE_A, a),
-        LineSeries::new("B", STYLE_B, b),
+        LineSeries {
+            label: "A".to_string(),
+            style: STYLE_A,
+            points: a.iter().map(|p| Some(*p)).collect(),
+            band: band_a,
+        },
+        LineSeries {
+            label: "B".to_string(),
+            style: STYLE_B,
+            points: b.iter().map(|p| Some(*p)).collect(),
+            band: band_b,
+        },
     ];
     let diff_series = vec![LineSeries::new("B − A", STYLE_B, differences)];
     chart_frame(
@@ -433,6 +552,7 @@ pub fn tone_comparison_svg(plot: &ToneComparison) -> String {
         720.0,
         400.0,
         &series,
+        (!has_uncertainty).then_some("layer uncertainty unavailable"),
         |out| {
             panel(
                 out,
@@ -449,6 +569,8 @@ pub fn tone_comparison_svg(plot: &ToneComparison) -> String {
                     y_ticks: ticks(top_domain.0, top_domain.1, 5),
                     x_label: "s (stops from 18% gray)",
                     y_label: "J′",
+                    clip_id: "tone-clip-main".to_string(),
+                    reference: None,
                 },
                 &series,
             );
@@ -467,6 +589,8 @@ pub fn tone_comparison_svg(plot: &ToneComparison) -> String {
                     y_ticks: ticks(diff_domain.0, diff_domain.1, 3),
                     x_label: "s (stops from 18% gray)",
                     y_label: "B − A (J′)",
+                    clip_id: "tone-clip-diff".to_string(),
+                    reference: Some(0.0),
                 },
                 &diff_series,
             );
@@ -480,39 +604,89 @@ fn tint_panels(
     a: Option<&TintCurve>,
     comparison: Option<&TintComparison>,
 ) -> String {
-    let (points_a, points_b): (Pixels, Pixels) = match (a, comparison) {
-        (Some(curve), _) => (
-            curve.points.iter().map(|p| (p.j, p.a)).collect(),
-            Vec::new(),
-        ),
-        (None, Some(plot)) => (
-            plot.points.iter().map(|p| (p.j_a, p.a_a)).collect(),
-            plot.points.iter().map(|p| (p.j_b, p.a_b)).collect(),
-        ),
-        (None, None) => (Vec::new(), Vec::new()),
-    };
-    let (points_a_b, points_b_b): (Pixels, Pixels) = match (a, comparison) {
-        (Some(curve), _) => (
-            curve.points.iter().map(|p| (p.j, p.b)).collect(),
-            Vec::new(),
-        ),
-        (None, Some(plot)) => (
-            plot.points.iter().map(|p| (p.j_a, p.b_a)).collect(),
-            plot.points.iter().map(|p| (p.j_b, p.b_b)).collect(),
-        ),
-        (None, None) => (Vec::new(), Vec::new()),
-    };
+    let (points_a, points_b, band_a, band_b): (Points, Points, BandPixels, BandPixels) =
+        match (a, comparison) {
+            (Some(curve), _) => (
+                curve.points.iter().map(|p| Some((p.j, p.a))).collect(),
+                Vec::new(),
+                curve
+                    .points
+                    .iter()
+                    .map(|p| band_of(p.j, p.a, p.sigma_a))
+                    .collect(),
+                Vec::new(),
+            ),
+            (None, Some(plot)) => (
+                plot.points.iter().map(|p| Some((p.j_a, p.a_a))).collect(),
+                plot.points.iter().map(|p| Some((p.j_b, p.a_b))).collect(),
+                plot.points
+                    .iter()
+                    .map(|p| band_of(p.j_a, p.a_a, p.sigma_a[0]))
+                    .collect(),
+                plot.points
+                    .iter()
+                    .map(|p| band_of(p.j_b, p.a_b, p.sigma_a[1]))
+                    .collect(),
+            ),
+            (None, None) => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        };
+    let (points_a_b, points_b_b, band_a_b, band_b_b): (Points, Points, BandPixels, BandPixels) =
+        match (a, comparison) {
+            (Some(curve), _) => (
+                curve.points.iter().map(|p| Some((p.j, p.b))).collect(),
+                Vec::new(),
+                curve
+                    .points
+                    .iter()
+                    .map(|p| band_of(p.j, p.b, p.sigma_b))
+                    .collect(),
+                Vec::new(),
+            ),
+            (None, Some(plot)) => (
+                plot.points.iter().map(|p| Some((p.j_a, p.b_a))).collect(),
+                plot.points.iter().map(|p| Some((p.j_b, p.b_b))).collect(),
+                plot.points
+                    .iter()
+                    .map(|p| band_of(p.j_a, p.b_a, p.sigma_b[0]))
+                    .collect(),
+                plot.points
+                    .iter()
+                    .map(|p| band_of(p.j_b, p.b_b, p.sigma_b[1]))
+                    .collect(),
+            ),
+            (None, None) => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        };
 
     let single = comparison.is_none();
     let label_a = if single { "a′" } else { "A" };
     let label_b = if single { "b′" } else { "B" };
-    let mut series = vec![LineSeries::new(label_a, STYLE_A, points_a.clone())];
+    let mut series = vec![LineSeries {
+        label: label_a.to_string(),
+        style: STYLE_A,
+        points: points_a.clone(),
+        band: band_a.clone(),
+    }];
     if !points_b.is_empty() {
-        series.push(LineSeries::new(label_b, STYLE_B, points_b.clone()));
+        series.push(LineSeries {
+            label: label_b.to_string(),
+            style: STYLE_B,
+            points: points_b.clone(),
+            band: band_b.clone(),
+        });
     }
-    let mut series_b = vec![LineSeries::new(label_a, STYLE_A, points_a_b.clone())];
+    let mut series_b = vec![LineSeries {
+        label: label_a.to_string(),
+        style: STYLE_A,
+        points: points_a_b.clone(),
+        band: band_a_b.clone(),
+    }];
     if !points_b_b.is_empty() {
-        series_b.push(LineSeries::new(label_b, STYLE_B, points_b_b.clone()));
+        series_b.push(LineSeries {
+            label: label_b.to_string(),
+            style: STYLE_B,
+            points: points_b_b.clone(),
+            band: band_b_b.clone(),
+        });
     }
 
     let mut all = series.clone();
@@ -529,14 +703,30 @@ fn tint_panels(
             .chain(points_b.iter())
             .chain(points_a_b.iter())
             .chain(points_b_b.iter())
+            .flatten()
             .map(|p| p.0),
         false,
     );
-    let a_domain = padded_domain(points_a.iter().chain(points_b.iter()).map(|p| p.1), true);
-    let b_domain = padded_domain(
-        points_a_b.iter().chain(points_b_b.iter()).map(|p| p.1),
+    let a_domain = domain_with_bands(
+        points_a
+            .iter()
+            .chain(points_b.iter())
+            .flatten()
+            .map(|p| p.1),
+        [&band_a, &band_b].into_iter(),
         true,
     );
+    let b_domain = domain_with_bands(
+        points_a_b
+            .iter()
+            .chain(points_b_b.iter())
+            .flatten()
+            .map(|p| p.1),
+        [&band_a_b, &band_b_b].into_iter(),
+        true,
+    );
+    let has_uncertainty = band_a.iter().chain(band_b.iter()).any(Option::is_some)
+        || band_a_b.iter().chain(band_b_b.iter()).any(Option::is_some);
 
     let mut out = String::new();
     open_svg(
@@ -555,6 +745,11 @@ fn tint_panels(
             .map(|line| (line.label.clone(), line.style))
             .collect::<Vec<_>>(),
     );
+    if !has_uncertainty {
+        out.push_str(&format!(
+            "<text x=\"704.0\" y=\"18.0\" font-family=\"sans-serif\" font-size=\"11\" fill=\"{MUTED_COLOR}\" text-anchor=\"end\" dominant-baseline=\"middle\">layer uncertainty unavailable</text>\n",
+        ));
+    }
     panel(
         &mut out,
         Panel {
@@ -570,6 +765,8 @@ fn tint_panels(
             y_ticks: ticks(a_domain.0, a_domain.1, 5),
             x_label: "J′",
             y_label: "a′",
+            clip_id: format!("{prefix}-clip-a"),
+            reference: None,
         },
         &series,
     );
@@ -588,6 +785,8 @@ fn tint_panels(
             y_ticks: ticks(b_domain.0, b_domain.1, 5),
             x_label: "J′",
             y_label: "b′",
+            clip_id: format!("{prefix}-clip-b"),
+            reference: None,
         },
         &series_b,
     );
@@ -608,24 +807,23 @@ pub fn tint_comparison_svg(plot: &TintComparison) -> String {
     tint_panels("Neutral tint of both functions", "tint", None, Some(plot))
 }
 
-fn grl_series_points(values: &[Option<GrlValue>], bins: &[HueBin]) -> (Pixels, BandPixels) {
+fn grl_series_points(values: &[Option<GrlValue>], bins: &[HueBin]) -> (Points, BandPixels) {
     let mut points = Vec::with_capacity(values.len());
     let mut band = Vec::with_capacity(values.len());
     for (index, value) in values.iter().enumerate() {
-        let Some(value) = value else {
-            band.push(None);
-            continue;
-        };
-        let Some(bin) = bins.get(index) else {
-            continue;
-        };
-        let center = (bin.start_deg + bin.end_deg) / 2.0;
-        points.push((center, value.value));
-        band.push(
-            value
-                .sigma
-                .map(|sigma| (center, value.value - sigma, value.value + sigma)),
-        );
+        let center = bins
+            .get(index)
+            .map_or(0.0, |bin| (bin.start_deg + bin.end_deg) / 2.0);
+        match value {
+            Some(value) => {
+                points.push(Some((center, value.value)));
+                band.push(band_of(center, value.value, value.sigma));
+            }
+            None => {
+                points.push(None);
+                band.push(None);
+            }
+        }
     }
     (points, band)
 }
@@ -648,6 +846,14 @@ pub fn grl_svg(plot: &GrlPlot) -> String {
     } else {
         vec![("A".to_string(), STYLE_A)]
     };
+    let has_uncertainty = plot.series.iter().any(|series| {
+        series
+            .a
+            .iter()
+            .chain(series.b.iter())
+            .flatten()
+            .any(|value| value.sigma.is_some())
+    });
     let mut out = String::new();
     open_svg(
         &mut out,
@@ -657,8 +863,23 @@ pub fn grl_svg(plot: &GrlPlot) -> String {
         "Chroma, hue and lightness by hue",
         "Chroma gain, hue rotation and lightness shift against hue for each lightness",
     );
+    out.push_str("<defs>\n");
+    out.push_str(
+        "<pattern id=\"grl-hatch\" width=\"6\" height=\"6\" patternUnits=\"userSpaceOnUse\" patternTransform=\"rotate(45)\">\n",
+    );
+    out.push_str("<rect width=\"6\" height=\"6\" fill=\"#f2f2f2\"/>\n");
+    out.push_str(
+        "<line x1=\"0\" y1=\"0\" x2=\"0\" y2=\"6\" stroke=\"#b0b0b0\" stroke-width=\"1\"/>\n",
+    );
+    out.push_str("</pattern>\n</defs>\n");
     legend(&mut out, left, 20.0, &labels);
-
+    if !has_uncertainty {
+        out.push_str(&format!(
+            "<text x=\"{x}\" y=\"20.0\" font-family=\"sans-serif\" font-size=\"11\" fill=\"{MUTED_COLOR}\" text-anchor=\"end\" dominant-baseline=\"middle\">layer uncertainty unavailable</text>\n",
+            x = num(width - 16.0, 1),
+        ));
+    }
+    let mut any_shaded = false;
     for (row, component) in GrlComponentKind::ALL.iter().enumerate() {
         let row_y = top + row as f64 * (panel_height + gap_y);
         out.push_str(&format!(
@@ -699,12 +920,40 @@ pub fn grl_svg(plot: &GrlPlot) -> String {
                     band: band_b,
                 });
             }
+            for bin in &plot.hue_bins {
+                let a_missing = series.a.get(bin.index).is_none_or(Option::is_none);
+                let b_missing =
+                    !series.b.is_empty() && series.b.get(bin.index).is_none_or(Option::is_none);
+                if a_missing || b_missing {
+                    any_shaded = true;
+                    let x = column_x + panel_width * bin.start_deg / 360.0;
+                    let band_width = panel_width * (bin.end_deg - bin.start_deg) / 360.0;
+                    out.push_str(&format!(
+                        "<rect x=\"{x}\" y=\"{y}\" width=\"{w}\" height=\"{h}\" fill=\"url(#grl-hatch)\"/>\n",
+                        x = num(x, 1),
+                        y = num(row_y, 1),
+                        w = num(band_width, 1),
+                        h = num(panel_height, 1),
+                    ));
+                }
+            }
+            let reference = if *component == GrlComponentKind::ChromaGain {
+                1.0
+            } else {
+                0.0
+            };
             let domain = padded_domain(
                 curves
                     .iter()
-                    .flat_map(|line| line.points.iter().map(|p| p.1))
-                    .chain(std::iter::once(0.0)),
-                true,
+                    .flat_map(|line| line.points.iter().flatten().map(|p| p.1))
+                    .chain(
+                        curves
+                            .iter()
+                            .flat_map(|line| line.band.iter().flatten())
+                            .flat_map(|(_, low, high)| [*low, *high]),
+                    )
+                    .chain(std::iter::once(reference)),
+                false,
             );
             let ticks_x = [0.0, 90.0, 180.0, 270.0, 360.0];
             panel(
@@ -722,10 +971,18 @@ pub fn grl_svg(plot: &GrlPlot) -> String {
                     y_ticks: vec![domain.0, (domain.0 + domain.1) / 2.0, domain.1],
                     x_label: "hue (deg)",
                     y_label: "",
+                    clip_id: format!("grl-clip-{row}-{column}"),
+                    reference: Some(reference),
                 },
                 &curves,
             );
         }
+    }
+    if any_shaded {
+        out.push_str(&format!(
+            "<text x=\"{x}\" y=\"38.0\" font-family=\"sans-serif\" font-size=\"10\" fill=\"{MUTED_COLOR}\" text-anchor=\"end\">hatched: unsupported</text>\n",
+            x = num(width - 16.0, 1),
+        ));
     }
     close_svg(&mut out);
     out
@@ -761,6 +1018,15 @@ pub fn delta_e_histogram_svg(dist: &DeltaEDistribution) -> String {
         x = num(width / 2.0, 1),
         y = num(16.0, 1),
     ));
+    if dist.count == 0 {
+        out.push_str(&format!(
+            "<text x=\"{x}\" y=\"{y}\" font-family=\"sans-serif\" font-size=\"13\" fill=\"{MUTED_COLOR}\" text-anchor=\"middle\">no supported probes</text>\n",
+            x = num(width / 2.0, 1),
+            y = num(height / 2.0, 1),
+        ));
+        close_svg(&mut out);
+        return out;
+    }
     let max_count = dist
         .histogram
         .iter()

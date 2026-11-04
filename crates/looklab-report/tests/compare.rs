@@ -8,8 +8,8 @@ use looklab_model::basis::TONE_KNOTS;
 use looklab_model::probes::{Probe, ProbeGroup, ProbeId, ProbeSet};
 use looklab_model::{ColorLayer, Look, LookInput, ProbeSetVersion, Tone};
 use looklab_report::compare::{
-    Comparison, ComparisonInput, Covariance3, FunctionName, LayerId, LookFunction, Support,
-    compare, hue_bins, look_diagnostics,
+    Comparison, ComparisonInput, Covariance3, FunctionName, LayerCovariance, LayerId, LookFunction,
+    Support, compare, hue_bins, look_diagnostics,
 };
 use looklab_report::{
     ReportSource, delta_e_histogram_svg, grl_svg, look_page, region_map_svg, tint_comparison_svg,
@@ -165,6 +165,65 @@ impl LookFunction for Uncertain {
         Some(Look::layer_values(&self.look, input))
     }
 
+    fn layer_covariance(&self, _input: &LookInput) -> Option<LayerCovariance> {
+        Some(LayerCovariance {
+            t: 0.04,
+            n_a: 0.01,
+            n_b: 0.01,
+            log_g: 0.004,
+            r: 0.5,
+            lambda: 0.02,
+        })
+    }
+
+    fn look(&self) -> Option<&Look> {
+        Some(&self.look)
+    }
+}
+
+struct RedUnsupported {
+    look: Look,
+}
+
+impl LookFunction for RedUnsupported {
+    fn predict(&self, xyz: Xyz) -> Ucs {
+        self.look.eval(xyz)
+    }
+
+    fn support(&self, probe: &Probe) -> Support {
+        if LookInput::new(probe.xyz).h_in < 45.0 {
+            Support::Unsupported
+        } else {
+            Support::Supported
+        }
+    }
+
+    fn layer_values(&self, input: &LookInput) -> Option<looklab_model::LayerValues> {
+        Some(Look::layer_values(&self.look, input))
+    }
+
+    fn look(&self) -> Option<&Look> {
+        Some(&self.look)
+    }
+}
+
+struct NoSupport {
+    look: Look,
+}
+
+impl LookFunction for NoSupport {
+    fn predict(&self, xyz: Xyz) -> Ucs {
+        self.look.eval(xyz)
+    }
+
+    fn support(&self, _probe: &Probe) -> Support {
+        Support::Unsupported
+    }
+
+    fn layer_values(&self, input: &LookInput) -> Option<looklab_model::LayerValues> {
+        Some(Look::layer_values(&self.look, input))
+    }
+
     fn look(&self) -> Option<&Look> {
         Some(&self.look)
     }
@@ -186,6 +245,14 @@ fn top_layer(comparison: &Comparison) -> LayerId {
     comparison.attribution[0].layer
 }
 
+fn number_between(text: &str, prefix: &str, suffix: &str) -> f64 {
+    let start = text.find(prefix).expect("prefix present") + prefix.len();
+    let rest = &text[start..];
+    rest[..rest.find(suffix).expect("suffix present")]
+        .parse()
+        .expect("number present")
+}
+
 #[test]
 fn tone_shoulder_lift_is_named_and_ranked_first() {
     let a = base_look();
@@ -196,6 +263,8 @@ fn tone_shoulder_lift_is_named_and_ranked_first() {
     assert!(comparison.attribution[0].contribution > 0.1);
     assert!(comparison.summary.contains("brighter in the highlights"));
     assert!(comparison.summary.contains("J′ above s = +1"));
+    let lift = number_between(&comparison.summary, "(", " J′ above");
+    assert!(lift > 1.0 && lift < 2.5, "lift: {lift}");
 }
 
 #[test]
@@ -210,6 +279,17 @@ fn tint_shift_is_named_and_ranked_first() {
 }
 
 #[test]
+fn tint_shift_in_the_opposite_direction_is_signed() {
+    let a = base_look();
+    let b = with_tint(base_look(), -1.2);
+    let comparison = run(&a, &b, &probes());
+
+    assert_eq!(top_layer(&comparison), LayerId::Tint);
+    assert!(comparison.summary.contains("cooler neutrals"));
+    assert!(comparison.summary.contains("b′ -1.2"));
+}
+
+#[test]
 fn chroma_gain_in_reds_is_named_and_ranked_first() {
     let a = base_look();
     let b = with_chroma(base_look(), -0.18, &[1]);
@@ -218,6 +298,8 @@ fn chroma_gain_in_reds_is_named_and_ranked_first() {
     assert_eq!(top_layer(&comparison), LayerId::Chroma);
     assert!(comparison.summary.contains("less saturated in reds"));
     assert!(comparison.summary.contains("0–40°"));
+    let percent = number_between(&comparison.summary, "(", "% chroma");
+    assert!(percent < -5.0 && percent > -12.0, "percent: {percent}");
 }
 
 #[test]
@@ -227,8 +309,10 @@ fn hue_rotation_in_blues_is_named_and_ranked_first() {
     let comparison = run(&a, &b, &probes());
 
     assert_eq!(top_layer(&comparison), LayerId::Hue);
-    assert!(comparison.summary.contains("hue rotated"));
+    assert!(comparison.summary.contains("hue rotated by "));
     assert!(comparison.summary.contains("blues (205–265°)"));
+    let degrees = number_between(&comparison.summary, "hue rotated by ", "°");
+    assert!(degrees > 4.5 && degrees < 6.5, "degrees: {degrees}");
 }
 
 #[test]
@@ -302,7 +386,7 @@ fn every_svg_parses_and_unsupported_regions_are_hatched() {
     for document in &documents {
         Document::parse(document).expect("well-formed SVG");
     }
-    assert!(documents[4].contains("url(#hatch-unsupported)"));
+    assert!(has_hatched_data_cell(&documents[4]));
     assert!(comparison.region_map.cells[0][0].delta_e.is_none());
     assert!(comparison.delta_e.excluded > 0);
 }
@@ -349,6 +433,124 @@ fn probe_set_v1_yields_region_map_and_layer_curves() {
     assert!(comparison.grl.is_some());
     assert!(comparison.delta_e.count > 0);
     Document::parse(&region_map_svg(&comparison.region_map)).expect("well-formed SVG");
+}
+
+fn with_lightness_slices(
+    mut look: Look,
+    shift: f64,
+    hue_indices: &[usize],
+    s_indices: &[usize],
+) -> Look {
+    for hue in hue_indices {
+        for s in s_indices {
+            for c in 0..3 {
+                look.color.lambda.volume[(hue * 10 + s) * 3 + c] = shift;
+            }
+        }
+    }
+    look
+}
+
+#[test]
+fn chroma_gain_in_the_opposite_direction_is_signed() {
+    let a = base_look();
+    let b = with_chroma(base_look(), 0.18, &[1]);
+    let comparison = run(&a, &b, &probes());
+
+    assert_eq!(top_layer(&comparison), LayerId::Chroma);
+    assert!(comparison.summary.contains("more saturated in reds"));
+    assert!(comparison.summary.contains("0–40°"));
+    let percent = number_between(&comparison.summary, "(", "% chroma");
+    assert!(percent > 5.0 && percent < 12.0, "percent: {percent}");
+}
+
+#[test]
+fn lightness_change_only_in_the_shadows_reports_its_slice() {
+    let a = base_look();
+    let b = with_lightness_slices(base_look(), 2.0, &[6, 7], &[2]);
+    let comparison = run(&a, &b, &probes());
+
+    assert_eq!(top_layer(&comparison), LayerId::Lightness);
+    assert!(comparison.summary.contains("lighter in yellows"));
+    assert!(comparison.summary.contains("at s = -4"));
+}
+
+#[test]
+fn unsupported_regions_do_not_supply_layer_differences() {
+    let a = RedUnsupported { look: base_look() };
+    let mut b_look = with_chroma(base_look(), -0.18, &[1]);
+    b_look.tint.b.fill(1.2);
+    let b = RedUnsupported { look: b_look };
+    let comparison = run(&a, &b, &probes());
+
+    let order: Vec<LayerId> = comparison.attribution.iter().map(|c| c.layer).collect();
+    let tint_rank = order.iter().position(|layer| *layer == LayerId::Tint);
+    let chroma_rank = order.iter().position(|layer| *layer == LayerId::Chroma);
+    assert!(tint_rank.is_some() && chroma_rank.is_some());
+    assert!(tint_rank.unwrap() < chroma_rank.unwrap());
+    assert!(!comparison.summary.contains("saturated in reds"));
+
+    let grl = comparison.grl.as_ref().expect("layer curves");
+    let series = grl
+        .series
+        .iter()
+        .find(|series| {
+            series.component == looklab_report::GrlComponentKind::ChromaGain && series.s == 0.0
+        })
+        .expect("chroma series");
+    assert!(series.a[1].is_none(), "red bin must stay unsupported");
+    let svg = grl_svg(grl);
+    Document::parse(&svg).expect("well-formed GRL SVG");
+    assert!(svg.contains("url(#grl-hatch)"));
+    assert!(svg.contains("hatched: unsupported"));
+}
+
+#[test]
+fn no_supported_probes_is_not_an_equivalence_claim() {
+    let a = NoSupport { look: base_look() };
+    let b = NoSupport {
+        look: with_tint(base_look(), 1.2),
+    };
+    let comparison = run(&a, &b, &probes());
+
+    assert_eq!(comparison.delta_e.count, 0);
+    assert!(comparison.summary.contains("no supported probes"));
+    assert!(!comparison.summary.contains("indistinguishable"));
+    assert!(comparison.attribution.is_empty());
+    let page = looklab_report::comparison_page(
+        &comparison,
+        &ReportSource::default(),
+        &ReportSource::default(),
+    );
+    assert!(page.contains("unavailable"));
+    assert!(!page.contains("Median</th><td>0.00"));
+    Document::parse(&delta_e_histogram_svg(&comparison.delta_e)).expect("empty histogram SVG");
+}
+
+#[test]
+fn missing_layer_uncertainty_is_stated_in_every_plot() {
+    let a = base_look();
+    let b = with_tint(base_look(), 1.2);
+    let comparison = run(&a, &b, &probes());
+
+    let grl = grl_svg(comparison.grl.as_ref().expect("layer curves"));
+    assert!(grl.contains("layer uncertainty unavailable"));
+    assert!(tone_comparison_svg(&comparison.tone).contains("layer uncertainty unavailable"));
+    assert!(tint_comparison_svg(&comparison.tint).contains("layer uncertainty unavailable"));
+}
+
+fn has_hatched_data_cell(svg: &str) -> bool {
+    let document = Document::parse(svg).expect("well-formed SVG");
+    document.descendants().any(|node| {
+        node.has_tag_name("g")
+            && node
+                .children()
+                .any(|child| child.has_tag_name("title") && child.text() == Some("unsupported"))
+            && node.children().any(|child| {
+                child.has_tag_name("rect")
+                    && child.attribute("fill") == Some("url(#hatch-unsupported)")
+            })
+    })
 }
 
 #[test]

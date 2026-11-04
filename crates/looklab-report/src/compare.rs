@@ -107,13 +107,23 @@ impl Covariance3 {
     pub fn sigma(self) -> f64 {
         self.trace().max(0.0).sqrt()
     }
+}
 
-    /// `cᵀ Σ c`, the predicted variance along `c`.
-    fn along(self, c: [f64; 3]) -> f64 {
-        c[0] * c[0] * self.jj
-            + c[1] * c[1] * self.aa
-            + c[2] * c[2] * self.bb
-            + 2.0 * (c[0] * c[1] * self.ja + c[0] * c[2] * self.jb + c[1] * c[2] * self.ab)
+/// Per-layer predictive variances at an input, in each layer's units squared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct LayerCovariance {
+    pub t: f64,
+    pub n_a: f64,
+    pub n_b: f64,
+    pub log_g: f64,
+    /// Degrees squared.
+    pub r: f64,
+    pub lambda: f64,
+}
+
+impl LayerCovariance {
+    pub fn sigma(variance: f64) -> f64 {
+        variance.max(0.0).sqrt()
     }
 }
 
@@ -133,6 +143,12 @@ pub trait LookFunction {
     }
 
     fn layer_values(&self, _input: &LookInput) -> Option<LayerValues> {
+        None
+    }
+
+    /// A probe's input or a synthesized curve sample; probe-only callers pass
+    /// `LookInput::new(probe.xyz)`.
+    fn layer_covariance(&self, _input: &LookInput) -> Option<LayerCovariance> {
         None
     }
 
@@ -235,6 +251,7 @@ pub fn hue_bin_index(hue_degrees: f64) -> usize {
 pub struct TonePoint {
     pub s: f64,
     pub j: f64,
+    pub sigma: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -247,6 +264,8 @@ pub struct TintPoint {
     pub j: f64,
     pub a: f64,
     pub b: f64,
+    pub sigma_a: Option<f64>,
+    pub sigma_b: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -266,6 +285,8 @@ pub struct ToneSample {
     pub a: f64,
     pub b: f64,
     pub delta: f64,
+    /// One-sigma layer uncertainty of `J'`; index 0 is the first function.
+    pub sigma: [Option<f64>; 2],
 }
 
 /// Neutral tint curve of both functions plus the difference.
@@ -285,12 +306,14 @@ pub struct TintSample {
     pub b_b: f64,
     pub delta_a: f64,
     pub delta_b: f64,
+    pub sigma_a: [Option<f64>; 2],
+    pub sigma_b: [Option<f64>; 2],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrlComponentKind {
-    /// `log G`, the natural log of the chroma gain.
+    /// `G = exp(log_g)`, the chroma gain relative to colorimetric.
     ChromaGain,
     /// `R`, hue rotation in degrees.
     HueRotation,
@@ -345,7 +368,8 @@ pub struct LookDiagnostics {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RegionCell {
     pub delta_e: Option<f64>,
-    /// Combined one-sigma prediction uncertainty, zero when unknown.
+    /// Combined one-sigma prediction uncertainty in CAM16-UCS units, zero when
+    /// unknown.
     pub sigma: f64,
     pub probe: Option<ProbeId>,
 }
@@ -389,7 +413,8 @@ impl DistributionMetric {
 pub struct WorstProbe {
     pub id: ProbeId,
     pub delta_e: f64,
-    /// Combined one-sigma prediction uncertainty, zero when unknown.
+    /// Combined one-sigma prediction uncertainty in CAM16-UCS units, zero when
+    /// unknown; not transformed by the distribution metric.
     pub sigma: f64,
 }
 
@@ -487,10 +512,7 @@ pub fn look_diagnostics(function: &dyn LookFunction, probes: &ProbeSet) -> LookD
         tone: ToneCurve {
             points: curve_s_values()
                 .into_iter()
-                .map(|s| TonePoint {
-                    s,
-                    j: tone_j(function, s),
-                })
+                .map(|s| tone_point(function, s))
                 .collect(),
         },
         tint: TintCurve {
@@ -514,11 +536,21 @@ fn neutral_xyz(s: f64) -> Xyz {
     Illuminant::D65.xyz().scale(0.18 * libm::pow(2.0, s))
 }
 
-fn tone_j(function: &dyn LookFunction, s: f64) -> f64 {
+fn tone_point(function: &dyn LookFunction, s: f64) -> TonePoint {
     let input = LookInput::new(neutral_xyz(s));
     match function.layer_values(&input) {
-        Some(values) => values.t,
-        None => function.predict(input.xyz).j,
+        Some(values) => TonePoint {
+            s,
+            j: values.t,
+            sigma: function
+                .layer_covariance(&input)
+                .map(|covariance| LayerCovariance::sigma(covariance.t)),
+        },
+        None => TonePoint {
+            s,
+            j: function.predict(input.xyz).j,
+            sigma: None,
+        },
     }
 }
 
@@ -526,15 +558,22 @@ fn tint_point(function: &dyn LookFunction, s: f64) -> TintPoint {
     let input = LookInput::new(neutral_xyz(s));
     let ucs = function.predict(input.xyz);
     match function.layer_values(&input) {
-        Some(values) => TintPoint {
-            j: values.t,
-            a: values.n_a,
-            b: values.n_b,
-        },
+        Some(values) => {
+            let covariance = function.layer_covariance(&input);
+            TintPoint {
+                j: values.t,
+                a: values.n_a,
+                b: values.n_b,
+                sigma_a: covariance.map(|c| LayerCovariance::sigma(c.n_a)),
+                sigma_b: covariance.map(|c| LayerCovariance::sigma(c.n_b)),
+            }
+        }
         None => TintPoint {
             j: ucs.j,
             a: ucs.a,
             b: ucs.b,
+            sigma_a: None,
+            sigma_b: None,
         },
     }
 }
@@ -544,13 +583,14 @@ fn tone_comparison(a: &dyn LookFunction, b: &dyn LookFunction) -> ToneComparison
         points: curve_s_values()
             .into_iter()
             .map(|s| {
-                let first = tone_j(a, s);
-                let second = tone_j(b, s);
+                let first = tone_point(a, s);
+                let second = tone_point(b, s);
                 ToneSample {
                     s,
-                    a: first,
-                    b: second,
-                    delta: second - first,
+                    a: first.j,
+                    b: second.j,
+                    delta: second.j - first.j,
+                    sigma: [first.sigma, second.sigma],
                 }
             })
             .collect(),
@@ -573,6 +613,8 @@ fn tint_comparison(a: &dyn LookFunction, b: &dyn LookFunction) -> TintComparison
                     b_b: second.b,
                     delta_a: second.a - first.a,
                     delta_b: second.b - first.b,
+                    sigma_a: [first.sigma_a, second.sigma_a],
+                    sigma_b: [first.sigma_b, second.sigma_b],
                 }
             })
             .collect(),
@@ -636,43 +678,26 @@ fn grl_value(
     probe: &Probe,
     component: GrlComponentKind,
 ) -> Option<GrlValue> {
-    let input = LookInput::new(probe.xyz);
-    let values = function.layer_values(&input)?;
-    let value = match component {
-        GrlComponentKind::ChromaGain => values.log_g,
-        GrlComponentKind::HueRotation => values.r,
-        GrlComponentKind::LightnessShift => values.lambda,
-    };
-    Some(GrlValue {
-        value,
-        sigma: layer_sigma(function, probe, &input, &values, component),
-    })
-}
-
-/// One-sigma layer uncertainty by the delta method: a layer displacement `δ`
-/// moves the prediction by `c δ`, so `σ_δ² = cᵀ Σ c / ‖c‖⁴`.
-fn layer_sigma(
-    function: &dyn LookFunction,
-    probe: &Probe,
-    input: &LookInput,
-    values: &LayerValues,
-    component: GrlComponentKind,
-) -> Option<f64> {
-    let covariance = function.covariance(probe)?;
-    let look = function.look()?;
-    let columns = look.d_output_d_layer_values(input, values);
-    let column = match component {
-        GrlComponentKind::ChromaGain => 3,
-        GrlComponentKind::HueRotation => 4,
-        GrlComponentKind::LightnessShift => 5,
-    };
-    let c = [columns[0][column], columns[1][column], columns[2][column]];
-    let norm2 = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
-    let variance = covariance.along(c);
-    if norm2 < 1e-12 || variance < 0.0 {
+    if function.support(probe) == Support::Unsupported {
         return None;
     }
-    Some(variance.sqrt() / norm2)
+    let input = LookInput::new(probe.xyz);
+    let values = function.layer_values(&input)?;
+    let covariance = function.layer_covariance(&input);
+    let (value, sigma) = match component {
+        GrlComponentKind::ChromaGain => (
+            libm::exp(values.log_g),
+            covariance.map(|c| libm::exp(values.log_g) * LayerCovariance::sigma(c.log_g)),
+        ),
+        GrlComponentKind::HueRotation => {
+            (values.r, covariance.map(|c| LayerCovariance::sigma(c.r)))
+        }
+        GrlComponentKind::LightnessShift => (
+            values.lambda,
+            covariance.map(|c| LayerCovariance::sigma(c.lambda)),
+        ),
+    };
+    Some(GrlValue { value, sigma })
 }
 
 fn grl_plot(a: &dyn LookFunction, b: &dyn LookFunction, set: &ProbeSet) -> Option<GrlPlot> {
@@ -956,23 +981,30 @@ fn attribution(
     let (Some(look_a), Some(look_b)) = (a.look(), b.look()) else {
         return Vec::new();
     };
-    if set.probes.is_empty() {
+    let supported: Vec<&Probe> = set
+        .probes
+        .iter()
+        .filter(|probe| {
+            a.support(probe) == Support::Supported && b.support(probe) == Support::Supported
+        })
+        .collect();
+    if supported.is_empty() {
         return Vec::new();
     }
     let mut baseline = 0.0;
-    for probe in &set.probes {
+    for probe in &supported {
         baseline += delta_e_ucs(a.predict(probe.xyz), b.predict(probe.xyz));
     }
-    baseline /= set.probes.len() as f64;
+    baseline /= supported.len() as f64;
 
     let mut contributions = Vec::with_capacity(LayerId::ALL.len());
     for layer in LayerId::ALL {
         let hybrid = with_layer(look_a, look_b, layer);
         let mut error = 0.0;
-        for probe in &set.probes {
+        for probe in &supported {
             error += delta_e_ucs(hybrid.eval(probe.xyz), b.predict(probe.xyz));
         }
-        error /= set.probes.len() as f64;
+        error /= supported.len() as f64;
         contributions.push(LayerContribution {
             layer,
             contribution: (baseline - error).max(0.0),
