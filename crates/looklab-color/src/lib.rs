@@ -8,6 +8,7 @@ pub mod cam16;
 pub mod cat;
 pub mod chart;
 pub mod ciede2000;
+pub mod dng;
 pub mod lab;
 pub mod linalg;
 pub mod spaces;

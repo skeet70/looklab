@@ -22,6 +22,7 @@ looklab-export = { path = "crates/looklab-export" }
 looklab-trust = { path = "crates/looklab-trust" }
 looklab-schema = { path = "crates/looklab-schema" }
 looklab-report = { path = "crates/looklab-report" }
+looklab-upload = { path = "crates/looklab-upload" }
 looklab-wasm = { path = "crates/looklab-wasm" }
 
 libm = "0.2"
@@ -36,6 +37,7 @@ proptest = "1"
 criterion = { version = "0.7", default-features = false }
 
 zip = { version = "2", default-features = false }
+png = "0.18"
 
 rawler = "0.8"
 uuid = { version = "1", features = ["js"] }
@@ -45,8 +47,12 @@ toml = "0.8"
 rand_chacha = "0.9"
 sha2 = "0.10"
 hmac = "0.12"
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+ciborium = "0.2"
+base64 = "0.22"
 jpeg-encoder = "0.6"
 zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
+roxmltree = "0.21"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

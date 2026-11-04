@@ -1,0 +1,325 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+use jpeg_encoder::{ColorType, Encoder};
+use looklab_color::spaces::RgbSpace;
+use looklab_prep::{
+    DecodedJpeg, Image3, LocalImageKey, PREP_VERSION, PrepParams, PriorTransform, SamplingSeed,
+    SeedFile, prepare_decoded, prepare_pair, prepare_pair_decoded,
+};
+use looklab_raw::{DecodedRaw, Orientation, RawDecoder, RawlerDecoder};
+use looklab_samples::{
+    MAX_DENSITY_WEIGHT, MAX_RGB, MIN_RGB, OutputSpace, PrepVersion, PriorTransformVersion, encode,
+};
+
+const WIDTH: u32 = 96;
+const HEIGHT: u32 = 72;
+
+fn scene() -> Image3 {
+    let mut data = Vec::with_capacity((WIDTH * HEIGHT) as usize);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let u = x as f32 / (WIDTH - 1) as f32;
+            let v = y as f32 / (HEIGHT - 1) as f32;
+            let field = 0.08 + 0.75 * (u * (1.0 - v) + 0.12);
+            data.push([
+                field * (1.0 - 0.35 * v),
+                field * (0.55 + 0.35 * u),
+                field * (0.35 + 0.5 * (1.0 - u)),
+            ]);
+        }
+    }
+    Image3::new(WIDTH, HEIGHT, data).expect("dimensions match")
+}
+
+fn scaled(image: &Image3, factor: f32) -> Image3 {
+    Image3::new(
+        image.width,
+        image.height,
+        image
+            .data
+            .iter()
+            .map(|rgb| [rgb[0] * factor, rgb[1] * factor, rgb[2] * factor])
+            .collect(),
+    )
+    .expect("dimensions match")
+}
+
+fn raw_from(image: &Image3, wb: [f64; 3]) -> DecodedRaw {
+    let rgb = image
+        .data
+        .iter()
+        .flat_map(|px| {
+            [
+                (f64::from(px[0]) / wb[0]) as f32,
+                (f64::from(px[1]) / wb[1]) as f32,
+                (f64::from(px[2]) / wb[2]) as f32,
+            ]
+        })
+        .collect();
+    DecodedRaw {
+        width: image.width as usize,
+        height: image.height as usize,
+        rgb,
+        as_shot_wb: wb,
+        orientation: Orientation::Normal,
+        make: "FUJIFILM".to_owned(),
+        model: "X-S10".to_owned(),
+        color_matrices: None,
+    }
+}
+
+fn jpeg_from(image: Image3) -> DecodedJpeg {
+    let code_values_near_clip = image
+        .data
+        .iter()
+        .map(|rgb| rgb.iter().any(|channel| *channel >= 0.98))
+        .collect();
+    DecodedJpeg {
+        image,
+        space: OutputSpace::Srgb,
+        space_assumed: false,
+        code_values_near_clip,
+    }
+}
+
+fn fixed_seed(fill: u8) -> SamplingSeed {
+    let hex: String = format!("{fill:02x}").repeat(32);
+    let json = format!(
+        r#"{{"format":"looklab-seeds/1","prior_transform_version":1,"entries":[{{"key":"A.RAF","seed":"{hex}"}}]}}"#
+    );
+    SeedFile::from_json(&json)
+        .expect("valid seed file")
+        .seed_for(&LocalImageKey::new("A.RAF").expect("valid key"))
+        .expect("entry exists")
+}
+
+fn prior() -> PriorTransform {
+    PriorTransform::new(
+        RgbSpace::Srgb.to_xyz_matrix(),
+        5500.0,
+        PriorTransformVersion::new(3),
+    )
+}
+
+fn params() -> PrepParams {
+    PrepParams::default()
+}
+
+fn all_samples_in_limits(samples: &looklab_samples::SampleSet) {
+    for rgb in samples.in_rgb().iter().chain(samples.out_rgb()) {
+        for channel in rgb {
+            assert!(channel.is_finite());
+            assert!((MIN_RGB..=MAX_RGB).contains(channel));
+        }
+    }
+    for weight in samples.density_w() {
+        assert!(weight.is_finite() && *weight > 0.0 && *weight <= MAX_DENSITY_WEIGHT);
+    }
+}
+
+#[test]
+fn prepares_a_pair_with_identity_output() {
+    let scene = scene();
+    let raw = raw_from(&scene, [2.0, 1.0, 1.5]);
+    let jpeg = jpeg_from(scene.clone());
+    let samples =
+        prepare_pair_decoded(&raw, &jpeg, &prior(), fixed_seed(0x5a), &params()).expect("prepares");
+
+    assert!(samples.n() > 10);
+    assert_eq!(samples.header().n as usize, samples.n());
+    assert_eq!(
+        samples.header().prep_version,
+        PrepVersion::new(PREP_VERSION)
+    );
+    assert_eq!(samples.header().output_space, OutputSpace::Srgb);
+    assert_eq!(
+        samples.header().prior_transform_version,
+        PriorTransformVersion::new(3)
+    );
+    assert_eq!(samples.header().wb_multipliers, [2.0, 1.0, 1.5]);
+    assert!(samples.header().rerender_group.is_none());
+    assert_eq!(
+        samples.header().prep_params_hash,
+        params().hash().expect("hash")
+    );
+    all_samples_in_limits(&samples);
+
+    for (in_rgb, out_rgb) in samples.in_rgb().iter().zip(samples.out_rgb()) {
+        for (a, b) in in_rgb.iter().zip(out_rgb) {
+            assert!((a - b).abs() < 0.05, "{in_rgb:?} vs {out_rgb:?}");
+        }
+    }
+}
+
+#[test]
+fn group_members_share_input_pixels_and_shuffle() {
+    let scene = scene();
+    let raw = raw_from(&scene, [2.0, 1.0, 1.5]);
+    let brighter = jpeg_from(scene.clone());
+    let darker = jpeg_from(scaled(&scene, 0.7));
+    let sets = prepare_decoded(
+        &raw,
+        &[&brighter, &darker],
+        &prior(),
+        fixed_seed(0x33),
+        &params(),
+    )
+    .expect("prepares");
+    assert_eq!(sets.len(), 2);
+
+    assert_eq!(sets[0].in_rgb(), sets[1].in_rgb());
+    assert_eq!(sets[0].density_w(), sets[1].density_w());
+    assert_eq!(
+        sets[0].header().rerender_group,
+        sets[1].header().rerender_group
+    );
+    assert!(sets[0].header().rerender_group.is_some());
+    assert_ne!(sets[0].out_rgb(), sets[1].out_rgb());
+}
+
+#[test]
+fn same_seed_reproduces_blobs_and_a_different_seed_reorders() {
+    let scene = scene();
+    let raw = raw_from(&scene, [2.0, 1.0, 1.5]);
+    let jpeg = jpeg_from(scene);
+    let run =
+        |seed| prepare_pair_decoded(&raw, &jpeg, &prior(), seed, &params()).expect("prepares");
+    let first = run(fixed_seed(0x01));
+    let repeat = run(fixed_seed(0x01));
+    assert_eq!(
+        encode(&first).expect("encodes"),
+        encode(&repeat).expect("encodes")
+    );
+
+    let other = run(fixed_seed(0x02));
+    assert_eq!(other.n(), first.n());
+    assert_ne!(
+        encode(&first).expect("encodes"),
+        encode(&other).expect("encodes")
+    );
+    assert_ne!(first.in_rgb(), other.in_rgb());
+}
+
+#[test]
+fn non_finite_raw_pixels_never_reach_the_samples() {
+    let scene = scene();
+    let mut raw = raw_from(&scene, [2.0, 1.0, 1.5]);
+    for y in 20..24 {
+        for x in 30..34 {
+            let base = (y * scene.width as usize + x) * 3;
+            raw.rgb[base] = f32::NAN;
+        }
+    }
+    let jpeg = jpeg_from(scene);
+    let samples =
+        prepare_pair_decoded(&raw, &jpeg, &prior(), fixed_seed(0x04), &params()).expect("prepares");
+    assert!(samples.n() > 0);
+    all_samples_in_limits(&samples);
+}
+
+#[test]
+fn a_non_finite_jpeg_sample_is_an_error() {
+    let scene = scene();
+    let raw = raw_from(&scene, [2.0, 1.0, 1.5]);
+    let mut data = scene.data.clone();
+    for pixel in &mut data {
+        pixel[0] = f32::NAN;
+    }
+    let jpeg = jpeg_from(Image3::new(WIDTH, HEIGHT, data).expect("dimensions match"));
+    let result = prepare_pair_decoded(&raw, &jpeg, &prior(), fixed_seed(0x05), &params());
+    assert!(result.is_err());
+}
+
+#[test]
+fn the_params_hash_covers_the_params() {
+    let a = params();
+    let b = params();
+    assert_eq!(a.hash().expect("hash"), b.hash().expect("hash"));
+    let mut changed = params();
+    changed.downsample_max_pixels += 1;
+    assert_ne!(a.hash().expect("hash"), changed.hash().expect("hash"));
+}
+
+const X_S10_RAF: &[u8] = include_bytes!("../../../fixtures/fujifilm-x-s10.raf");
+
+fn jpeg_bytes_from(image: &Image3, quality: u8) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let encoded: Vec<u8> = image
+        .data
+        .iter()
+        .flat_map(|rgb| {
+            rgb.map(|channel| {
+                let linear = f64::from(channel.clamp(0.0, 1.0));
+                (RgbSpace::Srgb.encode(linear) * 255.0).round() as u8
+            })
+        })
+        .collect();
+    let encoder = Encoder::new(&mut bytes, quality);
+    encoder
+        .encode(
+            &encoded,
+            image.width as u16,
+            image.height as u16,
+            ColorType::Rgb,
+        )
+        .expect("encodes jpeg");
+    bytes
+}
+
+fn meta_orientation(orientation: Orientation) -> looklab_meta::Orientation {
+    match orientation {
+        Orientation::Normal => looklab_meta::Orientation::Normal,
+        Orientation::HorizontalFlip => looklab_meta::Orientation::FlipHorizontal,
+        Orientation::Rotate180 => looklab_meta::Orientation::Rotate180,
+        Orientation::VerticalFlip => looklab_meta::Orientation::FlipVertical,
+        Orientation::Transpose => looklab_meta::Orientation::Transpose,
+        Orientation::Rotate90 => looklab_meta::Orientation::Rotate90Clockwise,
+        Orientation::Transverse => looklab_meta::Orientation::Transverse,
+        Orientation::Rotate270 => looklab_meta::Orientation::Rotate270Clockwise,
+    }
+}
+
+#[test]
+fn prepares_the_x_s10_fixture_with_a_rendered_jpeg() {
+    let raw_bytes = X_S10_RAF;
+    let decoded = RawlerDecoder.decode(raw_bytes).expect("fixture decodes");
+    let wb = decoded.as_shot_wb;
+    let (pixels, _) = decoded.rgb.as_chunks::<3>();
+    let data: Vec<[f32; 3]> = pixels
+        .iter()
+        .map(|px| {
+            [
+                (f64::from(px[0]) * wb[0]) as f32,
+                (f64::from(px[1]) * wb[1]) as f32,
+                (f64::from(px[2]) * wb[2]) as f32,
+            ]
+        })
+        .collect();
+    let image = Image3::new(decoded.width as u32, decoded.height as u32, data)
+        .expect("dimensions match")
+        .apply_orientation(meta_orientation(decoded.orientation));
+    let jpeg_bytes = jpeg_bytes_from(&image, 95);
+    let matrices = decoded
+        .color_matrices
+        .as_ref()
+        .expect("the fixture reports colour matrices");
+    let dng_prior =
+        PriorTransform::from_camera_matrices(matrices, wb, PriorTransformVersion::new(3))
+            .expect("prior transform");
+    assert!((2000.0..=10_000.0).contains(&dng_prior.cct_k()));
+
+    let prepared = prepare_pair(
+        X_S10_RAF,
+        &jpeg_bytes,
+        &dng_prior,
+        fixed_seed(0x10),
+        &params(),
+    )
+    .expect("prepares the fixture");
+
+    assert!(prepared.samples.n() > 100);
+    assert!(prepared.samples.n() <= looklab_samples::MAX_SAMPLES as usize);
+    assert_eq!(prepared.sanitized.make.as_deref(), Some("FUJIFILM"));
+    assert!(prepared.sanitized.as_shot_wb.is_some());
+    all_samples_in_limits(&prepared.samples);
+}

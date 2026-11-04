@@ -7,7 +7,29 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Fixed sampling seeds from bytes, for tests and verify-payload fixtures.
+test-seeds = []
+
 [dependencies]
+looklab-color.workspace = true
+looklab-meta.workspace = true
+looklab-raw.workspace = true
+looklab-samples.workspace = true
+getrandom.workspace = true
+libm.workspace = true
+postcard.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zune-jpeg.workspace = true
+
+[dev-dependencies]
+jpeg-encoder.workspace = true
+proptest.workspace = true
+rand_chacha.workspace = true
 
 [lints]
 workspace = true
