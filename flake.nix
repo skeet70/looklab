@@ -41,6 +41,7 @@
           zstd
           wasm-bindgen-cli
           wasmtime
+          wasm-tools
           binaryen
           wabt
           nodejs_22

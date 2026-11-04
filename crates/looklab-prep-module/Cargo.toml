@@ -1,0 +1,30 @@
+[package]
+name = "looklab-prep-module"
+description = "Reproducible preparation module: a plain C ABI, no imports, for the browser and wasmtime."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+looklab-color.workspace = true
+looklab-meta.workspace = true
+looklab-prep.workspace = true
+looklab-raw.workspace = true
+looklab-samples.workspace = true
+looklab-upload.workspace = true
+postcard.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+jpeg-encoder.workspace = true
+wasmtime.workspace = true
+
+[lints]
+workspace = true

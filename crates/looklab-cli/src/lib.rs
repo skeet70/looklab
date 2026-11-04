@@ -1,6 +1,74 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Native command-line tool.
+//! Native command-line tool: prep, fit, report, compare, export, validate, synth.
+//! Commands and formats follow docs/01 "The CLI", docs/03 §2-§3, docs/04 §7.
 
-pub fn run() -> anyhow::Result<()> {
-    Ok(())
+mod body_transform;
+mod compare;
+mod export;
+mod fit;
+mod prep;
+mod report;
+mod synth;
+mod util;
+mod validate;
+
+pub use body_transform::{BodyTransform, TransformFile};
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "looklab",
+    version,
+    about = "Measure, compare and reproduce camera looks."
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Pair a RAW with its JPEGs (or a folder), prepare samples and write blobs.
+    Prep(prep::PrepArgs),
+    /// Fit one Look from a directory of `.llsamp` blobs.
+    Fit(fit::FitArgs),
+    /// Write an HTML report for one Look.
+    Report(report::ReportArgs),
+    /// Compare two Looks and write an HTML comparison.
+    Compare(compare::CompareArgs),
+    /// Bake a Look for a firmware interface profile and validate the artifact.
+    Export(export::ExportArgs),
+    /// Validate a data directory and its probe set files.
+    Validate(validate::ValidateArgs),
+    /// Write a synthetic dataset so the whole flow runs without fixtures.
+    Synth(synth::SynthArgs),
+}
+
+pub fn run() -> Result<()> {
+    run_with(Cli::parse())
+}
+
+pub fn run_with(cli: Cli) -> Result<()> {
+    match cli.command {
+        Command::Prep(args) => prep::run(&args),
+        Command::Fit(args) => fit::run(&args),
+        Command::Report(args) => report::run(&args),
+        Command::Compare(args) => compare::run(&args),
+        Command::Export(args) => export::run(&args),
+        Command::Validate(args) => validate::run(&args),
+        Command::Synth(args) => synth::run(&args),
+    }
+}
+
+fn write(path: &std::path::Path, bytes: &[u8]) -> Result<u64> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    Ok(bytes.len() as u64)
 }

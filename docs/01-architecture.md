@@ -46,6 +46,7 @@ crates/
   looklab-samples   # sample container format (versioned)
   looklab-upload    # canonical upload envelope, batch manifest, WebAuthn checks, Argon2id PoW
   looklab-prep      # align, downsample, mask, density sampling, chart/pattern detection
+  looklab-prep-module # reproducible prep wasm module: plain C ABI, no imports
   looklab-model     # Look representation, evaluation, look file format, probe sets
   looklab-fit       # single/hierarchical/joint fits, uncertainty, outlier scoring
   looklab-match     # control schemas, control-response models, optimizer, comparison reports

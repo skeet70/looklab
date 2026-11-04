@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 
 /// Mirrors the core float allow-list in AGENTS.md "Numerics".
 const FLOAT_METHOD_ALLOW: &[&str] = &[
@@ -51,6 +52,7 @@ const CORE_CRATES: &[&str] = &[
     "looklab-schema",
     "looklab-report",
     "looklab-wasm",
+    "looklab-prep-module",
 ];
 
 const SPDX_LINE: &str = "// SPDX-License-Identifier: AGPL-3.0-or-later";
@@ -61,8 +63,9 @@ fn main() -> Result<()> {
         Some("spdx") => spdx(),
         Some("bitid") => bitid(),
         Some("wasm-core") => wasm_core(),
+        Some("prep-module") => prep_module(),
         Some(other) => bail!("unknown xtask subcommand {other:?}"),
-        None => bail!("usage: cargo xtask <float-methods|spdx|bitid|wasm-core>"),
+        None => bail!("usage: cargo xtask <float-methods|spdx|bitid|wasm-core|prep-module>"),
     }
 }
 
@@ -455,6 +458,75 @@ fn first_difference(native: &[&str], wasm: &[&str]) -> String {
         }
     }
     format!("line count: native {}, wasm {}", native.len(), wasm.len())
+}
+
+fn prep_module() -> Result<()> {
+    let root = workspace_root()?;
+    let target_dir =
+        env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), |dir| root.join(dir));
+    let mut build = cargo(&root);
+    build.args([
+        "build",
+        "--release",
+        "--target",
+        "wasm32-unknown-unknown",
+        "-p",
+        "looklab-prep-module",
+    ]);
+    run_status(
+        &mut build,
+        "building looklab-prep-module for wasm32-unknown-unknown",
+    )?;
+    let wasm = target_dir.join("wasm32-unknown-unknown/release/looklab_prep_module.wasm");
+    if !wasm.is_file() {
+        bail!("expected the module at {}", wasm.display());
+    }
+
+    // chrono and getrandom hold wasm-bindgen type-description imports; they are
+    // unreachable, so wasm-opt replaces them with nops. Any other import fails.
+    let imports = module_imports(&wasm)?;
+    for line in &imports {
+        if !line.contains("__wbindgen") {
+            bail!("prep module imports {line}");
+        }
+    }
+    if !imports.is_empty() {
+        let optimized = wasm.with_extension("opt.wasm");
+        let mut optimize = Command::new("wasm-opt");
+        optimize
+            .arg("--remove-imports")
+            .arg(&wasm)
+            .arg("-o")
+            .arg(&optimized);
+        run_status(&mut optimize, "removing wasm-bindgen imports")?;
+        fs::rename(&optimized, &wasm).with_context(|| format!("replacing {}", wasm.display()))?;
+    }
+
+    let mut validate = Command::new("wasm-tools");
+    validate
+        .args(["validate", "--features=-relaxed-simd"])
+        .arg(&wasm);
+    run_status(&mut validate, "validating the module without relaxed-simd")?;
+
+    if let Some(line) = module_imports(&wasm)?.first() {
+        bail!("prep module imports {line}");
+    }
+
+    let bytes = fs::read(&wasm).with_context(|| format!("reading {}", wasm.display()))?;
+    let digest = Sha256::digest(&bytes);
+    println!("prep-module: validated without relaxed-simd, no imports; sha256 {digest:x}");
+    Ok(())
+}
+
+fn module_imports(wasm: &Path) -> Result<Vec<String>> {
+    let mut print = Command::new("wasm-tools");
+    print.args(["print", "--skeleton"]).arg(wasm);
+    let skeleton = run_capture(&mut print, "printing the module skeleton")?;
+    Ok(skeleton
+        .lines()
+        .filter(|line| line.trim_start().starts_with("(import"))
+        .map(|line| line.trim().to_owned())
+        .collect())
 }
 
 fn wasm_core() -> Result<()> {

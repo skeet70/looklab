@@ -245,7 +245,7 @@ Versioned in `data/probes/vN.yaml`, generated deterministically, in adapted scen
 |---|---|---|
 | Gray ramp | s ∈ [−10, +5], step 0.25 | 1.0 |
 | Chart patches | ColorChecker 24 + SG 140 reflectances under D65 at s ∈ {−2, −1, 0, +1, +2} | 1.0 |
-| Hue grid | 24 hues × 4 chroma levels × s ∈ {−5..+3}. Chroma levels are 20/40/60/80% of the Pointer's-gamut boundary **at the Y = 0.18-normalized chromaticity** (L* ≈ 49.5, inside the tabulated range). The same chromaticity is used at every s. | 0.5 |
+| Hue grid | 24 hues × 4 chroma levels × s ∈ {−5..+3}. Chroma levels are 20/40/60/80% of the Pointer's-gamut boundary in CAM16-UCS `M'` **at the Y = 0.18-normalized chromaticity** (L* ≈ 49.5, inside the tabulated range), at the boundary's CAM16 hue. The same chromaticity is used at every s. | 0.5 |
 | Skin | Skin-tone reflectance set (TBD, [10 Q5](10-open-questions.md)) at s ∈ {−1, 0, +1} | 2.0 |
 | Memory colors | Sky, foliage and similar | 1.5 |
 

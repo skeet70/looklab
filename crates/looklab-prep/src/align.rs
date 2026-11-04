@@ -59,6 +59,10 @@ pub struct Alignment {
 impl Alignment {
     fn linear(&self, u: f64, v: f64) -> (f64, f64) {
         let (sin, cos) = (libm::sin(self.rotation_rad), libm::cos(self.rotation_rad));
+        self.linear_with(u, v, sin, cos)
+    }
+
+    fn linear_with(&self, u: f64, v: f64, sin: f64, cos: f64) -> (f64, f64) {
         (
             self.scale * (cos * u - sin * v) + self.tx,
             self.scale * (sin * u + cos * v) + self.ty,
@@ -74,7 +78,7 @@ impl Alignment {
     fn undistort(&self, a: f64, b: f64) -> (f64, f64) {
         let target = libm::hypot(a, b);
         let mut radius = target;
-        for _ in 0..10 {
+        for _ in 0..6 {
             let r2 = radius * radius;
             let value = radius + self.k1 * radius * r2 + self.k2 * radius * r2 * r2 - target;
             let slope = 1.0 + 3.0 * self.k1 * r2 + 5.0 * self.k2 * r2 * r2;
@@ -201,7 +205,7 @@ pub fn align(
     let jpeg_luma = normalized_luma(&jpeg.image, grid, grid);
     let mut alignment = initial;
     alignment.gain = fit_gain(&gain_samples(raw_wb_linear, jpeg, &alignment));
-    for _ in 0..2 {
+    for _ in 0..1 {
         refine_geometry(raw_wb_linear, &jpeg_luma, &mut alignment, params)?;
         alignment.gain = fit_gain(&gain_samples(raw_wb_linear, jpeg, &alignment));
     }
@@ -244,7 +248,7 @@ fn refine_geometry(
         .map(|(cost, _)| cost)
         .ok_or(PrepError::AlignNoOverlap)?;
     let mut lambda = 1e-3_f64;
-    for _ in 0..params.max_iterations {
+    for _ in 0..params.max_iterations.min(12) {
         let base = evaluate_residual(raw, jpeg_luma, alignment, &u, &v, &mask)
             .ok_or(PrepError::AlignNoOverlap)?;
         let mut jacobian = vec![vec![0.0_f64; base.len()]; 6];
@@ -470,10 +474,14 @@ fn warped_grid(jpeg: &Image3, scale: f64, rotation: f64, size: usize) -> Vec<f64
 
 fn base_mask(raw: &Image3, alignment: &Alignment, u: &[f64], v: &[f64]) -> Vec<bool> {
     let (max_x, max_y) = (f64::from(raw.width - 1), f64::from(raw.height - 1));
+    let (sin, cos) = (
+        libm::sin(alignment.rotation_rad),
+        libm::cos(alignment.rotation_rad),
+    );
     u.iter()
         .zip(v)
         .map(|(u, v)| {
-            let (a, b) = alignment.linear(*u, *v);
+            let (a, b) = alignment.linear_with(*u, *v, sin, cos);
             let (ad, bd) = alignment.distort(a, b);
             let (x, y) = to_pixels(ad, bd, raw.width, raw.height);
             x > 2.0 && y > 2.0 && x < max_x - 2.0 && y < max_y - 2.0
@@ -511,11 +519,15 @@ fn evaluate_residual(
     let mut raw_values = Vec::with_capacity(mask.len());
     let mut jpeg_values = Vec::with_capacity(mask.len());
     let mut indices = Vec::with_capacity(mask.len());
+    let (sin, cos) = (
+        libm::sin(alignment.rotation_rad),
+        libm::cos(alignment.rotation_rad),
+    );
     for (index, selected) in mask.iter().enumerate() {
         if !selected {
             continue;
         }
-        let (a, b) = alignment.linear(u[index], v[index]);
+        let (a, b) = alignment.linear_with(u[index], v[index], sin, cos);
         let (ad, bd) = alignment.distort(a, b);
         let x = cx + ad * cx;
         let y = cy + bd * cy;
@@ -570,12 +582,16 @@ fn correlation_at(
     let mut raw_values = Vec::new();
     let mut jpeg_values = Vec::new();
     let mut eligible = 0usize;
+    let (sin, cos) = (
+        libm::sin(alignment.rotation_rad),
+        libm::cos(alignment.rotation_rad),
+    );
     for index in 0..u.len() {
         if u[index].abs() > 0.5 || v[index].abs() > 0.5 {
             continue;
         }
         eligible += 1;
-        let (a, b) = alignment.linear(u[index], v[index]);
+        let (a, b) = alignment.linear_with(u[index], v[index], sin, cos);
         let (ad, bd) = alignment.distort(a, b);
         let x = cx + ad * cx;
         let y = cy + bd * cy;
@@ -1016,12 +1032,16 @@ struct GainSample {
 }
 
 fn gain_samples(raw: &Image3, jpeg: &DecodedJpeg, alignment: &Alignment) -> Vec<GainSample> {
-    let size = 160;
+    let size = 96;
     let (u, v) = normalized_coords(size, size);
     let (cx, cy) = centre(raw.width, raw.height);
+    let (sin, cos) = (
+        libm::sin(alignment.rotation_rad),
+        libm::cos(alignment.rotation_rad),
+    );
     let mut samples = Vec::with_capacity(size * size);
     for (u, v) in u.into_iter().zip(v) {
-        let (a, b) = alignment.linear(u, v);
+        let (a, b) = alignment.linear_with(u, v, sin, cos);
         let (ad, bd) = alignment.distort(a, b);
         let x = cx + ad * cx;
         let y = cy + bd * cy;
@@ -1069,7 +1089,7 @@ fn fit_gain_with_tone(samples: &[GainSample]) -> ([f64; 3], Option<ToneMap>) {
     let mut gain = [0.0_f64; 3];
     let mut best = spline_tone_sse(&reduced, &gain);
     let mut step = 0.2_f64;
-    for _ in 0..30 {
+    for _ in 0..20 {
         let mut improved = false;
         for index in 0..3 {
             for sign in [1.0_f64, -1.0] {
@@ -1085,7 +1105,7 @@ fn fit_gain_with_tone(samples: &[GainSample]) -> ([f64; 3], Option<ToneMap>) {
         }
         if !improved {
             step *= 0.5;
-            if step < 1e-3 {
+            if step < 2e-3 {
                 break;
             }
         }
@@ -1252,6 +1272,8 @@ fn solve3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
 fn block_residual(raw: &Image3, jpeg: &Image3, alignment: &Alignment) -> f64 {
     const BLOCK: usize = 64;
     const STEP: usize = 64;
+    const SAMPLE: usize = 3;
+    const SIZE: usize = BLOCK / SAMPLE;
     let width = raw.width as usize;
     let height = raw.height as usize;
     let mut shifts: Vec<f64> = Vec::new();
@@ -1263,11 +1285,11 @@ fn block_residual(raw: &Image3, jpeg: &Image3, alignment: &Alignment) -> f64 {
     while y + BLOCK <= height {
         let mut x = 0;
         while x + BLOCK <= width {
-            let mut a = Vec::with_capacity(BLOCK * BLOCK);
-            let mut b = Vec::with_capacity(BLOCK * BLOCK);
+            let mut a = Vec::with_capacity(SIZE * SIZE);
+            let mut b = Vec::with_capacity(SIZE * SIZE);
             let mut valid = true;
-            for py in 0..BLOCK {
-                for px in 0..BLOCK {
+            for py in (0..BLOCK).step_by(SAMPLE) {
+                for px in (0..BLOCK).step_by(SAMPLE) {
                     let sx = (x + px) as f64;
                     let sy = (y + py) as f64;
                     let raw_pixel = raw
@@ -1306,11 +1328,11 @@ fn block_residual(raw: &Image3, jpeg: &Image3, alignment: &Alignment) -> f64 {
                 if std_a > 1e-6 && std_b > 1e-6 {
                     let mut normal = [[0.0_f64; 2]; 2];
                     let mut gradient = [0.0_f64; 2];
-                    for py in 1..BLOCK - 1 {
-                        for px in 1..BLOCK - 1 {
-                            let index = py * BLOCK + px;
+                    for py in 1..SIZE - 1 {
+                        for px in 1..SIZE - 1 {
+                            let index = py * SIZE + px;
                             let ix = (a[index + 1] - a[index - 1]) * 0.5 / std_a;
-                            let iy = (a[index + BLOCK] - a[index - BLOCK]) * 0.5 / std_a;
+                            let iy = (a[index + SIZE] - a[index - SIZE]) * 0.5 / std_a;
                             let it = (b[index] - mean_b) / std_b - (a[index] - mean_a) / std_a;
                             normal[0][0] += ix * ix;
                             normal[0][1] += ix * iy;
@@ -1325,7 +1347,7 @@ fn block_residual(raw: &Image3, jpeg: &Image3, alignment: &Alignment) -> f64 {
                             (gradient[0] * normal[1][1] - gradient[1] * normal[0][1]) / determinant;
                         let dy =
                             (normal[0][0] * gradient[1] - normal[0][1] * gradient[0]) / determinant;
-                        let shift = libm::hypot(dx, dy);
+                        let shift = libm::hypot(dx, dy) * SAMPLE as f64;
                         if shift.is_finite() && shift < 2.0 {
                             shifts.push(shift);
                         }

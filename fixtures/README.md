@@ -49,4 +49,4 @@ nix develop -c cargo test -p looklab-raw                                  # nati
 nix develop -c cargo test -p looklab-raw --target wasm32-unknown-unknown  # Node wasm32, digest parity with native
 ```
 
-The wasm test embeds the committed RAF and DNG with `include_bytes!` and compares the FNV-1a-64 digest of the reduced f32 image against the same constants the native tests use. `.cargo/config.toml` selects `wasm-bindgen-test-runner`, which runs under Node.
+The wasm test embeds the committed RAF and DNG with `include_bytes!` and compares the FNV-1a-64 digest of the reduced f32 image against the same constants the native tests use. The Canon DNG test also checks that DNG `ForwardMatrix1`/`ForwardMatrix2` are exposed with their calibration illuminants. `.cargo/config.toml` selects `wasm-bindgen-test-runner`, which runs under Node.

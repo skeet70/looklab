@@ -25,5 +25,7 @@ jobs:
         run: nix develop -c cargo xtask spdx
       - name: Core crates build for wasm32
         run: nix develop -c cargo xtask wasm-core
+      - name: Prep module
+        run: nix develop -c cargo xtask prep-module
       - name: Native/wasm bit identity
         run: nix develop -c cargo xtask bitid
