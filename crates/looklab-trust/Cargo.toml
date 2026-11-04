@@ -8,6 +8,16 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+libm.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+postcard.workspace = true
+looklab-meta.workspace = true
+looklab-model.workspace = true
+looklab-upload.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
