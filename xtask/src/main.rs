@@ -39,6 +39,7 @@ const FLOAT_METHOD_ALLOW: &[&str] = &[
 const CORE_CRATES: &[&str] = &[
     "looklab-color",
     "looklab-samples",
+    "looklab-upload",
     "looklab-model",
     "looklab-fit",
     "looklab-match",

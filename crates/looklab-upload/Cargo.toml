@@ -1,0 +1,27 @@
+[package]
+name = "looklab-upload"
+description = "Canonical upload envelope, batch manifest, WebAuthn structure checks and Argon2id proof-of-work."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+argon2.workspace = true
+base64.workspace = true
+ciborium.workspace = true
+libm.workspace = true
+looklab-meta.workspace = true
+looklab-samples.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

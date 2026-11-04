@@ -130,6 +130,7 @@ A failed gate leaves the candidate provisional and opens a moderation item.
 - One proof-of-work per upload batch, bound to `H(server_nonce ‖ batch_manifest_hash)`, with **cost proportional to the number of images**. Proposals carry one too.
 - **Memory-hard** (Argon2id-based, 16 MB *(tentative)*) to narrow the native/GPU advantage.
 - **Split into k = 16 sub-puzzles** of equal expected cost. One puzzle's work is exponentially distributed (p95 ≈ 3× the mean); 16 sub-puzzles make waits predictable for photographers.
+- **Difficulty:** sub-puzzle `j` needs `d = round(difficulty_bits_per_image + log2(n_images) − log2(16))` leading zero bits of `Argon2id(password = H(nonce ‖ manifest hash) ‖ j ‖ x, salt = "looklab-pow-v1")`, so expected work is `n_images · 2^difficulty_bits_per_image` evaluations. Defaults: 16 MiB memory, 1 iteration, `difficulty_bits_per_image = 8` (about 256 evaluations, a few seconds, per image; verification is one evaluation per sub-puzzle).
 - **Server cost:** verification is k Argon2 evaluations. Do the cheap checks first, so junk costs a lookup, not an Argon2 run:
   1. request size limit;
   2. nonce (read at its fixed offset in the envelope header, [03 §2.3](03-data-model.md)) was issued by this server, is unused and unexpired (consume it);

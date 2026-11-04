@@ -44,6 +44,7 @@ crates/
   looklab-raw       # RAW decode wrapper (LGPL deps isolated here)
   looklab-meta      # EXIF/makernote parse, film-sim extraction, sanitization
   looklab-samples   # sample container format (versioned)
+  looklab-upload    # canonical upload envelope, batch manifest, WebAuthn checks, Argon2id PoW
   looklab-prep      # align, downsample, mask, density sampling, chart/pattern detection
   looklab-model     # Look representation, evaluation, look file format, probe sets
   looklab-fit       # single/hierarchical/joint fits, uncertainty, outlier scoring
@@ -71,6 +72,7 @@ fuzz/               # cargo-fuzz project (its own workspace, excluded from the c
 **Dependency DAG:**
 - `color` ← `model`
 - `samples` (independent of `model`)
+- `upload` ← {`meta`, `samples`}
 - `fit` ← {`model`, `samples`}
 - `match` ← {`fit`, `model`}
 - `trust` ← {`fit`, `model`, `samples`}
