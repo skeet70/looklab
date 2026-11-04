@@ -24,6 +24,13 @@ const BIN_MAGIC: &[u8; 4] = b"LKBN";
 const JSON_NAME: &str = "look.json";
 const BIN_NAME: &str = "look.bin";
 
+const MAX_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_JSON_BYTES: usize = 1024 * 1024;
+const MAX_BIN_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BIN_ARRAYS: usize = 8;
+const MAX_NAME_BYTES: usize = 32;
+const MAX_ARRAY_VALUES: usize = 1_000_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FormatId {
     #[serde(rename = "looklab-look/1")]
@@ -86,6 +93,10 @@ impl BinRef {
             Some(name) if !name.is_empty() => Ok(Self(value)),
             _ => Err(ModelError::Invalid(format!("bin reference {value:?}"))),
         }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -152,7 +163,9 @@ pub enum SurroundRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ViewingConditionsRecord {
     pub white: WhitePoint,
+    #[serde(rename = "L_A")]
     pub l_a: f64,
+    #[serde(rename = "Y_b")]
     pub y_b: f64,
     pub surround: SurroundRecord,
     pub discount_illuminant: bool,
@@ -271,6 +284,14 @@ pub struct LayersRecord {
 pub enum ProbeSetVersion {
     #[serde(rename = "v1")]
     V1,
+}
+
+impl ProbeSetVersion {
+    pub fn probe_count(self) -> usize {
+        match self {
+            Self::V1 => crate::probes::V1_PROBE_COUNT,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -409,6 +430,30 @@ impl LookFile {
         if !self.output_clip.validate() {
             return Err(ModelError::Invalid("clip k out of range".to_string()));
         }
+        let reference = |value: &BinRef, name: &str| value.as_str() == name;
+        match (&self.layers.tone.kind, &self.layers.tone.coef_ref) {
+            (ToneKindRecord::Spline, Some(value)) if reference(value, "bin:T") => {}
+            (ToneKindRecord::Colorimetric, None) => {}
+            _ => return Err(ModelError::Invalid("tone coef_ref".to_string())),
+        }
+        if !reference(&self.layers.tint.coef_ref, "bin:N")
+            || !reference(&self.layers.chroma.coef_ref, "bin:G")
+            || !reference(&self.layers.hue.coef_ref, "bin:R")
+            || !reference(&self.layers.lightness.coef_ref, "bin:Lambda")
+            || !reference(&self.layers.residual.coef_ref, "bin:res")
+        {
+            return Err(ModelError::Invalid("layer coef_ref".to_string()));
+        }
+        if let Some(value) = &self.uncertainty.probe_cov_ref
+            && !reference(value, "bin:probe_cov")
+        {
+            return Err(ModelError::Invalid("probe_cov ref".to_string()));
+        }
+        if let Some(value) = &self.uncertainty.density_ref
+            && !reference(value, "bin:kde")
+        {
+            return Err(ModelError::Invalid("kde ref".to_string()));
+        }
         Ok(())
     }
 }
@@ -457,15 +502,79 @@ impl LayersRecord {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ProbeCovariance {
+    pub probes: usize,
+    pub values: Vec<f64>,
+}
+
+impl ProbeCovariance {
+    pub fn new(probes: usize, values: Vec<f64>) -> Result<Self> {
+        if values.len() != probes.saturating_mul(9) {
+            return Err(ModelError::CoefficientLength {
+                name: "probe_cov".to_string(),
+                found: values.len(),
+                expected: probes.saturating_mul(9),
+            });
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(ModelError::Invalid("non-finite probe_cov".to_string()));
+        }
+        Ok(Self { probes, values })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Density {
+    pub values: Vec<f64>,
+}
+
+impl Density {
+    pub fn new(values: Vec<f64>) -> Result<Self> {
+        if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+            return Err(ModelError::Invalid("invalid kde".to_string()));
+        }
+        Ok(Self { values })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UncertaintyData {
+    pub probe_cov: Option<ProbeCovariance>,
+    pub density: Option<Density>,
+}
+
+impl UncertaintyData {
+    fn validate(&self, probes: usize) -> Result<()> {
+        if let Some(covariance) = &self.probe_cov
+            && covariance.probes != probes
+        {
+            return Err(ModelError::Invalid("probe_cov dimensions".to_string()));
+        }
+        if let Some(density) = &self.density
+            && density.values.len() != probes
+        {
+            return Err(ModelError::Invalid("kde dimensions".to_string()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct LookDocument {
     pub file: LookFile,
     pub look: Look,
+    pub uncertainty: UncertaintyData,
 }
 
 impl LookDocument {
     pub fn new(file: LookFile, look: Look) -> Result<Self> {
         file.validate()?;
-        Ok(Self { file, look })
+        look.validate()?;
+        Ok(Self {
+            file,
+            look,
+            uncertainty: UncertaintyData::default(),
+        })
     }
 
     pub fn from_look(identity: LookIdentity, look: Look) -> Result<Self> {
@@ -473,10 +582,32 @@ impl LookDocument {
         Self::new(file, look)
     }
 
+    pub fn with_uncertainty(mut self, uncertainty: UncertaintyData) -> Result<Self> {
+        uncertainty.validate(self.file.probe_set.probe_count())?;
+        self.file.uncertainty.probe_cov_ref = uncertainty
+            .probe_cov
+            .as_ref()
+            .map(|_| BinRef::new("bin:probe_cov").expect("static bin reference"));
+        self.file.uncertainty.density_ref = uncertainty
+            .density
+            .as_ref()
+            .map(|_| BinRef::new("bin:kde").expect("static bin reference"));
+        self.uncertainty = uncertainty;
+        Ok(self)
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.file.validate()?;
+        self.look.validate()?;
+        self.uncertainty
+            .validate(self.file.probe_set.probe_count())?;
+        if self.file.uncertainty.probe_cov_ref.is_some() != self.uncertainty.probe_cov.is_some()
+            || self.file.uncertainty.density_ref.is_some() != self.uncertainty.density.is_some()
+        {
+            return Err(ModelError::Invalid("uncertainty refs".to_string()));
+        }
         let json = serde_json::to_vec_pretty(&self.file)?;
-        let bin = encode_bin(&self.look)?;
+        let bin = encode_bin(&self.look, &self.uncertainty)?;
 
         let options = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored)
@@ -492,16 +623,35 @@ impl LookDocument {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_ARCHIVE_BYTES {
+            return Err(ModelError::Invalid("looklab archive too large".to_string()));
+        }
         let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
+        let (json_size, bin_size) = {
+            let json_entry = archive.by_name(JSON_NAME)?;
+            let json_size = json_entry.size();
+            drop(json_entry);
+            let bin_entry = archive.by_name(BIN_NAME)?;
+            let bin_size = bin_entry.size();
+            (json_size, bin_size)
+        };
+        if json_size > MAX_JSON_BYTES as u64 || bin_size > MAX_BIN_BYTES as u64 {
+            return Err(ModelError::Invalid("looklab entry too large".to_string()));
+        }
         let mut json = Vec::new();
         archive.by_name(JSON_NAME)?.read_to_end(&mut json)?;
         let mut bin = Vec::new();
         archive.by_name(BIN_NAME)?.read_to_end(&mut bin)?;
         let file: LookFile = serde_json::from_slice(&json)?;
         file.validate()?;
-        let arrays = decode_bin(&bin)?;
+        let mut arrays = decode_bin(&bin)?;
+        let uncertainty = uncertainty_from_arrays(&file, &mut arrays)?;
         let look = look_from_arrays(&file, arrays)?;
-        Ok(Self { file, look })
+        Ok(Self {
+            file,
+            look,
+            uncertainty,
+        })
     }
 }
 
@@ -513,6 +663,8 @@ enum BinArray {
     Hue,
     Lightness,
     Residual,
+    ProbeCovariance,
+    Density,
 }
 
 impl BinArray {
@@ -524,7 +676,19 @@ impl BinArray {
             Self::Hue => "R",
             Self::Lightness => "Lambda",
             Self::Residual => "res",
+            Self::ProbeCovariance => "probe_cov",
+            Self::Density => "kde",
         }
+    }
+
+    fn expected_len(self) -> Option<usize> {
+        Some(match self {
+            Self::Tone => 1 + TONE_COEFS,
+            Self::Tint => 2 * TINT_COEFS,
+            Self::Chroma | Self::Hue | Self::Lightness => GRL_COEFS,
+            Self::Residual => RESIDUAL_COEFS,
+            Self::ProbeCovariance | Self::Density => return None,
+        })
     }
 
     fn from_name(name: &str) -> Option<Self> {
@@ -535,17 +699,29 @@ impl BinArray {
             "R" => Self::Hue,
             "Lambda" => Self::Lightness,
             "res" => Self::Residual,
+            "probe_cov" => Self::ProbeCovariance,
+            "kde" => Self::Density,
             _ => return None,
         })
     }
 }
 
-fn encode_bin(look: &Look) -> Result<Vec<u8>> {
-    let arrays = look_into_arrays(look);
+fn encode_bin(look: &Look, uncertainty: &UncertaintyData) -> Result<Vec<u8>> {
+    let mut arrays = look_into_arrays(look);
+    if let Some(covariance) = &uncertainty.probe_cov {
+        arrays.insert(BinArray::ProbeCovariance, covariance.values.clone());
+    }
+    if let Some(density) = &uncertainty.density {
+        arrays.insert(BinArray::Density, density.values.clone());
+    }
+    if arrays.len() > MAX_BIN_ARRAYS {
+        return Err(ModelError::Invalid("look.bin array count".to_string()));
+    }
     let mut out = Vec::new();
     out.extend_from_slice(BIN_MAGIC);
     out.extend_from_slice(&(arrays.len() as u32).to_le_bytes());
-    for (name, values) in arrays {
+    for (array, values) in arrays {
+        let name = array.name();
         let length = u8::try_from(name.len())
             .map_err(|_| ModelError::Invalid("coefficient name too long".to_string()))?;
         out.push(length);
@@ -558,7 +734,7 @@ fn encode_bin(look: &Look) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn look_into_arrays(look: &Look) -> Vec<(&'static str, Vec<f64>)> {
+fn look_into_arrays(look: &Look) -> BTreeMap<BinArray, Vec<f64>> {
     let mut arrays = BTreeMap::new();
     if let Tone::Spline { c0, beta } = &look.tone {
         let mut tone = Vec::with_capacity(1 + TONE_COEFS);
@@ -575,9 +751,6 @@ fn look_into_arrays(look: &Look) -> Vec<(&'static str, Vec<f64>)> {
     arrays.insert(BinArray::Lightness, grl_coefficients(&look.color.lambda));
     arrays.insert(BinArray::Residual, look.residual.values.clone());
     arrays
-        .into_iter()
-        .map(|(array, values)| (array.name(), values))
-        .collect()
 }
 
 fn grl_coefficients(component: &GrlComponent) -> Vec<f64> {
@@ -591,11 +764,17 @@ fn decode_bin(bytes: &[u8]) -> Result<BTreeMap<BinArray, Vec<f64>>> {
     if bytes.len() < 8 || &bytes[..4] != BIN_MAGIC {
         return Err(ModelError::Invalid("look.bin magic".to_string()));
     }
+    if bytes.len() > MAX_BIN_BYTES {
+        return Err(ModelError::Invalid("look.bin too large".to_string()));
+    }
     let count = u32::from_le_bytes(
         bytes[4..8]
             .try_into()
             .map_err(|_| ModelError::Invalid("look.bin count".to_string()))?,
-    );
+    ) as usize;
+    if count > MAX_BIN_ARRAYS {
+        return Err(ModelError::Invalid("look.bin array count".to_string()));
+    }
     let mut cursor = 8;
     let mut arrays = BTreeMap::new();
     for _ in 0..count {
@@ -603,6 +782,9 @@ fn decode_bin(bytes: &[u8]) -> Result<BTreeMap<BinArray, Vec<f64>>> {
             .get(cursor)
             .ok_or_else(|| ModelError::Invalid("look.bin name".to_string()))?
             as usize;
+        if name_length == 0 || name_length > MAX_NAME_BYTES {
+            return Err(ModelError::Invalid("look.bin name length".to_string()));
+        }
         cursor += 1;
         let name_bytes = bytes
             .get(cursor..cursor + name_length)
@@ -621,6 +803,18 @@ fn decode_bin(bytes: &[u8]) -> Result<BTreeMap<BinArray, Vec<f64>>> {
                 .map_err(|_| ModelError::Invalid("look.bin length".to_string()))?,
         ) as usize;
         cursor += 4;
+        if length > MAX_ARRAY_VALUES {
+            return Err(ModelError::Invalid("look.bin array length".to_string()));
+        }
+        if let Some(expected) = array.expected_len()
+            && length != expected
+        {
+            return Err(ModelError::CoefficientLength {
+                name: name.to_string(),
+                found: length,
+                expected,
+            });
+        }
         let data_length = length
             .checked_mul(8)
             .ok_or_else(|| ModelError::Invalid("look.bin length".to_string()))?;
@@ -634,7 +828,11 @@ fn decode_bin(bytes: &[u8]) -> Result<BTreeMap<BinArray, Vec<f64>>> {
         }
         let mut values = Vec::with_capacity(length);
         for chunk in chunks {
-            values.push(f64::from_le_bytes(*chunk));
+            let value = f64::from_le_bytes(*chunk);
+            if !value.is_finite() {
+                return Err(ModelError::Invalid("non-finite coefficient".to_string()));
+            }
+            values.push(value);
         }
         if arrays.insert(array, values).is_some() {
             return Err(ModelError::UnknownCoefficient(name.to_string()));
@@ -644,6 +842,42 @@ fn decode_bin(bytes: &[u8]) -> Result<BTreeMap<BinArray, Vec<f64>>> {
         return Err(ModelError::Invalid("look.bin trailing data".to_string()));
     }
     Ok(arrays)
+}
+
+fn uncertainty_from_arrays(
+    file: &LookFile,
+    arrays: &mut BTreeMap<BinArray, Vec<f64>>,
+) -> Result<UncertaintyData> {
+    let probe_cov = match (
+        file.uncertainty.probe_cov_ref.is_some(),
+        arrays.remove(&BinArray::ProbeCovariance),
+    ) {
+        (false, None) => None,
+        (false, Some(_)) => {
+            return Err(ModelError::UnknownCoefficient("probe_cov".to_string()));
+        }
+        (true, None) => {
+            return Err(ModelError::MissingCoefficient("probe_cov".to_string()));
+        }
+        (true, Some(values)) => {
+            if values.len() % 9 != 0 {
+                return Err(ModelError::Invalid("probe_cov dimensions".to_string()));
+            }
+            Some(ProbeCovariance::new(values.len() / 9, values)?)
+        }
+    };
+    let density = match (
+        file.uncertainty.density_ref.is_some(),
+        arrays.remove(&BinArray::Density),
+    ) {
+        (false, None) => None,
+        (false, Some(_)) => return Err(ModelError::UnknownCoefficient("kde".to_string())),
+        (true, None) => return Err(ModelError::MissingCoefficient("kde".to_string())),
+        (true, Some(values)) => Some(Density::new(values)?),
+    };
+    let uncertainty = UncertaintyData { probe_cov, density };
+    uncertainty.validate(file.probe_set.probe_count())?;
+    Ok(uncertainty)
 }
 
 fn look_from_arrays(file: &LookFile, mut arrays: BTreeMap<BinArray, Vec<f64>>) -> Result<Look> {
@@ -703,4 +937,52 @@ fn look_from_arrays(file: &LookFile, mut arrays: BTreeMap<BinArray, Vec<f64>>) -
 
 pub fn identity(slug: &str, version: &str) -> Result<LookIdentity> {
     LookIdentity::new(slug, version, LookKind::NativeFamily, WbPolicy::Adaptive)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bin_bytes(arrays: &[(&str, &[f64])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(BIN_MAGIC);
+        out.extend_from_slice(&(arrays.len() as u32).to_le_bytes());
+        for (name, values) in arrays {
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+            for value in *values {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rejects_non_finite_coefficients() {
+        let bytes = bin_bytes(&[("N", &[f64::NAN; 2 * TINT_COEFS])]);
+        assert!(decode_bin(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_wrong_array_length_before_allocating() {
+        let bytes = bin_bytes(&[("N", &[0.0; 2 * TINT_COEFS - 1])]);
+        assert!(decode_bin(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_headers() {
+        let mut too_many = Vec::from(*BIN_MAGIC);
+        too_many.extend_from_slice(&((MAX_BIN_ARRAYS + 1) as u32).to_le_bytes());
+        assert!(decode_bin(&too_many).is_err());
+
+        let mut long_name = Vec::from(*BIN_MAGIC);
+        long_name.extend_from_slice(&1_u32.to_le_bytes());
+        long_name.push((MAX_NAME_BYTES + 1) as u8);
+        assert!(decode_bin(&long_name).is_err());
+
+        let mut huge = vec![0_u8; MAX_BIN_BYTES + 1];
+        huge[..4].copy_from_slice(BIN_MAGIC);
+        assert!(decode_bin(&huge).is_err());
+    }
 }

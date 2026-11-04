@@ -12,6 +12,9 @@ const POINTER_JSON: &str = include_str!("../../../data/probes/pointer_gamut.json
 
 pub const PROBES_V1_YAML: &str = include_str!("../../../data/probes/v1.yaml");
 
+/// Probe count of v1; fixed by the generator and checked by the file format.
+pub const V1_PROBE_COUNT: usize = 1057;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeGroup {
@@ -109,15 +112,22 @@ pub fn v1() -> ProbeSet {
         }
     }
 
-    let pointer = PointerGamut::load();
-    let white_xy = Illuminant::D65.xy();
+    let pointer = pointer_gamut();
     for hue_step in 0..24 {
         let hue = 15.0 * hue_step as f64;
         let boundary = pointer.boundary_xy(hue);
+        let boundary_xyz = xyy_to_xyz(Xyy::new(boundary.0, boundary.1, 0.18));
+        let boundary_ucs = crate::deriv::reference_cam16().ucs(boundary_xyz);
+        let boundary_m = (boundary_ucs.a * boundary_ucs.a + boundary_ucs.b * boundary_ucs.b).sqrt();
+        let boundary_h = libm::atan2(boundary_ucs.b, boundary_ucs.a);
+        let white_xy = Illuminant::D65.xy();
         for fraction in [0.2, 0.4, 0.6, 0.8] {
-            let x = white_xy.0 + fraction * (boundary.0 - white_xy.0);
-            let y = white_xy.1 + fraction * (boundary.1 - white_xy.1);
-            let base = xyy_to_xyz(Xyy::new(x, y, 0.18));
+            let initial = (
+                white_xy.0 + fraction * (boundary.0 - white_xy.0),
+                white_xy.1 + fraction * (boundary.1 - white_xy.1),
+            );
+            let chromaticity = solve_chromaticity(boundary_h, fraction * boundary_m, initial);
+            let base = xyy_to_xyz(Xyy::new(chromaticity.0, chromaticity.1, 0.18));
             for s in -5..=3 {
                 probes.push(Probe {
                     id: ProbeId::new(format!(
@@ -161,7 +171,7 @@ pub fn v1() -> ProbeSet {
         notes: vec![
             "SG 140 is absent from the committed chart data; the chart group is ColorChecker 24 only.".to_string(),
             "Chart and skin patches are scaled by 2^s from the D65-adapted ColorChecker 24 values.".to_string(),
-            "Hue grid: 24 hues, 20/40/60/80% of the Pointer gamut boundary at L* = 49.5, D65 adapted.".to_string(),
+            "Hue grid: 24 hues, 20/40/60/80% of the Pointer gamut boundary CAM16-UCS M' at Y = 0.18 (boundary hue, D65 adapted).".to_string(),
             "Skin: ColorChecker patches 1 and 2 only (docs/10 Q5).".to_string(),
             "Memory colors: sky = ColorChecker patch 3 (blue sky), foliage = patch 4.".to_string(),
         ],
@@ -209,6 +219,74 @@ struct BoundaryPoint {
 
 struct PointerGamut {
     points: Vec<BoundaryPoint>,
+}
+
+static POINTER: std::sync::LazyLock<PointerGamut> = std::sync::LazyLock::new(PointerGamut::load);
+
+fn pointer_gamut() -> &'static PointerGamut {
+    &POINTER
+}
+
+/// `xy` of the Pointer gamut boundary at `hue`, Bradford-adapted to D65.
+pub fn pointer_boundary_xy(hue_degrees: f64) -> (f64, f64) {
+    pointer_gamut().boundary_xy(hue_degrees)
+}
+
+fn ucs_at_018(x: f64, y: f64) -> looklab_color::ucs::Ucs {
+    crate::deriv::reference_cam16().ucs(xyy_to_xyz(Xyy::new(x, y, 0.18)))
+}
+
+fn solve_chromaticity(target_hue: f64, target_chroma: f64, initial: (f64, f64)) -> (f64, f64) {
+    let mut x = initial.0;
+    let mut y = initial.1;
+    let step = 1e-6;
+    let pi = core::f64::consts::PI;
+    for _ in 0..60 {
+        let value = ucs_at_018(x, y);
+        let hue = libm::atan2(value.b, value.a);
+        let chroma = (value.a * value.a + value.b * value.b).sqrt();
+        let mut d_hue = hue - target_hue;
+        while d_hue > pi {
+            d_hue -= 2.0 * pi;
+        }
+        while d_hue < -pi {
+            d_hue += 2.0 * pi;
+        }
+        let d_chroma = chroma - target_chroma;
+        if d_hue.abs() < 1e-10 && d_chroma.abs() < 1e-9 {
+            break;
+        }
+        let along_x = ucs_at_018(x + step, y);
+        let along_y = ucs_at_018(x, y + step);
+        let mut d_hue_dx = libm::atan2(along_x.b, along_x.a) - hue;
+        while d_hue_dx > pi {
+            d_hue_dx -= 2.0 * pi;
+        }
+        while d_hue_dx < -pi {
+            d_hue_dx += 2.0 * pi;
+        }
+        let mut d_hue_dy = libm::atan2(along_y.b, along_y.a) - hue;
+        while d_hue_dy > pi {
+            d_hue_dy -= 2.0 * pi;
+        }
+        while d_hue_dy < -pi {
+            d_hue_dy += 2.0 * pi;
+        }
+        let d_hue_dx = d_hue_dx / step;
+        let d_hue_dy = d_hue_dy / step;
+        let d_chroma_dx = ((along_x.a * along_x.a + along_x.b * along_x.b).sqrt() - chroma) / step;
+        let d_chroma_dy = ((along_y.a * along_y.a + along_y.b * along_y.b).sqrt() - chroma) / step;
+        let determinant = d_hue_dx * d_chroma_dy - d_hue_dy * d_chroma_dx;
+        if !determinant.is_finite() || determinant.abs() < 1e-12 {
+            break;
+        }
+        x += (-d_hue * d_chroma_dy + d_hue_dy * d_chroma) / determinant;
+        y += (d_hue * d_chroma_dx - d_chroma * d_hue_dx) / determinant;
+        if !(x.is_finite() && y.is_finite()) || !(x > 0.0 && y > 0.0 && x + y < 1.0) {
+            return initial;
+        }
+    }
+    (x, y)
 }
 
 impl PointerGamut {

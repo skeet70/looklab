@@ -14,13 +14,15 @@ pub mod tone;
 pub use clip::{ClipFunction, ClipSettings, output_encode_clip, soft_clip};
 pub use error::{ModelError, Result};
 pub use file::{
-    BinRef, ChromaReference, FormatId, LayersRecord, LookDocument, LookFile, LookIdentity,
-    LookKind, ProbeSetVersion, WbPolicy,
+    BinRef, ChromaReference, Density, FormatId, LayersRecord, LookDocument, LookFile, LookIdentity,
+    LookKind, ProbeCovariance, ProbeSetVersion, UncertaintyData, WbPolicy,
 };
 pub use look::{
-    ColorLayer, GrlComponent, GrlWeights, LayerValues, Look, LookInput, ParamLayout, Residual,
-    ResidualWeights, Tint,
+    CoefTerm, ColorLayer, GrlComponent, GrlWeights, LayerValues, Look, LookInput, ParamLayout,
+    Residual, ResidualWeights, Tint,
 };
-pub use probes::{Probe, ProbeGroup, ProbeId, ProbeSet, ProbeSetFile};
-pub use solve::{neutral_j_prime, solve_y_ref};
+pub use probes::{Probe, ProbeGroup, ProbeId, ProbeSet, ProbeSetFile, V1_PROBE_COUNT};
+pub use solve::{
+    J_PRIME_MAX, SolveError, neutral_j_prime, neutral_j_prime_max, solve_y_ref, try_solve_y_ref,
+};
 pub use tone::Tone;

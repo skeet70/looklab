@@ -4,6 +4,7 @@ use core::f64::consts::PI;
 use core::ops::Range;
 use looklab_color::Xyz;
 use looklab_color::ucs::Ucs;
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use crate::basis::{
@@ -131,6 +132,13 @@ pub struct LayerValues {
     pub residual: [f64; 3],
 }
 
+/// Derivative of `J'a'b'` with respect to one coefficient.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoefTerm {
+    pub index: usize,
+    pub derivative: [f64; 3],
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParamLayout {
     pub tone: Range<usize>,
@@ -222,22 +230,34 @@ impl Look {
         residual: Residual,
         clip: ClipSettings,
     ) -> Result<Self> {
-        tint.validate()?;
-        color.validate()?;
-        if residual.values.len() != RESIDUAL_COEFS {
-            return Err(ModelError::CoefficientLength {
-                name: "res".to_string(),
-                found: residual.values.len(),
-                expected: RESIDUAL_COEFS,
-            });
-        }
-        Ok(Self {
+        let look = Self {
             tone,
             tint,
             color,
             residual,
             clip,
-        })
+        };
+        look.validate()?;
+        Ok(look)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.tint.validate()?;
+        self.color.validate()?;
+        if self.residual.values.len() != RESIDUAL_COEFS {
+            return Err(ModelError::CoefficientLength {
+                name: "res".to_string(),
+                found: self.residual.values.len(),
+                expected: RESIDUAL_COEFS,
+            });
+        }
+        if self.residual.values.iter().any(|value| !value.is_finite()) {
+            return Err(ModelError::Invalid("non-finite residual".to_string()));
+        }
+        if let Tone::Spline { c0, beta } = &self.tone {
+            Tone::spline(*c0, *beta)?;
+        }
+        Ok(())
     }
 
     pub fn colorimetric() -> Self {
@@ -308,6 +328,9 @@ impl Look {
                 found: coef.len(),
                 expected: layout.total,
             });
+        }
+        if coef.iter().any(|value| !value.is_finite()) {
+            return Err(ModelError::Invalid("non-finite coefficient".to_string()));
         }
         if !self.tone.is_colorimetric() {
             let mut beta = [0.0_f64; TONE_COEFS];
@@ -404,12 +427,21 @@ impl Look {
         input: &LookInput,
         values: &LayerValues,
     ) -> [[f64; 9]; 3] {
-        let y_ref = solve::solve_y_ref(values.t, input.y);
-        let (_, neutral_slope) = crate::deriv::reference_cam16().neutral_j_and_dj_dy(y_ref);
-        let dy_dt = if neutral_slope.is_finite() && neutral_slope > 0.0 {
-            1.0 / neutral_slope
-        } else {
-            0.0
+        let solved = solve::try_solve_y_ref(values.t, input.y);
+        let y_ref = match solved {
+            Ok(y) => y,
+            Err(_) => solve::solve_y_ref(values.t, input.y),
+        };
+        let dy_dt = match solved {
+            Ok(_) => {
+                let (_, neutral_slope) = crate::deriv::reference_cam16().neutral_j_and_dj_dy(y_ref);
+                if neutral_slope.is_finite() && neutral_slope > 0.0 {
+                    1.0 / neutral_slope
+                } else {
+                    0.0
+                }
+            }
+            Err(_) => 0.0,
         };
         let (reference, derivative) = REFERENCE_CAM16.ucs_and_derivative(input.unit_xyz, y_ref);
         let d_j_ref = derivative[0] * dy_dt;
@@ -451,6 +483,132 @@ impl Look {
         ]
     }
 
+    /// Derivative of the tint layer `(a', b')` with respect to `t`.
+    pub fn d_tint_d_t(&self, t: f64) -> (f64, f64) {
+        if !(0.0..=100.0).contains(&t) {
+            return (0.0, 0.0);
+        }
+        let (indices, _, derivative) = tint_weights(t);
+        let mut a = 0.0;
+        let mut b = 0.0;
+        for (position, index) in indices.iter().enumerate() {
+            a += derivative[position] * self.tint.a[*index];
+            b += derivative[position] * self.tint.b[*index];
+        }
+        (a, b)
+    }
+
+    /// Row-wise derivative of `J'a'b'` with respect to every non-zero
+    /// coefficient, indexed by [`ParamLayout`];
+    pub fn coef_jacobian(&self, input: &LookInput) -> Vec<CoefTerm> {
+        let values = self.layer_values(input);
+        let jacobian = self.d_output_d_layer_values(input, &values);
+        let layout = self.layout();
+        let mut terms: BTreeMap<usize, [f64; 3]> = BTreeMap::new();
+        let mut add = |index: usize, layer: [f64; 9]| {
+            let mut row = [0.0_f64; 3];
+            for (component, slot) in row.iter_mut().enumerate() {
+                for (column, value) in layer.iter().enumerate() {
+                    *slot += jacobian[component][column] * value;
+                }
+            }
+            if row.iter().any(|value| *value != 0.0) {
+                let entry = terms.entry(index).or_insert([0.0; 3]);
+                for (total, value) in entry.iter_mut().zip(row.iter()) {
+                    *total += value;
+                }
+            }
+        };
+
+        let (d_n_a, d_n_b) = self.d_tint_d_t(values.t);
+        if !self.tone.is_colorimetric() {
+            add(
+                layout.tone.start,
+                [1.0, d_n_a, d_n_b, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            );
+            for k in 0..TONE_COEFS {
+                let weight = input.tone_weights[k + 1];
+                add(
+                    layout.tone.start + 1 + k,
+                    [
+                        weight,
+                        d_n_a * weight,
+                        d_n_b * weight,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
+                );
+            }
+        }
+
+        let (indices, weights, _) = tint_weights(values.t);
+        for (position, index) in indices.iter().enumerate() {
+            add(
+                layout.tint_a.start + *index,
+                [0.0, weights[position], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            );
+            add(
+                layout.tint_b.start + *index,
+                [0.0, 0.0, weights[position], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            );
+        }
+
+        let plane_weight = input.grl.c_w[0];
+        for (position, index) in input.grl.s_idx.iter().enumerate() {
+            let weight = plane_weight * input.grl.s_w[position];
+            add(
+                layout.g.start + *index,
+                [0.0, 0.0, 0.0, weight, 0.0, 0.0, 0.0, 0.0, 0.0],
+            );
+            add(
+                layout.r.start + *index,
+                [0.0, 0.0, 0.0, 0.0, weight, 0.0, 0.0, 0.0, 0.0],
+            );
+            add(
+                layout.lambda.start + *index,
+                [0.0, 0.0, 0.0, 0.0, 0.0, weight, 0.0, 0.0, 0.0],
+            );
+        }
+        for (h, hue_index) in input.grl.hue_idx.iter().enumerate() {
+            for (s, s_index) in input.grl.s_idx.iter().enumerate() {
+                for (c, c_index) in input.grl.c_idx.iter().enumerate().skip(1) {
+                    let weight = input.grl.hue_w[h] * input.grl.s_w[s] * input.grl.c_w[c];
+                    let node = (*hue_index * S_COEFS + *s_index) * 3 + (c_index - 1);
+                    add(
+                        layout.g.start + S_COEFS + node,
+                        [0.0, 0.0, 0.0, weight, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    );
+                    add(
+                        layout.r.start + S_COEFS + node,
+                        [0.0, 0.0, 0.0, 0.0, weight, 0.0, 0.0, 0.0, 0.0],
+                    );
+                    add(
+                        layout.lambda.start + S_COEFS + node,
+                        [0.0, 0.0, 0.0, 0.0, 0.0, weight, 0.0, 0.0, 0.0],
+                    );
+                }
+            }
+        }
+
+        for (corner, index) in input.residual.indices.iter().enumerate() {
+            let weight = input.residual.weights[corner];
+            for channel in 0..3 {
+                let mut layer = [0.0_f64; 9];
+                layer[6 + channel] = weight;
+                add(layout.residual.start + index * 3 + channel, layer);
+            }
+        }
+
+        terms
+            .into_iter()
+            .map(|(index, derivative)| CoefTerm { index, derivative })
+            .collect()
+    }
+
     pub fn output_encode(&self, ucs: Ucs, output_space: looklab_color::RgbSpace) -> Ucs {
         crate::clip::output_encode_clip(ucs, output_space, self.clip.k)
     }
@@ -474,6 +632,14 @@ impl Tint {
                 found: self.a.len() + self.b.len(),
                 expected: 2 * TINT_COEFS,
             });
+        }
+        if self
+            .a
+            .iter()
+            .chain(self.b.iter())
+            .any(|value| !value.is_finite())
+        {
+            return Err(ModelError::Invalid("non-finite tint".to_string()));
         }
         Ok(())
     }
@@ -517,6 +683,14 @@ impl ColorLayer {
                     found: component.plane.len() + component.volume.len(),
                     expected: GRL_COEFS,
                 });
+            }
+            if component
+                .plane
+                .iter()
+                .chain(component.volume.iter())
+                .any(|value| !value.is_finite())
+            {
+                return Err(ModelError::Invalid("non-finite grl".to_string()));
             }
         }
         Ok(())

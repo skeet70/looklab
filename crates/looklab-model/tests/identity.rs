@@ -22,6 +22,34 @@ fn colorimetric(xyz: looklab_color::Xyz) -> looklab_color::ucs::Ucs {
 }
 
 #[test]
+fn y_ref_range_is_explicit() {
+    use looklab_model::{J_PRIME_MAX, SolveError, neutral_j_prime_max, try_solve_y_ref};
+
+    let max = neutral_j_prime_max();
+    assert!(max > 0.0 && max < J_PRIME_MAX);
+    assert!(max > neutral_j_prime(1e6));
+    assert!(matches!(
+        try_solve_y_ref(max + 1.0, 0.18),
+        Err(SolveError::Unattainable { .. })
+    ));
+    assert!(matches!(
+        try_solve_y_ref(-1.0, 0.18),
+        Err(SolveError::Unattainable { .. })
+    ));
+    assert!(solve_y_ref(0.0, 0.18) == 0.0);
+
+    let relaxed = max * (1.0 - 1e-12);
+    let y = try_solve_y_ref(relaxed, 0.18).expect("attainable near the limit");
+    println!("max {max} y {y}");
+    assert!(y.is_finite() && y > 1e8);
+    assert!((neutral_j_prime(y) - relaxed).abs() < 1e-9);
+
+    let saturated = solve_y_ref(max + 10.0, 0.18);
+    assert!(saturated.is_finite());
+    assert!((neutral_j_prime(saturated) - max * (1.0 - 1e-12)).abs() < 1e-9);
+}
+
+#[test]
 fn colorimetric_look_matches_cam16_ucs() {
     let look = Look::colorimetric();
     for probe in v1().probes {

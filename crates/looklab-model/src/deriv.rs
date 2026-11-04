@@ -281,6 +281,15 @@ impl ReferenceCam16 {
         (y > 0.0 && y.is_finite()).then_some(y)
     }
 
+    /// Neutral `J'` as the stimulus luminance goes to infinity.
+    pub(crate) fn neutral_j_prime_max(&self) -> f64 {
+        let response = 400.1;
+        let achromatic = (3.05 * response - 0.305) * self.n_bb;
+        let ratio = achromatic / self.a_w;
+        let j = 100.0 * signed_pow(ratio, self.j_exp);
+        j * (1.0 + 100.0 * 0.007) / (1.0 + 0.007 * j)
+    }
+
     /// CAM16-UCS of `unit_xyz * y`, with derivatives with respect to `y`.
     pub(crate) fn ucs_and_derivative(&self, unit_xyz: Xyz, y: f64) -> (Ucs, [f64; 3]) {
         let x = Dual::new(unit_xyz.x * y, unit_xyz.x);
