@@ -61,6 +61,8 @@ pub struct TrustParams {
     pub min_look_contributors: usize,
     /// Effective contributors needed before the body's provisional label clears.
     pub min_body_contributors: usize,
+    /// Credentials sharing one serial HMAC before it raises a moderation flag (docs/05 §2).
+    pub serial_reuse_credentials: usize,
 
     /// Root sunset: endorsed contributors and distinct bodies needed to re-derive
     /// the root (docs/05 §7).
@@ -130,6 +132,7 @@ impl Default for TrustParams {
             diminishing_scale: 20.0,
             min_look_contributors: 20,
             min_body_contributors: 5,
+            serial_reuse_credentials: 3,
             root_sunset_contributors: 20,
             root_sunset_bodies: 3,
             gate_bound_scale: 2.0,

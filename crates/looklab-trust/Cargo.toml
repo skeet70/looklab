@@ -7,6 +7,11 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = []
+# Builds the simulator only; it needs looklab-fit and does not target wasm.
+harness = ["dep:looklab-fit", "dep:looklab-color"]
+
 [dependencies]
 libm.workspace = true
 serde.workspace = true
@@ -15,9 +20,15 @@ postcard.workspace = true
 looklab-meta.workspace = true
 looklab-model.workspace = true
 looklab-upload.workspace = true
+looklab-fit = { workspace = true, features = ["synth"], optional = true }
+looklab-color = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
+
+[[test]]
+name = "redteam"
+required-features = ["harness"]
 
 [lints]
 workspace = true

@@ -168,6 +168,8 @@ A failed gate leaves the candidate provisional and opens a moderation item.
 
 The two gauge rows (a body joining a component; two components merging) need the multi-body component fit ([09 P4.2](09-roadmap.md)). Their scenarios exist and are ignored until that fit lands; the exposure conversion they depend on is exercised through `convert_exposure_gauge`.
 
+At CI-sized synthetic pools the fitted sandwich σ crosses the 1.5 support threshold when a contributor joins a pool, so an honest release trips the supported→unsupported rule of §8 at a handful of probes. The scenarios that need an honest release to publish are implemented and marked ignored with that reason; they run once the fit's contributor-level σ_v is stable at these sizes.
+
 The harness runs in CI as `cargo test -p looklab-trust --features harness --release`.
 
 ## 11. Audit log and artifact integrity
@@ -182,7 +184,7 @@ The harness runs in CI as `cargo test -p looklab-trust --features harness --rele
   - release manifests.
 - Artifacts are **content-addressed** ([03 §4](03-data-model.md)). Each version manifest lists its artifact hashes, and clients check downloaded artifacts against the manifest.
 - Entries reference credentials by internal id or display handle, never by public key or serial HMAC.
-- The server publishes the log at `GET /log.json` (paged with `after` and `limit`), the grant and endorsement lists at `GET /lists/grants.json` and `GET /lists/endorsements.json`, and each version manifest at `GET /manifests/<look>/<version>.json`. Both lists render scope rules as plain-language text alongside the rule list.
+- The server publishes the log at `GET /log.json` (paged with `after` and `limit`), the grant and endorsement lists at `GET /lists/grants.json` and `GET /lists/endorsements.json` (paged the same way, capped at 100 records), and each version manifest at `GET /manifests/<look>/<version>.json`. Both lists render scope rules as plain-language text alongside the rule list.
 
 ## 12. Recipe channel and bounties
 

@@ -268,6 +268,33 @@ pub fn resolve_effective_contributors(
         .collect()
 }
 
+/// Credentials that reported one serial HMAC (docs/05 §2). The HMAC is the join key and is not carried.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SerialReuse {
+    pub credentials: Vec<CredentialId>,
+}
+
+/// Serial HMACs reported by at least [`TrustParams::serial_reuse_credentials`] credentials.
+pub fn serial_reuse(params: &crate::params::TrustParams, links: &[SerialLink]) -> Vec<SerialReuse> {
+    use std::collections::BTreeMap;
+
+    let threshold = params.serial_reuse_credentials.max(2);
+    let mut groups: BTreeMap<[u8; 32], std::collections::BTreeSet<CredentialId>> = BTreeMap::new();
+    for link in links {
+        groups
+            .entry(*link.hmac.as_bytes())
+            .or_default()
+            .insert(link.credential);
+    }
+    groups
+        .into_values()
+        .filter(|credentials| credentials.len() >= threshold)
+        .map(|credentials| SerialReuse {
+            credentials: credentials.into_iter().collect(),
+        })
+        .collect()
+}
+
 fn find(
     parent: &mut std::collections::BTreeMap<CredentialId, CredentialId>,
     start: CredentialId,

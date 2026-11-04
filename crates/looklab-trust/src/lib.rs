@@ -7,6 +7,8 @@
 pub mod error;
 pub mod evidence;
 pub mod gates;
+#[cfg(feature = "harness")]
+pub mod harness;
 pub mod ids;
 pub mod params;
 pub mod region;
@@ -25,8 +27,8 @@ pub use gates::{
     exposure_gauge_excluded, gate_release,
 };
 pub use ids::{
-    ArtifactHash, CredentialId, EffectiveContributorId, ImageRef, SerialLink, VersionId,
-    resolve_effective_contributors,
+    ArtifactHash, CredentialId, EffectiveContributorId, ImageRef, SerialLink, SerialReuse,
+    VersionId, resolve_effective_contributors, serial_reuse,
 };
 pub use params::TrustParams;
 pub use region::{EXPOSURE_CELLS, EXPOSURE_MAX, EXPOSURE_MIN, HUE_CELLS, Region, RegionCoverage};

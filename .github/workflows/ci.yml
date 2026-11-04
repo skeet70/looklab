@@ -19,6 +19,8 @@ jobs:
         run: nix develop -c cargo test --workspace
       - name: Fit acceptance tests
         run: nix develop -c cargo test -p looklab-fit --features synth
+      - name: Trust red-team harness
+        run: nix develop -c cargo test -p looklab-trust --features harness --release
       - name: RAW decode under Node
         run: nix develop -c cargo test -p looklab-raw --target wasm32-unknown-unknown --test wasm_node
       - name: Float method allow-list
