@@ -4,7 +4,6 @@ Decisions not yet made. Each has a default so work isn't blocked. Change a defau
 
 | # | Question | Default until decided | Affects |
 |---|---|---|---|
-| Q1 | Project name | `looklab` | crates, domain |
 | Q2 | Data license for fitted targets, body parameters and community data: CC0-1.0 vs CC-BY-4.0 | CC0-1.0. **Per-image samples aren't published under any license.** | ToS, exports, 06 §6 |
 | Q3 | Legal review: "outputs aren't AGPL-covered"; ToS; GDPR posture for pseudonymous data; **erasure path for contributors who lost their credential** (a server-keyed RAW hash would enable it but is itself a photo identifier) | Required before launch; no RAW hash until decided | 01, 03 §4, 06 §4 |
 | Q4 | ~~CAM16 reference viewing conditions~~ | **Resolved:** D65, L_A ≈ 4.07, Y_b = 20, average, D = 1 | 02 §1 |

@@ -1,7 +1,5 @@
 # looklab
 
-> Working name. Rename freely; crate prefixes (`looklab-*`) are the only place it's baked in.
-
 A tool, and eventually a web app, for **measuring camera "looks" (film simulations, picture profiles, LUTs) rigorously, and telling you how to reproduce a target look on your own camera**.
 
 - Build a **target look** from RAW+JPEG pairs attested to use a given sim. Data can come from one camera or be crowdsourced from many, so the look is separated from any single sensor.
