@@ -6,12 +6,17 @@ use looklab_color::ucs::Ucs;
 use looklab_color::{Mat3, Rgb, RgbSpace};
 use looklab_model::Look;
 use looklab_model::basis::TONE_COEFS;
+use looklab_model::realization::{
+    ControlResponseModel, Delta, ResponseComponent, ResponseParamId, Settings,
+};
 use looklab_model::solve::ucs_of_xyz;
 use looklab_samples::OutputSpace;
 
 use crate::layout::{BlockKind, Layout, Params, softplus_slope};
-use crate::predict::{ColumnMap, ImageCtx, Jac, evaluate_sample};
-use crate::types::{ContributorId, ExposureModeId, FitError, FitImage, FitOptions, Result};
+use crate::predict::{ColumnMap, ImageCtx, Jac, ResponseTerm, evaluate_sample};
+use crate::types::{
+    ContributorId, ExposureModeId, FitError, FitImage, FitOptions, ImageIntent, Result,
+};
 
 pub(crate) struct ImageEntry {
     pub transform: Mat3,
@@ -21,6 +26,23 @@ pub(crate) struct ImageEntry {
     pub mode: Option<usize>,
     pub contributor: usize,
     pub samples: Range<usize>,
+    pub intent: ImageIntent,
+    pub known_exposure: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntentFilter {
+    NativeOnly,
+    All,
+}
+
+impl IntentFilter {
+    fn includes(self, intent: ImageIntent) -> bool {
+        match self {
+            Self::NativeOnly => intent == ImageIntent::Native,
+            Self::All => true,
+        }
+    }
 }
 
 pub(crate) struct Sample {
@@ -40,6 +62,9 @@ pub(crate) struct Problem {
     pub samples: Vec<Sample>,
     pub hessian: Vec<u32>,
     pub nu: f64,
+    pub parameter_ids: Vec<ResponseParamId>,
+    pub terms: Vec<Vec<ResponseTerm>>,
+    pub settings: Vec<Settings>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -48,6 +73,7 @@ pub(crate) struct ActiveColumns {
     pub mode: bool,
     pub wb: bool,
     pub clip: bool,
+    pub response: bool,
 }
 
 impl ActiveColumns {
@@ -56,6 +82,7 @@ impl ActiveColumns {
         mode: true,
         wb: true,
         clip: true,
+        response: true,
     };
 }
 
@@ -126,10 +153,38 @@ fn space_of(output: OutputSpace) -> RgbSpace {
 }
 
 impl Problem {
-    pub fn new(images: &[FitImage], options: &FitOptions) -> Result<Self> {
+    pub fn new_with(
+        images: &[FitImage],
+        model: Option<&ControlResponseModel>,
+        options: &FitOptions,
+    ) -> Result<Self> {
         if images.is_empty() {
             return Err(FitError::NoImages);
         }
+        let parameter_ids = model
+            .map(ControlResponseModel::parameter_ids)
+            .unwrap_or_default();
+        let terms: Vec<Vec<ResponseTerm>> = match model {
+            Some(model) => images
+                .iter()
+                .map(|image| {
+                    model
+                        .active_parameters(&image.settings)
+                        .into_iter()
+                        .filter_map(|(param, phi)| {
+                            let id = parameter_ids.get(param)?;
+                            Some(ResponseTerm {
+                                index: param,
+                                phi,
+                                component: id.component,
+                                feature: id.feature,
+                            })
+                        })
+                        .collect()
+                })
+                .collect(),
+            None => vec![Vec::new(); images.len()],
+        };
         let default_mode = ExposureModeId(0);
         let mut modes: Vec<ExposureModeId> = Vec::new();
         let mut contributors: Vec<ContributorId> = Vec::new();
@@ -155,9 +210,13 @@ impl Problem {
             let n = image.samples.n();
             let take = n.min(options.max_samples_per_image);
             let mut order: Vec<u32> = (0..n as u32).collect();
-            for i in 0..take {
-                let j = i + rng.below(n - i);
-                order.swap(i, j);
+            // Re-render groups share one pixel set, so one order keeps their rows aligned.
+            match image.samples.header().rerender_group {
+                Some(group) => {
+                    let mut group_rng = Xorshift::new(group_seed(*group.as_bytes()));
+                    shuffle(&mut order, &mut group_rng, take);
+                }
+                None => shuffle(&mut order, &mut rng, take),
             }
             order.truncate(take);
             let start = samples.len();
@@ -206,13 +265,33 @@ impl Problem {
                     .position(|contributor| *contributor == image.contributor)
                     .unwrap_or(0),
                 samples: start..samples.len(),
+                intent: image.intent,
+                known_exposure: model.map_or(0.0, |model| {
+                    model
+                        .exposure
+                        .steps
+                        .iter()
+                        .filter_map(|step| match image.settings.get(&step.key) {
+                            Some(looklab_model::realization::ControlValue::Step(value)) => {
+                                Some((*value - step.default) as f64 * step.ev_per_step)
+                            }
+                            _ => None,
+                        })
+                        .sum()
+                }),
             });
         }
         if samples.is_empty() {
             return Err(FitError::NoSamples);
         }
         let hessian = hessian_subset(samples.len(), options.hessian_samples, options.seed);
-        let layout = Layout::new(entries.len(), mode_list.len(), contributors.len());
+        let layout = Layout::with_response(
+            entries.len(),
+            mode_list.len(),
+            contributors.len(),
+            parameter_ids.len(),
+        );
+        let settings = images.iter().map(|image| image.settings.clone()).collect();
         Ok(Self {
             layout,
             images: entries,
@@ -221,6 +300,9 @@ impl Problem {
             samples,
             hessian,
             nu: options.nu,
+            parameter_ids,
+            terms,
+            settings,
         })
     }
 
@@ -233,15 +315,43 @@ impl Problem {
         (look, slope)
     }
 
+    pub fn effective_look(&self, params: &Params, index: usize) -> Look {
+        let base = params.look();
+        let terms = &self.terms[index];
+        if terms.is_empty() {
+            return base;
+        }
+        let mut delta = Delta::default();
+        for term in terms {
+            if let Some(layer) = term.component.layer() {
+                let value = params.theta[self.layout.response.start + term.index];
+                delta.add(layer, term.feature, value * term.phi);
+            }
+        }
+        delta.apply(&base).unwrap_or(base)
+    }
+
     pub fn image_ctx(&self, params: &Params, index: usize) -> ImageCtx {
         let image = &self.images[index];
         let nuisance = params.image(index);
+        let mut log_r = nuisance[1];
+        let mut log_b = nuisance[2];
+        for term in &self.terms[index] {
+            let value = params.theta[self.layout.response.start + term.index] * term.phi;
+            match term.component {
+                ResponseComponent::WbR => log_r += value,
+                ResponseComponent::WbB => log_b += value,
+                _ => {}
+            }
+        }
         ImageCtx {
             transform: image.transform,
             space: image.space,
-            exposure: nuisance[0] + image.mode.map_or(0.0, |mode| params.mode_offset(mode)),
-            wb_r: libm::exp(nuisance[1]),
-            wb_b: libm::exp(nuisance[2]),
+            exposure: nuisance[0]
+                + image.mode.map_or(0.0, |mode| params.mode_offset(mode))
+                + image.known_exposure,
+            wb_r: libm::exp(log_r),
+            wb_b: libm::exp(log_b),
         }
     }
 
@@ -267,6 +377,7 @@ impl Problem {
         (0.5 * (nu + 3.0) * libm::log1p(ratio), weight)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn pass(
         &self,
         params: &Params,
@@ -275,8 +386,12 @@ impl Problem {
         want_residuals: bool,
         want_per_image: bool,
         neutral_only: bool,
+        intents: IntentFilter,
     ) -> PassOutput {
-        let (look, slope) = self.look_and_slope(params);
+        let (_, slope) = self.look_and_slope(params);
+        let looks: Vec<Look> = (0..self.images.len())
+            .map(|index| self.effective_look(params, index))
+            .collect();
         let clip_k = params.clip_k();
         let clip_slope = params.clip_slope();
         let total = self.layout.total;
@@ -334,9 +449,17 @@ impl Problem {
                 continue;
             }
             let image = sample.image as usize;
+            if !intents.includes(self.images[image].intent) {
+                continue;
+            }
             let (context, columns) = &contexts[image];
+            let terms: &[ResponseTerm] = if active.response {
+                &self.terms[image]
+            } else {
+                &[]
+            };
             let evaluated = evaluate_sample(
-                &look,
+                &looks[image],
                 &self.layout,
                 context,
                 columns,
@@ -344,6 +467,7 @@ impl Problem {
                 clip_k,
                 clip_slope,
                 &slope,
+                terms,
                 &mut jac,
             );
             let target = &sample.target;
@@ -426,6 +550,22 @@ impl Problem {
         }
         output
     }
+}
+
+fn shuffle(order: &mut [u32], rng: &mut Xorshift, take: usize) {
+    for i in 0..take {
+        let j = i + rng.below(order.len() - i);
+        order.swap(i, j);
+    }
+}
+
+fn group_seed(group: [u8; 16]) -> u64 {
+    let mut state = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in group {
+        state ^= u64::from(byte);
+        state = state.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    state
 }
 
 /// Uniform draw of at most `cap` sample indices.

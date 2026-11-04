@@ -66,6 +66,7 @@ pub struct Nuisance {
     pub hint: f64,
 }
 
+#[derive(Clone)]
 struct Scene {
     xyz: Vec<Xyz>,
     rgb: Vec<[f64; 3]>,
@@ -390,4 +391,231 @@ pub fn dataset_with(
 ) -> SyntheticDataset {
     let scenes = build_scenes(config);
     render(config, &scenes, truth, selector)
+}
+
+use looklab_model::realization::{ControlResponseModel, ControlValue, Delta, LayerKind, Settings};
+use looklab_schema::{ControlSchema, SimKey};
+
+#[derive(Clone, Debug)]
+pub struct ControlSynthConfig {
+    pub base: SynthConfig,
+    pub schema: ControlSchema,
+    pub epoch: u32,
+    pub base_sim: SimKey,
+    pub settings: Vec<Settings>,
+    /// `None` gives the image its own scene.
+    pub groups: Vec<Option<[u8; 16]>>,
+    pub response_scale: f64,
+    pub truth_seed: u64,
+}
+
+pub struct ControlledDataset {
+    pub images: Vec<FitImage>,
+    pub truth_look: Look,
+    pub truth_model: ControlResponseModel,
+    pub schema: ControlSchema,
+    pub settings: Vec<Settings>,
+    pub groups: Vec<Option<[u8; 16]>>,
+    pub clip_k: f64,
+}
+
+/// Per-control coefficients as a smooth function of the value index.
+pub fn random_control_model(
+    schema: &ControlSchema,
+    epoch: u32,
+    base_sim: &SimKey,
+    seed: u64,
+    scale: f64,
+) -> ControlResponseModel {
+    let mut rng = ChaCha12Rng::seed_from_u64(seed ^ 0xc0_11_ec_7e_d0_0d);
+    let mut model = ControlResponseModel::zeroed(schema, epoch, base_sim, 1)
+        .expect("synthetic schemas are validated before generation");
+    for control in &mut model.controls {
+        let count = control.values.len().max(1);
+        let layers = control.layers();
+        for (vi, value) in control.values.iter_mut().enumerate() {
+            let t = if count > 1 {
+                vi as f64 / (count - 1) as f64 - 0.5
+            } else {
+                0.0
+            };
+            for layer in &layers {
+                let layer_scale = match layer {
+                    LayerKind::Tone => scale,
+                    LayerKind::Tint => 1.5 * scale,
+                    _ => 0.4 * scale,
+                };
+                let a = gaussian(&mut rng) / 3.0;
+                let b = gaussian(&mut rng) / 3.0;
+                let c = gaussian(&mut rng) / 6.0;
+                let mut delta = Delta::default();
+                for feature in 0..layer.feature_count() {
+                    let jitter = 0.2 * gaussian(&mut rng);
+                    delta.add(
+                        *layer,
+                        feature,
+                        layer_scale * (a + b * t + c * t * t + jitter),
+                    );
+                }
+                value
+                    .delta
+                    .layers
+                    .push(match delta.layers.into_iter().next() {
+                        Some(entry) => entry,
+                        None => continue,
+                    });
+            }
+        }
+    }
+    for control in &mut model.wb.controls {
+        for value in &mut control.values {
+            let offset = match value.value {
+                ControlValue::Step(step) => step as f64,
+                _ => 0.0,
+            };
+            value.log_gain = [
+                0.008 * offset + 0.002 * gaussian(&mut rng),
+                0.008 * offset + 0.002 * gaussian(&mut rng),
+            ];
+        }
+    }
+    for (index, mode) in model.exposure.modes.iter_mut().enumerate() {
+        mode.ev = if index == 0 {
+            0.0
+        } else {
+            0.05 * gaussian(&mut rng)
+        };
+    }
+    model
+}
+
+/// Random settings over a model's declared non-default values.
+pub fn random_settings(
+    model: &ControlResponseModel,
+    rng: &mut ChaCha12Rng,
+    non_default_fraction: f64,
+) -> Settings {
+    let mut settings = Settings::new();
+    for control in &model.controls {
+        let draw = rng.next_u32() as f64 / (u32::MAX as f64);
+        if control.values.is_empty() || draw > non_default_fraction {
+            continue;
+        }
+        let index = (rng.next_u32() as usize) % control.values.len();
+        settings.set(control.key.clone(), control.values[index].value.clone());
+    }
+    for control in &model.wb.controls {
+        if control.values.is_empty() {
+            continue;
+        }
+        let index = (rng.next_u32() as usize) % control.values.len();
+        settings.set(control.key.clone(), control.values[index].value.clone());
+    }
+    for step in &model.exposure.steps {
+        let draw = rng.next_u32() as f64 / (u32::MAX as f64);
+        if draw > non_default_fraction {
+            continue;
+        }
+        let shift = (rng.next_u32() as i64 % 7) - 3;
+        settings.set(step.key.clone(), ControlValue::Step(step.default + shift));
+    }
+    settings
+}
+
+pub fn controlled_dataset(config: &ControlSynthConfig) -> ControlledDataset {
+    let n = config.settings.len();
+    let mut base = config.base;
+    base.images = n;
+    let mut scenes = build_scenes(&base);
+    for index in 0..n {
+        let Some(group) = config.groups.get(index).copied().flatten() else {
+            continue;
+        };
+        if let Some(first) =
+            (0..index).find(|prior| config.groups.get(*prior).copied().flatten() == Some(group))
+        {
+            scenes[index] = scenes[first].clone();
+        }
+    }
+    let truth_look = truth_look(config.truth_seed);
+    let truth_model = random_control_model(
+        &config.schema,
+        config.epoch,
+        &config.base_sim,
+        config.truth_seed,
+        config.response_scale,
+    );
+    let mut rng = ChaCha12Rng::seed_from_u64(config.truth_seed ^ 0x5a_11_ed_00_00_00_00_01);
+    let mut images = Vec::with_capacity(n);
+    for (index, scene) in scenes.iter().enumerate() {
+        let settings = &config.settings[index];
+        let realization = looklab_model::realization::realize(&truth_look, &truth_model, settings)
+            .expect("generated model realizes every declared setting");
+        let group = config.groups.get(index).copied().flatten();
+        let mode = mode_id(&truth_model, settings);
+        let exposure_scale = libm::pow(2.0, realization.exposure_ev);
+        let gain = realization.wb_gain;
+        let mut in_rgb = Vec::with_capacity(scene.xyz.len());
+        let mut out_rgb = Vec::with_capacity(scene.xyz.len());
+        let mut density = Vec::with_capacity(scene.xyz.len());
+        let mut flags = Vec::with_capacity(scene.xyz.len());
+        for rgb in &scene.rgb {
+            let cam = [
+                rgb[0] * gain[0] * exposure_scale,
+                rgb[1] * gain[1] * exposure_scale,
+                rgb[2] * gain[2] * exposure_scale,
+            ];
+            let xyz = Xyz::from_array(scene.transform.mul_vec(cam));
+            let clean = realization.look.eval(xyz);
+            let jitter = [
+                student_t(&mut rng, config.base.nu) * config.base.noise_ucs,
+                student_t(&mut rng, config.base.nu) * config.base.noise_ucs,
+                student_t(&mut rng, config.base.nu) * config.base.noise_ucs,
+            ];
+            let noisy = looklab_color::ucs::Ucs::new(
+                clean.j + jitter[0],
+                clean.a + jitter[1],
+                clean.b + jitter[2],
+            );
+            let xyz = reference_model().jmh_to_xyz(ucs_to_jmh(noisy, UcsSpace::Ucs));
+            let linear = config.base.space.xyz_to_rgb_linear(xyz);
+            let clipped = Rgb::new(
+                soft_clip(linear.r, config.base.clip_k),
+                soft_clip(linear.g, config.base.clip_k),
+                soft_clip(linear.b, config.base.clip_k),
+            );
+            in_rgb.push(rgb.map(|value| value as f32));
+            out_rgb.push(clipped.to_array().map(|value| value as f32));
+            density.push(1.0_f32);
+            flags.push(SampleFlags::NONE);
+        }
+        let mut header = header(scene.xyz.len(), config.base.space);
+        header.rerender_group = group.map(looklab_samples::RerenderGroupId::new);
+        let samples = SampleSet::new(header, in_rgb, out_rgb, density, flags)
+            .unwrap_or_else(|_| unreachable!("generated samples are in range"));
+        let mut image = FitImage::new(samples, scene.transform);
+        image.exposure_hint = scene.nuisance.hint;
+        image.exposure_mode = mode;
+        image.settings = settings.clone();
+        images.push(image);
+    }
+    ControlledDataset {
+        images,
+        truth_look,
+        truth_model,
+        schema: config.schema.clone(),
+        settings: config.settings.clone(),
+        groups: config.groups.clone(),
+        clip_k: config.base.clip_k,
+    }
+}
+
+pub fn mode_id(model: &ControlResponseModel, settings: &Settings) -> ExposureModeId {
+    model
+        .exposure
+        .modes
+        .iter()
+        .position(|mode| settings.get(&mode.control) == Some(&mode.value))
+        .map(|index| ExposureModeId(index as u32))
+        .unwrap_or_default()
 }

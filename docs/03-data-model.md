@@ -179,6 +179,32 @@ epochs:
 ### ControlResponseModel
 `body_id`, `epoch`, `base_sim`, `version`, `D` coefficients, `support` (controls/ranges with data), `metrics`.
 
+`D` is stored per control and non-default value as a delta over the layers named in `affects`. Tone and tint deltas are coefficient offsets on their spline coefficients. Chroma, hue and lightness deltas use a six-term unit-norm expansion over the layer's coefficients: the `C = 0` plane, a uniform shift over the `C > 0` volume, hue cosine and sine, an `s`-linear term and a `C`-linear term. Numeric controls interpolate piecewise-linearly between stored steps, with the default fixed at zero; enums and booleans select one stored value exactly.
+
+WB controls store a 2-DOF camera-space log gain (R/B vs G) per value. Exposure stores `ξ` per exposure mode selected by an exposure-affecting enum value, and exact EV per EC step. Interactions are an optional sparse list of `(control, value)` pairs with an extra delta, empty in v1.
+
+`support` records the values each control was observed at, including the default. A setting outside its observed range keeps its prediction and gets a variance multiplier that grows with the step distance.
+
+The model serializes as `crm.json`:
+
+```jsonc
+{
+  "format": "looklab-crm/1",
+  "model": {
+    "body": "fujifilm/x-t5", "epoch": 1, "base_sim": "classic_chrome", "version": 3,
+    "controls": [
+      { "key": "color", "default": {"step": 0}, "affects": ["chroma"],
+        "values": [{ "value": {"step": 2},
+                     "delta": { "layers": [{ "layer": "chroma",
+                                             "entries": [[0, 0.02], [1, -0.11]] }] } }] }
+    ],
+    "wb": { "controls": [], "omega": [0.0, 0.0] },
+    "exposure": { "modes": [], "steps": [] },
+    "support": { "controls": [] }
+  }
+}
+```
+
 ### Credential
 `id` (random internal id), `webauthn_credential` (credential id + public key, as `webauthn-rs` stores it), `display_handle?` (optional, user-chosen), `tier` (`new` | `endorsed` | `seeder`), `roles` (`moderator`, `admin`), `reputation`, `created_at`, `status` (`active` | `revoked`), `status_token_hash` (capability-token status feed; [06 §4](06-privacy-and-payload.md)). Public keys and serial HMACs are never published.
 
@@ -322,9 +348,40 @@ A `lut_defined` Look stores the uploaded LUT, its declared encodings and license
 
 `look.bin` is a named-array container: `LKBN`, a little-endian `u32` array count, then per array a `u8` name length, the ASCII name, a little-endian `u32` element count and that many little-endian `f64`, arrays sorted by name. v1 names are `T` (absent for a colorimetric tone), `N`, `G`, `R`, `Lambda`, `res`, and optionally `probe_cov` (9 `f64` per probe, row-major 3×3) and `kde` (one `f64` per probe); `res` is channel-minor, `((s·17 + a)·17 + b)·3 + channel`. v1 fixes the knot vectors and residual domain, repeated in `look.json` for validation; the zip is stored, fixed-order and fixed-timestamp.
 
+A body's control-response model is a separate `crm.json` (§1), versioned and referenced from provenance by `control_response_version`.
+
 ## 4. Storage notes
 
 - SQLite (WAL mode) for entities, replicated continuously with Litestream. Settings/metadata are JSON text validated in the application. UUIDs are stored as text. Migrations via `sqlx migrate`.
 - Object storage keyed by `sha256`. Sample blobs are **private** (never published). Artifacts are public and addressed by hash.
 - **Withdrawal:** a request signed by the contributing credential. The data is excluded from the next fit. Published versions are immutable. Blobs are hard-deleted after 30 days. Erasure for users who lost their credential is pending legal review ([10 Q3](10-open-questions.md)).
 - Don't store IP addresses. Rate limiting is in memory only.
+
+## 5. Published static data
+
+The site is a directory of immutable files plus JSON indexes, written by `looklab-publish`. The crate has no filesystem access: `write_site` takes a `SiteSink` (one `put(path, bytes)` call per file), so the same writer runs natively and in a browser test.
+
+```
+data/index.json                          SiteIndex: bodies, looks, versions, scenes
+data/audit-log.json                      AuditLog (docs/05 §11)
+data/bodies/<make>/<model>.json          BodyPage
+data/looks/<slug>.json                   LookPage
+data/looks/<slug>/<version>/manifest.json VersionManifest
+data/looks/<slug>/<version>/<artifact>   artifact bytes, for example look.looklab
+data/scenes/index.json                   SceneIndex
+data/scenes/<name>.f16                   scene-linear D65 XYZ, little-endian half floats
+```
+
+**VersionManifest.** `{ look, version, artifacts: [{ name, sha256, bytes }], status, gate_summary, provenance }`. `status` is `provisional | rooted | published | deprecated`; `gate_summary` lists each release check and its result; `provenance` summarizes bodies and epochs, root admissions, the anchor version, the community snapshot, prep versions, the creation time and the producing software. Every artifact is addressed by the lowercase hex SHA-256 of its bytes. `verify_artifact(manifest, name, bytes)` returns `HashMismatch` when the name is unlisted or the size or digest differs.
+
+**Client rule.** A page downloads an artifact only through its manifest and verifies it before parsing. A mismatch is an error and nothing is rendered from the bytes. The Look page shows each artifact's digest and a "matches version manifest" indicator after a successful check.
+
+**Body page data** is derived from the body and control-schema YAML snapshots: make/model, epochs and firmware ranges, capabilities, mapping status, the control schema per epoch with control differences, native sims, plus page-only facts the schema does not hold: input-transform confidence (source, anchor count, tier) and plain-language realization notes. The writer joins native sims to the latest published look version.
+
+**Look page data** repeats the identity (`slug`, name, kind, `wb_policy`, description, aliases, license for LUT-defined looks) and lists each version's manifest, changelog, weak spots and any publication notice (a since-revoked root admission, or a revert).
+
+**Previews.** A version may publish `preview.lut33`, a 33³ grid over encoded sRGB as little-endian `f32`, baked through the Look with its output clip. The browser applies the LUT trilinearly to the half-float scene and writes sRGB to a canvas. The LUT is an artifact like any other, so it is checked before use and a look switch costs only the LUT application.
+
+**Canonical scenes** are scene-linear XYZ at the D65 white point, stored as `f16` triples with dimensions in `SceneIndex`. The sample site generates a neutral and hue gradient, a hue wheel, and skin, foliage and sky patches. Real photographic scenes replace them when project-owned releases exist.
+
+**Sample data.** `cargo run -p looklab-publish --example site_data` fits three synthetic Looks with `looklab-fit`'s `synth` feature, builds the bodies, scenes and audit log, and writes the tree above to `site/data`. `trunk build --release` in `site/` then produces a site that renders with no server.

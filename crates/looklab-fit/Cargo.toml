@@ -16,6 +16,7 @@ synth = ["dep:rand_chacha"]
 looklab-color.workspace = true
 looklab-samples.workspace = true
 looklab-model.workspace = true
+looklab-schema.workspace = true
 libm.workspace = true
 thiserror.workspace = true
 rand_chacha = { workspace = true, optional = true }

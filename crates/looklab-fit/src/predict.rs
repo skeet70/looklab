@@ -4,8 +4,9 @@
 use core::f64::consts::PI;
 use looklab_color::ucs::{Ucs, UcsSpace, ucs_to_jmh};
 use looklab_color::{Mat3, Rgb, RgbSpace, Xyz};
-use looklab_model::basis::{S_COEFS, TONE_COEFS};
+use looklab_model::basis::{S_COEFS, TINT_COEFS, TONE_COEFS};
 use looklab_model::look::RESIDUAL_DOMAIN;
+use looklab_model::realization::{LayerKind, ResponseComponent, feature_coefficient};
 use looklab_model::solve::{reference_model, ucs_of_xyz};
 use looklab_model::{GrlComponent, LayerValues, Look, LookInput, soft_clip};
 
@@ -19,6 +20,14 @@ pub(crate) struct ImageCtx {
     pub exposure: f64,
     pub wb_r: f64,
     pub wb_b: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ResponseTerm {
+    pub index: usize,
+    pub phi: f64,
+    pub component: ResponseComponent,
+    pub feature: u32,
 }
 
 /// Global parameter indices whose columns the current stage wants.
@@ -284,6 +293,7 @@ pub(crate) fn evaluate_sample(
     clip_k: f64,
     clip_slope: f64,
     beta_slope: &[f64; TONE_COEFS],
+    terms: &[ResponseTerm],
     jac: &mut Jac,
 ) -> EvalOutput {
     jac.clear();
@@ -402,8 +412,16 @@ pub(crate) fn evaluate_sample(
         jac.push(index, d_out_ds);
     }
 
-    if columns.wb_r.is_some() || columns.wb_b.is_some() {
-        let d_out_dxyz = d_out_d_xyz(
+    let needs_xyz = columns.wb_r.is_some()
+        || columns.wb_b.is_some()
+        || terms.iter().any(|term| {
+            matches!(
+                term.component,
+                ResponseComponent::WbR | ResponseComponent::WbB
+            )
+        });
+    let d_out_dxyz = needs_xyz.then(|| {
+        d_out_d_xyz(
             &input,
             &values,
             &d_layer,
@@ -414,27 +432,38 @@ pub(crate) fn evaluate_sample(
             dt_ds,
             xyz,
             s_active,
+        )
+    });
+    let wb_derivative = |component: usize| {
+        d_out_dxyz.as_ref().map(|jacobian| {
+            jacobian.mul_vec([
+                image.transform.0[0][component] * cam[component],
+                image.transform.0[1][component] * cam[component],
+                image.transform.0[2][component] * cam[component],
+            ])
+        })
+    };
+    if let Some(index) = columns.wb_r
+        && let Some(derivative) = wb_derivative(0)
+    {
+        jac.push(index, derivative);
+    }
+    if let Some(index) = columns.wb_b
+        && let Some(derivative) = wb_derivative(2)
+    {
+        jac.push(index, derivative);
+    }
+    if !terms.is_empty() {
+        push_response_columns(
+            jac,
+            look,
+            layout,
+            &input,
+            &values,
+            &d_layer,
+            terms,
+            &wb_derivative,
         );
-        if let Some(index) = columns.wb_r {
-            jac.push(
-                index,
-                d_out_dxyz.mul_vec([
-                    image.transform.0[0][0] * cam[0],
-                    image.transform.0[1][0] * cam[0],
-                    image.transform.0[2][0] * cam[0],
-                ]),
-            );
-        }
-        if let Some(index) = columns.wb_b {
-            jac.push(
-                index,
-                d_out_dxyz.mul_vec([
-                    image.transform.0[0][2] * cam[2],
-                    image.transform.0[1][2] * cam[2],
-                    image.transform.0[2][2] * cam[2],
-                ]),
-            );
-        }
     }
 
     jac.apply(&clip_jacobian);
@@ -448,6 +477,106 @@ pub(crate) fn evaluate_sample(
         residual_indices,
         clip_jacobian,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_response_columns(
+    jac: &mut Jac,
+    look: &Look,
+    layout: &Layout,
+    input: &LookInput,
+    values: &LayerValues,
+    d_layer: &[[f64; 9]; 3],
+    terms: &[ResponseTerm],
+    wb_derivative: &impl Fn(usize) -> Option<[f64; 3]>,
+) {
+    let d_na = column(d_layer, 1);
+    let d_nb = column(d_layer, 2);
+    let (na_slope, nb_slope) = look.d_tint_d_t(values.t);
+    let d_t = add(
+        add(column(d_layer, 0), scale(d_na, na_slope)),
+        scale(d_nb, nb_slope),
+    );
+    let (tint_idx, tint_w, _) = basis::tint_values(values.t);
+    let tint_weight = |feature: usize| {
+        tint_idx
+            .iter()
+            .position(|index| *index == feature)
+            .map(|position| tint_w[position])
+            .unwrap_or(0.0)
+    };
+    for term in terms {
+        let index = layout.response.start + term.index;
+        match term.component {
+            ResponseComponent::Tone => {
+                if look.tone.is_colorimetric() {
+                    continue;
+                }
+                let weight = if term.feature == 0 {
+                    1.0
+                } else {
+                    input.tone_weights[term.feature as usize]
+                };
+                jac.push(index, scale(d_t, term.phi * weight));
+            }
+            ResponseComponent::Tint => {
+                let feature = term.feature as usize;
+                let (column, weight) = if feature < TINT_COEFS {
+                    (d_na, tint_weight(feature))
+                } else {
+                    (d_nb, tint_weight(feature - TINT_COEFS))
+                };
+                jac.push(index, scale(column, term.phi * weight));
+            }
+            ResponseComponent::Chroma | ResponseComponent::Hue | ResponseComponent::Lightness => {
+                let layer = term.component.layer().unwrap_or(LayerKind::Chroma);
+                let column_index = match layer {
+                    LayerKind::Chroma => 3,
+                    LayerKind::Hue => 4,
+                    _ => 5,
+                };
+                let weight = grl_response_weight(input, layer, term.feature);
+                jac.push(
+                    index,
+                    scale(column(d_layer, column_index), term.phi * weight),
+                );
+            }
+            ResponseComponent::WbR => {
+                if let Some(derivative) = wb_derivative(0) {
+                    jac.push(index, scale(derivative, term.phi));
+                }
+            }
+            ResponseComponent::WbB => {
+                if let Some(derivative) = wb_derivative(2) {
+                    jac.push(index, scale(derivative, term.phi));
+                }
+            }
+        }
+    }
+}
+
+fn grl_response_weight(input: &LookInput, layer: LayerKind, feature: u32) -> f64 {
+    let weights = &input.grl;
+    let mut sum = weights.c_w[0]
+        * weights
+            .s_w
+            .iter()
+            .zip(weights.s_idx.iter())
+            .map(|(weight, index)| weight * feature_coefficient(layer, feature, *index))
+            .sum::<f64>();
+    for h in 0..4 {
+        for s in 0..4 {
+            let base = (weights.hue_idx[h] * S_COEFS + weights.s_idx[s]) * 3;
+            for c in 1..4 {
+                let node = S_COEFS + base + (weights.c_idx[c] - 1);
+                sum += weights.hue_w[h]
+                    * weights.s_w[s]
+                    * weights.c_w[c]
+                    * feature_coefficient(layer, feature, node);
+            }
+        }
+    }
+    sum
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -627,6 +756,7 @@ mod tests {
             params.clip_k(),
             params.clip_slope(),
             &slopes(params),
+            &[],
             &mut jac,
         )
         .prediction
@@ -679,6 +809,7 @@ mod tests {
                 params.clip_k(),
                 params.clip_slope(),
                 &slopes(&params),
+                &[],
                 &mut jac,
             );
             let analytic: Vec<(usize, [f64; 3])> = jac

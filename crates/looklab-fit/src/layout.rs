@@ -24,11 +24,22 @@ pub struct Layout {
     pub modes: Range<usize>,
     pub clip: usize,
     pub sigma: Range<usize>,
+    pub response: Range<usize>,
     pub total: usize,
 }
 
 impl Layout {
+    #[cfg(test)]
     pub fn new(n_images: usize, n_modes: usize, n_contributors: usize) -> Self {
+        Self::with_response(n_images, n_modes, n_contributors, 0)
+    }
+
+    pub fn with_response(
+        n_images: usize,
+        n_modes: usize,
+        n_contributors: usize,
+        n_response: usize,
+    ) -> Self {
         let tone_c0 = 0;
         let tone_beta = 1..1 + TONE_COEFS;
         let tint_a = tone_beta.end..tone_beta.end + TINT_COEFS;
@@ -41,7 +52,8 @@ impl Layout {
         let modes = images.end..images.end + n_modes;
         let clip = modes.end;
         let sigma = clip + 1..clip + 1 + n_contributors;
-        let total = sigma.end;
+        let response = sigma.end..sigma.end + n_response;
+        let total = response.end;
         Self {
             tone_c0,
             tone_beta,
@@ -55,6 +67,7 @@ impl Layout {
             modes,
             clip,
             sigma,
+            response,
             total,
         }
     }
@@ -148,6 +161,13 @@ pub enum BlockKind {
     R,
     Lambda,
     Residual,
+    Nuisance,
+    ResponseTone,
+    ResponseTint,
+    ResponseChroma,
+    ResponseHue,
+    ResponseLightness,
+    ResponseWb,
 }
 
 #[derive(Clone, Debug)]

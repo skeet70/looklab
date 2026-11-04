@@ -8,6 +8,7 @@ pub mod error;
 pub mod file;
 pub mod look;
 pub mod probes;
+pub mod realization;
 pub mod solve;
 pub mod tone;
 

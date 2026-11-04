@@ -18,14 +18,47 @@ mod uncertainty;
 pub mod synth;
 
 pub use looklab_color::{Mat3, RgbSpace, Xyz};
+pub use looklab_model::realization::{
+    ControlResponseModel, ControlValue, ResponseParamId, Settings,
+};
 pub use looklab_model::{Look, LookInput, Probe, ProbeId, ProbeSet};
 pub use types::{
-    ContributorId, Density, Diagnostics, ExposureModeId, ExposureOffset, FitError, FitImage,
-    FitOptions, FitResult, ImageFitStats, ImageNuisances, OutlierReason, ProbeEstimate,
-    ProbeUncertainty, Realization, Result, StageLambdas, Verdict,
+    ContributorId, ControlResponseFit, Density, Diagnostics, ExcludeReason, ExcludedImage,
+    ExposureModeId, ExposureOffset, FitError, FitImage, FitOptions, FitResult, ImageFitStats,
+    ImageIntent, ImageNuisances, OutlierReason, ProbeEstimate, ProbeUncertainty, Realization,
+    Result, StageLambdas, Verdict,
 };
 
-/// Fit one body's single Look from its images.
+/// Fit one body's single Look at the reference control setting.
 pub fn fit(images: &[FitImage], options: &FitOptions) -> Result<FitResult> {
-    fit::run(images, options)
+    fit::run(images, options, None)
+}
+
+/// Joint θ/D fit over all native settings on one body.
+pub fn fit_controlled(
+    images: &[FitImage],
+    schema: &looklab_schema::ControlSchema,
+    epoch: u32,
+    base_sim: &looklab_schema::SimKey,
+    options: &FitOptions,
+) -> Result<FitResult> {
+    let model = ControlResponseModel::zeroed(schema, epoch, base_sim, 1)?;
+    let (kept, excluded) = fit::filter_spatial(images, schema, epoch)?;
+    if !kept.iter().any(|image| image.intent == ImageIntent::Native) {
+        return Err(FitError::NoNativeImages);
+    }
+    fit::run_with(&kept, options, Some(model), excluded)
+}
+
+/// Refit the control response with θ_L fixed.
+pub fn refit_responses(
+    look: &Look,
+    images: &[FitImage],
+    schema: &looklab_schema::ControlSchema,
+    epoch: u32,
+    base_sim: &looklab_schema::SimKey,
+    model: &ControlResponseModel,
+    options: &FitOptions,
+) -> Result<ControlResponseFit> {
+    fit::run_responses(look, images, schema, epoch, base_sim, model, options)
 }

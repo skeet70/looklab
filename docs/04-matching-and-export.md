@@ -31,6 +31,8 @@ input effects = WB gain ω_B · W(u_wb)  and  exposure 2^(ξ_{B,m(u)} + EC(u))
 - **`wb` controls** act as a 2-DOF gain on camera RGB before the Look. **`exposure` controls** (mode and EC) act through ξ and EC. Neither changes θ.
 - Learned from re-render series (most informative), all native library data, and recipe uploads (recipe stage only, [02 §4.3](02-color-pipeline.md)). Uncertainty comes from the image-clustered sandwich estimator. Settings far from observed data get inflated uncertainty.
 
+**v1 storage.** `T` and `N` deltas are coefficient offsets. `G`, `R` and `Λ` deltas are a six-term unit-norm expansion over the layer's coefficient vector (`C = 0` plane, uniform `C > 0` volume, hue cosine and sine, `s`-linear, `C`-linear), which keeps a control with many steps to a few coefficients per step. The fit regularizes each control's expansion with shrinkage toward zero plus second differences across adjacent numeric steps; generalized cross-validation chooses the weight. Deltas at the default are exactly zero, and numeric interpolation is piecewise-linear between stored steps. `support` records the observed values; a probe or candidate beyond it keeps its prediction and has the response covariance multiplied by `1 + d`, where `d` is the step distance outside the observed range (unobserved enum values use 2). [03 §1](03-data-model.md) gives the `crm.json` layout.
+
 ## 3. Settings optimizer
 
 Objective for a candidate (k, u):
@@ -42,6 +44,15 @@ E(k,u) = Σ_p w_p c_p · ΔE_UCS( L(p), Real_{k,u}(p) )²  +  β Σ_p w_p · tr 
 - `w_p`: probe group weight times the user's emphasis (balanced / skin / landscape / product).
 - `c_p = 1/(1 + σ²_L(p)/τ²)`, with τ = 1 ΔE. Unsupported probes are excluded.
 - β = 0.25 penalizes extrapolation.
+- Emphasis multiplies the [02 §6](02-color-pipeline.md) group weights:
+
+| Group | balanced | skin | landscape | product |
+|---|---|---|---|---|
+| Gray ramp | 1.0 | 1.0 | 0.8 | 1.2 |
+| Chart patches | 1.0 | 1.0 | 1.0 | 2.0 |
+| Hue grid | 1.0 | 0.8 | 1.25 | 1.0 |
+| Skin | 1.0 | 3.0 | 0.5 | 0.8 |
+| Memory colors | 1.0 | 1.2 | 3.0 | 1.0 |
 
 **Budget: < 2 s for a full search in one WASM worker** (p95 across fixture bodies). The same budget applies everywhere ([09 P2.3](09-roadmap.md)). To meet it:
 
@@ -50,7 +61,9 @@ E(k,u) = Σ_p w_p c_p · ΔE_UCS( L(p), Real_{k,u}(p) )²  +  β Σ_p w_p · tr 
 3. **Per-probe linearization.** For each kept base sim, precompute at its default the per-probe output `o_p` and the Jacobian `J_p` with respect to the coefficients D can move, plus the WB and exposure input effects. Then precompute every control value's contribution `c_{p,j,v} = J_p D_{B,k,j} φ_j(v)` (a 3-vector). Evaluating a candidate is then a handful of 3-vector adds per probe. Exactly re-evaluate the top candidates. If linear and exact predictions differ by > 0.3 ΔE median, re-linearize at that candidate and continue (a trust-region style step).
 4. **Low-rank predicted covariance.** Rank-20 eigen-approximation of Cov(D); per-control-value trace contributions precomputed in the same additive form.
 
-**Search:** for each kept base sim, run staged integer coordinate descent following the schema's `solve_plan` (tone stage, then color stage; each control swept over its range; iterate to convergence). Then 3 perturbation rounds (random joint ±1–2 step moves on 2–3 controls, accepted if better). Keep a beam of 5 per sim and return the top 3 overall.
+Cov(D) arrives as `looklab-crm-cov/1`: the control-response model's `parameter_ids`, row-major covariance over them (D and WB). The optimizer splits it by `(control, value)`, eigendecomposes each block, keeps the 20 largest positive eigenvalues, and applies `Support::inflation(settings)` to the resulting trace.
+
+**Search:** for each kept base sim, run staged integer coordinate descent following the schema's `solve_plan` (tone stage, then color stage; each control swept over its range; iterate to convergence). Then 3 perturbation rounds (random joint ±1–2 step moves on 2–3 controls, accepted if better). Keep a beam of 5 per sim and return the top 3 overall. Defaults: 500-probe subset, 5-probe full rescore, 4 coordinate passes, 2 re-linearizations, seed supplied by the caller.
 
 ## 4. Settings card and permalinks
 
@@ -61,7 +74,11 @@ The **settings card** shows:
 - Unreachable regions, e.g. "Cyan chroma can't be reduced enough; the remaining error is 3.8 ΔE."
 - Confidence, which is low when the control-response model is thin.
 
-**Permalinks** pin everything needed to reproduce the result: Look version, control-response model version, input transform version, realization params version, epoch map version, probe set version, optimizer version and the user's emphasis. All versions are immutable, so a permalink always reproduces.
+**Permalinks** pin everything needed to reproduce the result: Look version, base realization Look version, control-response model version, input transform version, realization params version, epoch map version, probe set version, optimizer version and the user's emphasis. All versions are immutable, so a permalink always reproduces.
+
+The canonical encoding is a single line of `key=value` fields joined by `|`, starting with `looklab-match/1`, in this order: `look`, `base`, `crm`, `input`, `realization`, `epoch_map`, `probes`, `optimizer`, `emphasis`, then optional `target_file`, `base_file`, `body_file`, `crm_file`, `transform_file`, `covariance_file`. Look and base are `slug@version`; CRM is `body@epoch@sim@version`. Values are percent-encoded. `looklab match` writes this string; `looklab verify --permalink` resolves the optional file fields relative to the permalink's directory.
+
+`looklab match --look <target.looklab> --body <schema.yaml> --crm <crm.json> [--emphasis skin]` prints the settings card and the permalink; `looklab verify --permalink <file> --observed <dir>` runs one loop iteration and prints the measured error of the first suggestion and the re-optimized second suggestion.
 
 ## 5. Verification loop (local, anonymous OK)
 
@@ -69,6 +86,8 @@ The **settings card** shows:
 2. The user re-renders them in camera at the recommended settings and drops in the JPEGs.
 3. The client fits the observed realization, compares it with the prediction, updates a **local** copy of D (a few LM iterations) and re-optimizes. Repeat 1–3 times.
 4. At the end, offer to contribute (this creates a credential if there isn't one). Verification renders are re-render series plus recipe data.
+
+The first implementation updates one scale factor per non-default control with two Gauss-Newton iterations (ridge 1e-3, factor clamped to 0.05–20), then re-runs the full search. Selection ranks candidate RAW sample sets by mean `tr Cov_pred` at the recommended settings and keeps 2–4. `looklab verify` reports the first suggestion's error against the observed re-renders; measuring the second suggestion needs a re-render at its settings.
 
 ## 6. Firmware interface profiles
 

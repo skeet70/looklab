@@ -182,6 +182,93 @@ pub(crate) fn probe_uncertainty(
     })
 }
 
+/// Image-clustered sandwich covariance of the control-response coefficients.
+pub(crate) fn response_covariance(
+    problem: &Problem,
+    blocks: &[BlockAcc],
+    penalties: &[Vec<f64>],
+    lambdas: &crate::types::StageLambdas,
+    hessian_scale: f64,
+    per_image_gradient: &[Vec<f64>],
+) -> (Vec<looklab_model::realization::ResponseParamId>, Vec<f64>) {
+    let n = problem.layout.response.len();
+    let mut covariance = vec![0.0_f64; n * n];
+    for (block, penalty) in blocks.iter().zip(penalties.iter()) {
+        let Some(lambda) = response_lambda(lambdas, block.kind) else {
+            continue;
+        };
+        let m = block.len();
+        if m == 0 {
+            continue;
+        }
+        let mut h = block.hessian.clone();
+        for value in &mut h {
+            *value *= hessian_scale;
+        }
+        for entry in 0..m * m {
+            h[entry] += lambda * penalty[entry];
+        }
+        for index in 0..m {
+            h[index * m + index] += 1e-9;
+        }
+        let Some(inverse) = invert(&h, m) else {
+            continue;
+        };
+        let mut scores = vec![vec![0.0_f64; m]; per_image_gradient.len()];
+        for (image, gradient) in per_image_gradient.iter().enumerate() {
+            for (local, global) in block.params.iter().enumerate() {
+                scores[image][local] = gradient[*global];
+            }
+        }
+        let mut middle = vec![0.0_f64; m * m];
+        for score in &scores {
+            for a in 0..m {
+                for b in 0..m {
+                    middle[a * m + b] += score[a] * score[b];
+                }
+            }
+        }
+        let mut left = vec![0.0_f64; m * m];
+        for a in 0..m {
+            for i in 0..m {
+                let value = inverse[a * m + i];
+                if value == 0.0 {
+                    continue;
+                }
+                for j in 0..m {
+                    left[a * m + j] += value * middle[i * m + j];
+                }
+            }
+        }
+        for a in 0..m {
+            for j in 0..m {
+                let global_a = block.params[a] - problem.layout.response.start;
+                for b in 0..m {
+                    let global_b = block.params[b] - problem.layout.response.start;
+                    covariance[global_a * n + global_b] += left[a * m + j] * inverse[j * m + b];
+                }
+            }
+        }
+    }
+    (problem.parameter_ids.clone(), covariance)
+}
+
+fn response_lambda(
+    lambdas: &crate::types::StageLambdas,
+    kind: crate::layout::BlockKind,
+) -> Option<f64> {
+    use crate::layout::BlockKind;
+    match kind {
+        BlockKind::ResponseTone => Some(lambdas.response_tone),
+        BlockKind::ResponseTint => Some(lambdas.response_tint),
+        BlockKind::ResponseChroma => Some(lambdas.response_chroma),
+        BlockKind::ResponseHue => Some(lambdas.response_hue),
+        BlockKind::ResponseLightness => Some(lambdas.response_lightness),
+        BlockKind::ResponseWb => Some(lambdas.response_wb),
+        _ => None,
+    }
+}
+
 fn residual_inverse_diagonal(samples: &[ResidualSample], lambda: f64) -> Vec<f64> {
     let mut diagonal = vec![0.0_f64; RESIDUAL_COEFS];
     for sample in samples {

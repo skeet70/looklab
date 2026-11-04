@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use looklab_color::Mat3;
 use looklab_color::ucs::Ucs;
+use looklab_model::realization::{ControlResponseModel, ResponseParamId, Settings};
 use looklab_model::{Look, ModelError, ProbeId};
 use looklab_samples::{Error as SamplesError, SampleSet};
+use looklab_schema::ControlKey;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FitError {
@@ -20,6 +22,12 @@ pub enum FitError {
     Model(#[from] ModelError),
     #[error("regularization matrix is singular")]
     SingularRegularization,
+    #[error("control schema: {0}")]
+    Schema(String),
+    #[error("no native images remain after excluding unsupported settings")]
+    NoNativeImages,
+    #[error("control response: {0}")]
+    Realization(#[from] looklab_model::realization::RealizationError),
 }
 
 pub type Result<T, E = FitError> = core::result::Result<T, E>;
@@ -40,6 +48,8 @@ pub struct FitImage {
     pub trust_weight: f64,
     pub exposure_mode: ExposureModeId,
     pub contributor: ContributorId,
+    pub settings: Settings,
+    pub intent: ImageIntent,
 }
 
 impl FitImage {
@@ -51,8 +61,18 @@ impl FitImage {
             trust_weight: 1.0,
             exposure_mode: ExposureModeId::default(),
             contributor: ContributorId::default(),
+            settings: Settings::default(),
+            intent: ImageIntent::Native,
         }
     }
+}
+
+/// Recipe images are fitted after θ_L is frozen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageIntent {
+    #[default]
+    Native,
+    Recipe,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -75,6 +95,8 @@ pub struct FitOptions {
     pub support_sigma: f64,
     pub run_gcv: bool,
     pub fit_residual: bool,
+    /// Sweeps of the recipe stage, which holds θ_L fixed (docs/02 §4.3).
+    pub recipe_sweeps: usize,
 }
 
 impl Default for FitOptions {
@@ -96,6 +118,7 @@ impl Default for FitOptions {
             support_sigma: 1.5,
             run_gcv: true,
             fit_residual: true,
+            recipe_sweeps: 4,
         }
     }
 }
@@ -129,6 +152,31 @@ pub struct StageLambdas {
     pub tint: f64,
     pub grl: f64,
     pub residual: f64,
+    pub response_tone: f64,
+    pub response_tint: f64,
+    pub response_chroma: f64,
+    pub response_hue: f64,
+    pub response_lightness: f64,
+    pub response_wb: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ControlResponseFit {
+    pub model: ControlResponseModel,
+    pub parameter_ids: Vec<ResponseParamId>,
+    /// Row-major covariance over `parameter_ids`.
+    pub covariance: Vec<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExcludeReason {
+    SpatialControl { key: ControlKey },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExcludedImage {
+    pub index: usize,
+    pub reason: ExcludeReason,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -211,4 +259,6 @@ pub struct FitResult {
     pub density: Density,
     pub image_stats: Vec<ImageFitStats>,
     pub diagnostics: Diagnostics,
+    pub control_response: Option<ControlResponseFit>,
+    pub excluded: Vec<ExcludedImage>,
 }

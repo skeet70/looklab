@@ -2,16 +2,20 @@
 //! Staged Gauss-Newton/Levenberg-Marquardt with block solves and per-stage GCV.
 
 use looklab_model::basis::{RESIDUAL_COEFS, S_COEFS, TONE_COEFS};
+use looklab_model::realization::{
+    ControlResponseModel, LayerKind, ResponseComponent, ResponseParamId,
+};
+use looklab_schema::{Control, ControlDefault, ControlSchema, ScalarValue, Tolerated};
 
 use crate::basis;
 use crate::density;
 use crate::layout::{BlockKind, Layout, Params};
 use crate::outlier;
-use crate::problem::{ActiveColumns, BlockAcc, PassOutput, Problem, ResidualSample};
+use crate::problem::{ActiveColumns, BlockAcc, IntentFilter, PassOutput, Problem, ResidualSample};
 use crate::solve::{factor_in_place, select_lambda, select_lambda_diagonal, solve_in_place};
 use crate::types::{
-    Diagnostics, ExposureOffset, FitImage, FitOptions, FitResult, ImageNuisances, Realization,
-    Result, StageLambdas, Verdict,
+    ControlResponseFit, Diagnostics, ExcludeReason, ExcludedImage, ExposureOffset, FitImage,
+    FitOptions, FitResult, ImageIntent, ImageNuisances, Realization, Result, StageLambdas, Verdict,
 };
 use crate::uncertainty;
 
@@ -34,13 +38,19 @@ const STAGES: [Stage; 5] = [
             mode: true,
             wb: true,
             clip: false,
+            response: false,
         },
         neutral: true,
         sweeps: 6,
         gcv: true,
     },
     Stage {
-        blocks: &[BlockKind::Tone, BlockKind::Tint],
+        blocks: &[
+            BlockKind::Tone,
+            BlockKind::Tint,
+            BlockKind::ResponseTone,
+            BlockKind::ResponseTint,
+        ],
         active: ActiveColumns::ALL,
         neutral: false,
         sweeps: 4,
@@ -53,6 +63,12 @@ const STAGES: [Stage; 5] = [
             BlockKind::G,
             BlockKind::R,
             BlockKind::Lambda,
+            BlockKind::ResponseTone,
+            BlockKind::ResponseTint,
+            BlockKind::ResponseChroma,
+            BlockKind::ResponseHue,
+            BlockKind::ResponseLightness,
+            BlockKind::ResponseWb,
         ],
         active: ActiveColumns::ALL,
         neutral: false,
@@ -60,7 +76,16 @@ const STAGES: [Stage; 5] = [
         gcv: true,
     },
     Stage {
-        blocks: &[BlockKind::Tone, BlockKind::Residual],
+        blocks: &[
+            BlockKind::Tone,
+            BlockKind::Residual,
+            BlockKind::ResponseTone,
+            BlockKind::ResponseTint,
+            BlockKind::ResponseChroma,
+            BlockKind::ResponseHue,
+            BlockKind::ResponseLightness,
+            BlockKind::ResponseWb,
+        ],
         active: ActiveColumns::ALL,
         neutral: false,
         sweeps: 3,
@@ -74,6 +99,12 @@ const STAGES: [Stage; 5] = [
             BlockKind::R,
             BlockKind::Lambda,
             BlockKind::Residual,
+            BlockKind::ResponseTone,
+            BlockKind::ResponseTint,
+            BlockKind::ResponseChroma,
+            BlockKind::ResponseHue,
+            BlockKind::ResponseLightness,
+            BlockKind::ResponseWb,
         ],
         active: ActiveColumns::ALL,
         neutral: false,
@@ -82,11 +113,118 @@ const STAGES: [Stage; 5] = [
     },
 ];
 
-pub(crate) fn run(images: &[FitImage], options: &FitOptions) -> Result<FitResult> {
-    let problem = Problem::new(images, options)?;
-    let layout = problem.layout.clone();
+pub(crate) fn filter_spatial(
+    images: &[FitImage],
+    schema: &ControlSchema,
+    epoch: u32,
+) -> Result<(Vec<FitImage>, Vec<ExcludedImage>)> {
+    let epoch_schema = schema
+        .epochs
+        .iter()
+        .find(|entry| entry.id == epoch)
+        .ok_or_else(|| crate::types::FitError::Schema(format!("epoch {epoch} is not declared")))?;
+    let spatial: Vec<&Control> = epoch_schema
+        .controls
+        .iter()
+        .filter(|control| control.spatial)
+        .collect();
+    let mut kept = Vec::with_capacity(images.len());
+    let mut excluded = Vec::new();
+    for (index, image) in images.iter().enumerate() {
+        let mut reason = None;
+        for control in &spatial {
+            let value = image
+                .settings
+                .get(&control.key)
+                .cloned()
+                .unwrap_or_else(|| control_value(control));
+            if !tolerated(control, &value) {
+                reason = Some(ExcludeReason::SpatialControl {
+                    key: control.key.clone(),
+                });
+                break;
+            }
+        }
+        match reason {
+            Some(reason) => excluded.push(ExcludedImage { index, reason }),
+            None => kept.push(image.clone()),
+        }
+    }
+    Ok((kept, excluded))
+}
+
+fn control_value(control: &Control) -> looklab_model::realization::ControlValue {
+    use looklab_model::realization::ControlValue;
+    match &control.default {
+        ControlDefault::Number(number) => ControlValue::Step(
+            control
+                .step
+                .as_ref()
+                .and_then(|step| number.div_exact(step))
+                .unwrap_or(0),
+        ),
+        ControlDefault::Enum(value) => ControlValue::Enum(value.clone()),
+        ControlDefault::Bool(value) => ControlValue::Bool(*value),
+    }
+}
+
+fn tolerated(control: &Control, value: &looklab_model::realization::ControlValue) -> bool {
+    use looklab_model::realization::ControlValue;
+    let default = control_value(control);
+    let allowed = match &control.tolerated {
+        Some(Tolerated::Any) => return true,
+        Some(Tolerated::Values(values)) => values.clone(),
+        None => Vec::new(),
+    };
+    let scalar = match value {
+        ControlValue::Step(index) => {
+            let number = control
+                .step
+                .as_ref()
+                .and_then(|step| step.checked_mul_i64(*index));
+            match number {
+                Some(number) => ScalarValue::Number(number),
+                None => return false,
+            }
+        }
+        ControlValue::Enum(name) => ScalarValue::Text(name.as_str().to_string()),
+        ControlValue::Bool(value) => ScalarValue::Bool(*value),
+    };
+    if value == &default {
+        return true;
+    }
+    allowed.contains(&scalar)
+}
+
+pub(crate) fn run(
+    images: &[FitImage],
+    options: &FitOptions,
+    model: Option<ControlResponseModel>,
+) -> Result<FitResult> {
+    run_with(images, options, model, Vec::new())
+}
+
+pub(crate) fn run_with(
+    images: &[FitImage],
+    options: &FitOptions,
+    model: Option<ControlResponseModel>,
+    excluded: Vec<ExcludedImage>,
+) -> Result<FitResult> {
+    let mut native_positions: Vec<Option<usize>> = vec![None; images.len()];
+    let mut native = Vec::new();
+    for (index, image) in images.iter().enumerate() {
+        if image.intent == ImageIntent::Native {
+            native_positions[index] = Some(native.len());
+            native.push(image.clone());
+        }
+    }
+    if native.is_empty() {
+        return Err(crate::types::FitError::NoNativeImages);
+    }
+    let mut problem = Problem::new_with(&native, model.as_ref(), options)?;
+    let mut layout = problem.layout.clone();
     let mut params = initial_params(&problem);
-    let roles = prior_roles(&problem, &layout);
+    let mut roles = prior_roles(&problem, &layout);
     let mut lambdas = StageLambdas::default();
     let mut evaluations = 0usize;
 
@@ -108,12 +246,11 @@ pub(crate) fn run(images: &[FitImage], options: &FitOptions) -> Result<FitResult
             .collect();
         let mut blocks: Vec<BlockAcc> = kinds
             .iter()
-            .map(|kind| make_block(*kind, &layout, stage.active))
+            .map(|kind| make_block(&problem, *kind, stage.active))
             .collect();
-        let penalties: Vec<Vec<f64>> = kinds
+        let penalties: Vec<Vec<f64>> = blocks
             .iter()
-            .zip(blocks.iter())
-            .map(|(kind, block)| double(embed(penalty_for(*kind), block.len())))
+            .map(|block| block_penalty(&problem, block))
             .collect();
         let mut damping: f64 = 1e-3;
         let mut previous: Option<(f64, Params)> = None;
@@ -129,6 +266,7 @@ pub(crate) fn run(images: &[FitImage], options: &FitOptions) -> Result<FitResult
                 false,
                 false,
                 stage.neutral,
+                IntentFilter::NativeOnly,
             );
             evaluations += 1;
             let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
@@ -204,28 +342,98 @@ pub(crate) fn run(images: &[FitImage], options: &FitOptions) -> Result<FitResult
         }
     }
 
+    if images
+        .iter()
+        .any(|image| image.intent == ImageIntent::Recipe)
+    {
+        let all_problem = Problem::new_with(images, model.as_ref(), options)?;
+        let mut all_params =
+            carry_params(&problem, &params, &all_problem, &native_positions, images);
+        layout = all_problem.layout.clone();
+        roles = prior_roles(&all_problem, &layout);
+        let kinds = [
+            BlockKind::Nuisance,
+            BlockKind::ResponseTone,
+            BlockKind::ResponseTint,
+            BlockKind::ResponseChroma,
+            BlockKind::ResponseHue,
+            BlockKind::ResponseLightness,
+            BlockKind::ResponseWb,
+        ];
+        let mut blocks: Vec<BlockAcc> = kinds
+            .iter()
+            .map(|kind| make_block(&all_problem, *kind, ActiveColumns::ALL))
+            .collect();
+        let penalties: Vec<Vec<f64>> = blocks
+            .iter()
+            .map(|block| block_penalty(&all_problem, block))
+            .collect();
+        let mut damping: f64 = 1e-3;
+        for _ in 0..options.recipe_sweeps {
+            for block in &mut blocks {
+                block.reset();
+            }
+            let pass = all_problem.pass(
+                &all_params,
+                ActiveColumns::ALL,
+                &mut blocks,
+                false,
+                false,
+                false,
+                IntentFilter::All,
+            );
+            evaluations += 1;
+            let mut step = vec![0.0_f64; layout.total];
+            for (index, block) in blocks.iter().enumerate() {
+                let (prior_gradient, prior_curvature) =
+                    prior_terms(&all_problem, &roles, &all_params, options, block);
+                solve_block(
+                    block,
+                    &mut step,
+                    &penalties[index],
+                    &prior_gradient,
+                    &prior_curvature,
+                    &all_params,
+                    &lambdas,
+                    damping,
+                );
+            }
+            apply_step(&mut all_params, &step);
+            update_sigma(&all_problem, &mut all_params, &pass, options);
+            damping = (damping * 0.3).max(1e-6);
+        }
+        problem = all_problem;
+        params = all_params;
+    }
+
     let mut blocks: Vec<BlockAcc> = STAGES[4]
         .blocks
         .iter()
-        .map(|kind| make_block(*kind, &layout, ActiveColumns::ALL))
+        .map(|kind| make_block(&problem, *kind, ActiveColumns::ALL))
         .collect();
     for block in &mut blocks {
         block.reset();
     }
-    let penalties: Vec<Vec<f64>> = STAGES[4]
-        .blocks
+    let penalties: Vec<Vec<f64>> = blocks
         .iter()
-        .zip(blocks.iter())
-        .map(|(kind, block)| double(embed(penalty_for(*kind), block.len())))
+        .map(|block| block_penalty(&problem, block))
         .collect();
-    let final_pass = problem.pass(&params, ActiveColumns::ALL, &mut blocks, true, true, false);
+    let final_pass = problem.pass(
+        &params,
+        ActiveColumns::ALL,
+        &mut blocks,
+        true,
+        true,
+        false,
+        IntentFilter::All,
+    );
     evaluations += 1;
     // The exposure/body gauge is a definition (docs/02 §2.1), not an estimate, so
     // the Look's covariance is conditional on the exposure nuisances.
     let uncertainty_columns = ActiveColumns::ALL;
     let mut uncertainty_blocks = vec![
         make_look_block(&layout, uncertainty_columns),
-        make_block(BlockKind::Residual, &layout, uncertainty_columns),
+        make_block(&problem, BlockKind::Residual, uncertainty_columns),
     ];
     let uncertainty_pass = problem.pass(
         &params,
@@ -234,6 +442,7 @@ pub(crate) fn run(images: &[FitImage], options: &FitOptions) -> Result<FitResult
         false,
         true,
         false,
+        IntentFilter::All,
     );
     evaluations += 1;
     let _ = &final_pass.per_image_gradient;
@@ -292,6 +501,20 @@ pub(crate) fn run(images: &[FitImage], options: &FitOptions) -> Result<FitResult
         options,
     )?;
 
+    let hessian_scale =
+        final_pass.active_samples.max(1) as f64 / final_pass.hessian_rows.max(1) as f64;
+    let (parameter_ids, covariance) = uncertainty::response_covariance(
+        &problem,
+        &blocks,
+        &penalties,
+        &lambdas,
+        hessian_scale,
+        &final_pass.per_image_gradient,
+    );
+    let control_response = model.map(|template| {
+        build_control_response(template, &problem, &params, parameter_ids, covariance)
+    });
+
     let mut diagnostics = Diagnostics {
         sweeps: 0,
         evaluations,
@@ -323,7 +546,378 @@ pub(crate) fn run(images: &[FitImage], options: &FitOptions) -> Result<FitResult
         density,
         image_stats,
         diagnostics,
+        control_response,
+        excluded,
     })
+}
+
+fn carry_params(
+    native: &Problem,
+    native_params: &Params,
+    all: &Problem,
+    positions: &[Option<usize>],
+    images: &[FitImage],
+) -> Params {
+    let mut params = Params::initial(all.layout.clone(), all.contributors.len());
+    let copy =
+        |source: core::ops::Range<usize>, target: core::ops::Range<usize>, params: &mut Params| {
+            params.theta[target].copy_from_slice(&native_params.theta[source]);
+        };
+    copy(
+        native.layout.tone_beta.clone(),
+        all.layout.tone_beta.clone(),
+        &mut params,
+    );
+    params.theta[all.layout.tone_c0] = native_params.theta[native.layout.tone_c0];
+    copy(
+        native.layout.tint_a.clone(),
+        all.layout.tint_a.clone(),
+        &mut params,
+    );
+    copy(
+        native.layout.tint_b.clone(),
+        all.layout.tint_b.clone(),
+        &mut params,
+    );
+    copy(native.layout.g.clone(), all.layout.g.clone(), &mut params);
+    copy(native.layout.r.clone(), all.layout.r.clone(), &mut params);
+    copy(
+        native.layout.lambda.clone(),
+        all.layout.lambda.clone(),
+        &mut params,
+    );
+    copy(
+        native.layout.residual.clone(),
+        all.layout.residual.clone(),
+        &mut params,
+    );
+    params.theta[all.layout.clip] = native_params.theta[native.layout.clip];
+    if !native.layout.response.is_empty() {
+        copy(
+            native.layout.response.clone(),
+            all.layout.response.clone(),
+            &mut params,
+        );
+    }
+    for (index, contributor) in all.contributors.iter().enumerate() {
+        if let Some(position) = native
+            .contributors
+            .iter()
+            .position(|entry| entry == contributor)
+        {
+            params.theta[all.layout.sigma_of(index)] =
+                native_params.theta[native.layout.sigma_of(position)];
+        }
+    }
+    for (index, mode) in all.modes.iter().enumerate() {
+        if let Some(position) = native.modes.iter().position(|entry| entry == mode) {
+            params.theta[all.layout.mode_of(index)] =
+                native_params.theta[native.layout.mode_of(position)];
+        }
+    }
+    for (index, image) in images.iter().enumerate() {
+        let target = all.layout.image(index);
+        match positions[index] {
+            Some(position) => {
+                let source = native.layout.image(position);
+                params.theta[target.start..target.end]
+                    .copy_from_slice(&native_params.theta[source.start..source.end]);
+            }
+            None => {
+                params.theta[target.start] = image.exposure_hint.clamp(-8.0, 8.0);
+            }
+        }
+    }
+    params
+}
+
+pub(crate) fn run_responses(
+    look: &looklab_model::Look,
+    images: &[FitImage],
+    schema: &ControlSchema,
+    epoch: u32,
+    base_sim: &looklab_schema::SimKey,
+    model: &ControlResponseModel,
+    options: &FitOptions,
+) -> Result<ControlResponseFit> {
+    let template = ControlResponseModel::zeroed(schema, epoch, base_sim, model.version)?;
+    let problem = Problem::new_with(images, Some(&template), options)?;
+    let layout = problem.layout.clone();
+    let mut params = params_from_look(&problem, look);
+    seed_response_params(&problem, &mut params, model);
+    let kinds = [
+        BlockKind::Nuisance,
+        BlockKind::ResponseTone,
+        BlockKind::ResponseTint,
+        BlockKind::ResponseChroma,
+        BlockKind::ResponseHue,
+        BlockKind::ResponseLightness,
+        BlockKind::ResponseWb,
+    ];
+    let mut blocks: Vec<BlockAcc> = kinds
+        .iter()
+        .map(|kind| make_block(&problem, *kind, ActiveColumns::ALL))
+        .collect();
+    let penalties: Vec<Vec<f64>> = blocks
+        .iter()
+        .map(|block| block_penalty(&problem, block))
+        .collect();
+    let lambdas = StageLambdas::default();
+    let roles = prior_roles(&problem, &layout);
+    let mut damping = 1e-3;
+    for _ in 0..options.recipe_sweeps.max(1) {
+        for block in &mut blocks {
+            block.reset();
+        }
+        let pass = problem.pass(
+            &params,
+            ActiveColumns::ALL,
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::All,
+        );
+        let mut step = vec![0.0_f64; layout.total];
+        for (index, block) in blocks.iter().enumerate() {
+            let (prior_gradient, prior_curvature) =
+                prior_terms(&problem, &roles, &params, options, block);
+            solve_block(
+                block,
+                &mut step,
+                &penalties[index],
+                &prior_gradient,
+                &prior_curvature,
+                &params,
+                &lambdas,
+                damping,
+            );
+        }
+        apply_step(&mut params, &step);
+        update_sigma(&problem, &mut params, &pass, options);
+        damping = (damping * 0.3).max(1e-6);
+    }
+    let mut blocks: Vec<BlockAcc> = kinds
+        .iter()
+        .map(|kind| make_block(&problem, *kind, ActiveColumns::ALL))
+        .collect();
+    let penalties: Vec<Vec<f64>> = blocks
+        .iter()
+        .map(|block| block_penalty(&problem, block))
+        .collect();
+    let final_pass = problem.pass(
+        &params,
+        ActiveColumns::ALL,
+        &mut blocks,
+        false,
+        true,
+        false,
+        IntentFilter::All,
+    );
+    let hessian_scale =
+        final_pass.active_samples.max(1) as f64 / final_pass.hessian_rows.max(1) as f64;
+    let (parameter_ids, covariance) = uncertainty::response_covariance(
+        &problem,
+        &blocks,
+        &penalties,
+        &lambdas,
+        hessian_scale,
+        &final_pass.per_image_gradient,
+    );
+    Ok(build_control_response(
+        template,
+        &problem,
+        &params,
+        parameter_ids,
+        covariance,
+    ))
+}
+
+fn params_from_look(problem: &Problem, look: &looklab_model::Look) -> Params {
+    let mut params = Params::initial(problem.layout.clone(), problem.contributors.len());
+    let layout = look.layout();
+    let coef = look.coef_vector();
+    if let looklab_model::Tone::Spline { c0, beta } = look.tone {
+        params.theta[problem.layout.tone_c0] = c0;
+        for (k, value) in beta.iter().enumerate() {
+            params.theta[problem.layout.tone_beta.start + k] =
+                crate::layout::softplus_inverse(*value);
+        }
+    }
+    params.theta[problem.layout.tint_a.clone()].copy_from_slice(&coef[layout.tint_a.clone()]);
+    params.theta[problem.layout.tint_b.clone()].copy_from_slice(&coef[layout.tint_b.clone()]);
+    params.theta[problem.layout.g.clone()].copy_from_slice(&coef[layout.g.clone()]);
+    params.theta[problem.layout.r.clone()].copy_from_slice(&coef[layout.r.clone()]);
+    params.theta[problem.layout.lambda.clone()].copy_from_slice(&coef[layout.lambda.clone()]);
+    params.theta[problem.layout.residual.clone()].copy_from_slice(&coef[layout.residual.clone()]);
+    params.theta[problem.layout.clip] = crate::layout::zeta_from_clip(look.clip.k);
+    params
+}
+
+fn seed_response_params(problem: &Problem, params: &mut Params, model: &ControlResponseModel) {
+    for (index, id) in problem.parameter_ids.iter().enumerate() {
+        let value = match id.component {
+            ResponseComponent::WbR | ResponseComponent::WbB => model
+                .wb
+                .controls
+                .iter()
+                .find(|control| control.key == id.control)
+                .and_then(|control| control.values.iter().find(|value| value.value == id.value))
+                .map(|value| {
+                    if id.component == ResponseComponent::WbR {
+                        value.log_gain[0]
+                    } else {
+                        value.log_gain[1]
+                    }
+                })
+                .unwrap_or(0.0),
+            _ => {
+                let layer = match id.component {
+                    ResponseComponent::Tone => LayerKind::Tone,
+                    ResponseComponent::Tint => LayerKind::Tint,
+                    ResponseComponent::Chroma => LayerKind::Chroma,
+                    ResponseComponent::Hue => LayerKind::Hue,
+                    ResponseComponent::Lightness => LayerKind::Lightness,
+                    ResponseComponent::WbR | ResponseComponent::WbB => unreachable!(),
+                };
+                model
+                    .controls
+                    .iter()
+                    .find(|control| control.key == id.control)
+                    .and_then(|control| control.values.iter().find(|value| value.value == id.value))
+                    .and_then(|value| value.delta.layers.iter().find(|delta| delta.layer == layer))
+                    .and_then(|delta| {
+                        delta
+                            .entries
+                            .iter()
+                            .find(|(feature, _)| *feature == id.feature)
+                    })
+                    .map(|(_, value)| *value)
+                    .unwrap_or(0.0)
+            }
+        };
+        params.theta[problem.layout.response.start + index] = value;
+    }
+}
+
+fn build_control_response(
+    mut model: ControlResponseModel,
+    problem: &Problem,
+    params: &Params,
+    parameter_ids: Vec<ResponseParamId>,
+    covariance: Vec<f64>,
+) -> ControlResponseFit {
+    let index_of = |control: &looklab_schema::ControlKey,
+                    value: &looklab_model::realization::ControlValue,
+                    component: ResponseComponent,
+                    feature: u32| {
+        parameter_ids.iter().position(|id| {
+            &id.control == control
+                && &id.value == value
+                && id.component == component
+                && id.feature == feature
+        })
+    };
+    let coefficient = |index: Option<usize>| match index {
+        Some(index) => params.theta[problem.layout.response.start + index],
+        None => 0.0,
+    };
+    for control in &mut model.controls {
+        let layers = control.layers();
+        for value in &mut control.values {
+            let mut delta = looklab_model::realization::Delta::default();
+            for layer in &layers {
+                let entries: Vec<(u32, f64)> = (0..layer.feature_count())
+                    .filter_map(|feature| {
+                        let coefficient = coefficient(index_of(
+                            &control.key,
+                            &value.value,
+                            (*layer).into(),
+                            feature,
+                        ));
+                        (coefficient != 0.0).then_some((feature, coefficient))
+                    })
+                    .collect();
+                if !entries.is_empty() {
+                    delta.layers.push(looklab_model::realization::LayerDelta {
+                        layer: *layer,
+                        entries,
+                    });
+                }
+            }
+            value.delta = delta;
+        }
+    }
+    for control in &mut model.wb.controls {
+        for value in &mut control.values {
+            value.log_gain = [
+                coefficient(index_of(
+                    &control.key,
+                    &value.value,
+                    ResponseComponent::WbR,
+                    0,
+                )),
+                coefficient(index_of(
+                    &control.key,
+                    &value.value,
+                    ResponseComponent::WbB,
+                    0,
+                )),
+            ];
+        }
+    }
+    for (index, mode) in model.exposure.modes.iter_mut().enumerate() {
+        mode.ev = if index == 0 {
+            0.0
+        } else {
+            problem
+                .modes
+                .iter()
+                .position(|mode_id| mode_id.0 as usize == index)
+                .map(|position| params.mode_offset(position))
+                .unwrap_or(0.0)
+        };
+    }
+    model.support = build_support(&model, problem);
+    ControlResponseFit {
+        model,
+        parameter_ids,
+        covariance,
+    }
+}
+
+fn build_support(
+    model: &ControlResponseModel,
+    problem: &Problem,
+) -> looklab_model::realization::Support {
+    use looklab_model::realization::{ControlSupport, Support};
+    let mut controls = Vec::new();
+    let mut add = |key: &looklab_schema::ControlKey,
+                   default: &looklab_model::realization::ControlValue| {
+        let mut observed = vec![default.clone()];
+        for settings in &problem.settings {
+            let value = settings.get(key).unwrap_or(default).clone();
+            if !observed.contains(&value) {
+                observed.push(value);
+            }
+        }
+        controls.push(ControlSupport {
+            key: key.clone(),
+            default: default.clone(),
+            observed,
+        });
+    };
+    for control in &model.controls {
+        add(&control.key, &control.default);
+    }
+    for control in &model.wb.controls {
+        add(&control.key, &control.default);
+    }
+    for step in &model.exposure.steps {
+        let default = looklab_model::realization::ControlValue::Step(step.default);
+        add(&step.key, &default);
+    }
+    Support { controls }
 }
 
 fn initial_params(problem: &Problem) -> Params {
@@ -335,7 +929,8 @@ fn initial_params(problem: &Problem) -> Params {
     params
 }
 
-fn make_block(kind: BlockKind, layout: &Layout, active: ActiveColumns) -> BlockAcc {
+fn make_block(problem: &Problem, kind: BlockKind, active: ActiveColumns) -> BlockAcc {
+    let layout = &problem.layout;
     let params: Vec<usize> = match kind {
         BlockKind::Tone => {
             let mut out = vec![layout.tone_c0];
@@ -367,8 +962,64 @@ fn make_block(kind: BlockKind, layout: &Layout, active: ActiveColumns) -> BlockA
         BlockKind::R => layout.r.clone().collect(),
         BlockKind::Lambda => layout.lambda.clone().collect(),
         BlockKind::Residual => Vec::new(),
+        BlockKind::Nuisance => {
+            let mut out = Vec::new();
+            for index in 0..problem_image_count(layout) {
+                let range = layout.image(index);
+                if active.image {
+                    out.push(range.start);
+                }
+                if active.wb {
+                    out.push(range.start + 1);
+                    out.push(range.start + 2);
+                }
+            }
+            if active.mode {
+                out.extend(layout.modes.clone());
+            }
+            if active.clip {
+                out.push(layout.clip);
+            }
+            out
+        }
+        BlockKind::ResponseTone
+        | BlockKind::ResponseTint
+        | BlockKind::ResponseChroma
+        | BlockKind::ResponseHue
+        | BlockKind::ResponseLightness
+        | BlockKind::ResponseWb => {
+            if !active.response {
+                Vec::new()
+            } else {
+                let component = response_component(kind);
+                problem
+                    .parameter_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, id)| match kind {
+                        BlockKind::ResponseWb => matches!(
+                            id.component,
+                            ResponseComponent::WbR | ResponseComponent::WbB
+                        ),
+                        _ => Some(id.component) == component,
+                    })
+                    .map(|(index, _)| layout.response.start + index)
+                    .collect()
+            }
+        }
     };
     BlockAcc::new(kind, params, layout.total)
+}
+
+fn response_component(kind: BlockKind) -> Option<ResponseComponent> {
+    match kind {
+        BlockKind::ResponseTone => Some(ResponseComponent::Tone),
+        BlockKind::ResponseTint => Some(ResponseComponent::Tint),
+        BlockKind::ResponseChroma => Some(ResponseComponent::Chroma),
+        BlockKind::ResponseHue => Some(ResponseComponent::Hue),
+        BlockKind::ResponseLightness => Some(ResponseComponent::Lightness),
+        _ => None,
+    }
 }
 
 /// One dense block over every look coefficient the covariance needs, plus the WB nuisances and clip.
@@ -547,7 +1198,103 @@ fn penalty_for(kind: BlockKind) -> Vec<f64> {
             }
             s
         }
-        BlockKind::Residual => Vec::new(),
+        BlockKind::Residual
+        | BlockKind::Nuisance
+        | BlockKind::ResponseTone
+        | BlockKind::ResponseTint
+        | BlockKind::ResponseChroma
+        | BlockKind::ResponseHue
+        | BlockKind::ResponseLightness
+        | BlockKind::ResponseWb => Vec::new(),
+    }
+}
+
+/// Shrinkage plus second differences over adjacent steps, per control and feature.
+fn response_penalty(problem: &Problem, block: &BlockAcc, component_is_wb: bool) -> Vec<f64> {
+    let n = block.len();
+    let mut out = vec![0.0_f64; n * n];
+    for local in 0..n {
+        out[local * n + local] += 1.0;
+    }
+    for control in &problem.parameter_ids {
+        if component_is_wb
+            != matches!(
+                control.component,
+                ResponseComponent::WbR | ResponseComponent::WbB
+            )
+        {
+            continue;
+        }
+        let mut by_feature: Vec<(u32, Vec<(i64, usize)>)> = Vec::new();
+        for (local, global) in block.params.iter().enumerate() {
+            let Some(id) = problem
+                .parameter_ids
+                .get(*global - problem.layout.response.start)
+            else {
+                continue;
+            };
+            if id.control != control.control || id.component != control.component {
+                continue;
+            }
+            let Some(offset) = value_offset(&id.value) else {
+                continue;
+            };
+            match by_feature
+                .iter_mut()
+                .find(|(feature, _)| *feature == id.feature)
+            {
+                Some((_, entries)) => entries.push((offset, local)),
+                None => by_feature.push((id.feature, vec![(offset, local)])),
+            }
+        }
+        for (_, mut entries) in by_feature {
+            entries.sort_by_key(|(offset, _)| *offset);
+            let mut points: Vec<(i64, Option<usize>)> = vec![(0, None)];
+            points.extend(
+                entries
+                    .iter()
+                    .map(|(offset, local)| (*offset, Some(*local))),
+            );
+            points.sort_by_key(|(offset, _)| *offset);
+            points.dedup_by_key(|(offset, _)| *offset);
+            for window in points.windows(3) {
+                let mut indices = Vec::new();
+                for (position, (_, local)) in window.iter().enumerate() {
+                    if let Some(local) = local {
+                        let weight = match position {
+                            0 => 1.0,
+                            1 => -2.0,
+                            _ => 1.0,
+                        };
+                        indices.push((*local, weight));
+                    }
+                }
+                accumulate_row(&mut out, n, &indices);
+            }
+        }
+    }
+    out
+}
+
+fn value_offset(value: &looklab_model::realization::ControlValue) -> Option<i64> {
+    match value {
+        looklab_model::realization::ControlValue::Step(step) => Some(*step),
+        _ => None,
+    }
+}
+
+fn block_penalty(problem: &Problem, block: &BlockAcc) -> Vec<f64> {
+    match block.kind {
+        BlockKind::Nuisance => vec![0.0; block.len() * block.len()],
+        BlockKind::ResponseTone
+        | BlockKind::ResponseTint
+        | BlockKind::ResponseChroma
+        | BlockKind::ResponseHue
+        | BlockKind::ResponseLightness
+        | BlockKind::ResponseWb => {
+            response_penalty(problem, block, block.kind == BlockKind::ResponseWb)
+        }
+        kind => double(embed(penalty_for(kind), block.len())),
     }
 }
 
@@ -580,6 +1327,13 @@ fn lam(lambdas: &StageLambdas, kind: BlockKind) -> f64 {
         BlockKind::Tint => lambdas.tint,
         BlockKind::G | BlockKind::R | BlockKind::Lambda => lambdas.grl,
         BlockKind::Residual => lambdas.residual,
+        BlockKind::Nuisance => 0.0,
+        BlockKind::ResponseTone => lambdas.response_tone,
+        BlockKind::ResponseTint => lambdas.response_tint,
+        BlockKind::ResponseChroma => lambdas.response_chroma,
+        BlockKind::ResponseHue => lambdas.response_hue,
+        BlockKind::ResponseLightness => lambdas.response_lightness,
+        BlockKind::ResponseWb => lambdas.response_wb,
     }
 }
 
@@ -589,6 +1343,13 @@ fn set_lam(lambdas: &mut StageLambdas, kind: BlockKind, value: f64) {
         BlockKind::Tint => lambdas.tint = value,
         BlockKind::G | BlockKind::R | BlockKind::Lambda => lambdas.grl = value,
         BlockKind::Residual => lambdas.residual = value,
+        BlockKind::Nuisance => {}
+        BlockKind::ResponseTone => lambdas.response_tone = value,
+        BlockKind::ResponseTint => lambdas.response_tint = value,
+        BlockKind::ResponseChroma => lambdas.response_chroma = value,
+        BlockKind::ResponseHue => lambdas.response_hue = value,
+        BlockKind::ResponseLightness => lambdas.response_lightness = value,
+        BlockKind::ResponseWb => lambdas.response_wb = value,
     }
 }
 
@@ -738,7 +1499,19 @@ fn choose_lambdas(
                 options.seed,
             )
         };
-        set_lam(lambdas, block.kind, choice.lambda.max(1e-12));
+        let mut value = choice.lambda.max(1e-12);
+        if matches!(
+            block.kind,
+            BlockKind::ResponseTone
+                | BlockKind::ResponseTint
+                | BlockKind::ResponseChroma
+                | BlockKind::ResponseHue
+                | BlockKind::ResponseLightness
+                | BlockKind::ResponseWb
+        ) {
+            value = value.max(10.0);
+        }
+        set_lam(lambdas, block.kind, value);
     }
 }
 
