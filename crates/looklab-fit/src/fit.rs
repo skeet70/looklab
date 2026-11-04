@@ -335,6 +335,7 @@ pub(crate) fn run_with(
                 let (prior_gradient, prior_curvature) =
                     prior_terms(&problem, &roles, &params, options, block);
                 solve_block(
+                    &layout,
                     block,
                     &mut step,
                     &penalties[index],
@@ -424,6 +425,7 @@ pub(crate) fn run_with(
                 let (prior_gradient, prior_curvature) =
                     prior_terms(&all_problem, &roles, &all_params, options, block);
                 solve_block(
+                    &layout,
                     block,
                     &mut step,
                     &penalties[index],
@@ -766,6 +768,7 @@ fn run_frozen_responses(
             let (prior_gradient, prior_curvature) =
                 prior_terms(problem, &roles, params, options, block);
             solve_block(
+                &layout,
                 block,
                 &mut step,
                 &penalties[index],
@@ -835,6 +838,7 @@ pub(crate) fn run_responses(
             let (prior_gradient, prior_curvature) =
                 prior_terms(&problem, &roles, &params, options, block);
             solve_block(
+                &layout,
                 block,
                 &mut step,
                 &penalties[index],
@@ -1300,9 +1304,6 @@ fn penalty_for(kind: BlockKind) -> Vec<f64> {
                     .collect();
                 accumulate_row(&mut s, n, &indices);
             }
-            for index in 0..n {
-                s[index * n + index] += 1.0;
-            }
             s
         }
         BlockKind::Tint => {
@@ -1318,9 +1319,6 @@ fn penalty_for(kind: BlockKind) -> Vec<f64> {
                         .collect();
                     accumulate_row(&mut s, n, &indices);
                 }
-            }
-            for index in 0..n {
-                s[index * n + index] += 1.0;
             }
             s
         }
@@ -1380,9 +1378,6 @@ fn penalty_for(kind: BlockKind) -> Vec<f64> {
                         accumulate_row(&mut s, n, &indices);
                     }
                 }
-            }
-            for index in 0..n {
-                s[index * n + index] += 1.0;
             }
             s
         }
@@ -1581,6 +1576,40 @@ fn embed(penalty: Vec<f64>, n: usize) -> Vec<f64> {
     out
 }
 
+/// Fixed prior weight (energy per unit squared) for shrinkage toward the identity look.
+///
+/// These are priors, not smoothing: they must not weaken as the pool grows, or
+/// weakly identified regions lose their variance floor (docs/02 §4.1).
+pub(crate) fn identity_weight(kind: BlockKind) -> f64 {
+    // One natural unit of prior sd per layer: log G, tint in J'a'b', residual in DeltaE,
+    // tone slope in J' per stop; 10 deg for the hue rotation and 5 J' for the lightness shift.
+    match kind {
+        BlockKind::Tone => 1.0,
+        BlockKind::Tint => 0.25,
+        BlockKind::G => 11.0,
+        BlockKind::R => 0.0044,
+        BlockKind::Lambda => 0.0156,
+        BlockKind::Residual => 4.0,
+        _ => 0.0,
+    }
+}
+
+/// Identity-prior curvature per block coordinate (doubled, fixed across pools).
+pub(crate) fn identity_curvature(layout: &Layout, block: &BlockAcc) -> Vec<f64> {
+    let weight = 2.0 * identity_weight(block.kind);
+    block
+        .params
+        .iter()
+        .map(|global| {
+            if *global < layout.residual.end {
+                weight
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
 fn accumulate_row(target: &mut [f64], n: usize, indices: &[(usize, f64)]) {
     for (i, a) in indices {
         for (j, b) in indices {
@@ -1619,6 +1648,16 @@ fn set_lam(lambdas: &mut StageLambdas, kind: BlockKind, value: f64) {
         BlockKind::ResponseLightness => lambdas.response_lightness = value,
         BlockKind::ResponseWb => lambdas.response_wb = value,
     }
+}
+
+/// Energy of the fixed identity prior over a block.
+fn identity_cost(layout: &Layout, block: &BlockAcc, theta: &[f64]) -> f64 {
+    let identity = identity_curvature(layout, block);
+    let mut value = 0.0;
+    for (local, global) in block.params.iter().enumerate() {
+        value += 0.5 * identity[local] * theta[*global] * theta[*global];
+    }
+    value
 }
 
 fn penalty_value(theta: &[f64], params: &[usize], penalty: &[f64]) -> f64 {
@@ -1690,6 +1729,7 @@ fn total_cost(
         }
         cost += lam(lambdas, block.kind)
             * penalty_value(&params.theta, &block.params, &penalties[index]);
+        cost += identity_cost(&problem.layout, block, &params.theta);
     }
     cost
 }
@@ -1709,6 +1749,7 @@ fn prior_and_reg(
         }
         reg += lam(lambdas, block.kind)
             * penalty_value(&params.theta, &block.params, &penalties[index]);
+        reg += identity_cost(&problem.layout, block, &params.theta);
     }
     (prior_cost(problem, params, options) + reg, reg)
 }
@@ -1724,16 +1765,17 @@ fn choose_lambdas(
 ) {
     // The objective is tempered by n_eff per image, so the effective observation count is
     // `3 * n_eff * n_images`, not the raw sample count (docs/02 §4.1).
-    let observations = 3.0 * options.n_eff * problem.images.len().max(1) as f64;
+    let observations = 3.0 * options.n_eff * problem.active_images.max(1) as f64;
     for (index, block) in blocks.iter().enumerate() {
         if lam(lambdas, block.kind) != 0.0 {
             continue;
         }
         let choice = if block.kind == BlockKind::Residual {
             let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
+            let identity = 2.0 * identity_weight(BlockKind::Residual);
             let diagonal: Vec<f64> = residual_diagonal(&pass.residual_samples)
                 .into_iter()
-                .map(|value| value * hessian_scale)
+                .map(|value| value * hessian_scale + identity)
                 .collect();
             let penalty_diagonal: Vec<f64> = residual_penalty_diagonal()
                 .into_iter()
@@ -1755,8 +1797,13 @@ fn choose_lambdas(
                 .iter()
                 .map(|index| params.theta[*index])
                 .collect();
+            let identity = identity_curvature(&problem.layout, block);
+            let mut hessian = block.hessian.clone();
+            for i in 0..block.len() {
+                hessian[i * block.len() + i] += identity[i];
+            }
             select_lambda(
-                &block.hessian,
+                &hessian,
                 &penalties[index],
                 &block.gradient,
                 &theta0,
@@ -1850,6 +1897,7 @@ fn prior_terms(
 
 #[allow(clippy::too_many_arguments)]
 fn solve_block(
+    layout: &Layout,
     block: &BlockAcc,
     step: &mut [f64],
     penalty: &[f64],
@@ -1879,6 +1927,11 @@ fn solve_block(
             gradient += penalty[i * n + j] * params.theta[block.params[j]];
         }
         rhs[i] -= lambda * gradient + prior_gradient[i];
+    }
+    let identity = identity_curvature(layout, block);
+    for i in 0..n {
+        a[i * n + i] += identity[i];
+        rhs[i] -= identity[i] * params.theta[block.params[i]];
     }
     let mut delta = rhs.clone();
     if !factor_in_place(&mut a, n) {
@@ -2079,11 +2132,13 @@ fn residual_step(
     let (mut rhs, _) = residual_gradient(samples);
     // The objective is `lambda * theta' P theta`, so the ridge matrix is 2 * lambda * P.
     let ridge = 2.0 * lambda;
+    let identity = 2.0 * identity_weight(BlockKind::Residual);
     let mut diagonal = vec![0.0_f64; dim];
     for index in 0..dim {
         let base = data_diagonal[index].max(1e-9);
-        diagonal[index] = base + ridge * penalty_diagonal[index] + damping * base + 1e-3;
-        rhs[index] -= ridge * laplacian_at(theta, index, &penalty_diagonal);
+        diagonal[index] = base + ridge * penalty_diagonal[index] + damping * base + 1e-3 + identity;
+        rhs[index] -=
+            ridge * laplacian_at(theta, index, &penalty_diagonal) + identity * theta[index];
     }
     let mut solution = vec![0.0_f64; dim];
     crate::solve::conjugate_gradient(
@@ -2115,7 +2170,8 @@ fn residual_step(
             }
             for index in 0..dim {
                 product[index] += ridge * laplacian_at(v, index, &penalty_diagonal);
-                product[index] += (damping * data_diagonal[index].max(1e-9) + 1e-3) * v[index];
+                product[index] +=
+                    (damping * data_diagonal[index].max(1e-9) + 1e-3 + identity) * v[index];
             }
         },
         &diagonal,

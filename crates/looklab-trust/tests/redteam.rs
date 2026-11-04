@@ -800,7 +800,6 @@ fn probes_at(look: &looklab_model::Look, delta_xi: f64) -> VersionProbes {
 /// Producing that candidate needs the multi-body fit that assigns the body to a
 /// component (P4.2); until then this asserts only the probe side.
 #[test]
-#[ignore = "needs the P4.2 multi-body component fit to produce the candidate"]
 fn body_joining_a_component_keeps_the_gauge() {
     let truth = looklab_fit::synth::truth_look(4);
     let version = probes_at(&truth, 0.0);

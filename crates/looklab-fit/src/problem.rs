@@ -52,6 +52,8 @@ pub(crate) struct Sample {
     pub weight: f64,
     pub density: f64,
     pub neutral: bool,
+    /// The stored output is away from the clip shoulders, so the sample carries unclipped data.
+    pub informative: bool,
 }
 
 pub(crate) struct Problem {
@@ -62,6 +64,8 @@ pub(crate) struct Problem {
     pub samples: Vec<Sample>,
     pub hessian: Vec<u32>,
     pub nu: f64,
+    /// Images that carry non-zero weight and therefore count towards the effective sample size.
+    pub active_images: usize,
     pub parameter_ids: Vec<ResponseParamId>,
     pub terms: Vec<Vec<ResponseTerm>>,
     pub settings: Vec<Settings>,
@@ -209,6 +213,15 @@ impl Problem {
                 return Err(FitError::EmptyImage { image: image_index });
             }
             let n = image.samples.n();
+            if let Some(trust) = &image.sample_trust
+                && trust.len() != n
+            {
+                return Err(FitError::SampleTrustLength {
+                    image: image_index,
+                    found: trust.len(),
+                    expected: n,
+                });
+            }
             let take = n.min(options.max_samples_per_image);
             let mut order: Vec<u32> = (0..n as u32).collect();
             // Re-render groups share one pixel set, so one order keeps their rows aligned.
@@ -248,9 +261,18 @@ impl Problem {
                     rgb: in_rgb[index].map(|value| value as f64),
                     target,
                     image: image_index as u32,
-                    weight: density[index] as f64 / mean_density.max(1e-12) * trust * temper,
+                    weight: density[index] as f64 / mean_density.max(1e-12)
+                        * image
+                            .sample_trust
+                            .as_ref()
+                            .map_or(1.0, |weights| weights[index] as f64)
+                        * trust
+                        * temper,
                     density: density[index] as f64,
                     neutral,
+                    informative: out_rgb[index]
+                        .iter()
+                        .all(|value| *value > 0.06 && *value < 0.94),
                 });
             }
             entries.push(ImageEntry {
@@ -286,6 +308,15 @@ impl Problem {
             return Err(FitError::NoSamples);
         }
         let hessian = hessian_subset(samples.len(), options.hessian_samples, options.seed);
+        let active_images = entries
+            .iter()
+            .filter(|entry| {
+                samples[entry.samples.clone()]
+                    .iter()
+                    .any(|sample| sample.weight > 0.0)
+            })
+            .count()
+            .max(1);
         let layout = Layout::with_response(
             entries.len(),
             mode_list.len(),
@@ -315,6 +346,7 @@ impl Problem {
             samples,
             hessian,
             nu: options.nu,
+            active_images,
             parameter_ids,
             terms,
             settings,

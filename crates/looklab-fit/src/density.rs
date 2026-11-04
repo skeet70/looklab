@@ -44,6 +44,9 @@ fn coordinates(s: f64, hue: f64, c: f64) -> [f64; 3] {
 pub(crate) fn build(problem: &Problem, params: &Params, floor_fraction: f64) -> Density {
     let mut counts = vec![0.0_f64; S_BINS * H_BINS * C_BINS];
     for sample in &problem.samples {
+        if !sample.informative {
+            continue;
+        }
         let image = sample.image as usize;
         let context = problem.image_ctx(params, image);
         let xyz = context.transform.mul_vec([
@@ -63,14 +66,20 @@ pub(crate) fn build(problem: &Problem, params: &Params, floor_fraction: f64) -> 
     for value in &mut counts {
         *value *= scale;
     }
-    let peak = counts.iter().copied().fold(0.0_f64, f64::max);
+    // The counts are scaled so their mean over bins is one, which makes the floor a
+    // stable, pool-size-independent threshold (a peak-relative floor moves as the pool grows).
+    let mean = if counts.is_empty() {
+        1.0
+    } else {
+        counts.iter().sum::<f64>() / counts.len() as f64
+    };
     Density {
         s_bins: S_BINS,
         hue_bins: H_BINS,
         c_bins: C_BINS,
         counts,
         total,
-        floor: floor_fraction * peak,
+        floor: floor_fraction * mean.max(1e-9),
     }
 }
 

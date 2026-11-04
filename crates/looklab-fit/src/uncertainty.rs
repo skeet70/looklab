@@ -78,8 +78,9 @@ pub(crate) fn probe_uncertainty(
     for entry in 0..n * n {
         h[entry] += penalty[entry];
     }
+    let identity = crate::fit::identity_curvature(layout, block);
     for (local, global) in block.params.iter().enumerate() {
-        h[local * n + local] += priors[*global];
+        h[local * n + local] += priors[*global] + identity[local];
     }
     let ridge = (0..n)
         .map(|index| h[index * n + index])
@@ -178,9 +179,41 @@ pub(crate) fn probe_uncertainty(
         let sigma_de = (covariance[0][0] + covariance[1][1] + covariance[2][2])
             .max(0.0)
             .sqrt();
+        if std::env::var_os("LOOKLAB_SIGMA_TRACE").is_some()
+            && matches!(
+                probes.probes[estimates.len()].id.as_str(),
+                "chart-red-s+1" | "chart-yellow-green-s+2"
+            )
+        {
+            let mut rows = Vec::new();
+            for (image, gradient) in per_image_gradient.iter().enumerate() {
+                let mut score = [0.0_f64; 3];
+                for (channel, z) in z_columns.iter().enumerate() {
+                    let mut sum = 0.0;
+                    for index in &support {
+                        sum += gradient[*index] * z[*index];
+                    }
+                    score[channel] = sum;
+                }
+                let norm = (score[0] * score[0] + score[1] * score[1] + score[2] * score[2]).sqrt();
+                let gnorm = gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+                rows.push((norm, gnorm, problem.images[image].contributor, image));
+            }
+            rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+            eprintln!(
+                "{} base sigma {sigma_de:.3} z {:.4} top scores {:?}",
+                probes.probes[estimates.len()].id.as_str(),
+                z_columns[0].iter().map(|v| v.abs()).fold(0.0, f64::max),
+                rows.iter()
+                    .take(6)
+                    .map(|(score, g, c, i)| format!("img{i} c{c} |s|{score:.3} |g|{g:.2}"))
+                    .collect::<Vec<_>>()
+            );
+        }
         let input = LookInput::new(probe.xyz);
         let local_density = density.at(input.s, input.h_in, input.c_in);
         let is_supported = sigma_de <= options.support_sigma && local_density >= density.floor;
+        let _ = &pre;
         if is_supported {
             supported += 1;
         }
@@ -311,6 +344,10 @@ fn residual_inverse_diagonal(samples: &[ResidualSample], lambda: f64) -> Vec<f64
                 diagonal[*node as usize * 3 + channel] += sample.alpha * weight * weight * sum;
             }
         }
+    }
+    let identity = 2.0 * crate::fit::identity_weight(crate::layout::BlockKind::Residual);
+    for value in &mut diagonal {
+        *value += identity;
     }
     let peak = diagonal.iter().copied().fold(0.0_f64, f64::max);
     for value in &mut diagonal {

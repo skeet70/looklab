@@ -14,6 +14,12 @@ pub enum FitError {
     EmptyImage { image: usize },
     #[error("no samples left after subsampling")]
     NoSamples,
+    #[error("image {image}: sample_trust has {found} entries, expected {expected}")]
+    SampleTrustLength {
+        image: usize,
+        found: usize,
+        expected: usize,
+    },
     #[error("exposure mode {mode} is not present in any image")]
     UnknownExposureMode { mode: u32 },
     #[error("samples: {0}")]
@@ -46,6 +52,8 @@ pub struct FitImage {
     pub transform: Mat3,
     pub exposure_hint: f64,
     pub trust_weight: f64,
+    /// Per-sample multipliers of `trust_weight` (docs/05 §6 caps are per region).
+    pub sample_trust: Option<Vec<f32>>,
     pub exposure_mode: ExposureModeId,
     pub contributor: ContributorId,
     pub settings: Settings,
@@ -59,6 +67,7 @@ impl FitImage {
             transform,
             exposure_hint: 0.0,
             trust_weight: 1.0,
+            sample_trust: None,
             exposure_mode: ExposureModeId::default(),
             contributor: ContributorId::default(),
             settings: Settings::default(),
