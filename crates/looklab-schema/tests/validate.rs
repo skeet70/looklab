@@ -40,11 +40,11 @@ fn shipped_files_validate() {
     assert_eq!(body.mapping_status, MappingStatus::Provisional);
 
     let profile = validate_interface_profile(include_str!(
-        "../../../data/interfaces/example-firmware-sim-v1.yaml"
+        "../../../data/interfaces/example-app-lut3d-v1.yaml"
     ))
     .unwrap();
-    assert_eq!(profile.id.as_str(), "example-firmware/sim-v1");
-    assert_eq!(profile.limits.max_bytes, 2_097_152);
+    assert_eq!(profile.id.as_str(), "example-app/lut3d-v1");
+    assert_eq!(profile.limits.max_bytes, 8_388_608);
 }
 
 #[test]
@@ -308,10 +308,8 @@ fn rejects_unknown_fields() {
         .is_err()
     );
 
-    let profile = include_str!("../../../data/interfaces/example-firmware-sim-v1.yaml").replace(
-        "    sizes: [17, 33, 65]",
-        "    sizes: [17, 33, 65]\n    bogus: 1",
-    );
+    let profile = include_str!("../../../data/interfaces/example-app-lut3d-v1.yaml")
+        .replace("    sizes: [17, 33]", "    sizes: [17, 33]\n    bogus: 1");
     assert!(validate_interface_profile(&profile).is_err());
 }
 
@@ -323,17 +321,17 @@ fn shipped_directory_validates() {
     assert!(errors.is_empty(), "{errors:?}");
 }
 
-const INTERFACE: &str = include_str!("../../../data/interfaces/example-firmware-sim-v1.yaml");
+const INTERFACE: &str = include_str!("../../../data/interfaces/example-app-lut3d-v1.yaml");
 
 #[test]
 fn interface_lut_sides_and_node_counts_are_bounded() {
     let errors =
-        validate_interface_profile(&INTERFACE.replace("sizes: [17, 33, 65]", "sizes: [70000]"))
+        validate_interface_profile(&INTERFACE.replace("sizes: [17, 33]", "sizes: [70000]"))
             .unwrap_err();
     assert_eq!(errors[0].path, "accepts[0].sizes[0]");
 
     let errors = validate_interface_profile(
-        &INTERFACE.replace("sizes: [17, 33, 65]", "sizes: [256, 256, 256, 256]"),
+        &INTERFACE.replace("sizes: [17, 33]", "sizes: [17, 33, 65, 129, 256]"),
     )
     .unwrap_err();
     assert_eq!(errors[0].path, "accepts[0].sizes");
@@ -356,7 +354,7 @@ fn yaml_anchors_are_rejected_at_every_entry_point() {
     );
     assert!(validate_control_schema(&schema).is_err());
 
-    let profile = INTERFACE.replace("max_bytes: 2097152", "max_bytes: &limit 2097152");
+    let profile = INTERFACE.replace("max_bytes: 8388608", "max_bytes: &limit 8388608");
     assert!(validate_interface_profile(&profile).is_err());
 }
 

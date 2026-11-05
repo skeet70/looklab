@@ -9,10 +9,6 @@ use crate::emphasis::Emphasis;
 use crate::error::{MatchError, Result};
 use crate::linear::ProbeSubset;
 
-/// Fraction of the largest stored density treated as the support floor, from
-/// `FitOptions::density_floor_fraction`.
-pub const DEFAULT_DENSITY_FLOOR_FRACTION: f64 = 0.02;
-
 pub trait TargetFunction {
     fn predict(&self, xyz: Xyz) -> Ucs;
 
@@ -60,33 +56,27 @@ impl<'a> PreparedTarget<'a> {
     pub fn new(spec: TargetSpec<'a>) -> Result<Self> {
         let count = spec.probes.probes.len();
         let mut sigma2 = vec![0.0_f64; count];
-        if let Some(uncertainty) = spec.uncertainty
-            && let Some(covariance) = &uncertainty.probe_cov
-        {
-            if covariance.values.len() != count.saturating_mul(9) {
-                return Err(MatchError::Dimension(
-                    "probe covariance does not cover the probe set".to_string(),
-                ));
-            }
-            for (index, chunk) in covariance.values.as_chunks::<9>().0.iter().enumerate() {
-                sigma2[index] = chunk[0] + chunk[4] + chunk[8];
-            }
-        }
-        let density_floor = match spec.density_floor {
-            Some(floor) => floor,
-            None => match spec.uncertainty.and_then(|data| data.density.as_ref()) {
-                Some(density) if density.values.len() == count => {
-                    let maximum = density.values.iter().copied().fold(0.0_f64, f64::max);
-                    maximum * DEFAULT_DENSITY_FLOOR_FRACTION
-                }
-                Some(_) => {
+        if let Some(uncertainty) = spec.uncertainty {
+            let covariance = uncertainty
+                .probe_cov_post
+                .as_ref()
+                .or(uncertainty.probe_cov.as_ref());
+            if let Some(covariance) = covariance {
+                if covariance.values.len() != count.saturating_mul(9) {
                     return Err(MatchError::Dimension(
-                        "density does not cover the probe set".to_string(),
+                        "probe covariance does not cover the probe set".to_string(),
                     ));
                 }
-                None => 0.0,
-            },
-        };
+                for (index, chunk) in covariance.values.as_chunks::<9>().0.iter().enumerate() {
+                    sigma2[index] = chunk[0] + chunk[4] + chunk[8];
+                }
+            }
+        }
+        let support_mask = spec
+            .uncertainty
+            .and_then(|data| data.support.as_ref())
+            .filter(|mask| mask.values.len() == count);
+        let density_floor = spec.density_floor.unwrap_or(0.0);
 
         let mut supported = Vec::with_capacity(count);
         let mut weight = vec![0.0_f64; count];
@@ -100,7 +90,11 @@ impl<'a> PreparedTarget<'a> {
                 .and_then(|data| data.density.as_ref())
                 .and_then(|density| density.values.get(index).copied())
                 .unwrap_or(f64::INFINITY);
-            if sigma <= spec.support_sigma && dense >= density_floor {
+            let accepted = support_mask.map_or_else(
+                || sigma <= spec.support_sigma && dense >= density_floor,
+                |mask| mask.values[index] > 0.5,
+            );
+            if accepted {
                 supported.push(index);
                 let c = 1.0 / (1.0 + sigma2[index] / (spec.tau * spec.tau));
                 covariance_weight[index] =

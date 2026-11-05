@@ -137,12 +137,22 @@ pub struct VersionSummary {
     pub bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LookVisibility {
+    #[default]
+    Public,
+    TestFixture,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LookSummary {
     pub slug: Slug,
     pub name: String,
     pub kind: LookKind,
     pub wb_policy: WbPolicy,
+    #[serde(default)]
+    pub visibility: LookVisibility,
     pub versions: Vec<VersionSummary>,
 }
 
@@ -229,7 +239,13 @@ pub fn version_dir(slug: &Slug, version: &LookVersion) -> Result<SitePath, Publi
 /// # Errors
 /// Rejects a scene name that is not a safe path component.
 pub fn scene_path(name: &SceneName) -> Result<SitePath, PublishError> {
-    SitePath::new(format!("data/scenes/{}.f16", name.as_str()))
+    SitePath::new(format!("data/scenes/{}.png", name.as_str()))
+}
+
+/// # Errors
+/// Rejects a scene name that is not a safe path component.
+pub fn scene_thumbnail_path(name: &SceneName) -> Result<SitePath, PublishError> {
+    SitePath::new(format!("data/scenes/{}-thumb.png", name.as_str()))
 }
 
 /// # Errors
@@ -282,12 +298,20 @@ pub fn write_site<S: SiteSink + ?Sized>(
         }
     }
 
+    let mut scenes = Vec::with_capacity(site.scenes.len());
     for scene in &site.scenes {
-        sink.put(&scene_path(&scene.name)?, &scene.to_f16_bytes())?;
+        let encoded = EncodedScene::new(scene)?;
+        sink.put(&encoded.summary.path, &encoded.png)?;
+        sink.put(&encoded.summary.thumbnail.path, &encoded.thumbnail_png)?;
+        scenes.push(encoded.summary);
     }
-    sink.put(&scene_index_path(), &json(&scene_index(site)?)?)?;
+    let scene_index = SceneIndex {
+        format: SCENE_FORMAT.to_owned(),
+        scenes,
+    };
+    sink.put(&scene_index_path(), &json(&scene_index)?)?;
     sink.put(&audit_log_path(), &json(&site.audit_log)?)?;
-    let index = json(&site_index(site)?)?;
+    let index = json(&site_index(site, scene_index.scenes)?)?;
     sink.put(&index_path(), &index)?;
     Ok(ArtifactHash::of(&index))
 }
@@ -296,29 +320,44 @@ fn json<T: Serialize>(value: &T) -> Result<Vec<u8>, PublishError> {
     Ok(serde_json::to_vec_pretty(value)?)
 }
 
-fn scene_index(site: &SiteData) -> Result<SceneIndex, PublishError> {
-    let scenes = site
-        .scenes
-        .iter()
-        .map(|scene| {
-            let bytes = scene.to_f16_bytes();
-            Ok(SceneSummary {
-                name: scene.name.clone(),
-                width: scene.width,
-                height: scene.height,
-                path: scene_path(&scene.name)?,
-                sha256: ArtifactHash::of(&bytes),
-                bytes: bytes.len() as u64,
-            })
-        })
-        .collect::<Result<Vec<_>, PublishError>>()?;
-    Ok(SceneIndex {
-        format: SCENE_FORMAT.to_owned(),
-        scenes,
-    })
+struct EncodedScene {
+    summary: SceneSummary,
+    png: Vec<u8>,
+    thumbnail_png: Vec<u8>,
 }
 
-fn site_index(site: &SiteData) -> Result<SiteIndex, PublishError> {
+impl EncodedScene {
+    fn new(scene: &Scene) -> Result<Self, PublishError> {
+        let png = scene.to_png()?;
+        let thumbnail = scene.downscale(220);
+        let thumbnail_png = thumbnail.to_png()?;
+        let summary = SceneSummary {
+            name: scene.name.clone(),
+            kind: scene.kind,
+            title: scene.title.clone(),
+            credit: scene.credit.clone(),
+            thumbnail: crate::SceneArtifact {
+                width: thumbnail.width,
+                height: thumbnail.height,
+                path: scene_thumbnail_path(&scene.name)?,
+                sha256: ArtifactHash::of(&thumbnail_png),
+                bytes: thumbnail_png.len() as u64,
+            },
+            width: scene.width,
+            height: scene.height,
+            path: scene_path(&scene.name)?,
+            sha256: ArtifactHash::of(&png),
+            bytes: png.len() as u64,
+        };
+        Ok(Self {
+            summary,
+            png,
+            thumbnail_png,
+        })
+    }
+}
+
+fn site_index(site: &SiteData, scenes: Vec<SceneSummary>) -> Result<SiteIndex, PublishError> {
     let bodies = site
         .bodies
         .iter()
@@ -374,6 +413,7 @@ fn site_index(site: &SiteData) -> Result<SiteIndex, PublishError> {
                 name: look.name.clone(),
                 kind: look.kind,
                 wb_policy: look.wb_policy,
+                visibility: LookVisibility::Public,
                 versions,
             })
         })
@@ -382,7 +422,7 @@ fn site_index(site: &SiteData) -> Result<SiteIndex, PublishError> {
         format: SITE_FORMAT.to_owned(),
         bodies,
         looks,
-        scenes: scene_index(site)?.scenes,
+        scenes,
     })
 }
 
@@ -535,7 +575,8 @@ mod tests {
             "data/looks/provia.json",
             "data/looks/provia/1.0.0/look.looklab",
             "data/looks/provia/1.0.0/manifest.json",
-            "data/scenes/gradient.f16",
+            "data/scenes/gradient.png",
+            "data/scenes/gradient-thumb.png",
         ] {
             assert!(sink.0.contains_key(path), "{path}");
         }
@@ -582,5 +623,82 @@ mod tests {
             write_site(&mut sink, &site),
             Err(PublishError::DuplicateLook(_))
         ));
+    }
+
+    #[test]
+    fn scene_indexes_authenticate_published_images_and_preserve_source_metadata() {
+        let mut photo = Scene::new(
+            SceneName::new("sample-photo").expect("name"),
+            440,
+            2,
+            vec![[0.18; 3]; 880],
+        )
+        .expect("scene");
+        photo.kind = crate::scene::SceneKind::Photo;
+        photo.title = "Sample photograph".to_owned();
+        photo.credit = Some(crate::scene::SceneCredit {
+            text: "Photographer".to_owned(),
+            source_url: "https://example.com/sample.raw".to_owned(),
+            license: "CC0-1.0".to_owned(),
+            source_sha256: ArtifactHash::of(b"source RAW"),
+        });
+        let site = SiteData {
+            scenes: vec![photo.clone()],
+            ..SiteData::default()
+        };
+        let mut sink = MemorySink(BTreeMap::new());
+        let root = write_site(&mut sink, &site).expect("write");
+        assert_eq!(root, ArtifactHash::of(&sink.0[INDEX_PATH]));
+        let index: SiteIndex = serde_json::from_slice(&sink.0[INDEX_PATH]).expect("site index");
+        let scenes: SceneIndex =
+            serde_json::from_slice(&sink.0[SCENE_INDEX_PATH]).expect("scene index");
+        assert_eq!(index.scenes, scenes.scenes);
+        assert_eq!(index.scenes.len(), 1);
+        let summary = &index.scenes[0];
+        assert_eq!(summary.name, photo.name);
+        assert_eq!(summary.kind, photo.kind);
+        assert_eq!(summary.title, photo.title);
+        assert_eq!(summary.credit, photo.credit);
+        assert_eq!((summary.width, summary.height), (440, 2));
+        assert_eq!(summary.path, scene_path(&photo.name).expect("scene path"));
+        let full = &sink.0[summary.path.as_str()];
+        assert_eq!(summary.sha256, ArtifactHash::of(full));
+        assert_eq!(summary.bytes, full.len() as u64);
+        let decoded = Scene::from_png(photo.name.clone(), full).expect("full PNG");
+        assert_eq!((decoded.width, decoded.height), (440, 2));
+        let thumbnail = &summary.thumbnail;
+        assert_eq!(
+            thumbnail.path,
+            scene_thumbnail_path(&photo.name).expect("thumbnail path")
+        );
+        let bytes = &sink.0[thumbnail.path.as_str()];
+        assert_eq!(thumbnail.sha256, ArtifactHash::of(bytes));
+        assert_eq!(thumbnail.bytes, bytes.len() as u64);
+        assert_eq!((thumbnail.width, thumbnail.height), (220, 1));
+        let decoded = Scene::from_png(photo.name.clone(), bytes).expect("thumbnail PNG");
+        assert_eq!((decoded.width, decoded.height), (220, 1));
+    }
+
+    #[test]
+    fn writer_rejects_oversized_scenes() {
+        let scene = Scene::new(
+            SceneName::new("oversized").expect("name"),
+            1601,
+            1,
+            vec![[0.18; 3]; 1601],
+        )
+        .expect("RAW intermediate");
+        let path = scene_path(&scene.name).expect("path");
+        let site = SiteData {
+            scenes: vec![scene],
+            ..SiteData::default()
+        };
+        let mut sink = MemorySink(BTreeMap::new());
+        assert!(matches!(
+            write_site(&mut sink, &site),
+            Err(PublishError::SceneDimensions)
+        ));
+        assert!(!sink.0.contains_key(path.as_str()));
+        assert!(!sink.0.contains_key(INDEX_PATH));
     }
 }

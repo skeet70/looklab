@@ -32,6 +32,12 @@ pub enum TrustError {
     InvalidReputation(f64),
     #[error("encoding failed: {0}")]
     Encode(String),
+    #[error("recipe value `{0}` is not finite or non-negative")]
+    InvalidRecipeValue(&'static str),
+    #[error("residual observation `{0}` is not finite or non-positive")]
+    InvalidObservation(&'static str),
+    #[error("bounty uncertainty is not finite or positive: {0}")]
+    InvalidBountyUncertainty(f64),
 }
 
 pub type Result<T, E = TrustError> = core::result::Result<T, E>;

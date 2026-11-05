@@ -181,7 +181,7 @@ Little-endian throughout. 8.3 file names; the export suggests `<NAME>.LLK` from 
 | 0x34 | 12 bytes, all 0 |
 | 0x40 | section table: `count × 16` bytes |
 
-Each section-table entry is `u32` kind, `u32` offset (4-byte aligned, inside the file), `u32` length, `u32` CRC-32 of the section's bytes. Entries are sorted by kind, with no duplicates and no overlaps. Readers ignore kinds they don't know. The manifest's SHA-256 covers the whole file; the content id lets firmware name the file in the render tag (§8.4) without hashing it.
+Each section-table entry is `u32` kind, `u32` offset (4-byte aligned, inside the file), `u32` length, `u32` CRC-32 of the section's bytes. Entries are sorted by kind, with no duplicates and no overlaps. Readers ignore kinds they don't know. The manifest's SHA-256 covers the whole file; the content id lets firmware name the file in the render tag (§8.4) without hashing it. The reference writer lays payloads out in kind order, 4-byte aligned with zero padding before each section; the content id covers that padding. Readers accept any non-overlapping layout whose entries are sorted and aligned.
 
 ### 8.3 Sections
 
@@ -195,7 +195,12 @@ Each section-table entry is `u32` kind, `u32` offset (4-byte aligned, inside the
 
 **Grid interpolation (normative):** clamp each shaped coordinate to [0, 1], split it into a base node and fractions. Sort the fractions descending, ties broken red before green before blue, to get `f₁ ≥ f₂ ≥ f₃` with unit steps `e₁, e₂, e₃`. Then `out = (1 − f₁)·V₀ + (f₁ − f₂)·V(e₁) + (f₂ − f₃)·V(e₁ + e₂) + f₃·V(e₁ + e₂ + e₃)`.
 
-**Reader rules:** reject the file unless the magic, version, lengths, header CRC and the CRCs of every section it reads match; every required section is present; counts match lengths; and every value it reads is finite. A rejected file changes nothing: the firmware keeps its previous state and never uses a partly read file. Sections the firmware doesn't use (typically `GRID`) need not be read.
+**Section details (v1):**
+- **Identity:** META slug is `[a-z0-9._-]{1,63}` and version is `[0-9A-Za-z.+-]{1,31}`, both ASCII; name and short name are non-empty, and the writer rejects bytes outside these grammars.
+- **FIT record:** `input` is the probe's scene XYZ as linear Rec.2020, and `output` is pre-clip linear Rec.2020 (the same space as NEUTRAL). `σ_ΔE` is the Look version's published post-clip σ (docs/02 §5) and the supported flag is its published support mask; neither comes from a gamut test. A probe without published support is unsupported, with `σ_ΔE` = `+∞` (`0x7f800000`) and weight 0. `n` is the record count: readers accept any `n ≥ 1` whose byte length matches, and v1 writers emit one record per probe, in probe-set order. Weights are normalized over supported probes; when none is supported every weight is 0.
+- **GRID values:** a node whose Look output channel is not finite is written as 0, and a finite channel beyond the f16 range clamps to ±65504. Nodes are red fastest: `r + side·(g + side·b)`.
+
+**Reader rules:** reject the file unless the magic, version, lengths, header CRC and the CRCs of every section it reads match; every required section is present; counts match lengths; and every value it reads is finite, except a FIT `σ_ΔE` of `+∞` that marks unknown uncertainty. Unknown kinds are skipped after their CRC check; a duplicate kind is a mismatch whether or not the reader understands it. A rejected file changes nothing: the firmware keeps its previous state and never uses a partly read file. Sections the firmware doesn't use (typically `GRID`) need not be read.
 
 ### 8.4 Render tag
 Firmware **must** write this token, in ASCII, into EXIF `UserComment` of every JPEG it renders with a card look:
@@ -217,8 +222,8 @@ looklab can't see camera internals, so this is advice, not a requirement.
 - **Offline fallback:** where startup time or the FPU can't afford the fit, a host tool can read the file and write the firmware's native format.
 
 ### 8.6 Conformance
-`data/card/conformance-v1/` holds valid and malformed files with the expected reader outcome, grid-evaluation vectors (shaped input → output under the normative interpolation), and render-tag strings with their parse result. Grid outputs must match the reference within 2 f16 ulp *(tentative)*.
+`data/card/conformance-v1/` holds valid and malformed files with the expected reader outcome, grid-evaluation vectors (shaped input → output under the normative interpolation), and render-tag strings with their parse result. Grid outputs must match the reference within 2 f16 ulp *(tentative)*. Regenerate the set with `cargo run -p looklab-export --example gen_card_conformance -- data/card/conformance-v1`; `README.md` there describes every file.
 
 ## 9. Reference implementation
 
-The reference consumer is looklab's own card reader and grid evaluator in `looklab-export`, native and wasm32, exposed as `looklab-cli card inspect | eval`, plus the conformance vectors of §8.6. An example translator in portable C99 with no allocator fits a 3×3 matrix and a per-channel tone curve from `FIT` and `NEUTRAL`, for firmware authors to start from. Software interface profiles keep their own bake → simulate → compare round-trip test in `data/interfaces/` with fixtures.
+The reference consumer is looklab's own card reader and grid evaluator in `looklab-export`, native and wasm32, exposed as `looklab-cli card inspect | eval`, plus the conformance vectors of §8.6. An example translator in portable C99 with no allocator (`tools/card-translator-c99`) fits a 3×3 matrix and a per-channel tone curve from `FIT` and `NEUTRAL`, for firmware authors to start from. Software interface profiles keep their own bake → simulate → compare round-trip test in `data/interfaces/` with fixtures.

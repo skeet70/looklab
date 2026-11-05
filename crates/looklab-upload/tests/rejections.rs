@@ -3,8 +3,9 @@ mod common;
 
 use common::{Fixture, compact_limits, image, manifest};
 use looklab_upload::{
-    BlobKind, EnvelopeError, Limits, LookSettings, ManifestField, ManifestMetadata, MetadataError,
-    MetadataField, Tagged, WhiteBalanceMultipliers, parse_envelope_strict,
+    BlobKind, CardDeclaration, EnvelopeError, FirmwareId, FirmwareVersion, Intent, IntentError,
+    Limits, LookSettings, ManifestField, ManifestMetadata, MetadataError, MetadataField, RenderTag,
+    Tagged, WhiteBalanceMultipliers, parse_envelope_strict, parse_render_tag,
 };
 
 fn parse_error(bytes: &[u8], limits: &Limits) -> EnvelopeError {
@@ -444,4 +445,125 @@ fn decodes_both_blob_kinds() {
     assert_eq!(parsed.blobs.len(), 2);
     assert!(looklab_samples::decode(&parsed.blobs[0]).is_ok());
     assert!(looklab_samples::decode_patch_table(&parsed.blobs[1]).is_ok());
+}
+
+fn render_tag() -> RenderTag {
+    parse_render_tag("looklab-card/1 fw=acme-sim/2.0.1 look=provia@1.0.0 cid=0123456789abcdef")
+        .expect("render tag")
+}
+
+fn card_fixture(intent: Intent, tag: Option<RenderTag>) -> Fixture {
+    let mut meta = common::metadata();
+    meta.render_tag = tag;
+    let mut fixture = fixture_with_meta(meta);
+    fixture.manifest.intent = intent;
+    fixture
+}
+
+#[test]
+fn accepts_a_tagged_card_batch() {
+    let tag = render_tag();
+    let fixture = card_fixture(
+        Intent::Card(CardDeclaration::Tagged(tag.clone())),
+        Some(tag),
+    );
+    let parsed =
+        parse_envelope_strict(&fixture.bytes(), &compact_limits()).expect("card batch parses");
+    assert_eq!(
+        parsed.manifest.intent,
+        Intent::Card(CardDeclaration::Tagged(render_tag()))
+    );
+}
+
+#[test]
+fn accepts_a_user_declared_card_batch() {
+    let intent = Intent::Card(CardDeclaration::user_declared(
+        FirmwareId::new("acme-sim").expect("firmware id"),
+        FirmwareVersion::new("2.0.1").expect("firmware version"),
+    ));
+    let fixture = card_fixture(intent.clone(), None);
+    let parsed =
+        parse_envelope_strict(&fixture.bytes(), &compact_limits()).expect("card batch parses");
+    assert_eq!(parsed.manifest.intent, intent);
+}
+
+#[test]
+fn rejects_a_tag_under_a_non_card_intent() {
+    let fixture = card_fixture(Intent::Native, Some(render_tag()));
+    assert!(matches!(
+        parse_error(&fixture.bytes(), &compact_limits()),
+        EnvelopeError::IntentInvalid {
+            source: IntentError::TaggedImageNeedsCard { index: 0 }
+        }
+    ));
+}
+
+#[test]
+fn rejects_a_tag_under_a_user_declared_card() {
+    let intent = Intent::Card(CardDeclaration::user_declared(
+        FirmwareId::new("acme-sim").expect("firmware id"),
+        FirmwareVersion::new("2.0.1").expect("firmware version"),
+    ));
+    let fixture = card_fixture(intent, Some(render_tag()));
+    assert!(matches!(
+        parse_error(&fixture.bytes(), &compact_limits()),
+        EnvelopeError::IntentInvalid {
+            source: IntentError::UserDeclaredWithTag { index: 0 }
+        }
+    ));
+}
+
+#[test]
+fn rejects_a_mismatched_card_tag() {
+    let tag = render_tag();
+    let other =
+        parse_render_tag("looklab-card/1 fw=acme-sim/2.0.1 look=provia@1.0.0 cid=fedcba9876543210")
+            .expect("other tag");
+    let fixture = card_fixture(Intent::Card(CardDeclaration::Tagged(tag)), Some(other));
+    assert!(matches!(
+        parse_error(&fixture.bytes(), &compact_limits()),
+        EnvelopeError::IntentInvalid {
+            source: IntentError::CardTagMismatch { index: 0 }
+        }
+    ));
+}
+
+#[test]
+fn rejects_a_malformed_tag_under_a_non_card_intent() {
+    let mut meta = common::metadata();
+    meta.render_tag_malformed = true;
+    let mut fixture = fixture_with_meta(meta);
+    fixture.manifest.intent = Intent::Native;
+    assert!(matches!(
+        parse_error(&fixture.bytes(), &compact_limits()),
+        EnvelopeError::IntentInvalid {
+            source: IntentError::MalformedCardTag { index: 0 }
+        }
+    ));
+}
+
+#[test]
+fn accepts_a_malformed_tag_in_a_user_declared_card_batch() {
+    let mut meta = common::metadata();
+    meta.render_tag_malformed = true;
+    let mut fixture = fixture_with_meta(meta);
+    let intent = Intent::Card(CardDeclaration::user_declared(
+        FirmwareId::new("acme-sim").expect("firmware id"),
+        FirmwareVersion::new("2.0.1").expect("firmware version"),
+    ));
+    fixture.manifest.intent = intent.clone();
+    let parsed =
+        parse_envelope_strict(&fixture.bytes(), &compact_limits()).expect("card batch parses");
+    assert_eq!(parsed.manifest.intent, intent);
+}
+
+#[test]
+fn rejects_a_tagged_card_batch_without_tags() {
+    let fixture = card_fixture(Intent::Card(CardDeclaration::Tagged(render_tag())), None);
+    assert!(matches!(
+        parse_error(&fixture.bytes(), &compact_limits()),
+        EnvelopeError::IntentInvalid {
+            source: IntentError::MissingCardTag
+        }
+    ));
 }

@@ -5,8 +5,8 @@ mod common;
 
 use looklab_export::{
     Artifact, BakeIlluminant, BakeOutput, Baker, CctK, ExportError, Format, Interpolation,
-    NativeDocument, cube_files, read_binary_f16, read_cube, read_cube_1d, read_haldclut,
-    read_native_json, validate, write_binary_f16, write_haldclut, write_native_json, written_bytes,
+    NativeDocument, cube_files, read_cube, read_cube_1d, read_haldclut, read_native_json, validate,
+    write_haldclut, write_native_json, written_bytes,
 };
 
 const LUT_ACCEPTS: &str = r#"  - type: lut3d
@@ -156,7 +156,7 @@ fn every_declared_format_fits_the_byte_limit() {
 
 #[test]
 fn the_example_interface_profile_bakes_and_validates() {
-    let yaml = include_str!("../../../data/interfaces/example-firmware-sim-v1.yaml");
+    let yaml = include_str!("../../../data/interfaces/example-app-lut3d-v1.yaml");
     let profile = common::profile(yaml);
     let body = common::body();
     let look = common::look();
@@ -173,9 +173,6 @@ fn the_example_interface_profile_bakes_and_validates() {
         "evaluated {} of {eligible}",
         report.primary.stats.count
     );
-    // 33^3 is the largest grid the profile's 2 MiB budget affords as .cube text
-    // (45^3 is ~2.6 MiB, 65^3 ~7.9 MiB). At that grid the gamut boundary is not
-    // resolvable to the 1.0 flag, so the report carries the flag.
     assert!(
         report.primary.stats.p95 < 2.5,
         "p95 {} at the bake CCT",
@@ -183,7 +180,7 @@ fn the_example_interface_profile_bakes_and_validates() {
     );
     assert!(report.flagged(), "{:?}", report.primary);
 
-    for format in [Format::Cube, Format::NativeJson] {
+    for format in [Format::Cube, Format::Haldclut, Format::NativeJson] {
         let bytes = written_bytes(&output, format).expect("bytes");
         assert!(bytes <= profile.limits.max_bytes, "{format:?}: {bytes}");
     }
@@ -237,55 +234,4 @@ fn baked_output_is_deterministic() {
     let (_, first) = bake_fixture();
     let (_, second) = bake_fixture();
     assert_eq!(first.artifacts, second.artifacts);
-}
-
-#[test]
-fn a_binary_f16_profile_reaches_the_flag_at_65() {
-    let insertion = r#"  point: camera_rgb_wb_linear
-  encoding:
-    transfer: log2_shaper
-    shaper: { min_ev: -12, max_ev: 6, mid_gray: 0.18 }
-    primaries: camera_native
-    range: [0.0, 1.0]
-  illuminant_handling: single"#;
-    let accepts = r#"  - type: lut3d
-    sizes: [17, 33, 65]
-    interpolation: tetrahedral
-    precision: f16
-    with_shaper: true"#;
-    let profile = common::profile(&common::profile_yaml(
-        insertion,
-        accepts,
-        "[binary_f16]",
-        2 * 1024 * 1024,
-    ));
-    let body = common::body();
-    let look = common::look();
-    let output = Baker::new(&profile, &look, &body)
-        .bake(BakeIlluminant::Single { cct: CctK::D65 })
-        .expect("bake");
-    assert_eq!(common::lut(&output).size, 65);
-
-    let bytes = written_bytes(&output, Format::BinaryF16).expect("bytes");
-    assert!(bytes <= profile.limits.max_bytes, "{bytes} bytes");
-    assert_eq!(
-        bytes,
-        16 + 65_u64.pow(3) * 6,
-        "header plus size^3 * 3 half floats"
-    );
-
-    let probes = common::probes();
-    let report = validate(&output, &look, &body, &probes, None).expect("validation");
-    assert!(
-        report.primary.stats.p95 <= 1.0,
-        "p95 {} at 65^3",
-        report.primary.stats.p95
-    );
-    assert!(!report.flagged(), "{:?}", report.primary);
-
-    let encoded = write_binary_f16(common::lut(&output)).expect("binary");
-    assert_eq!(
-        read_binary_f16(&encoded).expect("binary"),
-        *common::lut(&output)
-    );
 }

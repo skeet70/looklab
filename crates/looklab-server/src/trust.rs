@@ -5,7 +5,8 @@ use looklab_upload::PowParams;
 
 use crate::config::PowConfig;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Tier {
     New,
     Endorsed,
@@ -36,6 +37,11 @@ pub struct CredentialStanding {
     pub tier: Tier,
     pub reputation: f64,
 }
+
+pub const NEW_CREDENTIAL_STANDING: CredentialStanding = CredentialStanding {
+    tier: Tier::New,
+    reputation: 0.5,
+};
 
 pub trait TrustPolicy: Send + Sync {
     fn pow_params(&self, standing: CredentialStanding) -> PowParams;

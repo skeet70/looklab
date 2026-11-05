@@ -289,6 +289,9 @@ pub struct ManifestMetadata {
     pub as_shot_wb: Option<WhiteBalanceMultipliers>,
     pub capture_month: Option<CaptureMonth>,
     pub software: Option<String>,
+    pub render_tag: Option<looklab_meta::RenderTag>,
+    #[serde(default)]
+    pub render_tag_malformed: bool,
     pub look: Option<LookSettings>,
 }
 
@@ -449,6 +452,8 @@ impl From<&SanitizedMetadata> for ManifestMetadata {
                 .capture_month
                 .and_then(|month| CaptureMonth::new(month.year(), month.month())),
             software: meta.software.clone(),
+            render_tag: meta.render_tag.clone(),
+            render_tag_malformed: meta.render_tag_malformed,
             look: meta.look.as_ref().map(LookSettings::from),
         }
     }

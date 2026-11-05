@@ -45,8 +45,27 @@ pub fn soft_clip(x: f64, k: f64) -> f64 {
 
 /// `J'a'b'` through linear output RGB, the per-channel soft clip, and back.
 pub fn output_encode_clip(ucs: Ucs, output_space: RgbSpace, k: f64) -> Ucs {
+    if let Some(encoded) = encode_once(ucs, output_space, k) {
+        return encoded;
+    }
+    // Contract to the neutral at the same lightness, bounded to CAM16's inverse domain.
+    let neutral = if ucs.j.is_finite() {
+        Ucs::new(ucs.j.clamp(0.0, solve::neutral_j_prime_max()), 0.0, 0.0)
+    } else {
+        Ucs::new(0.0, 0.0, 0.0)
+    };
+    encode_once(neutral, output_space, k)
+        .or_else(|| encode_once(Ucs::new(0.0, 0.0, 0.0), output_space, k))
+        .unwrap_or(Ucs::new(0.0, 0.0, 0.0))
+}
+
+/// [`output_encode_clip`] for a point CAM16's inverse model is defined on.
+fn encode_once(ucs: Ucs, output_space: RgbSpace, k: f64) -> Option<Ucs> {
     let model = solve::reference_model();
     let jmh = ucs_to_jmh(ucs, UcsSpace::Ucs);
+    if !(jmh.j.is_finite() && jmh.m.is_finite() && jmh.h.is_finite()) {
+        return None;
+    }
     let xyz = model.cam16_to_xyz(jmh.j, Chroma::M(jmh.m), jmh.h);
     let rgb = output_space.xyz_to_rgb_linear(xyz);
     let clipped = looklab_color::Rgb::new(
@@ -54,8 +73,15 @@ pub fn output_encode_clip(ucs: Ucs, output_space: RgbSpace, k: f64) -> Ucs {
         soft_clip(rgb.g, k),
         soft_clip(rgb.b, k),
     );
+    if !(clipped.r.is_finite() && clipped.g.is_finite() && clipped.b.is_finite()) {
+        return None;
+    }
     let encoded: Xyz = output_space.rgb_linear_to_xyz(clipped);
-    solve::ucs_of_xyz(encoded)
+    let out = solve::ucs_of_xyz(encoded);
+    out.to_array()
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(out)
 }
 
 #[cfg(test)]

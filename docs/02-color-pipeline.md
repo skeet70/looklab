@@ -93,6 +93,8 @@ A Look maps adapted scene XYZ to CAM16-UCS `J'a'b'`. Input coordinates:
 - `s = log2(Y/0.18)`, clamped to [−12, +6].
 - `(h_in, C_in)`: hue and chroma of the input chromaticity, computed by scaling XYZ to Y = 0.18 and converting to CAM16-UCS. They're independent of exposure, and they're used **only as spline coordinates**.
 
+Inputs whose CAM16 chromaticity is undefined (`Y ≤ 0`, or a chromaticity outside CAM16's forward domain) are contracted toward the D65 neutral at the same luminance until defined, so evaluation and output encoding stay finite.
+
 ### 3.1 Tone `T`
 `J'_base = T(s)`. Monotone non-decreasing spline (I-spline), ~20 knots over [−12, +6], dense in [−4, +3], including the shoulder.
 
@@ -134,7 +136,7 @@ c(x) = k − k·tanh((k − x)/k)               for x < k
 
 The function is C¹ and maps (−∞, ∞) → (0, 1). `k` is a per-realization parameter (default 0.03, fitted per body/sim; prior N(0.03, 0.02²) truncated to [0.005, 0.1]). The Look file stores the function id and `k` for each realization in its provenance. The published Look itself is pre-clip.
 
-Pre-clip values in saturated regions are only weakly constrained by data, because the clip's derivative → 0. This shows up as large posterior variance, so those probes are correctly marked unsupported (§5).
+Pre-clip values in saturated regions are only weakly constrained by data, because the clip's derivative → 0. Through the prior curvature floor (§5) this appears as a large pre-clip σ, while the post-clip value stays supported and gated. The clip derivative at the probe, not `x < k`, is the quantity that decides whether the pre-clip value is identifiable.
 
 ### 3.5 Residual LUT
 A 17³ grid over `(s, a_in, b_in)` outputs ΔJ′a′b′, trilinear. Regularization: Laplacian smoothness + L2. Nodes with negligible density are pinned to 0. A large residual is itself a diagnostic.
@@ -179,6 +181,8 @@ The total objective is:
 4. Fit the residual on the residuals, then do a short joint refinement.
 
 **Regularization:** choose each λ **within its own stage** by generalized cross-validation (GCV) on that stage's linearized problem, using a 1-D search over ~8 log-spaced values. K-fold CV over images is a periodic quality check on a per-image subsample, not part of every fit. Store the chosen λ in the Look file.
+
+**Identity prior:** shrinkage toward the identity Look is a fixed Gaussian prior on each layer, not a smoothness term: energy `0.5·θ²/sd²`, curvature `1/sd²`. SDs are tone 1 J′ per stop, tint 2 J′a′b′, `log G` 0.3, hue rotation 15°, lightness 8 J′, residual 0.5 ΔE. These weights do not weaken as the pool grows. Their curvature enters `H`, the covariance floor and the prior-bias test (§5).
 
 Solver: Levenberg–Marquardt with sparse normal equations (`faer`).
 
@@ -242,17 +246,25 @@ A positive result opens a moderation proposal.
 
 Per Look version, per-probe 3×3 predictive covariance:
 
-1. **Fit (interactive path):** an image-clustered **sandwich estimator** `Σ_θ = H⁻¹ (Σ_i g_i g_iᵀ) H⁻¹`, where `g_i` is image *i*'s summed gradient at the optimum. It's propagated to probes through the Jacobian. Optionally cluster by contributor for an even more conservative estimate.
+1. **Fit (interactive path):** `Σ = H⁻¹ (c·M + Λ_prior) H⁻¹`, where `M = Σ_i g_i g_iᵀ` is the image-clustered meat (`g_i` is image *i*'s summed gradient at the optimum), `c` is the small-cluster factor applied to `M` alone, and `Λ_prior` is the curvature of every prior and penalty term in `H` (identity priors, smoothness penalties at the chosen λ, nuisance priors). Where data dominates this is the sandwich; thin regions, few clusters and flat clip derivatives tend to the prior variance.
 2. **Bootstrap (published versions):** B = 32 warm-started refits on image clusters resampled with replacement; a cluster is one body's images, so within-body correlation is kept (a single-body pool is the image bootstrap).
 3. **Cross-body disagreement:** covariance of leave-one-body-out predictions.
 
-Combination: `Σ_fit = Σ_boot` when available, else `Σ_sandwich`, then `Σ_total = Σ_fit + Σ_disagree + Σ_model`. Scalar `σ_ΔE = sqrt(tr Σ_total)`.
+Combination: `Σ_fit = Σ_boot` when available, else `Σ`, then `Σ_total = Σ_fit + Σ_disagree + Σ_model`. Scalar `σ_ΔE = sqrt(tr Σ_total)`.
+
+Each probe carries both the **pre-clip** J′a′b′ the Look defines and the **post-clip** J′a′b′ in the reference output encoding (J′a′b′ → output RGB → soft clip with the realization's `k` → J′a′b′), each with its own 3×3 covariance. The post-clip covariance is `M_clip Σ M_clipᵀ` plus the clip-`k` term, with `M_clip` the clip Jacobian. Matching and drift gating use the post-clip prediction and covariance; gating also checks pre-clip J′ and hue `h` where `pre_clip_reliable` is true (smallest per-channel clip derivative ≥ 0.25).
+
+**Prior-attributable bias:** `b_p = J_p H⁻¹ Λ_prior θ̂`, evaluated post-clip and reported as |b_p| in ΔE, with `Λ_prior` the curvature of every prior and penalty in `H` (identity priors, smoothness at the chosen λ, nuisance priors, residual prior). A coefficient far from the identity Look, or one held by a smoothness penalty, carries a bias that its σ does not include.
 
 **Model error:** the published path runs K-fold cross-validation over bodies (images when the pool has one body). Each held-out body's residual is binned into 12 hue × 6 exposure regions, compared with what `Σ_fit + Σ_disagree` predicted, and the mean excess plus `t_{0.95,K−1}·sd·√(1+1/K)` is smoothed and added as a radial `Σ_model` (one third per axis). The excess carries a tentative 1.3 between-body inflation. The interactive path reuses the last published [`ModelErrorField`](../crates/looklab-fit/src/model_error.rs) instead of recomputing it.
 
-**Support:** a probe is *supported* iff `σ_ΔE ≤ 1.5` **and** density ≥ the floor **and** at least `min_probe_clusters` images (tentative 3) carry non-negligible weight in its region **and** no channel of its predicted output lies in a soft-clip shoulder (`> 1 − k` or `< k`), where pre-clip values are not constrained (§3.4). This automatically excludes pre-clip values the data can't identify (§3.4). Unsupported probes are excluded from matching objectives and hatched in plots.
+**Support:** a probe enters support when post-clip `σ_ΔE ≤ 1.5`, `|b_p| ≤ 0.33·1.5` (tentative), the absolute density floor is met, and at least `min_probe_clusters` images (tentative 3) carry non-negligible weight in its region. It leaves support when `σ_ΔE > 1.65` or `|b_p| > 1.1·0.33·1.5`. The previous published version supplies the prior state for this hysteresis; the first version applies the enter rule only. Density and cluster floors are absolute, so they have no hysteresis and no shoulder exclusion. Unsupported probes are excluded from matching objectives and hatched in plots.
+
+**Absolute density floor:** the KDE counts are the tempered effective weight in each `(s, h_in, √C_in)` bin, `Σ n_eff/n_i · trust · density_w`, with the density weight normalized within each image. The floor is an absolute weight per bin (`FitOptions::density_floor`, tentative 0.01), so adding data elsewhere cannot lower a rare region's density below it.
 
 **Small clusters:** for the sandwich path the meat is scaled by `G/(G−1)` and `σ_ΔE` by `t_{0.95,G−1}/z_{0.95}`, where `G` is the number of active image clusters in the fit (Cameron & Miller 2015, *J. Hum. Resour.* 50(2), eq. 10-11; MacKinnon & White 1985). Published versions use the bootstrap when available.
+
+**Convergence:** the final refinement stage runs to objective and step tolerances, up to `max_sweeps`, and reports nonconvergence when the sample budget is exhausted. On the Velvia-like noise-free fixture the all-probe bias converges to 0.20 ΔE at `n_eff` 500 and 0.28 at `n_eff` 5000; the earlier flat 0.9–1.5 ΔE bias was truncated optimization, not a model floor. The residual sits on probes with data (0.22 ΔE) more than in empty density bins (0.13 ΔE), and the post-clip covariance with the clip-`k` column covers it (2σ coverage 0.95 or better). The worker records the outcome as `ReleaseRecord.converged` and as a `converged` check in the version's gate summary. A fit that exhausts the budget still publishes, flagged.
 
 ## 6. Probe set (v1)
 

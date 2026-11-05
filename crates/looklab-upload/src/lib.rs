@@ -22,13 +22,16 @@ pub use envelope::{
     parse_envelope_strict, peek_nonce,
 };
 pub use ids::{
-    BodyId, ContributionKind, ControlEntry, ControlKey, ControlSettings, FirmwareVersionString,
-    IdError, Intent, LookSlug, SettingsError, SimKey, StepIndex,
+    BodyId, CardDeclaration, ContributionKind, ControlEntry, ControlKey, ControlSettings,
+    FirmwareVersionString, IdError, Intent, LookSlug, SettingsError, SimKey, StepIndex,
 };
-pub use looklab_meta::{RawSerial, SerialHmac, SerialHmacKey};
+pub use looklab_meta::{
+    FirmwareId, FirmwareVersion, RawSerial, RenderTag, RenderTagError, SerialHmac, SerialHmacKey,
+    parse_render_tag,
+};
 pub use looklab_samples::RerenderGroupId;
 pub use manifest::{
-    BatchManifest, BlobKind, ManifestImage, canonical_manifest_bytes, manifest_hash,
+    BatchManifest, BlobKind, IntentError, ManifestImage, canonical_manifest_bytes, manifest_hash,
 };
 pub use metadata::{
     BadMonth, CaptureMonth, DynamicRange, DynamicRangeSetting, EffectStrength, FilmMode,

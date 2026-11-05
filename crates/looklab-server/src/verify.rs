@@ -107,7 +107,8 @@ pub fn verify_assertion(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestDomain {
-    StatusReissue,
+    Session,
+    SessionRevoke,
     Withdraw,
     Grant,
     RevokeGrant,
@@ -125,7 +126,8 @@ pub enum RequestDomain {
 impl RequestDomain {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::StatusReissue => "status-reissue",
+            Self::Session => "session",
+            Self::SessionRevoke => "session-revoke",
             Self::Withdraw => "withdraw",
             Self::Grant => "grant",
             Self::RevokeGrant => "revoke-grant",
@@ -153,6 +155,7 @@ pub fn request_digest(domain: RequestDomain, payload: &[u8]) -> ManifestHash {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignedRequestPayload {
     pub nonce: String,
     pub credential_id: String,

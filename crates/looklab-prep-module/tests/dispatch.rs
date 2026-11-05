@@ -41,6 +41,8 @@ fn metadata() -> ManifestMetadata {
         as_shot_wb: None,
         capture_month: None,
         software: None,
+        render_tag: None,
+        render_tag_malformed: false,
         look: None,
     }
 }

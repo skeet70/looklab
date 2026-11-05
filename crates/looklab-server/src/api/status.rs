@@ -6,18 +6,17 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use looklab_upload::Challenge;
 use serde::Serialize;
 
-use crate::api::consume_nonce;
 use crate::error::{ApiError, ApiResult, ErrorCode};
-use crate::ids::{CredentialId, RawCredentialId, StatusToken};
-use crate::rate_limit::{Action, RateKey};
+use crate::ids::{CredentialId, StatusToken};
+use crate::rate_limit::Action;
 use crate::state::AppState;
 use crate::store::{self, ContributionFeed};
-use crate::verify::{RequestDomain, SignedRequestPayload, request_digest, verify_assertion};
+use crate::trust::Tier;
+use crate::verify::{RequestDomain, SignedRequestPayload};
 
 #[derive(Serialize)]
 pub struct StatusResponse {
@@ -115,51 +114,89 @@ fn escape_xml(value: &str) -> String {
 }
 
 #[derive(Serialize)]
-pub struct ReissueResponse {
+pub struct SessionResponse {
     status_token: String,
+    roles: Vec<looklab_trust::Role>,
+    tier: Tier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_handle: Option<String>,
 }
 
-pub async fn reissue(
+#[derive(serde::Deserialize)]
+pub struct SessionRequest {
+    #[serde(flatten)]
+    signed: SignedRequestPayload,
+    pow: Option<[u64; looklab_upload::POW_K]>,
+}
+
+pub async fn session(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<SessionRequest>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(payload) = payload.map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
+    let credential = super::auth::authenticate_with_pow(
+        &state,
+        &payload.signed,
+        RequestDomain::Session,
+        &[],
+        Action::Session,
+        payload.pow.map(looklab_upload::PowSolutions::new),
+    )
+    .await?;
+    let token = StatusToken::generate().map_err(|_| ApiError::new(ErrorCode::Internal))?;
+    let mut tx = state.db.begin().await?;
+    store::insert_status_token(&mut tx, &credential, &token.hash()).await?;
+    tx.commit().await?;
+    session_response(&state, &credential, &token).await
+}
+
+pub async fn restore_session(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let token = super::auth::bearer_token(&headers)?;
+    let credential = store::credential_id_for_token(&state.db, &token.hash())
+        .await?
+        .ok_or_else(|| ApiError::new(ErrorCode::TokenUnknown))?;
+    session_response(&state, &credential, &token).await
+}
+
+async fn session_response(
+    state: &AppState,
+    credential: &CredentialId,
+    token: &StatusToken,
+) -> ApiResult<Response> {
+    let standing = super::auth::roles(state, credential).await?;
+    let display_handle: Option<String> =
+        sqlx::query_scalar("SELECT display_handle FROM credentials WHERE id = ?")
+            .bind(credential.as_str())
+            .fetch_one(&state.db)
+            .await?;
+    Ok(Json(SessionResponse {
+        status_token: token.as_str().to_owned(),
+        roles: standing.roles,
+        tier: standing.tier,
+        display_handle,
+    })
+    .into_response())
+}
+
+pub async fn revoke_session(
     State(state): State<Arc<AppState>>,
     payload: Result<Json<SignedRequestPayload>, JsonRejection>,
 ) -> ApiResult<Response> {
     let Json(payload) = payload.map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
-    let (assertion, nonce) = payload.decode()?;
-    let raw_id = RawCredentialId::new(assertion.credential_id.clone());
-    consume_nonce(&state, &nonce).await?;
-    if !state.rate_limiter.check(&RateKey::GlobalSigned) {
-        return Err(ApiError::new(ErrorCode::RateLimited));
-    }
-
-    let credential = store::find_credential(&state.db, raw_id.as_slice())
-        .await
-        .map_err(|_| ApiError::new(ErrorCode::Internal))?
-        .ok_or_else(|| ApiError::new(ErrorCode::CredentialUnknown))?;
-    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::StatusReissue, &[]));
-    let passkey = verify_assertion(
-        &credential.passkey,
-        &assertion,
-        challenge,
-        &state.config.origin,
-        &state.config.rp_id,
+    let credential = super::auth::authenticate(
+        &state,
+        &payload,
+        RequestDomain::SessionRevoke,
+        &[],
+        Action::SessionRevoke,
     )
-    .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
-    if !state.rate_limiter.check(&RateKey::Assertion {
-        action: Action::StatusReissue,
-        id: raw_id,
-    }) {
-        return Err(ApiError::new(ErrorCode::RateLimited));
-    }
-
-    let token = StatusToken::generate().map_err(|_| ApiError::new(ErrorCode::Internal))?;
+    .await?;
     let mut tx = state.db.begin().await?;
-    store::update_credential_passkey_tx(&mut tx, &credential.id, &passkey).await?;
-    store::revoke_tokens(&mut tx, &credential.id).await?;
-    store::insert_status_token(&mut tx, &credential.id, &token.hash()).await?;
+    store::revoke_tokens(&mut tx, &credential).await?;
     tx.commit().await?;
-
-    Ok(Json(ReissueResponse {
-        status_token: token.as_str().to_owned(),
-    })
-    .into_response())
+    state.mod_sessions.close_credential(&credential);
+    Ok(StatusCode::NO_CONTENT.into_response())
 }

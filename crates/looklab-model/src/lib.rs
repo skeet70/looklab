@@ -16,7 +16,7 @@ pub use clip::{ClipFunction, ClipSettings, output_encode_clip, soft_clip};
 pub use error::{ModelError, Result};
 pub use file::{
     BinRef, ChromaReference, Density, FormatId, LayersRecord, LookDocument, LookFile, LookIdentity,
-    LookKind, ProbeCovariance, ProbeSetVersion, UncertaintyData, WbPolicy,
+    LookKind, ProbeCovariance, ProbeScalars, ProbeSetVersion, UncertaintyData, WbPolicy,
 };
 pub use look::{
     CoefTerm, ColorLayer, GrlComponent, GrlWeights, LayerValues, Look, LookInput, ParamLayout,

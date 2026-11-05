@@ -1023,7 +1023,7 @@ mod tests {
 
     #[test]
     fn a_round_trip_report_has_one_entry_per_bake_cct() {
-        let payload = include_str!("../../../data/interfaces/example-firmware-sim-v1.yaml");
+        let payload = include_str!("../../../data/interfaces/example-app-lut3d-v1.yaml");
         let report = round_trip_report(payload).expect("report");
         assert_eq!(report.ccts[0].cct, 6500.0);
         assert!(!report.ccts.is_empty());

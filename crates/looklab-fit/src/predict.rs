@@ -733,12 +733,88 @@ pub(crate) fn output_channels(pre: Ucs, space: RgbSpace) -> [f64; 3] {
     [rgb.r, rgb.g, rgb.b]
 }
 
-/// Whether any linear output channel of the pre-clip prediction lies in a
-/// soft-clip shoulder, where the data does not constrain the pre-clip value.
-pub(crate) fn in_clip_shoulder(pre: Ucs, space: RgbSpace, clip_k: f64) -> bool {
+/// Post-clip `J'a'b'` in `space` with soft clip `clip_k`.
+pub fn post_clip(look: &Look, xyz: Xyz, space: RgbSpace, clip_k: f64) -> Ucs {
+    let channels = output_channels(look.eval(xyz), space);
+    let clipped = channels.map(|value| soft_clip(value, clip_k));
+    ucs_of_xyz(space.rgb_linear_to_xyz(Rgb::new(clipped[0], clipped[1], clipped[2])))
+}
+
+/// Post-clip prediction without the Jacobian, for samples outside the Hessian set.
+pub(crate) fn predict_only(look: &Look, image: &ImageCtx, rgb: [f64; 3], clip_k: f64) -> Ucs {
+    let exposure_scale = libm::pow(2.0, image.exposure);
+    let cam = [
+        rgb[0] * image.wb_r * exposure_scale,
+        rgb[1] * exposure_scale,
+        rgb[2] * image.wb_b * exposure_scale,
+    ];
+    let xyz = Xyz::from_array(image.transform.mul_vec(cam));
+    let values = look.layer_values(&LookInput::new(xyz));
+    let pre = look.eval_from_layer_values(&LookInput::new(xyz), &values);
+    let channels = output_channels(pre, image.space);
+    let clipped = channels.map(|value| soft_clip(value, clip_k));
+    ucs_of_xyz(
+        image
+            .space
+            .rgb_linear_to_xyz(Rgb::new(clipped[0], clipped[1], clipped[2])),
+    )
+}
+
+/// Below 0.25 the pre-clip value is unidentifiable.
+pub(crate) fn clip_derivative_min(pre: Ucs, space: RgbSpace, clip_k: f64) -> f64 {
     output_channels(pre, space)
         .iter()
-        .any(|value| *value > 1.0 - clip_k || *value < clip_k)
+        .map(|value| clip_derivative(*value, clip_k))
+        .fold(1.0_f64, f64::min)
+}
+
+/// `d post-clip / d k` in `J'a'b'` coordinates.
+pub(crate) fn clip_k_gradient(pre: Ucs, space: RgbSpace, clip_k: f64) -> [f64; 3] {
+    let channels = output_channels(pre, space);
+    if channels
+        .iter()
+        .all(|value| *value >= clip_k && *value <= 1.0 - clip_k)
+    {
+        return [0.0; 3];
+    }
+    let clipped = channels.map(|value| soft_clip(value, clip_k));
+    let xyz1 = space.rgb_linear_to_xyz(Rgb::new(clipped[0], clipped[1], clipped[2]));
+    let (_, j1) = cam::ucs_jacobian(xyz1);
+    Mat3(j1).mul(&space.to_xyz_matrix()).mul_vec([
+        clip_k_derivative(channels[0], clip_k),
+        clip_k_derivative(channels[1], clip_k),
+        clip_k_derivative(channels[2], clip_k),
+    ])
+}
+
+/// `d post-clip / d pre-clip` in `J'a'b'` coordinates.
+pub(crate) fn clip_jacobian(pre: Ucs, space: RgbSpace, clip_k: f64) -> Mat3 {
+    let channels = output_channels(pre, space);
+    let unclipped = channels
+        .iter()
+        .all(|value| *value >= clip_k && *value <= 1.0 - clip_k);
+    if unclipped {
+        return Mat3::IDENTITY;
+    }
+    let model = reference_model();
+    let xyz0 = model.jmh_to_xyz(ucs_to_jmh(pre, UcsSpace::Ucs));
+    let clipped = channels.map(|value| soft_clip(value, clip_k));
+    let xyz1 = space.rgb_linear_to_xyz(Rgb::new(clipped[0], clipped[1], clipped[2]));
+    let (_, j0) = cam::ucs_jacobian(xyz0);
+    let (_, j1) = cam::ucs_jacobian(xyz1);
+    let per_channel = Mat3::diag([
+        clip_derivative(channels[0], clip_k),
+        clip_derivative(channels[1], clip_k),
+        clip_derivative(channels[2], clip_k),
+    ]);
+    let chain = Mat3(j1)
+        .mul(&space.to_xyz_matrix())
+        .mul(&per_channel)
+        .mul(&space.from_xyz_matrix());
+    match Mat3(j0).inverse() {
+        Some(inverse) => chain.mul(&inverse),
+        None => Mat3::IDENTITY,
+    }
 }
 
 /// Pre-clip `J'a'b'` of one probe and `dJ'a'b'/dθ`, for the sandwich estimator.

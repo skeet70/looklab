@@ -11,7 +11,9 @@ use looklab_export::DeltaStats;
 use looklab_fit::{ExposureModeId, FitImage, FitOptions, FitResult, OutlierReason, Verdict, fit};
 use looklab_model::file::{BodyProvenance, Provenance, RootProvenance};
 use looklab_model::solve::ucs_of_xyz;
-use looklab_model::{LookDocument, ProbeCovariance, UncertaintyData, output_encode_clip};
+use looklab_model::{
+    LookDocument, ProbeCovariance, ProbeScalars, UncertaintyData, output_encode_clip,
+};
 use looklab_samples::OutputSpace;
 
 use crate::body_transform::TransformFile;
@@ -139,19 +141,37 @@ fn build_document(
     let identity = looklab_model::file::identity(&args.look_slug, &args.look_version)?;
     let mut document = LookDocument::from_look(identity, result.look.clone())?;
 
-    let mut covariance = Vec::with_capacity(result.probes.probes.len() * 9);
-    let mut density = Vec::with_capacity(result.probes.probes.len());
+    let count = result.probes.probes.len();
+    let mut covariance = Vec::with_capacity(count * 9);
+    let mut covariance_post = Vec::with_capacity(count * 9);
+    let mut bias = Vec::with_capacity(count);
+    let mut sigma = Vec::with_capacity(count);
+    let mut sigma_post = Vec::with_capacity(count);
+    let mut reliable = Vec::with_capacity(count);
+    let mut support = Vec::with_capacity(count);
+    let mut density = Vec::with_capacity(count);
     for probe in &result.probes.probes {
         for row in &probe.covariance {
             covariance.extend_from_slice(row);
         }
+        for row in &probe.post_covariance {
+            covariance_post.extend_from_slice(row);
+        }
+        bias.push(probe.bias_de);
+        sigma.push(probe.sigma_de);
+        sigma_post.push(probe.post_sigma_de);
+        reliable.push(if probe.pre_clip_reliable { 1.0 } else { 0.0 });
+        support.push(if probe.supported { 1.0 } else { 0.0 });
         density.push(probe.density);
     }
     let uncertainty = UncertaintyData {
-        probe_cov: Some(ProbeCovariance::new(
-            result.probes.probes.len(),
-            covariance,
-        )?),
+        probe_cov: Some(ProbeCovariance::new(count, covariance)?),
+        probe_cov_post: Some(ProbeCovariance::new(count, covariance_post)?),
+        probe_bias: Some(ProbeScalars::new(bias)?),
+        probe_sigma: Some(ProbeScalars::new(sigma)?),
+        probe_sigma_post: Some(ProbeScalars::new(sigma_post)?),
+        probe_pre_reliable: Some(ProbeScalars::new(reliable)?),
+        support: Some(ProbeScalars::new(support)?),
         density: Some(looklab_model::Density::new(density)?),
     };
     document = document.with_uncertainty(uncertainty)?;

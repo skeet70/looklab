@@ -9,6 +9,8 @@ publish = false
 
 [dependencies]
 looklab-color.workspace = true
+looklab-export.workspace = true
+looklab-meta.workspace = true
 looklab-match.workspace = true
 looklab-model.workspace = true
 looklab-publish.workspace = true
@@ -16,6 +18,7 @@ looklab-report.workspace = true
 looklab-schema.workspace = true
 looklab-wasm.workspace = true
 looklab-prep.workspace = true
+looklab-trust.workspace = true
 looklab-upload.workspace = true
 
 leptos.workspace = true

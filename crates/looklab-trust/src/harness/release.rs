@@ -7,7 +7,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use looklab_fit::{ContributorId, FitImage, FitOptions, ImageFitStats, Verdict, fit};
+use looklab_color::RgbSpace;
+use looklab_fit::{
+    ContributorId, FitImage, FitOptions, ImageFitStats, PreviousSupport, Verdict, fit_with_history,
+    post_clip,
+};
 use looklab_meta::{RawSerial, SerialHmac, SerialHmacKey};
 use looklab_model::{Look, LookInput, ProbeId, ProbeSet, probes};
 use looklab_upload::{BodyId, ContributionKind, Intent, LookSlug};
@@ -17,8 +21,8 @@ use super::{HarnessError, HarnessResult};
 use crate::error::TrustError;
 use crate::evidence::{EvidenceGrid, coverage_gain, evidence};
 use crate::gates::{
-    GateInput, GateReport, ProbeEstimate, RootObservation, VersionProbes, exposure_gauge_excluded,
-    gate_release,
+    GateInput, GateReport, GatedUnion, ProbeEstimate, ProbeSupport, RootObservation, VersionProbes,
+    exposure_gauge_excluded, gate_release,
 };
 use crate::ids::{
     ArtifactHash, CredentialId, EffectiveContributorId, ImageRef, SerialLink, SerialReuse,
@@ -117,13 +121,11 @@ pub struct Version {
     pub gauge: f64,
     /// Fitted per-image exposures, for the gauge conversion between versions.
     pub exposures: BTreeMap<ImageRef, f64>,
-    /// Per probe-set index.
-    pub sigma: Vec<f64>,
-    pub supported: Vec<bool>,
-    /// Per probe-set index.
-    pub density: Vec<f64>,
-    /// The fitted density floor that `supported` was compared against.
-    pub density_floor: f64,
+    /// Per probe-set index, in this version's own gauge.
+    pub probes: Vec<ProbeEstimate>,
+    /// The reference output encoding the post-clip prediction goes through.
+    pub space: RgbSpace,
+    pub clip_k: f64,
     pub status: VersionStatus,
     pub content: ArtifactHash,
     pub contributors: Vec<CredentialId>,
@@ -167,7 +169,7 @@ pub struct RevertOutcome {
     pub refit: ReleaseOutcome,
 }
 
-/// ΔE at one probe between two versions in the anchor's gauge.
+/// Post-clip ΔE at one probe between two versions in the anchor's gauge.
 #[derive(Clone, Debug)]
 pub struct ProbeShift {
     pub probe: ProbeId,
@@ -199,6 +201,7 @@ pub struct Sim {
     anchor: Option<VersionId>,
     published: Option<VersionId>,
     root: Vec<RootObservation>,
+    gated: GatedUnion,
     moderation: Vec<ModerationItem>,
     serials: BTreeMap<CredentialId, SerialHmac>,
     slots: BTreeMap<EffectiveContributorId, u32>,
@@ -239,6 +242,7 @@ impl Sim {
             anchor: None,
             published: None,
             root: Vec::new(),
+            gated: GatedUnion::default(),
             moderation: Vec::new(),
             serials: BTreeMap::new(),
             slots: BTreeMap::new(),
@@ -435,10 +439,9 @@ impl Sim {
             look: source.look,
             gauge: source.gauge,
             exposures: source.exposures,
-            sigma: source.sigma,
-            supported: source.supported,
-            density: source.density,
-            density_floor: source.density_floor,
+            probes: source.probes,
+            space: source.space,
+            clip_k: source.clip_k,
             status: VersionStatus::Published,
             content: plan.publish_as_new,
             contributors: source.contributors,
@@ -468,9 +471,9 @@ impl Sim {
             .filter_map(|(id, a)| {
                 reference_probes.get(id).map(|b| ProbeShift {
                     probe: id.clone(),
-                    delta: distance(&a.jab, &b.jab),
-                    sigma_new: a.sigma,
-                    sigma_reference: b.sigma,
+                    delta: distance(&a.post_clip, &b.post_clip),
+                    sigma_new: a.sigma_post_clip,
+                    sigma_reference: b.sigma_post_clip,
                 })
             })
             .collect()
@@ -493,13 +496,32 @@ impl Sim {
         let (result, fit_indices) = self.refit(&weights, exclude)?;
 
         let (gauge, exposures) = self.gauge(&result, &fit_indices);
-        let mut sigma = vec![0.0_f64; self.probes.probes.len()];
-        let mut supported = vec![false; self.probes.probes.len()];
-        let mut density = vec![0.0_f64; self.probes.probes.len()];
-        for estimate in &result.probes.probes {
-            sigma[estimate.id_hint] = estimate.sigma_de;
-            supported[estimate.id_hint] = estimate.supported;
-            density[estimate.id_hint] = estimate.density;
+        let estimates: BTreeMap<usize, &looklab_fit::ProbeEstimate> = result
+            .probes
+            .probes
+            .iter()
+            .map(|estimate| (estimate.id_hint, estimate))
+            .collect();
+        let mut probes = Vec::with_capacity(self.probes.probes.len());
+        for (index, probe) in self.probes.probes.iter().enumerate() {
+            let estimate = estimates
+                .get(&index)
+                .ok_or(HarnessError::MissingProbe(index))?;
+            probes.push(ProbeEstimate {
+                id: probe.id.clone(),
+                pre_clip: estimate.ucs.to_array(),
+                sigma_pre_clip: estimate.sigma_de,
+                post_clip: estimate.post_ucs.to_array(),
+                sigma_post_clip: estimate.post_sigma_de,
+                bias_de: estimate.bias_de,
+                support: ProbeSupport {
+                    sigma: estimate.supported_sigma,
+                    density: estimate.supported_density,
+                    clusters: estimate.supported_clusters,
+                    bias: estimate.supported_bias,
+                },
+                pre_clip_identified: estimate.pre_clip_reliable,
+            });
         }
         let contributors: Vec<CredentialId> = self
             .pool
@@ -515,10 +537,9 @@ impl Sim {
             look: result.look.clone(),
             gauge,
             exposures,
-            sigma,
-            supported,
-            density,
-            density_floor: result.density.floor,
+            probes,
+            space: result.output_space,
+            clip_k: result.realization.clip_k,
             status: VersionStatus::Provisional,
             content: population::artifact_hash(&result.look),
             contributors,
@@ -529,6 +550,7 @@ impl Sim {
         if self.anchor.is_none() {
             self.anchor = Some(id);
             self.root = self.observations(&candidate);
+            self.gated = GatedUnion::at_anchor(&version_probes(&candidate));
         }
         let previous = self.published.unwrap_or(id);
         let anchor = self.anchor.unwrap_or(id);
@@ -579,6 +601,7 @@ impl Sim {
         let published = gate.passed;
         let audit = if published {
             self.published = Some(id);
+            self.gated.include(&version_probes(&candidate));
             let slot = self
                 .versions
                 .iter_mut()
@@ -677,7 +700,13 @@ impl Sim {
             .iter()
             .map(|probe| RootObservation {
                 id: probe.id.clone(),
-                jab: self.truth.eval(probe.xyz.scale(scale)).to_array(),
+                jab: post_clip(
+                    &self.truth,
+                    probe.xyz.scale(scale),
+                    anchor.space,
+                    self.truth.clip.k,
+                )
+                .to_array(),
             })
             .collect()
     }
@@ -695,16 +724,21 @@ impl Sim {
                 excluded.insert(probe.id.clone());
                 continue;
             }
+            let stored = &version.probes[index];
+            let xyz = probe.xyz.scale(scale);
             estimates.insert(
                 probe.id.clone(),
-                ProbeEstimate::from_fit(
-                    probe.id.clone(),
-                    version.look.eval(probe.xyz.scale(scale)).to_array(),
-                    version.sigma[index],
-                    version.density[index] >= version.density_floor,
-                    version.supported[index],
-                    self.params.fit.support_sigma,
-                ),
+                ProbeEstimate {
+                    id: probe.id.clone(),
+                    pre_clip: version.look.eval(xyz).to_array(),
+                    sigma_pre_clip: stored.sigma_pre_clip,
+                    post_clip: post_clip(&version.look, xyz, version.space, version.clip_k)
+                        .to_array(),
+                    sigma_post_clip: stored.sigma_post_clip,
+                    bias_de: stored.bias_de,
+                    support: stored.support,
+                    pre_clip_identified: stored.pre_clip_identified,
+                },
             );
         }
         (estimates, excluded)
@@ -735,6 +769,7 @@ impl Sim {
                 previous: select(&previous_probes),
                 anchor: select(&anchor_probes),
                 root_observations: self.root.clone(),
+                gated_since_anchor: self.gated.clone(),
             },
         )
     }
@@ -875,7 +910,19 @@ impl Sim {
                 fit
             })
             .collect();
-        let result = fit(&images, &self.params.fit)?;
+        let previous = self.published().map(|version| PreviousSupport {
+            sigma: version
+                .probes
+                .iter()
+                .map(|probe| probe.support.sigma)
+                .collect(),
+            bias: version
+                .probes
+                .iter()
+                .map(|probe| probe.support.bias)
+                .collect(),
+        });
+        let result = fit_with_history(&images, &self.params.fit, previous.as_ref())?;
         Ok((result, fit_indices))
     }
 
@@ -925,6 +972,12 @@ impl Sim {
             self.trust = state;
         }
         Ok(())
+    }
+}
+
+fn version_probes(version: &Version) -> VersionProbes {
+    VersionProbes {
+        probes: version.probes.clone(),
     }
 }
 

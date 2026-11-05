@@ -10,8 +10,10 @@ publish = false
 [dependencies]
 libm.workspace = true
 looklab-color.workspace = true
+looklab-export.workspace = true
 looklab-model.workspace = true
 looklab-schema.workspace = true
+png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -20,7 +22,15 @@ thiserror.workspace = true
 [dev-dependencies]
 libm.workspace = true
 looklab-fit = { workspace = true, features = ["synth"] }
+looklab-match.workspace = true
+looklab-raw.workspace = true
+looklab-body.workspace = true
+looklab-samples.workspace = true
+looklab-report.workspace = true
+serde_norway.workspace = true
+toml.workspace = true
 proptest.workspace = true
+zip.workspace = true
 
 [lints]
 workspace = true

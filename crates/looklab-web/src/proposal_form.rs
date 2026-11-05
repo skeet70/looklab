@@ -7,7 +7,102 @@ use looklab_schema::{
     Date, FixtureDonation, FixtureLicense, LabeledFile, LabeledTag, MakernoteTag, MakernoteValue,
     MappingInference, Sha256Hex, SimKey, infer_mapping, validate_confirmation,
 };
+
+pub fn kind_label(kind: looklab_schema::ProposalKind) -> &'static str {
+    use looklab_schema::ProposalKind;
+    match kind {
+        ProposalKind::Body => "Add a camera",
+        ProposalKind::Mapping => "Add or fix a film simulation on a camera",
+        ProposalKind::SchemaChange => "Change a camera's controls",
+        ProposalKind::LutLook => "Add a custom look",
+        ProposalKind::InterfaceProfile => "Add an editing-app profile",
+        ProposalKind::EpochSplit => "Separate firmware versions",
+        ProposalKind::LookSplit => "Separate looks",
+        ProposalKind::GateOverride => "Review a release exception",
+    }
+}
+
+pub fn menu_summary(
+    kind: looklab_schema::ProposalKind,
+    summary: &looklab_schema::ProposalSummary,
+) -> looklab_schema::ProposalSummary {
+    use looklab_schema::ProposalKind;
+    let headline = match kind {
+        ProposalKind::Body => summary
+            .headline
+            .replace("camera body", "camera")
+            .replace("software body", "editing app"),
+        ProposalKind::SchemaChange => summary.headline.replace("control schema", "controls"),
+        ProposalKind::LutLook => summary.headline.replace("LUT-defined look", "custom look"),
+        ProposalKind::InterfaceProfile => summary
+            .headline
+            .replace("software interface profile", "editing-app profile"),
+        ProposalKind::EpochSplit => summary.headline.replace("new epoch", "new firmware range"),
+        _ => summary.headline.clone(),
+    };
+    let details = if kind == ProposalKind::SchemaChange {
+        summary.details.clone()
+    } else {
+        Vec::new()
+    };
+    looklab_schema::ProposalSummary::with_details(headline, details)
+}
 use sha2::{Digest, Sha256};
+
+pub fn file_menu_value(bytes: &[u8]) -> Result<String, String> {
+    let metadata = looklab_meta::parse(bytes).map_err(|error| error.to_string())?;
+    let look = metadata.fuji.map(|fuji| fuji.look).ok_or_else(|| {
+        "This file has no supported camera menu information. Try an original camera JPEG."
+            .to_owned()
+    })?;
+    let values = [
+        ("FilmMode", look.film_mode.map(|value| value.raw)),
+        ("DynamicRange", look.dynamic_range.map(|value| value.raw)),
+        (
+            "DynamicRangeSetting",
+            look.dynamic_range_setting.map(|value| value.raw),
+        ),
+        (
+            "DevelopmentDynamicRange",
+            look.development_dynamic_range.map(|value| value.raw),
+        ),
+        ("GrainSize", look.grain_size.map(|value| value.raw)),
+        (
+            "GrainRoughness",
+            look.grain_roughness.map(|value| value.raw),
+        ),
+        (
+            "ColorChromeEffect",
+            look.color_chrome_effect.map(|value| value.raw),
+        ),
+        (
+            "ColorChromeFxBlue",
+            look.color_chrome_fx_blue.map(|value| value.raw),
+        ),
+        ("WhiteBalance", look.white_balance.map(|value| value.raw)),
+        ("HighlightTone", look.highlight_tone.map(|value| value.raw)),
+        ("ShadowTone", look.shadow_tone.map(|value| value.raw)),
+        (
+            "NoiseReduction",
+            look.noise_reduction.map(|value| value.raw),
+        ),
+    ];
+    let tags = values
+        .into_iter()
+        .filter_map(|(tag, value)| {
+            value
+                .and_then(|value| u64::try_from(value).ok())
+                .map(|value| format!("{tag}={value}"))
+        })
+        .collect::<Vec<_>>();
+    if tags.is_empty() {
+        return Err(
+            "This file has no supported camera menu information. Try an original camera JPEG."
+                .to_owned(),
+        );
+    }
+    Ok(tags.join("\n"))
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FixtureFile {

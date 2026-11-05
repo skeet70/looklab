@@ -24,10 +24,11 @@ use looklab_schema::{
 };
 use looklab_server::{AppState, Config, PowConfig, router};
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, Challenge, ContributionKind, ControlEntry, ControlKey,
-    ControlSettings, EnvelopeParts, FirmwareVersionString, Intent, Limits, ManifestHash,
-    ManifestImage, ManifestMetadata, Nonce, PowParams, PowSolutions, RawSerial, SerialHmacKey,
-    SimKey, StepIndex, WebAuthnAssertion, encode_envelope, manifest_hash, solve,
+    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, ContributionKind, ControlEntry,
+    ControlKey, ControlSettings, EnvelopeParts, FirmwareVersionString, Intent, Limits,
+    ManifestHash, ManifestImage, ManifestMetadata, Nonce, PowParams, PowSolutions, RawSerial,
+    SerialHmacKey, SimKey, StepIndex, WebAuthnAssertion, encode_envelope, manifest_hash,
+    parse_render_tag, solve,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -291,8 +292,17 @@ impl TestServer {
 
     async fn upload_valid(&mut self, serial: Option<&RawSerial>) -> (StatusCode, Value) {
         let (manifest, blobs) = manifest(valid_settings());
+        self.upload_manifest(&manifest, &blobs, serial).await
+    }
+
+    async fn upload_manifest(
+        &mut self,
+        manifest: &BatchManifest,
+        blobs: &[Vec<u8>],
+        serial: Option<&RawSerial>,
+    ) -> (StatusCode, Value) {
         let nonce = self.nonce().await;
-        let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+        let challenge = Challenge::new(&nonce, &manifest_hash(manifest));
         let assertion = self.assertion(&challenge).await;
         let pow = solve(
             &challenge,
@@ -303,11 +313,11 @@ impl TestServer {
         .expect("proof-of-work");
         let bytes = encode_envelope(&EnvelopeParts {
             nonce,
-            manifest: &manifest,
+            manifest,
             assertion: &assertion,
             pow: &pow,
             serial,
-            blobs: &blobs,
+            blobs,
         });
         self.upload_bytes(bytes).await
     }
@@ -417,8 +427,15 @@ async fn register(app: &Router, soft: &mut SoftPasskey) -> Vec<u8> {
     .await;
     assert_eq!(status, StatusCode::OK, "register start: {body}");
     let handle = body["handle"].as_str().expect("handle").to_owned();
-    let options: CreationChallengeResponse =
+    let mut options: CreationChallengeResponse =
         serde_json::from_value(body["options"].clone()).expect("creation options");
+    // SoftPasskey does not implement resident-key storage.
+    options
+        .public_key
+        .authenticator_selection
+        .as_mut()
+        .expect("authenticator selection")
+        .require_resident_key = false;
     let credential = soft
         .do_registration(AuthUrl::parse(ORIGIN).expect("origin"), options)
         .expect("software authenticator registration");
@@ -431,6 +448,17 @@ async fn register(app: &Router, soft: &mut SoftPasskey) -> Vec<u8> {
     .await;
     assert_eq!(status, StatusCode::OK, "register finish: {body}");
     raw_id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn registration_requires_a_discoverable_user_verified_credential() {
+    let server = TestServer::start().await;
+    let (status, body) = post_json(&server.app, "/api/passkey/register/start", &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let selection = &body["options"]["publicKey"]["authenticatorSelection"];
+    assert_eq!(selection["residentKey"], "required");
+    assert_eq!(selection["requireResidentKey"], true);
+    assert_eq!(selection["userVerification"], "required");
 }
 
 fn request_options(
@@ -471,6 +499,8 @@ fn metadata() -> ManifestMetadata {
         as_shot_wb: None,
         capture_month: None,
         software: Some("X-T5 Ver.2.10".to_owned()),
+        render_tag: None,
+        render_tag_malformed: false,
         look: None,
     }
 }
@@ -593,14 +623,16 @@ fn b64(bytes: &[u8]) -> String {
 
 #[derive(Clone, Copy)]
 enum RequestDomain {
-    StatusReissue,
+    Session,
+    SessionRevoke,
     Withdraw,
 }
 
 impl RequestDomain {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::StatusReissue => "status-reissue",
+            Self::Session => "session",
+            Self::SessionRevoke => "session-revoke",
             Self::Withdraw => "withdraw",
         }
     }
@@ -818,6 +850,60 @@ async fn schema_invalid_settings_are_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn card_intent_is_stored_with_its_parsed_fields() {
+    let mut server = TestServer::start().await;
+    let (mut manifest, blobs) = manifest(valid_settings());
+    let tag = render_tag();
+    manifest.intent = Intent::Card(CardDeclaration::Tagged(tag.clone()));
+    manifest.images[0].meta.render_tag = Some(tag);
+
+    let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let id = body["contribution_id"]
+        .as_str()
+        .expect("contribution id")
+        .to_owned();
+
+    let row: (String, Option<String>) =
+        sqlx::query_as("SELECT intent, card FROM contributions WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&server.db)
+            .await
+            .expect("contribution row");
+    assert_eq!(row.0, "card");
+    let declaration: CardDeclaration =
+        serde_json::from_str(row.1.as_deref().expect("card field")).expect("card json");
+    assert_eq!(declaration, CardDeclaration::Tagged(render_tag()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_card_tag_under_native_is_rejected() {
+    let mut server = TestServer::start().await;
+    let (mut manifest, blobs) = manifest(valid_settings());
+    manifest.images[0].meta.render_tag_malformed = true;
+
+    let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "MALFORMED_ENVELOPE");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn card_fields_must_match_the_images() {
+    let mut server = TestServer::start().await;
+    let (mut manifest, blobs) = manifest(valid_settings());
+    manifest.images[0].meta.render_tag = Some(render_tag());
+
+    let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "MALFORMED_ENVELOPE");
+}
+
+fn render_tag() -> looklab_upload::RenderTag {
+    parse_render_tag("looklab-card/1 fw=acme-sim/2.0.1 look=provia@1.0.0 cid=0123456789abcdef")
+        .expect("render tag")
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn withdrawal_marks_contribution_and_schedules_deletion() {
     let mut server = TestServer::start().await;
     let (status, body) = server.upload_valid(None).await;
@@ -862,32 +948,263 @@ async fn withdrawal_marks_contribution_and_schedules_deletion() {
     assert_eq!(withdrawals, 1);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn status_reissue_revokes_the_old_token() {
-    let mut server = TestServer::start().await;
-    let (status, body) = server.upload_valid(None).await;
-    assert_eq!(status, StatusCode::CREATED);
-    let old_token = body["status_token"].as_str().expect("token").to_owned();
-
+async fn signed_session_request(server: &mut TestServer, domain: RequestDomain) -> Value {
     let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::StatusReissue, ""));
+    let challenge = Challenge::new(&nonce, &request_digest(domain, ""));
     let assertion = server.assertion(&challenge).await;
-    let payload = json!({
+    json!({
         "nonce": b64(nonce.as_bytes()),
         "credential_id": b64(&assertion.credential_id),
         "authenticator_data": b64(&assertion.authenticator_data),
         "client_data_json": b64(&assertion.client_data_json),
         "signature": b64(&assertion.signature),
-    });
-    let (status, body) = post_json(&server.app, "/api/status/reissue", &payload).await;
-    assert_eq!(status, StatusCode::OK, "reissue: {body}");
-    let new_token = body["status_token"].as_str().expect("token").to_owned();
-    assert_ne!(new_token, old_token);
+    })
+}
 
-    let (status, _, _) = server.get(&format!("/status/{old_token}")).await;
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_coexist_and_revoke_every_token() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let mut tokens = vec![body["status_token"].as_str().expect("token").to_owned()];
+    for _ in 0..2 {
+        let payload = signed_session_request(&mut server, RequestDomain::Session).await;
+        let (status, body) = post_json(&server.app, "/api/session", &payload).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["roles"], json!([]));
+        assert_eq!(body["tier"], "new");
+        let token = body["status_token"].as_str().expect("token").to_owned();
+        assert!(!tokens.contains(&token));
+        tokens.push(token);
+    }
+    for token in &tokens {
+        assert_eq!(
+            server.get(&format!("/status/{token}")).await.0,
+            StatusCode::OK
+        );
+    }
+    let payload = signed_session_request(&mut server, RequestDomain::SessionRevoke).await;
+    assert_eq!(
+        post_json(&server.app, "/api/session/revoke", &payload)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    for token in &tokens {
+        assert_eq!(
+            server.get(&format!("/status/{token}")).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_returns_only_the_signing_credentials_roles_and_handle() {
+    let mut server = TestServer::start().await;
+    let other = looklab_server::CredentialId::try_from(server.add_credential().await)
+        .expect("other credential");
+    looklab_server::admin::grant_credential(
+        &server.db,
+        looklab_trust::Actor::Cli,
+        &other,
+        looklab_trust::Grant::Admin,
+        None,
+        "other profile grant",
+    )
+    .await
+    .expect("other grant");
+    let mut payload = signed_session_request(&mut server, RequestDomain::Session).await;
+    let nonce = URL_SAFE_NO_PAD
+        .decode(payload["nonce"].as_str().expect("nonce"))
+        .expect("nonce bytes");
+    let nonce = Nonce::from_slice(&nonce).expect("nonce size");
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    payload["pow"] = json!(
+        solve(&challenge, 1, &pow_params(), 0)
+            .expect("pow")
+            .as_array()
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["roles"], json!([]));
+    assert_eq!(body["tier"], "new");
+    assert_eq!(body["display_handle"], "tester");
+    let credential: String =
+        sqlx::query_scalar("SELECT id FROM credentials WHERE credential_id = ?")
+            .bind(&server.credential_id)
+            .fetch_one(&server.db)
+            .await
+            .expect("credential");
+    let credential = looklab_server::CredentialId::try_from(credential).expect("credential id");
+    for grant in [
+        looklab_trust::Grant::Moderator,
+        looklab_trust::Grant::Admin,
+        looklab_trust::Grant::Seeder,
+    ] {
+        looklab_server::admin::grant_credential(
+            &server.db,
+            looklab_trust::Actor::Cli,
+            &credential,
+            grant,
+            None,
+            "session role fixture",
+        )
+        .await
+        .expect("grant");
+    }
+    sqlx::query("UPDATE credentials SET display_handle = 'helper' WHERE id = ?")
+        .bind(credential.as_str())
+        .execute(&server.db)
+        .await
+        .expect("handle");
+    let payload = signed_session_request(&mut server, RequestDomain::Session).await;
+    let (status, body) = post_json(&server.app, "/api/session", &payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["roles"], json!(["moderator", "admin"]));
+    assert_eq!(body["tier"], "seeder");
+    assert_eq!(body["display_handle"], "helper");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_out_everywhere_closes_moderator_sessions() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    server
+        .set_credential_tier_roles(&server.credential_id, "new", "[\"moderator\"]")
+        .await;
+    let signed = server.signed_fields("mod-session", &[]).await;
+    let (status, session) = post_json(&server.app, "/api/mod/session", &signed).await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let token = session["session_token"].as_str().expect("moderator token");
+    let queue_request = || {
+        Request::builder()
+            .uri("/api/mod/queue")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .expect("queue request")
+    };
+    assert_eq!(send(&server.app, queue_request()).await.0, StatusCode::OK);
+    let signed = signed_session_request(&mut server, RequestDomain::SessionRevoke).await;
+    assert_eq!(
+        post_json(&server.app, "/api/session/revoke", &signed)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    let (status, _, body) = send(&server.app, queue_request()).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _, _) = server.get(&format!("/status/{new_token}")).await;
+    let error: Value = serde_json::from_slice(&body).expect("error response");
+    assert_eq!(error["error"], "TOKEN_UNKNOWN");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_capability_restores_current_own_profile_without_rotating_tokens() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let other = looklab_server::CredentialId::try_from(server.add_credential().await)
+        .expect("other credential");
+    looklab_server::admin::grant_credential(
+        &server.db,
+        looklab_trust::Actor::Cli,
+        &other,
+        looklab_trust::Grant::Admin,
+        None,
+        "other profile grant",
+    )
+    .await
+    .expect("other grant");
+    let signed = signed_session_request(&mut server, RequestDomain::Session).await;
+    let (status, session) = post_json(&server.app, "/api/session", &signed).await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let token = session["status_token"].as_str().expect("status token");
+    let restore = || {
+        Request::builder()
+            .uri("/api/session")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .expect("restore request")
+    };
+    let (status, _, body) = send(&server.app, restore()).await;
     assert_eq!(status, StatusCode::OK);
+    let restored: Value = serde_json::from_slice(&body).expect("restored session");
+    assert_eq!(restored, session);
+    server
+        .set_credential_tier_roles(&server.credential_id, "endorsed", "[\"moderator\"]")
+        .await;
+    let (status, _, body) = send(&server.app, restore()).await;
+    assert_eq!(status, StatusCode::OK);
+    let restored: Value = serde_json::from_slice(&body).expect("refreshed session");
+    assert_eq!(restored["status_token"], token);
+    assert_eq!(restored["roles"], json!(["moderator"]));
+    assert_eq!(restored["tier"], "endorsed");
+    assert_eq!(restored["display_handle"], "tester");
+    assert_eq!(server.get("/api/session").await.0, StatusCode::NOT_FOUND);
+    let signed = signed_session_request(&mut server, RequestDomain::SessionRevoke).await;
+    assert_eq!(
+        post_json(&server.app, "/api/session/revoke", &signed)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    let (status, _, body) = send(&server.app, restore()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let error: Value = serde_json::from_slice(&body).expect("error response");
+    assert_eq!(error["error"], "TOKEN_UNKNOWN");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_session_signed_requests_reject_pow() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    for (domain, path) in [
+        ("session-revoke", "/api/session/revoke"),
+        ("mod-session", "/api/mod/session"),
+    ] {
+        let mut signed = server.signed_fields(domain, &[]).await;
+        signed["pow"] = json!(vec![0; 16]);
+        let (status, error) = post_json(&server.app, path, &signed).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert_eq!(error["error"], "MALFORMED_ENVELOPE");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_domains_cannot_authorize_each_other() {
+    let mut server = TestServer::start().await;
+    assert_eq!(server.upload_valid(None).await.0, StatusCode::CREATED);
+    for (domain, endpoint) in [
+        (RequestDomain::Session, "/api/session/revoke"),
+        (RequestDomain::SessionRevoke, "/api/session"),
+    ] {
+        let payload = signed_session_request(&mut server, domain).await;
+        let (status, body) = post_json(&server.app, endpoint, &payload).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["error"], "SIGNATURE_INVALID");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_profile_session_requires_valid_pow_and_persists_nothing_on_failure() {
+    let mut server = TestServer::start().await;
+    for include_invalid_pow in [false, true] {
+        let mut payload = signed_session_request(&mut server, RequestDomain::Session).await;
+        if include_invalid_pow {
+            let nonce = URL_SAFE_NO_PAD
+                .decode(payload["nonce"].as_str().expect("nonce"))
+                .expect("nonce bytes");
+            let nonce = Nonce::from_slice(&nonce).expect("nonce size");
+            let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+            payload["pow"] = json!(bad_pow(&challenge, 1).as_array());
+        }
+        let (status, body) = post_json(&server.app, "/api/session", &payload).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "POW_INVALID");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credentials")
+            .fetch_one(&server.db)
+            .await
+            .expect("credential count");
+        assert_eq!(rows, 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1589,7 +1906,7 @@ async fn moderator_session_serves_the_queue_and_records_decisions() {
     let second = server.add_credential().await;
     let actor = server.persist_credential().await;
     server
-        .set_credential_tier_roles(&server.credential_id, "new", "[\"moderator\"]")
+        .set_credential_tier_roles(&server.credential_id, "seeder", "[\"moderator\"]")
         .await;
     sqlx::query("UPDATE credentials SET reputation = 1.4 WHERE id = ?")
         .bind(&second)
@@ -2238,7 +2555,7 @@ makernote: { tag: FilmMode, value: 1792 }
     );
     let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
 
-    let profile = include_str!("../../../data/interfaces/example-firmware-sim-v1.yaml");
+    let profile = include_str!("../../../data/interfaces/example-app-lut3d-v1.yaml");
     let (status, body) = server
         .submit_proposal("interface_profile", profile, &[], true)
         .await;
@@ -2517,15 +2834,15 @@ async fn an_interface_profile_with_unbounded_lut_grids_is_rejected() {
     let mut server = TestServer::start().await;
     let (status, body) = server.upload_valid(None).await;
     assert_eq!(status, StatusCode::CREATED, "upload: {body}");
-    let profile = include_str!("../../../data/interfaces/example-firmware-sim-v1.yaml");
+    let profile = include_str!("../../../data/interfaces/example-app-lut3d-v1.yaml");
 
-    let oversized = profile.replace("sizes: [17, 33, 65]", "sizes: [70000]");
+    let oversized = profile.replace("sizes: [17, 33]", "sizes: [70000]");
     let (status, body) = server
         .submit_proposal("interface_profile", &oversized, &[], true)
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "oversized side: {body}");
 
-    let over_budget = profile.replace("sizes: [17, 33, 65]", "sizes: [256, 256, 256, 256]");
+    let over_budget = profile.replace("sizes: [17, 33]", "sizes: [17, 33, 65, 129, 256]");
     let (status, body) = server
         .submit_proposal("interface_profile", &over_budget, &[], true)
         .await;

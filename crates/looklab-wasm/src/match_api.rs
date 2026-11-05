@@ -199,6 +199,9 @@ pub fn run_match(message: &MatchRequest) -> Result<MatchReply, FacadeError> {
         .first()
         .ok_or_else(|| FacadeError::Input("no settings suggestion".to_owned()))?;
     let card = settings_card(&target, &plan, &model, best)?;
+    let realization = model.realize(&best.settings)?;
+    let realization_lut =
+        looklab_publish::bake_lut(&realization.look, |xyz| model.input_xyz(&realization, xyz));
     Ok(MatchReply {
         target_slug: case.target.file.look.slug.clone(),
         target_version: case.target.file.look.version.clone(),
@@ -216,6 +219,7 @@ pub fn run_match(message: &MatchRequest) -> Result<MatchReply, FacadeError> {
             .map(SuggestionDto::from_suggestion)
             .collect(),
         stats: StatsDto::from_outcome(&outcome),
+        realization_lut,
     })
 }
 
@@ -353,4 +357,80 @@ pub fn encode_match_request(request: &MatchRequest) -> Vec<u8> {
 )]
 pub fn encode_verify_request(request: &VerifyRequestMessage) -> Vec<u8> {
     postcard::to_allocvec(request).expect("verify request is encodable")
+}
+
+#[cfg(test)]
+mod tests {
+    use looklab_match::synth;
+    use looklab_model::Look;
+    use looklab_model::file::identity;
+    use looklab_model::realization::encode_crm;
+    use looklab_schema::SimKey;
+
+    use super::{ControlResponseModel, LookDocument, MatchInputs, MatchRequest, SourceNames};
+
+    fn request(look: Look, crm: &ControlResponseModel) -> (MatchRequest, LookDocument) {
+        let document = LookDocument::from_look(
+            identity("preview-regression", "1.0.0").expect("identity"),
+            look,
+        )
+        .expect("document");
+        let request = MatchRequest {
+            inputs: MatchInputs {
+                target_look: document.encode().expect("encode look"),
+                base_look: None,
+                body_yaml: synth::SYNTH_SCHEMA.to_owned(),
+                crm: encode_crm(crm).expect("encode CRM"),
+                transform_yaml: None,
+                covariance: None,
+                emphasis: "balanced".to_owned(),
+                epoch: 1,
+                input_transform_version: 1,
+                realization_version: 1,
+                seed: 7,
+                sources: SourceNames::default(),
+            },
+        };
+        (request, document)
+    }
+
+    fn assert_finite_bounded_lut(lut: &[u8]) {
+        assert_eq!(lut.len(), looklab_publish::LUT_BYTES);
+        for (index, bytes) in lut.as_chunks::<4>().0.iter().enumerate() {
+            let value = f32::from_le_bytes(*bytes);
+            assert!(
+                value.is_finite() && (0.0..=1.0).contains(&value),
+                "channel {index}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_realization_and_target_share_full_grid_clipping() {
+        let mut crm = ControlResponseModel::zeroed(
+            &synth::schema(),
+            1,
+            &SimKey::new(synth::SYNTH_SIM).expect("sim"),
+            1,
+        )
+        .expect("zeroed CRM");
+        for step in &mut crm.exposure.steps {
+            step.ev_per_step = 0.0;
+        }
+        let (request, document) = request(Look::colorimetric(), &crm);
+        let reply = crate::run_match(&request).expect("match");
+        assert_finite_bounded_lut(&reply.realization_lut);
+        assert_eq!(
+            reply.realization_lut,
+            looklab_publish::bake_preview_lut(&document)
+        );
+    }
+
+    #[test]
+    fn nontrivial_realization_lut_is_finite_and_bounded_across_the_full_shaped_grid() {
+        let body = synth::body(9).expect("synthetic body");
+        let (request, _) = request(body.model.base_look, &body.model.crm);
+        let reply = crate::run_match(&request).expect("match");
+        assert_finite_bounded_lut(&reply.realization_lut);
+    }
 }

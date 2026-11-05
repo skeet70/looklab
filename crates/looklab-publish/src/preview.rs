@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Preview LUTs: a 33³ grid over encoded sRGB, baked from a Look and applied to
-//! canonical scenes (docs/08 §5).
+//! Preview LUTs: a 33³ grid over shaped scene-linear Rec.2020, outputting encoded sRGB.
 
-use looklab_color::cam16::{Cam16Model, ViewingConditions};
-use looklab_color::ucs::{Ucs, UcsSpace, ucs_to_jmh};
+use looklab_color::ucs::Ucs;
 use looklab_color::{Rgb, RgbSpace, Xyz};
-use looklab_model::LookDocument;
+use looklab_export::{OutputSpace, in_gamut, perceptual_clip, ucs_to_xyz};
+use looklab_model::{Look, LookDocument};
 
 use crate::PublishError;
 use crate::scene::Scene;
@@ -52,26 +51,45 @@ pub fn preview_unshaper(coordinate: f64) -> f64 {
     }
 }
 
-/// Encoded-sRGB output of [`bake_preview_lut`], little-endian `f32`, red slowest.
+/// Encoded-sRGB preview of a published Look with an identity input transform.
 pub fn bake_preview_lut(document: &LookDocument) -> Vec<u8> {
-    let model = Cam16Model::new(&ViewingConditions::reference());
+    bake_lut(&document.look, |xyz| xyz)
+}
+
+/// Encoded-sRGB output, little-endian `f32`, red slowest.
+///
+/// Out-of-gamut targets lose chroma at constant `J'` and hue (docs/04 §7).
+/// Lightness is bounded by the sRGB neutral range before chroma clipping.
+/// The input transform precedes appearance-domain projection.
+/// Inputs outside the forward appearance domain contract toward D65 at fixed luminance.
+pub fn bake_lut(look: &Look, input: impl Fn(Xyz) -> Xyz) -> Vec<u8> {
+    let lightness_ceiling = preview_lightness_ceiling();
     let mut out = Vec::with_capacity(LUT_BYTES);
     let scale = 1.0 / (LUT_SIZE - 1) as f64;
     for r in 0..LUT_SIZE {
         for g in 0..LUT_SIZE {
             for b in 0..LUT_SIZE {
-                let input = RgbSpace::Rec2020.rgb_linear_to_xyz(Rgb::new(
+                let xyz = RgbSpace::Rec2020.rgb_linear_to_xyz(Rgb::new(
                     preview_unshaper(r as f64 * scale),
                     preview_unshaper(g as f64 * scale),
                     preview_unshaper(b as f64 * scale),
                 ));
-                let clipped = document
-                    .look
-                    .output_encode(document.look.eval(input), RgbSpace::Srgb);
-                let output = ucs_to_xyz(&model, clipped);
+                let target = preview_target(look, input(xyz));
+                // Extreme grid chromaticities can exceed CAM16's inverse response domain.
+                let target = if in_gamut(target, OutputSpace::Srgb) {
+                    target
+                } else {
+                    perceptual_clip(
+                        Ucs::new(target.j.clamp(0.0, lightness_ceiling), target.a, target.b),
+                        OutputSpace::Srgb,
+                    )
+                };
+                let clipped = look.output_encode(target, RgbSpace::Srgb);
+                let output = ucs_to_xyz(clipped);
                 let encoded = RgbSpace::Srgb.xyz_to_rgb_encoded(output);
+                // Gamut membership admits a 1e-6 boundary tolerance.
                 for channel in [encoded.r, encoded.g, encoded.b] {
-                    out.extend_from_slice(&(channel as f32).to_le_bytes());
+                    out.extend_from_slice(&(channel.clamp(0.0, 1.0) as f32).to_le_bytes());
                 }
             }
         }
@@ -79,11 +97,56 @@ pub fn bake_preview_lut(document: &LookDocument) -> Vec<u8> {
     out
 }
 
-fn ucs_to_xyz(model: &Cam16Model, ucs: Ucs) -> Xyz {
-    model.jmh_to_xyz(ucs_to_jmh(ucs, UcsSpace::Ucs))
+fn preview_target(look: &Look, input: Xyz) -> Ucs {
+    let target = look.eval(input);
+    if target.to_array().iter().all(|channel| channel.is_finite()) {
+        return target;
+    }
+    let luminance = input.y.max(0.0);
+    let neutral = RgbSpace::Rec2020.rgb_linear_to_xyz(Rgb::new(luminance, luminance, luminance));
+    let mut target = look.eval(neutral);
+    let mut inside = 0.0;
+    let mut outside = 1.0;
+    // Negative scene channels can put CAM16's forward log1p outside its domain.
+    for _ in 0..32 {
+        let middle = 0.5 * (inside + outside);
+        let candidate = look.eval(Xyz::new(
+            neutral.x + middle * (input.x - neutral.x),
+            luminance,
+            neutral.z + middle * (input.z - neutral.z),
+        ));
+        if candidate
+            .to_array()
+            .iter()
+            .all(|channel| channel.is_finite())
+        {
+            inside = middle;
+            target = candidate;
+        } else {
+            outside = middle;
+        }
+    }
+    target
 }
 
-/// A canonical scene with its encoded-sRGB coordinates.
+fn preview_lightness_ceiling() -> f64 {
+    let mut inside = 0.0;
+    let mut outside = 100.0;
+    if in_gamut(Ucs::new(outside, 0.0, 0.0), OutputSpace::Srgb) {
+        return outside;
+    }
+    for _ in 0..32 {
+        let middle = 0.5 * (inside + outside);
+        if in_gamut(Ucs::new(middle, 0.0, 0.0), OutputSpace::Srgb) {
+            inside = middle;
+        } else {
+            outside = middle;
+        }
+    }
+    inside
+}
+
+/// A canonical scene with precomputed LUT interpolation corners and weights.
 #[derive(Clone, Debug)]
 pub struct PreparedScene {
     pub scene: Scene,
@@ -247,6 +310,52 @@ mod tests {
         assert!((f64::from(rgba[1]) / 255.0 - expected.g).abs() < 0.02);
         assert!((f64::from(rgba[2]) / 255.0 - expected.b).abs() < 0.02);
         assert_eq!(rgba[3], 255);
+    }
+
+    #[test]
+    fn nontrivial_lut_is_finite_and_bounded_across_the_full_shaped_grid() {
+        for lightness_offset in [-300.0, 0.0, 300.0] {
+            let mut look = Look::colorimetric();
+            look.tint.a.fill(6.0);
+            look.tint.b.fill(-4.0);
+            look.color.g.plane.fill(0.2);
+            look.color.g.volume.fill(0.2);
+            look.color.r.plane.fill(12.0);
+            look.color.r.volume.fill(12.0);
+            look.color.lambda.plane.fill(lightness_offset);
+            look.color.lambda.volume.fill(lightness_offset);
+            let document =
+                LookDocument::from_look(identity("finite-preview", "1.0.0").expect("id"), look)
+                    .expect("document");
+            let lut = bake_preview_lut(&document);
+            assert_eq!(lut.len(), LUT_BYTES);
+            for (index, bytes) in lut.as_chunks::<4>().0.iter().enumerate() {
+                let value = f32::from_le_bytes(*bytes);
+                assert!(
+                    value.is_finite() && (0.0..=1.0).contains(&value),
+                    "lightness offset {lightness_offset}, channel {index}: {value}"
+                );
+            }
+            if lightness_offset != 0.0 {
+                let scene = PreparedScene::new(
+                    Scene::new(
+                        SceneName::new("patch").expect("name"),
+                        1,
+                        1,
+                        vec![[0.2, 0.2, 0.2]],
+                    )
+                    .expect("scene"),
+                );
+                let rgba = render_preview(&lut, &scene).expect("render");
+                for channel in &rgba[..3] {
+                    if lightness_offset > 0.0 {
+                        assert!(*channel > 240, "{rgba:?}");
+                    } else {
+                        assert!(*channel < 50, "{rgba:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

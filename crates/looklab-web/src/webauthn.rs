@@ -10,7 +10,18 @@ use wasm_bindgen_futures::JsFuture;
 
 use looklab_wasm::AssertionFields;
 
+use crate::base::api_url;
 use crate::request_digest::{RequestDomain, challenge, request_digest};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialId(Vec<u8>);
+
+impl core::ops::Deref for CredentialId {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NonceReply {
@@ -67,7 +78,7 @@ struct PowWire {
 /// # Errors
 /// Reports a server or browser failure while issuing the nonce.
 pub async fn fetch_nonce() -> Result<NonceReply, String> {
-    let response = Request::post("/api/nonce")
+    let response = Request::post(&api_url("/api/nonce"))
         .header("Content-Type", "application/json")
         .send()
         .await
@@ -91,52 +102,60 @@ pub async fn fetch_nonce() -> Result<NonceReply, String> {
     })
 }
 
-/// Creates a passkey at the first contribution and returns its credential id.
-///
-/// # Errors
-/// Reports a server rejection or a WebAuthn failure.
-pub async fn create_passkey() -> Result<Vec<u8>, String> {
-    let response = Request::post("/api/passkey/register/start")
+pub async fn create_profile(
+    display_name: Option<DisplayHandle>,
+) -> Result<CredentialId, SignInError> {
+    let response = Request::post(&api_url("/api/passkey/register/start"))
         .header("Content-Type", "application/json")
-        .body(Some(JsValue::from_str("{}")))
-        .map_err(|error| error.to_string())?
+        .body(Some(JsValue::from_str(
+            &serde_json::json!({ "display_handle": display_name }).to_string(),
+        )))
+        .map_err(|_| SignInError::Registration)?
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| SignInError::Network)?;
     if !response.ok() {
-        return Err(format!("passkey start: HTTP {}", response.status()));
+        return Err(SignInError::Registration);
     }
-    let start: Value = response.json().await.map_err(|error| error.to_string())?;
+    let start: Value = response
+        .json()
+        .await
+        .map_err(|_| SignInError::InvalidResponse)?;
     let handle = start
         .get("handle")
         .and_then(Value::as_str)
-        .ok_or_else(|| "passkey start: no handle".to_owned())?
+        .ok_or(SignInError::InvalidResponse)?
         .to_owned();
-    let options = start
-        .get("options")
-        .ok_or_else(|| "passkey start: no options".to_owned())?;
-    let options = js_sys::JSON::parse(&options.to_string())
-        .map_err(|error| format!("passkey start options: {error:?}"))?;
-    patch_creation_options(&options)?;
+    let options = start.get("options").ok_or(SignInError::InvalidResponse)?;
+    let options =
+        js_sys::JSON::parse(&options.to_string()).map_err(|_| SignInError::InvalidResponse)?;
+    patch_creation_options(&options).map_err(|_| SignInError::InvalidResponse)?;
 
-    let credential = call_credentials(CredentialMethod::Create, &options).await?;
-    let credential_json = credential_to_json(&credential)?;
+    let credential = call_credentials(CredentialMethod::Create, &options)
+        .await
+        .map_err(|_| SignInError::Prompt)?;
+    let credential_json =
+        credential_to_json(&credential).map_err(|_| SignInError::InvalidResponse)?;
     let body = serde_json::json!({ "handle": handle, "credential": credential_json });
-    let response = Request::post("/api/passkey/register/finish")
+    let response = Request::post(&api_url("/api/passkey/register/finish"))
         .header("Content-Type", "application/json")
         .body(Some(JsValue::from_str(&body.to_string())))
-        .map_err(|error| error.to_string())?
+        .map_err(|_| SignInError::Registration)?
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| SignInError::Network)?;
     if !response.ok() {
-        return Err(format!("passkey finish: HTTP {}", response.status()));
+        return Err(SignInError::Registration);
     }
     let raw_id = credential_json
         .get("rawId")
         .and_then(Value::as_str)
-        .ok_or_else(|| "passkey finish: no rawId".to_owned())?;
-    decode_base64url(raw_id).ok_or_else(|| "passkey finish: rawId is not base64url".to_owned())
+        .ok_or(SignInError::InvalidResponse)?;
+    let id = decode_base64url(raw_id).ok_or(SignInError::InvalidResponse)?;
+    crate::idb::put(crate::idb::StorageKey::PENDING_PROFILE, raw_id)
+        .await
+        .map_err(|_| SignInError::Storage)?;
+    Ok(CredentialId(id))
 }
 
 /// Signs one batch challenge with the contributing passkey.
@@ -179,10 +198,29 @@ pub async fn sign_request(
     payload: &[u8],
     credential_id: Option<&[u8]>,
 ) -> Result<SignedRequest, String> {
-    let nonce = fetch_nonce().await?;
+    sign_request_classified(domain, payload, credential_id)
+        .await
+        .map_err(|error| match error {
+            SigningFailure::Nonce(message) | SigningFailure::Prompt(message) => message,
+        })
+}
+
+enum SigningFailure {
+    Nonce(String),
+    Prompt(String),
+}
+
+async fn sign_request_classified(
+    domain: RequestDomain,
+    payload: &[u8],
+    credential_id: Option<&[u8]>,
+) -> Result<SignedRequest, SigningFailure> {
+    let nonce = fetch_nonce().await.map_err(SigningFailure::Nonce)?;
     let digest = request_digest(domain, payload);
     let challenge = challenge(&nonce.nonce, &digest);
-    let assertion = sign_batch(&challenge, credential_id).await?;
+    let assertion = sign_batch(&challenge, credential_id)
+        .await
+        .map_err(SigningFailure::Prompt)?;
     Ok(SignedRequest {
         nonce: nonce.nonce,
         pow: nonce.pow,
@@ -196,49 +234,272 @@ pub async fn sign_request(
     })
 }
 
-/// Returns the stored credential id, registering a passkey on first use.
-///
-/// # Errors
-/// Reports a WebAuthn failure or a storage failure.
-pub async fn ensure_credential() -> Result<Vec<u8>, String> {
-    if let Some(text) = crate::idb::get(crate::idb::StorageKey::CREDENTIAL).await? {
-        return decode_base64url(&text)
-            .ok_or_else(|| "the stored credential id is malformed".to_owned());
-    }
-    let id = create_passkey().await?;
-    crate::idb::put(crate::idb::StorageKey::CREDENTIAL, &encode_base64url(&id)).await?;
-    Ok(id)
+pub async fn stored_credential() -> Result<CredentialId, SignInError> {
+    let text = crate::idb::get(crate::idb::StorageKey::CREDENTIAL)
+        .await
+        .map_err(|_| SignInError::Storage)?
+        .ok_or(SignInError::MissingCredential)?;
+    decode_base64url(&text)
+        .filter(|bytes| !bytes.is_empty())
+        .map(CredentialId)
+        .ok_or(SignInError::MissingCredential)
 }
 
-/// Re-issues the status link from a passkey assertion ([docs/06 §4](../../../docs/06-privacy-and-payload.md)).
-///
+pub async fn profile_credential(
+    session: crate::session::SessionContext,
+) -> Result<CredentialId, String> {
+    session
+        .require_profile()
+        .await
+        .ok_or_else(|| "Sign-in was cancelled.".to_owned())?;
+    stored_credential().await.map_err(|error| error.to_string())
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct StatusToken(String);
+
+impl StatusToken {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for StatusToken {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match decode_base64url(&value) {
+            Some(bytes) if bytes.len() == 32 => Ok(Self(value)),
+            _ => Err("invalid status token".to_owned()),
+        }
+    }
+}
+
+impl core::fmt::Debug for StatusToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("StatusToken(..)")
+    }
+}
+
+impl<'de> Deserialize<'de> for StatusToken {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::try_from(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct DisplayHandle(String);
+
+impl DisplayHandle {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for DisplayHandle {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.is_empty() || value.chars().count() > 64 || value.chars().any(char::is_control) {
+            return Err(
+                "Choose a display name of up to 64 characters, without control characters."
+                    .to_owned(),
+            );
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for DisplayHandle {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::try_from(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRole {
+    Moderator,
+    Admin,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTier {
+    New,
+    Endorsed,
+    Seeder,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct Session {
+    pub status_token: StatusToken,
+    pub roles: Vec<SessionRole>,
+    pub tier: SessionTier,
+    pub display_handle: Option<DisplayHandle>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SignInError {
+    Prompt,
+    Nonce,
+    UnknownPasskey,
+    Network,
+    Registration,
+    Work,
+    Rejected,
+    InvalidResponse,
+    MissingCredential,
+    Expired,
+    Storage,
+}
+
+impl core::fmt::Display for SignInError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::Prompt => "The passkey prompt did not finish. Try again and choose the device where you saved your passkey.",
+            Self::Nonce => "Couldn't prepare sign-in. Check your connection and try again.",
+            Self::UnknownPasskey => "We don't recognise that passkey. Create a profile instead?",
+            Self::Network => "Couldn't reach looklab. Check your connection and try again.",
+            Self::Registration => "Couldn't create your profile. Try again, or use a different passkey store.",
+            Self::Work => "Couldn't prepare your new profile. Try again on this device.",
+            Self::Rejected => "Sign-in was not accepted. Try again with your profile's passkey.",
+            Self::InvalidResponse => "looklab returned an unreadable response. Try again later.",
+            Self::MissingCredential => "Sign out here, then sign in with your profile's passkey before continuing.",
+            Self::Expired => "This sign-in link no longer works. Sign in with your passkey instead.",
+            Self::Storage => "This browser couldn't remember your sign-in. Allow site storage and try again.",
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum SessionErrorCode {
+    CredentialUnknown,
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct SessionErrorReply {
+    error: SessionErrorCode,
+}
+
 /// # Errors
 /// Reports a server rejection or a WebAuthn failure.
-pub async fn reissue_status_token(credential_id: Option<&[u8]>) -> Result<String, String> {
-    let signed = sign_request(RequestDomain::StatusReissue, &[], credential_id).await?;
-    let body = serde_json::to_value(&signed.fields).map_err(|error| error.to_string())?;
-    let response = Request::post("/api/status/reissue")
-        .header("Content-Type", "application/json")
-        .body(Some(JsValue::from_str(&body.to_string())))
-        .map_err(|error| error.to_string())?
+pub async fn sign_in(selected: Option<&CredentialId>) -> Result<Session, SignInError> {
+    let pending = crate::idb::get(crate::idb::StorageKey::PENDING_PROFILE)
+        .await
+        .map_err(|_| SignInError::Storage)?;
+    let signed = sign_request_classified(RequestDomain::Session, &[], selected.map(|id| &**id))
+        .await
+        .map_err(|error| match error {
+            SigningFailure::Nonce(_) => SignInError::Nonce,
+            SigningFailure::Prompt(_) => SignInError::Prompt,
+        })?;
+    #[derive(serde::Serialize)]
+    struct SessionRequest<'a> {
+        #[serde(flatten)]
+        signed: &'a SignedFields,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pow: Option<Vec<u64>>,
+    }
+    let pending_profile = pending.as_deref() == Some(signed.fields.credential_id.as_str());
+    let pow = if pending_profile {
+        let digest = request_digest(RequestDomain::Session, &[]);
+        Some(
+            crate::data::solve_pow(
+                challenge(&signed.nonce, &digest),
+                signed.pow.unwrap_or_else(crate::data::default_parameters),
+            )
+            .await
+            .map_err(|_| SignInError::Work)?,
+        )
+    } else {
+        None
+    };
+    let response = Request::post(&api_url("/api/session"))
+        .json(&SessionRequest {
+            signed: &signed.fields,
+            pow,
+        })
+        .map_err(|_| SignInError::InvalidResponse)?
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| SignInError::Network)?;
     if !response.ok() {
-        return Err(format!("status reissue: HTTP {}", response.status()));
+        return Err(match response.json::<SessionErrorReply>().await {
+            Ok(reply) if matches!(reply.error, SessionErrorCode::CredentialUnknown) => {
+                SignInError::UnknownPasskey
+            }
+            _ => SignInError::Rejected,
+        });
     }
-    let reply: Value = response.json().await.map_err(|error| error.to_string())?;
-    reply
-        .get("status_token")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| "status reissue: no token".to_owned())
+    let session = response
+        .json()
+        .await
+        .map_err(|_| SignInError::InvalidResponse)?;
+    crate::idb::put(
+        crate::idb::StorageKey::CREDENTIAL,
+        &signed.fields.credential_id,
+    )
+    .await
+    .map_err(|_| SignInError::Storage)?;
+    if pending_profile {
+        crate::idb::remove(crate::idb::StorageKey::PENDING_PROFILE)
+            .await
+            .map_err(|_| SignInError::Storage)?;
+    }
+    Ok(session)
+}
+
+pub async fn restore_session(token: &StatusToken) -> Result<Session, SignInError> {
+    let response = Request::get(&api_url("/api/session"))
+        .header("Authorization", &format!("Bearer {}", token.as_str()))
+        .send()
+        .await
+        .map_err(|_| SignInError::Network)?;
+    if !response.ok() {
+        return Err(if matches!(response.status(), 401 | 403 | 404) {
+            SignInError::Expired
+        } else {
+            SignInError::Rejected
+        });
+    }
+    response
+        .json()
+        .await
+        .map_err(|_| SignInError::InvalidResponse)
+}
+
+/// # Errors
+/// Reports a server rejection or a WebAuthn failure.
+pub async fn sign_out_everywhere() -> Result<(), SignInError> {
+    let credential = stored_credential().await?;
+    let signed = sign_request_classified(RequestDomain::SessionRevoke, &[], Some(&credential))
+        .await
+        .map_err(|error| match error {
+            SigningFailure::Nonce(_) => SignInError::Nonce,
+            SigningFailure::Prompt(_) => SignInError::Prompt,
+        })?;
+    let response = Request::post(&api_url("/api/session/revoke"))
+        .json(&signed.fields)
+        .map_err(|_| SignInError::InvalidResponse)?
+        .send()
+        .await
+        .map_err(|_| SignInError::Network)?;
+    if !response.ok() {
+        return Err(SignInError::Rejected);
+    }
+    Ok(())
 }
 
 /// # Errors
 /// Reports a server rejection of the envelope.
 pub async fn upload_envelope(envelope: Vec<u8>) -> Result<UploadReply, String> {
-    let response = Request::post("/api/upload")
+    let response = Request::post(&api_url("/api/upload"))
         .header("Content-Type", "application/octet-stream")
         .body(Some(JsValue::from(Uint8Array::from(envelope.as_slice()))))
         .map_err(|error| error.to_string())?

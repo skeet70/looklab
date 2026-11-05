@@ -47,6 +47,8 @@ fn capture_from_bytes(bytes: Vec<u8>) -> CaptureTuple {
         as_shot_wb: None,
         capture_month: None,
         software: Some(String::from_utf8_lossy(&bytes).into_owned()),
+        render_tag: None,
+        render_tag_malformed: false,
         look: None,
     };
     CaptureTuple::from_metadata(&metadata).expect("capture tuple encodes")

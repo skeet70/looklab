@@ -331,6 +331,7 @@ fn published_uncertainty_covers_held_out_bodies() {
                 leave_one_body_out: true,
             },
             parameters.clip_k,
+            None,
         )
         .expect("published uncertainty");
         let probes = probes_v1();
@@ -712,6 +713,7 @@ fn single_body_bootstrap_draws_images() {
             leave_one_body_out: false,
         },
         result.realization.clip_k,
+        None,
     )
     .expect("published");
     assert_eq!(

@@ -8,6 +8,13 @@ For anyone (human or agent) implementing looklab. Read [README](README.md) and t
 - If a doc is wrong or underspecified, fix it in the same PR and call it out. Don't silently diverge.
 - Thresholds marked *(tentative)* may change with evidence (data + reasoning in the PR).
 
+## Build storage and agent cleanup
+- Run builds through `nix develop` from a checkout. All linked worktrees share the main checkout's `target/` for Cargo and `target-ui/` for the UI launcher. Reuse these two roots; do not create `target/agents/<name>`, per-task target roots, or per-worktree caches. Cargo lock contention is expected; wait rather than creating another cache.
+- Every delegated task must include this storage policy and cleanup ownership in its instructions. The integration owner is responsible for cleanup after merging or abandoning the task.
+- After integration, stop the task's builds and services, remove every isolated build/cache directory the task created, and remove its clean worktree with `git worktree remove <path>`. Check for uncommitted and untracked work first; never force-remove a worktree or delete unmerged work.
+- An exceptional isolated build directory must have a named owner and be removed when its command finishes, including on failure. Do not leave it until the next session.
+- Never delete shared build roots while another task uses them. UI target roots can contain `stub-state/`, including a database and server secret; preserve that state before retiring a UI root.
+
 ## Rust conventions
 - **Stable Rust**, edition 2021 (or 2024 once adopted). `cargo fmt`; `cargo clippy --all-targets -- -D warnings`.
 - SPDX header in every source file: `// SPDX-License-Identifier: AGPL-3.0-or-later`.

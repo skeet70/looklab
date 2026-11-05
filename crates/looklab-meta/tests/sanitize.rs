@@ -96,6 +96,23 @@ fn render_tag_leaves_only_parsed_fields() {
 }
 
 #[test]
+fn malformed_render_tag_leaves_only_the_flag() {
+    const TOKEN: &str = "looklab-card/1 fw=acme-sim/2.0.1 look=provia@1.0.0 cid=NOT-A-CID";
+    let mut payload = b"ASCII\0\0\0".to_vec();
+    payload.extend_from_slice(TOKEN.as_bytes());
+    let tiff = support::build_tiff(&[], &[(0x9286, support::Value::Undefined(payload))], None);
+    let parsed = parse_tiff(&tiff).expect("synthetic TIFF");
+    let (sanitized, removed) = sanitize(&parsed);
+
+    assert!(sanitized.render_tag.is_none());
+    assert!(sanitized.render_tag_malformed);
+    let json = serde_json::to_string(&sanitized).expect("sanitized metadata is JSON");
+    support::assert_whitelisted_keys(&json);
+    assert!(!json.contains(TOKEN), "raw tag leaked in {json}");
+    assert!(removed.contains(RemovedField::UserComment));
+}
+
+#[test]
 fn removed_fields_name_every_dropped_picture_identifier() {
     let parsed = parse_tiff(&support::full_exif_tiff()).expect("synthetic TIFF");
     let (_, removed) = sanitize(&parsed);

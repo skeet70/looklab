@@ -41,35 +41,91 @@ pub(crate) async fn authenticate(
     payload: &[u8],
     action: Action,
 ) -> ApiResult<CredentialId> {
+    authenticate_with_pow(state, signed, domain, payload, action, None).await
+}
+
+pub(crate) async fn authenticate_with_pow(
+    state: &AppState,
+    signed: &SignedRequestPayload,
+    domain: RequestDomain,
+    payload: &[u8],
+    action: Action,
+    pow: Option<looklab_upload::PowSolutions>,
+) -> ApiResult<CredentialId> {
     let (assertion, nonce) = signed.decode()?;
     let raw_id = RawCredentialId::new(assertion.credential_id.clone());
     consume_nonce(state, &nonce).await?;
     if !state.rate_limiter.check(&RateKey::GlobalSigned) {
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
-    let credential = store::find_credential(&state.db, raw_id.as_slice())
+    let stored = store::find_credential(&state.db, raw_id.as_slice())
         .await
-        .map_err(|_| ApiError::new(ErrorCode::Internal))?
-        .ok_or_else(|| ApiError::new(ErrorCode::CredentialUnknown))?;
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+    let (passkey, existing, display_handle) = match stored {
+        Some(credential) => (credential.passkey, Some(credential.id), None),
+        None if domain == RequestDomain::Session => {
+            if store::credential_exists(&state.db, raw_id.as_slice()).await? {
+                return Err(ApiError::new(ErrorCode::CredentialUnknown));
+            }
+            let (passkey, handle) = state
+                .pending_credential(raw_id.as_slice())
+                .ok_or_else(|| ApiError::new(ErrorCode::CredentialUnknown))?;
+            (passkey, None, handle)
+        }
+        None => return Err(ApiError::new(ErrorCode::CredentialUnknown)),
+    };
     let challenge = Challenge::new(&nonce, &request_digest(domain, payload));
     let passkey = verify_assertion(
-        &credential.passkey,
+        &passkey,
         &assertion,
         challenge,
         &state.config.origin,
         &state.config.rp_id,
     )
     .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
-    if !state
-        .rate_limiter
-        .check(&RateKey::Assertion { action, id: raw_id })
-    {
+    if !state.rate_limiter.check(&RateKey::Assertion {
+        action,
+        id: raw_id.clone(),
+    }) {
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
-    store::update_credential_passkey(&state.db, &credential.id, &passkey)
+    if let Some(credential) = existing {
+        store::update_credential_passkey(&state.db, &credential, &passkey)
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+        Ok(credential)
+    } else {
+        let solutions = pow.ok_or_else(|| ApiError::new(ErrorCode::PowInvalid))?;
+        let params = state
+            .trust
+            .pow_params(crate::trust::NEW_CREDENTIAL_STANDING);
+        let slot = state
+            .upload_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ApiError::new(ErrorCode::Busy))?;
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            looklab_upload::verify(&challenge, 1, &params, &solutions)
+        })
         .await
-        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
-    Ok(credential.id)
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?
+        .map_err(|_| ApiError::new(ErrorCode::PowInvalid))?;
+        let credential = CredentialId::new();
+        let mut tx = state.db.begin().await?;
+        store::insert_credential(
+            &mut tx,
+            &credential,
+            raw_id.as_slice(),
+            &passkey,
+            display_handle.as_deref(),
+        )
+        .await
+        .map_err(super::upload::database_error)?;
+        tx.commit().await.map_err(super::upload::database_error)?;
+        state.remove_pending_credential(raw_id.as_slice());
+        Ok(credential)
+    }
 }
 
 pub(crate) async fn roles(state: &AppState, credential: &CredentialId) -> ApiResult<Roles> {

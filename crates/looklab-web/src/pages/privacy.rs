@@ -6,14 +6,22 @@ use leptos::prelude::*;
 pub fn PrivacyPage() -> impl IntoView {
     view! {
         <article class="prose">
-            <h1>"Privacy and client integrity"</h1>
+            <h1>"Your photos stay with you"</h1>
+            <p class="lede">"Browsing, comparing and matching looks is anonymous. Your photos are processed on your device, not uploaded."</p>
+            <h2>"When you contribute"</h2>
+            <p>"looklab extracts shuffled color samples and a short list of camera settings. No pixels, location, names or capture dates are sent. You can inspect what's being shared before you send it."</p>
+            <p>"A profile uses a passkey, with an optional public display name. There's no email address or password. Your browser stores a private sign-in link locally. Keep that link private: anyone with it can read your contribution status."</p>
+            <h2>"What others can see"</h2>
+            <p>"Individual color samples stay private. Published looks, camera models and aggregate measurements are shared under the data license. Donating an original file as a camera-data test fixture is a separate choice, made for each file."</p>
             <p>
-                "Browsing, matching and previews are anonymous and upload nothing. A credential is created only at the first contribution."
+                <a href=crate::base::site_url("/me")>"Your contributions"</a>
+                " includes withdrawal. Withdrawing stops your samples counting toward new models; already published versions remain available."
             </p>
+            <crate::ui::Disclosure summary="Technical details and independent verification".to_owned()>
             <h2 id="limits">"What a served client can and cannot prove"</h2>
             <p>
                 "Subresource Integrity and published build hashes protect against a tampered CDN. They cannot protect against a malicious origin, because the hashes come from that same origin. Client build hashes are not published yet; when the publisher emits them they will appear in the "
-                <a href="/log">"audit log"</a>"."
+                <a href=crate::base::site_url("/community/log")>"audit log"</a>"."
             </p>
             <h2 id="cli">"The CLI alternative"</h2>
             <p>
@@ -33,8 +41,9 @@ pub fn PrivacyPage() -> impl IntoView {
             </p>
             <h2 id="source">"Source"</h2>
             <p>
-                <a href="https://github.com/skeet70/looklab">"looklab on GitHub"</a>" - AGPL-3.0-or-later. This site reads only static JSON, artifacts and scene files; it has no server session."
+                <a href="https://github.com/skeet70/looklab">"looklab on GitHub"</a>" - AGPL-3.0-or-later. Published looks and previews are static files. Sharing and profiles use the looklab server."
             </p>
+            </crate::ui::Disclosure>
         </article>
     }
 }

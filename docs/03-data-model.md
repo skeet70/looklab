@@ -220,7 +220,7 @@ The model serializes as `crm.json`:
 ```
 
 ### Credential
-`id` (random internal id), `webauthn_credential` (credential id + public key, as `webauthn-rs` stores it), `display_handle?` (optional, user-chosen), `tier` (`new` | `endorsed` | `seeder`), `roles` (`moderator`, `admin`), `reputation`, `created_at`, `status` (`active` | `revoked`), `status_token_hash` (capability-token status feed; [06 §4](06-privacy-and-payload.md)). Public keys and serial HMACs are never published.
+`id` (random internal id), `webauthn_credential` (credential id + public key, as `webauthn-rs` stores it), `display_handle?` (optional, user-chosen), `tier` (`new` | `endorsed` | `seeder`), `roles` (`moderator`, `admin`), `reputation`, `created_at`, `status` (`active` | `revoked`). Status tokens are hashed rows in `status_tokens`, one per signed-in browser (capability-token status feed; [06 §4](06-privacy-and-payload.md)). Public keys and serial HMACs are never published.
 
 ### Grant, Endorsement, RootAdmission
 - `Grant`: `id`, `subject_credential`, `role_or_tier` (`seeder` | `moderator` | `admin`), `scope?: { rules: [{ body, look }] }` where either side may be `*`, `granted_by` (an admin credential or `cli`), `reason`, `granted_at`, `revoked_at?`.
@@ -363,7 +363,7 @@ The challenge signed by WebAuthn is `H(nonce ‖ sha256(manifest))`. The server 
 
 A `lut_defined` Look stores the uploaded LUT, its declared encodings and license, plus a fitted layered approximation.
 
-`look.bin` is a named-array container: `LKBN`, a little-endian `u32` array count, then per array a `u8` name length, the ASCII name, a little-endian `u32` element count and that many little-endian `f64`, arrays sorted by name. v1 names are `T` (absent for a colorimetric tone), `N`, `G`, `R`, `Lambda`, `res`, and optionally `probe_cov` (9 `f64` per probe, row-major 3×3) and `kde` (one `f64` per probe); `res` is channel-minor, `((s·17 + a)·17 + b)·3 + channel`. v1 fixes the knot vectors and residual domain, repeated in `look.json` for validation; the zip is stored, fixed-order and fixed-timestamp.
+`look.bin` is a named-array container: `LKBN`, a little-endian `u32` array count, then per array a `u8` name length, the ASCII name, a little-endian `u32` element count and that many little-endian `f64`, arrays sorted by name. v1 names are `T` (absent for a colorimetric tone), `N`, `G`, `R`, `Lambda`, `res`, and optionally `probe_cov` and `probe_cov_post` (9 `f64` per probe, row-major 3×3), `probe_sigma`, `probe_sigma_post`, `probe_bias`, `probe_pre_reliable` and `support` (one `f64` per probe) and `kde` (one `f64` per probe); `res` is channel-minor, `((s·17 + a)·17 + b)·3 + channel`. v1 fixes the knot vectors and residual domain, repeated in `look.json` for validation; the zip is stored, fixed-order and fixed-timestamp.
 
 A body's control-response model is a separate `crm.json` (§1), versioned and referenced from provenance by `control_response_version`.
 
@@ -386,7 +386,8 @@ data/looks/<slug>.json                   LookPage
 data/looks/<slug>/<version>/manifest.json VersionManifest
 data/looks/<slug>/<version>/<artifact>   artifact bytes, for example look.looklab
 data/scenes/index.json                   SceneIndex
-data/scenes/<name>.f16                   scene-linear D65 XYZ, little-endian half floats
+data/scenes/<name>.png                   RGB16 PNG of shaped scene-linear Rec.2020 coordinates
+data/scenes/<name>-thumb.png             thumbnail in the same coordinate format
 ```
 
 **VersionManifest.** `{ look, version, artifacts: [{ name, sha256, bytes }], status, gate_summary, provenance }`. `status` is `provisional | rooted | published | deprecated`; `gate_summary` lists each release check and its result; `provenance` summarizes bodies and epochs, root admissions, the anchor version, the community snapshot, prep versions, the creation time and the producing software. Every artifact is addressed by the lowercase hex SHA-256 of its bytes. `verify_artifact(manifest, name, bytes)` returns `HashMismatch` when the name is unlisted or the size or digest differs.
@@ -403,8 +404,10 @@ data/scenes/<name>.f16                   scene-linear D65 XYZ, little-endian hal
 
 **Card files.** Every published version includes `card.llk`, the firmware card file of [04 §8](04-matching-and-export.md). It is body-agnostic, listed in the manifest like any artifact, and checked before use under the client rule.
 
-**Canonical scenes** are scene-linear XYZ at the D65 white point, stored as `f16` triples with dimensions in `SceneIndex`. The sample site generates a neutral and hue gradient, a hue wheel, and skin, foliage and sky patches. Real photographic scenes replace them when project-owned releases exist.
+**Canonical scenes** originate as scene-linear D65 XYZ and are stored as RGB16 PNGs of the preview shaper's Rec.2020 coordinates, quantized to 12 bits (`looklab-scene/rec2020-shaper-png16/1`). These PNGs are LUT coordinates, not display-ready images. Full scenes have at most 1600 px on the long edge; thumbnail variants have at most 400 px. The sample site publishes six CC0 RAW photographs alongside the neutral and hue gradient, hue wheel, and skin, foliage and sky test charts.
 
-**Sample data.** `cargo run -p looklab-publish --example site_data` fits three synthetic Looks with `looklab-fit`'s `synth` feature, builds the bodies, scenes and audit log, and writes the tree above plus `site/site-root.txt` to `site/`. `trunk build --release` in `site/` then embeds the root digest and produces a site that renders with no server.
+`SceneIndex` and the authenticated `SiteIndex` list each scene's `name`, typed `kind` (`photo | test_chart`), display `title`, optional `credit` (`text`, `source_url`, `license`, `source_sha256`), dimensions, `path`, `sha256` and `bytes`. The nested `thumbnail` records its own dimensions, path, digest and byte count. Clients verify full scenes and thumbnails against the authenticated index before decoding.
+
+**Sample data.** `cargo run -p looklab-publish --example site_data` fits three synthetic Looks, builds their manifested sample camera match bundles, then computes Release audit entries from the final manifests. It publishes bodies, photographic scenes, test charts and the audit log, writing the tree above plus `site/site-root.txt` to `site/`. `publish_match_fixture` in `looklab-wasm` adds the separate `synthetic-match` test fixture without rewriting public look manifests. `trunk build --release` in `site/` embeds the root digest and produces a site that renders with no server.
 
 `looklab publish --db <sqlite> --blobs <dir> --out site/data` writes the same tree from the server database: published Look versions and their manifested artifacts, body pages from `data/bodies/`, the release entries of the audit log, and `site/site-root.txt`.

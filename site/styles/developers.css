@@ -1,0 +1,46 @@
+.developers-page { display: grid; gap: 3rem; padding-block: 1rem 3rem; }
+.developers-page header { max-width: 48rem; }
+.developers-page h1 { max-width: 22ch; margin-block: .5rem 1rem; font-size: clamp(2rem, 4.5vw, 3.5rem); line-height: 1.08; letter-spacing: -.035em; }
+.developers-page h2 { margin-top: 0; }
+.developers-page p { max-width: 70ch; }
+.developers-page .eyebrow { font-size: .8rem; font-weight: 650; letter-spacing: .1em; text-transform: uppercase; }
+.developer-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.5rem; padding: 0; margin: 0; list-style: none; }
+.developer-steps li { border-top: 1px solid var(--line); padding-top: 1.25rem; }
+.developer-step-number { display: block; margin-bottom: 1.25rem; font-variant-numeric: tabular-nums; color: var(--muted); }
+.developer-steps h2 { font-size: 1.3rem; }
+.developer-resource-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+.developer-resource-grid a { display: grid; align-content: start; gap: .6rem; padding: 1.25rem; border: 1px solid var(--line); border-radius: .6rem; text-decoration: none; }
+.developer-resource-grid a:hover strong { text-decoration: underline; }
+.developer-resource-grid span { font-size: .9rem; color: var(--muted); }
+.conformance-download { min-width: 0; }
+.conformance-sha256 { display: block; overflow-wrap: anywhere; font-size: .8rem; }
+.developer-tools { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2rem; }
+.developer-tool { min-width: 0; padding: 1.5rem; border: 1px solid var(--line); border-radius: .7rem; }
+.developers-page pre { max-width: 100%; padding: 1rem; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .85rem; line-height: 1.6; border: 1px solid var(--line); border-radius: .4rem; }
+.developer-tool textarea { display: block; width: 100%; box-sizing: border-box; margin-block: .5rem 1rem; resize: vertical; font: inherit; }
+.developer-tool .inspection-result { margin-top: 1rem; }
+.developer-tool .inspection-result h3 { margin-top: 0; }
+.developer-prose { max-width: 50rem; margin-inline: auto; }
+.developer-prose section { max-width: 70ch; }
+.developer-definition-list { display: grid; grid-template-columns: 12rem 1fr; gap: 1rem 1.5rem; }
+.developer-definition-list dt { font-weight: 650; }
+.developer-definition-list dd { margin: 0; }
+.closeness-explanation { display: grid; gap: .8rem; padding-left: 1.5rem; }
+.closeness-explanation strong { display: block; }
+.closeness-explanation span { color: var(--muted); }
+#firmware-listings { min-width: 0; }
+.firmware-table-wrap { max-width: 100%; overflow-x: auto; }
+.firmware-table { width: 100%; min-width: 42rem; border-collapse: collapse; text-align: left; font-variant-numeric: tabular-nums; }
+.firmware-table caption { padding-bottom: 1rem; text-align: left; }
+.firmware-table th, .firmware-table td { padding: .9rem .75rem; vertical-align: top; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.firmware-table th:first-child, .firmware-table td:first-child { padding-left: 0; }
+.firmware-table .disclosure { margin-top: .5rem; }
+@media (max-width: 700px) {
+  .developers-page { gap: 2rem; }
+  .developer-steps, .developer-resource-grid, .developer-tools { grid-template-columns: 1fr; }
+  .developer-steps { gap: 1rem; }
+  .developer-step-number { margin-bottom: .5rem; }
+  .developer-tool { padding: 1rem; }
+  .developer-definition-list { grid-template-columns: 1fr; gap: .4rem; }
+  .developer-definition-list dd { margin-bottom: .8rem; }
+}

@@ -33,7 +33,9 @@ pub async fn run(
     contribution_id: &looklab_server::ContributionId,
 ) -> Result<()> {
     let contribution = db::contribution(db_pool, contribution_id).await?;
-    if contribution.status == db::ContributionStatus::Withdrawn {
+    if contribution.status == db::ContributionStatus::Withdrawn
+        || contribution.intent == ContributionIntent::Card
+    {
         return Ok(());
     }
     let resources = DataDir::new(&config.data).load(&contribution.body)?;

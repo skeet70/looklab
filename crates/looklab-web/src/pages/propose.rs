@@ -4,8 +4,6 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use looklab_schema::{MENU_QUESTION, ProposalKind, ProposalView, validate_proposal};
-use wasm_bindgen::JsCast;
-use web_sys::HtmlInputElement;
 
 use crate::proposal_form::{self, FixtureFile};
 use crate::{data, files};
@@ -17,7 +15,7 @@ acros FilmMode=0x0500 GrainSize=0x0002";
 
 const BODY: &str = include_str!("../../../../data/bodies/fujifilm-x-t5.body.yaml");
 const SCHEMA: &str = include_str!("../../../../data/bodies/fujifilm-x-t5.yaml");
-const INTERFACE: &str = include_str!("../../../../data/interfaces/example-firmware-sim-v1.yaml");
+const INTERFACE: &str = include_str!("../../../../data/interfaces/example-app-lut3d-v1.yaml");
 
 fn example(kind: ProposalKind) -> &'static str {
     match kind {
@@ -74,6 +72,13 @@ struct PendingDonations {
     model: String,
 }
 
+#[derive(Clone, Debug)]
+struct MenuFileDraft {
+    name: String,
+    answer: String,
+    parsed_values: String,
+}
+
 fn body_identity(kind: ProposalKind, payload: &str) -> Option<(String, String)> {
     match validate_proposal(kind, payload).ok()? {
         looklab_schema::ValidatedPayload::Body(body) => Some((body.make, body.model)),
@@ -83,6 +88,7 @@ fn body_identity(kind: ProposalKind, payload: &str) -> Option<(String, String)> 
 
 #[component]
 pub fn ProposePage() -> impl IntoView {
+    let session = crate::session::use_session();
     let kind = RwSignal::new(ProposalKind::Mapping);
     let payload = RwSignal::new(example(ProposalKind::Mapping).to_owned());
     let files_text = RwSignal::new(EXAMPLE_FILES.to_owned());
@@ -94,10 +100,51 @@ pub fn ProposePage() -> impl IntoView {
     let message = RwSignal::new(None::<String>);
     let submitted = RwSignal::new(None::<ProposalView>);
     let pending = RwSignal::new(None::<PendingDonations>);
+    let available = crate::base::server_available();
+    let labeled = RwSignal::new(Vec::<MenuFileDraft>::new());
+    let read_mapping = Callback::new(move |selected| {
+        spawn_local(async move {
+            match files::read_files(selected).await {
+                Ok(read) => {
+                    let mut parsed = Vec::new();
+                    for file in read {
+                        match proposal_form::file_menu_value(&file.bytes) {
+                            Ok(tags) => parsed.push(MenuFileDraft {
+                                name: file.name,
+                                answer: String::new(),
+                                parsed_values: tags.replace('\n', " "),
+                            }),
+                            Err(error) => {
+                                message.set(Some(error));
+                                return;
+                            }
+                        }
+                    }
+                    labeled.set(parsed);
+                }
+                Err(error) => message.set(Some(error)),
+            }
+        });
+    });
+    let query = leptos_router::hooks::use_query_map();
+    if let Some(value) = query.get_untracked().get("kind")
+        && let Ok(initial) = value.parse::<ProposalKind>()
+        && matches!(
+            initial,
+            ProposalKind::Body
+                | ProposalKind::Mapping
+                | ProposalKind::SchemaChange
+                | ProposalKind::LutLook
+                | ProposalKind::InterfaceProfile
+        )
+    {
+        kind.set(initial);
+        payload.set(example(initial).to_owned());
+    }
 
     let preview = move || match validate_proposal(kind.get(), &payload.get()) {
         Ok(validated) => {
-            let summary = validated.summary();
+            let summary = proposal_form::menu_summary(kind.get(), &validated.summary());
             let details = summary
                 .details
                 .iter()
@@ -105,7 +152,7 @@ pub fn ProposePage() -> impl IntoView {
                 .collect_view();
             view! {
                 <div class="valid">
-                    <p class="muted">"The browser validator accepts this payload."</p>
+                    <p class="muted">"Ready for a moderator to review."</p>
                     <h3>{summary.headline}</h3>
                     <ul>{details}</ul>
                 </div>
@@ -119,7 +166,7 @@ pub fn ProposePage() -> impl IntoView {
                 .collect_view();
             view! {
                 <div class="error" role="alert">
-                    <strong>"The browser validator rejects this payload."</strong>
+                    <strong>"Check these details before sending."</strong>
                     <ul>{items}</ul>
                 </div>
             }
@@ -174,15 +221,9 @@ pub fn ProposePage() -> impl IntoView {
         Err(error) => view! { <p class="error">{error}</p> }.into_any(),
     };
 
-    let on_fixtures = move |event: leptos::ev::Event| {
-        let Some(input) = event
-            .target()
-            .and_then(|target| target.dyn_into::<HtmlInputElement>().ok())
-        else {
-            return;
-        };
+    let on_fixtures = Callback::new(move |selected| {
         spawn_local(async move {
-            match files::read_input(&input).await {
+            match files::read_files(selected).await {
                 Ok(read) => {
                     let mut parsed = Vec::with_capacity(read.len());
                     for file in read {
@@ -201,7 +242,7 @@ pub fn ProposePage() -> impl IntoView {
                 Err(error) => message.set(Some(error)),
             }
         });
-    };
+    });
 
     let submit = move |_| {
         if busy.get() {
@@ -215,9 +256,7 @@ pub fn ProposePage() -> impl IntoView {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join("; ");
-            message.set(Some(format!(
-                "The browser validator rejects this payload: {text}"
-            )));
+            message.set(Some(format!("Check these details before sending: {text}")));
             return;
         }
         let chosen: Vec<FixtureFile> = fixture_files
@@ -235,7 +274,11 @@ pub fn ProposePage() -> impl IntoView {
         if chosen.is_empty() {
             busy.set(true);
             spawn_local(async move {
-                match data::submit_proposal(current_kind, &current_payload, &[]).await {
+                if session.require_profile().await.is_none() {
+                    busy.set(false);
+                    return;
+                }
+                match data::submit_proposal(session, current_kind, &current_payload, &[]).await {
                     Ok(reply) => submitted.set(Some(reply.view)),
                     Err(error) => message.set(Some(error)),
                 }
@@ -260,9 +303,13 @@ pub fn ProposePage() -> impl IntoView {
         busy.set(true);
         message.set(None);
         spawn_local(async move {
+            if session.require_profile().await.is_none() {
+                busy.set(false);
+                return;
+            }
             let mut donations = Vec::with_capacity(selected.files.len());
             for file in &selected.files {
-                let source = match data::upload_fixture(file).await {
+                let source = match data::upload_fixture(session, file).await {
                     Ok(source) => source,
                     Err(error) => {
                         message.set(Some(error));
@@ -280,7 +327,7 @@ pub fn ProposePage() -> impl IntoView {
                     }
                 }
             }
-            match data::submit_proposal(current_kind, &current_payload, &donations).await {
+            match data::submit_proposal(session, current_kind, &current_payload, &donations).await {
                 Ok(reply) => {
                     submitted.set(Some(reply.view));
                     pending.set(None);
@@ -295,10 +342,7 @@ pub fn ProposePage() -> impl IntoView {
 
     view! {
         <h1>"Propose a change"</h1>
-        <p>
-            "Proposals are shown in menu terms. The same validator that CI runs checks the payload here
-            in the browser, so errors are caught before submission."
-        </p>
+        <p class="lede">"Tell us what your camera can do. A moderator will check your change and the evidence you share."</p>
         <section aria-labelledby="payload">
             <h2 id="payload">"The change"</h2>
             <label for="kind">"What are you proposing?"</label>
@@ -312,7 +356,7 @@ pub fn ProposePage() -> impl IntoView {
                     }
                 }
             >
-                {ProposalKind::ALL
+                {[ProposalKind::Body, ProposalKind::Mapping, ProposalKind::SchemaChange, ProposalKind::LutLook, ProposalKind::InterfaceProfile]
                     .into_iter()
                     .map(|candidate| {
                         view! {
@@ -320,12 +364,14 @@ pub fn ProposePage() -> impl IntoView {
                                 value=candidate.as_str()
                                 prop:selected=move || kind.get() == candidate
                             >
-                                {candidate.menu_label()}
+                                {proposal_form::kind_label(candidate)}
                             </option>
                         }
                     })
                     .collect_view()}
             </select>
+            <MenuFields kind payload/>
+            <crate::ui::Disclosure summary="Advanced".to_owned()>
             <label for="payload-yaml">"Payload (YAML, validated locally)"</label>
             <textarea
                 id="payload-yaml"
@@ -334,15 +380,29 @@ pub fn ProposePage() -> impl IntoView {
                 prop:value=move || payload.get()
                 on:input=move |event| payload.set(event_target_value(&event))
             ></textarea>
-            <h3>"Menu-level summary"</h3>
+            </crate::ui::Disclosure>
+            <h3>"Your proposed change"</h3>
             {preview}
         </section>
-        <section aria-labelledby="mapping">
-            <h2 id="mapping">"Film simulation mapping"</h2>
-            <p>
-                "Label a few files with the menu answer and paste their parsed makernote values.
-                The app infers which tag separates the answers."
-            </p>
+        <section aria-labelledby="mapping" hidden=move || kind.get() != ProposalKind::Mapping>
+            <h2 id="mapping">"Which film simulation was this shot with?"</h2>
+            <p>"Choose several original camera files, then label each with its film simulation. Photos stay on this device."</p>
+            <crate::ui::DropZone on_files=read_mapping accept=".jpg,.jpeg,.raf".to_owned() folders=false/>
+            {move || labeled.get().into_iter().enumerate().map(|(index, file)| view! {
+                <label for=format!("mapping-answer-{index}")>{file.name}</label>
+                <input id=format!("mapping-answer-{index}") value=file.answer placeholder="For example: Classic Chrome" on:input=move |event| {
+                    labeled.update(|files| files[index].answer = event_target_value(&event));
+                    let text = labeled.get().iter().filter(|file| !file.answer.is_empty()).map(|file| format!("{} {}", file.answer.to_lowercase().replace([' ', '-'], "_"), file.parsed_values)).collect::<Vec<_>>().join("\n");
+                    if let Ok(inferred) = proposal_form::parse_labeled_files(&text)
+                        && let Some(best) = inferred.best()
+                        && let Some((_, value)) = best.pairs.iter().find(|(label, _)| payload.get().lines().any(|line| line.strip_prefix("sim_key:").is_some_and(|value| value.trim().trim_matches('"') == label.as_str())))
+                    {
+                        payload.update(|text| *text = text.lines().map(|line| if line.starts_with("makernote:") { format!("makernote: {{ tag: {}, value: {} }}", best.tag, value.0) } else { line.to_owned() }).collect::<Vec<_>>().join("\n"));
+                    }
+                    files_text.set(text);
+                }/>
+            }).collect_view()}
+            <crate::ui::Disclosure summary="Advanced: parsed file information".to_owned()>
             <label for="mapping-files">"One file per line: answer Tag=value ..."</label>
             <textarea
                 id="mapping-files"
@@ -352,16 +412,12 @@ pub fn ProposePage() -> impl IntoView {
                 on:input=move |event| files_text.set(event_target_value(&event))
             ></textarea>
             {inference}
+            </crate::ui::Disclosure>
         </section>
         <section aria-labelledby="fixtures">
-            <h2 id="fixtures">"Fixture donation"</h2>
-            <p>
-                "Each file is a separate opt-in. The consent record holds your handle, the date,
-                the CC0-1.0 license and the file's sha256, and exports into fixtures/manifest.toml.
-                Mappings without a donated fixture stay provisional."
-            </p>
-            <label for="fixture-files">"Files you can donate"</label>
-            <input type="file" id="fixture-files" multiple on:change=on_fixtures/>
+            <h2 id="fixtures">"Donate sample files"</h2>
+            <p>"Choose each file you want to share under CC0. Only checked files leave this device, and they stay private until your proposal is approved. Without a sample file, a mapping is marked as not yet confirmed."</p>
+            <crate::ui::DropZone on_files=on_fixtures/>
             <div class="field-row">
                 <label for="fixture-make">"Make"</label>
                 <input
@@ -416,12 +472,10 @@ pub fn ProposePage() -> impl IntoView {
         </section>
         <section aria-labelledby="submit">
             <h2 id="submit">"Submit"</h2>
-            <p>
-                "Submission needs your passkey's signature over the payload and a proof-of-work,
-                and is rate-limited per credential."
-            </p>
-            <button type="button" id="submit-proposal" disabled=move || busy.get() on:click=submit>
-                {move || if busy.get() { "Signing and working…" } else { "Sign and submit" }}
+            <p>"Sign in to send your proposal. Preparing it keeps spam out. A moderator will review it before camera data changes."</p>
+            {(!available).then(crate::ui::preview_notice)}
+            <button type="button" id="submit-proposal" disabled=move || busy.get() || !available on:click=submit>
+                {move || if busy.get() { "Preparing proposal…" } else { "Submit proposal" }}
             </button>
             {move || {
                 pending
@@ -464,7 +518,7 @@ pub fn ProposePage() -> impl IntoView {
                                     <button
                                         type="button"
                                         id="confirm-donation"
-                                        disabled=move || busy.get()
+                                        disabled=move || busy.get() || !available
                                         on:click=confirm_donations
                                     >
                                         "Upload files and submit"
@@ -491,7 +545,8 @@ pub fn ProposePage() -> impl IntoView {
                 submitted
                     .get()
                     .map(|proposal| {
-                        let href = format!("/proposals/{}", proposal.id.as_str());
+                        let href =
+                            crate::base::site_url(&format!("/proposals/{}", proposal.id.as_str()));
                         view! {
                             <div class="valid">
                                 <p>"Submitted. It is now in the moderation queue."</p>
@@ -502,4 +557,215 @@ pub fn ProposePage() -> impl IntoView {
             }}
         </section>
     }
+}
+
+#[derive(Clone, Copy)]
+enum MenuField {
+    Camera,
+    Make,
+    Model,
+    Name,
+    Look,
+    Simulation,
+    Firmware,
+    Attribution,
+    Identifier,
+}
+
+impl MenuField {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Camera => "body",
+            Self::Make => "make",
+            Self::Model => "model",
+            Self::Name => "name",
+            Self::Look => "look",
+            Self::Simulation => "sim_key",
+            Self::Firmware => "firmware_from",
+            Self::Attribution => "attribution",
+            Self::Identifier => "id",
+        }
+    }
+    fn display_value(self, value: &str) -> String {
+        match self {
+            Self::Simulation => value.replace('_', " "),
+            _ => value.to_owned(),
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Camera => "Camera (make/model)",
+            Self::Make => "Camera make",
+            Self::Model => "Camera model",
+            Self::Name => "Name",
+            Self::Look => "Look name in links",
+            Self::Simulation => "Film simulation in the camera menu",
+            Self::Firmware => "Available from firmware version",
+            Self::Attribution => "Credit the author",
+            Self::Identifier => "Name in links",
+        }
+    }
+}
+
+#[component]
+fn MenuFields(kind: RwSignal<ProposalKind>, payload: RwSignal<String>) -> impl IntoView {
+    view! {
+        <div class="proposal-fields">
+        {move || (kind.get() == ProposalKind::SchemaChange).then(|| view! { <ControlFields payload/> })}
+        {move || {
+            let fields = match kind.get() {
+                ProposalKind::Body => vec![MenuField::Identifier, MenuField::Make, MenuField::Model],
+                ProposalKind::Mapping => vec![MenuField::Camera, MenuField::Simulation, MenuField::Look, MenuField::Firmware],
+                ProposalKind::SchemaChange => vec![MenuField::Camera],
+                ProposalKind::LutLook => vec![MenuField::Look, MenuField::Name, MenuField::Attribution],
+                ProposalKind::InterfaceProfile => vec![MenuField::Identifier, MenuField::Name],
+                _ => vec![],
+            };
+            fields.into_iter().map(|field| {
+                let key = field.key();
+                let id = format!("proposal-{key}");
+                view! {
+                    <label for=id.clone()>{field.label()}</label>
+                    <input id=id prop:value=move || payload.get().lines().find_map(|line| line.strip_prefix(&format!("{key}:")).map(|value| field.display_value(value.trim().trim_matches('"')))).unwrap_or_default()
+                        on:input=move |event| {
+                            let input = event_target_value(&event);
+                            let input = if matches!(field, MenuField::Simulation) { input.to_lowercase().replace([' ', '-'], "_") } else { input };
+                            let value = serde_json::to_string(&input).unwrap_or_default();
+                            payload.update(|text| {
+                                let prefix = format!("{key}:");
+                                *text = text.lines().map(|line| if line.starts_with(&prefix) { format!("{key}: {value}") } else { line.to_owned() }).collect::<Vec<_>>().join("\n");
+                            });
+                        }/>
+                    {move || validate_proposal(kind.get(), &payload.get()).err().map(|errors| errors.into_iter().filter(|error| error.path == key || error.path.starts_with(&format!("{key}."))).map(|error| view! { <p class="error" role="alert">{error.kind.to_string()}</p> }).collect_view())}
+                }
+            }).collect_view()
+        }}
+        {move || (kind.get() == ProposalKind::LutLook).then(|| view! { <label class="consent"><input type="checkbox" checked on:change=move |event| {
+            let own = event_target_checked(&event);
+            payload.update(|text| *text = text.lines().map(|line| if line.starts_with("license:") { format!("license: {{ own_work: {own} }}") } else { line.to_owned() }).collect::<Vec<_>>().join("\n"));
+        }/>"I made this look and may share it under the data license."</label><label for="look-source-license">"Or name the license that allows redistribution"</label><input id="look-source-license" placeholder="For example: CC0-1.0" on:input=move |event| {
+            let license = serde_json::to_string(&event_target_value(&event)).unwrap_or_default();
+            payload.update(|text| *text = text.lines().map(|line| if line.starts_with("license:") { format!("license: {{ own_work: false, source_license: {license} }}") } else { line.to_owned() }).collect::<Vec<_>>().join("\n"));
+        }/> })}
+        </div>
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlField {
+    Range,
+    Step,
+    Default,
+    Choices,
+}
+
+impl ControlField {
+    fn parse(line: &str) -> Option<Self> {
+        match line.split_once(':')?.0.trim() {
+            "range" => Some(Self::Range),
+            "step" => Some(Self::Step),
+            "default" => Some(Self::Default),
+            "values" => Some(Self::Choices),
+            _ => None,
+        }
+    }
+    fn key(self) -> &'static str {
+        match self {
+            Self::Range => "range",
+            Self::Step => "step",
+            Self::Default => "default",
+            Self::Choices => "values",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Range => "Minimum and maximum",
+            Self::Step => "Step size",
+            Self::Default => "Default setting",
+            Self::Choices => "Menu choices",
+        }
+    }
+}
+
+#[component]
+fn ControlFields(payload: RwSignal<String>) -> impl IntoView {
+    let rows = Memo::new(move |_| {
+        let text = payload.get();
+        let mut in_controls = false;
+        let mut control = String::new();
+        let mut firmware = String::new();
+        let mut rows = Vec::new();
+        let mut epoch_index: Option<usize> = None;
+        let mut control_index: Option<usize> = None;
+        for (index, line) in text.lines().enumerate() {
+            if line.starts_with("  - id:") {
+                epoch_index = Some(epoch_index.map_or(0, |index| index + 1));
+            }
+            if let Some(value) = line.trim().strip_prefix("firmware:") {
+                firmware = value
+                    .replace(['{', '}', '"'], "")
+                    .replace("from:", "")
+                    .replace(", to:", " to")
+                    .trim()
+                    .to_owned();
+            }
+            if line.trim() == "controls:" {
+                in_controls = true;
+                control_index = None;
+                continue;
+            }
+            if !in_controls {
+                continue;
+            }
+            if line.starts_with("    ") && !line.starts_with("      ") {
+                in_controls = false;
+                continue;
+            }
+            if let Some(key) = line.trim().strip_prefix("- key:") {
+                control = key.trim().replace('_', " ");
+                control_index = Some(control_index.map_or(0, |index| index + 1));
+            }
+            if let Some(field) = ControlField::parse(line)
+                && line.starts_with("        ")
+                && !line.starts_with("          ")
+            {
+                rows.push((
+                    index,
+                    control.clone(),
+                    firmware.clone(),
+                    field,
+                    line.split_once(':')
+                        .map(|(_, value)| value.trim().to_owned())
+                        .unwrap_or_default(),
+                    format!(
+                        "epochs[{}].controls[{}].{}",
+                        epoch_index.unwrap_or_default(),
+                        control_index.unwrap_or_default(),
+                        field.key()
+                    ),
+                ));
+            }
+        }
+        rows
+    });
+    view! { <section><h3>"Camera controls"</h3><p>"Edit settings in camera menu order. Enter ranges as [minimum, maximum], and menu choices in brackets."</p>
+        {move || rows.get().into_iter().map(|(index, control, firmware, field, value, path)| view! {
+            <label for=format!("control-{index}")>{format!("{} · {}", control, field.label())}</label>
+            <small class="muted">{format!("Firmware versions {firmware}")}</small>
+            <input id=format!("control-{index}") value=value on:change=move |event| {
+                let value = event_target_value(&event);
+                payload.update(|text| *text = text.lines().enumerate().map(|(line_index, line)| {
+                    if line_index == index { format!("{}: {value}", line.split_once(':').map(|(key, _)| key).unwrap_or_default()) } else { line.to_owned() }
+                }).collect::<Vec<_>>().join("\n"));
+            }/>
+            {move || validate_proposal(ProposalKind::SchemaChange, &payload.get())
+                .err()
+                .map(|errors| errors.into_iter()
+                    .filter(|error| error.path == path || error.path.starts_with(&format!("{path}[")))
+                    .map(|error| view! {
+                        <p class="error" role="alert">{error.kind.to_string()}</p>
+                    })
+                    .collect_view())}
+        }).collect_view()}
+    </section> }
 }

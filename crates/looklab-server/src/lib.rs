@@ -48,7 +48,11 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(api::passkey::register_finish),
         )
         .route("/api/upload", post(api::upload::upload))
-        .route("/api/status/reissue", post(api::status::reissue))
+        .route(
+            "/api/session",
+            post(api::status::session).get(api::status::restore_session),
+        )
+        .route("/api/session/revoke", post(api::status::revoke_session))
         .route("/api/withdraw", post(api::withdraw::withdraw))
         .route("/api/admin/grant", post(api::admin::grant))
         .route("/api/admin/revoke-grant", post(api::admin::revoke_grant))
@@ -87,6 +91,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/fixtures/manifest.toml",
             get(api::proposals::fixture_manifest),
         )
+        .route("/api/recipes", get(api::bounties::recipes))
+        .route("/api/cards/verification", get(api::cards::verifications))
+        .route("/bounties.json", get(api::bounties::bounties))
         .route("/log.json", get(api::public::audit_log))
         .route("/lists/grants.json", get(api::public::grants))
         .route("/lists/endorsements.json", get(api::public::endorsements))

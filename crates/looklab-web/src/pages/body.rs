@@ -13,11 +13,19 @@ use crate::ui;
 pub fn BodyDetail() -> impl IntoView {
     let params = use_params_map();
     let state = RwSignal::new(Load::<BodyPage>::Loading);
+    let generation = RwSignal::new(0_u32);
     Effect::new(move |_| {
         let make = params.read().get("make").unwrap_or_default();
         let model = params.read().get("model").unwrap_or_default();
-        wasm_bindgen_futures::spawn_local(async move {
-            state.set(match data::body(&make, &model).await {
+        let mine = generation.get_untracked() + 1;
+        generation.set(mine);
+        state.set(Load::Loading);
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
+            let result = data::body(&make, &model).await;
+            if generation.try_get_untracked() != Some(mine) {
+                return;
+            }
+            state.set(match result {
                 Ok(body) => Load::Ready(body),
                 Err(error) => Load::Failed(error),
             });
@@ -48,14 +56,73 @@ fn BodyDetailView(body: BodyPage) -> impl IntoView {
         }
     };
     let initial_epoch = body.epochs.first().map(|epoch| epoch.id);
+    let gallery = RwSignal::new(
+        Load::<(
+            looklab_publish::SiteIndex,
+            std::sync::Arc<looklab_publish::PreparedScene>,
+        )>::Loading,
+    );
+    Effect::new(move |_| {
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
+            gallery.set(
+                match async { Ok((data::index().await?, super::looks::photo().await?)) }.await {
+                    Ok(value) => Load::Ready(value),
+                    Err(error) => Load::Failed(error),
+                },
+            );
+        });
+    });
+    let camera_id = body.id.clone();
+    let match_camera = body.id.clone();
+    let navigate = leptos_router::hooks::use_navigate();
 
     view! {
         <h1>{format!("{} {}", body.make, body.model)}</h1>
-        <p class="muted">{body.id.to_string()}</p>
+        <p class="lede">"Explore its built-in color, then find settings for the looks you love."</p>
+        <h2>"Built-in looks"</h2>
+        {move || match gallery.get() { Load::Ready((index,scene)) => {
+            let items=super::looks::cards(&index);
+            let built_in=items.iter().filter(|item|index.bodies.iter().any(|body|body.id==camera_id && body.looks.contains(&item.slug))).cloned().collect::<Vec<_>>();
+            let on_select = {
+                let camera = match_camera.clone();
+                let navigate = navigate.clone();
+                Callback::new(move |item: ui::LookCardItem| {
+                    navigate(&format!("/match?camera={camera}&look={}", item.slug), Default::default());
+                })
+            };
+            view! {
+                <div class="look-gallery">
+                    {built_in.into_iter().map(|item| view! {
+                        <super::looks::CharacterCard item scene=scene.clone()/>
+                    }).collect_view()}
+                </div>
+                <h2>"Get any look on this camera"</h2>
+                <ui::LookPicker items scene on_select/>
+                <p>"These simulated previews use the shared measurements available so far. More photos help us check agreement across cameras."</p>
+            }.into_any()
+        },Load::Failed(error)=>ui::failure(&error).into_any(),_=>ui::loading().into_any() }}
+        <h2>"Ways to apply looks"</h2><p>"Start with in-camera settings, or use an editing app."</p><a href=crate::base::site_url(&format!("/match?camera={}",body.id))>"Find settings and downloads →"</a>
+        <section><h2>"Help with this camera"</h2><a href=crate::base::site_url("/contribute/wanted")>"See wanted shots →"</a></section>
+        <super::recipes::RecipeSection camera=body.id.clone()/>
+        <section aria-labelledby="realization">
+            <h2 id="realization">"Rendering notes"</h2>
+            {if body.realization_notes.is_empty() {
+                view! { <p class="muted">"No rendering notes for this camera."</p> }.into_any()
+            } else {
+                view! {
+                    <ul>
+                        {body.realization_notes.iter().map(|note| {
+                            view! { <li>{note.text.clone()}</li> }
+                        }).collect_view()}
+                    </ul>
+                }.into_any()
+            }}
+        </section>
+        <ui::Disclosure summary="Technical details".to_owned()>
         <dl class="facts">
-            <dt>"Kind"</dt><dd>{format!("{:?}", body.kind).to_lowercase()}</dd>
+            <dt>"Kind"</dt><dd>{ui::camera_kind_label(body.kind)}</dd>
             <dt>"Status"</dt><dd>{format!("{:?}", body.status).to_lowercase()}</dd>
-            <dt>"Mapping status"</dt><dd>{format!("{:?}", body.mapping_status).to_lowercase().replace('_', " ")}</dd>
+            <dt>"Sample-file confirmation"</dt><dd>{ui::mapping_status_label(body.mapping_status)}</dd>
             <dt>"EXIF aliases"</dt><dd>{body.exif_aliases.join(", ")}</dd>
         </dl>
         <section aria-labelledby="capabilities">
@@ -83,23 +150,9 @@ fn BodyDetailView(body: BodyPage) -> impl IntoView {
                 None => view! { <p class="muted">"No published input transform."</p> }.into_any(),
             }}
         </section>
-        <section aria-labelledby="realization">
-            <h2 id="realization">"Realization notes"</h2>
-            {if body.realization_notes.is_empty() {
-                view! { <p class="muted">"No realization notes for this body."</p> }.into_any()
-            } else {
-                view! {
-                    <ul>
-                        {body.realization_notes.iter().map(|note| {
-                            view! { <li>{note.text.clone()}</li> }
-                        }).collect_view()}
-                    </ul>
-                }.into_any()
-            }}
-        </section>
         <section aria-labelledby="schema">
             <h2 id="schema">"Control schema"</h2>
-            <label for="epoch-select">"Epoch"</label>
+            <label for="epoch-select">"Firmware versions"</label>
             <select
                 id="epoch-select"
                 on:change=move |event| {
@@ -110,36 +163,16 @@ fn BodyDetailView(body: BodyPage) -> impl IntoView {
                     let id = epoch.id;
                     view! {
                         <option value=id.to_string() selected=Some(id) == initial_epoch>
-                            {format!("Epoch {id} · firmware {}–{}", epoch.firmware_from, epoch.firmware_to)}
+                            {format!("Firmware versions {} to {}", epoch.firmware_from, epoch.firmware_to)}
                         </option>
                     }
                 }).collect_view()}
             </select>
             {move || selected().map(|epoch| view! { <ControlTable epoch/> })}
-            <h3>"Differences between epochs"</h3>
+            <h3>"Differences between firmware ranges"</h3>
             <EpochDifferences epochs=body.epochs.clone()/>
         </section>
-        <section aria-labelledby="native-looks">
-            <h2 id="native-looks">"Native looks"</h2>
-            <ul class="card-list">
-                {body.native_looks.iter().map(|card| {
-                    let slug = card.look.to_string();
-                    view! {
-                        <li class="card">
-                            <h3><a href=format!("/looks/{slug}")>{slug.clone()}</a></h3>
-                            <p class="muted">{format!("Epoch {} · sim {}", card.epoch, card.sim_key)}</p>
-                            <p>
-                                {match &card.version {
-                                    Some(version) => format!("Version {version}"),
-                                    None => "No published version".to_owned(),
-                                }}
-                            </p>
-                            {card.status.map(|status| view! { <ui::StatusBadge status/> })}
-                        </li>
-                    }
-                }).collect_view()}
-            </ul>
-        </section>
+        </ui::Disclosure>
     }
 }
 
@@ -150,9 +183,9 @@ fn yes_no(value: bool) -> &'static str {
 #[component]
 fn ControlTable(epoch: EpochPage) -> impl IntoView {
     view! {
-        <h3>{format!("Epoch {} controls", epoch.id)}</h3>
+        <h3>{format!("Firmware range {} controls", epoch.id)}</h3>
         <table class="data-table">
-            <caption>{format!("Controls in epoch {}", epoch.id)}</caption>
+            <caption>{format!("Controls in firmware range {}", epoch.id)}</caption>
             <thead>
                 <tr>
                     <th scope="col">"Control"</th>
@@ -215,7 +248,7 @@ fn default_text(control: &ControlPage) -> String {
 #[component]
 fn EpochDifferences(epochs: Vec<EpochPage>) -> impl IntoView {
     let Some(first) = epochs.first() else {
-        return view! { <p class="muted">"No epochs."</p> }.into_any();
+        return view! { <p class="muted">"No firmware ranges."</p> }.into_any();
     };
     let mut rows = Vec::new();
     for epoch in epochs.iter().skip(1) {
@@ -231,21 +264,21 @@ fn EpochDifferences(epochs: Vec<EpochPage>) -> impl IntoView {
             .collect();
         for (key, control) in &current {
             match previous.get(key) {
-                None => rows.push(format!("Epoch {} adds {key}", epoch.id)),
+                None => rows.push(format!("Firmware range {} adds {key}", epoch.id)),
                 Some(before) if *before != *control => {
-                    rows.push(format!("Epoch {} changes {key}", epoch.id));
+                    rows.push(format!("Firmware range {} changes {key}", epoch.id));
                 }
                 Some(_) => {}
             }
         }
         for key in previous.keys() {
             if !current.contains_key(key) {
-                rows.push(format!("Epoch {} removes {key}", epoch.id));
+                rows.push(format!("Firmware range {} removes {key}", epoch.id));
             }
         }
     }
     if rows.is_empty() {
-        view! { <p class="muted">"All epochs share one control set."</p> }.into_any()
+        view! { <p class="muted">"All firmware ranges share one control set."</p> }.into_any()
     } else {
         view! {
             <ul>{rows.into_iter().map(|row| view! { <li>{row}</li> }).collect_view()}</ul>

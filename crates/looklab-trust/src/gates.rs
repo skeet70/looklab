@@ -2,8 +2,9 @@
 //! Release gates against the previous version and the anchor ([docs/05 §8]).
 //!
 //! Root non-regression compares each version's ΔE to the admitted root observations,
-//! not to the anchor prediction. Every input validation failure is a violation and
-//! fails the gate: an omitted probe cannot pass.
+//! not to the anchor prediction. Drift is measured on post-clip predictions, with
+//! pre-clip `J'` and hue drift bounded by the same ceiling. Every input validation
+//! failure is a violation and fails the gate: an omitted probe cannot pass.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,59 +14,143 @@ use serde::{Deserialize, Serialize};
 use crate::params::TrustParams;
 use crate::region::{EXPOSURE_MAX, EXPOSURE_MIN};
 
+/// One probe's fit output before support is decided.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProbePrediction {
+    pub id: ProbeId,
+    /// Pre-clip `J'a'b'` the Look defines.
+    pub pre_clip: [f64; 3],
+    /// `σ_ΔE` of the pre-clip prediction.
+    pub sigma_pre_clip: f64,
+    /// Post-clip `J'a'b'` in the version's reference output encoding.
+    pub post_clip: [f64; 3],
+    /// `σ_ΔE` of the post-clip prediction.
+    pub sigma_post_clip: f64,
+    /// `|b_p|`: the identity-prior-attributable bias, ΔE.
+    pub bias_de: f64,
+    /// Absolute tempered effective weight per bin at the probe.
+    pub density: f64,
+    /// Distinct images with non-negligible weight near the probe.
+    pub clusters: usize,
+    /// The soft clip at the pre-clip prediction is not saturated: its smallest
+    /// per-channel derivative is at least [`IDENTIFIED_CLIP_DERIVATIVE`].
+    pub pre_clip_identified: bool,
+}
+
+/// Smallest soft-clip derivative at which the pre-clip value counts as identified
+/// (docs/05 §8). The fit sets [`ProbePrediction::pre_clip_identified`].
+pub const IDENTIFIED_CLIP_DERIVATIVE: f64 = 0.25;
+
+/// Thresholds for the four support tests (docs/05 §8). Mirror the fit's
+/// `FitOptions` support fields; a worker must configure both from the same values.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SupportThresholds {
+    /// Post-clip `σ_ΔE` at which a probe enters support.
+    pub sigma: f64,
+    /// Post-clip `σ_ΔE` at which a supported probe leaves support.
+    pub sigma_exit: f64,
+    /// `|b_p|` at which a probe enters support, as a fraction of [`Self::sigma`].
+    pub bias_fraction: f64,
+    /// Factor on the bias threshold once a probe is supported.
+    pub bias_exit_factor: f64,
+    /// Absolute tempered effective weight per bin a probe's region needs.
+    pub density_floor: f64,
+    /// Distinct-image clusters a probe needs.
+    pub min_clusters: usize,
+}
+
+impl Default for SupportThresholds {
+    fn default() -> Self {
+        Self {
+            sigma: 1.5,
+            sigma_exit: 1.65,
+            bias_fraction: 0.33,
+            bias_exit_factor: 1.1,
+            density_floor: 0.5,
+            min_clusters: 3,
+        }
+    }
+}
+
+/// The four support tests at one probe (docs/05 §8).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeSupport {
+    /// The post-clip σ passed the enter or the exit threshold.
+    pub sigma: bool,
+    /// The region's density reached the absolute floor.
+    pub density: bool,
+    /// The probe has enough distinct-image clusters.
+    pub clusters: bool,
+    /// `|b_p|` passed the enter or the exit threshold.
+    pub bias: bool,
+}
+
+impl ProbeSupport {
+    /// A probe is supported only when every cause is.
+    pub fn supported(&self) -> bool {
+        self.sigma && self.density && self.clusters && self.bias
+    }
+}
+
 /// One version's prediction at one probe.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProbeEstimate {
     pub id: ProbeId,
-    /// Predicted CAM16-UCS `J'a'b'`.
-    pub jab: [f64; 3],
-    /// `σ_ΔE` of this version at the probe.
-    pub sigma: f64,
-    /// `sigma <= support_sigma`.
-    pub sigma_ok: bool,
-    /// The probe's local sample density reaches the fit's density floor.
-    pub density_ok: bool,
-    /// The fit's support rule: `sigma_ok && density_ok` and outside the clip shoulder.
-    pub supported: bool,
+    /// Pre-clip `J'a'b'` the Look defines.
+    pub pre_clip: [f64; 3],
+    /// `σ_ΔE` of the pre-clip prediction.
+    pub sigma_pre_clip: f64,
+    /// Post-clip `J'a'b'` after the reference encoding and the version's soft clip.
+    pub post_clip: [f64; 3],
+    /// `σ_ΔE` of the post-clip prediction.
+    pub sigma_post_clip: f64,
+    /// `|b_p|`: the identity-prior-attributable bias, ΔE.
+    pub bias_de: f64,
+    pub support: ProbeSupport,
+    /// The pre-clip value is identified in this version (see [`ProbePrediction`]).
+    pub pre_clip_identified: bool,
 }
 
 impl ProbeEstimate {
-    /// Derives `supported` for a caller that has no clip-shoulder verdict.
+    /// Decides support from a fit's raw quantities, using each cause's exit
+    /// threshold where the previous published version supported it (docs/05 §8).
     pub fn new(
-        id: ProbeId,
-        jab: [f64; 3],
-        sigma: f64,
-        density_ok: bool,
-        support_sigma: f64,
+        prediction: ProbePrediction,
+        previous: Option<&ProbeEstimate>,
+        thresholds: &SupportThresholds,
     ) -> Self {
-        let sigma_ok = sigma <= support_sigma;
+        let sigma_supported = previous.is_some_and(|probe| probe.support.sigma);
+        let bias_supported = previous.is_some_and(|probe| probe.support.bias);
+        let sigma_threshold = if sigma_supported {
+            thresholds.sigma_exit
+        } else {
+            thresholds.sigma
+        };
+        let bias_threshold = thresholds.bias_fraction * thresholds.sigma;
+        let bias_threshold = if bias_supported {
+            thresholds.bias_exit_factor * bias_threshold
+        } else {
+            bias_threshold
+        };
         Self {
-            id,
-            jab,
-            sigma,
-            sigma_ok,
-            density_ok,
-            supported: sigma_ok && density_ok,
+            id: prediction.id,
+            pre_clip: prediction.pre_clip,
+            sigma_pre_clip: prediction.sigma_pre_clip,
+            post_clip: prediction.post_clip,
+            sigma_post_clip: prediction.sigma_post_clip,
+            bias_de: prediction.bias_de,
+            support: ProbeSupport {
+                sigma: prediction.sigma_post_clip <= sigma_threshold,
+                density: prediction.density >= thresholds.density_floor,
+                clusters: prediction.clusters >= thresholds.min_clusters,
+                bias: prediction.bias_de <= bias_threshold,
+            },
+            pre_clip_identified: prediction.pre_clip_identified,
         }
     }
 
-    /// Carries the fit's `supported` flag, which also covers the clip shoulder.
-    pub fn from_fit(
-        id: ProbeId,
-        jab: [f64; 3],
-        sigma: f64,
-        density_ok: bool,
-        supported: bool,
-        support_sigma: f64,
-    ) -> Self {
-        Self {
-            id,
-            jab,
-            sigma,
-            sigma_ok: sigma <= support_sigma,
-            density_ok,
-            supported,
-        }
+    pub fn supported(&self) -> bool {
+        self.support.supported()
     }
 }
 
@@ -81,12 +166,46 @@ pub struct RootObservation {
     pub jab: [f64; 3],
 }
 
+/// Probes supported in any version published since the current anchor.
+/// Re-anchoring restarts the set from the new anchor (docs/05 §8).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GatedUnion {
+    probes: BTreeSet<ProbeId>,
+}
+
+impl GatedUnion {
+    /// The union a re-anchor starts from: the new anchor's supported probes.
+    pub fn at_anchor(anchor: &VersionProbes) -> Self {
+        let mut union = Self::default();
+        union.include(anchor);
+        union
+    }
+
+    pub fn include(&mut self, version: &VersionProbes) {
+        self.probes.extend(
+            version
+                .probes
+                .iter()
+                .filter(|probe| probe.supported())
+                .map(|probe| probe.id.clone()),
+        );
+    }
+
+    pub fn contains(&self, probe: &ProbeId) -> bool {
+        self.probes.contains(probe)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GateInput {
     pub candidate: VersionProbes,
     pub previous: VersionProbes,
     pub anchor: VersionProbes,
     pub root_observations: Vec<RootObservation>,
+    /// Probes supported in any published version since the current anchor.
+    #[serde(default)]
+    pub gated_since_anchor: GatedUnion,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,9 +252,13 @@ pub struct DriftGateReport {
     pub floor: f64,
     pub ceiling: f64,
     pub gated: usize,
+    /// Gated probes that neither compared version supports, carried by the union.
+    pub carried: usize,
     pub allowed_over_bound: usize,
     pub over_ceiling: Vec<GatedProbe>,
     pub over_bound: Vec<GatedProbe>,
+    pub pre_clip_over_ceiling: Vec<GatedProbe>,
+    pub hue_over_ceiling: Vec<GatedProbe>,
     pub p95_ratio: f64,
     pub pass: bool,
 }
@@ -174,6 +297,18 @@ pub enum Violation {
         probe: ProbeId,
         shift: f64,
         bound: f64,
+    },
+    PreClipOverCeiling {
+        reference: GateReference,
+        probe: ProbeId,
+        shift: f64,
+        ceiling: f64,
+    },
+    HueOverCeiling {
+        reference: GateReference,
+        probe: ProbeId,
+        shift: f64,
+        ceiling: f64,
     },
     TooManyOverBound {
         reference: GateReference,
@@ -264,18 +399,16 @@ pub fn gate_release(params: &TrustParams, input: &GateInput) -> GateReport {
         params,
         &candidate,
         &previous,
+        &input.gated_since_anchor,
         GateReference::Previous,
-        params.gate_previous_floor,
-        params.gate_previous_ceiling,
         input_valid,
     );
     let drift_anchor = drift_gate(
         params,
         &candidate,
         &anchor,
+        &input.gated_since_anchor,
         GateReference::Anchor,
-        params.gate_anchor_floor,
-        params.gate_anchor_ceiling,
         input_valid,
     );
 
@@ -283,22 +416,27 @@ pub fn gate_release(params: &TrustParams, input: &GateInput) -> GateReport {
     let mut regressions: Vec<(ProbeId, f64, f64)> = Vec::new();
     let threshold_scale = 1.0 + params.gate_support_margin;
     for (id, probe) in &candidate {
-        if probe.supported {
+        if probe.supported() {
             continue;
         }
         let sigma_reference = [previous.get(id), anchor.get(id)]
             .into_iter()
             .flatten()
-            .filter(|estimate| estimate.supported)
-            .map(|estimate| estimate.sigma)
+            .filter(|estimate| estimate.supported())
+            .map(|estimate| estimate.sigma_post_clip)
             .max_by(f64::total_cmp);
         let Some(sigma_reference) = sigma_reference else {
+            if input.gated_since_anchor.contains(id) {
+                coverage_changes.insert(id.clone());
+            }
             continue;
         };
-        if !probe.sigma_ok {
+        if !probe.support.sigma {
             let threshold = threshold_scale * sigma_reference;
-            if probe.sigma > threshold {
-                regressions.push((id.clone(), probe.sigma, threshold));
+            if probe.sigma_post_clip > params.support_sigma_exit
+                && probe.sigma_post_clip > threshold
+            {
+                regressions.push((id.clone(), probe.sigma_post_clip, threshold));
                 continue;
             }
         }
@@ -394,8 +532,8 @@ fn root_gate(
         ) else {
             continue;
         };
-        candidate_errors.push(distance(&candidate_probe.jab, &observation.jab));
-        reference_errors.push(distance(&reference_probe.jab, &observation.jab));
+        candidate_errors.push(distance(&candidate_probe.post_clip, &observation.jab));
+        reference_errors.push(distance(&reference_probe.post_clip, &observation.jab));
     }
 
     if observations.is_empty() {
@@ -433,19 +571,29 @@ fn root_gate(
     }
 }
 
+fn drift_bounds(params: &TrustParams, reference: GateReference) -> (f64, f64) {
+    match reference {
+        GateReference::Previous => (params.gate_previous_floor, params.gate_previous_ceiling),
+        GateReference::Anchor => (params.gate_anchor_floor, params.gate_anchor_ceiling),
+    }
+}
+
 fn drift_gate(
     params: &TrustParams,
     candidate: &BTreeMap<ProbeId, &ProbeEstimate>,
     reference_probes: &BTreeMap<ProbeId, &ProbeEstimate>,
+    sticky: &GatedUnion,
     reference: GateReference,
-    floor: f64,
-    ceiling: f64,
     input_valid: bool,
 ) -> DriftGateReport {
+    let (floor, ceiling) = drift_bounds(params, reference);
     let ids: BTreeSet<&ProbeId> = candidate.keys().chain(reference_probes.keys()).collect();
     let mut gated = 0usize;
+    let mut carried = 0usize;
     let mut over_ceiling = Vec::new();
     let mut over_bound = Vec::new();
+    let mut pre_clip_over_ceiling = Vec::new();
+    let mut hue_over_ceiling = Vec::new();
     let mut ratios = Vec::new();
 
     for probe_id in ids {
@@ -454,26 +602,52 @@ fn drift_gate(
         else {
             continue;
         };
-        if !candidate_probe.supported && !reference_probe.supported {
-            continue;
+        let supported = candidate_probe.supported() || reference_probe.supported();
+        let bounded = supported || sticky.contains(probe_id);
+        if bounded {
+            gated += 1;
+            if !supported {
+                carried += 1;
+            }
         }
-        gated += 1;
-        let shift = distance(&candidate_probe.jab, &reference_probe.jab);
-        let sigma_squared = candidate_probe.sigma * candidate_probe.sigma
-            + reference_probe.sigma * reference_probe.sigma;
+        let shift = distance(&candidate_probe.post_clip, &reference_probe.post_clip);
+        let sigma_squared = candidate_probe.sigma_post_clip * candidate_probe.sigma_post_clip
+            + reference_probe.sigma_post_clip * reference_probe.sigma_post_clip;
         let bound = (params.gate_bound_scale * sigma_squared.sqrt()).clamp(floor, ceiling);
-        ratios.push(shift / bound);
         if shift > ceiling {
             over_ceiling.push(GatedProbe {
                 probe: probe_id.clone(),
                 shift,
                 bound,
             });
-        } else if shift > bound {
-            over_bound.push(GatedProbe {
+        } else if bounded {
+            ratios.push(shift / bound);
+            if shift > bound {
+                over_bound.push(GatedProbe {
+                    probe: probe_id.clone(),
+                    shift,
+                    bound,
+                });
+            }
+        }
+
+        if !(candidate_probe.pre_clip_identified && reference_probe.pre_clip_identified) {
+            continue;
+        }
+        let pre_clip_lightness = (candidate_probe.pre_clip[0] - reference_probe.pre_clip[0]).abs();
+        if pre_clip_lightness > ceiling {
+            pre_clip_over_ceiling.push(GatedProbe {
                 probe: probe_id.clone(),
-                shift,
-                bound,
+                shift: pre_clip_lightness,
+                bound: ceiling,
+            });
+        }
+        let hue = hue_drift_ucs(&candidate_probe.pre_clip, &reference_probe.pre_clip);
+        if hue > ceiling {
+            hue_over_ceiling.push(GatedProbe {
+                probe: probe_id.clone(),
+                shift: hue,
+                bound: ceiling,
             });
         }
     }
@@ -487,6 +661,8 @@ fn drift_gate(
     let pass = input_valid
         && over_ceiling.is_empty()
         && over_bound.len() <= allowed
+        && pre_clip_over_ceiling.is_empty()
+        && hue_over_ceiling.is_empty()
         && p95_ratio <= params.gate_p95_ratio;
 
     DriftGateReport {
@@ -494,9 +670,12 @@ fn drift_gate(
         floor,
         ceiling,
         gated,
+        carried,
         allowed_over_bound: allowed,
         over_ceiling,
         over_bound,
+        pre_clip_over_ceiling,
+        hue_over_ceiling,
         p95_ratio,
         pass,
     }
@@ -539,6 +718,25 @@ fn collect_drift_violations(report: &DriftGateReport, violations: &mut Vec<Viola
         shift: gated.shift,
         bound: gated.bound,
     }));
+    violations.extend(report.pre_clip_over_ceiling.iter().map(|gated| {
+        Violation::PreClipOverCeiling {
+            reference: report.reference,
+            probe: gated.probe.clone(),
+            shift: gated.shift,
+            ceiling: report.ceiling,
+        }
+    }));
+    violations.extend(
+        report
+            .hue_over_ceiling
+            .iter()
+            .map(|gated| Violation::HueOverCeiling {
+                reference: report.reference,
+                probe: gated.probe.clone(),
+                shift: gated.shift,
+                ceiling: report.ceiling,
+            }),
+    );
     if report.over_bound.len() > report.allowed_over_bound {
         violations.push(Violation::TooManyOverBound {
             reference: report.reference,
@@ -553,6 +751,23 @@ fn collect_drift_violations(report: &DriftGateReport, violations: &mut Vec<Viola
             limit: 1.0,
         });
     }
+}
+
+/// `ΔH_ab = 2·sqrt(C₁·C₂)·sin(Δh/2)`, the CIEDE2000 hue difference
+/// (Sharma, Wu & Dalal 2005, eq. 10).
+fn hue_drift_ucs(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+    let chroma_a = (a[1] * a[1] + a[2] * a[2]).sqrt();
+    let chroma_b = (b[1] * b[1] + b[2] * b[2]).sqrt();
+    if chroma_a < 1e-9 || chroma_b < 1e-9 {
+        return 0.0;
+    }
+    let mut delta = libm::atan2(a[2], a[1]) - libm::atan2(b[2], b[1]);
+    if delta > core::f64::consts::PI {
+        delta -= core::f64::consts::TAU;
+    } else if delta < -core::f64::consts::PI {
+        delta += core::f64::consts::TAU;
+    }
+    2.0 * (chroma_a * chroma_b).sqrt() * libm::sin(0.5 * delta.abs())
 }
 
 /// Nearest-rank for `q > 0.5`; an even-length median is the mean of the two middle values.

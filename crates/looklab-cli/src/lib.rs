@@ -5,6 +5,7 @@
 
 mod admin;
 mod body_transform;
+mod card;
 mod compare;
 mod export;
 mod fit;
@@ -45,8 +46,10 @@ pub enum Command {
     Report(report::ReportArgs),
     /// Compare two Looks and write an HTML comparison.
     Compare(compare::CompareArgs),
-    /// Bake a Look for a firmware interface profile and validate the artifact.
+    /// Bake a Look for a software interface profile and validate the artifact.
     Export(export::ExportArgs),
+    /// Inspect or evaluate a firmware card file.
+    Card(card::CardArgs),
     /// Validate a data directory and its probe set files.
     Validate(validate::ValidateArgs),
     /// Validate a community data snapshot directory and its content hash.
@@ -75,6 +78,7 @@ pub fn run_with(cli: Cli) -> Result<()> {
         Command::Report(args) => report::run(&args),
         Command::Compare(args) => compare::run(&args),
         Command::Export(args) => export::run(&args),
+        Command::Card(args) => card::run(&args),
         Command::Validate(args) => validate::run(&args),
         Command::ValidateSnapshot(args) => validate::run_snapshot(&args),
         Command::Synth(args) => synth::run(&args),

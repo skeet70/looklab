@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Firmware-epoch split proposals from per-image residual projections (docs/02 §4.5).
+//! Firmware-epoch split proposals gated by the predicted ΔE between firmware
+//! offsets (docs/02 §4.5).
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use looklab_color::cam16::{Cam16Model, Jmh, ViewingConditions};
 use looklab_color::ucs::{UcsSpace, jmh_to_ucs};
 use looklab_color::{Rgb, RgbSpace, Xyz};
-use looklab_fit::FitResult;
-use looklab_fit::epoch::{SplitOptions, SplitSample, detect_split};
+use looklab_fit::epoch::{PROJECTION_DIM, SplitDecision};
+use looklab_fit::{
+    FitResult, ImageProjection, SampleProjection, SplitOptions, SplitSample,
+    detect_split_with_effect, firmware_probe_basis, predicted_effect, project_images,
+};
 use looklab_model::LookInput;
 use looklab_schema::{FirmwareVersion, ProposalKind};
 use looklab_server::admin::{self, WorkerProposal};
@@ -16,7 +20,7 @@ use sqlx::SqlitePool;
 
 use crate::config::WorkerConfig;
 use crate::db::ContributionIntent;
-use crate::error::Result;
+use crate::error::{Result, WorkerError};
 use crate::pool::{LookPool, PoolImage};
 
 const MAX_RESIDUAL_SAMPLES: usize = 1_000;
@@ -46,73 +50,107 @@ pub async fn detect_and_propose(
     if firmwares.len() < 2 {
         return Ok(());
     }
-    let probe_xyz: std::collections::HashMap<String, Xyz> = looklab_model::probes::v1()
+    let probe_set = looklab_model::probes::v1();
+    let basis = firmware_probe_basis(&result.look);
+    let probe_regions: Vec<Option<Region>> = probe_set
         .probes
-        .into_iter()
-        .map(|probe| (probe.id.as_str().to_owned(), probe.xyz))
-        .collect();
-    let supported: BTreeSet<Region> = result
-        .probes
-        .ids
         .iter()
-        .zip(&result.probes.probes)
-        .filter(|(_, probe)| probe.supported)
-        .filter_map(|(id, _)| probe_xyz.get(id.as_str()).and_then(|xyz| region_of(*xyz)))
+        .map(|probe| region_of(probe.xyz))
         .collect();
+    let supported: Vec<usize> = result
+        .probes
+        .probes
+        .iter()
+        .enumerate()
+        .filter(|(_, probe)| probe.supported)
+        .map(|(index, _)| index)
+        .filter(|index| *index < basis.len())
+        .collect();
+    if supported.is_empty() {
+        return Ok(());
+    }
     let model = Cam16Model::new(&ViewingConditions::reference());
-    let mut rows = Vec::new();
+    let mut rows: Vec<(&PoolImage, [f64; 2])> = Vec::new();
+    let mut groups: Vec<u32> = Vec::new();
     for image in native {
-        if let Some(mean) = mean_residual(&model, image, result, &supported) {
-            rows.push((image, mean));
-        }
+        let Some(group) = image
+            .contribution
+            .firmware
+            .parse()
+            .ok()
+            .and_then(|firmware| firmwares.iter().position(|known| *known == firmware))
+            .and_then(|index| u32::try_from(index).ok())
+        else {
+            continue;
+        };
+        let Some(projection) =
+            project_residual(&model, image, result, &basis, &probe_regions, &supported)
+        else {
+            continue;
+        };
+        rows.push((image, projection));
+        groups.push(group);
     }
     if rows.len() < 2 * MIN_IMAGES_PER_GROUP {
         return Ok(());
     }
-    let groups: Vec<u32> = rows
-        .iter()
-        .filter_map(|(image, _)| {
-            image
-                .contribution
-                .firmware
-                .parse()
-                .ok()
-                .and_then(|firmware| firmwares.iter().position(|known| *known == firmware))
-                .and_then(|index| u32::try_from(index).ok())
-        })
-        .collect();
-    let axes = principal_axes(&rows.iter().map(|(_, mean)| mean.mean).collect::<Vec<_>>());
-    let shift = firmware_axis(&rows, &groups);
-    let build = |first: usize, second: usize| -> Vec<SplitSample> {
-        groups
-            .iter()
-            .zip(&rows)
-            .map(|(group, (_, mean))| SplitSample {
-                group: *group,
-                projection: [
-                    dot(&axes[first], &mean.mean),
-                    dot(&axes[second], &mean.mean),
-                ],
-                effect_de: dot(&mean.mean, &shift),
-            })
-            .collect()
-    };
-    let samples = build(0, 1);
+    let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+    for group in &groups {
+        *counts.entry(*group).or_default() += 1;
+    }
+    let offsets = group_offsets(&groups, &rows);
     let options = SplitOptions {
         seed: config.seed,
         ..SplitOptions::default()
     };
-    let decision = detect_split(&samples, &options).or_else(|| {
-        // A nearly collinear group can make one projection pair singular.
-        let alternative = build(1, 2);
-        detect_split(&alternative, &options)
-    });
-    let Some(decision) = decision else {
+    let mut best: Option<SplitDecision> = None;
+    for index in 0..firmwares.len() {
+        for other in (index + 1)..firmwares.len() {
+            let (Ok(left_group), Ok(right_group)) = (u32::try_from(index), u32::try_from(other))
+            else {
+                continue;
+            };
+            if counts.get(&left_group).copied().unwrap_or(0) < MIN_IMAGES_PER_GROUP
+                || counts.get(&right_group).copied().unwrap_or(0) < MIN_IMAGES_PER_GROUP
+            {
+                continue;
+            }
+            let (Some(left_offset), Some(right_offset)) =
+                (offsets.get(&left_group), offsets.get(&right_group))
+            else {
+                continue;
+            };
+            let effect = predicted_effect(&basis, *left_offset, *right_offset);
+            if effect < options.min_effect_de {
+                continue;
+            }
+            let samples: Vec<SplitSample> = rows
+                .iter()
+                .zip(&groups)
+                .filter(|(_, group)| **group == left_group || **group == right_group)
+                .map(|((_, projection), group)| SplitSample {
+                    group: *group,
+                    projection: *projection,
+                    effect_de: predicted_effect(&basis, *projection, [0.0; PROJECTION_DIM]),
+                })
+                .collect();
+            let Some(decision) = detect_split_with_effect(&samples, &options, effect) else {
+                continue;
+            };
+            let better = best
+                .as_ref()
+                .is_none_or(|current| decision.p_value < current.p_value);
+            if better {
+                best = Some(decision);
+            }
+        }
+    }
+    let Some(decision) = best else {
         return Ok(());
     };
     let (left, right) = decision.groups;
-    let left_epoch = epoch_for_group(&rows, &groups, left, pool)?;
-    let right_epoch = epoch_for_group(&rows, &groups, right, pool)?;
+    let left_epoch = epoch_for_group(&groups, &rows, left, pool)?;
+    let right_epoch = epoch_for_group(&groups, &rows, right, pool)?;
     if left_epoch != right_epoch {
         return Ok(());
     }
@@ -137,12 +175,6 @@ pub async fn detect_and_propose(
         new_epoch,
         split_at: split_at.as_str(),
     })?;
-    let counts = |group: u32| {
-        groups
-            .iter()
-            .filter(|candidate| **candidate == group)
-            .count()
-    };
     let evidence = serde_json::json!({
         "source": "worker",
         "look": pool.look.as_str(),
@@ -153,8 +185,8 @@ pub async fn detect_and_propose(
         "p_value": decision.p_value,
         "effect_de": decision.effect_de,
         "t_squared": decision.t_squared,
-        "images_from": counts(left),
-        "images_to": counts(right),
+        "images_from": counts.get(&left).copied().unwrap_or(0),
+        "images_to": counts.get(&right).copied().unwrap_or(0),
     });
     admin::submit_worker_proposal(
         db_pool,
@@ -165,7 +197,7 @@ pub async fn detect_and_propose(
         },
     )
     .await
-    .map_err(crate::error::WorkerError::Admin)?;
+    .map_err(WorkerError::Admin)?;
     Ok(())
 }
 
@@ -191,60 +223,31 @@ impl serde::Serialize for SplitPayload<'_> {
     }
 }
 
-struct MeanResidual {
-    mean: [f64; 3],
-}
-
-/// The direction between the two firmware groups.
-fn firmware_axis(rows: &[(&PoolImage, MeanResidual)], groups: &[u32]) -> [f64; 3] {
-    let mut ordered: Vec<u32> = groups.to_vec();
-    ordered.sort_unstable();
-    ordered.dedup();
-    let mut means = Vec::new();
-    for group in ordered {
-        let count = groups
-            .iter()
-            .filter(|candidate| **candidate == group)
-            .count();
-        if count < MIN_IMAGES_PER_GROUP {
-            continue;
-        }
-        let mut mean = [0.0_f64; 3];
-        for ((_, residual), candidate) in rows.iter().zip(groups) {
-            if *candidate == group {
-                for (sum, channel) in mean.iter_mut().zip(residual.mean) {
-                    *sum += channel;
-                }
-            }
-        }
-        means.push(mean.map(|value| value / count as f64));
-        if means.len() == 2 {
-            break;
-        }
-    }
-    if means.len() < 2 {
-        return [1.0, 0.0, 0.0];
-    }
-    normalize([
-        means[1][0] - means[0][0],
-        means[1][1] - means[0][1],
-        means[1][2] - means[0][2],
-    ])
-}
-
-fn mean_residual(
+/// Least-squares firmware offset of one image.
+fn project_residual(
     model: &Cam16Model,
     image: &PoolImage,
     result: &FitResult,
-    supported: &BTreeSet<Region>,
-) -> Option<MeanResidual> {
+    basis: &[[[f64; 3]; PROJECTION_DIM]],
+    probe_regions: &[Option<Region>],
+    supported: &[usize],
+) -> Option<[f64; PROJECTION_DIM]> {
     let space = match image.samples.header().output_space {
         looklab_samples::OutputSpace::Srgb => RgbSpace::Srgb,
         looklab_samples::OutputSpace::AdobeRgb => RgbSpace::AdobeRgb,
     };
+    let mut slots: BTreeMap<Region, usize> = BTreeMap::new();
+    for (slot, probe_index) in supported.iter().enumerate() {
+        if let Some(region) = probe_regions.get(*probe_index).copied().flatten() {
+            slots.entry(region).or_insert(slot);
+        }
+    }
+    if slots.is_empty() {
+        return None;
+    }
     let step = (image.samples.n() / MAX_RESIDUAL_SAMPLES).max(1);
-    let mut sum = [0.0; 3];
-    let mut count = 0.0;
+    let mut sums = vec![[0.0_f64; 3]; supported.len()];
+    let mut counts = vec![0_usize; supported.len()];
     let in_rgb = image.samples.in_rgb();
     let out_rgb = image.samples.out_rgb();
     for index in (0..image.samples.n()).step_by(step) {
@@ -259,25 +262,55 @@ fn mean_residual(
         let Ok(region) = Region::from_probe(s, input.h_in) else {
             continue;
         };
-        if !supported.contains(&region) {
+        let Some(slot) = slots.get(&region) else {
             continue;
-        }
+        };
         let predicted = result.look.eval(Xyz::from_array(xyz)).to_array();
         let measured = ucs_of_xyz(
             model,
             space.rgb_linear_to_xyz(Rgb::from_array(out_rgb[index].map(f64::from))),
         );
         for channel in 0..3 {
-            sum[channel] += predicted[channel] - measured[channel];
+            sums[*slot][channel] += predicted[channel] - measured[channel];
         }
-        count += 1.0;
+        counts[*slot] += 1;
     }
-    if count < 2.0 {
+    let samples: Vec<SampleProjection> = supported
+        .iter()
+        .enumerate()
+        .filter(|(slot, _)| counts[*slot] > 0)
+        .map(|(slot, probe_index)| SampleProjection {
+            residual: sums[slot].map(|value| value / counts[slot] as f64),
+            basis: basis[*probe_index],
+            weight: counts[slot] as f64,
+        })
+        .collect();
+    if samples.is_empty() {
         return None;
     }
-    Some(MeanResidual {
-        mean: sum.map(|value| value / count),
-    })
+    let projected = project_images(&[ImageProjection { group: 0, samples }]);
+    projected.first().map(|sample| sample.projection)
+}
+
+/// The fitted offset of each firmware group: the mean of its images' projections.
+fn group_offsets(
+    groups: &[u32],
+    rows: &[(&PoolImage, [f64; PROJECTION_DIM])],
+) -> BTreeMap<u32, [f64; PROJECTION_DIM]> {
+    let mut sums: BTreeMap<u32, ([f64; PROJECTION_DIM], usize)> = BTreeMap::new();
+    for ((_, projection), group) in rows.iter().zip(groups) {
+        let entry = sums.entry(*group).or_default();
+        for (sum, value) in entry.0.iter_mut().zip(projection) {
+            *sum += value;
+        }
+        entry.1 += 1;
+    }
+    sums.into_iter()
+        .map(|(group, (sum, count))| {
+            let count = count as f64;
+            (group, sum.map(|value| value / count))
+        })
+        .collect()
 }
 
 fn ucs_of_xyz(model: &Cam16Model, xyz: Xyz) -> [f64; 3] {
@@ -293,10 +326,6 @@ fn ucs_of_xyz(model: &Cam16Model, xyz: Xyz) -> [f64; 3] {
     .to_array()
 }
 
-fn dot(left: &[f64; 3], right: &[f64; 3]) -> f64 {
-    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
-}
-
 fn region_of(xyz: Xyz) -> Option<Region> {
     let input = LookInput::new(xyz);
     Region::from_probe(
@@ -309,91 +338,16 @@ fn region_of(xyz: Xyz) -> Option<Region> {
 }
 
 fn epoch_for_group(
-    rows: &[(&PoolImage, MeanResidual)],
     groups: &[u32],
+    rows: &[(&PoolImage, [f64; PROJECTION_DIM])],
     group: u32,
     pool: &LookPool,
 ) -> Result<u32> {
-    let index = groups
+    let image = rows
         .iter()
-        .position(|candidate| *candidate == group)
-        .ok_or_else(|| crate::error::WorkerError::Data("split group is unknown".to_owned()))?;
-    let image = rows[index].0;
+        .zip(groups)
+        .find(|(_, candidate)| **candidate == group)
+        .map(|(row, _)| row.0)
+        .ok_or_else(|| WorkerError::Data("split group is unknown".to_owned()))?;
     Ok(crate::body::epoch_for(&pool.resources.schema, &image.contribution.firmware)?.id)
-}
-
-/// Three orthonormal axes of the image mean-residual cloud.
-fn principal_axes(vectors: &[[f64; 3]]) -> [[f64; 3]; 3] {
-    if vectors.len() < 2 {
-        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    }
-    let mut mean = [0.0; 3];
-    for vector in vectors {
-        for channel in 0..3 {
-            mean[channel] += vector[channel];
-        }
-    }
-    for value in &mut mean {
-        *value /= vectors.len() as f64;
-    }
-    let mut covariance = [[0.0_f64; 3]; 3];
-    for vector in vectors {
-        let delta = [
-            vector[0] - mean[0],
-            vector[1] - mean[1],
-            vector[2] - mean[2],
-        ];
-        for row in 0..3 {
-            for column in 0..3 {
-                covariance[row][column] += delta[row] * delta[column];
-            }
-        }
-    }
-    let first = power_iteration(&covariance, [1.0, 0.37, 0.19]);
-    let eigenvalue = dot(&first, &mat_vec(&covariance, &first));
-    let mut deflated = covariance;
-    for row in 0..3 {
-        for column in 0..3 {
-            deflated[row][column] -= eigenvalue * first[row] * first[column];
-        }
-    }
-    let second = power_iteration(&deflated, [0.23, 1.0, 0.41]);
-    let third = normalize([
-        first[1] * second[2] - first[2] * second[1],
-        first[2] * second[0] - first[0] * second[2],
-        first[0] * second[1] - first[1] * second[0],
-    ]);
-    [first, second, third]
-}
-
-fn mat_vec(matrix: &[[f64; 3]; 3], vector: &[f64; 3]) -> [f64; 3] {
-    let mut out = [0.0; 3];
-    for row in 0..3 {
-        for column in 0..3 {
-            out[row] += matrix[row][column] * vector[column];
-        }
-    }
-    out
-}
-
-fn power_iteration(matrix: &[[f64; 3]; 3], start: [f64; 3]) -> [f64; 3] {
-    let mut vector = normalize(start);
-    for _ in 0..64 {
-        let next = normalize(mat_vec(matrix, &vector));
-        if dot(&next, &vector) < 0.0 {
-            vector = next.map(|value| -value);
-        } else {
-            vector = next;
-        }
-    }
-    vector
-}
-
-fn normalize(vector: [f64; 3]) -> [f64; 3] {
-    let length = dot(&vector, &vector).sqrt();
-    if length <= f64::EPSILON {
-        [0.0, 0.0, 0.0]
-    } else {
-        vector.map(|value| value / length)
-    }
 }

@@ -18,6 +18,8 @@ pub struct StorageKey(&'static str);
 impl StorageKey {
     pub const CREDENTIAL: Self = Self("credential-id");
     pub const STATUS_TOKEN: Self = Self("status-token");
+    pub const SESSION: Self = Self("session");
+    pub const PENDING_PROFILE: Self = Self("pending-profile");
     pub const DRAFT: Self = Self("contribution-draft");
     pub const FIXTURE_CONSENT: Self = Self("fixture-consent");
 }
@@ -41,6 +43,46 @@ pub async fn put(key: StorageKey, value: &str) -> Result<(), String> {
         .map_err(|error| format!("{error:?}"))
 }
 
+pub async fn put_and_remove_atomically(
+    key: StorageKey,
+    value: &str,
+    removed: StorageKey,
+) -> Result<(), String> {
+    let db = open().await?;
+    let transaction = db
+        .transaction_with_str_and_mode(STORE, IdbTransactionMode::Readwrite)
+        .map_err(|error| format!("{error:?}"))?;
+    let store = transaction
+        .object_store(STORE)
+        .map_err(|error| format!("{error:?}"))?;
+    let operations = (|| {
+        store.put_with_key(&JsValue::from_str(value), &JsValue::from_str(key.0))?;
+        store.delete(&JsValue::from_str(removed.0))?;
+        Ok::<(), JsValue>(())
+    })();
+    if let Err(error) = operations {
+        let _ = transaction.abort();
+        return Err(format!("{error:?}"));
+    }
+    let completed = Promise::new(&mut |resolve, reject| {
+        let complete = Closure::once_into_js(move |_event: Event| {
+            let _ = resolve.call0(&JsValue::NULL);
+        });
+        transaction.set_oncomplete(Some(complete.unchecked_ref()));
+        let abort = Closure::once_into_js(move |_event: Event| {
+            let _ = reject.call1(
+                &JsValue::NULL,
+                &JsValue::from_str("IndexedDB transaction failed"),
+            );
+        });
+        transaction.set_onabort(Some(abort.unchecked_ref()));
+    });
+    JsFuture::from(completed)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("{error:?}"))
+}
+
 /// # Errors
 /// Reports an unavailable or failing IndexedDB.
 pub async fn get(key: StorageKey) -> Result<Option<String>, String> {
@@ -58,6 +100,23 @@ pub async fn get(key: StorageKey) -> Result<Option<String>, String> {
         .await
         .map_err(|error| format!("{error:?}"))?;
     Ok(value.as_string())
+}
+
+pub async fn remove(key: StorageKey) -> Result<(), String> {
+    let db = open().await?;
+    let transaction = db
+        .transaction_with_str_and_mode(STORE, IdbTransactionMode::Readwrite)
+        .map_err(|error| format!("{error:?}"))?;
+    let store = transaction
+        .object_store(STORE)
+        .map_err(|error| format!("{error:?}"))?;
+    let request = store
+        .delete(&JsValue::from_str(key.0))
+        .map_err(|error| format!("{error:?}"))?;
+    JsFuture::from(request_success(&request))
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("{error:?}"))
 }
 
 async fn open() -> Result<IdbDatabase, String> {

@@ -8,7 +8,7 @@ use looklab_trust::{
     RootTarget, Scope, Tier, TrustParams, admission_eligible, rooted, sunset_ready,
     sunset_sessions,
 };
-use looklab_upload::{BodyId, ContributionKind, LookSlug};
+use looklab_upload::{BodyId, ContributionKind, Intent, LookSlug};
 
 fn body(value: &str) -> BodyId {
     BodyId::new(value).expect("valid body id")
@@ -56,7 +56,21 @@ fn seeder_admission() -> RootAdmission {
 fn a_scoped_chart_session_is_eligible() {
     assert!(admission_eligible(
         &look_session(ContributionKind::Chart),
-        &seeder_admission()
+        &seeder_admission(),
+        &Intent::Native
+    ));
+}
+
+#[test]
+fn card_intent_never_roots_a_look() {
+    let tag = looklab_upload::parse_render_tag(
+        "looklab-card/1 fw=acme-sim/2.0.1 look=classic-chrome@1.0.0 cid=0123456789abcdef",
+    )
+    .expect("render tag");
+    assert!(!admission_eligible(
+        &look_session(ContributionKind::Chart),
+        &seeder_admission(),
+        &Intent::Card(looklab_upload::CardDeclaration::tagged(tag))
     ));
 }
 
@@ -64,7 +78,11 @@ fn a_scoped_chart_session_is_eligible() {
 fn new_tier_credentials_never_root_however_good_their_reputation() {
     let mut session = look_session(ContributionKind::Chart);
     session.tier = Tier::New;
-    assert!(!admission_eligible(&session, &seeder_admission()));
+    assert!(!admission_eligible(
+        &session,
+        &seeder_admission(),
+        &Intent::Native
+    ));
 }
 
 #[test]
@@ -73,7 +91,8 @@ fn admission_requires_a_seeder() {
     admission.seeder_tier = Tier::Endorsed;
     assert!(!admission_eligible(
         &look_session(ContributionKind::Chart),
-        &admission
+        &admission,
+        &Intent::Native
     ));
 }
 
@@ -83,7 +102,8 @@ fn a_session_outside_the_issuer_scope_is_ineligible() {
     admission.seeder_scope = Some(scope(&["fujifilm/x-h2"], &[]));
     assert!(!admission_eligible(
         &look_session(ContributionKind::Chart),
-        &admission
+        &admission,
+        &Intent::Native
     ));
 }
 
@@ -91,11 +111,13 @@ fn a_session_outside_the_issuer_scope_is_ineligible() {
 fn library_and_rerender_sessions_do_not_root_a_look() {
     assert!(!admission_eligible(
         &look_session(ContributionKind::Library),
-        &seeder_admission()
+        &seeder_admission(),
+        &Intent::Native
     ));
     assert!(!admission_eligible(
         &look_session(ContributionKind::Rerender),
-        &seeder_admission()
+        &seeder_admission(),
+        &Intent::Native
     ));
 }
 
@@ -108,13 +130,21 @@ fn spectral_data_roots_a_body_but_not_a_look() {
         covered_regions: BTreeSet::new(),
         ..look_session(ContributionKind::Chart)
     };
-    assert!(admission_eligible(&body_session, &seeder_admission()));
+    assert!(admission_eligible(
+        &body_session,
+        &seeder_admission(),
+        &Intent::Native
+    ));
 
     let look_session = RootSession {
         kind: RootDataKind::SpectralSensitivity,
         ..look_session(ContributionKind::Chart)
     };
-    assert!(!admission_eligible(&look_session, &seeder_admission()));
+    assert!(!admission_eligible(
+        &look_session,
+        &seeder_admission(),
+        &Intent::Native
+    ));
 }
 
 #[test]
@@ -128,15 +158,18 @@ fn gradient_and_pattern_do_not_root_a_body() {
     };
     assert!(admission_eligible(
         &body_session(ContributionKind::Chart),
-        &seeder_admission()
+        &seeder_admission(),
+        &Intent::Native
     ));
     assert!(!admission_eligible(
         &body_session(ContributionKind::Gradient),
-        &seeder_admission()
+        &seeder_admission(),
+        &Intent::Native
     ));
     assert!(!admission_eligible(
         &body_session(ContributionKind::Pattern),
-        &seeder_admission()
+        &seeder_admission(),
+        &Intent::Native
     ));
 }
 

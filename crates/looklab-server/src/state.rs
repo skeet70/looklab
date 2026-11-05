@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use sqlx::SqlitePool;
 use tokio::sync::Semaphore;
-use webauthn_rs::prelude::{Passkey, PasskeyRegistration, Url, Webauthn, WebauthnBuilder};
+use webauthn_rs::prelude::{Passkey, Url, WebauthnBuilder};
+use webauthn_rs_core::{WebauthnCore, proto::RegistrationState};
 
 use crate::blob::{BlobError, BlobStore, FsBlobStore};
 use crate::body_schema::{Bodies, BodiesError};
@@ -38,7 +39,7 @@ pub struct PendingRegistration {
 #[derive(Debug)]
 enum PendingStage {
     Challenge {
-        registration: Box<PasskeyRegistration>,
+        registration: Box<RegistrationState>,
         display_handle: Option<String>,
     },
     Credential {
@@ -115,13 +116,20 @@ impl ModSessions {
         };
         sessions.remove(&token.hash());
     }
+
+    pub fn close_credential(&self, credential: &CredentialId) {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return;
+        };
+        sessions.retain(|_, entry| &entry.credential != credential);
+    }
 }
 
 pub struct AppState {
     pub config: Config,
     pub db: SqlitePool,
     pub blobs: Arc<dyn BlobStore>,
-    pub webauthn: Webauthn,
+    pub webauthn: WebauthnCore,
     pub secret: ServerSecret,
     pub bodies: Bodies,
     pub rate_limiter: RateLimiter,
@@ -151,9 +159,16 @@ impl AppState {
         let secret = ServerSecret::load(&config.server_secret_path)?;
         let origin =
             Url::parse(&config.origin).map_err(|error| StateError::Webauthn(error.to_string()))?;
-        let webauthn = WebauthnBuilder::new(&config.rp_id, &origin)
-            .and_then(|builder| builder.rp_name("looklab").build())
+        WebauthnBuilder::new(&config.rp_id, &origin)
             .map_err(|error| StateError::Webauthn(error.to_string()))?;
+        let webauthn = WebauthnCore::new_unsafe_experts_only(
+            "looklab",
+            &config.rp_id,
+            vec![origin],
+            Duration::from_secs(300),
+            Some(false),
+            Some(false),
+        );
         let trust = Arc::new(DefaultTrustPolicy::new(config.pow));
         let slots = upload_slots(config.limits.max_body_bytes);
         Ok(Self {
@@ -174,7 +189,7 @@ impl AppState {
     pub fn insert_challenge(
         &self,
         handle: RegistrationHandle,
-        registration: PasskeyRegistration,
+        registration: RegistrationState,
         display_handle: Option<String>,
     ) -> bool {
         let Ok(mut pending) = self.pending.lock() else {
@@ -200,7 +215,7 @@ impl AppState {
     pub fn take_challenge(
         &self,
         handle: &RegistrationHandle,
-    ) -> Option<(PasskeyRegistration, Option<String>)> {
+    ) -> Option<(RegistrationState, Option<String>)> {
         let Ok(mut pending) = self.pending.lock() else {
             return None;
         };

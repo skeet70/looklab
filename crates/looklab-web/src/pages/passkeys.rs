@@ -1,82 +1,34 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Passkey guidance and status-link recovery ([docs/07](../../../docs/07-contribution.md), [docs/08 §1](../../../docs/08-ui.md)).
-
+//! Sign-in guidance.
 use leptos::prelude::*;
-use leptos::task::spawn_local;
-
-use crate::idb;
-use crate::webauthn;
 
 #[component]
 pub fn PasskeysPage() -> impl IntoView {
-    let busy = RwSignal::new(false);
-    let message = RwSignal::new(None::<String>);
-    let link = RwSignal::new(None::<String>);
-
-    let recover = move |_| {
-        busy.set(true);
-        message.set(None);
-        link.set(None);
-        spawn_local(async move {
-            match webauthn::reissue_status_token(None).await {
-                Ok(token) => {
-                    let _ = idb::put(idb::StorageKey::STATUS_TOKEN, &token).await;
-                    link.set(Some(format!("/status/{token}")));
-                    message.set(Some(
-                        "A new status link was issued; the old one is revoked.".to_owned(),
-                    ));
-                }
-                Err(error) => message.set(Some(error)),
-            }
-            busy.set(false);
-        });
-    };
-
+    let session = crate::session::use_session();
     view! {
-        <h1>"Passkeys"</h1>
-        <p class="lede">
-            "Contributing uses a passkey instead of an account. Browsing, matching and verification need none."
-        </p>
-        <section class="panel">
-            <h2>"Options"</h2>
-            <dl class="facts">
-                <dt>"This device"</dt>
-                <dd>"Face, fingerprint or screen lock, stored by your platform. The simplest option."</dd>
-                <dt>"Phone via QR"</dt>
-                <dd>
-                    "On a desktop without a platform passkey store, choose the cross-device option and scan the QR code with your phone. "
-                    "The passkey stays on the phone."
-                </dd>
-                <dt>"Security key"</dt>
-                <dd>"A USB or NFC key works everywhere. Recommended for seeders, moderators and admins."</dd>
-                <dt>"Password manager"</dt>
-                <dd>"Managers that store passkeys sync them across devices. Check that yours supports WebAuthn."</dd>
-            </dl>
+        <article class="prose account-help">
+            <p class="eyebrow">"Your profile"</p>
+            <h1>"Sign in without a password"</h1>
+            <p class="lede">"A profile keeps your contributions together. There's no email address or password to remember. Browsing, comparing and matching looks never needs a profile."</p>
+            <h2>"How it works"</h2>
+            <p>"Choose Create a profile in the sign-in window. Your browser helps you save a passkey. Next time, choose Continue with passkey and unlock it with your device's screen lock, fingerprint or face recognition. Your optional display name appears beside public credits."</p>
+            <button hidden=!crate::base::server_available() on:click=move |_| session.dialog_open.set(true)>"Sign in or create a profile"</button>
+            <h2>"Use your phone"</h2>
+            <p>"At your browser's prompt, choose to use another device. Scan the QR code with your phone and approve the request there. Keep Bluetooth enabled and your phone nearby. The passkey stays on your phone."</p>
+            <h2>"Security keys and password managers"</h2>
+            <p>"A USB or NFC security key can hold your passkey. Choose the security-key option in the browser prompt, then touch the key when asked. Hardware-backed passkeys or security keys are recommended for community moderators."</p>
+            <p>"A password manager that supports passkeys can save and sync yours across devices. Follow your manager's browser instructions when creating your profile."</p>
+            <h2>"On Linux"</h2>
+            <p>"Many Linux desktops have no built-in passkey store. This doesn't stop you signing in. Use the phone QR option, a security key, or a passkey-capable password manager. Your browser controls which options are offered."</p>
+            <h2>"If a prompt doesn't finish"</h2>
+            <p>"Try Continue with passkey again and choose the device where you saved it. A cancelled prompt doesn't create a profile. Create a profile only if you want a new, separate contribution history."</p>
+            <h2>"What's stored"</h2>
+            <p>"Your device or password manager keeps the private part of your passkey. looklab stores the public part to check that a request came from you. Your fingerprint, face scan and device unlock code are never sent to looklab."</p>
+            <p>"This browser remembers your sign-in in its local storage. Sign out removes it here without affecting your other browsers. Sign out everywhere asks for your passkey and ends all of your profile's sessions."</p>
+            <p>"Your private status link opens your contributions without a passkey. Bookmark it somewhere private. Anyone with that link can read your contributions. Signing in on another device creates another link, without breaking the old one."</p>
             <p>
-                "Linux desktops often have no built-in passkey store. Use a phone through the QR flow or a security key; "
-                "the browser offers both at the passkey prompt."
+                <a href=crate::base::site_url("/about/privacy")>"Read about photo privacy"</a>
             </p>
-        </section>
-        <section class="panel">
-            <h2>"Lost your status link?"</h2>
-            <p>
-                "A passkey assertion from the same credential re-issues the link and revokes the old token. "
-                "Your browser may offer any passkey for this site, including a discoverable one."
-            </p>
-            <button on:click=recover disabled=move || busy.get()>"Re-issue my status link"</button>
-            {move || busy.get().then(|| view! { <p role="status">"Waiting for the passkey…"</p> })}
-            {move || message.get().map(|text| view! { <p class="notice">{text}</p> })}
-            {move || link.get().map(|href| view! {
-                <p>"New link: " <a href=href.clone()>{href.clone()}</a></p>
-            })}
-        </section>
-        <section class="panel">
-            <h2>"What a passkey does here"</h2>
-            <ul>
-                <li>"It signs one batch manifest per contribution, in one gesture."</li>
-                <li>"The public key verifies uploads; it is never published."</li>
-                <li>"The status token is separate from the passkey and can be revoked without losing the credential."</li>
-            </ul>
-        </section>
+        </article>
     }
 }

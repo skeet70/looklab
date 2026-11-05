@@ -115,21 +115,39 @@ fn canonical_coefficient_refs_are_enforced() {
 
 #[test]
 fn uncertainty_arrays_round_trip() {
-    use looklab_model::{Density, ProbeCovariance, UncertaintyData, probes};
+    use looklab_model::{Density, ProbeCovariance, ProbeScalars, UncertaintyData, probes};
 
     let probes = probes::V1_PROBE_COUNT;
     let covariance = ProbeCovariance::new(probes, vec![0.25; probes * 9]).expect("covariance");
+    let post = ProbeCovariance::new(probes, vec![0.1; probes * 9]).expect("post covariance");
+    let bias = ProbeScalars::new(vec![0.2; probes]).expect("bias");
+    let sigma = ProbeScalars::new(vec![0.3; probes]).expect("sigma");
+    let sigma_post = ProbeScalars::new(vec![0.1; probes]).expect("post sigma");
+    let reliable = ProbeScalars::new(vec![1.0; probes]).expect("reliable");
+    let support = ProbeScalars::new(vec![1.0; probes]).expect("support");
     let density = Density::new(vec![1.5; probes]).expect("density");
     let document = LookDocument::from_look(identity("unc", "1.0.0").unwrap(), decorated())
         .expect("document")
         .with_uncertainty(UncertaintyData {
             probe_cov: Some(covariance.clone()),
+            probe_cov_post: Some(post.clone()),
+            probe_bias: Some(bias.clone()),
+            probe_sigma: Some(sigma.clone()),
+            probe_sigma_post: Some(sigma_post.clone()),
+            probe_pre_reliable: Some(reliable.clone()),
+            support: Some(support.clone()),
             density: Some(density.clone()),
         })
         .expect("uncertainty");
     let bytes = document.encode().expect("encode");
     let decoded = LookDocument::decode(&bytes).expect("decode");
     assert_eq!(decoded.uncertainty.probe_cov, Some(covariance));
+    assert_eq!(decoded.uncertainty.probe_cov_post, Some(post));
+    assert_eq!(decoded.uncertainty.probe_bias, Some(bias));
+    assert_eq!(decoded.uncertainty.probe_sigma, Some(sigma));
+    assert_eq!(decoded.uncertainty.probe_sigma_post, Some(sigma_post));
+    assert_eq!(decoded.uncertainty.probe_pre_reliable, Some(reliable));
+    assert_eq!(decoded.uncertainty.support, Some(support));
     assert_eq!(decoded.uncertainty.density, Some(density));
     assert_eq!(decoded.encode().expect("re-encode"), bytes);
 }
@@ -144,6 +162,12 @@ fn uncertainty_dimensions_are_checked() {
         LookDocument::from_look(identity("unc2", "1.0.0").unwrap(), decorated()).expect("document");
     let wrong_density = UncertaintyData {
         probe_cov: None,
+        probe_cov_post: None,
+        probe_bias: None,
+        probe_sigma: None,
+        probe_sigma_post: None,
+        probe_pre_reliable: None,
+        support: None,
         density: Some(Density::new(vec![1.0; probes::V1_PROBE_COUNT - 1]).unwrap()),
     };
     assert!(document.clone().with_uncertainty(wrong_density).is_err());
@@ -155,6 +179,12 @@ fn uncertainty_dimensions_are_checked() {
             )
             .unwrap(),
         ),
+        probe_cov_post: None,
+        probe_bias: None,
+        probe_sigma: None,
+        probe_sigma_post: None,
+        probe_pre_reliable: None,
+        support: None,
         density: None,
     };
     assert!(document.with_uncertainty(wrong_covariance).is_err());

@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
 use clap::{Args, ValueEnum};
 use looklab_meta::{ParsedMetadata, RawSerial};
 use looklab_prep::{LocalImageKey, PrepParams, RawFormat, SeedFile};
@@ -18,12 +19,14 @@ use looklab_prep_module::{
 };
 use looklab_schema::{MakernoteValues, SimKey, settings_from_makernote, sim_from_makernote};
 use looklab_server::body_schema::{Bodies, resolve_epoch, validate_settings};
+use looklab_server::verify::{RequestDomain, request_digest};
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, ContributionKind, ControlEntry, ControlKey, ControlSettings,
-    Envelope, EnvelopeParts, ExpectedAssertion, FirmwareVersionString, Intent, Limits, LookSlug,
-    ManifestImage, ManifestMetadata, PowParams, RawSerial as UploadSerial, SignatureAlgorithm,
-    StepIndex, StructuralVerdict, TopOriginReview, check_structure, encode_envelope,
-    parse_envelope_strict, verify as verify_pow,
+    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, ContributionKind, ControlEntry,
+    ControlKey, ControlSettings, Envelope, EnvelopeParts, ExpectedAssertion, FirmwareId,
+    FirmwareVersion, FirmwareVersionString, Intent, Limits, LookSlug, ManifestHash, ManifestImage,
+    ManifestMetadata, Nonce, PowParams, RawSerial as UploadSerial, RenderTag, SignatureAlgorithm,
+    StepIndex, StructuralVerdict, TopOriginReview, WebAuthnAssertion, check_structure,
+    encode_envelope, parse_envelope_strict, verify as verify_pow,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -32,6 +35,7 @@ use wasmtime::{Engine, Instance, Module, Store};
 const STATE_FORMAT: &str = "looklab-verify-state/1";
 const UPLOAD_PATH: &str = "/api/upload";
 const NONCE_PATH: &str = "/api/nonce";
+const SESSION_PATH: &str = "/api/session";
 const REGISTER_START_PATH: &str = "/api/passkey/register/start";
 const REGISTER_FINISH_PATH: &str = "/api/passkey/register/finish";
 const STATUS_PREFIX: &str = "/status/";
@@ -72,6 +76,7 @@ impl From<DeclaredKind> for ContributionKind {
 pub enum DeclaredIntent {
     Native,
     Recipe,
+    Card,
 }
 
 #[derive(Debug, Args)]
@@ -103,6 +108,10 @@ pub struct VerifyPayloadArgs {
     /// The recipe's target look, required with `--intent recipe`.
     #[arg(long = "target-look", value_name = "SLUG")]
     pub target_look: Option<String>,
+    /// The card firmware, as `<firmware-id>/<firmware-version>`, for `--intent card`
+    /// when no image carries a render tag.
+    #[arg(long, value_name = "ID/VERSION")]
+    pub firmware: Option<String>,
     /// Where the credential id is recorded between runs. Defaults to
     /// `$XDG_STATE_HOME/looklab/verify.json`, else `~/.local/state/looklab/verify.json`.
     #[arg(long, value_name = "FILE")]
@@ -205,7 +214,7 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
     if args.rp_id.trim().is_empty() {
         bail!("--rp-id must not be empty");
     }
-    let intent = declared_intent(args.intent, args.target_look.as_deref())?;
+    let intent = intent_before_files(args)?;
     let bodies = Bodies::load(&args.data.join("bodies"))
         .with_context(|| format!("loading bodies from {}", args.data.display()))?;
     if bodies.is_empty() {
@@ -254,6 +263,10 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         .collect();
 
     let reproduced = reproduce(&groups, &seeds, &module, &mut findings);
+    let intent = match intent {
+        Some(intent) => intent,
+        None => resolve_card_intent(args, &reproduced, &mut findings)?,
+    };
     let derived = derive_batch(&reproduced, &bodies, &mut findings);
     let declared = DeclaredFields {
         kind: args.kind.into(),
@@ -305,7 +318,7 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
                 _ => {}
             }
             if UrlParts::parse(&entry.request.url).is_some_and(|parts| parts.origin() == origin.0) {
-                audit_request(&entry.request, class, &mut findings);
+                audit_request(&entry.request, class, &service, &mut findings);
             }
         }
         if uploads.is_empty() {
@@ -336,6 +349,85 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
     Ok(findings)
 }
 
+fn intent_before_files(args: &VerifyPayloadArgs) -> Result<Option<Intent>> {
+    match args.intent {
+        DeclaredIntent::Card => {
+            if args.target_look.is_some() {
+                bail!("--target-look is only meaningful with --intent recipe");
+            }
+            Ok(None)
+        }
+        DeclaredIntent::Native | DeclaredIntent::Recipe => {
+            if args.firmware.is_some() {
+                bail!("--firmware is only meaningful with --intent card");
+            }
+            Ok(Some(declared_intent(
+                args.intent,
+                args.target_look.as_deref(),
+            )?))
+        }
+    }
+}
+
+fn resolve_card_intent(
+    args: &VerifyPayloadArgs,
+    reproduced: &[ReproducedImage],
+    findings: &mut Findings,
+) -> Result<Intent> {
+    let tag = reproduced_tag(reproduced, findings);
+    let declared = args
+        .firmware
+        .as_deref()
+        .map(parse_card_firmware)
+        .transpose()?;
+    match (tag, declared) {
+        (Some(tag), declared) => {
+            if let Some((id, version)) = declared
+                && (tag.firmware_id != id || tag.firmware_version != version)
+            {
+                findings.fail(format!(
+                    "--firmware {id}/{version} disagrees with the render tag {}/{}",
+                    tag.firmware_id, tag.firmware_version
+                ));
+            }
+            Ok(Intent::Card(CardDeclaration::Tagged(tag)))
+        }
+        (None, Some((id, version))) => {
+            Ok(Intent::Card(CardDeclaration::user_declared(id, version)))
+        }
+        (None, None) => bail!(
+            "--intent card needs --firmware <id>/<version> when no image carries a render tag"
+        ),
+    }
+}
+
+fn reproduced_tag(reproduced: &[ReproducedImage], findings: &mut Findings) -> Option<RenderTag> {
+    let mut tags = reproduced
+        .iter()
+        .filter_map(|image| image.metadata.render_tag.clone());
+    let first = tags.next()?;
+    for tag in tags {
+        if tag != first {
+            findings.fail("the images disagree on the render tag; one batch carries one tag");
+            return None;
+        }
+    }
+    Some(first)
+}
+
+fn parse_card_firmware(text: &str) -> Result<(FirmwareId, FirmwareVersion)> {
+    let (id, version) = text
+        .split_once('/')
+        .with_context(|| format!("--firmware {text:?} is not <firmware-id>/<firmware-version>"))?;
+    if version.contains('/') {
+        bail!("--firmware {text:?} is not <firmware-id>/<firmware-version>");
+    }
+    let id = FirmwareId::new(id).map_err(|error| anyhow!("--firmware id {id:?}: {error}"))?;
+    let version =
+        FirmwareVersion::new(version).map_err(|error| anyhow!("--firmware version: {error}"))?;
+    Ok((id, version))
+}
+
 fn declared_intent(intent: DeclaredIntent, target_look: Option<&str>) -> Result<Intent> {
     match intent {
         DeclaredIntent::Native => {
@@ -350,6 +442,7 @@ fn declared_intent(intent: DeclaredIntent, target_look: Option<&str>) -> Result<
                 .with_context(|| format!("--target-look {slug:?} is not a look slug"))?;
             Ok(Intent::Recipe { target_look })
         }
+        DeclaredIntent::Card => bail!("a card intent is resolved from the files"),
     }
 }
 
@@ -478,7 +571,7 @@ fn match_body(bodies: &Bodies, make: &str, model: &str) -> Result<BodyId, String
     }
     match matches.as_slice() {
         [] => Err(format!(
-            "no body in the data snapshot matches EXIF make {make:?} and model {model:?}"
+            "no body in the data snapshot matches EXIF make {make:?} and model {model:?}; pass --data with the snapshot that contains it"
         )),
         [id] => BodyId::new(id).map_err(|error| error.to_string()),
         _ => Err(format!(
@@ -524,6 +617,32 @@ fn print_batch_fields(
         Intent::Recipe { target_look } => findings.note(format!(
             "  intent: recipe (declared), target look: {target_look} (declared)"
         )),
+        Intent::Card(declaration) => match declaration {
+            CardDeclaration::Tagged(tag) => {
+                findings.note("  intent: card (reproduced from the render tag)");
+                findings.note(format!(
+                    "  card firmware: {}/{} (reproduced from the render tag)",
+                    tag.firmware_id, tag.firmware_version
+                ));
+                findings.note(format!(
+                    "  card look: {}@{} (reproduced from the render tag)",
+                    tag.look_slug, tag.look_version
+                ));
+                findings.note(format!(
+                    "  card cid: {} (reproduced from the render tag)",
+                    tag.cid_prefix_hex()
+                ));
+            }
+            CardDeclaration::UserDeclared {
+                firmware_id,
+                firmware_version,
+            } => {
+                findings.note("  intent: card (declared)");
+                findings.note(format!(
+                    "  card firmware: {firmware_id}/{firmware_version} (declared)"
+                ));
+            }
+        },
     }
 }
 
@@ -786,8 +905,26 @@ fn manifest_differences(site: &BatchManifest, expected: &BatchManifest) -> Vec<S
 }
 
 fn check_webauthn(envelope: &Envelope, service: &Service<'_>, findings: &mut Findings) {
+    check_assertion(
+        &envelope.assertion,
+        service,
+        envelope.challenge(),
+        "H(nonce ‖ manifest hash)",
+        findings,
+    );
+}
+
+/// Structural WebAuthn checks against `challenge`; returns whether some supported
+/// signature algorithm passed.
+fn check_assertion(
+    assertion: &WebAuthnAssertion,
+    service: &Service<'_>,
+    challenge: Challenge,
+    challenge_name: &str,
+    findings: &mut Findings,
+) -> bool {
     let expected = ExpectedAssertion {
-        challenge: envelope.challenge(),
+        challenge,
         origin: service.origin.0.as_str(),
         rp_id: service.rp_id,
         algorithm: SignatureAlgorithm::Ecdsa,
@@ -800,7 +937,7 @@ fn check_webauthn(envelope: &Envelope, service: &Service<'_>, findings: &mut Fin
         SignatureAlgorithm::Rsa,
     ] {
         let verdict = check_structure(
-            &envelope.assertion,
+            assertion,
             &ExpectedAssertion {
                 algorithm,
                 ..expected
@@ -809,8 +946,10 @@ fn check_webauthn(envelope: &Envelope, service: &Service<'_>, findings: &mut Fin
         match verdict {
             StructuralVerdict::Pass => {
                 findings.note(webauthn_line(service, algorithm));
-                findings.note("  challenge: H(nonce ‖ manifest hash) matches client_data_json");
-                return;
+                findings.note(format!(
+                    "  challenge: {challenge_name} matches client_data_json"
+                ));
+                return true;
             }
             StructuralVerdict::ReviewNeeded {
                 unknown_client_data_keys,
@@ -819,7 +958,9 @@ fn check_webauthn(envelope: &Envelope, service: &Service<'_>, findings: &mut Fin
                 extensions,
             } => {
                 findings.note(webauthn_line(service, algorithm));
-                findings.note("  challenge: H(nonce ‖ manifest hash) matches client_data_json");
+                findings.note(format!(
+                    "  challenge: {challenge_name} matches client_data_json"
+                ));
                 for extra in unknown_client_data_keys {
                     findings.review(format!(
                         "client_data_json key {:?} appears in full: {}",
@@ -849,7 +990,7 @@ fn check_webauthn(envelope: &Envelope, service: &Service<'_>, findings: &mut Fin
                         ));
                     }
                 }
-                return;
+                return true;
             }
             StructuralVerdict::Fail(error) => {
                 failures.insert(error.to_string());
@@ -860,6 +1001,7 @@ fn check_webauthn(envelope: &Envelope, service: &Service<'_>, findings: &mut Fin
         "webauthn: {}",
         failures.into_iter().collect::<Vec<_>>().join("; ")
     ));
+    false
 }
 
 fn webauthn_line(service: &Service<'_>, algorithm: SignatureAlgorithm) -> String {
@@ -1361,8 +1503,6 @@ impl HarRequest {
 }
 
 fn decode_base64(text: &str) -> Result<Vec<u8>> {
-    use base64::Engine as _;
-
     let text = text.trim();
     base64::engine::general_purpose::STANDARD
         .decode(text)
@@ -1402,7 +1542,12 @@ fn is_browser_header(name: &str) -> bool {
     name.starts_with("sec-") || ALLOWED.contains(&name.as_str())
 }
 
-fn audit_request(request: &HarRequest, class: RequestClass, findings: &mut Findings) {
+fn audit_request(
+    request: &HarRequest,
+    class: RequestClass,
+    service: &Service<'_>,
+    findings: &mut Findings,
+) {
     for header in &request.headers {
         if !is_browser_header(&header.name) {
             findings.review(format!(
@@ -1425,6 +1570,7 @@ fn audit_request(request: &HarRequest, class: RequestClass, findings: &mut Findi
                 request.method, request.url
             )),
         },
+        RequestClass::Session => audit_session(request, service, findings),
         RequestClass::RegisterStart => {
             audit_registration(request, &["display_handle"], findings);
         }
@@ -1433,6 +1579,135 @@ fn audit_request(request: &HarRequest, class: RequestClass, findings: &mut Findi
         }
         RequestClass::Upload | RequestClass::Unexpected => {}
     }
+}
+
+const SESSION_FIELDS: &[&str] = &[
+    "nonce",
+    "credential_id",
+    "authenticator_data",
+    "client_data_json",
+    "signature",
+    "pow",
+];
+
+fn audit_session(request: &HarRequest, service: &Service<'_>, findings: &mut Findings) {
+    let body = match request.body() {
+        Ok(body) => body,
+        Err(error) => {
+            findings.fail(format!(
+                "request {} {} body: {error}",
+                request.method, request.url
+            ));
+            return;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            findings.fail(format!(
+                "request {} {} body is not JSON: {error}",
+                request.method, request.url
+            ));
+            return;
+        }
+    };
+    let Some(object) = value.as_object() else {
+        findings.fail(format!(
+            "request {} {} body is not a JSON object",
+            request.method, request.url
+        ));
+        return;
+    };
+    for key in object.keys() {
+        if !SESSION_FIELDS.contains(&key.as_str()) {
+            findings.fail(format!(
+                "request {} {} body carries an unaccounted key {key:?}",
+                request.method, request.url
+            ));
+        }
+    }
+    let field = |name: &str| object.get(name).and_then(serde_json::Value::as_str);
+    let mut decoded = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for (slot, name) in decoded.iter_mut().zip([
+        "credential_id",
+        "authenticator_data",
+        "client_data_json",
+        "signature",
+    ]) {
+        let Some(text) = field(name) else {
+            findings.fail(format!(
+                "request {} {} body has no {name}",
+                request.method, request.url
+            ));
+            return;
+        };
+        match decode_url_field(text) {
+            Ok(bytes) => *slot = bytes,
+            Err(error) => {
+                findings.fail(format!(
+                    "request {} {} body's {name} is not base64url: {error}",
+                    request.method, request.url
+                ));
+                return;
+            }
+        }
+    }
+    if let Some(pow) = object.get("pow")
+        && !pow.as_array().is_some_and(|values| {
+            values.len() == looklab_upload::POW_K && values.iter().all(serde_json::Value::is_u64)
+        })
+    {
+        findings.fail(format!(
+            "request {} {} body's pow is not {POW_K} unsigned integers",
+            request.method,
+            request.url,
+            POW_K = looklab_upload::POW_K
+        ));
+    }
+    let Some(nonce_text) = field("nonce") else {
+        findings.fail(format!(
+            "request {} {} body has no nonce",
+            request.method, request.url
+        ));
+        return;
+    };
+    let nonce = match decode_url_field(nonce_text)
+        .ok()
+        .and_then(|bytes| Nonce::from_slice(&bytes))
+    {
+        Some(nonce) => nonce,
+        None => {
+            findings.fail(format!(
+                "request {} {} body's nonce is not a 32-byte base64url value",
+                request.method, request.url
+            ));
+            return;
+        }
+    };
+    let [
+        credential_id,
+        authenticator_data,
+        client_data_json,
+        signature,
+    ] = decoded;
+    let assertion = WebAuthnAssertion {
+        credential_id,
+        authenticator_data,
+        client_data_json,
+        signature,
+    };
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, b""));
+    check_assertion(
+        &assertion,
+        service,
+        challenge,
+        "H(nonce ‖ H(looklab-request-v1:session:))",
+        findings,
+    );
+}
+
+fn decode_url_field(value: &str) -> std::result::Result<Vec<u8>, base64::DecodeError> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value)
 }
 
 fn audit_registration(request: &HarRequest, allowed: &[&str], findings: &mut Findings) {
@@ -1484,6 +1759,101 @@ fn audit_registration(request: &HarRequest, allowed: &[&str], findings: &mut Fin
             ));
         }
     }
+    for key in allowed {
+        if !object.contains_key(*key) {
+            findings.fail(format!("registration body is missing {key:?}"));
+        }
+    }
+    if allowed == ["display_handle"] {
+        if !object.get("display_handle").is_some_and(|value| {
+            value.is_null()
+                || value.as_str().is_some_and(|handle| {
+                    !handle.is_empty()
+                        && handle.chars().count() <= 64
+                        && !handle.chars().any(char::is_control)
+                })
+        }) {
+            findings.fail("registration display_handle must be null or a valid display handle");
+        }
+        return;
+    }
+    if !object.get("handle").is_some_and(serde_json::Value::is_string) {
+        findings.fail("registration handle must be a string");
+    }
+    let Some(credential) = object.get("credential") else {
+        return;
+    };
+    audit_registration_credential(credential, findings);
+}
+
+fn audit_registration_credential(credential: &serde_json::Value, findings: &mut Findings) {
+    let Some(object) = credential.as_object() else {
+        findings.fail("registration credential must be an object");
+        return;
+    };
+    for key in object.keys() {
+        if ![
+            "id", "rawId", "type", "response", "authenticatorAttachment", "clientExtensionResults",
+        ].contains(&key.as_str()) {
+            findings.fail(format!("registration credential carries an unaccounted key {key:?}"));
+        }
+    }
+    for key in ["id", "rawId"] {
+        if !object.get(key).and_then(serde_json::Value::as_str).is_some_and(|text| {
+            decode_url_field(text).is_ok_and(|bytes| !bytes.is_empty() && bytes.len() <= 255)
+        }) {
+            findings.fail(format!("registration credential {key} must be a base64url credential ID"));
+        }
+    }
+    if object.get("id") != object.get("rawId") {
+        findings.fail("registration credential id and rawId differ");
+    }
+    if object.get("type").and_then(serde_json::Value::as_str) != Some("public-key") {
+        findings.fail("registration credential type must be public-key");
+    }
+    if let Some(attachment) = object.get("authenticatorAttachment")
+        && !attachment.is_null()
+        && !matches!(attachment.as_str(), Some("platform" | "cross-platform"))
+    {
+        findings.fail("registration authenticatorAttachment is not a WebAuthn attachment");
+    }
+    match object.get("clientExtensionResults").and_then(serde_json::Value::as_object) {
+        Some(extensions) if extensions.is_empty() => {}
+        Some(extensions) => findings.review(format!("registration client extensions: {extensions:?}")),
+        None => findings.fail("registration clientExtensionResults must be an object"),
+    }
+    let Some(response) = object.get("response").and_then(serde_json::Value::as_object) else {
+        findings.fail("registration credential response must be an object");
+        return;
+    };
+    for key in response.keys() {
+        if ![
+            "clientDataJSON", "attestationObject", "authenticatorData", "publicKey",
+            "publicKeyAlgorithm", "transports",
+        ].contains(&key.as_str()) {
+            findings.fail(format!("registration response carries an unaccounted key {key:?}"));
+        }
+    }
+    for key in ["clientDataJSON", "attestationObject", "authenticatorData", "publicKey"] {
+        match response.get(key) {
+            None if matches!(key, "authenticatorData" | "publicKey") => {}
+            Some(value) if key == "publicKey" && value.is_null() => {}
+            Some(value) if value.as_str().is_some_and(|text| decode_url_field(text).is_ok()) => {}
+            _ => findings.fail(format!("registration response {key} must be base64url")),
+        }
+    }
+    if let Some(algorithm) = response.get("publicKeyAlgorithm")
+        && !algorithm.is_i64()
+    {
+        findings.fail("registration publicKeyAlgorithm must be an integer");
+    }
+    if let Some(transports) = response.get("transports")
+        && !transports.as_array().is_some_and(|values| values.iter().all(|value| {
+            matches!(value.as_str(), Some("usb" | "nfc" | "ble" | "internal" | "hybrid" | "smart-card"))
+        }))
+    {
+        findings.fail("registration transports must contain WebAuthn transports");
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1491,6 +1861,7 @@ enum RequestClass {
     Nonce,
     Upload,
     Status,
+    Session,
     RegisterStart,
     RegisterFinish,
     Unexpected,
@@ -1506,6 +1877,7 @@ fn classify(request: &HarRequest, origin: &Origin) -> RequestClass {
     match (request.method.as_str(), parts.path()) {
         ("POST", NONCE_PATH) => RequestClass::Nonce,
         ("POST", UPLOAD_PATH) => RequestClass::Upload,
+        ("POST", SESSION_PATH) => RequestClass::Session,
         ("POST", REGISTER_START_PATH) => RequestClass::RegisterStart,
         ("POST", REGISTER_FINISH_PATH) => RequestClass::RegisterFinish,
         ("GET", path) if status_token(path).is_some() => RequestClass::Status,

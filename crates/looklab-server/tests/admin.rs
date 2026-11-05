@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use looklab_server::admin::{self, AdminError};
-use looklab_server::{ContributionId, CredentialId, EndorsementId, GrantId, LookVersionId};
+use looklab_server::{ContributionId, CredentialId, EndorsementId, GrantId, LookVersionId, Tier};
 use looklab_trust::{Actor, Grant, Scope, ScopeRule, TrustError, VersionId};
 use looklab_upload::{BodyId, LookSlug};
 use sqlx::SqlitePool;
@@ -45,16 +45,28 @@ async fn add_contribution(
     kind: &str,
     target_look: Option<&str>,
 ) -> ContributionId {
+    add_contribution_with_intent(db, credential, body, kind, target_look, "native").await
+}
+
+async fn add_contribution_with_intent(
+    db: &SqlitePool,
+    credential: &CredentialId,
+    body: &str,
+    kind: &str,
+    target_look: Option<&str>,
+    intent: &str,
+) -> ContributionId {
     let id = ContributionId::new();
     sqlx::query(
         "INSERT INTO contributions
          (id, credential_id, batch_manifest_hash, signature, pow, kind, intent, target_look_id,
           body_id, firmware_version, sim_key, settings, status, created_at)
-         VALUES (?, ?, x'00', x'00', 'pow', ?, 'native', ?, ?, '2.10', 'sim', '{}', 'pending', 0)",
+         VALUES (?, ?, x'00', x'00', 'pow', ?, ?, ?, ?, '2.10', 'sim', '{}', 'pending', 0)",
     )
     .bind(id.as_str())
     .bind(credential.as_str())
     .bind(kind)
+    .bind(intent)
     .bind(target_look)
     .bind(body)
     .execute(db)
@@ -95,6 +107,26 @@ const BODY_A: &str = "canon/eos-r5";
 const BODY_B: &str = "fujifilm/x-t5";
 const LOOK_1: &str = "classic-chrome";
 const LOOK_2: &str = "reala-ace";
+
+#[tokio::test]
+async fn card_intent_is_not_root_admissible() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let seeder = credential(db, "seeder", "[]", 1.2).await;
+    let contributor = credential(db, "endorsed", "[]", 1.0).await;
+    let card = add_contribution_with_intent(db, &contributor, BODY_B, "chart", None, "card").await;
+
+    let error = admin::admit_root(
+        db,
+        actor(&seeder),
+        &card,
+        body_scope(BODY_B),
+        "card sessions are not root data",
+    )
+    .await
+    .expect_err("card intent is ineligible");
+    assert!(matches!(error, AdminError::IneligibleContribution));
+}
 
 #[tokio::test]
 async fn seeder_scope_comes_from_grants_not_endorsements() {
@@ -483,6 +515,20 @@ async fn wildcard_root_revocation_creates_versions_for_dependent_looks() {
         .collect();
     assert!(looks.contains(LOOK_1), "dependent look");
     assert!(looks.contains(LOOK_2), "explicit look");
+}
+
+#[tokio::test]
+async fn endorsement_nominations_are_seeder_only() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let nominated = credential(db, "new", "[]", 1.4).await;
+
+    let queue = admin::mod_queue(db, Tier::New).await.expect("queue");
+    assert!(queue.nominations.is_empty());
+
+    let queue = admin::mod_queue(db, Tier::Seeder).await.expect("queue");
+    assert_eq!(queue.nominations.len(), 1);
+    assert_eq!(queue.nominations[0].credential, nominated);
 }
 
 #[tokio::test]

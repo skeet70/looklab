@@ -2,15 +2,24 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use looklab_fit::{FitOptions, FitResult, fit_controlled, refit_responses};
+use looklab_color::RgbSpace;
+use looklab_export::card::{CardMeta, CardOptions, write_card};
+use looklab_fit::{
+    ExposureGauge, FitOptions, FitResult, ImageIntent, PreviousSupport,
+    fit_controlled_with_history, post_clip, refit_responses,
+};
 use looklab_model::realization::{ControlResponseModel, decode_crm, encode_crm};
-use looklab_model::{Density, Look, LookDocument, ProbeCovariance, ProbeId, UncertaintyData};
+use looklab_model::{
+    Density, Look, LookDocument, ProbeCovariance, ProbeId, ProbeScalars, UncertaintyData,
+};
 use looklab_publish::{
-    BodyUse, GateCheck, GateSummary, PREVIEW_LUT_ARTIFACT, ProvenanceSummary, bake_preview_lut,
+    BodyUse, CARD_ARTIFACT, GateCheck, GateSummary, PREVIEW_LUT_ARTIFACT, ProvenanceSummary,
+    bake_preview_lut,
 };
 use looklab_server::admin::{self, ManifestArtifact};
 use looklab_trust::{
-    GateInput, GateReport, ReputationUpdate, TrustParams, VersionId, VersionProbes, gate_release,
+    GateInput, GateReport, GatedUnion, ProbeEstimate, ProbeSupport, ReputationUpdate, TrustParams,
+    VersionId, VersionProbes, gate_release,
 };
 use looklab_upload::{BodyId, LookSlug};
 use serde::{Deserialize, Serialize};
@@ -34,11 +43,20 @@ pub const CRM_ARTIFACT: &str = "crm.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredProbe {
     pub id: ProbeId,
+    /// Pre-clip `σ_ΔE`.
     pub sigma: f64,
-    /// The probe's density reached the fit's floor.
+    /// Post-clip `σ_ΔE`.
     #[serde(default)]
-    pub density_ok: bool,
-    pub supported: bool,
+    pub sigma_post: f64,
+    /// `|b_p|`, ΔE.
+    #[serde(default)]
+    pub bias_de: f64,
+    /// The pre-clip value was identified in the fit that published this version.
+    #[serde(default)]
+    pub pre_clip_identified: bool,
+    /// The four support tests as the fit decided them.
+    #[serde(default)]
+    pub support: ProbeSupport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,10 +64,36 @@ pub struct ReleaseRecord {
     pub version: u32,
     pub gauge: f64,
     pub anchor: u32,
+    /// Soft clip of the published realization, for re-evaluating the Look.
+    #[serde(default)]
+    pub clip_k: f64,
+    /// Output encoding of the published probe predictions.
+    #[serde(default = "default_output_space")]
+    pub output_space: RgbSpace,
     pub probes: Vec<StoredProbe>,
+    /// Probes supported in any version published since [`Self::anchor`].
+    #[serde(default)]
+    pub gated_since_anchor: GatedUnion,
+    /// The native stage reached its objective and step tolerances.
+    #[serde(default)]
+    pub converged: bool,
     pub gate: GateReport,
     pub provenance: ProvenanceSummary,
     pub created_at: i64,
+}
+
+fn default_output_space() -> RgbSpace {
+    RgbSpace::Srgb
+}
+
+/// Body parameters published for the recipe stage (docs/02 §4.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecipeStageParams {
+    /// Hex of `encode_crm` for the recipe-stage control response.
+    control_response: String,
+    /// `body_pool_fingerprint` of the images the response was fitted on.
+    #[serde(default)]
+    recipe_pool: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,27 +169,54 @@ async fn is_dirty(
 fn pool_fingerprint(pool: &LookPool) -> Result<String> {
     let mut hasher = Sha256::new();
     for image in &pool.images {
-        hasher.update(image.image.id.as_str().as_bytes());
-        hasher.update(db::hex(&image.image.samples_hash).as_bytes());
-        hasher.update(image.contribution.id.as_str().as_bytes());
-        hasher.update(image.contribution.status.as_str().as_bytes());
-        hasher.update(image.contribution.intent.as_str().as_bytes());
-        hasher.update(
-            image
-                .image
-                .status
-                .map_or("pending", ImageOutcome::as_str)
-                .as_bytes(),
-        );
-        hasher.update(image.credential.id.as_str().as_bytes());
-        hasher.update(format!("{:?}", image.credential.tier).as_bytes());
-        hasher.update(image.contributor.to_string().as_bytes());
-        hasher.update(serde_json::to_vec(&image.credential.scope)?);
-        hasher.update(serde_json::to_vec(&image.settings)?);
-        hasher.update(image.epoch.to_le_bytes());
-        hasher.update(image.exposure_mode.0.to_le_bytes());
+        hash_image(&mut hasher, image)?;
     }
     Ok(db::hex(&hasher.finalize()))
+}
+
+fn hash_image(hasher: &mut Sha256, image: &crate::pool::PoolImage) -> Result<()> {
+    hasher.update(image.image.id.as_str().as_bytes());
+    hasher.update(db::hex(&image.image.samples_hash).as_bytes());
+    hasher.update(image.contribution.id.as_str().as_bytes());
+    hasher.update(image.contribution.status.as_str().as_bytes());
+    hasher.update(image.contribution.intent.as_str().as_bytes());
+    hasher.update(
+        image
+            .image
+            .status
+            .map_or("pending", ImageOutcome::as_str)
+            .as_bytes(),
+    );
+    hasher.update(image.credential.id.as_str().as_bytes());
+    hasher.update(format!("{:?}", image.credential.tier).as_bytes());
+    hasher.update(image.contributor.to_string().as_bytes());
+    hasher.update(serde_json::to_vec(&image.credential.scope)?);
+    hasher.update(serde_json::to_vec(&image.settings)?);
+    hasher.update(image.epoch.to_le_bytes());
+    hasher.update(image.exposure_mode.0.to_le_bytes());
+    Ok(())
+}
+
+/// The body-stage pool and the weights the stage saw. A refit with the same hash
+/// can reuse the published recipe-stage response.
+fn body_pool_fingerprint(pool: &LookPool, weighted: &WeightedPool) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for entry in &weighted.images {
+        let image = &pool.images[entry.pool_index];
+        hash_image(&mut hasher, image)?;
+        hasher.update(entry.look_weight.to_le_bytes());
+        hasher.update(entry.body_weight.to_le_bytes());
+        hasher.update(entry.duplicates.to_le_bytes());
+        hasher.update(serde_json::to_vec(&entry.per_region)?);
+    }
+    Ok(db::hex(&hasher.finalize()))
+}
+
+fn lap(at: &mut std::time::Instant, label: &str) {
+    if std::env::var_os("LOOKLAB_TIMING").is_some() {
+        eprintln!("refit timing: {label} {:?}", at.elapsed());
+        *at = std::time::Instant::now();
+    }
 }
 
 async fn refit_look(
@@ -155,16 +226,28 @@ async fn refit_look(
     look: &LookSlug,
     ownership: &JobOwnership,
 ) -> Result<RefitOutcome> {
+    let mut at = std::time::Instant::now();
     let pool = pool::build(db_pool, config, body, look).await?;
     if pool.images.is_empty() {
         return Ok(RefitOutcome::Skipped);
     }
+    lap(&mut at, "pool");
     let roots = roots::load(db_pool, config, &pool).await?;
-    let params = TrustParams::default();
+    let options = FitOptions {
+        seed: config.seed,
+        max_samples_per_image: config.max_samples_per_image,
+        ..FitOptions::default()
+    };
+    let params = TrustParams {
+        support_sigma_exit: options.support_sigma_exit,
+        ..TrustParams::default()
+    };
     let weighted = weights::weigh(&pool, &params, &roots.weights)?;
+    lap(&mut at, "weigh");
     let contributors = weights::contributor_index(&pool);
     let native_images = weights::fit_images(&pool, &weighted, &contributors);
     let recipe_images = weights::recipe_fit_images(&pool, &weighted, &contributors);
+    lap(&mut at, "fit images");
 
     let versions = db::look_versions(db_pool, look.as_str()).await?;
     let next_version = versions
@@ -179,9 +262,11 @@ async fn refit_look(
         Some(version) => Some(load_snapshot(db_pool, config, look, version.version).await?),
         None => None,
     };
+    lap(&mut at, "snapshot");
 
     let fingerprint = pool_fingerprint(&pool)?;
     let stored = db::pool_fingerprint(db_pool, look.as_str(), body.as_str()).await?;
+    lap(&mut at, "fingerprint");
     if stored.as_deref() == Some(fingerprint.as_str()) && previous_version.is_some() {
         return Ok(RefitOutcome::Skipped);
     }
@@ -215,16 +300,21 @@ async fn refit_look(
         return Ok(RefitOutcome::Held(next_version));
     }
 
-    let options = FitOptions {
-        seed: config.seed,
-        max_samples_per_image: config.max_samples_per_image,
-        ..FitOptions::default()
+    let body_images = recipe_images;
+    let has_recipe = body_images
+        .iter()
+        .any(|image| image.intent == ImageIntent::Recipe);
+    let recipe_pool = if has_recipe {
+        Some(body_pool_fingerprint(&pool, &weighted)?)
+    } else {
+        None
     };
     if native_images.is_empty() {
         return run_recipe_only(
             db_pool,
             &pool,
-            &recipe_images,
+            &body_images,
+            recipe_pool.as_deref(),
             &previous,
             &options,
             look,
@@ -233,76 +323,122 @@ async fn refit_look(
         .await;
     }
     let (epoch, sim) = roots::base_sim(&pool)?;
-    let native_result = fit_controlled(
+    let support_history = previous_support(&previous);
+    let native_result = fit_controlled_with_history(
         &native_images,
         &pool.resources.schema,
         epoch,
         &sim,
         &options,
+        support_history.as_ref(),
     )?;
+    let converged = native_result.diagnostics.converged;
+    if !converged {
+        tracing::warn!(
+            look = look.as_str(),
+            body = body.as_str(),
+            sweeps = native_result.diagnostics.sweeps,
+            evaluations = native_result.diagnostics.evaluations,
+            "native fit exhausted its sweep budget"
+        );
+    }
+    if std::env::var_os("LOOKLAB_TIMING").is_some() {
+        eprintln!(
+            "native fit diagnostics: converged={} sweeps={} evaluations={} cost={} samples={}",
+            native_result.diagnostics.converged,
+            native_result.diagnostics.sweeps,
+            native_result.diagnostics.evaluations,
+            native_result.diagnostics.final_cost,
+            native_result.diagnostics.objective_samples
+        );
+    }
+    lap(&mut at, "native fit");
     let native_model = native_result
         .control_response
         .as_ref()
         .map(|fit| fit.model.clone())
         .ok_or_else(|| WorkerError::Data("native stage produced no control response".to_owned()))?;
-    let control = refit_responses(
-        &native_result.look,
-        &recipe_images,
-        &pool.resources.schema,
-        epoch,
-        &sim,
-        &native_model,
-        &options,
-    )?;
+    // Without recipe data the native optimum already solves the response block;
+    // an unchanged body pool reuses the response the previous release published.
+    let recipe_model = match &recipe_pool {
+        None => native_model.clone(),
+        Some(recipe_pool) => {
+            let reused = match &previous_version {
+                Some(version) => db::release_body_params(
+                    db_pool,
+                    look.as_str(),
+                    version.version,
+                    body.as_str(),
+                    BodyStage::Recipe,
+                )
+                .await?
+                .map(|stored| stored_recipe_model(&stored, recipe_pool))
+                .transpose()?
+                .flatten(),
+                None => None,
+            };
+            match reused {
+                Some(model) => model,
+                None => {
+                    let mut recipe_options = options;
+                    recipe_options.recipe_sweeps = recipe_sweeps(body_images.len(), options.n_eff);
+                    refit_responses(
+                        &native_result.look,
+                        &body_images,
+                        &pool.resources.schema,
+                        epoch,
+                        &sim,
+                        &native_model,
+                        &recipe_options,
+                    )?
+                    .model
+                }
+            }
+        }
+    };
+    lap(&mut at, "recipe fit");
 
     crate::split::detect_and_propose(db_pool, config, &pool, &native_result).await?;
+    lap(&mut at, "split");
     let gauge = gauge(&pool, &weighted, &native_result);
-    let candidate_probes = candidate_probes(&native_result);
+    let candidate_probes = stored_probes(&native_result);
+    let candidate_versions = candidate_estimates(&native_result);
 
     let anchor_version = select_anchor(db_pool, look, &versions).await?;
     let anchor = match &anchor_version {
         Some(version) => Some(load_snapshot(db_pool, config, look, *version).await?),
         None => None,
     };
-    let anchor_gauge = anchor.as_ref().map(|snapshot| snapshot.record.gauge);
+    let anchor_id = anchor_version.unwrap_or(next_version);
 
-    let candidate = canonical_probes(
-        &native_result.look,
-        gauge,
-        anchor_gauge.unwrap_or(gauge),
-        options.support_sigma,
-        &candidate_probes,
-    );
     let previous_probes = match &previous {
-        Some(snapshot) => canonical_probes(
-            &snapshot.look,
-            snapshot.record.gauge,
-            anchor_gauge.unwrap_or(gauge),
-            options.support_sigma,
-            &snapshot.record.probes,
-        ),
-        None => candidate.clone(),
+        Some(snapshot) => stored_estimates(&snapshot.look, &snapshot.record, gauge)?,
+        None => candidate_versions.clone(),
     };
     let anchor_probes = match &anchor {
-        Some(snapshot) => canonical_probes(
-            &snapshot.look,
-            snapshot.record.gauge,
-            anchor_gauge.unwrap_or(gauge),
-            options.support_sigma,
-            &snapshot.record.probes,
-        ),
+        Some(snapshot) => stored_estimates(&snapshot.look, &snapshot.record, gauge)?,
         None => previous_probes.clone(),
     };
 
+    let gated = gated_since_anchor(&previous, anchor_id, &anchor_probes);
+    let published_gated = if anchor_id == next_version {
+        GatedUnion::at_anchor(&candidate_versions)
+    } else {
+        let mut union = gated.clone();
+        union.include(&candidate_versions);
+        union
+    };
     let gate = gate_release(
         &params,
         &GateInput {
-            candidate,
+            candidate: candidate_versions,
             previous: previous_probes,
             anchor: anchor_probes,
             root_observations: roots.observations.clone(),
+            gated_since_anchor: gated,
         },
     );
+    lap(&mut at, "gate");
 
     let now = now_unix();
     let provenance = provenance(
@@ -334,21 +470,32 @@ async fn refit_look(
 
     ownership.check(db_pool).await?;
     let (document, document_bytes) = look_document(look, next_version, &native_result)?;
+    lap(&mut at, "document");
     let release = ReleaseRecord {
         version: next_version,
         gauge,
-        anchor: anchor_version.unwrap_or(next_version),
+        anchor: anchor_id,
+        clip_k: native_result.realization.clip_k,
+        output_space: native_result.output_space,
         probes: candidate_probes,
+        gated_since_anchor: published_gated,
+        converged,
         gate: gate.clone(),
         provenance: provenance.clone(),
         created_at: now,
     };
     let artifacts = vec![
         store_artifact(config, LOOK_ARTIFACT, &document_bytes)?,
+        store_artifact(
+            config,
+            CARD_ARTIFACT,
+            &write_card(&document, &card_meta(look), &CardOptions::default())?,
+        )?,
         store_artifact(config, PREVIEW_LUT_ARTIFACT, &bake_preview_lut(&document))?,
-        store_artifact(config, CRM_ARTIFACT, &encode_crm(&control.model)?)?,
+        store_artifact(config, CRM_ARTIFACT, &encode_crm(&recipe_model)?)?,
         store_artifact(config, RELEASE_ARTIFACT, &serde_json::to_vec(&release)?)?,
     ];
+    lap(&mut at, "artifacts");
     store_stage_params(
         db_pool,
         look,
@@ -356,10 +503,12 @@ async fn refit_look(
         body,
         &native_result,
         &native_model,
-        &control.model,
+        &recipe_model,
+        recipe_pool.as_deref(),
         now,
     )
     .await?;
+    lap(&mut at, "stage params");
     admin::write_version_manifest(
         db_pool,
         look,
@@ -368,7 +517,9 @@ async fn refit_look(
         &roots.admissions,
     )
     .await?;
+    lap(&mut at, "manifest");
     update_reputation(db_pool, look, next_version, &pool, &previous).await?;
+    lap(&mut at, "reputation");
     db::record_pool_fingerprint(
         db_pool,
         look.as_str(),
@@ -380,10 +531,12 @@ async fn refit_look(
     Ok(RefitOutcome::Published(next_version))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_recipe_only(
     db_pool: &SqlitePool,
     pool: &LookPool,
     recipe_images: &[looklab_fit::FitImage],
+    recipe_pool: Option<&str>,
     previous: &Option<Snapshot>,
     options: &FitOptions,
     look: &LookSlug,
@@ -405,6 +558,8 @@ async fn run_recipe_only(
             &sim,
             1,
         )?);
+    let mut recipe_options = *options;
+    recipe_options.recipe_sweeps = recipe_sweeps(recipe_images.len(), options.n_eff);
     let control = refit_responses(
         &previous.look,
         recipe_images,
@@ -412,7 +567,7 @@ async fn run_recipe_only(
         epoch,
         &sim,
         &model,
-        options,
+        &recipe_options,
     )?;
     let now = now_unix();
     db::store_release_body_params(
@@ -421,7 +576,7 @@ async fn run_recipe_only(
         previous.record.version,
         body.as_str(),
         BodyStage::Recipe,
-        &crm_params(&control.model)?,
+        &recipe_params(&control.model, recipe_pool)?,
         now,
     )
     .await?;
@@ -534,26 +689,49 @@ fn look_document(
 ) -> Result<(LookDocument, Vec<u8>)> {
     let identity = looklab_model::file::identity(look.as_str(), &format!("{version}.0.0"))?;
     let mut document = LookDocument::from_look(identity, result.look.clone())?;
-    let mut covariance = Vec::with_capacity(result.probes.probes.len() * 9);
-    let mut density = Vec::with_capacity(result.probes.probes.len());
+    let count = result.probes.probes.len();
+    let mut covariance = Vec::with_capacity(count * 9);
+    let mut covariance_post = Vec::with_capacity(count * 9);
+    let mut bias = Vec::with_capacity(count);
+    let mut sigma = Vec::with_capacity(count);
+    let mut sigma_post = Vec::with_capacity(count);
+    let mut pre_reliable = Vec::with_capacity(count);
+    let mut support = Vec::with_capacity(count);
+    let mut density = Vec::with_capacity(count);
     for probe in &result.probes.probes {
         for row in &probe.covariance {
             covariance.extend_from_slice(row);
         }
+        for row in &probe.post_covariance {
+            covariance_post.extend_from_slice(row);
+        }
+        bias.push(probe.bias_de);
+        sigma.push(probe.sigma_de);
+        sigma_post.push(probe.post_sigma_de);
+        pre_reliable.push(if probe.pre_clip_reliable { 1.0 } else { 0.0 });
+        support.push(if probe.supported { 1.0 } else { 0.0 });
         density.push(probe.density);
     }
     document = document.with_uncertainty(UncertaintyData {
-        probe_cov: Some(ProbeCovariance::new(
-            result.probes.probes.len(),
-            covariance,
-        )?),
+        probe_cov: Some(ProbeCovariance::new(count, covariance)?),
+        probe_cov_post: Some(ProbeCovariance::new(count, covariance_post)?),
+        probe_bias: Some(ProbeScalars::new(bias)?),
+        probe_sigma: Some(ProbeScalars::new(sigma)?),
+        probe_sigma_post: Some(ProbeScalars::new(sigma_post)?),
+        probe_pre_reliable: Some(ProbeScalars::new(pre_reliable)?),
+        support: Some(ProbeScalars::new(support)?),
         density: Some(Density::new(density)?),
     })?;
     let bytes = document.encode()?;
     Ok((document, bytes))
 }
 
-fn candidate_probes(result: &FitResult) -> Vec<StoredProbe> {
+fn card_meta(look: &LookSlug) -> CardMeta {
+    let short: String = look.as_str().chars().take(27).collect();
+    CardMeta::new(look.as_str(), short)
+}
+
+fn stored_probes(result: &FitResult) -> Vec<StoredProbe> {
     result
         .probes
         .ids
@@ -562,46 +740,106 @@ fn candidate_probes(result: &FitResult) -> Vec<StoredProbe> {
         .map(|(id, probe)| StoredProbe {
             id: id.clone(),
             sigma: probe.sigma_de,
-            density_ok: probe.density >= result.density.floor,
-            supported: probe.supported,
+            sigma_post: probe.post_sigma_de,
+            bias_de: probe.bias_de,
+            pre_clip_identified: probe.pre_clip_reliable,
+            support: ProbeSupport {
+                sigma: probe.supported_sigma,
+                density: probe.supported_density,
+                clusters: probe.supported_clusters,
+                bias: probe.supported_bias,
+            },
         })
         .collect()
 }
 
-fn canonical_probes(
-    look: &Look,
-    gauge: f64,
-    anchor_gauge: f64,
-    support_sigma: f64,
-    stored: &[StoredProbe],
-) -> VersionProbes {
-    let by_id: BTreeMap<&ProbeId, &StoredProbe> =
-        stored.iter().map(|probe| (&probe.id, probe)).collect();
-    let scale = 2.0_f64.powf(gauge - anchor_gauge);
-    let probes = looklab_model::probes::v1()
+fn candidate_estimates(result: &FitResult) -> VersionProbes {
+    VersionProbes {
+        probes: result
+            .probes
+            .ids
+            .iter()
+            .zip(&result.probes.probes)
+            .map(|(id, probe)| ProbeEstimate {
+                id: id.clone(),
+                pre_clip: probe.ucs.to_array(),
+                sigma_pre_clip: probe.sigma_de,
+                post_clip: probe.post_ucs.to_array(),
+                sigma_post_clip: probe.post_sigma_de,
+                bias_de: probe.bias_de,
+                pre_clip_identified: probe.pre_clip_reliable,
+                support: ProbeSupport {
+                    sigma: probe.supported_sigma,
+                    density: probe.supported_density,
+                    clusters: probe.supported_clusters,
+                    bias: probe.supported_bias,
+                },
+            })
+            .collect(),
+    }
+}
+
+/// Re-evaluates a published Look in the candidate's exposure gauge.
+fn stored_estimates(look: &Look, record: &ReleaseRecord, gauge: f64) -> Result<VersionProbes> {
+    let by_id: BTreeMap<&ProbeId, &StoredProbe> = record
         .probes
-        .into_iter()
-        .map(|probe| {
-            let stored = by_id.get(&probe.id);
-            // A record written before `density_ok` existed keeps its support flag.
-            let (sigma, density_ok, supported) = stored.map_or((1.0, true, true), |probe| {
-                (
-                    probe.sigma,
-                    probe.density_ok || probe.supported,
-                    probe.supported,
-                )
-            });
-            looklab_trust::ProbeEstimate::from_fit(
-                probe.id.clone(),
-                look.eval(probe.xyz.scale(scale)).to_array(),
-                sigma,
-                density_ok,
-                supported,
-                support_sigma,
-            )
-        })
+        .iter()
+        .map(|probe| (&probe.id, probe))
         .collect();
-    VersionProbes { probes }
+    let exposure = ExposureGauge::between(record.gauge, gauge);
+    let mut probes = Vec::with_capacity(by_id.len());
+    for probe in looklab_model::probes::v1().probes {
+        let stored = by_id.get(&probe.id).ok_or_else(|| {
+            WorkerError::Data(format!(
+                "release {} lacks probe {}",
+                record.version,
+                probe.id.as_str()
+            ))
+        })?;
+        let input = exposure.apply(probe.xyz);
+        probes.push(ProbeEstimate {
+            id: probe.id,
+            pre_clip: look.eval(input).to_array(),
+            sigma_pre_clip: stored.sigma,
+            post_clip: post_clip(look, input, record.output_space, record.clip_k).to_array(),
+            sigma_post_clip: stored.sigma_post,
+            bias_de: stored.bias_de,
+            pre_clip_identified: stored.pre_clip_identified,
+            support: stored.support,
+        });
+    }
+    Ok(VersionProbes { probes })
+}
+
+/// The union as of the previous release; a re-anchor restarts it from the new anchor.
+fn gated_since_anchor(
+    previous: &Option<Snapshot>,
+    anchor: u32,
+    anchor_probes: &VersionProbes,
+) -> GatedUnion {
+    match previous {
+        Some(snapshot) if snapshot.record.anchor == anchor => {
+            snapshot.record.gated_since_anchor.clone()
+        }
+        _ => GatedUnion::at_anchor(anchor_probes),
+    }
+}
+
+fn previous_support(previous: &Option<Snapshot>) -> Option<PreviousSupport> {
+    previous.as_ref().map(|snapshot| PreviousSupport {
+        sigma: snapshot
+            .record
+            .probes
+            .iter()
+            .map(|probe| probe.support.sigma)
+            .collect(),
+        bias: snapshot
+            .record
+            .probes
+            .iter()
+            .map(|probe| probe.support.bias)
+            .collect(),
+    })
 }
 
 fn gauge(pool: &LookPool, weighted: &WeightedPool, result: &FitResult) -> f64 {
@@ -675,7 +913,7 @@ fn provenance(
     })
 }
 
-pub fn gate_summary(report: &GateReport) -> GateSummary {
+pub fn gate_summary(report: &GateReport, converged: bool) -> GateSummary {
     GateSummary {
         checks: vec![
             GateCheck {
@@ -703,15 +941,59 @@ pub fn gate_summary(report: &GateReport) -> GateSummary {
                 passed: report.supported_regressions.is_empty(),
                 detail: None,
             },
+            GateCheck {
+                name: "converged".to_owned(),
+                passed: converged,
+                detail: (!converged)
+                    .then(|| "the native stage exhausted its sweep budget".to_owned()),
+            },
         ],
     }
 }
 
-fn crm_params(model: &ControlResponseModel) -> Result<String> {
-    Ok(serde_json::json!({
-        "control_response": db::hex(&encode_crm(model)?),
-    })
-    .to_string())
+fn recipe_params(model: &ControlResponseModel, recipe_pool: Option<&str>) -> Result<String> {
+    Ok(serde_json::to_string(&RecipeStageParams {
+        control_response: db::hex(&encode_crm(model)?),
+        recipe_pool: recipe_pool.map(str::to_owned),
+    })?)
+}
+
+/// The recipe-stage response the record holds, when it was fitted on `recipe_pool`.
+fn stored_recipe_model(params: &str, recipe_pool: &str) -> Result<Option<ControlResponseModel>> {
+    let stored: RecipeStageParams = serde_json::from_str(params)?;
+    if stored.recipe_pool.as_deref() != Some(recipe_pool) {
+        return Ok(None);
+    }
+    let bytes = unhex(&stored.control_response)
+        .ok_or_else(|| WorkerError::Data("recipe control response is not hex".to_owned()))?;
+    Ok(Some(decode_crm(&bytes)?))
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    let (pairs, remainder) = text.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    pairs
+        .iter()
+        .map(|pair| {
+            let high = char::from(pair[0]).to_digit(16)?;
+            let low = char::from(pair[1]).to_digit(16)?;
+            u8::try_from(high * 16 + low).ok()
+        })
+        .collect()
+}
+
+/// Upper bound on the tempered sample evaluations the stage processes.
+const RECIPE_SWEEP_BUDGET: f64 = 1_000_000.0;
+
+/// The recipe stage solves only body parameters, so its cost is bounded by the
+/// tempered effective sample count rather than the raw sample count.
+fn recipe_sweeps(images: usize, n_eff: f64) -> usize {
+    let effective = n_eff * images as f64;
+    (RECIPE_SWEEP_BUDGET / effective.max(1.0))
+        .ceil()
+        .clamp(2.0, 4.0) as usize
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -723,6 +1005,7 @@ async fn store_stage_params(
     result: &FitResult,
     native_model: &ControlResponseModel,
     recipe_model: &ControlResponseModel,
+    recipe_pool: Option<&str>,
     now: i64,
 ) -> Result<()> {
     let native = serde_json::json!({
@@ -754,7 +1037,7 @@ async fn store_stage_params(
         version,
         body.as_str(),
         BodyStage::Recipe,
-        &crm_params(recipe_model)?,
+        &recipe_params(recipe_model, recipe_pool)?,
         now,
     )
     .await

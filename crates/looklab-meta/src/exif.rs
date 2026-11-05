@@ -2,7 +2,7 @@
 
 use crate::error::MetaError;
 use crate::fuji::{self, FujiMakernote};
-use crate::render_tag::{RenderTag, parse_render_tag};
+use crate::render_tag::{RenderTagOutcome, classify_render_tag};
 use crate::serial::RawSerial;
 use crate::tiff::{Entry, Tiff};
 use crate::types::{
@@ -40,7 +40,7 @@ pub struct ParsedMetadata {
     /// Camera firmware: RAF header `FirmwareVersion` (0x3c, four digits normalized to `x.yy`),
     /// else the `Ver` token of the EXIF `Software` tag (`Ver1.00` -> `1.00`).
     pub firmware: Option<String>,
-    pub render_tag: Option<RenderTag>,
+    pub render_tag: RenderTagOutcome,
 }
 
 impl ParsedMetadata {
@@ -166,8 +166,10 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<ParsedMetadata, MetaError> {
     })
 }
 
-fn parse_user_comment(entry: Option<&Entry<'_>>) -> Option<RenderTag> {
-    let bytes = entry.and_then(Entry::undefined)?;
+fn parse_user_comment(entry: Option<&Entry<'_>>) -> RenderTagOutcome {
+    let Some(bytes) = entry.and_then(Entry::undefined) else {
+        return RenderTagOutcome::Absent;
+    };
     let bytes = bytes
         .strip_prefix(b"ASCII\0\0\0")
         .or_else(|| bytes.strip_prefix(b"\0\0\0\0\0\0\0\0"))
@@ -176,7 +178,12 @@ fn parse_user_comment(entry: Option<&Entry<'_>>) -> Option<RenderTag> {
         .iter()
         .rposition(|byte| *byte != 0)
         .map_or(0, |index| index + 1);
-    parse_render_tag(core::str::from_utf8(&bytes[..end]).ok()?).ok()
+    let body = &bytes[..end];
+    match core::str::from_utf8(body) {
+        Ok(text) => classify_render_tag(text),
+        Err(_) if body.starts_with(b"looklab-card/") => RenderTagOutcome::Malformed,
+        Err(_) => RenderTagOutcome::Absent,
+    }
 }
 
 fn parse_capture_time(datetime: &str, subsec: Option<&str>) -> Option<CaptureTime> {

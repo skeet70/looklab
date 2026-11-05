@@ -7,7 +7,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ids::{
-    BodyId, ContributionKind, ControlSettings, FirmwareVersionString, Intent, SimKey,
+    BodyId, CardDeclaration, ContributionKind, ControlSettings, FirmwareVersionString, Intent,
+    SimKey,
 };
 use crate::metadata::ManifestMetadata;
 use crate::nonce::ManifestHash;
@@ -55,6 +56,75 @@ pub struct BatchManifest {
     pub sim_key: SimKey,
     pub settings: ControlSettings,
     pub images: Vec<ManifestImage>,
+}
+
+/// A batch whose intent disagrees with its images' render tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum IntentError {
+    #[error("image {index} carries a render tag but the batch intent is not card")]
+    TaggedImageNeedsCard { index: usize },
+    #[error("image {index} carries a render tag in a user-declared card batch")]
+    UserDeclaredWithTag { index: usize },
+    #[error("image {index} render tag does not match the batch card declaration")]
+    CardTagMismatch { index: usize },
+    #[error(
+        "image {index} carries a malformed render tag; declare card intent with its firmware or exclude it"
+    )]
+    MalformedCardTag { index: usize },
+    #[error("a tagged card batch has no image carrying its render tag")]
+    MissingCardTag,
+}
+
+impl BatchManifest {
+    /// Rejects a batch whose render tags and card declaration disagree
+    /// ([docs/07 §4](../../../docs/07-contribution.md)).
+    pub fn validate_intent(&self) -> Result<(), IntentError> {
+        match &self.intent {
+            Intent::Card(CardDeclaration::Tagged(expected)) => {
+                let mut found = false;
+                for (index, image) in self.images.iter().enumerate() {
+                    if image.meta.render_tag_malformed {
+                        return Err(IntentError::MalformedCardTag { index });
+                    }
+                    if let Some(tag) = &image.meta.render_tag {
+                        found = true;
+                        if tag != expected {
+                            return Err(IntentError::CardTagMismatch { index });
+                        }
+                    }
+                }
+                if !found {
+                    return Err(IntentError::MissingCardTag);
+                }
+            }
+            Intent::Card(CardDeclaration::UserDeclared { .. }) => {
+                if let Some(index) = self
+                    .images
+                    .iter()
+                    .position(|image| image.meta.render_tag.is_some())
+                {
+                    return Err(IntentError::UserDeclaredWithTag { index });
+                }
+            }
+            Intent::Native | Intent::Recipe { .. } => {
+                if let Some(index) = self
+                    .images
+                    .iter()
+                    .position(|image| image.meta.render_tag.is_some())
+                {
+                    return Err(IntentError::TaggedImageNeedsCard { index });
+                }
+                if let Some(index) = self
+                    .images
+                    .iter()
+                    .position(|image| image.meta.render_tag_malformed)
+                {
+                    return Err(IntentError::MalformedCardTag { index });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The bytes whose SHA-256 is the manifest hash and which the envelope carries.

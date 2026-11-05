@@ -42,6 +42,8 @@ pub enum JobKind {
     HonestDuplicateMerge,
     NightlyRefit,
     BlobGc,
+    Bounties,
+    CardVerification,
     PublishSite,
     Other(String),
 }
@@ -54,6 +56,8 @@ impl JobKind {
             "nightly_refit" => Self::NightlyRefit,
             // The server enqueues this name when a withdrawal is recorded.
             "blob_gc" | "hard_delete_blobs" => Self::BlobGc,
+            "bounties" => Self::Bounties,
+            "card_verification" => Self::CardVerification,
             "publish_site" => Self::PublishSite,
             other => Self::Other(other.to_owned()),
         }
@@ -65,6 +69,8 @@ impl JobKind {
             Self::HonestDuplicateMerge => "honest_duplicate_merge",
             Self::NightlyRefit => "nightly_refit",
             Self::BlobGc => "blob_gc",
+            Self::Bounties => "bounties",
+            Self::CardVerification => "card_verification",
             Self::PublishSite => "publish_site",
             Self::Other(value) => value,
         }
@@ -83,6 +89,8 @@ pub enum JobPayload {
     BlobGc {
         contribution_id: Option<ContributionId>,
     },
+    Bounties,
+    CardVerification,
     PublishSite,
 }
 
@@ -110,6 +118,8 @@ impl JobPayload {
             Self::HonestDuplicateMerge => JobKind::HonestDuplicateMerge,
             Self::NightlyRefit { .. } => JobKind::NightlyRefit,
             Self::BlobGc { .. } => JobKind::BlobGc,
+            Self::Bounties => JobKind::Bounties,
+            Self::CardVerification => JobKind::CardVerification,
             Self::PublishSite => JobKind::PublishSite,
         }
     }
@@ -122,7 +132,10 @@ impl JobPayload {
                     contribution_id: contribution_id.as_str().to_owned(),
                 })?
             }
-            Self::HonestDuplicateMerge | Self::PublishSite => "{}".to_owned(),
+            Self::HonestDuplicateMerge
+            | Self::Bounties
+            | Self::CardVerification
+            | Self::PublishSite => "{}".to_owned(),
             Self::NightlyRefit { bodies } => serde_json::to_string(&NightlyWire {
                 bodies: bodies.iter().map(|body| body.as_str().to_owned()).collect(),
             })?,
@@ -165,6 +178,8 @@ impl JobPayload {
                     .transpose()?;
                 Self::BlobGc { contribution_id }
             }
+            JobKind::Bounties => Self::Bounties,
+            JobKind::CardVerification => Self::CardVerification,
             JobKind::PublishSite => Self::PublishSite,
             JobKind::Other(kind) => {
                 return Err(WorkerError::Job(format!("unknown job kind `{kind}`")));

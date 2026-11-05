@@ -50,7 +50,6 @@ pub(crate) struct Sample {
     pub target: Ucs,
     pub image: u32,
     pub weight: f64,
-    pub density: f64,
     pub neutral: bool,
     /// The stored output is away from the clip shoulders, so the sample carries unclipped data.
     pub informative: bool,
@@ -271,7 +270,6 @@ impl Problem {
                             .map_or(1.0, |weights| weights[index] as f64)
                         * trust
                         * temper,
-                    density: density[index] as f64,
                     neutral,
                     informative: out_rgb[index]
                         .iter()
@@ -516,23 +514,32 @@ impl Problem {
             } else {
                 &[]
             };
-            let evaluated = evaluate_sample(
-                &looks[image],
-                &self.layout,
-                context,
-                columns,
-                sample.rgb,
-                clip_k,
-                clip_slope,
-                &slope,
-                terms,
-                &mut jac,
-            );
+            let needs_jacobian = hessian_set[index] || want_per_image;
+            let (prediction, evaluated) = if needs_jacobian {
+                let evaluated = evaluate_sample(
+                    &looks[image],
+                    &self.layout,
+                    context,
+                    columns,
+                    sample.rgb,
+                    clip_k,
+                    clip_slope,
+                    &slope,
+                    terms,
+                    &mut jac,
+                );
+                (evaluated.prediction, Some(evaluated))
+            } else {
+                (
+                    crate::predict::predict_only(&looks[image], context, sample.rgb, clip_k),
+                    None,
+                )
+            };
             let target = &sample.target;
             let residual = [
-                evaluated.prediction.j - target.j,
-                evaluated.prediction.a - target.a,
-                evaluated.prediction.b - target.b,
+                prediction.j - target.j,
+                prediction.a - target.a,
+                prediction.b - target.b,
             ];
             let squared =
                 residual[0] * residual[0] + residual[1] * residual[1] + residual[2] * residual[2];
@@ -555,13 +562,15 @@ impl Problem {
             }
             let contribution = weight * alpha;
             output.rss += contribution * squared;
-            for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
-                let term = derivative[0] * residual[0]
-                    + derivative[1] * residual[1]
-                    + derivative[2] * residual[2];
-                output.gradient[*column as usize] += contribution * term;
-                if want_per_image {
-                    output.per_image_gradient[image][*column as usize] += contribution * term;
+            if evaluated.is_some() {
+                for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
+                    let term = derivative[0] * residual[0]
+                        + derivative[1] * residual[1]
+                        + derivative[2] * residual[2];
+                    output.gradient[*column as usize] += contribution * term;
+                    if want_per_image {
+                        output.per_image_gradient[image][*column as usize] += contribution * term;
+                    }
                 }
             }
 
@@ -600,6 +609,9 @@ impl Problem {
                 }
             }
             if wants_residual_block {
+                let evaluated = evaluated
+                    .as_ref()
+                    .expect("Hessian samples carry the Jacobian");
                 output.residual_samples.push(ResidualSample {
                     nodes: evaluated.residual_indices.map(|index| index as u32),
                     weights: evaluated.residual_weights,

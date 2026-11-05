@@ -1,27 +1,37 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Writes the synthetic match case into the static site tree.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use looklab_color::Mat3;
 use looklab_match::ControlCovariance;
 use looklab_match::synth;
 use looklab_model::LookDocument;
-use looklab_model::file::identity;
+use looklab_model::file::{LookKind, LookVersion, Slug, WbPolicy, identity};
 use looklab_model::realization::encode_crm;
-use looklab_publish::ArtifactHash;
+use looklab_publish::{
+    ArtifactHash, ArtifactName, LookStatus, LookSummary, LookVisibility, SiteIndex, SitePath,
+    VersionSummary,
+};
 use serde::Serialize;
 
 const SLUG: &str = "synthetic-match";
 const VERSION: &str = "1.0.0";
 const BODY: &str = "fujifilm/x-t5";
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "native fixture publication reads and writes site artifacts"
+)]
 fn main() -> Result<(), String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .ok_or_else(|| "workspace root".to_owned())?;
-    let site = root.join("site");
+    let site = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("site"));
     let version_dir = site.join("data/looks").join(SLUG).join(VERSION);
     std::fs::create_dir_all(&version_dir).map_err(|error| error.to_string())?;
 
@@ -69,7 +79,7 @@ fn main() -> Result<(), String> {
 
     let index_path = site.join("data/index.json");
     let index_bytes = std::fs::read(&index_path).map_err(|error| error.to_string())?;
-    let mut index: serde_json::Value =
+    let mut index: SiteIndex =
         serde_json::from_slice(&index_bytes).map_err(|error| error.to_string())?;
     upsert_index(&mut index, &manifest_bytes, &look_bytes)?;
     let new_index = serde_json::to_vec_pretty(&index).map_err(|error| error.to_string())?;
@@ -164,31 +174,29 @@ fn look_page_value(manifest: &serde_json::Value) -> serde_json::Value {
 }
 
 fn upsert_index(
-    index: &mut serde_json::Value,
+    index: &mut SiteIndex,
     manifest_bytes: &[u8],
     look_bytes: &[u8],
 ) -> Result<(), String> {
-    let looks = index
-        .get_mut("looks")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| "site index has no looks".to_owned())?;
-    looks.retain(|look| look.get("slug").and_then(serde_json::Value::as_str) != Some(SLUG));
-    looks.push(serde_json::json!({
-        "slug": SLUG,
-        "name": "Synthetic Match Case",
-        "kind": "native_family",
-        "wb_policy": "adaptive",
-        "versions": [{
-            "version": VERSION,
-            "status": "published",
-            "manifest": format!("data/looks/{SLUG}/{VERSION}/manifest.json"),
-            "manifest_sha256": ArtifactHash::of(manifest_bytes).as_str(),
-            "manifest_bytes": manifest_bytes.len(),
-            "artifact": "look.looklab",
-            "sha256": ArtifactHash::of(look_bytes).as_str(),
-            "bytes": look_bytes.len()
-        }]
-    }));
+    index.looks.retain(|look| look.slug.as_str() != SLUG);
+    index.looks.push(LookSummary {
+        slug: Slug::new(SLUG).map_err(|error| error.to_string())?,
+        name: "Synthetic Match Case".to_owned(),
+        kind: LookKind::NativeFamily,
+        visibility: LookVisibility::TestFixture,
+        wb_policy: WbPolicy::Adaptive,
+        versions: vec![VersionSummary {
+            version: LookVersion::new(VERSION).map_err(|error| error.to_string())?,
+            status: LookStatus::Published,
+            manifest: SitePath::new(format!("data/looks/{SLUG}/{VERSION}/manifest.json"))
+                .map_err(|error| error.to_string())?,
+            manifest_sha256: ArtifactHash::of(manifest_bytes),
+            manifest_bytes: manifest_bytes.len() as u64,
+            artifact: ArtifactName::new("look.looklab").map_err(|error| error.to_string())?,
+            sha256: ArtifactHash::of(look_bytes),
+            bytes: look_bytes.len() as u64,
+        }],
+    });
     Ok(())
 }
 

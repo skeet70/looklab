@@ -10,6 +10,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{MessageEvent, Worker, WorkerOptions, WorkerType};
 
+use crate::base::site_url;
 use looklab_wasm::{
     RECYCLE_AFTER_FILES, RECYCLE_MEMORY_FRACTION, WORKER_BUDGET_BYTES, WORKER_FN_MATCH,
     WORKER_FN_VERIFY,
@@ -186,11 +187,10 @@ impl PrepWorker {
     /// # Errors
     /// Reports a browser that cannot start a module worker.
     pub fn spawn() -> Result<Self, String> {
-        let link = WorkerLink::spawn("/workers/prep-worker.js")?;
-        link.post(&[
-            ("type", "init"),
-            ("url", "/generated/wasm/looklab_prep_module.wasm"),
-        ])?;
+        let script = site_url("/workers/prep-worker.js");
+        let module = site_url("/generated/wasm/looklab_prep_module.wasm");
+        let link = WorkerLink::spawn(&script)?;
+        link.post(&[("type", "init"), ("url", &module)])?;
         Ok(Self {
             link,
             files: 0,
@@ -245,11 +245,10 @@ impl MatchWorker {
     /// # Errors
     /// Reports a browser that cannot start a module worker.
     pub fn spawn() -> Result<Self, String> {
-        let link = WorkerLink::spawn("/workers/match-worker.js")?;
-        link.post(&[
-            ("type", "init"),
-            ("url", "/generated/wasm/looklab_match.wasm"),
-        ])?;
+        let script = site_url("/workers/match-worker.js");
+        let module = site_url("/generated/wasm/looklab_match.wasm");
+        let link = WorkerLink::spawn(&script)?;
+        link.post(&[("type", "init"), ("url", &module)])?;
         Ok(Self { link })
     }
 

@@ -89,6 +89,23 @@ pub struct TrustParams {
     pub gate_p95_ratio: f64,
     /// Relative σ rise above which losing support is a violation (docs/05 §8).
     pub gate_support_margin: f64,
+    /// Post-clip σ at which a supported probe leaves support (docs/05 §8). Must match
+    /// the fit's `support_sigma_exit`.
+    pub support_sigma_exit: f64,
+
+    /// Standard errors above the mean before a region is a persistent residual
+    /// (docs/05 §12).
+    pub residual_sigma_threshold: f64,
+    /// Effective contributors a persistent residual needs (docs/05 §12).
+    pub residual_min_contributors: usize,
+    /// One more verification image's ΔE standard deviation, used to price a
+    /// bounty (docs/05 §12). Tentative.
+    pub bounty_image_sigma: f64,
+    /// Region σ below which trusted data resolves a bounty (docs/05 §12).
+    /// Tentative.
+    pub bounty_resolution_sigma: f64,
+    /// Published bounties per Look × body (docs/05 §12).
+    pub bounty_top_n: usize,
 }
 
 impl TrustParams {
@@ -149,6 +166,12 @@ impl Default for TrustParams {
             gate_over_bound_fraction: 0.02,
             gate_p95_ratio: 1.0,
             gate_support_margin: 0.1,
+            support_sigma_exit: 1.65,
+            residual_sigma_threshold: 2.0,
+            residual_min_contributors: 5,
+            bounty_image_sigma: 1.0,
+            bounty_resolution_sigma: 0.5,
+            bounty_top_n: 10,
         }
     }
 }

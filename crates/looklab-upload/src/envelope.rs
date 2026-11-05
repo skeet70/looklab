@@ -4,11 +4,16 @@
 //! Encoding is total for values that satisfy the field limits; decoding rejects
 //! every deviation from the layout with its own error variant.
 
-use looklab_meta::RawSerial;
+use looklab_meta::{
+    MAX_FIRMWARE_ID_LEN, MAX_FIRMWARE_VERSION_LEN, MAX_LOOK_SLUG_LEN, MAX_LOOK_VERSION_LEN,
+    RawSerial,
+};
 use sha2::{Digest, Sha256};
 
 use crate::ids::{MAX_BODY_ID_LEN, MAX_FIRMWARE_LEN, MAX_SLUG_LEN};
-use crate::manifest::{BatchManifest, BlobKind, canonical_manifest_bytes, manifest_hash};
+use crate::manifest::{
+    BatchManifest, BlobKind, IntentError, canonical_manifest_bytes, manifest_hash,
+};
 use crate::metadata::MetadataError;
 use crate::nonce::{Challenge, ManifestHash, Nonce};
 use crate::pow::{POW_K, PowSolutions};
@@ -83,6 +88,7 @@ pub enum ManifestField {
     FirmwareVersion,
     SimKey,
     ControlKey,
+    CardIdentifier,
 }
 
 impl core::fmt::Display for ManifestField {
@@ -93,6 +99,7 @@ impl core::fmt::Display for ManifestField {
             Self::FirmwareVersion => "firmware version",
             Self::SimKey => "sim key",
             Self::ControlKey => "control key",
+            Self::CardIdentifier => "card identifier",
         })
     }
 }
@@ -128,6 +135,11 @@ pub enum EnvelopeError {
         index: usize,
         #[source]
         source: MetadataError,
+    },
+    #[error("batch intent does not match its images: {source}")]
+    IntentInvalid {
+        #[source]
+        source: IntentError,
     },
     #[error("credential id is empty")]
     CredentialIdEmpty,
@@ -313,6 +325,9 @@ pub fn parse_envelope_strict(bytes: &[u8], limits: &Limits) -> Result<Envelope, 
             .validate()
             .map_err(|source| EnvelopeError::MetadataInvalid { index, source })?;
     }
+    manifest
+        .validate_intent()
+        .map_err(|source| EnvelopeError::IntentInvalid { source })?;
 
     let credential_len = usize::from(reader.u8()?);
     if credential_len == 0 {
@@ -423,6 +438,33 @@ fn scan_manifest_images(bytes: &[u8]) -> Result<Option<usize>, EnvelopeError> {
         };
         check_string_len(len, ManifestField::LookSlug, MAX_SLUG_LEN)?;
         if !scan.skip(len) {
+            return Ok(None);
+        }
+    }
+    if intent == 2 {
+        let Some(variant) = scan.varint() else {
+            return Ok(None);
+        };
+        let limits: &[usize] = match variant {
+            0 => &[
+                MAX_FIRMWARE_ID_LEN,
+                MAX_FIRMWARE_VERSION_LEN,
+                MAX_LOOK_SLUG_LEN,
+                MAX_LOOK_VERSION_LEN,
+            ],
+            1 => &[MAX_FIRMWARE_ID_LEN, MAX_FIRMWARE_VERSION_LEN],
+            _ => return Ok(None),
+        };
+        for &max in limits {
+            let Some(len) = scan.varint() else {
+                return Ok(None);
+            };
+            check_string_len(len, ManifestField::CardIdentifier, max)?;
+            if !scan.skip(len) {
+                return Ok(None);
+            }
+        }
+        if variant == 0 && !scan.skip(8) {
             return Ok(None);
         }
     }

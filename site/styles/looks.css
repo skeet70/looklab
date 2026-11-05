@@ -1,0 +1,20 @@
+.look-gallery { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr)); gap: 1.5rem; margin-block: 1.5rem 3rem; }
+.camera-gallery { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 27rem), 1fr)); gap: 2rem; margin-top: 2rem; }
+.camera-card { min-width: 0; padding: 1rem; border: 1px solid var(--line); border-radius: 1rem; }
+.camera-look-strip { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; }
+.camera-card h2 { margin-bottom: .25rem; }
+.look { min-width: 0; }
+.look .photo-strip { display: flex; gap: .5rem; flex-wrap: wrap; margin-block: 1rem; }
+.look .photo-strip button[aria-pressed=true] { outline: 2px solid currentColor; }
+.look .tabs [role=tabpanel] > div { padding-block: 1rem; }
+.look .photo-strip button { width: calc((100% - 2.5rem) / 6); min-width: 3rem; padding: .2rem; overflow: hidden; }
+.look .photo-strip canvas { display: block; width: 100%; height: auto; aspect-ratio: 3 / 2; object-fit: cover; }
+.character-tags { display: flex; flex-wrap: wrap; gap: .5rem; padding: 0; list-style: none; }
+.character-tags li { padding: .3rem .65rem; border: 1px solid var(--line); border-radius: 2rem; font-size: .85rem; }
+.look .tabs [role=tabpanel] > div[hidden] { display: none; }
+.look .data-table { display: block; max-width: 100%; overflow-x: auto; }
+.look .data-table code { overflow-wrap: anywhere; }
+.recipe-grid { display: grid; gap: 1rem; }
+.recipe { padding-block: 1rem; border-top: 1px solid var(--line); }
+@media (max-width: 480px) { .camera-look-strip { grid-template-columns: 1fr; } .camera-look-strip > :nth-child(n+2) { display: none; } }
+@media (max-width: 480px) { .look [role=tablist] { flex-wrap: nowrap; gap: .4rem; } .look [role=tab] { padding: .6rem .65rem; } }

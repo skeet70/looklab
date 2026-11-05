@@ -106,25 +106,41 @@ w_img = base(kind) × evidence × tier × reputation        → then caps (§6)
 
 **Anchor:** the first rooted version of a Look, or the last version a moderator explicitly re-anchored (the re-anchor action requires a reason, e.g. a new root session). Re-anchoring is needed so that legitimate long-term improvement isn't blocked forever.
 
+**Gated set.** The gated probes are the **sticky union**: every probe supported in any version published since the current anchor, plus every probe in either compared version's supported set. A probe that loses support for any cause stays gated until a re-anchor, which restarts the union from the new anchor's supported probes. So making a region uncertain, thin or biased cannot take it out of the gate.
+
+**Support.** Each probe carries a pre-clip prediction (the `J'a'b'` the Look defines) and a post-clip prediction in the version's reference output encoding (pre-clip `J'a'b'` → output RGB → soft clip → `J'a'b'`), each with its own σ, and the identity-prior-attributable bias in ΔE. A probe is supported when all four causes hold:
+
+- post-clip `σ ≤ 1.5` entering and `σ > 1.65` leaving;
+- its bias is at most `0.33 × 1.5` ΔE entering and above `1.1 ×` that leaving;
+- its region reaches the absolute density floor (tempered effective weight per bin, not a share of the mean bin) and it has at least 3 distinct-image clusters. Neither has hysteresis.
+
+Enter and exit thresholds differ so that honest boundary jitter does not flip a probe between versions, and the previous published version's per-cause state is an input to marking. The first version uses the enter rule only. The absolute floor means data uploaded elsewhere cannot push a rare region below it.
+
 A candidate LookVersion is published only if:
-1. **Root non-regression:** median ΔE on root probes rises by ≤ 0.3 (p95 ≤ 0.5) vs. the previous version, **and** by ≤ 0.5 (p95 ≤ 0.8) vs. the anchor.
-2. **Bounded drift, scaled by uncertainty.** Deltas are computed after converting the reference version into the candidate's gauge ([02 §2.1](02-color-pipeline.md)). The gated probe set is the **union of probes supported in either version**. For each such probe p, the shift |Δ_p| is compared with a bound that grows with the uncertainty of the two versions, and an absolute ceiling C:
+
+1. **Root non-regression:** median ΔE on root probes rises by ≤ 0.3 (p95 ≤ 0.5) vs. the previous version, **and** by ≤ 0.5 (p95 ≤ 0.8) vs. the anchor. Root error is measured on post-clip predictions against the admitted observations.
+
+2. **Bounded drift, scaled by uncertainty.** Deltas are computed after converting the reference version into the candidate's gauge ([02 §2.1](02-color-pipeline.md)). Drift is the post-clip ΔE at each gated probe. For each such probe p, the shift |Δ_p| is compared with a bound that grows with the uncertainty of the two versions, and an absolute ceiling C:
    ```
    vs. anchor:    b_p = clamp( 2·sqrt(σ²_anchor(p) + σ²_cand(p)), 1.0, C = 3.0 )
    vs. previous:  b_p = clamp( 2·sqrt(σ²_prev(p)   + σ²_cand(p)), 0.75, C = 2.0 )
    ```
    Pass only if, for each comparison:
-   - **no** probe exceeds the ceiling C (absolute; no allowance);
+   - **no** probe present in both versions exceeds the post-clip ceiling C (absolute; no allowance, and it applies outside the gated union too);
    - ≤ 2% of gated probes exceed their b_p (these may only land between b_p and C);
    - the p95 of |Δ_p|/b_p ≤ 1.0;
-   - **no** probe that was supported leaves support because its σ rose: a probe becomes unsupported with `σ_cand > 1.5` (the support threshold) and `σ_cand > (1 + 0.1)·σ_ref`, where σ_ref is σ in the version the probe was supported in. Conflicting uploads raise σ well past that margin; honest boundary jitter around 1.5 does not. Raising a region's σ would otherwise take it out of the gate while it still feeds bakes and previews. Such probes count as violations and go to moderation. A support loss that is not a violation, whether the density floor rose, the probe entered the clip shoulder, or σ rose within the margin, is a **coverage change**: it is reported in the gate report and stays in the gated union.
+   - **every** probe whose pre-clip value is identified in both versions (the reference encoding's soft clip keeps a per-channel derivative of at least 0.25 at the prediction) keeps its pre-clip lightness shift |ΔJ′| and hue-angle shift `ΔH_ab = 2·sqrt(C₁·C₂)·sin(Δh/2)` (CIEDE2000's hue difference, UCS units scaled by chroma) within C. An unidentified pre-clip value takes its variance through the prior floor and is gated on its post-clip ΔE only; `J′` and hue survive the reference encoding into exports, where post-clip ΔE alone can hide a pre-clip change behind the clip;
+   - **no** probe that was supported leaves support because its σ rose: the candidate fails the σ test at the exit threshold (`σ_cand > 1.65`) and `σ_cand > (1 + 0.1)·σ_ref`, where σ_ref is the post-clip σ in the version that supported it. Conflicting uploads raise σ well past that margin; honest boundary jitter does not. Since b_p sits at its ceiling for such a probe, only C bounds it. Such probes count as violations and go to moderation.
+
+   A support loss for any other cause (density floor, cluster count, bias, or σ within the margin) is a **coverage change**: it is reported in the gate report and stays in the gated union. Neither kind of loss removes a probe from drift gating.
 
    The floor keeps well-measured regions tight. The ceiling keeps the gate meaningful in uncertain, provisional regions, which is where a nudging attacker would aim.
+
 3. **Changelog:** data added (counts by tier), largest contributors by weight (internal ids), gate metrics, bodies/epochs affected, input-transform versions.
 
 A failed gate leaves the candidate provisional and opens a moderation item.
 
-**Rollback:** one moderator action, "revert to version N, exclude credential(s) K, refit". The revert publishes N's content as a new version immediately, then schedules the refit without K. Published versions stay immutable and pinnable.
+**Rollback:** one moderator action, "revert to version N, exclude credential(s) K, refit". The revert publishes N's content as a new version immediately, then schedules the refit without K. Published versions stay immutable and pinnable. A revert is not a re-anchor: the gated union continues across it.
 
 ## 9. Anti-spam: proof-of-work
 
@@ -168,7 +184,7 @@ A failed gate leaves the candidate provisional and opens a moderation item.
 
 The two gauge rows (a body joining a component; two components merging) are asserted against the component and reference gauges in `looklab-fit` ([09 P4.2](09-roadmap.md)): a join keeps the designated body and its reference, a merge converts the exposure gauge exactly through `ExposureGauge::between`, and a WB reference change takes `WbGaugeChange::RefitAndReanchor`.
 
-At CI-sized synthetic pools the fitted sandwich σ crosses the 1.5 support threshold when a contributor joins a pool, so an honest release loses support at a handful of boundary probes. §8 counts that only when σ rises past the support margin, so the jitter does not block honest releases. Scenarios that still move an honest release past a drift ceiling, or whose fitted σ jumps past the margin when a thin pool gains data, remain ignored with that reason.
+At CI-sized synthetic pools the fitted σ moves sharply when a pool gains data, so an honest release loses support at boundary probes. The hysteresis band (1.5 enter, 1.65 exit), the sticky union and the σ-rise rule (exit threshold plus the margin) absorb jitter between versions, but not a thin rooted version's overconfident σ: when honest data joins, a probe's σ can rise from 0.5 to 10.7 and the margin rule holds the release. Rows whose honest releases are still held by the drift gate, by the post-clip ceiling or by that σ rise remain ignored, each with its measured failure in the `#[ignore]` reason. The post-clip ceiling applies to every probe present in both versions, so a shift concentrated on probes outside the union is still bounded; pre-clip `J′` and hue are checked only where the clip leaves the value identified (smallest per-channel derivative ≥ 0.25).
 
 The harness runs in CI as `cargo test -p looklab-trust --features harness --release`.
 

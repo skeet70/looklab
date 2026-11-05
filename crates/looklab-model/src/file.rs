@@ -27,7 +27,7 @@ const BIN_NAME: &str = "look.bin";
 const MAX_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_JSON_BYTES: usize = 1024 * 1024;
 const MAX_BIN_BYTES: usize = 8 * 1024 * 1024;
-const MAX_BIN_ARRAYS: usize = 8;
+const MAX_BIN_ARRAYS: usize = 16;
 const MAX_NAME_BYTES: usize = 32;
 const MAX_ARRAY_VALUES: usize = 1_000_000;
 
@@ -329,6 +329,18 @@ pub struct UncertaintyRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe_cov_ref: Option<BinRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_cov_post_ref: Option<BinRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_bias_ref: Option<BinRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_sigma_ref: Option<BinRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_sigma_post_ref: Option<BinRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_pre_reliable_ref: Option<BinRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub support_ref: Option<BinRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub density_ref: Option<BinRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<UncertaintyMethod>,
@@ -444,15 +456,45 @@ impl LookFile {
         {
             return Err(ModelError::Invalid("layer coef_ref".to_string()));
         }
-        if let Some(value) = &self.uncertainty.probe_cov_ref
-            && !reference(value, "bin:probe_cov")
-        {
-            return Err(ModelError::Invalid("probe_cov ref".to_string()));
-        }
-        if let Some(value) = &self.uncertainty.density_ref
-            && !reference(value, "bin:kde")
-        {
-            return Err(ModelError::Invalid("kde ref".to_string()));
+        for (value, name, field) in [
+            (
+                &self.uncertainty.probe_cov_ref,
+                "bin:probe_cov",
+                "probe_cov",
+            ),
+            (
+                &self.uncertainty.probe_cov_post_ref,
+                "bin:probe_cov_post",
+                "probe_cov_post",
+            ),
+            (
+                &self.uncertainty.probe_bias_ref,
+                "bin:probe_bias",
+                "probe_bias",
+            ),
+            (
+                &self.uncertainty.probe_sigma_ref,
+                "bin:probe_sigma",
+                "probe_sigma",
+            ),
+            (
+                &self.uncertainty.probe_sigma_post_ref,
+                "bin:probe_sigma_post",
+                "probe_sigma_post",
+            ),
+            (
+                &self.uncertainty.probe_pre_reliable_ref,
+                "bin:probe_pre_reliable",
+                "probe_pre_reliable",
+            ),
+            (&self.uncertainty.support_ref, "bin:support", "support"),
+            (&self.uncertainty.density_ref, "bin:kde", "kde"),
+        ] {
+            if let Some(value) = value
+                && !reference(value, name)
+            {
+                return Err(ModelError::Invalid(format!("{field} ref")));
+            }
         }
         Ok(())
     }
@@ -523,6 +565,21 @@ impl ProbeCovariance {
     }
 }
 
+/// One scalar per probe (bias, support mask).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProbeScalars {
+    pub values: Vec<f64>,
+}
+
+impl ProbeScalars {
+    pub fn new(values: Vec<f64>) -> Result<Self> {
+        if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+            return Err(ModelError::Invalid("invalid probe scalars".to_string()));
+        }
+        Ok(Self { values })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Density {
     pub values: Vec<f64>,
@@ -540,15 +597,39 @@ impl Density {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UncertaintyData {
     pub probe_cov: Option<ProbeCovariance>,
+    pub probe_cov_post: Option<ProbeCovariance>,
+    pub probe_bias: Option<ProbeScalars>,
+    pub probe_sigma: Option<ProbeScalars>,
+    pub probe_sigma_post: Option<ProbeScalars>,
+    pub probe_pre_reliable: Option<ProbeScalars>,
+    pub support: Option<ProbeScalars>,
     pub density: Option<Density>,
 }
 
 impl UncertaintyData {
     fn validate(&self, probes: usize) -> Result<()> {
-        if let Some(covariance) = &self.probe_cov
-            && covariance.probes != probes
-        {
-            return Err(ModelError::Invalid("probe_cov dimensions".to_string()));
+        for (name, covariance) in [
+            ("probe_cov", &self.probe_cov),
+            ("probe_cov_post", &self.probe_cov_post),
+        ] {
+            if let Some(covariance) = covariance
+                && covariance.probes != probes
+            {
+                return Err(ModelError::Invalid(format!("{name} dimensions")));
+            }
+        }
+        for (name, scalars) in [
+            ("probe_bias", &self.probe_bias),
+            ("probe_sigma", &self.probe_sigma),
+            ("probe_sigma_post", &self.probe_sigma_post),
+            ("probe_pre_reliable", &self.probe_pre_reliable),
+            ("support", &self.support),
+        ] {
+            if let Some(scalars) = scalars
+                && scalars.values.len() != probes
+            {
+                return Err(ModelError::Invalid(format!("{name} dimensions")));
+            }
         }
         if let Some(density) = &self.density
             && density.values.len() != probes
@@ -588,6 +669,30 @@ impl LookDocument {
             .probe_cov
             .as_ref()
             .map(|_| BinRef::new("bin:probe_cov").expect("static bin reference"));
+        self.file.uncertainty.probe_cov_post_ref = uncertainty
+            .probe_cov_post
+            .as_ref()
+            .map(|_| BinRef::new("bin:probe_cov_post").expect("static bin reference"));
+        self.file.uncertainty.probe_bias_ref = uncertainty
+            .probe_bias
+            .as_ref()
+            .map(|_| BinRef::new("bin:probe_bias").expect("static bin reference"));
+        self.file.uncertainty.probe_sigma_ref = uncertainty
+            .probe_sigma
+            .as_ref()
+            .map(|_| BinRef::new("bin:probe_sigma").expect("static bin reference"));
+        self.file.uncertainty.probe_sigma_post_ref = uncertainty
+            .probe_sigma_post
+            .as_ref()
+            .map(|_| BinRef::new("bin:probe_sigma_post").expect("static bin reference"));
+        self.file.uncertainty.probe_pre_reliable_ref = uncertainty
+            .probe_pre_reliable
+            .as_ref()
+            .map(|_| BinRef::new("bin:probe_pre_reliable").expect("static bin reference"));
+        self.file.uncertainty.support_ref = uncertainty
+            .support
+            .as_ref()
+            .map(|_| BinRef::new("bin:support").expect("static bin reference"));
         self.file.uncertainty.density_ref = uncertainty
             .density
             .as_ref()
@@ -602,6 +707,17 @@ impl LookDocument {
         self.uncertainty
             .validate(self.file.probe_set.probe_count())?;
         if self.file.uncertainty.probe_cov_ref.is_some() != self.uncertainty.probe_cov.is_some()
+            || self.file.uncertainty.probe_cov_post_ref.is_some()
+                != self.uncertainty.probe_cov_post.is_some()
+            || self.file.uncertainty.probe_bias_ref.is_some()
+                != self.uncertainty.probe_bias.is_some()
+            || self.file.uncertainty.probe_sigma_ref.is_some()
+                != self.uncertainty.probe_sigma.is_some()
+            || self.file.uncertainty.probe_sigma_post_ref.is_some()
+                != self.uncertainty.probe_sigma_post.is_some()
+            || self.file.uncertainty.probe_pre_reliable_ref.is_some()
+                != self.uncertainty.probe_pre_reliable.is_some()
+            || self.file.uncertainty.support_ref.is_some() != self.uncertainty.support.is_some()
             || self.file.uncertainty.density_ref.is_some() != self.uncertainty.density.is_some()
         {
             return Err(ModelError::Invalid("uncertainty refs".to_string()));
@@ -664,6 +780,12 @@ enum BinArray {
     Lightness,
     Residual,
     ProbeCovariance,
+    ProbeCovariancePost,
+    ProbeBias,
+    ProbeSigma,
+    ProbeSigmaPost,
+    ProbePreReliable,
+    Support,
     Density,
 }
 
@@ -677,6 +799,12 @@ impl BinArray {
             Self::Lightness => "Lambda",
             Self::Residual => "res",
             Self::ProbeCovariance => "probe_cov",
+            Self::ProbeCovariancePost => "probe_cov_post",
+            Self::ProbeBias => "probe_bias",
+            Self::ProbeSigma => "probe_sigma",
+            Self::ProbeSigmaPost => "probe_sigma_post",
+            Self::ProbePreReliable => "probe_pre_reliable",
+            Self::Support => "support",
             Self::Density => "kde",
         }
     }
@@ -687,7 +815,14 @@ impl BinArray {
             Self::Tint => 2 * TINT_COEFS,
             Self::Chroma | Self::Hue | Self::Lightness => GRL_COEFS,
             Self::Residual => RESIDUAL_COEFS,
-            Self::ProbeCovariance | Self::Density => return None,
+            Self::ProbeCovariance
+            | Self::ProbeCovariancePost
+            | Self::ProbeBias
+            | Self::ProbeSigma
+            | Self::ProbeSigmaPost
+            | Self::ProbePreReliable
+            | Self::Support
+            | Self::Density => return None,
         })
     }
 
@@ -700,6 +835,12 @@ impl BinArray {
             "Lambda" => Self::Lightness,
             "res" => Self::Residual,
             "probe_cov" => Self::ProbeCovariance,
+            "probe_cov_post" => Self::ProbeCovariancePost,
+            "probe_bias" => Self::ProbeBias,
+            "probe_sigma" => Self::ProbeSigma,
+            "probe_sigma_post" => Self::ProbeSigmaPost,
+            "probe_pre_reliable" => Self::ProbePreReliable,
+            "support" => Self::Support,
             "kde" => Self::Density,
             _ => return None,
         })
@@ -710,6 +851,24 @@ fn encode_bin(look: &Look, uncertainty: &UncertaintyData) -> Result<Vec<u8>> {
     let mut arrays = look_into_arrays(look);
     if let Some(covariance) = &uncertainty.probe_cov {
         arrays.insert(BinArray::ProbeCovariance, covariance.values.clone());
+    }
+    if let Some(covariance) = &uncertainty.probe_cov_post {
+        arrays.insert(BinArray::ProbeCovariancePost, covariance.values.clone());
+    }
+    if let Some(scalars) = &uncertainty.probe_bias {
+        arrays.insert(BinArray::ProbeBias, scalars.values.clone());
+    }
+    if let Some(scalars) = &uncertainty.probe_sigma {
+        arrays.insert(BinArray::ProbeSigma, scalars.values.clone());
+    }
+    if let Some(scalars) = &uncertainty.probe_sigma_post {
+        arrays.insert(BinArray::ProbeSigmaPost, scalars.values.clone());
+    }
+    if let Some(scalars) = &uncertainty.probe_pre_reliable {
+        arrays.insert(BinArray::ProbePreReliable, scalars.values.clone());
+    }
+    if let Some(scalars) = &uncertainty.support {
+        arrays.insert(BinArray::Support, scalars.values.clone());
     }
     if let Some(density) = &uncertainty.density {
         arrays.insert(BinArray::Density, density.values.clone());
@@ -844,6 +1003,37 @@ fn decode_bin(bytes: &[u8]) -> Result<BTreeMap<BinArray, Vec<f64>>> {
     Ok(arrays)
 }
 
+fn covariance_from_arrays(
+    name: &str,
+    present: bool,
+    values: Option<Vec<f64>>,
+) -> Result<Option<ProbeCovariance>> {
+    match (present, values) {
+        (false, None) => Ok(None),
+        (false, Some(_)) => Err(ModelError::UnknownCoefficient(name.to_string())),
+        (true, None) => Err(ModelError::MissingCoefficient(name.to_string())),
+        (true, Some(values)) => {
+            if values.len() % 9 != 0 {
+                return Err(ModelError::Invalid(format!("{name} dimensions")));
+            }
+            Ok(Some(ProbeCovariance::new(values.len() / 9, values)?))
+        }
+    }
+}
+
+fn scalars_from_arrays(
+    name: &str,
+    present: bool,
+    values: Option<Vec<f64>>,
+) -> Result<Option<ProbeScalars>> {
+    match (present, values) {
+        (false, None) => Ok(None),
+        (false, Some(_)) => Err(ModelError::UnknownCoefficient(name.to_string())),
+        (true, None) => Err(ModelError::MissingCoefficient(name.to_string())),
+        (true, Some(values)) => Ok(Some(ProbeScalars::new(values)?)),
+    }
+}
+
 fn uncertainty_from_arrays(
     file: &LookFile,
     arrays: &mut BTreeMap<BinArray, Vec<f64>>,
@@ -866,6 +1056,36 @@ fn uncertainty_from_arrays(
             Some(ProbeCovariance::new(values.len() / 9, values)?)
         }
     };
+    let probe_cov_post = covariance_from_arrays(
+        "probe_cov_post",
+        file.uncertainty.probe_cov_post_ref.is_some(),
+        arrays.remove(&BinArray::ProbeCovariancePost),
+    )?;
+    let probe_bias = scalars_from_arrays(
+        "probe_bias",
+        file.uncertainty.probe_bias_ref.is_some(),
+        arrays.remove(&BinArray::ProbeBias),
+    )?;
+    let probe_sigma = scalars_from_arrays(
+        "probe_sigma",
+        file.uncertainty.probe_sigma_ref.is_some(),
+        arrays.remove(&BinArray::ProbeSigma),
+    )?;
+    let probe_sigma_post = scalars_from_arrays(
+        "probe_sigma_post",
+        file.uncertainty.probe_sigma_post_ref.is_some(),
+        arrays.remove(&BinArray::ProbeSigmaPost),
+    )?;
+    let probe_pre_reliable = scalars_from_arrays(
+        "probe_pre_reliable",
+        file.uncertainty.probe_pre_reliable_ref.is_some(),
+        arrays.remove(&BinArray::ProbePreReliable),
+    )?;
+    let support = scalars_from_arrays(
+        "support",
+        file.uncertainty.support_ref.is_some(),
+        arrays.remove(&BinArray::Support),
+    )?;
     let density = match (
         file.uncertainty.density_ref.is_some(),
         arrays.remove(&BinArray::Density),
@@ -875,7 +1095,16 @@ fn uncertainty_from_arrays(
         (true, None) => return Err(ModelError::MissingCoefficient("kde".to_string())),
         (true, Some(values)) => Some(Density::new(values)?),
     };
-    let uncertainty = UncertaintyData { probe_cov, density };
+    let uncertainty = UncertaintyData {
+        probe_cov,
+        probe_cov_post,
+        probe_bias,
+        probe_sigma,
+        probe_sigma_post,
+        probe_pre_reliable,
+        support,
+        density,
+    };
     uncertainty.validate(file.probe_set.probe_count())?;
     Ok(uncertainty)
 }

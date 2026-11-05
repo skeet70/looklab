@@ -9,7 +9,7 @@ use looklab_schema::{
 
 const BODY: &str = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
 const SCHEMA: &str = include_str!("../../../data/bodies/fujifilm-x-t5.yaml");
-const INTERFACE: &str = include_str!("../../../data/interfaces/example-firmware-sim-v1.yaml");
+const INTERFACE: &str = include_str!("../../../data/interfaces/example-app-lut3d-v1.yaml");
 
 fn summary_of(kind: ProposalKind, payload: &str) -> ProposalSummary {
     validate_proposal(kind, payload)
@@ -113,9 +113,13 @@ fn an_interface_profile_summarizes_its_insertion_point() {
     let summary = summary_of(ProposalKind::InterfaceProfile, INTERFACE);
     assert_eq!(
         summary.headline,
-        "adds the Example firmware sim slot firmware interface profile"
+        "adds the Example editor 3D LUT module software interface profile"
     );
-    assert!(summary.text().contains("accepts: cube, native JSON"));
+    assert!(
+        summary
+            .text()
+            .contains("accepts: cube, Hald clut, native JSON")
+    );
     assert!(summary.text().contains("bodies: Model-A"));
 }
 

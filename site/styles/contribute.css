@@ -1,0 +1,30 @@
+.contribute-intro { max-width: 70ch; margin-bottom: 2rem; }
+.contribute-intro .eyebrow { color: var(--muted); font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; }
+.contribute-intro.contribution-active { margin-bottom: 1.5rem; }
+.contribute-intro.contribution-active > p { display: none; }
+.contribute-intro.contribution-active h1 { font-size: clamp(1.8rem, 3vw, 2.5rem); }
+.help-grid, .wanted-grid, .pairing-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr)); gap: 1rem; }
+.help-card, .wanted-card, .pairing-card { padding: 1.25rem; border: 1px solid var(--line); border-radius: .6rem; background: var(--panel); min-width: 0; }
+.help-card h3, .wanted-card h2 { margin: .35rem 0 .6rem; }
+.help-meta { color: var(--muted); font-size: .85rem; margin: 0; }
+.ways-to-help { margin-block: 2rem; }
+.contribute-page .step { margin-block: 1.5rem; padding: 1.5rem; border: 1px solid var(--line); border-radius: .6rem; }
+.contribute-page .step > label:not(:has(input[type=checkbox])) { display: block; margin-top: 1rem; }
+.contribute-page .step > input[type=text], .contribute-page textarea { display: block; width: min(100%, 36rem); box-sizing: border-box; }
+.contribute-page .step > button { margin-top: 1.25rem; }
+.contribute-page .button-primary:hover:not(:disabled) { background: var(--accent); color: var(--accent-ink); }
+.contribute-page .step > label:has(input[type=checkbox]) { display: block; margin-top: 1rem; }
+.contribute-page .disclosure { margin-block: 1rem; }
+.contribute-page .inspector-canvases { display: flex; gap: 1rem; flex-wrap: wrap; }
+.contribute-page canvas { max-width: 100%; height: auto; }
+.contribute-page .data-table { display: block; overflow-x: auto; max-width: 100%; }
+.contribute-page .data-table td { overflow-wrap: anywhere; }
+.contribute-page progress { width: min(100%, 36rem); }
+.payload-summary { font-size: 1.15rem; font-weight: 600; max-width: 65ch; }
+.pairing-card p { overflow-wrap: anywhere; }
+.menu-setting { display: flex; align-items: center; justify-content: space-between; gap: 1rem; max-width: 36rem; text-transform: capitalize; }
+.menu-setting input { width: 7rem; }
+.contribution-done > a { display: inline-block; margin: .5rem 1rem .5rem 0; }
+.contribution-done a { overflow-wrap: anywhere; max-width: 100%; }
+.wanted-intro { max-width: 70ch; margin-bottom: 2rem; }
+@media (max-width: 600px) { .contribute-page .step { padding: 1rem; } .help-grid { gap: .75rem; } }

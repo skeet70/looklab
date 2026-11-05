@@ -19,6 +19,7 @@ looklab-color.workspace = true
 looklab-fit.workspace = true
 looklab-meta.workspace = true
 looklab-model.workspace = true
+looklab-export.workspace = true
 looklab-publish.workspace = true
 looklab-samples.workspace = true
 looklab-schema = { workspace = true, features = ["fs"] }

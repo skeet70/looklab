@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use looklab_color::Mat3;
 use looklab_color::ucs::Ucs;
+use looklab_color::{Mat3, RgbSpace};
 use looklab_model::realization::{ControlResponseModel, ResponseParamId, Settings};
 use looklab_model::{Look, ModelError, ProbeId};
 use looklab_samples::{Error as SamplesError, SampleSet};
@@ -102,13 +102,23 @@ pub struct FitOptions {
     pub exposure_prior_sd: f64,
     pub wb_prior_sd: f64,
     pub exposure_mode_prior_sd: f64,
-    pub density_floor_fraction: f64,
+    /// Absolute tempered effective weight per KDE bin.
+    pub density_floor: f64,
+    /// Post-clip σ at which a probe enters support.
     pub support_sigma: f64,
+    /// Post-clip σ above which a supported probe leaves support.
+    pub support_sigma_exit: f64,
+    /// `|b_p| / support_sigma` at which a probe enters the bias test; exit is 1.1 times this.
+    pub bias_fraction: f64,
     /// Minimum images with non-negligible weight near a probe (tentative 3).
     pub min_probe_clusters: usize,
+    /// Add the prior curvature floor to the probe covariance (the recovery study ablates it).
+    pub prior_floor: bool,
     /// Scale the image-clustered sandwich for few clusters (Cameron & Miller 2015).
     pub sandwich_correction: bool,
     pub run_gcv: bool,
+    /// Starting smoothness weights; GCV replaces them when `run_gcv` is set.
+    pub initial_lambdas: StageLambdas,
     pub fit_residual: bool,
     /// Sweeps of the recipe stage, which holds θ_L fixed (docs/02 §4.3).
     pub recipe_sweeps: usize,
@@ -122,18 +132,22 @@ impl Default for FitOptions {
             nu: 4.0,
             max_samples_per_image: 10_000,
             hessian_samples: 8_000,
-            max_sweeps: 24,
-            sweep_budget: 3_000_000.0,
+            max_sweeps: 128,
+            sweep_budget: 2_000_000.0,
             sigma_prior: (4.0, 4.5),
             clip_prior: (0.03, 0.02),
             exposure_prior_sd: 0.3,
             wb_prior_sd: 0.02,
             exposure_mode_prior_sd: 0.3,
-            density_floor_fraction: 0.02,
+            density_floor: 0.01,
             support_sigma: 1.5,
+            support_sigma_exit: 1.65,
+            bias_fraction: 0.33,
             min_probe_clusters: 3,
+            prior_floor: true,
             sandwich_correction: true,
             run_gcv: true,
+            initial_lambdas: StageLambdas::default(),
             fit_residual: true,
             recipe_sweeps: 4,
         }
@@ -222,13 +236,38 @@ pub struct ImageFitStats {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProbeEstimate {
     pub id_hint: usize,
+    /// Pre-clip `J'a'b'` the Look defines.
     pub ucs: Ucs,
+    /// Pre-clip covariance, UCS units squared.
     pub covariance: [[f64; 3]; 3],
+    /// `sqrt(tr pre covariance)`, ΔE.
     pub sigma_de: f64,
+    /// Post-clip `J'a'b'` in the reference output encoding.
+    pub post_ucs: Ucs,
+    /// Post-clip covariance, UCS units squared.
+    pub post_covariance: [[f64; 3]; 3],
+    /// `sqrt(tr post covariance)`, ΔE.
+    pub post_sigma_de: f64,
+    /// `|b_p|` from the prior and penalty curvature, post-clip, ΔE.
+    pub bias_de: f64,
+    /// `min` per-channel clip derivative is at least 0.25, so pre-clip J′ is identifiable.
+    pub pre_clip_reliable: bool,
+    /// Absolute tempered effective weight per KDE bin.
     pub density: f64,
+    pub supported_sigma: bool,
+    pub supported_density: bool,
+    pub supported_clusters: bool,
+    pub supported_bias: bool,
     pub supported: bool,
     /// Images with non-negligible weight in the probe's region.
     pub clusters: usize,
+}
+
+/// Previous published state, for support hysteresis (docs/02 §5).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PreviousSupport {
+    pub sigma: Vec<bool>,
+    pub bias: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -266,11 +305,17 @@ pub struct Diagnostics {
     pub objective_samples: usize,
     pub quarantined: usize,
     pub down_weighted: usize,
+    /// Data curvature over prior plus smoothness curvature, per G/R/Λ coefficient.
+    pub grl_precision_ratio: Vec<f64>,
+    /// The final refinement stage met its objective and step tolerances.
+    pub converged: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FitResult {
     pub look: Look,
+    /// Output encoding of the post-clip probe predictions.
+    pub output_space: RgbSpace,
     pub images: Vec<ImageNuisances>,
     pub realization: Realization,
     pub lambdas: StageLambdas,

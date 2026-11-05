@@ -31,6 +31,13 @@ fn sanitized() -> SanitizedMetadata {
         }),
         capture_month: YearMonth::new(2024, 5),
         software: Some("X-T5 Ver.2.10".to_owned()),
+        render_tag: Some(
+            looklab_meta::parse_render_tag(
+                "looklab-card/1 fw=acme-sim/2.0.1 look=provia@1.0.0 cid=0123456789abcdef",
+            )
+            .expect("render tag"),
+        ),
+        render_tag_malformed: false,
         look: Some(LookSettings {
             film_mode: Some(ParsedTag {
                 tag: FujiTag::FilmMode,
@@ -69,6 +76,11 @@ fn mirror_carries_every_sanitized_field() {
     );
     let month = mirror.capture_month.expect("month survives the mirror");
     assert_eq!((month.year(), month.month()), (2024, 5));
+
+    let tag = mirror.render_tag.expect("render tag survives the mirror");
+    assert_eq!(tag.firmware_id.as_str(), "acme-sim");
+    assert_eq!(tag.cid_prefix_hex(), "0123456789abcdef");
+    assert!(!mirror.render_tag_malformed);
 
     let look = mirror.look.expect("look settings survive the mirror");
     let film = look.film_mode.expect("film mode survives");

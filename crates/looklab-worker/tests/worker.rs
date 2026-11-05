@@ -2,12 +2,14 @@
 
 use std::path::{Path, PathBuf};
 
+use looklab_export::card::read_card;
 use looklab_fit::FitImage;
 use looklab_fit::synth::{LookSelector, SynthConfig, SyntheticDataset};
-use looklab_publish::{ArtifactName, SiteIndex, VersionManifest, verify_artifact};
+use looklab_publish::{ArtifactName, CARD_ARTIFACT, SiteIndex, VersionManifest, verify_artifact};
 use looklab_samples::{SampleSet, encode};
 use looklab_server::{ContributionId, CredentialId};
-use looklab_upload::ManifestMetadata;
+use looklab_upload::{CardDeclaration, ContributionKind, ManifestMetadata, RenderTag};
+use looklab_worker::db::{ContributionIntent, ContributionStatus, ImageOutcome};
 use looklab_worker::{JobPayload, Worker, WorkerConfig, WorkerError};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -89,6 +91,8 @@ fn metadata(index: usize) -> ManifestMetadata {
         as_shot_wb: None,
         capture_month: None,
         software: Some("looklab-test".to_owned()),
+        render_tag: None,
+        render_tag_malformed: false,
         look: None,
     }
 }
@@ -140,23 +144,94 @@ async fn add_contribution_with(
     dataset: &SyntheticDataset,
     indices: &[usize],
     created_at: i64,
-    kind: &str,
-    intent: &str,
+    kind: ContributionKind,
+    intent: ContributionIntent,
     target_look: Option<&str>,
     settings: &str,
+) -> (ContributionId, Vec<String>) {
+    insert_contribution(
+        worker,
+        credential,
+        dataset,
+        indices,
+        created_at,
+        kind,
+        intent,
+        target_look,
+        settings,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn add_card_contribution(
+    worker: &Worker,
+    credential: &CredentialId,
+    dataset: &SyntheticDataset,
+    indices: &[usize],
+    created_at: i64,
+    declaration: &CardDeclaration,
+) -> (ContributionId, Vec<String>) {
+    let card = serde_json::to_string(declaration).expect("card declaration");
+    let tag = match declaration {
+        CardDeclaration::Tagged(tag) => Some(tag),
+        CardDeclaration::UserDeclared { .. } => None,
+    };
+    insert_contribution(
+        worker,
+        credential,
+        dataset,
+        indices,
+        created_at,
+        ContributionKind::Rerender,
+        ContributionIntent::Card,
+        None,
+        "[]",
+        Some(&card),
+        tag,
+    )
+    .await
+}
+
+/// The `contributions.kind` column text for a client-claimed kind.
+fn kind_column(kind: ContributionKind) -> &'static str {
+    match kind {
+        ContributionKind::Library => "library",
+        ContributionKind::Rerender => "rerender",
+        ContributionKind::Pattern => "pattern",
+        ContributionKind::Gradient => "gradient",
+        ContributionKind::Chart => "chart",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_contribution(
+    worker: &Worker,
+    credential: &CredentialId,
+    dataset: &SyntheticDataset,
+    indices: &[usize],
+    created_at: i64,
+    kind: ContributionKind,
+    intent: ContributionIntent,
+    target_look: Option<&str>,
+    settings: &str,
+    card: Option<&str>,
+    render_tag: Option<&RenderTag>,
 ) -> (ContributionId, Vec<String>) {
     let id = ContributionId::new();
     sqlx::query(
         "INSERT INTO contributions
          (id, credential_id, batch_manifest_hash, signature, pow, kind, serial_hmac, intent,
-          target_look_id, body_id, firmware_version, sim_key, settings, status, created_at)
-         VALUES (?, ?, x'00', x'00', 'pow', ?, NULL, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+          target_look_id, card, body_id, firmware_version, sim_key, settings, status, created_at)
+         VALUES (?, ?, x'00', x'00', 'pow', ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
     )
     .bind(id.as_str())
     .bind(credential.as_str())
-    .bind(kind)
-    .bind(intent)
+    .bind(kind_column(kind))
+    .bind(intent.as_str())
     .bind(target_look)
+    .bind(card)
     .bind(BODY)
     .bind(FIRMWARE)
     .bind(SIM)
@@ -181,7 +256,9 @@ async fn add_contribution_with(
         .await
         .expect("blob row");
         let image_id = uuid::Uuid::new_v4().to_string();
-        let meta = serde_json::to_string(&metadata(index)).expect("metadata");
+        let mut meta = metadata(index);
+        meta.render_tag = render_tag.cloned();
+        let meta = serde_json::to_string(&meta).expect("metadata");
         sqlx::query(
             "INSERT INTO contribution_images
              (id, contribution_id, samples_hash, n_samples, meta, rerender_group, status)
@@ -208,7 +285,15 @@ async fn add_contribution(
     created_at: i64,
 ) -> (ContributionId, Vec<String>) {
     add_contribution_with(
-        worker, credential, dataset, indices, created_at, "library", "native", None, "{}",
+        worker,
+        credential,
+        dataset,
+        indices,
+        created_at,
+        ContributionKind::Library,
+        ContributionIntent::Native,
+        None,
+        "[]",
     )
     .await
 }
@@ -392,6 +477,13 @@ async fn nightly_refit_publishes_a_manifest_and_a_verifiable_site() {
     )
     .expect("manifest");
     let manifest: VersionManifest = serde_json::from_slice(&manifest_bytes).expect("manifest");
+    let converged = manifest
+        .gate_summary
+        .checks
+        .iter()
+        .find(|check| check.name == "converged")
+        .expect("converged check");
+    assert_eq!(converged.passed, read_release(&fixture, 1).converged);
     let artifact = manifest
         .artifacts
         .iter()
@@ -674,10 +766,10 @@ async fn root_admissions_feed_the_root_gate_and_the_manifest_dependencies() {
         &dataset,
         &[0, 1, 2, 3, 4, 5],
         100,
-        "chart",
-        "native",
+        ContributionKind::Chart,
+        ContributionIntent::Native,
         None,
-        "{}",
+        "[]",
     )
     .await;
     admit_root(worker, &credential, &contribution).await;
@@ -724,10 +816,10 @@ async fn recipe_data_does_not_change_the_look_and_the_recipe_stage_is_persisted(
         &dataset,
         &[0, 1, 2],
         200,
-        "rerender",
-        "recipe",
+        ContributionKind::Rerender,
+        ContributionIntent::Recipe,
         Some(LOOK),
-        "{}",
+        "[]",
     )
     .await;
     refit(&plain.worker).await;
@@ -789,6 +881,212 @@ async fn recipe_data_does_not_change_the_look_and_the_recipe_stage_is_persisted(
 }
 
 #[tokio::test]
+async fn bounties_score_accepted_recipes_and_prune_withdrawn_ones() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 6,
+        samples_per_image: 300,
+        ..SynthConfig::default()
+    });
+    let credential = add_credential(worker, "seeder", 1.2).await;
+    add_contribution(worker, &credential, &dataset, &[0, 1, 2, 3, 4, 5], 100).await;
+    refit(worker).await;
+
+    let recipe_credential = add_credential(worker, "endorsed", 1.0).await;
+    let (recipe, _) = add_contribution_with(
+        worker,
+        &recipe_credential,
+        &dataset,
+        &[0, 1, 2],
+        200,
+        ContributionKind::Rerender,
+        ContributionIntent::Recipe,
+        Some(LOOK),
+        "[]",
+    )
+    .await;
+    sqlx::query("UPDATE contributions SET status = 'accepted' WHERE id = ?")
+        .bind(recipe.as_str())
+        .execute(worker.pool())
+        .await
+        .expect("accept recipe");
+
+    worker
+        .enqueue(&JobPayload::Bounties, 0)
+        .await
+        .expect("enqueue bounties");
+    worker.run_until_idle().await.expect("bounties");
+
+    let (measured, n_verifications): (f64, i64) = sqlx::query_as(
+        "SELECT measured_de, n_verifications FROM recipe_scores
+         WHERE target_look = ? AND body_id = ?",
+    )
+    .bind(LOOK)
+    .bind(BODY)
+    .fetch_one(worker.pool())
+    .await
+    .expect("recipe score");
+    assert_eq!(n_verifications, 1);
+    assert!(measured.is_finite() && measured >= 0.0, "{measured}");
+    assert!(
+        count(worker, "SELECT COUNT(*) FROM recipe_observations").await > 0,
+        "no recipe observations"
+    );
+
+    sqlx::query("UPDATE contributions SET status = 'withdrawn' WHERE id = ?")
+        .bind(recipe.as_str())
+        .execute(worker.pool())
+        .await
+        .expect("withdraw recipe");
+    worker
+        .enqueue(&JobPayload::Bounties, 0)
+        .await
+        .expect("enqueue bounties");
+    worker.run_until_idle().await.expect("bounties");
+
+    assert_eq!(
+        count(worker, "SELECT COUNT(*) FROM recipe_observations").await,
+        0
+    );
+    assert_eq!(count(worker, "SELECT COUNT(*) FROM recipe_scores").await, 0);
+}
+
+#[tokio::test]
+async fn card_renders_never_change_a_fit_and_verify_per_firmware() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 4,
+        samples_per_image: 300,
+        ..SynthConfig::default()
+    });
+    let credential = add_credential(worker, "seeder", 1.2).await;
+    add_contribution(worker, &credential, &dataset, &[0, 1, 2, 3], 100).await;
+    refit(worker).await;
+
+    let look_path = fixture
+        .site
+        .join(format!("data/looks/{LOOK}/1.0.0/look.looklab"));
+    let before = std::fs::read(&look_path).expect("published look");
+    let card_path = fixture
+        .site
+        .join(format!("data/looks/{LOOK}/1.0.0/{}", CARD_ARTIFACT));
+    let published = read_card(&std::fs::read(&card_path).expect("card artifact")).expect("card");
+    let tag = looklab_meta::parse_render_tag(&format!(
+        "looklab-card/1 fw=acme-sim/2.0.1 look={LOOK}@1.0.0 cid={}",
+        hex(&published.cid_prefix())
+    ))
+    .expect("render tag");
+
+    let card_credential = add_credential(worker, "endorsed", 1.0).await;
+    let (card, card_images) = add_card_contribution(
+        worker,
+        &card_credential,
+        &dataset,
+        &[0, 1],
+        200,
+        &CardDeclaration::Tagged(tag),
+    )
+    .await;
+    // Intake queues the consistency job; for a card batch it validates and queues verification.
+    worker
+        .enqueue(
+            &JobPayload::ConsistencyScore {
+                contribution_id: card.clone(),
+            },
+            0,
+        )
+        .await
+        .expect("enqueue intake");
+    refit(worker).await;
+
+    assert_eq!(
+        image_field(worker, &card_images[0], "status")
+            .await
+            .as_deref()
+            .and_then(ImageOutcome::parse),
+        Some(ImageOutcome::Accepted)
+    );
+    assert_eq!(
+        count(
+            worker,
+            "SELECT COUNT(*) FROM look_versions WHERE look = 'classic-chrome'",
+        )
+        .await,
+        1
+    );
+    assert_eq!(std::fs::read(&look_path).expect("look"), before);
+    assert_eq!(
+        count(worker, "SELECT COUNT(*) FROM release_body_params").await,
+        2
+    );
+
+    let (firmware, images, median, p95): (String, i64, f64, f64) = sqlx::query_as(
+        "SELECT firmware_id, images, median_de, p95_de FROM card_verifications
+         WHERE look_slug = ? AND look_version = '1.0.0'",
+    )
+    .bind(LOOK)
+    .fetch_one(worker.pool())
+    .await
+    .expect("card verification row");
+    assert_eq!(firmware, "acme-sim");
+    assert_eq!(images, 2);
+    assert!(median.is_finite() && median >= 0.0, "{median}");
+    assert!(p95 >= median && p95.is_finite(), "{p95} < {median}");
+
+    // A tag naming another card is rejected before it can add images to a score.
+    let mismatched = looklab_meta::parse_render_tag(&format!(
+        "looklab-card/1 fw=acme-sim/2.0.1 look={LOOK}@1.0.0 cid={}",
+        hex(&[0_u8; 8])
+    ))
+    .expect("render tag");
+    let (rejected, rejected_images) = add_card_contribution(
+        worker,
+        &card_credential,
+        &dataset,
+        &[2],
+        300,
+        &CardDeclaration::Tagged(mismatched),
+    )
+    .await;
+    worker
+        .enqueue(
+            &JobPayload::ConsistencyScore {
+                contribution_id: rejected.clone(),
+            },
+            0,
+        )
+        .await
+        .expect("enqueue intake");
+    worker.run_until_idle().await.expect("card validation");
+    let status: String = sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
+        .bind(rejected.as_str())
+        .fetch_one(worker.pool())
+        .await
+        .expect("contribution status");
+    assert_eq!(
+        ContributionStatus::parse(&status).expect("known status"),
+        ContributionStatus::Quarantined
+    );
+    assert!(
+        image_field(worker, &rejected_images[0], "status_reason")
+            .await
+            .is_some()
+    );
+    let images: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(images), 0) FROM card_verifications WHERE look_slug = ?",
+    )
+    .bind(LOOK)
+    .fetch_one(worker.pool())
+    .await
+    .expect("verification images");
+    assert_eq!(images, 2);
+}
+
+#[tokio::test]
 async fn a_release_carries_a_verifiable_preview_lut() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -814,6 +1112,14 @@ async fn a_release_carries_a_verifiable_preview_lut() {
         &bytes,
     )
     .expect("preview artifact hash");
+
+    let card = std::fs::read(directory.join(looklab_publish::CARD_ARTIFACT)).expect("card");
+    verify_artifact(
+        &manifest,
+        &looklab_publish::ArtifactName::new(looklab_publish::CARD_ARTIFACT).expect("name"),
+        &card,
+    )
+    .expect("card artifact hash");
 }
 
 #[tokio::test]
@@ -1205,10 +1511,10 @@ async fn non_tolerated_spatial_settings_exclude_every_image() {
         &dataset,
         &[0, 1],
         100,
-        "library",
-        "native",
+        ContributionKind::Library,
+        ContributionIntent::Native,
         None,
-        r#"{"grain":{"enum":"strong"}}"#,
+        r#"[{"key":"clarity","step":2}]"#,
     )
     .await;
     worker

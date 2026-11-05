@@ -102,6 +102,7 @@ impl WeightImage {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CapReason {
     RecipeChannel,
+    CardChannel,
     DuplicateMerge,
     DiminishingReturns { position: usize },
     NewTierGroupCap,
@@ -206,6 +207,7 @@ pub struct BodyWeightReport {
 pub struct StagePartition {
     pub native: Vec<ImageRef>,
     pub recipe: Vec<ImageRef>,
+    pub card: Vec<ImageRef>,
 }
 
 pub fn partition_stages(images: impl IntoIterator<Item = (ImageRef, Intent)>) -> StagePartition {
@@ -214,6 +216,7 @@ pub fn partition_stages(images: impl IntoIterator<Item = (ImageRef, Intent)>) ->
         match intent {
             Intent::Native => partition.native.push(id),
             Intent::Recipe { .. } => partition.recipe.push(id),
+            Intent::Card(_) => partition.card.push(id),
         }
     }
     partition
@@ -232,6 +235,7 @@ struct Working<'a> {
 struct Prepared<'a> {
     working: Vec<Working<'a>>,
     recipe: Vec<&'a WeightImage>,
+    card: Vec<&'a WeightImage>,
 }
 
 type DuplicateGroups<'a> =
@@ -240,12 +244,14 @@ type DuplicateGroups<'a> =
 struct LookState<'a> {
     working: Vec<Working<'a>>,
     recipe: Vec<&'a WeightImage>,
+    card: Vec<&'a WeightImage>,
     new_scale: BTreeMap<Region, f64>,
 }
 
 struct BodyState<'a> {
     working: Vec<Working<'a>>,
     recipe: Vec<&'a WeightImage>,
+    card: Vec<&'a WeightImage>,
     group_scale: f64,
 }
 
@@ -401,6 +407,7 @@ fn build_look<'a>(
     let Prepared {
         mut working,
         recipe,
+        card,
     } = prepare(params, &input.images, false, caps);
 
     let pool: BTreeSet<EffectiveContributorId> = working
@@ -421,6 +428,7 @@ fn build_look<'a>(
     LookState {
         working,
         recipe,
+        card,
         new_scale,
     }
 }
@@ -435,6 +443,7 @@ fn build_body<'a>(
     let Prepared {
         mut working,
         recipe,
+        card,
     } = prepare(params, &input.images, true, caps);
 
     let pool: BTreeSet<EffectiveContributorId> = working
@@ -456,6 +465,7 @@ fn build_body<'a>(
     BodyState {
         working,
         recipe,
+        card,
         group_scale,
     }
 }
@@ -469,6 +479,7 @@ fn finalize_look(
     let LookState {
         working,
         recipe,
+        card,
         new_scale,
     } = state;
     let pool: BTreeSet<EffectiveContributorId> = working
@@ -495,7 +506,7 @@ fn finalize_look(
             }
         })
         .collect();
-    images.extend(recipe.into_iter().map(|image| {
+    images.extend(recipe.into_iter().chain(card).map(|image| {
         ImageWeight {
             id: image.id.clone(),
             credential: image.credential,
@@ -569,6 +580,7 @@ fn finalize_body(
     let BodyState {
         working,
         recipe,
+        card,
         group_scale,
     } = state;
     let pool: BTreeSet<EffectiveContributorId> = working
@@ -587,7 +599,7 @@ fn finalize_body(
             duplicates: entry.duplicates,
         })
         .collect();
-    images.extend(recipe.into_iter().map(|image| BodyImageWeight {
+    images.extend(recipe.into_iter().chain(card).map(|image| BodyImageWeight {
         id: image.id.clone(),
         credential: image.credential,
         contributor: image.contributor,
@@ -689,7 +701,20 @@ fn prepare<'a>(
 ) -> Prepared<'a> {
     let mut groups: DuplicateGroups<'a> = BTreeMap::new();
     let mut recipe = Vec::new();
+    let mut card = Vec::new();
     for image in images {
+        if matches!(image.intent, Intent::Card(_)) {
+            caps.reductions.push(cap_reduction(
+                image,
+                CapReason::CardChannel,
+                None,
+                0.0,
+                image.raw_weight(params),
+                0.0,
+            ));
+            card.push(image);
+            continue;
+        }
         if !include_recipe && matches!(image.intent, Intent::Recipe { .. }) {
             caps.reductions.push(cap_reduction(
                 image,
@@ -775,7 +800,11 @@ fn prepare<'a>(
         *position += 1;
     }
 
-    Prepared { working, recipe }
+    Prepared {
+        working,
+        recipe,
+        card,
+    }
 }
 
 fn look_weight(entry: &Working<'_>, region: Region, new_scale: &BTreeMap<Region, f64>) -> f64 {
@@ -825,7 +854,9 @@ fn gamma_ratio(params: &TrustParams) -> f64 {
 fn look_new_raw_totals(params: &TrustParams, images: &[WeightImage]) -> BTreeMap<Region, f64> {
     let mut new: BTreeMap<Region, f64> = BTreeMap::new();
     for image in images {
-        if image.standing != Standing::New || matches!(image.intent, Intent::Recipe { .. }) {
+        if image.standing != Standing::New
+            || matches!(image.intent, Intent::Recipe { .. } | Intent::Card(_))
+        {
             continue;
         }
         let raw = image.raw_weight(params);
@@ -839,7 +870,7 @@ fn look_new_raw_totals(params: &TrustParams, images: &[WeightImage]) -> BTreeMap
 fn body_new_raw_total(params: &TrustParams, images: &[WeightImage]) -> f64 {
     images
         .iter()
-        .filter(|image| image.standing == Standing::New)
+        .filter(|image| image.standing == Standing::New && !matches!(image.intent, Intent::Card(_)))
         .map(|image| image.raw_weight(params))
         .sum()
 }

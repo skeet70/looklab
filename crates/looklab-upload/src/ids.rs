@@ -7,6 +7,7 @@ use core::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use looklab_meta::{FirmwareId, FirmwareVersion, RenderTag};
 pub use looklab_schema::{
     BodyId, ControlKey, IdError, MAX_BODY_ID_LEN, MAX_SLUG_LEN, SimKey, validate_slug,
 };
@@ -114,14 +115,59 @@ pub enum ContributionKind {
 pub enum Intent {
     Native,
     Recipe { target_look: LookSlug },
+    Card(CardDeclaration),
 }
 
 impl Intent {
     pub fn target_look(&self) -> Option<&LookSlug> {
         match self {
-            Self::Native => None,
+            Self::Native | Self::Card(_) => None,
             Self::Recipe { target_look } => Some(target_look),
         }
+    }
+}
+
+/// Card identity of a card-intent batch ([docs/03 §1](../../../docs/03-data-model.md),
+/// [docs/04 §8.4](../../../docs/04-matching-and-export.md)).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CardDeclaration {
+    Tagged(RenderTag),
+    UserDeclared {
+        firmware_id: FirmwareId,
+        firmware_version: FirmwareVersion,
+    },
+}
+
+impl CardDeclaration {
+    pub fn tagged(tag: RenderTag) -> Self {
+        Self::Tagged(tag)
+    }
+
+    pub fn user_declared(firmware_id: FirmwareId, firmware_version: FirmwareVersion) -> Self {
+        Self::UserDeclared {
+            firmware_id,
+            firmware_version,
+        }
+    }
+
+    pub fn firmware_id(&self) -> &FirmwareId {
+        match self {
+            Self::Tagged(tag) => &tag.firmware_id,
+            Self::UserDeclared { firmware_id, .. } => firmware_id,
+        }
+    }
+
+    pub fn firmware_version(&self) -> &FirmwareVersion {
+        match self {
+            Self::Tagged(tag) => &tag.firmware_version,
+            Self::UserDeclared {
+                firmware_version, ..
+            } => firmware_version,
+        }
+    }
+
+    pub const fn tag_present(&self) -> bool {
+        matches!(self, Self::Tagged(_))
     }
 }
 

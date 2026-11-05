@@ -10,8 +10,8 @@ use looklab_prep_module::{
     PriorTransformSpec, Response, SolvePowRequest, SolvePowResponse,
 };
 use looklab_upload::{
-    BlobKind, BodyId, Challenge, ContributionKind, ControlEntry, ControlSettings, Intent, Limits,
-    LookSlug, ManifestHash, Nonce, SimKey, StepIndex,
+    BlobKind, BodyId, CardDeclaration, Challenge, ContributionKind, ControlEntry, ControlSettings,
+    Intent, Limits, LookSlug, ManifestHash, Nonce, SimKey, StepIndex,
 };
 
 use crate::error::FacadeError;
@@ -32,6 +32,7 @@ pub struct GroupSettings {
 pub enum IntentChoice {
     Native,
     Recipe(String),
+    Card(CardDeclaration),
 }
 
 impl IntentChoice {
@@ -42,6 +43,7 @@ impl IntentChoice {
                 target_look: LookSlug::new(&slug)
                     .map_err(|error| FacadeError::Id(error.to_string()))?,
             }),
+            Self::Card(declaration) => Ok(Intent::Card(declaration)),
         }
     }
 }

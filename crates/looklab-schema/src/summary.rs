@@ -154,7 +154,7 @@ fn interface_summary(profile: &InterfaceProfile) -> ProposalSummary {
             .join(", ")
     };
     ProposalSummary::with_details(
-        format!("adds the {} firmware interface profile", profile.name),
+        format!("adds the {} software interface profile", profile.name),
         vec![
             format!("profile id: {}", profile.id),
             format!("inserts {inserts}, {illuminants}"),
@@ -169,7 +169,6 @@ fn format_name(format: &Format) -> &'static str {
         Format::Cube => "cube",
         Format::NativeJson => "native JSON",
         Format::Haldclut => "Hald clut",
-        Format::BinaryF16 => "binary f16",
     }
 }
 

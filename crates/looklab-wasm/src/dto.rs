@@ -190,6 +190,7 @@ pub struct MatchReply {
     pub card: CardDto,
     pub results: Vec<SuggestionDto>,
     pub stats: StatsDto,
+    pub realization_lut: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

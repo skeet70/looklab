@@ -9,10 +9,10 @@ use crate::hierarchical::BodyGroup;
 use crate::model_error::{
     MODEL_HUE_BINS, MODEL_S_BINS, ModelErrorField, estimate_model_error, region,
 };
-use crate::predict::in_clip_shoulder;
 use crate::problem::Xorshift;
 use crate::types::{
-    Density, FitImage, FitOptions, FitResult, ImageIntent, ProbeEstimate, ProbeUncertainty, Result,
+    Density, FitImage, FitOptions, FitResult, ImageIntent, PreviousSupport, ProbeEstimate,
+    ProbeUncertainty, Result,
 };
 
 pub const BOOTSTRAP_RESAMPLES: usize = 32;
@@ -118,6 +118,7 @@ pub fn published_uncertainty(
     options: &FitOptions,
     bootstrap: &BootstrapOptions,
     clip_k: f64,
+    previous: Option<&PreviousSupport>,
 ) -> Result<PublishedUncertainty> {
     let space = images.first().map_or(RgbSpace::Srgb, |image| {
         space_of(image.samples.header().output_space)
@@ -165,7 +166,18 @@ pub fn published_uncertainty(
     }
     let disagreement = covariance(&leave_one_out_rows);
 
-    let (fit_method, fit_covariance) = if boot.len() == predictions(look).len() {
+    let trace = |covariance: &Cov3| covariance[0][0] + covariance[1][1] + covariance[2][2];
+    let boot_trace: f64 = boot.iter().map(trace).sum();
+    let sandwich_trace: f64 = sandwich
+        .probes
+        .iter()
+        .map(|probe| trace(&probe.covariance))
+        .sum();
+    // A prior-dominated pool makes every resample land on the same Look, so the
+    // bootstrap collapses to zero while the prior floor still carries variance.
+    let use_bootstrap =
+        boot.len() == predictions(look).len() && boot_trace >= 0.05 * sandwich_trace.max(1e-12);
+    let (fit_method, fit_covariance) = if use_bootstrap {
         (UncertaintyMethod::Bootstrap, boot)
     } else {
         (
@@ -220,15 +232,49 @@ pub fn published_uncertainty(
         let input = LookInput::new(probe.xyz);
         let local_density = density.at(input.s, input.h_in, input.c_in);
         let prediction = look.eval(probe.xyz);
+        let chain = crate::predict::clip_jacobian(prediction, space, clip_k);
+        let mut post_covariance = [[0.0_f64; 3]; 3];
+        for a in 0..3 {
+            for b in 0..3 {
+                let mut sum = 0.0;
+                for c in 0..3 {
+                    for d in 0..3 {
+                        sum += chain.0[a][c] * covariance[c][d] * chain.0[b][d];
+                    }
+                }
+                post_covariance[a][b] = sum;
+            }
+        }
+        crate::uncertainty::floor_post_covariance(&covariance, &mut post_covariance);
+        let post_sigma_de = (post_covariance[0][0] + post_covariance[1][1] + post_covariance[2][2])
+            .max(0.0)
+            .sqrt();
+        let post_ucs = crate::predict::post_clip(look, probe.xyz, space, clip_k);
         let clusters = sandwich
             .probes
             .get(index)
             .map_or(0, |estimate| estimate.clusters);
-        let is_supported = sigma_de <= options.support_sigma
-            && local_density >= density.floor
-            && clusters >= options.min_probe_clusters
-            && !in_clip_shoulder(prediction, space, clip_k);
-        if is_supported {
+        let bias_de = sandwich
+            .probes
+            .get(index)
+            .map_or(0.0, |estimate| estimate.bias_de);
+        let previous_sigma = previous
+            .and_then(|state| state.sigma.get(index).copied())
+            .unwrap_or(false);
+        let previous_bias = previous
+            .and_then(|state| state.bias.get(index).copied())
+            .unwrap_or(false);
+        let flags = crate::uncertainty::mark_support(
+            post_sigma_de,
+            bias_de,
+            local_density,
+            clusters,
+            density.floor,
+            previous_sigma,
+            previous_bias,
+            options,
+        );
+        if flags.all() {
             supported += 1;
         }
         probes.push(ProbeEstimate {
@@ -236,8 +282,18 @@ pub fn published_uncertainty(
             ucs: prediction,
             covariance,
             sigma_de,
+            post_ucs,
+            post_covariance,
+            post_sigma_de,
+            bias_de,
+            pre_clip_reliable: crate::predict::clip_derivative_min(prediction, space, clip_k)
+                >= 0.25,
             density: local_density,
-            supported: is_supported,
+            supported_sigma: flags.sigma,
+            supported_density: flags.density,
+            supported_clusters: flags.clusters,
+            supported_bias: flags.bias,
+            supported: flags.all(),
             clusters,
         });
     }

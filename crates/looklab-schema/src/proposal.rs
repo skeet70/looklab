@@ -89,7 +89,7 @@ impl ProposalKind {
             Self::Body => "New camera body",
             Self::SchemaChange => "Control schema change",
             Self::Mapping => "Film simulation mapping",
-            Self::InterfaceProfile => "Firmware interface profile",
+            Self::InterfaceProfile => "Software interface profile",
             Self::LutLook => "LUT-defined look",
             Self::EpochSplit => "Firmware epoch split",
             Self::LookSplit => "Look split",

@@ -1,0 +1,30 @@
+.match-page { max-width: 68rem; margin-inline: auto; }
+.match-wizard { border: 0; padding: 0; margin: 0; min-width: 0; }
+.match-heading { padding-block: 1rem 1.5rem; }
+.match-heading h1 { margin-bottom: .7rem; }
+.match-page .eyebrow { color: var(--muted); text-transform: uppercase; font-size: .75rem; letter-spacing: .12em; font-weight: 700; }
+.match-step { margin-block: 2rem; max-width: 48rem; }
+.match-step .camera-picker { max-width: 40rem; }
+.match-methods { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr)); gap: .8rem; margin-block: 1.5rem; }
+.match-methods button { text-align: left; padding: 1.3rem; min-height: 9rem; }
+.match-methods button[aria-pressed=true] { box-shadow: inset 0 0 0 2px var(--ink); background: var(--notice); }
+.match-methods strong, .match-methods span { display: block; }
+.match-methods span { margin-top: .6rem; font-size: .9rem; font-weight: 400; color: var(--muted); }
+.match-result { margin-block: 2rem; }
+.match-result > h2 { margin-block: 1.5rem; }
+.match-page .stepper-actions { display: flex; justify-content: space-between; gap: 1rem; max-width: 48rem; }
+.match-page .stepper-actions button:last-child:not(:disabled) { background: var(--accent); color: var(--accent-ink); }
+.match-preview-labels { display: flex; justify-content: space-between; gap: 1rem; margin-top: .6rem; font-size: .85rem; color: var(--muted); }
+.match-preview-labels span:last-child { text-align: right; }
+.recipe-card { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); padding: clamp(1.25rem, 4vw, 2.5rem); max-width: 48rem; margin: 2rem auto 1rem; }
+.recipe-card header { border-bottom: 1px solid var(--line); padding-bottom: 1.25rem; }
+.recipe-card h3 { margin-block: .5rem 1rem; font-size: 1.5rem; }
+.recipe-settings { display: grid; grid-template-columns: 1fr minmax(5rem, 1fr); gap: .6rem 1.5rem; padding-block: 1rem; font-variant-numeric: tabular-nums; }
+.recipe-settings dt { color: var(--muted); }
+.recipe-settings dd { margin: 0; font-weight: 650; text-transform: capitalize; }
+.recipe-card details { border-top: 1px solid var(--line); padding-top: 1rem; margin-top: 1.5rem; }
+.match-actions { display: flex; flex-wrap: wrap; gap: .7rem; max-width: 48rem; margin: 1.25rem auto; }
+.match-verification, .match-download { max-width: 48rem; margin: 2rem auto; padding: 1.5rem; border: 1px solid var(--line); border-radius: var(--radius); }
+.match-verification summary { font-size: 1.15rem; font-weight: 650; cursor: pointer; }
+.match-download button { display: block; margin-top: 1rem; }
+@media (max-width: 30rem) { .match-actions > * { width: 100%; text-align: center; } .recipe-settings { gap: .7rem; } .match-verification { padding: 1rem; } }

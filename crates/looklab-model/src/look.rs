@@ -56,19 +56,87 @@ pub struct LookInput {
     pub residual: ResidualWeights,
 }
 
+/// Input chromaticity with `Y = 1`, and its scene exposure.
+fn chromaticity_input(xyz: Xyz) -> (f64, f64, Xyz) {
+    if xyz.y > 0.0 {
+        (
+            xyz.y,
+            libm::log(xyz.y / 0.18) / core::f64::consts::LN_2,
+            Xyz::new(xyz.x / xyz.y, 1.0, xyz.z / xyz.y),
+        )
+    } else {
+        (xyz.y, -12.0, solve::reference_white())
+    }
+}
+
+/// Whether CAM16's forward model is finite for this input chromaticity.
+fn cam16_chromaticity_defined(unit_xyz: Xyz) -> bool {
+    // `x / y` overflows for a subnormal `y`.
+    let ucs = crate::deriv::reference_cam16().ucs(unit_xyz.scale(0.18));
+    ucs.to_array().iter().all(|value| value.is_finite())
+}
+
+/// D65 neutral at luminance `luminance`.
+fn neutral_xyz(luminance: f64) -> Xyz {
+    let white = solve::reference_white();
+    Xyz::new(
+        white.x * luminance,
+        white.y * luminance,
+        white.z * luminance,
+    )
+}
+
+/// Contract an input outside CAM16's forward domain toward the D65 neutral at
+/// the same luminance until it is inside (docs/02 §3).
+fn contract_to_cam16(xyz: Xyz) -> Xyz {
+    let luminance = xyz.y.max(0.0);
+    let neutral = neutral_xyz(luminance);
+    let mut inside = 0.0;
+    let mut outside = 1.0;
+    for _ in 0..32 {
+        let middle = 0.5 * (inside + outside);
+        let candidate = Xyz::new(
+            neutral.x + middle * (xyz.x - neutral.x),
+            luminance,
+            neutral.z + middle * (xyz.z - neutral.z),
+        );
+        if cam16_chromaticity_defined(chromaticity_input(candidate).2) {
+            inside = middle;
+        } else {
+            outside = middle;
+        }
+    }
+    Xyz::new(
+        neutral.x + inside * (xyz.x - neutral.x),
+        luminance,
+        neutral.z + inside * (xyz.z - neutral.z),
+    )
+}
+
+/// A look input inside CAM16's forward domain, and the substitution when it was not.
 impl LookInput {
     pub fn new(xyz: Xyz) -> Self {
-        let y = xyz.y;
-        let (s, unit_xyz) = if y > 0.0 {
-            (
-                libm::log(y / 0.18) / core::f64::consts::LN_2,
-                Xyz::new(xyz.x / y, 1.0, xyz.z / y),
-            )
+        let (y, s, unit_xyz) = chromaticity_input(xyz);
+        let chromaticity = crate::deriv::reference_cam16().ucs(unit_xyz.scale(0.18));
+        let (xyz, y, s, unit_xyz, chromaticity) = if y > 0.0
+            && chromaticity
+                .to_array()
+                .iter()
+                .all(|value| value.is_finite())
+        {
+            (xyz, y, s, unit_xyz, chromaticity)
         } else {
-            (-12.0, solve::reference_white())
+            // Negative or zero Y has no chromaticity; its neutral is black.
+            let contracted = if y > 0.0 {
+                contract_to_cam16(xyz)
+            } else {
+                neutral_xyz(0.0)
+            };
+            let (y, s, unit_xyz) = chromaticity_input(contracted);
+            let chromaticity = crate::deriv::reference_cam16().ucs(unit_xyz.scale(0.18));
+            (contracted, y, s, unit_xyz, chromaticity)
         };
         let s = s.clamp(-12.0, 6.0);
-        let chromaticity = crate::deriv::reference_cam16().ucs(unit_xyz.scale(0.18));
         let c_in = (chromaticity.a * chromaticity.a + chromaticity.b * chromaticity.b).sqrt();
         let h_in = if c_in > 0.0 {
             let degrees = libm::atan2(chromaticity.b, chromaticity.a) * (180.0 / PI);
@@ -413,12 +481,46 @@ impl Look {
     }
 
     pub fn eval_input(&self, input: &LookInput) -> Ucs {
-        let values = self.layer_values(input);
-        self.eval_from_layer_values(input, &values)
+        let target = self.eval_once(input);
+        if target.to_array().iter().all(|value| value.is_finite()) {
+            return target;
+        }
+        self.eval_contracted(input.xyz)
     }
 
     pub fn eval(&self, xyz: Xyz) -> Ucs {
         self.eval_input(&LookInput::new(xyz))
+    }
+
+    fn eval_once(&self, input: &LookInput) -> Ucs {
+        let values = self.layer_values(input);
+        self.eval_from_layer_values(input, &values)
+    }
+
+    /// Contract the input chromaticity toward the D65 neutral until the evaluated
+    /// point is finite (docs/02 §3).
+    fn eval_contracted(&self, xyz: Xyz) -> Ucs {
+        let luminance = xyz.y.max(0.0);
+        let neutral = neutral_xyz(luminance);
+        let mut inside = 0.0;
+        let mut outside = 1.0;
+        let mut best = self.eval_once(&LookInput::new(neutral));
+        for _ in 0..32 {
+            let middle = 0.5 * (inside + outside);
+            let candidate = Xyz::new(
+                neutral.x + middle * (xyz.x - neutral.x),
+                luminance,
+                neutral.z + middle * (xyz.z - neutral.z),
+            );
+            let target = self.eval_once(&LookInput::new(candidate));
+            if target.to_array().iter().all(|value| value.is_finite()) {
+                inside = middle;
+                best = target;
+            } else {
+                outside = middle;
+            }
+        }
+        best
     }
 
     /// Columns: `[t, n_a, n_b, log_g, r, lambda, res_a, res_b, res_c]`.

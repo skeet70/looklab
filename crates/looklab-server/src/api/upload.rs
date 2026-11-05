@@ -21,7 +21,7 @@ use crate::preparse::parse_header;
 use crate::rate_limit::{Action, RateKey};
 use crate::state::AppState;
 use crate::store::{self, ContributionKind, IntentKind, NewContribution, NewImage};
-use crate::trust::CredentialStanding;
+use crate::trust::NEW_CREDENTIAL_STANDING;
 use crate::verify::verify_assertion;
 
 const NONCE_END: usize = 40;
@@ -87,15 +87,9 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
             Some(credential.id),
             None,
         ),
-        (None, Some((passkey, display_handle))) => (
-            passkey,
-            CredentialStanding {
-                tier: crate::trust::Tier::New,
-                reputation: 0.5,
-            },
-            None,
-            display_handle,
-        ),
+        (None, Some((passkey, display_handle))) => {
+            (passkey, NEW_CREDENTIAL_STANDING, None, display_handle)
+        }
         (None, None) => return Err(ApiError::new(ErrorCode::CredentialUnknown)),
     };
 
@@ -188,10 +182,17 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         })
         .collect::<ApiResult<Vec<_>>>()?;
 
-    let (intent, target_look) = match &manifest.intent {
-        looklab_upload::Intent::Native => (IntentKind::Native, None),
-        looklab_upload::Intent::Recipe { target_look } => {
-            (IntentKind::Recipe, Some(target_look.as_str().to_owned()))
+    let (intent, target_look, card) = match &manifest.intent {
+        looklab_upload::Intent::Native => (IntentKind::Native, None, None),
+        looklab_upload::Intent::Recipe { target_look } => (
+            IntentKind::Recipe,
+            Some(target_look.as_str().to_owned()),
+            None,
+        ),
+        looklab_upload::Intent::Card(declaration) => {
+            let card = serde_json::to_string(declaration)
+                .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+            (IntentKind::Card, None, Some(card))
         }
     };
 
@@ -220,6 +221,7 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
             serial_hmac,
             intent,
             target_look,
+            card,
             body_id: manifest.body.as_str().to_owned(),
             firmware_version: manifest.firmware_version.as_str().to_owned(),
             sim_key: manifest.sim_key.as_str().to_owned(),
@@ -301,7 +303,7 @@ fn store_blobs(store: &Arc<dyn BlobStore>, envelope: &Envelope) -> Result<Vec<i6
     Ok(counts)
 }
 
-fn database_error(error: sqlx::Error) -> ApiError {
+pub(super) fn database_error(error: sqlx::Error) -> ApiError {
     if matches!(&error, sqlx::Error::Database(detail) if detail.is_unique_violation()) {
         return ApiError::new(ErrorCode::CredentialConflict);
     }

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use looklab_body::{
     A0Source, AnchorOptions, BodyId, Delta6, InputTransform, TransformVersion, chart_anchor_terms,
 };
-use looklab_color::Mat3;
+use looklab_color::{Mat3, RgbSpace};
 use looklab_model::basis::TONE_COEFS;
 use looklab_model::realization::{ControlResponseModel, Delta, ResponseComponent};
 use looklab_model::{Look, Tone};
@@ -21,7 +21,7 @@ use crate::problem::Problem;
 use crate::solve::{factor_in_place, solve_in_place};
 use crate::types::{
     ContributorId, Density, ExposureModeId, ExposureOffset, FitError, FitImage, FitOptions,
-    ImageIntent, ImageNuisances, ProbeUncertainty, Result,
+    ImageIntent, ImageNuisances, PreviousSupport, ProbeUncertainty, Result,
 };
 
 /// Two firmware offset coordinates: a constant `T` shift and a constant `log G` shift.
@@ -79,6 +79,8 @@ pub struct HierOptions {
     pub anchor: AnchorOptions,
     /// Persisted component gauges; a designated body in the member set is kept.
     pub gauges: Vec<ComponentGauge>,
+    /// Previous published support state per Look family, for hysteresis.
+    pub previous_support: BTreeMap<LookFamilyId, PreviousSupport>,
 }
 
 impl Default for HierOptions {
@@ -90,6 +92,7 @@ impl Default for HierOptions {
             firmware_prior_sd: [0.5, 0.03],
             anchor: AnchorOptions::default(),
             gauges: Vec::new(),
+            previous_support: BTreeMap::new(),
         }
     }
 }
@@ -133,6 +136,8 @@ pub struct LookParameters {
     pub density: Density,
     /// Clip parameter of the published realization.
     pub clip_k: f64,
+    /// Output encoding of the post-clip probe predictions.
+    pub output_space: RgbSpace,
     pub provenance: Vec<LookProvenance>,
     /// Native images with the native-stage body parameters the Look was fitted against.
     pub pool: Vec<FitImage>,
@@ -1432,7 +1437,14 @@ pub fn fit_hierarchical(bodies: &[BodyData], options: &HierOptions) -> Result<Hi
         }
         let clip = contribution_clip(&member_states);
         let model = shared_model(&member_states);
-        let result = fit::run_look_only(&pool, &options.fit, None, clip, model.as_ref())?;
+        let result = fit::run_look_only(
+            &pool,
+            &options.fit,
+            None,
+            clip,
+            model.as_ref(),
+            options.previous_support.get(family),
+        )?;
         evaluations += result.evaluations;
         look_map.insert(*family, result.look.clone());
         look_results.insert(*family, result);
@@ -1508,7 +1520,14 @@ pub fn fit_hierarchical(bodies: &[BodyData], options: &HierOptions) -> Result<Hi
             let clip = contribution_clip(&member_states);
             let model = shared_model(&member_states);
             let warm = look_map.get(family);
-            let result = fit::run_look_only(&pool, &options.fit, warm, clip, model.as_ref())?;
+            let result = fit::run_look_only(
+                &pool,
+                &options.fit,
+                warm,
+                clip,
+                model.as_ref(),
+                options.previous_support.get(family),
+            )?;
             evaluations += result.evaluations;
             if let Some(previous) = warm {
                 change = change.max(look_distance(previous, &result.look));
@@ -1635,6 +1654,7 @@ pub fn fit_hierarchical(bodies: &[BodyData], options: &HierOptions) -> Result<Hi
             probes: result.probes.clone(),
             density: result.density.clone(),
             clip_k: result.clip_k,
+            output_space: result.output_space,
             provenance,
             pool,
             groups,

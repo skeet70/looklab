@@ -1,0 +1,40 @@
+.community-page { max-width: 70rem; margin-inline: auto; }
+.community-hero { padding-block: 1.5rem 3rem; max-width: 47rem; }
+.community-hero h1 { max-width: 16ch; }
+.community-principles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2rem; padding-block: 2rem; border-block: 1px solid var(--line); margin-bottom: 3rem; }
+.community-principles h2 { font-size: 1.25rem; }
+.activity-list { list-style: none; padding: 0; margin-block: 1.5rem 2.5rem; }
+.activity-list li { padding: 1.1rem 0; border-bottom: 1px solid var(--line); }
+.activity-list p { margin: 0 0 .35rem; }
+.activity-detail { margin-top: .5rem; }
+.activity-detail code { display: block; color: var(--muted); font-size: var(--text-small); overflow-wrap: anywhere; }
+.community-links { display: flex; flex-wrap: wrap; gap: 1rem 2rem; padding-block: 1rem; }
+.proposal-fields { max-width: 36rem; margin-block: 1.5rem; }
+.proposal-fields input:not([type=checkbox]) { width: 100%; }
+main:has(#submit-proposal) { max-width: 62rem; }
+main:has(#submit-proposal) > section { margin-block: 2rem; border-top: 1px solid var(--line); padding-block: 1rem; }
+main:has(#submit-proposal) .disclosure { margin-block: 1.5rem; }
+main:has(#submit-proposal) .drop-zone { margin-block: 1rem; }
+main:has(#submit-proposal) .field-row { display: flex; flex-wrap: wrap; gap: .75rem; align-items: baseline; }
+main:has(#submit-proposal) textarea { max-width: 100%; }
+.review-filters { display: flex; align-items: baseline; flex-wrap: wrap; gap: .75rem; margin-block: 1.5rem; }
+.review-panes { display: grid; grid-template-columns: minmax(16rem, .9fr) minmax(0, 1.3fr); gap: 2rem; align-items: start; }
+.review-panes > section { border: 1px solid var(--line); border-radius: var(--radius); padding: 1.5rem; background: var(--panel); }
+.review-panes .data-table thead { display: none; }
+.review-panes .data-table tr { display: grid; grid-template-columns: 1fr auto; padding-block: .8rem; border-bottom: 1px solid var(--line); }
+.review-panes .data-table td, .review-panes .data-table th { border: 0; padding: .25rem; }
+.review-panes .data-table th, .review-panes .data-table td:nth-child(2) { grid-column: 1 / -1; }
+.review-page .dialog textarea { width: 100%; }
+.review-back { display: none; }
+.trust-actions { max-width: 44rem; margin-block: 2rem; padding: 1.25rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.trust-actions fieldset { border: 0; padding: 0; min-width: 0; }
+.trust-actions input:not([type=checkbox]), .trust-actions select, .trust-actions textarea { width: 100%; }
+.trust-actions .dialog { max-width: min(38rem, calc(100vw - 2rem)); }
+@media (max-width: 44rem) {
+ .community-principles, .review-panes { grid-template-columns: minmax(0, 1fr); gap: 1rem; }
+ .community-principles { padding-block: 1rem; }
+ .community-hero { padding-block: 1rem 2rem; }
+ .review-panes > section { padding: 1rem; }
+ .review-panes.has-selection > section { position: fixed; inset: 0; z-index: 25; overflow-y: auto; border: 0; border-radius: 0; background: var(--paper); }
+ .review-back { display: block; margin-bottom: 1.5rem; }
+}

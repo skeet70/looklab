@@ -159,6 +159,45 @@ impl RenderTag {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RenderTagOutcome {
+    Absent,
+    Valid(RenderTag),
+    Malformed,
+}
+
+impl RenderTagOutcome {
+    pub const fn valid(&self) -> Option<&RenderTag> {
+        match self {
+            Self::Valid(tag) => Some(tag),
+            Self::Absent | Self::Malformed => None,
+        }
+    }
+
+    pub const fn is_malformed(&self) -> bool {
+        matches!(self, Self::Malformed)
+    }
+}
+
+/// Parses a `UserComment` string into the typed outcome of docs/04 §8.4.
+pub fn classify_render_tag(input: &str) -> RenderTagOutcome {
+    match parse_render_tag(input) {
+        Ok(tag) => RenderTagOutcome::Valid(tag),
+        Err(_) if looks_like_render_tag(input) => RenderTagOutcome::Malformed,
+        Err(_) => RenderTagOutcome::Absent,
+    }
+}
+
+fn looks_like_render_tag(input: &str) -> bool {
+    let input = input.trim();
+    if input.starts_with("looklab-card/") {
+        return true;
+    }
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    let has = |prefix: &str| tokens.iter().any(|token| token.starts_with(prefix));
+    (has("fw=") && has("look=") && has("cid=")) || (has("look=") && has("cid="))
+}
+
 /// Parses the exact token of docs/04 §8.4.
 pub fn parse_render_tag(input: &str) -> Result<RenderTag, RenderTagError> {
     let body = input
@@ -268,6 +307,34 @@ mod tests {
         ] {
             assert!(parse_render_tag(input).is_err(), "accepted {input:?}");
         }
+    }
+
+    #[test]
+    fn classifies_absent_valid_and_malformed_comments() {
+        assert_eq!(
+            classify_render_tag("a family photo"),
+            RenderTagOutcome::Absent
+        );
+        assert_eq!(classify_render_tag(""), RenderTagOutcome::Absent);
+        assert!(matches!(
+            classify_render_tag(CANONICAL),
+            RenderTagOutcome::Valid(_)
+        ));
+        for malformed in [
+            "looklab-card/1 fw=acme/1 look=provia@1.0.0 cid=NOTHEX",
+            "looklab-card/1 fw=Acme/1 look=provia@1.0.0 cid=0123456789abcdef",
+            "looklab-card/2",
+            "fw=acme/1 look=provia@1.0.0 cid=0123456789abcdef",
+            "looklab-card fw=acme/1 look=provia@1.0.0 cid=0123456789abcdef",
+        ] {
+            assert_eq!(
+                classify_render_tag(malformed),
+                RenderTagOutcome::Malformed,
+                "classified {malformed:?}"
+            );
+        }
+        assert!(RenderTagOutcome::Absent.valid().is_none());
+        assert!(!RenderTagOutcome::Absent.is_malformed());
     }
 
     #[test]

@@ -3212,6 +3212,7 @@ dependencies = [
  "png",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
 ]
 
@@ -3321,15 +3322,25 @@ name = "looklab-publish"
 version = "0.1.0"
 dependencies = [
  "libm",
+ "looklab-body",
  "looklab-color",
+ "looklab-export",
  "looklab-fit",
+ "looklab-match",
  "looklab-model",
+ "looklab-raw",
+ "looklab-report",
+ "looklab-samples",
  "looklab-schema",
+ "png",
  "proptest",
  "serde",
  "serde_json",
+ "serde_norway",
  "sha2 0.10.9",
  "thiserror 2.0.21",
+ "toml 0.8.23",
+ "zip",
 ]
 
 [[package]]
@@ -3414,6 +3425,7 @@ dependencies = [
  "uuid",
  "webauthn-authenticator-rs",
  "webauthn-rs",
+ "webauthn-rs-core",
 ]
 
 [[package]]
@@ -3467,6 +3479,7 @@ dependencies = [
  "js-sys",
  "libm",
  "looklab-color",
+ "looklab-export",
  "looklab-match",
  "looklab-meta",
  "looklab-model",
@@ -3501,7 +3514,9 @@ dependencies = [
  "leptos",
  "leptos_router",
  "looklab-color",
+ "looklab-export",
  "looklab-match",
+ "looklab-meta",
  "looklab-model",
  "looklab-prep",
  "looklab-prep-module",
@@ -3533,6 +3548,7 @@ dependencies = [
  "clap",
  "looklab-body",
  "looklab-color",
+ "looklab-export",
  "looklab-fit",
  "looklab-meta",
  "looklab-model",

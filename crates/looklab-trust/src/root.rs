@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use looklab_upload::{BodyId, ContributionKind, LookSlug};
+use looklab_upload::{BodyId, ContributionKind, Intent, LookSlug};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::CredentialId;
@@ -49,7 +49,14 @@ pub struct RootAdmission {
 ///
 /// Only chart, gradient and pattern sessions root a Look; only chart sessions and
 /// published spectral sensitivity data root a body input transform.
-pub fn admission_eligible(session: &RootSession, admission: &RootAdmission) -> bool {
+pub fn admission_eligible(
+    session: &RootSession,
+    admission: &RootAdmission,
+    intent: &Intent,
+) -> bool {
+    if matches!(intent, Intent::Card(_)) {
+        return false;
+    }
     if !session.anchored || admission.seeder_tier != Tier::Seeder {
         return false;
     }

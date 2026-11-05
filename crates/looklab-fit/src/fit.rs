@@ -15,8 +15,8 @@ use crate::problem::{ActiveColumns, BlockAcc, IntentFilter, PassOutput, Problem,
 use crate::solve::{factor_in_place, select_lambda, select_lambda_diagonal, solve_in_place};
 use crate::types::{
     ControlResponseFit, Diagnostics, ExcludeReason, ExcludedImage, ExposureOffset, FitImage,
-    FitOptions, FitResult, ImageIntent, ImageNuisances, ProbeUncertainty, Realization, Result,
-    StageLambdas, Verdict,
+    FitOptions, FitResult, ImageIntent, ImageNuisances, PreviousSupport, ProbeUncertainty,
+    Realization, Result, StageLambdas, Verdict,
 };
 use crate::uncertainty;
 
@@ -29,6 +29,8 @@ struct Stage {
     neutral: bool,
     sweeps: usize,
     gcv: bool,
+    /// Stage runs to convergence up to `FitOptions::max_sweeps` instead of a fixed count.
+    converge: bool,
 }
 
 const STAGES: [Stage; 5] = [
@@ -43,6 +45,7 @@ const STAGES: [Stage; 5] = [
         },
         neutral: true,
         sweeps: 6,
+        converge: false,
         gcv: true,
     },
     Stage {
@@ -55,6 +58,7 @@ const STAGES: [Stage; 5] = [
         active: ActiveColumns::ALL,
         neutral: false,
         sweeps: 4,
+        converge: false,
         gcv: true,
     },
     Stage {
@@ -74,6 +78,7 @@ const STAGES: [Stage; 5] = [
         active: ActiveColumns::ALL,
         neutral: false,
         sweeps: 2,
+        converge: false,
         gcv: true,
     },
     Stage {
@@ -90,6 +95,7 @@ const STAGES: [Stage; 5] = [
         active: ActiveColumns::ALL,
         neutral: false,
         sweeps: 3,
+        converge: false,
         gcv: true,
     },
     Stage {
@@ -110,9 +116,18 @@ const STAGES: [Stage; 5] = [
         active: ActiveColumns::ALL,
         neutral: false,
         sweeps: 3,
+        converge: true,
         gcv: false,
     },
 ];
+
+fn accepted(previous: f64, cost: f64) -> bool {
+    cost.is_finite() && cost <= previous + 1e-12 * previous.abs().max(1.0)
+}
+
+fn converged(previous: f64, cost: f64, step: f64) -> bool {
+    (previous - cost).abs() <= 1e-9 * previous.abs().max(1.0) && step <= 1e-7
+}
 
 pub(crate) fn filter_spatial(
     images: &[FitImage],
@@ -211,7 +226,17 @@ pub(crate) fn run_with(
     model: Option<ControlResponseModel>,
     excluded: Vec<ExcludedImage>,
 ) -> Result<FitResult> {
-    run_inner(images, options, model, excluded, None, true)
+    run_inner(images, options, model, excluded, None, true, None)
+}
+
+pub(crate) fn run_with_history(
+    images: &[FitImage],
+    options: &FitOptions,
+    model: Option<ControlResponseModel>,
+    excluded: Vec<ExcludedImage>,
+    previous: Option<&PreviousSupport>,
+) -> Result<FitResult> {
+    run_inner(images, options, model, excluded, None, true, previous)
 }
 
 /// Result of a conditional Look-only solve.
@@ -221,6 +246,7 @@ pub(crate) struct LookOnlyResult {
     pub probes: ProbeUncertainty,
     pub density: crate::types::Density,
     pub clip_k: f64,
+    pub output_space: looklab_color::RgbSpace,
     pub evaluations: usize,
 }
 
@@ -232,6 +258,7 @@ pub(crate) fn run_look_only(
     initial: Option<&looklab_model::Look>,
     clip_k: f64,
     model: Option<&ControlResponseModel>,
+    previous: Option<&PreviousSupport>,
 ) -> Result<LookOnlyResult> {
     let problem = Problem::new_with(images, model, options)?;
     let layout = problem.layout.clone();
@@ -256,7 +283,7 @@ pub(crate) fn run_look_only(
         clip: false,
         response: false,
     };
-    let mut lambdas = StageLambdas::default();
+    let mut lambdas = options.initial_lambdas;
     let roles = prior_roles(&problem, &layout);
     let mut evaluations = 0usize;
     for stage in &STAGES {
@@ -278,7 +305,19 @@ pub(crate) fn run_look_only(
         let mut damping: f64 = 1e-3;
         let mut previous: Option<(f64, Params)> = None;
         let mut gcv_done = false;
-        for _ in 0..stage.sweeps.min(options.max_sweeps.max(1)) {
+        let mut previous_step = f64::INFINITY;
+        let mut stable = 0usize;
+        let stage_sweeps = if stage.converge {
+            options.max_sweeps.max(1)
+        } else {
+            stage.sweeps.min(options.max_sweeps.max(1))
+        };
+        let mut sample_evaluations = 0.0_f64;
+        for _ in 0..stage_sweeps {
+            if sample_evaluations + problem.samples.len() as f64 > options.sweep_budget {
+                break;
+            }
+            sample_evaluations += problem.samples.len() as f64;
             for block in &mut blocks {
                 block.reset();
             }
@@ -294,15 +333,24 @@ pub(crate) fn run_look_only(
             evaluations += 1;
             let cost =
                 pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
-            if let Some((previous_cost, previous_params)) = &previous
-                && cost > previous_cost * (1.0 + 1e-12)
-            {
-                params = previous_params.clone();
-                damping = (damping * 10.0).min(1e6);
-                if damping >= 1e6 {
-                    break;
+            if let Some((previous_cost, previous_params)) = &previous {
+                if !accepted(*previous_cost, cost) {
+                    params = previous_params.clone();
+                    damping = (damping * 10.0).min(1e6);
+                    stable = 0;
+                    if damping >= 1e6 {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
+                if converged(*previous_cost, cost, previous_step) {
+                    stable += 1;
+                    if stable >= 2 {
+                        break;
+                    }
+                } else {
+                    stable = 0;
+                }
             }
             previous = Some((cost, params.clone()));
             if stage.gcv && !gcv_done && options.run_gcv {
@@ -354,6 +402,7 @@ pub(crate) fn run_look_only(
                     step[layout.residual.start + index] = *value;
                 }
             }
+            previous_step = step.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
             apply_step(&mut params, &step);
             if kinds.contains(&BlockKind::Residual) {
                 pin_residual(&mut params, &layout, &pass.residual_samples);
@@ -362,7 +411,7 @@ pub(crate) fn run_look_only(
         }
     }
     let look = params.look();
-    let density = density::build(&problem, &params, options.density_floor_fraction);
+    let density = density::build(&problem, &params, options.density_floor);
     let frozen = ActiveColumns {
         image: false,
         mode: false,
@@ -403,12 +452,17 @@ pub(crate) fn run_look_only(
         &density,
         &uncertainty_pass.residual_samples,
         options,
+        previous,
     )?;
     Ok(LookOnlyResult {
         look,
         probes,
         density,
         clip_k,
+        output_space: problem
+            .images
+            .first()
+            .map_or(looklab_color::RgbSpace::Srgb, |image| image.space),
         evaluations,
     })
 }
@@ -419,7 +473,7 @@ pub(crate) fn run_quick(
     options: &FitOptions,
     initial: Option<&looklab_model::Look>,
 ) -> Result<FitResult> {
-    run_inner(images, options, None, Vec::new(), initial, false)
+    run_inner(images, options, None, Vec::new(), initial, false, None)
 }
 
 fn run_inner(
@@ -429,6 +483,7 @@ fn run_inner(
     excluded: Vec<ExcludedImage>,
     initial: Option<&looklab_model::Look>,
     want_uncertainty: bool,
+    previous: Option<&PreviousSupport>,
 ) -> Result<FitResult> {
     let mut native_positions: Vec<Option<usize>> = vec![None; images.len()];
     let mut native = Vec::new();
@@ -448,7 +503,7 @@ fn run_inner(
         apply_look(&problem, &mut params, look);
     }
     let mut roles = prior_roles(&problem, &layout);
-    let mut lambdas = StageLambdas::default();
+    let mut lambdas = options.initial_lambdas;
     let mut evaluations = 0usize;
 
     if model.is_some() {
@@ -475,16 +530,21 @@ fn run_inner(
         }
     }
 
-    // Total sample evaluations are bounded so a large batch cannot run unbounded.
-    let allowed_sweeps =
+    // The warm-up stages keep their own budget; the convergent stage spends up to
+    // `FitOptions::max_sweeps` and stops on the objective and step tolerances.
+    let warmup_allowed =
         (options.sweep_budget / problem.samples.len().max(1) as f64).clamp(8.0, 64.0) as usize;
-    let mut used_sweeps = 0usize;
+    let mut final_converged = false;
+    let mut sample_evaluations = 0.0_f64;
     for stage in &STAGES {
-        let stage_sweeps = stage
-            .sweeps
-            .min(options.max_sweeps.max(1))
-            .min(allowed_sweeps.saturating_sub(used_sweeps));
-        used_sweeps += stage_sweeps;
+        let stage_sweeps = if stage.converge {
+            options.max_sweeps.max(1)
+        } else {
+            stage
+                .sweeps
+                .min(options.max_sweeps.max(1))
+                .min(warmup_allowed)
+        };
         let kinds: Vec<BlockKind> = stage
             .blocks
             .iter()
@@ -518,7 +578,13 @@ fn run_inner(
         let mut damping: f64 = 1e-3;
         let mut previous: Option<(f64, Params)> = None;
         let mut gcv_done = false;
+        let mut previous_step = f64::INFINITY;
+        let mut stable = 0usize;
         for _ in 0..stage_sweeps {
+            if sample_evaluations + problem.samples.len() as f64 > options.sweep_budget {
+                break;
+            }
+            sample_evaluations += problem.samples.len() as f64;
             for block in &mut blocks {
                 block.reset();
             }
@@ -535,15 +601,25 @@ fn run_inner(
             let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
             let cost =
                 pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
-            if let Some((previous_cost, previous_params)) = &previous
-                && cost > previous_cost * (1.0 + 1e-12)
-            {
-                params = previous_params.clone();
-                damping = (damping * 10.0).min(1e6_f64);
-                if damping >= 1e6 {
-                    break;
+            if let Some((previous_cost, previous_params)) = &previous {
+                if !accepted(*previous_cost, cost) {
+                    params = previous_params.clone();
+                    damping = (damping * 10.0).min(1e6_f64);
+                    stable = 0;
+                    if damping >= 1e6 {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
+                if converged(*previous_cost, cost, previous_step) {
+                    stable += 1;
+                    if stable >= 2 {
+                        final_converged = stage.converge;
+                        break;
+                    }
+                } else {
+                    stable = 0;
+                }
             }
             previous = Some((cost, params.clone()));
 
@@ -597,6 +673,7 @@ fn run_inner(
                     step[layout.residual.start + index] = *value;
                 }
             }
+            previous_step = step.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
             apply_step(&mut params, &step);
             if kinds.contains(&BlockKind::Residual) {
                 pin_residual(&mut params, &layout, &pass.residual_samples);
@@ -762,8 +839,9 @@ fn run_inner(
         })
         .collect::<Vec<_>>();
 
-    let density = density::build(&problem, &params, options.density_floor_fraction);
+    let density = density::build(&problem, &params, options.density_floor);
     let image_stats = outlier::score(&problem, &final_pass, options);
+    let mut grl_precision_ratio = Vec::new();
     let (probe_result, parameter_ids, covariance) =
         match (uncertainty_blocks.as_ref(), uncertainty_pass.as_ref()) {
             (Some(uncertainty_blocks), Some(uncertainty_pass)) => {
@@ -774,6 +852,22 @@ fn run_inner(
                     uncertainty_blocks[0].len(),
                     true,
                 ));
+                let block = &uncertainty_blocks[0];
+                let scale = uncertainty_pass.active_samples.max(1) as f64
+                    / uncertainty_pass.hessian_rows.max(1) as f64;
+                let identity = identity_curvature(&layout, block);
+                let block_len = block.len();
+                for (local, global) in block.params.iter().enumerate() {
+                    if layout.g.contains(global)
+                        || layout.r.contains(global)
+                        || layout.lambda.contains(global)
+                    {
+                        let data = block.hessian[local * block_len + local] * scale;
+                        let prior = identity[local]
+                            + lambdas.grl * uncertainty_penalty[local * block_len + local];
+                        grl_precision_ratio.push(data / prior.max(1e-12));
+                    }
+                }
                 let joint = uncertainty::probe_uncertainty(
                     &problem,
                     &params,
@@ -787,6 +881,7 @@ fn run_inner(
                     &density,
                     &uncertainty_pass.residual_samples,
                     options,
+                    previous,
                 );
                 let probes = match joint {
                     Ok(result) => result,
@@ -830,6 +925,7 @@ fn run_inner(
                             &density,
                             &fallback_pass.residual_samples,
                             options,
+                            previous,
                         )?
                     }
                     Err(error) => return Err(error),
@@ -876,11 +972,17 @@ fn run_inner(
             .iter()
             .filter(|stat| stat.verdict == Verdict::DownWeight)
             .count(),
+        grl_precision_ratio,
+        converged: final_converged,
     };
     diagnostics.sweeps = evaluations;
 
     Ok(FitResult {
         look,
+        output_space: problem
+            .images
+            .first()
+            .map_or(looklab_color::RgbSpace::Srgb, |image| image.space),
         images: images_out,
         realization: Realization {
             clip_k,
@@ -1881,49 +1983,66 @@ fn embed(penalty: Vec<f64>, n: usize) -> Vec<f64> {
     out
 }
 
-/// Fixed prior weight (energy per unit squared) for shrinkage toward the identity look.
+/// Fixed prior precision (1/sd²) for shrinkage toward the identity look.
 ///
-/// These are priors, not smoothing: they must not weaken as the pool grows, or
-/// weakly identified regions lose their variance floor (docs/02 §4.1).
+/// SDs: tone 1 J' per stop, tint 2 J'a'b', log G 0.3, hue 15°, lightness 8 J',
+/// residual 0.5 ΔE (docs/02 §4.1).
 pub(crate) fn identity_weight(kind: BlockKind) -> f64 {
-    // One natural unit of prior sd per layer: log G, tint in J'a'b', residual in DeltaE,
-    // tone slope in J' per stop; 10 deg for the hue rotation and 5 J' for the lightness shift.
     match kind {
         BlockKind::Tone => 1.0,
-        BlockKind::Tint => 0.25,
-        BlockKind::G => 11.0,
-        BlockKind::R => 0.0044,
-        BlockKind::Lambda => 0.0156,
-        BlockKind::Residual => 4.0,
+        BlockKind::Tint => 1.0 / (2.0 * 2.0),
+        BlockKind::G => 1.0 / (0.3 * 0.3),
+        BlockKind::R => 1.0 / (15.0 * 15.0),
+        BlockKind::Lambda => 1.0 / (8.0 * 8.0),
+        BlockKind::Residual => 1.0 / (0.5 * 0.5),
         _ => 0.0,
     }
 }
 
-/// Identity-prior curvature per block coordinate, selected by the coordinate's
-/// own layer because the joint covariance block carries every Look layer.
+fn kind_of(layout: &Layout, global: usize) -> Option<BlockKind> {
+    if layout.tone_beta.contains(&global) || global == layout.tone_c0 {
+        Some(BlockKind::Tone)
+    } else if layout.tint_a.contains(&global) || layout.tint_b.contains(&global) {
+        Some(BlockKind::Tint)
+    } else if layout.g.contains(&global) {
+        Some(BlockKind::G)
+    } else if layout.r.contains(&global) {
+        Some(BlockKind::R)
+    } else if layout.lambda.contains(&global) {
+        Some(BlockKind::Lambda)
+    } else if layout.residual.contains(&global) {
+        Some(BlockKind::Residual)
+    } else {
+        None
+    }
+}
+
+/// Identity-prior curvature matrix over a block.
+pub(crate) fn identity_matrix(layout: &Layout, block: &BlockAcc) -> Vec<f64> {
+    let n = block.len();
+    let mut out = vec![0.0_f64; n * n];
+    for (local, global) in block.params.iter().enumerate() {
+        out[local * n + local] = kind_of(layout, *global).map_or(0.0, identity_weight);
+    }
+    out
+}
+
+/// `Λ_id · x` restricted to the block's coordinates.
+pub(crate) fn identity_apply(layout: &Layout, block: &BlockAcc, x: &[f64]) -> Vec<f64> {
+    let mut out = vec![0.0_f64; block.len()];
+    for (local, global) in block.params.iter().enumerate() {
+        out[local] = kind_of(layout, *global).map_or(0.0, identity_weight) * x[*global];
+    }
+    out
+}
+
+/// Diagonal of the identity-prior curvature, for GCV's diagonal approximation.
 pub(crate) fn identity_curvature(layout: &Layout, block: &BlockAcc) -> Vec<f64> {
-    block
-        .params
-        .iter()
-        .map(|global| {
-            let kind = if layout.tone_beta.contains(global) || *global == layout.tone_c0 {
-                BlockKind::Tone
-            } else if layout.tint_a.contains(global) || layout.tint_b.contains(global) {
-                BlockKind::Tint
-            } else if layout.g.contains(global) {
-                BlockKind::G
-            } else if layout.r.contains(global) {
-                BlockKind::R
-            } else if layout.lambda.contains(global) {
-                BlockKind::Lambda
-            } else if layout.residual.contains(global) {
-                BlockKind::Residual
-            } else {
-                return 0.0;
-            };
-            2.0 * identity_weight(kind)
-        })
-        .collect()
+    let mut diagonal = vec![0.0_f64; block.len()];
+    for (local, global) in block.params.iter().enumerate() {
+        diagonal[local] = kind_of(layout, *global).map_or(0.0, identity_weight);
+    }
+    diagonal
 }
 
 fn accumulate_row(target: &mut [f64], n: usize, indices: &[(usize, f64)]) {
@@ -1968,10 +2087,10 @@ fn set_lam(lambdas: &mut StageLambdas, kind: BlockKind, value: f64) {
 
 /// Energy of the fixed identity prior over a block.
 fn identity_cost(layout: &Layout, block: &BlockAcc, theta: &[f64]) -> f64 {
-    let identity = identity_curvature(layout, block);
+    let applied = identity_apply(layout, block, theta);
     let mut value = 0.0;
     for (local, global) in block.params.iter().enumerate() {
-        value += 0.5 * identity[local] * theta[*global] * theta[*global];
+        value += 0.5 * theta[*global] * applied[local];
     }
     value
 }
@@ -2088,7 +2207,7 @@ fn choose_lambdas(
         }
         let choice = if block.kind == BlockKind::Residual {
             let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
-            let identity = 2.0 * identity_weight(BlockKind::Residual);
+            let identity = identity_weight(BlockKind::Residual);
             let diagonal: Vec<f64> = residual_diagonal(&pass.residual_samples)
                 .into_iter()
                 .map(|value| value * hessian_scale + identity)
@@ -2244,10 +2363,16 @@ fn solve_block(
         }
         rhs[i] -= lambda * gradient + prior_gradient[i];
     }
-    let identity = identity_curvature(layout, block);
+    let identity = identity_matrix(layout, block);
+    for entry in 0..n * n {
+        a[entry] += identity[entry];
+    }
     for i in 0..n {
-        a[i * n + i] += identity[i];
-        rhs[i] -= identity[i] * params.theta[block.params[i]];
+        let mut sum = 0.0;
+        for j in 0..n {
+            sum += identity[i * n + j] * params.theta[block.params[j]];
+        }
+        rhs[i] -= sum;
     }
     let mut delta = rhs.clone();
     if !factor_in_place(&mut a, n) {
@@ -2322,7 +2447,7 @@ fn pin_residual(params: &mut Params, layout: &Layout, samples: &[ResidualSample]
     }
 }
 
-fn residual_penalty_diagonal() -> Vec<f64> {
+pub(crate) fn residual_penalty_diagonal() -> Vec<f64> {
     let mut diagonal = vec![0.0_f64; RESIDUAL_COEFS];
     for node in 0..RESIDUAL_NODES {
         let mut degree = 0.0;
@@ -2448,7 +2573,7 @@ fn residual_step(
     let (mut rhs, _) = residual_gradient(samples);
     // The objective is `lambda * theta' P theta`, so the ridge matrix is 2 * lambda * P.
     let ridge = 2.0 * lambda;
-    let identity = 2.0 * identity_weight(BlockKind::Residual);
+    let identity = identity_weight(BlockKind::Residual);
     let mut diagonal = vec![0.0_f64; dim];
     for index in 0..dim {
         let base = data_diagonal[index].max(1e-9);
@@ -2504,6 +2629,17 @@ mod review_tests {
     use super::*;
 
     #[test]
+    fn acceptance_is_sign_safe() {
+        assert!(accepted(-46_079.824, -46_079.824));
+        assert!(accepted(-100.0, -100.000_001));
+        assert!(!accepted(-100.0, -99.0));
+        assert!(accepted(100.0, 100.0));
+        assert!(!accepted(100.0, 100.1));
+        assert!(!accepted(100.0, f64::NAN));
+        assert!(!accepted(100.0, f64::INFINITY));
+    }
+
+    #[test]
     fn identity_curvature_follows_each_layer() {
         let layout = Layout::with_response(1, 0, 1, 0);
         let block = BlockAcc::new(
@@ -2521,13 +2657,71 @@ mod review_tests {
             layout.total,
         );
         let curvature = identity_curvature(&layout, &block);
-        assert_eq!(curvature[0], 2.0 * identity_weight(BlockKind::Tone));
-        assert_eq!(curvature[1], 2.0 * identity_weight(BlockKind::Tint));
-        assert_eq!(curvature[2], 2.0 * identity_weight(BlockKind::G));
-        assert_eq!(curvature[3], 2.0 * identity_weight(BlockKind::R));
-        assert_eq!(curvature[4], 2.0 * identity_weight(BlockKind::Lambda));
-        assert_eq!(curvature[5], 2.0 * identity_weight(BlockKind::Residual));
+        assert_eq!(curvature[0], identity_weight(BlockKind::Tone));
+        assert_eq!(curvature[1], identity_weight(BlockKind::Tint));
+        assert_eq!(curvature[2], identity_weight(BlockKind::G));
+        assert_eq!(curvature[3], identity_weight(BlockKind::R));
+        assert_eq!(curvature[4], identity_weight(BlockKind::Lambda));
+        assert_eq!(curvature[5], identity_weight(BlockKind::Residual));
         assert_eq!(curvature[6], 0.0);
         assert_eq!(curvature[7], 0.0);
+    }
+
+    #[cfg(feature = "synth")]
+    #[test]
+    fn truth_parameters_leave_quantization_residuals() {
+        let config = crate::synth::SynthConfig {
+            seed: 21,
+            images: 4,
+            samples_per_image: 200,
+            noise_ucs: 0.0,
+            ..crate::synth::SynthConfig::default()
+        };
+        let data = crate::synth::dataset(&config);
+        let problem =
+            Problem::new_with(&data.images, None, &FitOptions::default()).expect("problem");
+        let mut params = params_from_look(&problem, &data.truth);
+        for index in 0..problem.images.len() {
+            let range = problem.layout.image(index);
+            let nuisance = data.nuisances[index];
+            params.theta[range.start] = nuisance.exposure;
+            params.theta[range.start + 1] = nuisance.wb_log_r;
+            params.theta[range.start + 2] = nuisance.wb_log_b;
+        }
+        params.theta[problem.layout.clip] = crate::layout::zeta_from_clip(data.clip_k);
+        let mut blocks: Vec<BlockAcc> = Vec::new();
+        let pass = problem.pass(
+            &params,
+            ActiveColumns::ALL,
+            &mut blocks,
+            true,
+            false,
+            false,
+            IntentFilter::All,
+        );
+        let mut norms: Vec<f64> = pass
+            .residuals
+            .iter()
+            .map(|residual| {
+                (residual[0] * residual[0] + residual[1] * residual[1] + residual[2] * residual[2])
+                    .sqrt()
+            })
+            .collect();
+        norms.sort_by(f64::total_cmp);
+        let median = norms[norms.len() / 2];
+        let maximum = norms[norms.len() - 1];
+        assert!(median < 1e-4, "median residual {median}");
+        assert!(maximum < 1e-3, "maximum residual {maximum}");
+    }
+
+    #[test]
+    fn identity_apply_is_diagonal() {
+        let layout = Layout::with_response(0, 0, 0, 0);
+        let block = BlockAcc::new(BlockKind::G, layout.g.clone().collect(), layout.total);
+        let x = vec![1.0_f64; layout.total];
+        let applied = identity_apply(&layout, &block, &x);
+        for value in &applied {
+            assert_eq!(*value, identity_weight(BlockKind::G));
+        }
     }
 }

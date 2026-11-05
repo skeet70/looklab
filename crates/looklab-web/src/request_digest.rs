@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestDomain {
-    StatusReissue,
+    Session,
+    SessionRevoke,
     Withdraw,
     Grant,
     RevokeGrant,
@@ -26,7 +27,8 @@ pub enum RequestDomain {
 impl RequestDomain {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::StatusReissue => "status-reissue",
+            Self::Session => "session",
+            Self::SessionRevoke => "session-revoke",
             Self::Withdraw => "withdraw",
             Self::Grant => "grant",
             Self::RevokeGrant => "revoke-grant",

@@ -12,6 +12,7 @@ use looklab_trust::{
     CredentialId as TrustCredentialId, EffectiveContributorId, Region, RegionCoverage, SerialLink,
     resolve_effective_contributors,
 };
+use looklab_upload::ControlSettings;
 use looklab_upload::{BodyId, LookSlug};
 use sqlx::SqlitePool;
 
@@ -131,7 +132,8 @@ pub async fn build(
             .copied()
             .unwrap_or_else(|| EffectiveContributorId::from(credential.trust));
         let epoch = epoch_for(&resources.schema, &contribution.firmware)?.id;
-        let exposure_mode = exposure_mode(&resources.schema, epoch, &contribution.settings)?;
+        let settings = model_settings(&contribution.settings);
+        let exposure_mode = exposure_mode(&resources.schema, epoch, &settings)?;
         for row in rows {
             let path = db::blob_path(&config.blobs, &row.samples_hash);
             let bytes = std::fs::read(&path)
@@ -151,7 +153,7 @@ pub async fn build(
                 samples,
                 transform,
                 epoch,
-                settings: contribution.settings.clone(),
+                settings: settings.clone(),
                 exposure_mode,
                 outcome,
                 capture,
@@ -170,6 +172,14 @@ pub async fn build(
         transforms,
         images,
     })
+}
+
+fn model_settings(wire: &ControlSettings) -> Settings {
+    let mut settings = Settings::new();
+    for entry in wire.entries() {
+        settings.set(entry.key.clone(), ControlValue::Step(entry.step.get()));
+    }
+    settings
 }
 
 /// The exposure mode a settings map selects: the first enum control whose value

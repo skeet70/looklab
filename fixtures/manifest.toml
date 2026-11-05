@@ -36,3 +36,75 @@ source_url = "https://raw.pixls.us/getfile.php/7280/nice/Sigma%20-%20fp%20-%208b
 license = "CC0-1.0"
 consent = "CC0 public sample (raw.pixls.us)"
 committed = false
+
+[[fixture]]
+file = "scene-1955.dng"
+description = "Ricoh GR II, CC0 photographic preview scene"
+make = "Ricoh"
+model = "GR II"
+sha256 = "bc8e00ccfd8e4753e8ee0735255bff4dcca5fb8d1a1352adfa59b86806d03f44"
+size = 18537507
+source_url = "https://raw.pixls.us/getfile.php/1955/nice/Ricoh%20-%20GR%20II%20-%2012bit%20%283:2%29.DNG"
+license = "CC0-1.0"
+consent = "CC0 public sample (raw.pixls.us)"
+committed = false
+
+[[fixture]]
+file = "scene-3115.dng"
+description = "Ricoh GR III, CC0 photographic preview scene"
+make = "Ricoh"
+model = "GR III"
+sha256 = "05513ee72f7cac4165534c9f64995412084f414a033c80c473c79fd94154292e"
+size = 33374940
+source_url = "https://raw.pixls.us/getfile.php/3115/nice/Ricoh%20-%20GR%20III%20-%2014bit%20%283:2%29.DNG"
+license = "CC0-1.0"
+consent = "CC0 public sample (raw.pixls.us)"
+committed = false
+
+[[fixture]]
+file = "scene-1824.dng"
+description = "Pentax KP, CC0 photographic preview scene"
+make = "Pentax"
+model = "KP"
+sha256 = "16b09cb3032003989877659ae03cbb6985e3d7e84f1402863ccae8af10033c1c"
+size = 32655447
+source_url = "https://raw.pixls.us/getfile.php/1824/nice/Pentax%20-%20KP%20-%2014bit%20%283:2%29.DNG"
+license = "CC0-1.0"
+consent = "CC0 public sample (raw.pixls.us)"
+committed = false
+
+[[fixture]]
+file = "scene-1797.dng"
+description = "Leica Q (Typ 116), CC0 photographic preview scene"
+make = "Leica"
+model = "Q (Typ 116)"
+sha256 = "f7b2a6b6d7684536511cf2db2e2bfa46fae1ad7e52214093714f35e7ca60acbf"
+size = 45100032
+source_url = "https://raw.pixls.us/getfile.php/1797/nice/Leica%20-%20Q%20%28Typ%20116%29%20-%2014bit%20%283:2%29.DNG"
+license = "CC0-1.0"
+consent = "CC0 public sample (raw.pixls.us)"
+committed = false
+
+[[fixture]]
+file = "scene-3094.dng"
+description = "Pentax K-30, CC0 photographic preview scene"
+make = "Pentax"
+model = "K-30"
+sha256 = "63eaa1ff93ad7c89947017332b10f78f17cd3853a5b495adf25410edaefbe618"
+size = 14234631
+source_url = "https://raw.pixls.us/getfile.php/3094/nice/Pentax%20-%20K-30%20-%2012bit%20%283:2%29.DNG"
+license = "CC0-1.0"
+consent = "CC0 public sample (raw.pixls.us)"
+committed = false
+
+[[fixture]]
+file = "scene-1603.dng"
+description = "Leica M10, CC0 photographic preview scene"
+make = "Leica"
+model = "M10"
+sha256 = "26be5e06dfb53a2938dab3ca8f06024533a9c0dd0c652938f39eb48bc325f95e"
+size = 34209792
+source_url = "https://raw.pixls.us/getfile.php/1603/nice/Leica%20-%20M10%20-%2016bit%2016bit%20uncompressed%20%283:2%29.dng"
+license = "CC0-1.0"
+consent = "CC0 public sample (raw.pixls.us)"
+committed = false

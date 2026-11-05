@@ -3,6 +3,20 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 dist="$root/site/generated/wasm"
+case "${LOOKLAB_WORKER_WASM:-build}" in
+  build) ;;
+  reuse)
+    if [ -s "$dist/looklab_prep_module.wasm" ] && [ -s "$dist/looklab_match.wasm" ]; then
+      echo "Reusing worker wasm (LOOKLAB_WORKER_WASM=reuse)"
+      exit 0
+    fi
+    echo "Worker wasm missing; building release workers once"
+    ;;
+  *)
+    echo "LOOKLAB_WORKER_WASM must be build or reuse" >&2
+    exit 1
+    ;;
+esac
 mkdir -p "$dist"
 
 target="${CARGO_TARGET_DIR:-target}"

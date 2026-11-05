@@ -4,6 +4,24 @@
 use leptos::prelude::*;
 use looklab_publish::{GateCheck, LookStatus};
 
+#[path = "components/mod.rs"]
+pub mod components;
+pub use components::*;
+
+pub fn camera_kind_label(kind: looklab_publish::BodyKind) -> &'static str {
+    match kind {
+        looklab_publish::BodyKind::Camera => "Camera",
+        looklab_publish::BodyKind::Software => "Editing app",
+    }
+}
+
+pub fn mapping_status_label(status: looklab_publish::MappingStatus) -> &'static str {
+    match status {
+        looklab_publish::MappingStatus::Provisional => "Not yet confirmed from a sample file",
+        looklab_publish::MappingStatus::FixtureBacked => "Confirmed from a sample file",
+    }
+}
+
 pub fn loading() -> impl IntoView {
     view! { <p class="muted" role="status">"Loading…"</p> }
 }
@@ -17,6 +35,16 @@ pub fn failure(message: &str) -> impl IntoView + use<> {
     }
 }
 
+/// The notice on pages whose actions need the API.
+pub fn preview_notice() -> impl IntoView + use<> {
+    view! {
+        <div class="preview-notice" role="note">
+            <strong>"Sharing is turned off in this demo."</strong>
+            <p>"You can still explore looks and process your photos on this device."</p>
+        </div>
+    }
+}
+
 pub fn timestamp(seconds: i64) -> String {
     let millis = seconds as f64 * 1000.0;
     let date = js_sys::Date::new(&millis.into());
@@ -25,8 +53,7 @@ pub fn timestamp(seconds: i64) -> String {
 
 #[component]
 pub fn StatusBadge(status: LookStatus) -> impl IntoView {
-    let label = status.as_str();
-    view! { <span class=format!("badge badge-{label}")>{label}</span> }
+    view! { <Badge status/> }
 }
 
 #[component]

@@ -342,6 +342,7 @@ fn merge_rendering(raw: &SanitizedMetadata, jpeg: &SanitizedMetadata) -> Sanitiz
     merged.look = jpeg.look.clone();
     merged.software = jpeg.software.clone();
     merged.render_tag = jpeg.render_tag.clone();
+    merged.render_tag_malformed = jpeg.render_tag_malformed;
     if merged.make.is_none() {
         merged.make = jpeg.make.clone();
     }
@@ -772,6 +773,7 @@ mod tests {
             capture_month: None,
             software: None,
             render_tag: None,
+            render_tag_malformed: false,
             look: film.map(|value| LookSettings {
                 film_mode: Some(ParsedTag {
                     tag: FujiTag::FilmMode,

@@ -6,11 +6,12 @@ use sqlx::SqlitePool;
 
 use crate::clock::now_unix;
 use crate::config::WorkerConfig;
+use crate::db;
 use crate::error::Result;
 use crate::jobs::{self, ClaimedJob, JobId, JobPayload};
 use crate::publish::{self, PublishConfig};
 use crate::refit::{self, RefitOutcome};
-use crate::{consistency, duplicates, gc};
+use crate::{bounties, cards, consistency, duplicates, gc};
 
 pub struct Worker {
     pool: SqlitePool,
@@ -118,12 +119,22 @@ impl Worker {
     async fn execute(&self, job: &ClaimedJob) -> Result<()> {
         match job.payload()? {
             JobPayload::ConsistencyScore { contribution_id } => {
-                consistency::run(&self.pool, &self.config, &contribution_id).await
+                let contribution = db::contribution(&self.pool, &contribution_id).await?;
+                if contribution.intent == db::ContributionIntent::Card {
+                    cards::validate(&self.pool, &self.config, &contribution_id).await
+                } else {
+                    consistency::run(&self.pool, &self.config, &contribution_id).await
+                }
             }
             JobPayload::HonestDuplicateMerge => duplicates::run(&self.pool).await,
             JobPayload::NightlyRefit { bodies } => {
                 let outcomes =
                     refit::run(&self.pool, &self.config, &bodies, &job.ownership()).await?;
+                if !outcomes.is_empty() {
+                    jobs::enqueue_if_idle(&self.pool, &JobPayload::Bounties, now_unix()).await?;
+                    jobs::enqueue_if_idle(&self.pool, &JobPayload::CardVerification, now_unix())
+                        .await?;
+                }
                 if outcomes
                     .iter()
                     .any(|(_, _, outcome)| matches!(outcome, RefitOutcome::Published(_)))
@@ -135,6 +146,8 @@ impl Worker {
             JobPayload::BlobGc { contribution_id } => {
                 gc::run(&self.pool, &self.config, contribution_id.as_ref()).await
             }
+            JobPayload::Bounties => bounties::run(&self.pool, &self.config).await,
+            JobPayload::CardVerification => cards::run(&self.pool, &self.config).await,
             JobPayload::PublishSite => {
                 let config = PublishConfig::from_worker(&self.config);
                 publish::publish_with_pool(&self.pool, &config).await?;

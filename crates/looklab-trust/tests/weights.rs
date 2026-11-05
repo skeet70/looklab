@@ -513,6 +513,50 @@ fn body_weighting_includes_recipe_images() {
 }
 
 #[test]
+fn card_images_get_zero_weight_in_looks_and_bodies() {
+    let tag = looklab_upload::parse_render_tag(
+        "looklab-card/1 fw=acme-sim/2.0.1 look=provia@1.0.0 cid=0123456789abcdef",
+    )
+    .expect("render tag");
+    let declaration = looklab_upload::CardDeclaration::tagged(tag);
+    let images = vec![
+        ImageBuilder::new("native", 1).build(),
+        ImageBuilder::new("card", 2)
+            .kind(ContributionKind::Chart)
+            .intent(Intent::Card(declaration.clone()))
+            .build(),
+    ];
+
+    let report = weight_look(&params(), &look_input(images.clone()));
+    assert!((weight(&report, "card")).abs() < 1e-12);
+    assert!(weight(&report, "native") > 0.0);
+    let reduction = report
+        .caps
+        .reductions
+        .iter()
+        .find(|reduction| reduction.reason == CapReason::CardChannel)
+        .expect("card exclusion is reported");
+    assert_eq!(reduction.image.as_ref().map(|id| id.as_str()), Some("card"));
+
+    let report = weight_body(&params(), &body_input(images));
+    let card = report
+        .images
+        .iter()
+        .find(|image| image.id.as_str() == "card")
+        .expect("card image stays in the report");
+    assert!(card.final_weight.abs() < 1e-12);
+    assert!(report.total > 0.0);
+
+    let partition = looklab_trust::partition_stages([(
+        looklab_trust::ImageRef::new("card"),
+        Intent::Card(declaration),
+    )]);
+    assert_eq!(partition.card.len(), 1);
+    assert!(partition.native.is_empty());
+    assert!(partition.recipe.is_empty());
+}
+
+#[test]
 fn weight_components_multiply_in_the_documented_order() {
     let image = ImageBuilder::new("chart", 1)
         .kind(ContributionKind::Chart)
@@ -665,6 +709,8 @@ fn capture_tuple_distinguishes_every_field() {
         as_shot_wb: None,
         capture_month: None,
         software: None,
+        render_tag: None,
+        render_tag_malformed: false,
         look: None,
     };
     let mut with_focal = base.clone();

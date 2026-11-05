@@ -163,7 +163,7 @@ impl BodyId {
 id_type!(LookId);
 id_type!(ProposalRef);
 id_type!(
-    /// Interface profile id, for example `example-firmware/sim-v1`.
+    /// Interface profile id, for example `example-app/lut3d-v1`.
     InterfaceId,
     validate_interface_id
 );

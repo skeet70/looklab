@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Canonical preview scenes: scene-linear D65 XYZ in little-endian half floats (docs/08 §5).
+//! Preview scenes stored as 12-bit-quantized shaper coordinates in 16-bit RGB PNG.
 
 use core::fmt;
 
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::PublishError;
 use crate::hash::SitePath;
 
-pub const SCENE_FORMAT: &str = "looklab-scene/xyz-f16le/1";
+pub const SCENE_FORMAT: &str = "looklab-scene/rec2020-shaper-png16/1";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -56,9 +56,38 @@ impl fmt::Display for SceneName {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SceneKind {
+    Photo,
+    #[default]
+    TestChart,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneCredit {
+    pub text: String,
+    pub source_url: String,
+    pub license: String,
+    pub source_sha256: crate::ArtifactHash,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneArtifact {
+    pub width: u32,
+    pub height: u32,
+    pub path: SitePath,
+    pub sha256: crate::ArtifactHash,
+    pub bytes: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SceneSummary {
     pub name: SceneName,
+    pub kind: SceneKind,
+    pub title: String,
+    pub credit: Option<SceneCredit>,
+    pub thumbnail: SceneArtifact,
     pub width: u32,
     pub height: u32,
     pub path: SitePath,
@@ -75,6 +104,9 @@ pub struct SceneIndex {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scene {
     pub name: SceneName,
+    pub kind: SceneKind,
+    pub title: String,
+    pub credit: Option<SceneCredit>,
     pub width: u32,
     pub height: u32,
     pub xyz: Vec<[f32; 3]>,
@@ -82,7 +114,7 @@ pub struct Scene {
 
 impl Scene {
     /// # Errors
-    /// Rejects a `xyz` length that differs from `width * height`.
+    /// Rejects mismatched dimensions and non-finite XYZ values.
     pub fn new(
         name: SceneName,
         width: u32,
@@ -95,8 +127,14 @@ impl Scene {
         if xyz.len() != expected || expected == 0 {
             return Err(PublishError::SceneDimensions);
         }
+        if xyz.iter().flatten().any(|value| !value.is_finite()) {
+            return Err(PublishError::SceneValue);
+        }
         Ok(Self {
+            title: name.as_str().replace('-', " "),
             name,
+            kind: SceneKind::TestChart,
+            credit: None,
             width,
             height,
             xyz,
@@ -104,110 +142,113 @@ impl Scene {
     }
 
     /// # Errors
-    /// Rejects a byte length that does not match the scene dimensions or a
-    /// value that is not finite.
-    pub fn from_f16_bytes(
-        name: SceneName,
-        width: u32,
-        height: u32,
-        bytes: &[u8],
-    ) -> Result<Self, PublishError> {
-        let expected = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|pixels| pixels.checked_mul(3))
-            .ok_or(PublishError::SceneDimensions)?;
-        if bytes.len() != expected * 2 {
+    /// Rejects edges above 1600 pixels.
+    pub fn to_png(&self) -> Result<Vec<u8>, PublishError> {
+        use looklab_color::{RgbSpace, Xyz};
+        if self.width > 1600 || self.height > 1600 {
             return Err(PublishError::SceneDimensions);
         }
-        let mut xyz = Vec::with_capacity(expected);
-        for (index, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
-            let value = f16_to_f32(u16::from_le_bytes(*chunk));
-            if !value.is_finite() {
-                return Err(PublishError::SceneValue);
-            }
-            if index % 3 == 0 {
-                xyz.push([0.0; 3]);
-            }
-            xyz[index / 3][index % 3] = value;
-        }
-        Self::new(name, width, height, xyz)
-    }
-
-    pub fn to_f16_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.xyz.len() * 6);
+        let mut data = Vec::with_capacity(self.xyz.len() * 6);
         for pixel in &self.xyz {
-            for channel in pixel {
-                out.extend_from_slice(&f32_to_f16(*channel).to_le_bytes());
+            let rgb = RgbSpace::Rec2020.xyz_to_rgb_linear(Xyz::from_array(pixel.map(f64::from)));
+            for value in [rgb.r, rgb.g, rgb.b] {
+                let coordinate = (crate::preview_shaper(value) * 4095.0).round();
+                let value = (coordinate * (65535.0 / 4095.0)).round() as u16;
+                data.extend_from_slice(&value.to_be_bytes());
             }
         }
-        out
-    }
-}
-
-/// IEEE 754 binary16 bits of a finite `f32`, rounded to nearest even.
-pub fn f32_to_f16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let mantissa = bits & 0x007f_ffff;
-
-    if exponent == 0xff {
-        return sign | 0x7c00 | if mantissa != 0 { 0x0200 } else { 0 };
-    }
-    let half_exponent = exponent - 127 + 15;
-    if half_exponent >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if half_exponent <= 0 {
-        if half_exponent < -10 {
-            return sign;
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, self.width, self.height);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Sixteen);
+            let mut writer = encoder
+                .write_header()
+                .map_err(|e| PublishError::ScenePng(e.to_string()))?;
+            writer
+                .write_image_data(&data)
+                .map_err(|e| PublishError::ScenePng(e.to_string()))?;
         }
-        let mantissa = mantissa | 0x0080_0000;
-        let shift = (14 - half_exponent) as u32;
-        let dropped = mantissa & ((1 << shift) - 1);
-        let halfway = 1 << (shift - 1);
-        let mut half = (mantissa >> shift) as u16;
-        if dropped > halfway || (dropped == halfway && (half & 1) == 1) {
-            half += 1;
-        }
-        return sign | half;
+        Ok(out)
     }
-    let mut half = (((half_exponent as u32) << 10) | (mantissa >> 13)) as u16;
-    let dropped = mantissa & 0x1fff;
-    if dropped > 0x1000 || (dropped == 0x1000 && (half & 1) == 1) {
-        half = half.wrapping_add(1);
-        if half & 0x7c00 == 0x7c00 {
-            return sign | 0x7c00;
-        }
-    }
-    sign | half
-}
 
-pub fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits & 0x8000) as u32) << 16;
-    let exponent = (bits >> 10) & 0x1f;
-    let mantissa = (bits & 0x03ff) as u32;
-    let out = if exponent == 0 {
-        if mantissa == 0 {
-            sign
-        } else {
-            let mut exponent = -1i32;
-            let mut mantissa = mantissa;
-            loop {
-                mantissa <<= 1;
-                exponent += 1;
-                if mantissa & 0x0400 != 0 {
-                    break;
+    /// # Errors
+    /// Rejects malformed PNGs and formats other than RGB16.
+    pub fn from_png(name: SceneName, bytes: &[u8]) -> Result<Self, PublishError> {
+        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        let mut reader = decoder
+            .read_info()
+            .map_err(|e| PublishError::ScenePng(e.to_string()))?;
+        let info = reader.info();
+        if info.color_type != png::ColorType::Rgb
+            || info.bit_depth != png::BitDepth::Sixteen
+            || info.width == 0
+            || info.height == 0
+            || info.width > 1600
+            || info.height > 1600
+        {
+            return Err(PublishError::SceneDimensions);
+        }
+        let mut data = vec![
+            0;
+            reader
+                .output_buffer_size()
+                .ok_or(PublishError::SceneDimensions)?
+        ];
+        let frame = reader
+            .next_frame(&mut data)
+            .map_err(|e| PublishError::ScenePng(e.to_string()))?;
+        let xyz = data[..frame.buffer_size()]
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .map(|pixel| {
+                let channel = |i| {
+                    crate::preview_unshaper(
+                        f64::from(u16::from_be_bytes([pixel[i], pixel[i + 1]])) / 65535.0,
+                    )
+                };
+                let xyz = looklab_color::RgbSpace::Rec2020
+                    .rgb_linear_to_xyz(looklab_color::Rgb::new(channel(0), channel(2), channel(4)));
+                xyz.to_array().map(|v| v as f32)
+            })
+            .collect();
+        Self::new(name, frame.width, frame.height, xyz)
+    }
+
+    pub fn downscale(&self, long_edge: u32) -> Self {
+        let scale = (long_edge as f64 / self.width.max(self.height) as f64).min(1.0);
+        let width = (self.width as f64 * scale).round().max(1.0) as u32;
+        let height = (self.height as f64 * scale).round().max(1.0) as u32;
+        let mut xyz = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let x0 = x * self.width / width;
+                let x1 = ((x + 1) * self.width / width).max(x0 + 1);
+                let y0 = y * self.height / height;
+                let y1 = ((y + 1) * self.height / height).max(y0 + 1);
+                let mut sum = [0.0_f64; 3];
+                for sy in y0..y1 {
+                    for sx in x0..x1 {
+                        for (c, value) in sum.iter_mut().enumerate() {
+                            *value += f64::from(self.xyz[(sy * self.width + sx) as usize][c]);
+                        }
+                    }
                 }
+                let count = f64::from((x1 - x0) * (y1 - y0));
+                xyz.push(sum.map(|v| (v / count) as f32));
             }
-            sign | (((127 - 15 - exponent) as u32) << 23) | ((mantissa & 0x03ff) << 13)
         }
-    } else if exponent == 0x1f {
-        sign | 0x7f80_0000 | (mantissa << 13)
-    } else {
-        sign | (((exponent as u32) + 127 - 15) << 23) | (mantissa << 13)
-    };
-    f32::from_bits(out)
+        Self {
+            width,
+            height,
+            xyz,
+            name: self.name.clone(),
+            kind: self.kind,
+            title: self.title.clone(),
+            credit: self.credit.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -215,41 +256,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn half_float_round_trips_representable_values() {
-        for value in [0.0, -0.0, 0.5, -2.5, 1.0, 65504.0, 1.0e-4] {
-            let bits = f32_to_f16(value);
-            let back = f16_to_f32(bits);
-            if value == 0.0 {
-                assert_eq!(back, value);
-            } else {
-                assert!((back - value).abs() <= value.abs() * 1.0e-3);
+    fn non_finite_scene_values_are_rejected() {
+        assert!(matches!(
+            Scene::new(
+                SceneName::new("invalid").expect("name"),
+                1,
+                1,
+                vec![[f32::NAN, 0.18, 0.18]]
+            ),
+            Err(PublishError::SceneValue)
+        ));
+    }
+
+    #[test]
+    fn oversized_intermediates_must_be_downscaled_before_png_encoding() {
+        for (width, height) in [(1601, 1), (1, 1601)] {
+            let scene = Scene::new(
+                SceneName::new("raw-intermediate").expect("name"),
+                width,
+                height,
+                vec![[0.18; 3]; (width * height) as usize],
+            )
+            .expect("RAW intermediate");
+            assert!(matches!(scene.to_png(), Err(PublishError::SceneDimensions)));
+            let downscaled = scene.downscale(1600);
+            let bytes = downscaled.to_png().expect("downscaled PNG");
+            let decoded = Scene::from_png(scene.name.clone(), &bytes).expect("decode");
+            assert_eq!(
+                (decoded.width, decoded.height),
+                (downscaled.width, downscaled.height)
+            );
+        }
+    }
+
+    #[test]
+    fn compact_scene_preserves_negative_and_highlight_colors() {
+        let scene = Scene::new(
+            SceneName::new("colors").expect("name"),
+            3,
+            1,
+            vec![[-0.02, 0.01, 0.05], [0.18, 0.18, 0.18], [2.0, 3.0, 4.0]],
+        )
+        .expect("scene");
+        let decoded =
+            Scene::from_png(scene.name.clone(), &scene.to_png().expect("encode")).expect("decode");
+        assert_eq!((decoded.width, decoded.height), (3, 1));
+        for (expected, actual) in scene.xyz.iter().zip(&decoded.xyz) {
+            for (expected, actual) in expected.iter().zip(actual) {
+                assert!((expected - actual).abs() < 0.01);
             }
         }
     }
 
     #[test]
-    fn half_float_handles_subnormals_and_overflow() {
-        assert_eq!(f32_to_f16(1.0e-8), 0);
-        assert_eq!(f16_to_f32(1), 5.960_464_5e-8);
-        assert_eq!(f32_to_f16(1.0e9) & 0x7fff, 0x7c00);
-    }
-
-    #[test]
-    fn scene_round_trips_through_bytes() {
+    fn thumbnail_averages_scene_linear_light() {
         let scene = Scene::new(
-            SceneName::new("gradient").expect("name"),
+            SceneName::new("light").expect("name"),
             2,
             1,
-            vec![[0.0, 0.18, 1.0], [0.5, 0.25, 0.0]],
+            vec![[0.0; 3], [1.0; 3]],
         )
         .expect("scene");
-        let bytes = scene.to_f16_bytes();
-        assert_eq!(bytes.len(), 12);
-        let decoded =
-            Scene::from_f16_bytes(SceneName::new("gradient").expect("name"), 2, 1, &bytes)
-                .expect("decode");
-        assert_eq!(decoded.width, 2);
-        assert_eq!(decoded.xyz.len(), 2);
-        assert!((decoded.xyz[0][1] - 0.18).abs() < 1.0e-3);
+        let thumbnail = scene.downscale(1);
+        assert_eq!((thumbnail.width, thumbnail.height), (1, 1));
+        assert_eq!(thumbnail.xyz, vec![[0.5; 3]]);
     }
 }

@@ -10,13 +10,24 @@ use crate::data::{self, Load, MessageAuthor, ProposalMessage};
 use crate::proposal_form;
 use crate::ui;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProposalRequest(u64);
+
 #[component]
 pub fn ProposalDetail() -> impl IntoView {
     let params = use_params_map();
     let state = RwSignal::new(Load::<ProposalView>::Loading);
     let id = RwSignal::new(None::<ProposalRef>);
+    let request = RwSignal::new(ProposalRequest(0));
 
     Effect::new(move |_| {
+        let current_request = ProposalRequest(request.get_untracked().0.wrapping_add(1));
+        request.set(current_request);
+        id.set(None);
+        state.set(Load::Loading);
+        if !crate::base::server_available() {
+            return;
+        }
         let text = params.read().get("id").unwrap_or_default();
         let Ok(proposal) = ProposalRef::try_from(text) else {
             state.set(Load::Failed(
@@ -26,7 +37,11 @@ pub fn ProposalDetail() -> impl IntoView {
         };
         id.set(Some(proposal.clone()));
         spawn_local(async move {
-            state.set(match data::proposal(&proposal).await {
+            let result = data::proposal(&proposal).await;
+            if request.try_get_untracked() != Some(current_request) {
+                return;
+            }
+            state.set(match result {
                 Ok(proposal) => Load::Ready(proposal),
                 Err(error) => Load::Failed(error),
             });
@@ -34,24 +49,38 @@ pub fn ProposalDetail() -> impl IntoView {
     });
 
     view! {
-        {move || match state.get() {
-            Load::Loading => ui::loading().into_any(),
-            Load::Failed(error) => {
-                view! {
+        {move || {
+            if !crate::base::server_available() {
+                return view! {
                     <h1>"Proposal"</h1>
+                    {ui::preview_notice()}
                     <p class="muted">
                         "Proposals live in the server's moderation queue, not in the static site data."
                     </p>
-                    {ui::failure(&error)}
                 }
-                .into_any()
+                .into_any();
             }
-            Load::Ready(proposal) => {
-                match id.get() {
-                    Some(id) => {
-                        view! { <ProposalViewDetail proposal id state/> }.into_any()
+            match state.get() {
+                Load::Loading => ui::loading().into_any(),
+                Load::Failed(error) => {
+                    view! {
+                        <h1>"Proposal"</h1>
+                        <p class="muted">
+                            "Proposals live in the server's moderation queue, not in the static site data."
+                        </p>
+                        {ui::failure(&error)}
                     }
-                    None => ui::failure("the proposal id is missing").into_any(),
+                    .into_any()
+                }
+                Load::Ready(proposal) => {
+                    match id.get() {
+                        Some(proposal_id) => {
+                            view! {
+                                <ProposalViewDetail proposal id=proposal_id state current_id=id/>
+                            }.into_any()
+                        }
+                        None => ui::failure("the proposal id is missing").into_any(),
+                    }
                 }
             }
         }}
@@ -63,25 +92,56 @@ fn ProposalViewDetail(
     proposal: ProposalView,
     id: ProposalRef,
     state: RwSignal<Load<ProposalView>>,
+    current_id: RwSignal<Option<ProposalRef>>,
 ) -> impl IntoView {
+    let ctx = crate::session::use_session();
     let kind = proposal.kind;
     let status = proposal.status;
     let created = ui::timestamp(proposal.created_at);
-    let details = proposal
-        .summary
+    let summary = proposal_form::menu_summary(kind, &proposal.summary);
+    let details = summary
         .details
         .iter()
-        .map(|detail| view! { <li>{detail.clone()}</li> })
+        .map(|detail| {
+            view! {
+                <li>{detail.clone()}</li>
+            }
+        })
         .collect_view();
     let evidence = proposal
         .evidence
         .iter()
-        .map(|item| view! { <li>{describe(item)}</li> })
+        .map(|item| {
+            view! {
+                <li>{describe(item)}</li>
+            }
+        })
         .collect_view();
 
     let confirm_label = RwSignal::new("provia".to_owned());
-    let confirm_tags = RwSignal::new("FilmMode=0x0000".to_owned());
+    let confirm_tags = RwSignal::new(String::new());
     let confirm_message = RwSignal::new(None::<String>);
+    let read_confirmation = Callback::new(move |selected| {
+        spawn_local(async move {
+            let result = async {
+                let files = crate::files::read_files(selected).await?;
+                let file = files
+                    .first()
+                    .ok_or_else(|| "Choose a camera JPEG.".to_owned())?;
+                proposal_form::file_menu_value(&file.bytes)
+            }
+            .await;
+            match result {
+                Ok(tags) => {
+                    confirm_tags.set(tags);
+                    confirm_message.set(Some(
+                        "Menu information read locally. Your photo will not be sent.".to_owned(),
+                    ));
+                }
+                Err(error) => confirm_message.set(Some(error)),
+            }
+        });
+    });
 
     let confirm_id = id.clone();
     let confirm = move |_| {
@@ -91,8 +151,11 @@ fn ProposalViewDetail(
             Ok(tags) => {
                 confirm_message.set(None);
                 spawn_local(async move {
-                    match data::confirm_proposal(&current, &tags).await {
+                    match data::confirm_proposal(ctx, &current, &tags).await {
                         Ok(view) => {
+                            if current_id.try_get_untracked().flatten().as_ref() != Some(&current) {
+                                return;
+                            }
                             state.set(Load::Ready(view));
                             confirm_message
                                 .set(Some("Confirmation recorded as evidence.".to_owned()));
@@ -115,7 +178,7 @@ fn ProposalViewDetail(
         thread_busy.set(true);
         thread_notice.set(None);
         spawn_local(async move {
-            match data::proposer_thread(&current).await {
+            match data::proposer_thread(ctx, &current).await {
                 Ok(messages) => thread.set(Some(messages)),
                 Err(error) => thread_notice.set(Some(error)),
             }
@@ -134,10 +197,10 @@ fn ProposalViewDetail(
         thread_busy.set(true);
         thread_notice.set(None);
         spawn_local(async move {
-            match data::proposer_message(&current, &body).await {
+            match data::proposer_message(ctx, &current, &body).await {
                 Ok(()) => {
                     thread_message.set(String::new());
-                    match data::proposer_thread(&current).await {
+                    match data::proposer_thread(ctx, &current).await {
                         Ok(messages) => thread.set(Some(messages)),
                         Err(error) => thread_notice.set(Some(error)),
                     }
@@ -149,25 +212,27 @@ fn ProposalViewDetail(
     };
 
     view! {
-        <h1>{proposal.summary.headline.clone()}</h1>
+        <h1>{summary.headline.clone()}</h1>
         <p class="muted">
-            {format!("{} · {} · proposed {created}", kind.menu_label(), status_label(status))}
+            {format!("{} · {} · proposed {created}", proposal_form::kind_label(kind), status_label(status))}
         </p>
         <ul>{details}</ul>
+        <ui::Disclosure summary="Technical details".to_owned()>
+            <ul>
+                {proposal.summary.details.iter().map(|detail| view! {
+                    <li>{detail.clone()}</li>
+                }).collect_view()}
+            </ul>
+        </ui::Disclosure>
         <section aria-labelledby="evidence">
             <h2 id="evidence">"Evidence"</h2>
-            <p>
-                "Confirmations are evidence, not votes: each one attaches the confirmer's own parsed,
-                whitelisted tag values."
-            </p>
+            <p>"Confirmations help moderators check a change. They are evidence, not votes."</p>
             <ul>{evidence}</ul>
         </section>
         <section aria-labelledby="confirm">
-            <h2 id="confirm">"Confirm this menu"</h2>
-            <p>
-                "If your camera shows this menu too, your confirmation attaches the parsed tag values
-                from your own file. It needs a passkey signature."
-            </p>
+            <h2 id="confirm">"Does your camera show this menu too?"</h2>
+            <p>"Share the menu information from your own file to help a moderator check this proposal."</p>
+            <ui::DropZone on_files=read_confirmation accept=".jpg,.jpeg,.raf".to_owned() folders=false/>
             <label for="confirm-label">"Which menu answer did your file show?"</label>
             <input
                 type="text"
@@ -175,21 +240,25 @@ fn ProposalViewDetail(
                 prop:value=move || confirm_label.get()
                 on:input=move |event| confirm_label.set(event_target_value(&event))
             />
-            <label for="confirm-tags">"Parsed tag values, one Tag=value per line"</label>
-            <textarea
-                id="confirm-tags"
-                rows="4"
-                cols="40"
-                prop:value=move || confirm_tags.get()
-                on:input=move |event| confirm_tags.set(event_target_value(&event))
-            ></textarea>
+            <ui::Disclosure summary="Advanced: parsed file information".to_owned()>
+                <label for="confirm-tags">"Parsed tag values, one Tag=value per line"</label>
+                <textarea
+                    id="confirm-tags"
+                    rows="4"
+                    cols="40"
+                    prop:value=move || confirm_tags.get()
+                    on:input=move |event| confirm_tags.set(event_target_value(&event))
+                ></textarea>
+            </ui::Disclosure>
             <button type="button" id="confirm-proposal" on:click=confirm>
-                "Confirm with passkey"
+                "My camera shows this menu too"
             </button>
             {move || {
                 confirm_message
                     .get()
-                    .map(|text| view! { <p class="muted" role="status">{text}</p> })
+                    .map(|text| view! {
+                        <p class="muted" role="status">{text}</p>
+                    })
             }}
         </section>
         <section aria-labelledby="thread">
@@ -217,7 +286,9 @@ fn ProposalViewDetail(
                     .get()
                     .map(|messages| {
                         if messages.is_empty() {
-                            view! { <p class="muted">"No messages yet."</p> }.into_any()
+                            view! {
+                                <p class="muted">"No messages yet."</p>
+                            }.into_any()
                         } else {
                             view! {
                                 <ul id="thread-messages">
@@ -260,7 +331,9 @@ fn ProposalViewDetail(
             {move || {
                 thread_notice
                     .get()
-                    .map(|text| view! { <p class="error" role="alert">{text}</p> })
+                    .map(|text| view! {
+                        <p class="error" role="alert">{text}</p>
+                    })
             }}
         </section>
     }
@@ -275,21 +348,17 @@ fn status_label(status: ProposalStatus) -> &'static str {
     }
 }
 
-fn describe(evidence: &Evidence) -> String {
+pub(super) fn describe(evidence: &Evidence) -> String {
     match evidence {
         Evidence::Confirmation {
             author,
             tags,
             recorded_at,
         } => {
-            let values = tags
-                .iter()
-                .map(|tag| format!("{}={:04x} ({})", tag.tag, tag.value.0, tag.label))
-                .collect::<Vec<_>>()
-                .join(", ");
             format!(
-                "Confirmed by {} on {recorded_at} with {values}",
-                author.as_deref().unwrap_or("a contributor")
+                "{} confirmed this menu on {recorded_at} using {} file information fields.",
+                author.as_deref().unwrap_or("A contributor"),
+                tags.len()
             )
         }
         Evidence::Fixture { donation } => format!(

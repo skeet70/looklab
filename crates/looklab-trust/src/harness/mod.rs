@@ -26,6 +26,8 @@ pub enum HarnessError {
     InvalidSerial,
     #[error("no image enters the fit")]
     EmptyPool,
+    #[error("the fit returned no estimate for probe {0}")]
+    MissingProbe(usize),
 }
 
 pub type HarnessResult<T> = core::result::Result<T, HarnessError>;

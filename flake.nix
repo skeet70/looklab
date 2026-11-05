@@ -35,6 +35,7 @@
         goldenPython = pkgs.python3.withPackages (ps: [ colour-science ps.numpy ps.scipy ]);
 
         common = with pkgs; [
+          git
           pkg-config
           openssl
           sqlite
@@ -47,13 +48,24 @@
           nodejs_22
           cargo-nextest
           trunk
+          util-linux
         ];
+        buildShellHook = ''
+          if looklab_git_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+            looklab_build_root=$(dirname "$looklab_git_dir")
+          else
+            looklab_build_root=$PWD
+          fi
+          export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$looklab_build_root/target}"
+          export LOOKLAB_UI_TARGET_DIR="''${LOOKLAB_UI_TARGET_DIR:-$looklab_build_root/target-ui}"
+          unset looklab_git_dir looklab_build_root
+        '';
       in
       {
         devShells.default = pkgs.mkShell {
           buildInputs = [ rusttoolchain ] ++ common;
           # trunk 0.21 parses NO_COLOR as a bool; the conventional value 1 fails its CLI parser.
-          shellHook = ''
+          shellHook = buildShellHook + ''
             if [ "''${NO_COLOR:-}" = "1" ]; then export NO_COLOR=true; fi
           '';
         };
@@ -64,6 +76,7 @@
         # cargo-fuzz needs a nightly compiler for sanitizer instrumentation.
         devShells.fuzz = pkgs.mkShell {
           buildInputs = [ nightly pkgs.cargo-fuzz ];
+          shellHook = buildShellHook;
         };
       });
 }

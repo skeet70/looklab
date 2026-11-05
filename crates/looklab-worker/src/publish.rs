@@ -140,7 +140,7 @@ async fn site_data(pool: &SqlitePool, config: &PublishConfig) -> Result<SiteData
         };
         let gate = release
             .as_ref()
-            .map(|release| gate_summary(&release.gate))
+            .map(|release| gate_summary(&release.gate, release.converged))
             .unwrap_or_default();
         let provenance = release
             .map(|release| release.provenance)

@@ -229,9 +229,9 @@ pub fn apply_model_error(
     look: &Look,
     density: &crate::types::Density,
     space: RgbSpace,
-    support_sigma: f64,
-    min_clusters: usize,
+    options: &FitOptions,
     clip_k: f64,
+    previous: Option<&crate::types::PreviousSupport>,
 ) {
     let probes_v1 = looklab_model::probes::v1();
     let mut supported = 0usize;
@@ -245,10 +245,49 @@ pub fn apply_model_error(
             .max(0.0)
             .sqrt();
         let prediction = look.eval(probes_v1.probes[index].xyz);
-        probe.supported = probe.sigma_de <= support_sigma
-            && probe.density >= density.floor
-            && probe.clusters >= min_clusters
-            && !crate::predict::in_clip_shoulder(prediction, space, clip_k);
+        let chain = crate::predict::clip_jacobian(prediction, space, clip_k);
+        for a in 0..3 {
+            for b in 0..3 {
+                let mut sum = 0.0;
+                for c in 0..3 {
+                    for d in 0..3 {
+                        sum += chain.0[a][c] * probe.covariance[c][d] * chain.0[b][d];
+                    }
+                }
+                probe.post_covariance[a][b] = sum;
+            }
+        }
+        crate::uncertainty::floor_post_covariance(&probe.covariance, &mut probe.post_covariance);
+        probe.post_sigma_de = (probe.post_covariance[0][0]
+            + probe.post_covariance[1][1]
+            + probe.post_covariance[2][2])
+            .max(0.0)
+            .sqrt();
+        probe.post_ucs =
+            crate::predict::post_clip(look, probes_v1.probes[index].xyz, space, clip_k);
+        probe.pre_clip_reliable =
+            crate::predict::clip_derivative_min(prediction, space, clip_k) >= 0.25;
+        let previous_sigma = previous
+            .and_then(|state| state.sigma.get(index).copied())
+            .unwrap_or(false);
+        let previous_bias = previous
+            .and_then(|state| state.bias.get(index).copied())
+            .unwrap_or(false);
+        let flags = crate::uncertainty::mark_support(
+            probe.post_sigma_de,
+            probe.bias_de,
+            probe.density,
+            probe.clusters,
+            density.floor,
+            previous_sigma,
+            previous_bias,
+            options,
+        );
+        probe.supported_sigma = flags.sigma;
+        probe.supported_density = flags.density;
+        probe.supported_clusters = flags.clusters;
+        probe.supported_bias = flags.bias;
+        probe.supported = flags.all();
         if probe.supported {
             supported += 1;
         }
@@ -305,7 +344,16 @@ mod review_tests {
                 ucs: looklab_color::ucs::Ucs::new(50.0, 0.0, 0.0),
                 covariance: [[0.0; 3]; 3],
                 sigma_de: 0.0,
+                post_ucs: looklab_color::ucs::Ucs::new(50.0, 0.0, 0.0),
+                post_covariance: [[0.0; 3]; 3],
+                post_sigma_de: 0.0,
+                bias_de: 0.0,
+                pre_clip_reliable: true,
                 density: 1.0,
+                supported_sigma: false,
+                supported_density: false,
+                supported_clusters: false,
+                supported_bias: false,
                 supported: false,
                 clusters: 5,
             })
@@ -329,41 +377,16 @@ mod review_tests {
             &look,
             &density(),
             RgbSpace::Srgb,
-            1.5,
-            3,
+            &FitOptions {
+                density_floor: 0.0,
+                ..FitOptions::default()
+            },
             0.03,
+            None,
         );
         let sigma = estimates.probes[0].sigma_de;
         assert!((sigma * sigma - 3.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn support_uses_the_requested_clip_parameter() {
-        let look = Look::colorimetric_spline().expect("look");
-        let field = ModelErrorField::empty();
-        let mut narrow = probes();
-        apply_model_error(
-            &mut narrow,
-            &field,
-            &look,
-            &density(),
-            RgbSpace::Srgb,
-            1.5,
-            3,
-            0.005,
-        );
-        let mut wide = probes();
-        apply_model_error(
-            &mut wide,
-            &field,
-            &look,
-            &density(),
-            RgbSpace::Srgb,
-            1.5,
-            3,
-            0.45,
-        );
-        assert!(narrow.supported_fraction > wide.supported_fraction);
+        assert!(estimates.probes[0].post_sigma_de <= sigma + 1e-12);
     }
 
     #[cfg(feature = "synth")]

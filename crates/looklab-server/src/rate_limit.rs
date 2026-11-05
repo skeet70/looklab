@@ -14,7 +14,8 @@ const MAX_BUCKETS: usize = 16_384;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     Upload,
-    StatusReissue,
+    Session,
+    SessionRevoke,
     Withdraw,
     Admin,
     Endorse,
@@ -64,7 +65,8 @@ impl RateKey {
                     capacity: 30.0,
                     refill_per_second: 0.2,
                 },
-                Action::StatusReissue
+                Action::Session
+                | Action::SessionRevoke
                 | Action::Withdraw
                 | Action::Admin
                 | Action::Endorse
@@ -98,7 +100,8 @@ impl core::fmt::Display for RateKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let action = |action: Action| match action {
             Action::Upload => "upload",
-            Action::StatusReissue => "status-reissue",
+            Action::Session => "session",
+            Action::SessionRevoke => "session-revoke",
             Action::Withdraw => "withdraw",
             Action::Admin => "admin",
             Action::Endorse => "endorse",

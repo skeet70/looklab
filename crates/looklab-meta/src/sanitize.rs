@@ -39,8 +39,14 @@ pub struct SanitizedMetadata {
     pub software: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub render_tag: Option<RenderTag>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub render_tag_malformed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub look: Option<LookSettings>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl SanitizedMetadata {
@@ -74,7 +80,8 @@ pub fn sanitize(parsed: &ParsedMetadata) -> (SanitizedMetadata, RemovedFields) {
             .as_ref()
             .and_then(|time| YearMonth::new(time.year, time.month)),
         software: exif.software.clone(),
-        render_tag: parsed.render_tag.clone(),
+        render_tag: parsed.render_tag.valid().cloned(),
+        render_tag_malformed: parsed.render_tag.is_malformed(),
         look: fuji
             .map(|fuji| fuji.look.clone())
             .filter(|look| !look.is_empty()),

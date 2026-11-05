@@ -46,17 +46,27 @@ pub use looklab_model::{Look, LookInput, Probe, ProbeId, ProbeSet};
 pub use model_error::{
     MODEL_HUE_BINS, MODEL_S_BINS, ModelErrorField, apply_model_error, estimate_model_error, region,
 };
+pub use predict::post_clip;
 pub use types::{
     ContributorId, ControlResponseFit, Density, Diagnostics, ExcludeReason, ExcludedImage,
     ExposureModeId, ExposureOffset, FitError, FitImage, FitOptions, FitResult, ImageFitStats,
-    ImageIntent, ImageNuisances, OutlierReason, ProbeEstimate, ProbeUncertainty, Realization,
-    Result, StageLambdas, Verdict,
+    ImageIntent, ImageNuisances, OutlierReason, PreviousSupport, ProbeEstimate, ProbeUncertainty,
+    Realization, Result, StageLambdas, Verdict,
 };
 pub use uncertainty::small_cluster_factor;
 
 /// Fit one body's single Look at the reference control setting.
 pub fn fit(images: &[FitImage], options: &FitOptions) -> Result<FitResult> {
     fit::run(images, options, None)
+}
+
+/// Fit with the previous published support state, for hysteresis.
+pub fn fit_with_history(
+    images: &[FitImage],
+    options: &FitOptions,
+    previous: Option<&PreviousSupport>,
+) -> Result<FitResult> {
+    fit::run_with_history(images, options, None, Vec::new(), previous)
 }
 
 /// Joint θ/D fit over all native settings on one body.
@@ -73,6 +83,23 @@ pub fn fit_controlled(
         return Err(FitError::NoNativeImages);
     }
     fit::run_with(&kept, options, Some(model), excluded)
+}
+
+/// Joint θ/D fit over all native settings on one body, with previous probe support.
+pub fn fit_controlled_with_history(
+    images: &[FitImage],
+    schema: &looklab_schema::ControlSchema,
+    epoch: u32,
+    base_sim: &looklab_schema::SimKey,
+    options: &FitOptions,
+    previous: Option<&PreviousSupport>,
+) -> Result<FitResult> {
+    let model = ControlResponseModel::zeroed(schema, epoch, base_sim, 1)?;
+    let (kept, excluded) = fit::filter_spatial(images, schema, epoch)?;
+    if !kept.iter().any(|image| image.intent == ImageIntent::Native) {
+        return Err(FitError::NoNativeImages);
+    }
+    fit::run_with_history(&kept, options, Some(model), excluded, previous)
 }
 
 /// Refit the control response with θ_L fixed.

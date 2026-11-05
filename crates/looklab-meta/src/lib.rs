@@ -25,7 +25,8 @@ pub use fuji::{
 pub use render_tag::{
     CONTENT_ID_PREFIX_LEN, FirmwareId, FirmwareVersion, MAX_FIRMWARE_ID_LEN,
     MAX_FIRMWARE_VERSION_LEN, MAX_LOOK_SLUG_LEN, MAX_LOOK_VERSION_LEN, RENDER_TAG_PREFIX,
-    RenderLookSlug, RenderLookVersion, RenderTag, RenderTagError, parse_render_tag,
+    RenderLookSlug, RenderLookVersion, RenderTag, RenderTagError, RenderTagOutcome,
+    classify_render_tag, parse_render_tag,
 };
 pub use sanitize::{RemovedField, RemovedFields, SanitizedMetadata, sanitize};
 pub use serial::{RawSerial, SerialHmac, SerialHmacKey};

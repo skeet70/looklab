@@ -41,7 +41,7 @@ fn coordinates(s: f64, hue: f64, c: f64) -> [f64; 3] {
     ]
 }
 
-pub(crate) fn build(problem: &Problem, params: &Params, floor_fraction: f64) -> Density {
+pub(crate) fn build(problem: &Problem, params: &Params, floor: f64) -> Density {
     let mut counts = vec![0.0_f64; S_BINS * H_BINS * C_BINS];
     for sample in &problem.samples {
         if !sample.informative {
@@ -55,31 +55,19 @@ pub(crate) fn build(problem: &Problem, params: &Params, floor_fraction: f64) -> 
             sample.rgb[2] * context.wb_b * libm::pow(2.0, context.exposure),
         ]);
         let input = LookInput::new(looklab_color::Xyz::from_array(xyz));
-        let weight = sample.density * problem.images[image].trust;
-        counts[index_of([input.s, input.h_in, input.c_in])] += weight;
+        counts[index_of([input.s, input.h_in, input.c_in])] += sample.weight;
     }
     let total: f64 = counts.iter().sum();
     if total > 0.0 {
         smooth(&mut counts);
     }
-    let scale = (S_BINS * H_BINS * C_BINS) as f64 / total.max(1e-12);
-    for value in &mut counts {
-        *value *= scale;
-    }
-    // The counts are scaled so their mean over bins is one, which makes the floor a
-    // stable, pool-size-independent threshold (a peak-relative floor moves as the pool grows).
-    let mean = if counts.is_empty() {
-        1.0
-    } else {
-        counts.iter().sum::<f64>() / counts.len() as f64
-    };
     Density {
         s_bins: S_BINS,
         hue_bins: H_BINS,
         c_bins: C_BINS,
         counts,
         total,
-        floor: floor_fraction * mean.max(1e-9),
+        floor: floor.max(0.0),
     }
 }
 

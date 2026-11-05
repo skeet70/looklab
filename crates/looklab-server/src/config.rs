@@ -9,7 +9,7 @@ use std::time::Duration;
 use looklab_upload::{Limits, PowParams};
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PowConfig {
     pub memory_kib: u32,

@@ -8,7 +8,65 @@ use crate::layout::Params;
 use crate::predict::{Jac, evaluate_probe};
 use crate::problem::{BlockAcc, Problem, ResidualSample};
 use crate::solve::{factor_in_place, solve_in_place};
-use crate::types::{Density, FitOptions, ProbeEstimate, ProbeUncertainty, Result};
+use crate::types::{Density, FitOptions, PreviousSupport, ProbeEstimate, ProbeUncertainty, Result};
+
+/// Keep post-clip variance at least `(0.25)²` times the pre-clip trace, the clip
+/// derivative below which the pre-clip value is not identifiable.
+pub(crate) fn floor_post_covariance(pre: &[[f64; 3]; 3], post: &mut [[f64; 3]; 3]) {
+    let pre_trace = pre[0][0] + pre[1][1] + pre[2][2];
+    let post_trace = post[0][0] + post[1][1] + post[2][2];
+    let floor = 0.0625 * pre_trace;
+    if post_trace < floor {
+        let extra = (floor - post_trace) / 3.0;
+        for (channel, row) in post.iter_mut().enumerate() {
+            row[channel] += extra;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SupportFlags {
+    pub sigma: bool,
+    pub density: bool,
+    pub clusters: bool,
+    pub bias: bool,
+}
+
+impl SupportFlags {
+    pub fn all(self) -> bool {
+        self.sigma && self.density && self.clusters && self.bias
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mark_support(
+    sigma: f64,
+    bias: f64,
+    density: f64,
+    clusters: usize,
+    floor: f64,
+    previous_sigma: bool,
+    previous_bias: bool,
+    options: &FitOptions,
+) -> SupportFlags {
+    let sigma_limit = if previous_sigma {
+        options.support_sigma_exit
+    } else {
+        options.support_sigma
+    };
+    let bias_enter = options.bias_fraction * options.support_sigma;
+    let bias_limit = if previous_bias {
+        1.1 * bias_enter
+    } else {
+        bias_enter
+    };
+    SupportFlags {
+        sigma: sigma <= sigma_limit,
+        density: density >= floor,
+        clusters: clusters >= options.min_probe_clusters,
+        bias: bias <= bias_limit,
+    }
+}
 
 const CLUSTER_S: f64 = 0.75;
 const CLUSTER_HUE_DEG: f64 = 20.0;
@@ -168,6 +226,7 @@ pub(crate) fn probe_uncertainty(
     density: &Density,
     residual_samples: &[ResidualSample],
     options: &FitOptions,
+    previous: Option<&PreviousSupport>,
 ) -> Result<ProbeUncertainty> {
     let layout = &problem.layout;
     let priors = prior_diagonal(options, problem, params);
@@ -179,9 +238,12 @@ pub(crate) fn probe_uncertainty(
     for entry in 0..n * n {
         h[entry] += penalty[entry];
     }
-    let identity = crate::fit::identity_curvature(layout, block);
+    let identity = crate::fit::identity_matrix(layout, block);
+    for entry in 0..n * n {
+        h[entry] += identity[entry];
+    }
     for (local, global) in block.params.iter().enumerate() {
-        h[local * n + local] += priors[*global] + identity[local];
+        h[local * n + local] += priors[*global];
     }
     let ridge = (0..n)
         .map(|index| h[index * n + index])
@@ -204,11 +266,67 @@ pub(crate) fn probe_uncertainty(
         }
         bump *= 10.0;
     }
-    let Some(inverse) = inverse else {
-        return Err(crate::types::FitError::SingularRegularization);
-    };
+    let inverse = inverse.unwrap_or_else(|| {
+        // A zero-curvature direction has no data or prior information; its diagonal
+        // inverse keeps the probe covariance finite.
+        let mut fallback = vec![0.0_f64; n * n];
+        for index in 0..n {
+            fallback[index * n + index] = 1.0 / h[index * n + index].max(ridge);
+        }
+        fallback
+    });
     let residual_diagonal = residual_inverse_diagonal(residual_samples, lambdas.residual);
     let residual_start = layout.residual.start;
+    let residual_prior: Vec<f64> = crate::fit::residual_penalty_diagonal()
+        .into_iter()
+        .map(|degree| {
+            crate::fit::identity_weight(crate::layout::BlockKind::Residual)
+                + 2.0 * lambdas.residual * degree
+        })
+        .collect();
+    let clip_local = block
+        .params
+        .iter()
+        .position(|global| *global == layout.clip);
+    let z_clip = clip_local.map(|local| {
+        let mut column = vec![0.0_f64; layout.total];
+        for i in 0..n {
+            column[block.params[i]] = inverse[i * n + local];
+        }
+        column
+    });
+    let apply_prior = |z: &[f64]| -> Vec<f64> {
+        let mut out = crate::fit::identity_apply(layout, block, z);
+        for i in 0..n {
+            let global = block.params[i];
+            out[i] += priors[global] * z[global];
+            for j in 0..n {
+                out[i] += penalty[i * n + j] * z[block.params[j]];
+            }
+        }
+        out
+    };
+    let apply_prior_many = |z: [&[f64]; 3]| -> [Vec<f64>; 3] {
+        let mut out: [Vec<f64>; 3] =
+            core::array::from_fn(|channel| crate::fit::identity_apply(layout, block, z[channel]));
+        for i in 0..n {
+            let global = block.params[i];
+            for channel in 0..3 {
+                out[channel][i] += priors[global] * z[channel][global];
+            }
+            for j in 0..n {
+                let weight = penalty[i * n + j];
+                if weight != 0.0 {
+                    for channel in 0..3 {
+                        out[channel][i] += weight * z[channel][block.params[j]];
+                    }
+                }
+            }
+        }
+        out
+    };
+    let applied_theta = apply_prior(&params.theta);
+    let applied_k = z_clip.as_ref().map(|column| apply_prior(column));
 
     let (_, beta_slope) = problem.look_and_slope(params);
     let space = problem
@@ -261,7 +379,7 @@ pub(crate) fn probe_uncertainty(
         support.sort_unstable();
         support.dedup();
 
-        let mut covariance = [[0.0_f64; 3]; 3];
+        let mut meat = [[0.0_f64; 3]; 3];
         for gradient in per_image_gradient {
             let mut scores = [0.0_f64; 3];
             for (channel, z) in z_columns.iter().enumerate() {
@@ -272,35 +390,144 @@ pub(crate) fn probe_uncertainty(
                 scores[channel] = sum;
             }
             for a in 0..3 {
-                for b in a..3 {
-                    covariance[a][b] += scores[a] * scores[b];
+                for b in 0..3 {
+                    meat[a][b] += scores[a] * scores[b];
                 }
             }
         }
-        for a in 0..3 {
-            for b in 0..a {
-                covariance[a][b] = covariance[b][a];
+        let factor = if options.sandwich_correction {
+            small_cluster_factor(problem.active_images)
+        } else {
+            1.0
+        };
+
+        // `H^-1 (factor * M + L_prior) H^-1`: the meat uses z, the prior term is z' L z.
+        let mut prior_cov = [[0.0_f64; 3]; 3];
+        if options.prior_floor {
+            let applied = apply_prior_many([&z_columns[0], &z_columns[1], &z_columns[2]]);
+            for c in 0..3 {
+                for d in 0..3 {
+                    for (local, global) in block.params.iter().enumerate() {
+                        prior_cov[c][d] += z_columns[c][*global] * applied[d][local];
+                    }
+                    for (offset, weight) in residual_prior.iter().enumerate() {
+                        let global = residual_start + offset;
+                        prior_cov[c][d] += weight * z_columns[c][global] * z_columns[d][global];
+                    }
+                }
             }
         }
+        let mut covariance = [[0.0_f64; 3]; 3];
+        for a in 0..3 {
+            for b in 0..3 {
+                covariance[a][b] = factor * meat[a][b] + prior_cov[a][b];
+            }
+        }
+        let sigma_de = (covariance[0][0] + covariance[1][1] + covariance[2][2])
+            .max(0.0)
+            .sqrt();
+        let mut bias_pre = [0.0_f64; 3];
+        for (local, global) in block.params.iter().enumerate() {
+            let value = applied_theta[local];
+            if value != 0.0 {
+                for channel in 0..3 {
+                    bias_pre[channel] += z_columns[channel][*global] * value;
+                }
+            }
+        }
+        for (offset, weight) in residual_prior.iter().enumerate() {
+            let global = residual_start + offset;
+            let value = weight * params.theta[global];
+            for channel in 0..3 {
+                bias_pre[channel] += z_columns[channel][global] * value;
+            }
+        }
+        let mut kk = 0.0_f64;
+        let mut cross = [0.0_f64; 3];
+        let mut k_bias = 0.0_f64;
+        if let Some(column) = &z_clip {
+            let mut ks = vec![0.0_f64; per_image_gradient.len()];
+            for (image, gradient) in per_image_gradient.iter().enumerate() {
+                ks[image] = support
+                    .iter()
+                    .map(|index| gradient[*index] * column[*index])
+                    .sum();
+            }
+            kk += factor * ks.iter().map(|value| value * value).sum::<f64>();
+            for (image, gradient) in per_image_gradient.iter().enumerate() {
+                for (channel, z) in z_columns.iter().enumerate() {
+                    let score: f64 = support
+                        .iter()
+                        .map(|index| gradient[*index] * z[*index])
+                        .sum();
+                    cross[channel] += factor * score * ks[image];
+                }
+            }
+            for (local, global) in block.params.iter().enumerate() {
+                k_bias += column[*global] * applied_theta[local];
+            }
+            for (offset, weight) in residual_prior.iter().enumerate() {
+                let global = residual_start + offset;
+                k_bias += column[global] * weight * params.theta[global];
+            }
+            if options.prior_floor {
+                let applied_k = applied_k.as_ref().expect("clip column present");
+                for (local, global) in block.params.iter().enumerate() {
+                    kk += column[*global] * applied_k[local];
+                    for channel in 0..3 {
+                        cross[channel] += z_columns[channel][*global] * applied_k[local];
+                    }
+                }
+                for (offset, weight) in residual_prior.iter().enumerate() {
+                    let global = residual_start + offset;
+                    kk += weight * column[global] * column[global];
+                    for channel in 0..3 {
+                        cross[channel] += weight * z_columns[channel][global] * column[global];
+                    }
+                }
+            }
+        }
+        let clip_slope = params.clip_slope();
+        let chain = crate::predict::clip_jacobian(pre, space, params.clip_k());
+        let dk = crate::predict::clip_k_gradient(pre, space, params.clip_k());
+        let mut post_covariance = [[0.0_f64; 3]; 3];
+        let mut bias_post = [0.0_f64; 3];
+        for c in 0..3 {
+            for d in 0..3 {
+                let mut sum = 0.0;
+                for a in 0..3 {
+                    for b in 0..3 {
+                        sum += chain.0[c][a] * covariance[a][b] * chain.0[d][b];
+                    }
+                }
+                let left: f64 = (0..3).map(|a| chain.0[c][a] * cross[a]).sum();
+                let right: f64 = (0..3).map(|b| cross[b] * chain.0[d][b]).sum();
+                sum += clip_slope * (left * dk[d] + dk[c] * right)
+                    + clip_slope * clip_slope * dk[c] * dk[d] * kk;
+                post_covariance[c][d] = sum;
+            }
+            let mut sum = 0.0;
+            for a in 0..3 {
+                sum += chain.0[c][a] * bias_pre[a];
+            }
+            bias_post[c] = sum + clip_slope * dk[c] * k_bias;
+        }
+        floor_post_covariance(&covariance, &mut post_covariance);
+        let post_sigma_de = (post_covariance[0][0] + post_covariance[1][1] + post_covariance[2][2])
+            .max(0.0)
+            .sqrt();
+        let bias_de = (bias_post[0] * bias_post[0]
+            + bias_post[1] * bias_post[1]
+            + bias_post[2] * bias_post[2])
+            .max(0.0)
+            .sqrt();
+        let post_ucs = crate::predict::post_clip(look, probe.xyz, space, params.clip_k());
         let clusters = probe_cluster_count(
             &cluster_samples,
             probe.xyz,
             problem.images.len(),
             estimates.len(),
         );
-        let factor = if options.sandwich_correction {
-            small_cluster_factor(problem.active_images)
-        } else {
-            1.0
-        };
-        for row in &mut covariance {
-            for value in row {
-                *value *= factor;
-            }
-        }
-        let sigma_de = (covariance[0][0] + covariance[1][1] + covariance[2][2])
-            .max(0.0)
-            .sqrt();
         if std::env::var_os("LOOKLAB_SIGMA_TRACE").is_some()
             && matches!(
                 probes.probes[estimates.len()].id.as_str(),
@@ -334,11 +561,23 @@ pub(crate) fn probe_uncertainty(
         }
         let input = LookInput::new(probe.xyz);
         let local_density = density.at(input.s, input.h_in, input.c_in);
-        let is_supported = sigma_de <= options.support_sigma
-            && local_density >= density.floor
-            && clusters >= options.min_probe_clusters
-            && !crate::predict::in_clip_shoulder(pre, space, params.clip_k());
-        if is_supported {
+        let previous_sigma = previous
+            .and_then(|state| state.sigma.get(estimates.len()).copied())
+            .unwrap_or(false);
+        let previous_bias = previous
+            .and_then(|state| state.bias.get(estimates.len()).copied())
+            .unwrap_or(false);
+        let flags = mark_support(
+            post_sigma_de,
+            bias_de,
+            local_density,
+            clusters,
+            density.floor,
+            previous_sigma,
+            previous_bias,
+            options,
+        );
+        if flags.all() {
             supported += 1;
         }
         estimates.push(ProbeEstimate {
@@ -346,8 +585,18 @@ pub(crate) fn probe_uncertainty(
             ucs: pre,
             covariance,
             sigma_de,
+            post_ucs,
+            post_covariance,
+            post_sigma_de,
+            bias_de,
+            pre_clip_reliable: crate::predict::clip_derivative_min(pre, space, params.clip_k())
+                >= 0.25,
             density: local_density,
-            supported: is_supported,
+            supported_sigma: flags.sigma,
+            supported_density: flags.density,
+            supported_clusters: flags.clusters,
+            supported_bias: flags.bias,
+            supported: flags.all(),
             clusters,
         });
     }
@@ -470,7 +719,7 @@ fn residual_inverse_diagonal(samples: &[ResidualSample], lambda: f64) -> Vec<f64
             }
         }
     }
-    let identity = 2.0 * crate::fit::identity_weight(crate::layout::BlockKind::Residual);
+    let identity = crate::fit::identity_weight(crate::layout::BlockKind::Residual);
     for value in &mut diagonal {
         *value += identity;
     }
@@ -511,6 +760,16 @@ mod review_tests {
         });
         assert_eq!(probe_cluster_count(&samples, probe, 2, 0), 1);
         assert_eq!(probe_cluster_count(&two, probe, 2, 0), 2);
+    }
+
+    #[test]
+    fn post_clip_covariance_keeps_a_pre_clip_floor() {
+        let pre = [[4.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 4.0]];
+        let mut post = [[0.0; 3]; 3];
+        floor_post_covariance(&pre, &mut post);
+        let trace = post[0][0] + post[1][1] + post[2][2];
+        assert!((trace - 0.0625 * 12.0).abs() < 1e-12);
+        assert!((post[0][0] - trace / 3.0).abs() < 1e-12);
     }
 
     #[test]

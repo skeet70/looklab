@@ -4,6 +4,7 @@
 //! Pure computation over typed inputs; the server and worker map database rows into
 //! these types and persist the audit events operations return.
 
+pub mod bounty;
 pub mod error;
 pub mod evidence;
 pub mod gates;
@@ -19,12 +20,20 @@ pub mod standing;
 pub mod state;
 pub mod weight;
 
+pub use bounty::{
+    Attribution, Bounty, BountyReason, BountyStatus, BountyTarget, BountyVerification,
+    EpochOrdinal, JacobianDirections, ModelVersions, RecipeKey, RecipeLeaderboard,
+    RecipePrediction, RecipeScore, RegionResidual, RegionUncertainty, ResidualObservation,
+    VerifiedRecipe, analyze_residuals, leaderboards, rank_bounties, region_uncertainties,
+    resolution_status, resolve_bounty, score_recipe,
+};
 pub use error::{Result, TrustError};
 pub use evidence::{EvidenceGrid, coverage_gain, evidence};
 pub use gates::{
-    DriftGateReport, GateInput, GateReference, GateReport, GatedProbe, ProbeEstimate,
-    RootGateReport, RootObservation, VersionProbes, VersionRole, Violation, convert_exposure_gauge,
-    exposure_gauge_excluded, gate_release,
+    DriftGateReport, GateInput, GateReference, GateReport, GatedProbe, GatedUnion,
+    IDENTIFIED_CLIP_DERIVATIVE, ProbeEstimate, ProbePrediction, ProbeSupport, RootGateReport,
+    RootObservation, SupportThresholds, VersionProbes, VersionRole, Violation,
+    convert_exposure_gauge, exposure_gauge_excluded, gate_release,
 };
 pub use ids::{
     ArtifactHash, CredentialId, EffectiveContributorId, ImageRef, SerialLink, SerialReuse,

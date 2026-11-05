@@ -102,6 +102,15 @@ impl WeightedPool {
 }
 
 pub fn weigh(pool: &LookPool, params: &TrustParams, root: &RootWeights) -> Result<WeightedPool> {
+    if pool
+        .images
+        .iter()
+        .any(|image| image.contribution.intent == ContributionIntent::Card)
+    {
+        return Err(crate::error::WorkerError::Data(
+            "card renders cannot enter a weighting pool".to_owned(),
+        ));
+    }
     let evidence_values = evidence_values(pool, params)?;
     let inputs: Vec<WeightImage> = pool
         .images
@@ -184,6 +193,7 @@ fn weight_image(pool: &LookPool, image: &PoolImage, evidence: f64) -> WeightImag
         ContributionIntent::Recipe => Intent::Recipe {
             target_look: pool.look.clone(),
         },
+        ContributionIntent::Card => unreachable!("card renders never reach a weighting pool"),
     };
     WeightImage {
         id: ImageRef::new(image.image.id.as_str()),
@@ -354,6 +364,7 @@ pub fn recipe_fit_images(
             fit.intent = match image.contribution.intent {
                 ContributionIntent::Native => ImageIntent::Native,
                 ContributionIntent::Recipe => ImageIntent::Recipe,
+                ContributionIntent::Card => unreachable!("card renders carry no fit weight"),
             };
             fit
         })

@@ -112,7 +112,7 @@ fn synthetic_flow_fits_reports_compares_exports_and_validates() {
     .expect("comparison json");
     assert!(json["summary"].is_string());
 
-    let profile = workspace().join("data/interfaces/example-firmware-sim-v1.yaml");
+    let profile = workspace().join("data/interfaces/example-app-lut3d-v1.yaml");
     let cube = temp.path().join("look-a.cube");
     let export = |force: bool| {
         let mut command = looklab();
@@ -367,4 +367,31 @@ fn fit_skips_an_undecodable_sample_and_keeps_going() {
         "{stderr}"
     );
     assert!(out.exists());
+}
+
+#[test]
+fn card_inspect_and_eval_read_the_conformance_card() {
+    let path = workspace().join("data/card/conformance-v1/valid/card-33.llk");
+    let (stdout, _) = ok({
+        let mut command = looklab();
+        command.args(["card", "inspect"]).arg(&path);
+        command
+    });
+    assert!(stdout.contains("magic LLCF"), "{stdout}");
+    assert!(stdout.contains("content id: "), "{stdout}");
+    assert!(stdout.contains("slug: conformance-tone"), "{stdout}");
+    assert!(stdout.contains("grid: 33^3"), "{stdout}");
+
+    let (stdout, _) = ok({
+        let mut command = looklab();
+        command
+            .args(["card", "eval"])
+            .arg(&path)
+            .args(["0.18", "0.18", "0.18"]);
+        command
+    });
+    assert!(
+        stdout.contains("in [0.180000, 0.180000, 0.180000]"),
+        "{stdout}"
+    );
 }

@@ -3,12 +3,11 @@
 use std::sync::Arc;
 
 use leptos::prelude::*;
-use leptos_router::hooks::use_params_map;
+use leptos_router::hooks::{use_navigate, use_params_map, use_query_map};
 use looklab_publish::{LookPage, LookVersionPage, PreparedScene, SceneIndex, SiteIndex, WeakSpot};
 use looklab_report::svg::{grl_svg, tint_curve_svg, tone_curve_svg};
 
 use crate::data::{self, Load, LoadedVersion};
-use crate::preview::ScenePreview;
 use crate::ui;
 
 #[derive(Clone, Debug, Default)]
@@ -30,17 +29,59 @@ impl VersionDetails {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LookTab {
+    Overview,
+    Measurements,
+    History,
+}
+
+impl LookTab {
+    fn id(self) -> ui::TabId {
+        ui::TabId::new(match self {
+            Self::Overview => "overview",
+            Self::Measurements => "measurements",
+            Self::History => "history",
+        })
+        .expect("valid tab")
+    }
+
+    fn from_id(id: &ui::TabId) -> Self {
+        match id.as_str() {
+            "measurements" => Self::Measurements,
+            "history" => Self::History,
+            _ => Self::Overview,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Measurements => "Measurements",
+            Self::History => "History",
+        }
+    }
+}
+
 #[component]
 pub fn LookDetail() -> impl IntoView {
     let params = use_params_map();
     let state = RwSignal::new(Load::<LookPage>::Loading);
+    let generation = RwSignal::new(0_u32);
     Effect::new(move |_| {
         let slug = params.read().get("look").unwrap_or_default();
+        let mine = generation.get_untracked() + 1;
+        generation.set(mine);
+        state.set(Load::Loading);
         if slug.is_empty() {
             return;
         }
-        wasm_bindgen_futures::spawn_local(async move {
-            state.set(match data::look(&slug).await {
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
+            let result = data::look(&slug).await;
+            if generation.try_get_untracked() != Some(mine) {
+                return;
+            }
+            state.set(match result {
                 Ok(page) => Load::Ready(page),
                 Err(error) => Load::Failed(error),
             });
@@ -58,25 +99,37 @@ pub fn LookDetail() -> impl IntoView {
 
 #[component]
 fn LookPageView(page: LookPage) -> impl IntoView {
-    let params = use_params_map();
-    let initial = page
+    let query = use_query_map();
+    let navigate = use_navigate();
+    let default_version = page
         .latest()
         .map(|version| version.version().to_string())
         .unwrap_or_default();
-    let selected = RwSignal::new(initial);
+    let selected = RwSignal::new(
+        query
+            .get_untracked()
+            .get("version")
+            .unwrap_or_else(|| default_version.clone()),
+    );
+    Effect::new(move |_| {
+        selected.set(
+            query
+                .get()
+                .get("version")
+                .unwrap_or_else(|| default_version.clone()),
+        );
+    });
+    let version_slug = page.slug.to_string();
     let version = RwSignal::new(Load::<Arc<LoadedVersion>>::Loading);
     let scene_index = RwSignal::new(Load::<SceneIndex>::Loading);
     let scene_name = RwSignal::new(String::new());
     let scene = RwSignal::new(Load::<Arc<PreparedScene>>::Loading);
     let index = RwSignal::new(Load::<SiteIndex>::Loading);
-    let other = RwSignal::new(String::new());
-    let other_lut = RwSignal::new(Load::<Arc<Vec<u8>>>::Loading);
     let version_generation = RwSignal::new(0_u32);
     let scene_generation = RwSignal::new(0_u32);
-    let other_generation = RwSignal::new(0_u32);
 
     Effect::new(move |_| {
-        let slug = params.read().get("look").unwrap_or_default();
+        let slug = version_slug.clone();
         let chosen = selected.get();
         if slug.is_empty() || chosen.is_empty() {
             return;
@@ -84,9 +137,9 @@ fn LookPageView(page: LookPage) -> impl IntoView {
         let mine = version_generation.get_untracked() + 1;
         version_generation.set(mine);
         version.set(Load::Loading);
-        wasm_bindgen_futures::spawn_local(async move {
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
             let loaded = data::version(&slug, &chosen).await;
-            if version_generation.get_untracked() != mine {
+            if version_generation.try_get_untracked() != Some(mine) {
                 return;
             }
             version.set(match loaded {
@@ -97,15 +150,25 @@ fn LookPageView(page: LookPage) -> impl IntoView {
     });
 
     Effect::new(move |_| {
-        wasm_bindgen_futures::spawn_local(async move {
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
             match data::scenes().await {
                 Ok(index) => {
-                    if let Some(first) = index.scenes.first() {
+                    if let Some(first) = index
+                        .scenes
+                        .iter()
+                        .find(|scene| scene.kind == looklab_publish::SceneKind::Photo)
+                        .or_else(|| index.scenes.first())
+                    {
                         scene_name.set(first.name.to_string());
+                    } else {
+                        scene.set(Load::Failed("No sample photos are available.".to_owned()));
                     }
                     scene_index.set(Load::Ready(index));
                 }
-                Err(error) => scene_index.set(Load::Failed(error)),
+                Err(error) => {
+                    scene.set(Load::Failed(error.clone()));
+                    scene_index.set(Load::Failed(error));
+                }
             }
         });
     });
@@ -119,9 +182,9 @@ fn LookPageView(page: LookPage) -> impl IntoView {
             return;
         }
         scene.set(Load::Loading);
-        wasm_bindgen_futures::spawn_local(async move {
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
             let loaded = data::scene(&name).await;
-            if scene_generation.get_untracked() != mine {
+            if scene_generation.try_get_untracked() != Some(mine) {
                 return;
             }
             scene.set(match loaded {
@@ -132,7 +195,7 @@ fn LookPageView(page: LookPage) -> impl IntoView {
     });
 
     Effect::new(move |_| {
-        wasm_bindgen_futures::spawn_local(async move {
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
             index.set(match data::index().await {
                 Ok(index) => Load::Ready(index),
                 Err(error) => Load::Failed(error),
@@ -140,78 +203,78 @@ fn LookPageView(page: LookPage) -> impl IntoView {
         });
     });
 
-    Effect::new(move |_| {
-        let slug = other.get();
-        let mine = other_generation.get_untracked() + 1;
-        other_generation.set(mine);
-        if slug.is_empty() {
-            other_lut.set(Load::Loading);
-            return;
-        }
-        let Some(index) = index.get().ready().cloned() else {
-            return;
-        };
-        let Some(look) = index.looks.iter().find(|look| look.slug.as_str() == slug) else {
-            other_lut.set(Load::Failed(format!("unknown look `{slug}`")));
-            return;
-        };
-        let Some(version) = look.latest().map(|version| version.version.to_string()) else {
-            other_lut.set(Load::Failed(format!("{slug} has no published version")));
-            return;
-        };
-        other_lut.set(Load::Loading);
-        wasm_bindgen_futures::spawn_local(async move {
-            let loaded = data::preview(&slug, &version).await;
-            if other_generation.get_untracked() != mine {
-                return;
-            }
-            other_lut.set(match loaded {
-                Ok(lut) => Load::Ready(lut),
-                Err(error) => Load::Failed(error),
-            });
-        });
-    });
-
     let details: Vec<VersionDetails> = page.versions.iter().map(VersionDetails::of).collect();
     let slug = page.slug.to_string();
-    let current_slug = slug.clone();
     let look_name = page.name.clone();
     let details_for_version = details.clone();
+    let tab = RwSignal::new(LookTab::Overview.id());
+    let active_tab = Signal::derive(move || LookTab::from_id(&tab.get()));
+    let tabs = [LookTab::Overview, LookTab::Measurements, LookTab::History]
+        .into_iter()
+        .map(|tab| ui::TabSpec {
+            id: tab.id(),
+            label: tab.label().to_owned(),
+        })
+        .collect();
+    let overview_details = details.clone();
+    let camera = RwSignal::new(None::<looklab_schema::BodyId>);
+    let match_slug = slug.clone();
+    let origin_slug = page.slug.clone();
+    let character_name = page.name.clone();
+    let origin_author = page
+        .license
+        .as_ref()
+        .map(|license| license.attribution.clone());
+    let origin_kind = page.kind;
+    let description = page.description.clone();
+    let card_slug = page.slug.to_string();
 
     view! {
         <article class="look">
-            <header>
-                <h1>{look_name.clone()}</h1>
-                <p class="muted">{format!("{} · {}", page.slug, kind_label(page.kind))}</p>
-                <dl class="facts">
-                    <dt>"WB policy"</dt><dd>{wb_label(page.wb_policy)}</dd>
-                    <dt>"Versions"</dt><dd>{page.versions.len()}</dd>
-                </dl>
-                {if page.description.is_empty() {
-                    ().into_any()
-                } else {
-                    view! { <p>{page.description.clone()}</p> }.into_any()
-                }}
-                {page.license.clone().map(|license| view! {
-                    <p class="license">
-                        {format!("License: {} · {}", license.declaration, license.attribution)}
-                    </p>
-                })}
+            <header class="look-header"><h1>{page.name.clone()}</h1>
+                {move || match version.get() { Load::Ready(loaded) => {
+                    let character = character(&loaded, &character_name, &description);
+                    let tags = character.split_once(": ").map(|(_, phrases)| phrases.trim_end_matches('.').replace(", and ", ", ").replace(" and ", ", ").split(", ").take(4).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
+                    view! { <ui::Badge status=loaded.manifest.status/><p class="lede">{character}</p><ul class="character-tags">{tags.into_iter().map(|tag|view! { <li>{tag}</li> }).collect_view()}</ul> }.into_any()
+                }, _ => ().into_any() }}
+                {move || match index.get() { Load::Ready(index) => {
+                    let cameras = index.bodies.iter().filter(|body| body.looks.contains(&origin_slug)).map(|body| format!("{} {}",body.make,body.model)).collect::<Vec<_>>();
+                    let origin = match origin_kind {
+                        looklab_model::LookKind::LutDefined => format!("Custom look by {}", origin_author.as_deref().unwrap_or("its creator")),
+                        looklab_model::LookKind::NativeFamily if cameras.is_empty() => ui::look_kind_label(origin_kind).to_owned(),
+                        looklab_model::LookKind::NativeFamily => format!("Built into {}", cameras.join(", ")),
+                    };
+                    view! { <p class="muted">{origin}</p> }.into_any()
+                }, _ => ().into_any() }}
             </header>
+            <ui::Tabs tabs selected=tab>
+            <div hidden=move || active_tab.get() != LookTab::History>
+                <h2>"History"</h2><p><code>{page.slug.to_string()}</code></p>
+                <p>{format!("WB policy: {}",wb_label(page.wb_policy))}</p>
+                {page.license.clone().map(|license| view! { <p>{format!("License: {} · {}",license.declaration,license.attribution)}</p> })}
 
             <section aria-labelledby="version-picker">
                 <h2 id="version-picker">"Version"</h2>
                 <label for="look-version">"Published version"</label>
                 <select
                     id="look-version"
-                    on:change=move |event| selected.set(event_target_value(&event))
+                    prop:value=move || selected.get()
+                    on:change=move |event| {
+                        let chosen = event_target_value(&event);
+                        selected.set(chosen.clone());
+                        if let Ok(url) = web_sys::Url::new(&window().location().href().unwrap_or_default()) {
+                            url.search_params().set("version", &chosen);
+                            navigate(&format!("{}{}{}", url.pathname(), url.search(), url.hash()), leptos_router::NavigateOptions { scroll: false, ..Default::default() });
+                        }
+                    }
                 >
                     {page.versions.iter().map(|entry| {
                         let version = entry.version().to_string();
-                        let status = entry.manifest.status.as_str();
+                        let status = ui::status_label(entry.manifest.status, true);
+                        let label = status.map(|status| format!("{version} ({status})")).unwrap_or_else(|| version.clone());
                         view! {
-                            <option value=version.clone() selected=version == selected.get_untracked()>
-                                {format!("{version} ({status})")}
+                            <option value=version>
+                                {label}
                             </option>
                         }
                     }).collect_view()}
@@ -230,84 +293,87 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                     }
                 }}
             </section>
+            </div>
+            <div hidden=move || active_tab.get() != LookTab::Overview>
 
-            <section aria-labelledby="preview">
-                <h2 id="preview">"Canonical preview"</h2>
-                <p>
-                    "Scene-linear D65 XYZ test scenes, rendered through this Look to sRGB in the browser. "
-                    "The 33³ LUT is published with the look and checked against the version manifest before use."
-                </p>
-                <label for="scene-select">"Scene"</label>
-                <select
-                    id="scene-select"
-                    on:change=move |event| scene_name.set(event_target_value(&event))
-                >
-                    {move || match scene_index.get() {
-                        Load::Ready(index) => index.scenes.iter().map(|summary| {
-                            let name = summary.name.to_string();
-                            let selected = name == scene_name.get();
-                            let value = name.clone();
-                            view! { <option value=value selected=selected>{name}</option> }
-                        }).collect_view().into_any(),
-                        Load::Failed(error) => view! { <option>{error}</option> }.into_any(),
-                        Load::Loading => view! { <option>"Loading scenes…"</option> }.into_any(),
-                    }}
-                </select>
-                <label for="other-preview">"Compare with another look"</label>
-                <select
-                    id="other-preview"
-                    on:change=move |event| other.set(event_target_value(&event))
-                >
-                    <option value="">"None"</option>
-                    {move || match index.get() {
-                        Load::Ready(index) => index.looks.iter().filter(|look| look.slug.as_str() != current_slug).map(|look| {
-                            let value = look.slug.to_string();
-                            view! { <option value=value.clone()>{look.name.clone()}</option> }
-                        }).collect_view().into_any(),
-                        _ => ().into_any(),
-                    }}
-                </select>
+            <section aria-label="Simulated look preview">
                 {move || match (version.get(), scene.get()) {
                     (Load::Ready(loaded), Load::Ready(scene)) => {
-                        let label = format!("Preview of scene {} through {}", scene.scene.name, look_name);
-                        let caption = format!(
-                            "{} · {} {} · LUT applied client-side",
-                            scene.scene.name,
-                            look_name,
-                            loaded.manifest.version
-                        );
-                        let other_label = format!("Preview of scene {} through the other look", scene.scene.name);
-                        view! {
-                            <div class:preview-pair=move || other_lut.get().ready().is_some()>
-                                <ScenePreview
-                                    lut=loaded.lut.clone()
-                                    scene=scene.clone()
-                                    label=label
-                                    caption=caption
-                                />
-                                {move || match other_lut.get() {
-                                    Load::Ready(lut) => view! {
-                                        <ScenePreview
-                                            lut=lut
-                                            scene=scene.clone()
-                                            label=other_label.clone()
-                                            caption=format!("{} · {} · LUT applied client-side", scene.scene.name, other.get())
-                                        />
-                                    }.into_any(),
-                                    Load::Failed(error) => ui::failure(&error).into_any(),
-                                    Load::Loading => ().into_any(),
-                                }}
-                            </div>
-                        }.into_any()
+                        let label = look_name.clone();
+                        view! { <ui::Viewer lut_a=Signal::stored(loaded.lut.clone()) scene=Signal::stored(scene) label_a=label/> }.into_any()
                     }
                     (Load::Failed(error), _) => ui::failure(&error).into_any(),
                     (_, Load::Failed(error)) => ui::failure(&error).into_any(),
                     _ => ui::loading().into_any(),
                 }}
+                <div class="photo-strip" aria-label="Sample photos">{move || match scene_index.get() {
+                    Load::Ready(index) => index.scenes.into_iter().filter(|scene| scene.kind == looklab_publish::SceneKind::Photo).map(|summary| view! { <PhotoChoice summary selected=scene_name version/> }).collect_view().into_any(), _ => ().into_any()
+                }}</div>
                 <p>
-                    <a href=format!("/compare?a={slug}")>"Open diagnostics comparison"</a>
+                    <a href=crate::base::site_url(&format!("/compare?a={slug}"))>"Compare with another look →"</a>
                 </p>
             </section>
+            {move || match version.get() {
+                Load::Ready(loaded) => {
+                    let images = loaded.manifest.provenance.bodies.iter().map(|body| u64::from(body.images)).sum::<u64>();
+                    let contributors = loaded.manifest.provenance.bodies.iter().map(|body| u64::from(body.credentials)).sum::<u64>();
+                    let cameras = loaded.manifest.provenance.bodies.len();
+                    let evidence = format!(
+                        "Based on {images} {} from {contributors} {} on {cameras} {}.",
+                        if images == 1 { "photo" } else { "photos" },
+                        if contributors == 1 { "contributor" } else { "contributors" },
+                        if cameras == 1 { "camera" } else { "cameras" },
+                    );
+                    view! {
+                        <h2>"How we know"</h2>
+                        <p>{evidence}</p>
+                    }.into_any()
+                }, _ => ().into_any()
+            }}
+            {move || match index.get() { Load::Ready(index) => {
+                let slug = match_slug.clone();
+                let href = move || crate::base::site_url(&format!(
+                    "/match?camera={}&look={slug}",
+                    camera.get().map(|id| id.to_string()).unwrap_or_default(),
+                ));
+                view! {
+                    <h2>"Get this look"</h2>
+                    <ui::CameraPicker cameras=index.bodies selected=camera/>
+                    <a class="button" href=href>"Find my settings"</a>
+                }.into_any()
+            }, _ => ().into_any() }}
+            {move || match version.get() {
+                Load::Ready(loaded) if loaded.manifest.artifacts.iter().any(|artifact| artifact.name.as_str() == looklab_publish::CARD_ARTIFACT) => {
+                    let slug = card_slug.clone();
+                    view! { <p><a href=move || crate::base::site_url(&format!("/match?camera={}&look={slug}&apply=card",camera.get().map(|id| id.to_string()).unwrap_or_default()))>"Use custom firmware →"</a></p> }.into_any()
+                }, _ => ().into_any()
+            }}
+            {move || overview_details.iter().find(|details| details.version == selected.get()).map(|details| view! {
+                {details.notice.clone().map(|notice| view! { <p class="notice">{notice}</p> })}
+                {details.weak_spots.iter().map(|spot| view! {
+                    <p>
+                        {format!("Help us understand {} with a few more shots.", spot.region.to_lowercase())}
+                        " "
+                        <a href=crate::base::site_url("/contribute/wanted")>"See wanted shots →"</a>
+                    </p>
+                }).collect_view()}
+            })}
+            <super::recipes::RecipeSection look=page.slug.clone()/>
+            </div>
+            <div hidden=move || active_tab.get() != LookTab::Measurements>
+                {move || match version.get() {
+                    Load::Ready(loaded) => view! { <Measurements loaded/> }.into_any(),
+                    Load::Failed(error) => ui::failure(&error).into_any(),
+                    Load::Loading => ui::loading().into_any(),
+                }}
+                <h2>"Test charts"</h2>
+                {move || match (version.get(), scene_index.get()) {
+                    (Load::Ready(loaded), Load::Ready(index)) => view! { <Charts loaded index/> }.into_any(),
+                    (Load::Failed(error), _) | (_, Load::Failed(error)) => ui::failure(&error).into_any(),
+                    _ => ui::loading().into_any(),
+                }}
+            </div>
+            </ui::Tabs>
         </article>
     }
 }
@@ -315,10 +381,6 @@ fn LookPageView(page: LookPage) -> impl IntoView {
 #[component]
 fn VersionView(loaded: Arc<LoadedVersion>, details: VersionDetails) -> impl IntoView {
     let manifest = &loaded.manifest;
-    let diagnostics = &loaded.diagnostics;
-    let tone = tone_curve_svg(&diagnostics.tone);
-    let tint = tint_curve_svg(&diagnostics.tint);
-    let grl = diagnostics.grl.as_ref().map(grl_svg);
     let artifacts = manifest
         .artifacts
         .iter()
@@ -414,20 +476,23 @@ fn VersionView(loaded: Arc<LoadedVersion>, details: VersionDetails) -> impl Into
                     </section>
                 }.into_any()
             }}
-            <section aria-labelledby="diagnostics">
-                <h3 id="diagnostics">"Diagnostics"</h3>
-                <ui::Plot title="Tone: J′ against scene exposure".to_owned() svg=tone/>
-                <ui::Plot title="Neutral tint in a′b′".to_owned() svg=tint/>
-                {grl.map(|svg| view! { <ui::Plot title="Chroma, hue and lightness layers by hue".to_owned() svg=svg/> })}
-            </section>
         </div>
     }
 }
 
-fn kind_label(kind: looklab_model::file::LookKind) -> &'static str {
-    match kind {
-        looklab_model::file::LookKind::NativeFamily => "native family",
-        looklab_model::file::LookKind::LutDefined => "LUT-defined",
+#[component]
+fn Measurements(loaded: Arc<LoadedVersion>) -> impl IntoView {
+    let diagnostics = &loaded.diagnostics;
+    let tone = tone_curve_svg(&diagnostics.tone);
+    let tint = tint_curve_svg(&diagnostics.tint);
+    let grl = diagnostics.grl.as_ref().map(grl_svg);
+    view! {
+            <section aria-labelledby="diagnostics">
+                <h2 id="diagnostics">"Measurements"</h2>
+                <ui::Plot title="Tone: J′ against scene exposure".to_owned() svg=tone/>
+                <ui::Plot title="Neutral tint in a′b′".to_owned() svg=tint/>
+                {grl.map(|svg| view! { <ui::Plot title="Chroma, hue and lightness layers by hue".to_owned() svg=svg/> })}
+            </section>
     }
 }
 
@@ -435,5 +500,126 @@ fn wb_label(policy: looklab_model::file::WbPolicy) -> &'static str {
     match policy {
         looklab_model::file::WbPolicy::Adaptive => "adaptive",
         looklab_model::file::WbPolicy::FixedIlluminant => "fixed illuminant",
+    }
+}
+
+pub(crate) fn character(loaded: &LoadedVersion, name: &str, description: &str) -> String {
+    use looklab_report::compare::{ComparisonInput, FunctionName, compare};
+    let probes = looklab_model::probes::v1();
+    let reference = looklab_model::Look::colorimetric();
+    let look = crate::diagnostics::DocumentLook::new(&loaded.document, &probes);
+    let summary = compare(&ComparisonInput {
+        a: &reference,
+        b: &look,
+        probes: &probes,
+        a_name: &FunctionName::new("neutral color"),
+        b_name: &FunctionName::new(name),
+    })
+    .summary;
+    if summary.contains("ΔE") || summary.contains("cannot be compared") {
+        return description.to_owned();
+    }
+    if summary.contains("no meaningful difference") {
+        return format!("{name} stays close to neutral color.");
+    }
+    let mut depth = 0_u32;
+    let plain = summary
+        .chars()
+        .filter(|ch| match ch {
+            '(' => {
+                depth += 1;
+                false
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                false
+            }
+            _ => depth == 0,
+        })
+        .collect::<String>()
+        .replace("  ", " ")
+        .replace(" .", ".")
+        .replace(" ,", ",")
+        .replace("hue rotated by ", "a hue shift ");
+    let mut words = plain.split_whitespace().peekable();
+    let mut result = String::with_capacity(plain.len());
+    while let Some(word) = words.next() {
+        if matches!(word, "over" | "at") && words.peek() == Some(&"s") {
+            words.next();
+            words.next();
+            let mut end = words.next().unwrap_or_default();
+            if word == "over" {
+                words.next();
+                end = words.next().unwrap_or_default();
+            }
+            if let Some(punctuation) = end.chars().last().filter(|ch| matches!(ch, ',' | '.')) {
+                result.push(punctuation);
+            }
+        } else if !word.ends_with('°') {
+            if !result.is_empty() {
+                result.push(' ');
+            }
+            result.push_str(word);
+        }
+    }
+    result
+}
+
+#[component]
+fn PhotoChoice(
+    summary: looklab_publish::SceneSummary,
+    selected: RwSignal<String>,
+    version: RwSignal<Load<Arc<LoadedVersion>>>,
+) -> impl IntoView {
+    let scene = RwSignal::new(None::<Arc<PreparedScene>>);
+    let name = summary.name.to_string();
+    let load_name = name.clone();
+    let pressed = name.clone();
+    let title = summary.title.clone();
+    Effect::new(move |_| {
+        let name = load_name.clone();
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
+            if let Ok(photo) = data::scene_thumbnail(&name).await {
+                scene.set(Some(Arc::new(photo)));
+            }
+        });
+    });
+    view! { <button type="button" aria-label=summary.title aria-pressed=move || (selected.get()==pressed).to_string() on:click=move |_| selected.set(name.clone())>
+        {move || scene.get().map(|scene|view! { <ui::PreviewCanvas scene=Signal::stored(scene) lut=Signal::derive(move || version.get().ready().map(|loaded|loaded.lut.clone())) style=Signal::stored(String::new()) label=format!("Simulated: {title}")/> })}
+    </button> }
+}
+
+#[component]
+fn Charts(loaded: Arc<LoadedVersion>, index: SceneIndex) -> impl IntoView {
+    let charts = index
+        .scenes
+        .into_iter()
+        .filter(|scene| scene.kind == looklab_publish::SceneKind::TestChart)
+        .collect::<Vec<_>>();
+    let selected = RwSignal::new(
+        charts
+            .first()
+            .map(|chart| chart.name.to_string())
+            .unwrap_or_default(),
+    );
+    let scene = RwSignal::new(Load::<Arc<PreparedScene>>::Loading);
+    let generation = RwSignal::new(0_u32);
+    Effect::new(move |_| {
+        let name = selected.get();
+        let mine = generation.get_untracked() + 1;
+        generation.set(mine);
+        scene.set(Load::Loading);
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
+            let result = data::scene(&name).await;
+            if generation.get_untracked() == mine {
+                scene.set(match result {
+                    Ok(scene) => Load::Ready(Arc::new(scene)),
+                    Err(error) => Load::Failed(error),
+                });
+            }
+        });
+    });
+    view! { <div class="chart-picker">{charts.into_iter().map(|chart| { let name=chart.name.to_string(); view! { <button type="button" on:click=move |_|selected.set(name.clone())>{chart.title}</button> } }).collect_view()}</div>
+        {move ||match scene.get() { Load::Ready(scene)=>view! { <ui::Viewer lut_a=Signal::stored(loaded.lut.clone()) scene=Signal::stored(scene) label_a="Test chart".to_owned()/> }.into_any(),Load::Failed(error)=>ui::failure(&error).into_any(),_=>ui::loading().into_any() }}
     }
 }

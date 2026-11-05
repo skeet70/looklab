@@ -113,7 +113,7 @@ fn target_confidence_scales_error_but_not_predicted_covariance() {
     values[0] = 1.0;
     let uncertainty = UncertaintyData {
         probe_cov: Some(ProbeCovariance::new(probes.probes.len(), values).expect("covariance")),
-        density: None,
+        ..UncertaintyData::default()
     };
     let target_function = body.target();
     let target = PreparedTarget::new(TargetSpec {

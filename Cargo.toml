@@ -68,6 +68,7 @@ tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 webauthn-rs = "0.6"
+webauthn-rs-core = "0.6"
 webauthn-authenticator-rs = { version = "0.6", features = ["softpasskey"] }
 tempfile = "3"
 wasmtime = "50"
@@ -96,4 +97,13 @@ lto = true
 codegen-units = 1
 
 [profile.test]
+opt-level = 1
+
+[profile.web-dev]
+inherits = "dev"
+debug = 0
+incremental = true
+codegen-units = 256
+
+[profile.web-dev.package."*"]
 opt-level = 1

@@ -11,7 +11,7 @@ use looklab_trust::{
     RootSession, RootTarget, Scope, ScopeRule, Tier as TrustTier, TrustError, TrustParams,
     TrustState, VersionId, admission_eligible,
 };
-use looklab_upload::{ContributionKind as UploadKind, LookSlug};
+use looklab_upload::{ContributionKind as UploadKind, Intent, LookSlug};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -26,6 +26,7 @@ use crate::ids::{
     ProposalId, RootAdmissionId,
 };
 use crate::store::ContributionStatus;
+use crate::trust::Tier;
 
 const MAX_REASON_CHARS: usize = 2000;
 const MAX_SCOPE_RULES: usize = 64;
@@ -893,14 +894,14 @@ pub async fn admit_root(
         if actor_record.tier != TrustTier::Seeder {
             return Err(AdminError::NotAuthorized);
         }
-        let row: Option<(String, String, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT credential_id, kind, status, body_id, target_look_id
+        let row: Option<(String, String, String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT credential_id, kind, status, body_id, target_look_id, intent
              FROM contributions WHERE id = ?",
         )
         .bind(contribution_id.as_str())
         .fetch_optional(&mut *conn)
         .await?;
-        let Some((credential, kind, status, body_id, target_look_id)) = row else {
+        let Some((credential, kind, status, body_id, target_look_id, intent)) = row else {
             return Err(AdminError::UnknownContribution);
         };
         let kind = parse_contribution_kind(&kind)?;
@@ -915,6 +916,14 @@ pub async fn admit_root(
         let target_look = target_look_id
             .map(|look| LookSlug::try_from(look.as_str()).map_err(|_| AdminError::Corrupt))
             .transpose()?;
+        let intent = match intent.as_str() {
+            "native" => Intent::Native,
+            "recipe" => Intent::Recipe {
+                target_look: target_look.clone().ok_or(AdminError::Corrupt)?,
+            },
+            "card" => return Err(AdminError::IneligibleContribution),
+            _ => return Err(AdminError::Corrupt),
+        };
         let subject = CredentialId::try_from(credential).map_err(|_| AdminError::Corrupt)?;
         let subject_trust = trust_id(&subject)?;
         let subject_record = state
@@ -956,7 +965,7 @@ pub async fn admit_root(
                 target,
                 covered_regions: BTreeSet::new(),
             };
-            if !admission_eligible(&session, &seeder) {
+            if !admission_eligible(&session, &seeder, &intent) {
                 return Err(AdminError::IneligibleContribution);
             }
         }
@@ -1601,7 +1610,9 @@ pub struct ModQueue {
     pub nominations: Vec<Nomination>,
 }
 
-pub async fn mod_queue(db: &SqlitePool) -> Result<ModQueue, AdminError> {
+/// The queue a session at `tier` may read; endorsement nominations are seeder-only
+/// (docs/08 §6).
+pub async fn mod_queue(db: &SqlitePool, tier: Tier) -> Result<ModQueue, AdminError> {
     let proposals = sqlx::query(
         "SELECT id, type, human_summary, created_at FROM proposals
          WHERE status IN ('pending', 'needs_info') ORDER BY created_at, id",
@@ -1674,33 +1685,35 @@ pub async fn mod_queue(db: &SqlitePool) -> Result<ModQueue, AdminError> {
         });
     }
 
-    let state = {
-        let mut conn = db.acquire().await?;
-        trust_state(&mut conn).await?
-    };
     let mut nominations = Vec::new();
-    for nominated in state.nominations(&TrustParams::default()) {
-        let credential = local_credential(nominated)?;
-        let row: Option<(Option<String>, f64)> =
-            sqlx::query_as("SELECT display_handle, reputation FROM credentials WHERE id = ?")
-                .bind(credential.as_str())
-                .fetch_optional(db)
-                .await?;
-        let Some((display_handle, reputation)) = row else {
-            continue;
+    if tier == Tier::Seeder {
+        let state = {
+            let mut conn = db.acquire().await?;
+            trust_state(&mut conn).await?
         };
-        let accepted: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM contributions WHERE credential_id = ? AND status = 'accepted'",
-        )
-        .bind(credential.as_str())
-        .fetch_one(db)
-        .await?;
-        nominations.push(Nomination {
-            credential,
-            display_handle,
-            reputation,
-            accepted_contributions: accepted,
-        });
+        for nominated in state.nominations(&TrustParams::default()) {
+            let credential = local_credential(nominated)?;
+            let row: Option<(Option<String>, f64)> =
+                sqlx::query_as("SELECT display_handle, reputation FROM credentials WHERE id = ?")
+                    .bind(credential.as_str())
+                    .fetch_optional(db)
+                    .await?;
+            let Some((display_handle, reputation)) = row else {
+                continue;
+            };
+            let accepted: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM contributions WHERE credential_id = ? AND status = 'accepted'",
+            )
+            .bind(credential.as_str())
+            .fetch_one(db)
+            .await?;
+            nominations.push(Nomination {
+                credential,
+                display_handle,
+                reputation,
+                accepted_contributions: accepted,
+            });
+        }
     }
 
     Ok(ModQueue {

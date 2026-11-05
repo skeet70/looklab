@@ -27,6 +27,8 @@ pub enum WorkerError {
     Trust(#[from] looklab_trust::TrustError),
     #[error("publish: {0}")]
     Publish(#[from] looklab_publish::PublishError),
+    #[error("card: {0}")]
+    Card(#[from] looklab_export::card::CardError),
     #[error("manifest: {0}")]
     Admin(#[from] looklab_server::admin::AdminError),
     #[error("data: {0}")]

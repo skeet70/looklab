@@ -1,0 +1,57 @@
+name: Pages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Enable Pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          if nix shell nixpkgs#gh -c gh api "repos/$REPO/pages" > /dev/null 2>&1; then
+            nix shell nixpkgs#gh -c gh api -X PUT "repos/$REPO/pages" -f build_type=workflow
+          else
+            nix shell nixpkgs#gh -c gh api -X POST "repos/$REPO/pages" -f build_type=workflow
+          fi
+      - name: Fetch CC0 scene sources
+        run: nix develop -c tools/fetch-fixtures.sh
+      - name: Public site data and camera match bundles
+        run: nix develop -c cargo run --release -p looklab-publish --example site_data -j 6 -- site
+      - name: Synthetic-match end-to-end fixture
+        run: nix develop -c cargo run --release -p looklab-wasm --features fixtures --example publish_match_fixture -j 6 -- site
+      - name: Trunk build
+        working-directory: site
+        env:
+          LOOKLAB_PREVIEW: "1"
+        run: nix develop -c trunk build --release --public-url /looklab/
+      - name: SPA deep-link fallback
+        run: cp site/dist/index.html site/dist/404.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

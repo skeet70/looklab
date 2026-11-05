@@ -18,6 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 
+use crate::base::{api_url, site_url};
 use crate::proposal_form::FixtureFile;
 use crate::request_digest::{RequestDomain, challenge, request_digest};
 use crate::webauthn::{self, PowParameters, SignedFields};
@@ -60,7 +61,7 @@ async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
 
 /// The site index, verified against the digest embedded in this build.
 pub async fn index() -> Result<SiteIndex, String> {
-    let bytes = get("/data/index.json").await?;
+    let bytes = get(&site_url("/data/index.json")).await?;
     let expected = crate::site_root();
     if expected.is_empty() {
         return Err("this build has no embedded site root digest".to_owned());
@@ -75,47 +76,90 @@ pub async fn index() -> Result<SiteIndex, String> {
 }
 
 pub async fn body(make: &str, model: &str) -> Result<BodyPage, String> {
-    get_json(&format!("/data/bodies/{make}/{model}.json")).await
+    get_json(&site_url(&format!("/data/bodies/{make}/{model}.json"))).await
 }
 
 pub async fn look(slug: &str) -> Result<LookPage, String> {
-    get_json(&format!("/data/looks/{slug}.json")).await
+    get_json(&site_url(&format!("/data/looks/{slug}.json"))).await
 }
 
 pub async fn proposal(id: &ProposalRef) -> Result<ProposalView, String> {
-    get_json(&format!("/api/proposals/{}", id.as_str())).await
+    get_json(&api_url(&format!("/api/proposals/{}", id.as_str()))).await
 }
 
 pub async fn audit_log() -> Result<AuditLog, String> {
-    get_json("/data/audit-log.json").await
+    get_json(&site_url("/data/audit-log.json")).await
 }
 
 pub async fn scenes() -> Result<SceneIndex, String> {
-    get_json("/data/scenes/index.json").await
+    Ok(SceneIndex {
+        format: looklab_publish::SCENE_FORMAT.to_owned(),
+        scenes: index().await?.scenes,
+    })
+}
+
+pub async fn recipes() -> Result<Vec<looklab_trust::RecipeLeaderboard>, String> {
+    get_json(&api_url("/api/recipes")).await
+}
+
+#[derive(serde::Deserialize)]
+struct BountyFile {
+    bounties: Vec<looklab_trust::Bounty>,
+}
+
+pub async fn bounties() -> Result<Vec<looklab_trust::Bounty>, String> {
+    let file: BountyFile = get_json(&api_url("/bounties.json")).await?;
+    Ok(file.bounties)
 }
 
 pub async fn scene(name: &str) -> Result<PreparedScene, String> {
+    load_scene(name, false).await
+}
+
+pub async fn scene_thumbnail(name: &str) -> Result<PreparedScene, String> {
+    load_scene(name, true).await
+}
+
+async fn load_scene(name: &str, thumbnail: bool) -> Result<PreparedScene, String> {
     let index = index().await?;
     let summary = index
         .scenes
         .iter()
         .find(|scene| scene.name.as_str() == name)
         .ok_or_else(|| format!("unknown scene `{name}`"))?;
-    let bytes = get(&format!("/{}", summary.path.as_str())).await?;
+    let (path, hash, size, width, height) = if thumbnail {
+        let t = &summary.thumbnail;
+        (&t.path, &t.sha256, t.bytes, t.width, t.height)
+    } else {
+        (
+            &summary.path,
+            &summary.sha256,
+            summary.bytes,
+            summary.width,
+            summary.height,
+        )
+    };
+    let bytes = get(&site_url(&format!("/{}", path.as_str()))).await?;
     let digest = ArtifactHash::of(&bytes);
-    if digest != summary.sha256 || bytes.len() as u64 != summary.bytes {
+    if &digest != hash || bytes.len() as u64 != size {
         return Err(format!(
             "scene `{name}` does not match the site index: expected {}, got {digest}",
-            summary.sha256
+            hash
         ));
     }
-    let scene = Scene::from_f16_bytes(
+    let mut scene = Scene::from_png(
         SceneName::new(name).map_err(|error| error.to_string())?,
-        summary.width,
-        summary.height,
         &bytes,
     )
     .map_err(|error| error.to_string())?;
+    if scene.width != width || scene.height != height {
+        return Err(format!(
+            "scene `{name}` dimensions do not match the site index"
+        ));
+    }
+    scene.kind = summary.kind;
+    scene.title = summary.title.clone();
+    scene.credit = summary.credit.clone();
     Ok(PreparedScene::new(scene))
 }
 
@@ -157,7 +201,10 @@ async fn verified_manifest(
     version: &str,
     summary: &VersionSummary,
 ) -> Result<VersionManifest, String> {
-    let bytes = get(&format!("/data/looks/{slug}/{version}/manifest.json")).await?;
+    let bytes = get(&site_url(&format!(
+        "/data/looks/{slug}/{version}/manifest.json"
+    )))
+    .await?;
     let digest = ArtifactHash::of(&bytes);
     if digest != summary.manifest_sha256 || bytes.len() as u64 != summary.manifest_bytes {
         return Err(format!(
@@ -181,10 +228,10 @@ pub async fn preview(slug: &str, version: &str) -> Result<Arc<Vec<u8>>, String> 
         .iter()
         .find(|entry| matches!(LookArtifact::of(&entry.name), LookArtifact::PreviewLut))
         .ok_or_else(|| format!("{slug} {version}: no preview LUT in the manifest"))?;
-    let bytes = get(&format!(
+    let bytes = get(&site_url(&format!(
         "/data/looks/{slug}/{version}/{}",
         entry.name.as_str()
-    ))
+    )))
     .await?;
     verify_artifact(&manifest, &entry.name, &bytes)
         .map_err(|error| format!("{slug} {version}: {error}"))?;
@@ -195,6 +242,25 @@ pub async fn preview(slug: &str, version: &str) -> Result<Arc<Vec<u8>>, String> 
         ));
     }
     Ok(Arc::new(bytes))
+}
+
+pub async fn card(slug: &str, version: &str) -> Result<Vec<u8>, String> {
+    let index = index().await?;
+    let summary = version_summary(&index, slug, version)?;
+    let manifest = verified_manifest(slug, version, summary).await?;
+    let entry = manifest
+        .artifacts
+        .iter()
+        .find(|entry| matches!(LookArtifact::of(&entry.name), LookArtifact::Card))
+        .ok_or_else(|| format!("{slug} {version}: no card file in the manifest"))?;
+    let bytes = get(&site_url(&format!(
+        "/data/looks/{slug}/{version}/{}",
+        entry.name.as_str()
+    )))
+    .await?;
+    verify_artifact(&manifest, &entry.name, &bytes)
+        .map_err(|error| format!("{slug} {version}: {error}"))?;
+    Ok(bytes)
 }
 
 pub async fn version(slug: &str, version: &str) -> Result<LoadedVersion, String> {
@@ -211,17 +277,17 @@ pub async fn version(slug: &str, version: &str) -> Result<LoadedVersion, String>
     let mut lut = None;
     let mut artifacts = Vec::with_capacity(manifest.artifacts.len());
     for entry in &manifest.artifacts {
-        let bytes = get(&format!(
+        let bytes = get(&site_url(&format!(
             "/data/looks/{slug}/{version}/{}",
             entry.name.as_str()
-        ))
+        )))
         .await?;
         verify_artifact(&manifest, &entry.name, &bytes)
             .map_err(|error| format!("{slug} {version}: {error}"))?;
         match LookArtifact::of(&entry.name) {
             LookArtifact::Document => look_bytes = Some(bytes.clone()),
             LookArtifact::PreviewLut => lut = Some(bytes.clone()),
-            LookArtifact::Other => {}
+            LookArtifact::Card | LookArtifact::Other => {}
         }
         artifacts.push((entry.name.as_str().to_owned(), bytes));
     }
@@ -288,9 +354,57 @@ pub struct QueueProposal {
     pub created_at: i64,
 }
 
-#[derive(Deserialize)]
-struct Queue {
-    proposals: Vec<QueueProposal>,
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct ReviewQueue {
+    pub proposals: Vec<QueueProposal>,
+    #[serde(default)]
+    pub failed_gates: Vec<FailedGate>,
+    #[serde(default)]
+    pub serial_reuse: Vec<SerialReuseFlag>,
+    #[serde(default)]
+    pub nominations: Vec<EndorsementNomination>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct FailedGate {
+    pub look: looklab_upload::LookSlug,
+    pub version: looklab_trust::VersionId,
+    pub report: FailedGateReport,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct FailedGateReport {
+    pub passed: Option<bool>,
+    #[serde(default)]
+    pub violations: Vec<looklab_trust::Violation>,
+    pub root_previous: Option<looklab_trust::RootGateReport>,
+    pub root_anchor: Option<looklab_trust::RootGateReport>,
+    pub drift_previous: Option<looklab_trust::DriftGateReport>,
+    pub drift_anchor: Option<looklab_trust::DriftGateReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct SerialReuseFlag {
+    pub contributions: Vec<looklab_publish::ContributionRef>,
+    pub credentials: Vec<looklab_publish::CredentialRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct EndorsementNomination {
+    pub credential: looklab_publish::CredentialRef,
+    pub display_handle: Option<crate::webauthn::DisplayHandle>,
+    pub accepted_contributions: AcceptedContributions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct AcceptedContributions(u64);
+
+impl AcceptedContributions {
+    pub fn get(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -322,7 +436,12 @@ pub struct Submitted {
 #[derive(Deserialize)]
 struct SessionReply {
     session_token: String,
+    expires_in_seconds: ModeratorLifetimeSeconds,
 }
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct ModeratorLifetimeSeconds(u64);
 
 #[derive(Deserialize)]
 struct ThreadReply {
@@ -409,13 +528,27 @@ impl std::fmt::Debug for ModeratorToken {
     }
 }
 
-static MODERATION_SESSION: Mutex<Option<ModeratorToken>> = Mutex::new(None);
+struct ModeratorSession {
+    token: ModeratorToken,
+    expires_at: ModeratorExpiry,
+}
+
+struct ModeratorExpiry(f64);
+
+static MODERATION_SESSION: Mutex<Option<ModeratorSession>> = Mutex::new(None);
+
+pub fn moderation_session_remaining() -> Option<std::time::Duration> {
+    let mut slot = MODERATION_SESSION.lock().ok()?;
+    let remaining = slot.as_ref()?.expires_at.0 - js_sys::Date::now();
+    if remaining <= 0.0 {
+        *slot = None;
+        return None;
+    }
+    Some(std::time::Duration::from_secs_f64(remaining / 1000.0))
+}
 
 pub fn moderation_session_open() -> bool {
-    MODERATION_SESSION
-        .lock()
-        .map(|token| token.is_some())
-        .unwrap_or(false)
+    moderation_session_remaining().is_some()
 }
 
 pub fn close_moderation_session() {
@@ -426,42 +559,49 @@ pub fn close_moderation_session() {
 
 /// # Errors
 /// Reports a WebAuthn failure or a missing moderator role.
-pub async fn open_moderation_session() -> Result<(), String> {
-    let credential = webauthn::ensure_credential().await?;
+pub async fn open_moderation_session(
+    session: crate::session::SessionContext,
+) -> Result<std::time::Duration, String> {
+    let credential = webauthn::profile_credential(session).await?;
     let signed = webauthn::sign_request(RequestDomain::ModSession, &[], Some(&credential)).await?;
-    let request = Request::post("/api/mod/session")
+    let path = api_url("/api/mod/session");
+    let request = Request::post(&path)
         .header("Content-Type", "application/json")
         .body(Some(json_body(&signed.fields)?))
         .map_err(|error| error.to_string())?;
-    let reply: SessionReply = api_send("/api/mod/session", request).await?;
+    let reply: SessionReply = api_send(&path, request).await?;
+    let lifetime = std::time::Duration::from_secs(reply.expires_in_seconds.0);
     if let Ok(mut slot) = MODERATION_SESSION.lock() {
-        *slot = Some(ModeratorToken(reply.session_token));
+        *slot = Some(ModeratorSession {
+            token: ModeratorToken(reply.session_token),
+            expires_at: ModeratorExpiry(js_sys::Date::now() + lifetime.as_secs_f64() * 1000.0),
+        });
     }
-    Ok(())
+    Ok(lifetime)
 }
 
 /// # Errors
 /// Reports a closed session or a server failure.
-pub async fn moderation_queue() -> Result<Vec<QueueProposal>, String> {
+pub async fn moderation_queue() -> Result<ReviewQueue, String> {
     let token = moderation_token()?;
-    let request = Request::get("/api/mod/queue")
+    let path = api_url("/api/mod/queue");
+    let request = Request::get(&path)
         .header("Authorization", &format!("Bearer {}", token.0))
         .build()
         .map_err(|error| error.to_string())?;
-    let queue: Queue = api_send("/api/mod/queue", request).await?;
-    Ok(queue.proposals)
+    moderation_send(&path, request).await
 }
 
 /// # Errors
 /// Reports a closed session or a server failure.
 pub async fn moderator_proposal(id: &ProposalRef) -> Result<ModeratorProposal, String> {
     let token = moderation_token()?;
-    let path = format!("/api/mod/proposal/{}", id.as_str());
+    let path = api_url(&format!("/api/mod/proposal/{}", id.as_str()));
     let request = Request::get(&path)
         .header("Authorization", &format!("Bearer {}", token.0))
         .build()
         .map_err(|error| error.to_string())?;
-    api_send(&path, request).await
+    moderation_send(&path, request).await
 }
 
 /// # Errors
@@ -477,19 +617,21 @@ pub async fn decide(
         decision,
         reason,
     };
-    let request = Request::post("/api/mod/decision")
+    let path = api_url("/api/mod/decision");
+    let request = Request::post(&path)
         .header("Content-Type", "application/json")
         .header("Authorization", &format!("Bearer {}", token.0))
         .body(Some(json_body(&body)?))
         .map_err(|error| error.to_string())?;
-    api_send("/api/mod/decision", request).await
+    moderation_send(&path, request).await
 }
 
 /// # Errors
 /// Reports a closed session or a server failure.
 pub async fn moderator_message(id: &ProposalRef, body: &str) -> Result<(), String> {
     let token = moderation_token()?;
-    let request = Request::post("/api/mod/proposal-message")
+    let path = api_url("/api/mod/proposal-message");
+    let request = Request::post(&path)
         .header("Content-Type", "application/json")
         .header("Authorization", &format!("Bearer {}", token.0))
         .body(Some(json_body(&ModerationMessageRequest {
@@ -497,17 +639,18 @@ pub async fn moderator_message(id: &ProposalRef, body: &str) -> Result<(), Strin
             body,
         })?))
         .map_err(|error| error.to_string())?;
-    let _: serde_json::Value = api_send("/api/mod/proposal-message", request).await?;
+    let _: EmptyReply = moderation_send(&path, request).await?;
     Ok(())
 }
 
 /// # Errors
 /// Reports a WebAuthn failure, an invalid tag list or a server rejection.
 pub async fn confirm_proposal(
+    session: crate::session::SessionContext,
     id: &ProposalRef,
     tags: &[LabeledTag],
 ) -> Result<ProposalView, String> {
-    let credential = webauthn::ensure_credential().await?;
+    let credential = webauthn::profile_credential(session).await?;
     let bytes = serde_json::to_vec(&ConfirmationSigningBody {
         proposal_id: id.as_str(),
         tags,
@@ -519,7 +662,8 @@ pub async fn confirm_proposal(
         Some(&credential),
     )
     .await?;
-    let request = Request::post("/api/proposals/confirm")
+    let path = api_url("/api/proposals/confirm");
+    let request = Request::post(&path)
         .header("Content-Type", "application/json")
         .body(Some(json_body(&ConfirmRequest {
             proposal_id: id.as_str(),
@@ -527,34 +671,42 @@ pub async fn confirm_proposal(
             signed: &signed.fields,
         })?))
         .map_err(|error| error.to_string())?;
-    api_send("/api/proposals/confirm", request).await
+    api_send(&path, request).await
 }
 
 /// # Errors
 /// Reports a WebAuthn failure, a closed proposal or a server rejection.
-pub async fn proposer_thread(id: &ProposalRef) -> Result<Vec<ProposalMessage>, String> {
-    let credential = webauthn::ensure_credential().await?;
+pub async fn proposer_thread(
+    session: crate::session::SessionContext,
+    id: &ProposalRef,
+) -> Result<Vec<ProposalMessage>, String> {
+    let credential = webauthn::profile_credential(session).await?;
     let bytes = serde_json::to_vec(&ThreadSigningBody {
         proposal_id: id.as_str(),
     })
     .map_err(|error| error.to_string())?;
     let signed =
         webauthn::sign_request(RequestDomain::ProposalThread, &bytes, Some(&credential)).await?;
-    let request = Request::post("/api/proposals/thread")
+    let path = api_url("/api/proposals/thread");
+    let request = Request::post(&path)
         .header("Content-Type", "application/json")
         .body(Some(json_body(&ThreadRequest {
             proposal_id: id.as_str(),
             signed: &signed.fields,
         })?))
         .map_err(|error| error.to_string())?;
-    let reply: ThreadReply = api_send("/api/proposals/thread", request).await?;
+    let reply: ThreadReply = api_send(&path, request).await?;
     Ok(reply.messages)
 }
 
 /// # Errors
 /// Reports a WebAuthn failure, a closed proposal or a server rejection.
-pub async fn proposer_message(id: &ProposalRef, body: &str) -> Result<(), String> {
-    let credential = webauthn::ensure_credential().await?;
+pub async fn proposer_message(
+    session: crate::session::SessionContext,
+    id: &ProposalRef,
+    body: &str,
+) -> Result<(), String> {
+    let credential = webauthn::profile_credential(session).await?;
     let bytes = serde_json::to_vec(&ProposerMessageSigningBody {
         proposal_id: id.as_str(),
         body,
@@ -562,7 +714,8 @@ pub async fn proposer_message(id: &ProposalRef, body: &str) -> Result<(), String
     .map_err(|error| error.to_string())?;
     let signed =
         webauthn::sign_request(RequestDomain::ProposalThread, &bytes, Some(&credential)).await?;
-    let request = Request::post("/api/proposals/message")
+    let path = api_url("/api/proposals/message");
+    let request = Request::post(&path)
         .header("Content-Type", "application/json")
         .body(Some(json_body(&ProposerMessageRequest {
             proposal_id: id.as_str(),
@@ -570,7 +723,7 @@ pub async fn proposer_message(id: &ProposalRef, body: &str) -> Result<(), String
             signed: &signed.fields,
         })?))
         .map_err(|error| error.to_string())?;
-    let _: serde_json::Value = api_send("/api/proposals/message", request).await?;
+    let _: serde_json::Value = api_send(&path, request).await?;
     Ok(())
 }
 
@@ -593,8 +746,11 @@ struct FixtureUploadReply {
 ///
 /// # Errors
 /// Reports a WebAuthn, proof-of-work, size or server failure.
-pub async fn upload_fixture(file: &FixtureFile) -> Result<String, String> {
-    let credential = webauthn::ensure_credential().await?;
+pub async fn upload_fixture(
+    session: crate::session::SessionContext,
+    file: &FixtureFile,
+) -> Result<String, String> {
+    let credential = webauthn::profile_credential(session).await?;
     let size = u64::try_from(file.bytes.len()).map_err(|_| "file is too large".to_owned())?;
     let upload = FixtureUpload {
         file: file.name.clone(),
@@ -628,24 +784,26 @@ pub async fn upload_fixture(file: &FixtureFile) -> Result<String, String> {
     .map_err(|error| error.to_string())?;
     let framed = looklab_schema::frame_fixture_upload(&header, &file.bytes)
         .map_err(|error| error.to_string())?;
-    let request = Request::post("/api/fixtures/donate")
+    let path = api_url("/api/fixtures/donate");
+    let request = Request::post(&path)
         .header("Content-Type", "application/octet-stream")
         .body(Some(JsValue::from(js_sys::Uint8Array::from(
             framed.as_slice(),
         ))))
         .map_err(|error| error.to_string())?;
-    let reply: FixtureUploadReply = api_send("/api/fixtures/donate", request).await?;
+    let reply: FixtureUploadReply = api_send(&path, request).await?;
     Ok(reply.source)
 }
 
 /// # Errors
 /// Reports a WebAuthn failure, proof-of-work failure or a server rejection.
 pub async fn submit_proposal(
+    session: crate::session::SessionContext,
     kind: ProposalKind,
     payload: &str,
     fixtures: &[FixtureDonation],
 ) -> Result<Submitted, String> {
-    let credential = webauthn::ensure_credential().await?;
+    let credential = webauthn::profile_credential(session).await?;
     let bytes = serde_json::to_vec(&SubmitSigningBody {
         kind: kind.as_str(),
         payload,
@@ -656,7 +814,8 @@ pub async fn submit_proposal(
     let digest = request_digest(RequestDomain::Proposal, &bytes);
     let challenge = challenge(&signed.nonce, &digest);
     let pow = solve_pow(challenge, signed.pow.unwrap_or_else(default_parameters)).await?;
-    let request = Request::post("/api/proposals")
+    let path = api_url("/api/proposals");
+    let request = Request::post(&path)
         .header("Content-Type", "application/json")
         .body(Some(json_body(&SubmitRequest {
             kind: kind.as_str(),
@@ -666,18 +825,41 @@ pub async fn submit_proposal(
             signed: &signed.fields,
         })?))
         .map_err(|error| error.to_string())?;
-    api_send("/api/proposals", request).await
+    api_send(&path, request).await
 }
 
 fn moderation_token() -> Result<ModeratorToken, String> {
+    moderation_session_remaining()
+        .ok_or_else(|| "Confirm it's you to continue reviewing.".to_owned())?;
     MODERATION_SESSION
         .lock()
         .ok()
-        .and_then(|token| token.clone())
-        .ok_or_else(|| "open a moderator session first".to_owned())
+        .and_then(|session| session.as_ref().map(|session| session.token.clone()))
+        .ok_or_else(|| "Confirm it's you to continue reviewing.".to_owned())
 }
 
-fn default_parameters() -> PowParameters {
+#[derive(Deserialize)]
+struct EmptyReply {}
+
+async fn moderation_send<T: DeserializeOwned>(path: &str, request: Request) -> Result<T, String> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("{path}: {error}"))?;
+    if response.status() == 401 {
+        close_moderation_session();
+        return Err("Your review session ended. Confirm it's you to continue.".to_owned());
+    }
+    if !response.ok() {
+        return Err(format!("{path}: HTTP {}", response.status()));
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| format!("{path}: {error}"))
+}
+
+pub(crate) fn default_parameters() -> PowParameters {
     let defaults = default_pow();
     PowParameters {
         memory_kib: defaults.memory_kib,
@@ -686,7 +868,10 @@ fn default_parameters() -> PowParameters {
     }
 }
 
-async fn solve_pow(challenge: [u8; 32], params: PowParameters) -> Result<Vec<u64>, String> {
+pub(crate) async fn solve_pow(
+    challenge: [u8; 32],
+    params: PowParameters,
+) -> Result<Vec<u64>, String> {
     let request = solve_pow_request(
         challenge,
         1,

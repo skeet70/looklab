@@ -1,0 +1,15 @@
+.home-heading { max-width: 58rem; padding-block: 2.5rem 1.5rem; }
+.home-heading h1 { font-size: clamp(2.1rem, 4.6vw, 4rem); line-height: 1.08; letter-spacing: -.04em; }
+.eyebrow { font-size: .8rem; text-transform: uppercase; letter-spacing: .12em; }
+.home-preview { margin-bottom: 3rem; }
+.look-chips { display: flex; gap: .5rem; flex-wrap: wrap; padding-top: .8rem; }
+.look-chips button { border-radius: 2rem; }
+.look-chips button[aria-pressed=true] { outline: 2px solid currentColor; outline-offset: 2px; }
+.home-picker { padding: 1.5rem; border: 1px solid var(--line); border-radius: 1rem; margin-bottom: 3rem; }
+.home-picker-grid { display: grid; grid-template-columns: 1fr 1fr auto; gap: 1.5rem; align-items: center; }
+.home-picker-grid > * { min-width: 0; }
+.section-heading { display: flex; justify-content: space-between; gap: 1rem; align-items: baseline; }
+.home-help { display: flex; justify-content: space-between; gap: 2rem; align-items: center; margin-block: 3rem; padding: 2rem; background: var(--panel); border-radius: 1rem; }
+.home-help p { max-width: 45rem; }
+.home-developers { display: flex; justify-content: space-between; gap: 1rem; padding-block: 1.5rem; border-top: 1px solid var(--line); }
+@media (max-width: 650px) { .home-heading { padding-top: 1rem; } .home-picker-grid { grid-template-columns: 1fr; } .home-help, .home-developers, .section-heading { flex-direction: column; align-items: start; } .home-help { padding: 1.25rem; } }

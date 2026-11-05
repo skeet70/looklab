@@ -15,7 +15,7 @@
 | Exposure | ISO, shutter, aperture, EC, as-shot WB multipliers | Nuisance priors, CCT |
 | Capture date | **Month only** | Epoch sanity, drift analysis |
 | Software tag | String | Edited-JPEG detection |
-| Card render tag | Parsed fields only: format version, firmware id and version, look slug and version, 8-byte content-id prefix ([04 §8.4](04-matching-and-export.md)); the raw `UserComment` string is dropped | Routing card renders out of every fit; per-firmware verification |
+| Card render tag | Parsed fields only: format version, firmware id and version, look slug and version, 8-byte content-id prefix ([04 §8.4](04-matching-and-export.md)), plus a `render_tag_malformed` boolean for a recognizable card token that fails parsing; the raw `UserComment` string is dropped | Routing card renders out of every fit; per-firmware verification; keeping a malformed card token from becoming a stock render |
 | Re-render group id | Random 16 bytes, client-generated per group | Server-verifiable grouping without a RAW hash |
 | Body serial (optional, opt-out) | Sent in a dedicated request field; the server HMACs it on arrival and discards it ([05 §2](05-trust-and-integrity.md)) | Effective-contributor merging for caps only |
 | Signature, nonce, proof-of-work | Per batch | Integrity, anti-flood |
@@ -33,13 +33,14 @@
 
 ## 3. Credentials
 
-- Passkeys (WebAuthn) only, created at the first contribution ([05 §2](05-trust-and-integrity.md)). No email, no password, no account. Browsing and matching need no credential.
+- Passkeys (WebAuthn) only, created at the first contribution or when the contributor creates a profile in the sign-in dialog ([05 §2](05-trust-and-integrity.md), [08 §4.1](08-ui.md)). No email, no password, no account. Browsing and matching need no credential.
 - **Contributor public keys and serial HMACs are never published.** Logs and changelogs use internal ids or display handles.
 - **Serials:** the raw value exists only in a type that can be neither serialized nor printed with `Debug`; it's never stored or logged (a test scans the DB and logs). The HMAC is a stable identifier, which is part of why uploads count as pseudonymous personal data.
 
 ## 4. Status, withdrawal and erasure
 
-- **Status feed:** at first contribution, the client receives a random **capability token**. `/status/<token>` (and an RSS variant) shows accepted / down-weighted / quarantined per image. The server stores only the token's hash. The token isn't the public key. **Lost link:** a passkey assertion from the same credential re-issues a new token and revokes the old one.
+- **Status feed:** at first contribution, the client receives a random **capability token**. `/status/<token>` (and an RSS variant) shows accepted / down-weighted / quarantined per image. The server stores only the token's hash. The token isn't the public key. **Sign-in:** a passkey assertion from the same credential issues an additional token for that browser and leaves the credential's other tokens valid. Creating a profile before its first upload requires proof-of-work on that signed session request, at the same difficulty as a one-image upload by a new-tier credential; signing in with an existing credential does not. New profiles have tier `new` and no roles. **Sign out everywhere:** a signed request revokes every token of the credential. Each response to the credential's own sign-in names its roles, so the client can offer role-gated pages; roles are never published with the credential.
+- **Session restoration:** `GET /api/session` with the status token as an `Authorization: Bearer` capability returns that profile's current roles, tier and display handle, with the same token. It creates no token and requires no new assertion. Missing, unknown or revoked tokens disclose no profile metadata.
 - **Withdrawal:** a request signed by the contributing credential. The data is excluded from the next fit; blobs are hard-deleted after 30 days; published versions stay immutable.
 - **Lost credential:** pending legal review ([10 Q3](10-open-questions.md)). One option is a server-keyed hash of each RAW that lets a user prove possession and delete. But that hash is itself a photo identifier, so it isn't implemented without a decision.
 
@@ -53,6 +54,7 @@
      - **parses the upload body strictly** as the canonical envelope ([03 §2.3](03-data-model.md)) and rejects any deviation or trailing bytes;
      - checks that the **manifest and every sample blob reproduce byte for byte**. There's no tolerance, since a tolerance could hide data in low-order bits;
      - requires the **batch fields the files determine** to equal the manifest's: body from EXIF make/model against the `--data` snapshot, firmware from EXIF, sim and settings from the makernotes through the body's control schema. `--kind` and `--intent` supply what only you declare; every batch field is printed with its source, and anything neither reproduced nor declared fails;
+     - for **intent `card`**, reproduces the card declaration from the files' EXIF `UserComment` render tags; with no tag, `--firmware <id>/<version>` supplies what you declared, and it must equal the manifest's declaration;
      - checks that the remaining fields are the expected set:
        - **nonce:** 32 bytes;
        - **challenge:** the one inside `client_data_json`, which must equal H(nonce ‖ manifest hash);

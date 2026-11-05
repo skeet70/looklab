@@ -12,6 +12,24 @@ Every sample here is CC0 1.0. raw.pixls.us marks each file's license column with
 
 The RAF is an X-Trans IV sensor, so it exercises the 6×6 tile path. The DNG is a small RGGB crop, so it exercises the 2×2 path and the DNG ColorMatrix1/2 path. Other samples in the manifest are fetch-only and land in `fixtures/cache/` (gitignored); `sigma-fp-8bit.dng` is an 8-bit Sigma fp DNG used as a smoke test when present.
 
+## Preview photographs
+
+The six `scene-*.dng` files are fetch-only CC0 sources for `site_data`. The filename suffix is the raw.pixls.us record number. They contain no identifiable people.
+
+| File | Camera | Scene |
+|---|---|---|
+| `scene-1955.dng` | Ricoh GR II | Riverside light, sky, grass and neutral buildings |
+| `scene-3115.dng` | Ricoh GR III | Coastal dunes, warm grasses, sea and sky |
+| `scene-1824.dng` | Pentax KP | Autumn foliage against a pale sky |
+| `scene-1797.dng` | Leica Q (Typ 116) | Blue boat, green waterway and sunlit foliage |
+| `scene-3094.dng` | Pentax K-30 | Frog, lily pads and water reflections |
+| `scene-1603.dng` | Leica M10 | Warm brickwork, neutral windows and sunlit grass |
+
+Source URLs, original byte sizes, SHA-256 digests, license and consent are recorded in the manifest. Each generated scene repeats its source URL, license and source digest in both site scene indexes. All six DNGs expose color matrices through `looklab-raw`; `looklab-body` solves the as-shot white and adapts the transform to D65.
+
+Run `nix develop -c tools/fetch-fixtures.sh` before `CARGO_TARGET_DIR=target-ui nix develop -c cargo run -p looklab-publish --example site_data -j 6`. Missing or corrupt sources fail generation and name the fetch command. `site_data --charts-only` explicitly omits photographs. Photo scenes are area-averaged in linear light to a 1000 px long edge, reduced further when needed to fit 2.5 MB; thumbnails have a 220 px long edge. Scene PNGs store 12-bit-quantized LUT coordinates in 16-bit RGB, not display-ready sRGB pixels.
+
+
 ## Pattern fixture
 
 `fixtures/pattern/` holds a rendered contribution pattern and the page that shows it. The seed is public and fixed: the 32 bytes of SHA-256 over `looklab-fixture-pattern-v1`, which gives digest `c58d`. Regenerate the files with

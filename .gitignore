@@ -1,4 +1,5 @@
 target/
+/target-ui*/
 /result
 /fixtures/cache/
 /fixtures/generated/

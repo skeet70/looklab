@@ -171,6 +171,8 @@ pub fn capture_tuple(tag: &str) -> Result<CaptureTuple> {
         as_shot_wb: None,
         capture_month: None,
         software: Some(tag.to_owned()),
+        render_tag: None,
+        render_tag_malformed: false,
         look: None,
     };
     CaptureTuple::from_metadata(&metadata)

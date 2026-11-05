@@ -11,18 +11,23 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use looklab_upload::Nonce;
 use serde::{Deserialize, Serialize};
-use webauthn_rs::prelude::{CreationChallengeResponse, RegisterPublicKeyCredential, Uuid};
+use webauthn_rs::prelude::{
+    COSEAlgorithm, CreationChallengeResponse, Passkey, RegisterPublicKeyCredential, Uuid,
+};
+use webauthn_rs_core::proto::{AttestationConveyancePreference, UserVerificationPolicy};
 
 use crate::error::{ApiError, ApiResult, ErrorCode};
 use crate::ids::{RegistrationHandle, random_bytes};
 use crate::rate_limit::RateKey;
 use crate::state::AppState;
 use crate::store;
+use crate::trust::NEW_CREDENTIAL_STANDING;
 
 #[derive(Serialize)]
 pub struct NonceResponse {
     nonce: String,
     expires_in_seconds: u64,
+    pow: crate::config::PowConfig,
 }
 
 pub async fn nonce(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
@@ -38,6 +43,14 @@ pub async fn nonce(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
         Json(NonceResponse {
             nonce: URL_SAFE_NO_PAD.encode(nonce.as_bytes()),
             expires_in_seconds: ttl,
+            pow: {
+                let params = state.trust.pow_params(NEW_CREDENTIAL_STANDING);
+                crate::config::PowConfig {
+                    memory_kib: params.memory_kib,
+                    iterations: params.iterations,
+                    difficulty_bits_per_image: params.difficulty_bits_per_image,
+                }
+            },
         }),
     )
         .into_response())
@@ -69,9 +82,19 @@ pub async fn register_start(
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
 
+    let user_id = Uuid::new_v4();
+    let builder = state
+        .webauthn
+        .new_challenge_register_builder(user_id.as_bytes(), "contributor", "Contributor")
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?
+        .attestation(AttestationConveyancePreference::None)
+        .credential_algorithms(COSEAlgorithm::secure_algs())
+        .require_resident_key(true)
+        .user_verification_policy(UserVerificationPolicy::Required)
+        .reject_synchronised_authenticators(false);
     let (options, registration) = state
         .webauthn
-        .start_passkey_registration(Uuid::new_v4(), "contributor", "Contributor", None)
+        .generate_challenge_register(builder)
         .map_err(|_| ApiError::new(ErrorCode::Internal))?;
     let handle = RegistrationHandle::generate().map_err(|_| ApiError::new(ErrorCode::Internal))?;
     if !state.insert_challenge(handle.clone(), registration, display_handle) {
@@ -117,7 +140,8 @@ pub async fn register_finish(
         .ok_or_else(|| ApiError::new(ErrorCode::RegistrationUnknown))?;
     let passkey = state
         .webauthn
-        .finish_passkey_registration(&payload.credential, &registration)
+        .register_credential(&payload.credential, &registration, None)
+        .map(Passkey::from)
         .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
     let raw_id = passkey.cred_id().as_slice();
     if store::credential_exists(&state.db, raw_id)

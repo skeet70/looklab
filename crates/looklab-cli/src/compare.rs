@@ -103,7 +103,11 @@ impl LookFunction for DocumentFunction<'_> {
     }
 
     fn covariance(&self, probe: &Probe) -> Option<Covariance3> {
-        let covariance = self.document.uncertainty.probe_cov.as_ref()?;
+        let uncertainty = &self.document.uncertainty;
+        let covariance = uncertainty
+            .probe_cov_post
+            .as_ref()
+            .or(uncertainty.probe_cov.as_ref())?;
         let index = self.probe_index(probe)?;
         let values = covariance.values.get(index * 9..index * 9 + 9)?;
         Some(Covariance3 {
@@ -116,8 +120,24 @@ impl LookFunction for DocumentFunction<'_> {
         })
     }
 
-    fn support(&self, _probe: &Probe) -> Support {
-        Support::Supported
+    fn support(&self, probe: &Probe) -> Support {
+        let Some(index) = self.probe_index(probe) else {
+            return Support::Supported;
+        };
+        let Some(value) = self
+            .document
+            .uncertainty
+            .support
+            .as_ref()
+            .and_then(|mask| mask.values.get(index))
+        else {
+            return Support::Supported;
+        };
+        if *value > 0.5 {
+            Support::Supported
+        } else {
+            Support::Unsupported
+        }
     }
 
     fn layer_values(&self, input: &LookInput) -> Option<LayerValues> {

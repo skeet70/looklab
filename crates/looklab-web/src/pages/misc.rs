@@ -7,6 +7,6 @@ pub fn NotFound() -> impl IntoView {
     view! {
         <h1>"Not found"</h1>
         <p>"There is no page at this address."</p>
-        <p><a href="/">"Back to the start"</a></p>
+        <p><a href=crate::base::site_url("/")>"Back to the start"</a></p>
     }
 }

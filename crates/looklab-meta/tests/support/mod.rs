@@ -423,6 +423,7 @@ pub const TOP_LEVEL_KEYS: &[&str] = &[
     "capture_month",
     "software",
     "render_tag",
+    "render_tag_malformed",
     "look",
 ];
 

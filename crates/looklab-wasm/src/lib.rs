@@ -4,6 +4,7 @@
 //! Requests to the prep module are built here as postcard bytes; the worker
 //! JavaScript only copies them.
 
+pub mod card;
 pub mod coverage;
 pub mod dto;
 pub mod error;
@@ -20,6 +21,7 @@ mod ui;
 #[cfg(all(target_arch = "wasm32", feature = "worker"))]
 pub mod worker_abi;
 
+pub use card::{CardCheckError, check_card};
 pub use dto::{MatchReply, VerifyReply};
 pub use error::FacadeError;
 pub use looklab_prep_module::{

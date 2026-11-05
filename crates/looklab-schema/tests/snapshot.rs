@@ -10,7 +10,7 @@ use looklab_schema::{BodyId, validate_body, validate_interface_profile};
 
 const BODY: &str = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
 const SCHEMA: &str = include_str!("../../../data/bodies/fujifilm-x-t5.yaml");
-const INTERFACE: &str = include_str!("../../../data/interfaces/example-firmware-sim-v1.yaml");
+const INTERFACE: &str = include_str!("../../../data/interfaces/example-app-lut3d-v1.yaml");
 
 fn body_path() -> String {
     let body = validate_body(BODY).expect("body");

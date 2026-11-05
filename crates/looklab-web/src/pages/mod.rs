@@ -2,8 +2,11 @@
 
 mod bodies;
 mod body;
+mod bounties;
 mod compare;
 pub(crate) mod contribute;
+mod developers;
+mod how_it_works;
 mod landing;
 mod log;
 mod look;
@@ -16,15 +19,18 @@ mod pattern;
 mod privacy;
 mod proposal;
 mod propose;
+mod recipes;
 mod status;
-mod verify;
 
 pub use bodies::BodiesPage;
 pub use body::BodyDetail;
+pub use bounties::BountiesPage;
 pub use compare::ComparePage;
 pub use contribute::ContributePage;
+pub use developers::{DevelopersPage, PipelinesPage};
+pub use how_it_works::HowItWorksPage;
 pub use landing::Landing;
-pub use log::LogPage;
+pub use log::{CommunityPage, LogPage};
 pub use look::LookDetail;
 pub use looks::LooksPage;
 pub use match_page::{MatchPage, MatchResultPage};
@@ -36,4 +42,3 @@ pub use privacy::PrivacyPage;
 pub use proposal::ProposalDetail;
 pub use propose::ProposePage;
 pub use status::StatusPage;
-pub use verify::VerifyPage;

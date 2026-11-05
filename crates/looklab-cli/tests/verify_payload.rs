@@ -15,10 +15,11 @@ use looklab_prep_module::{
     Function, ModuleError, PrepareRequest, PreparedImageView, PriorTransformSpec, Response,
 };
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, Challenge, ContributionKind, ControlEntry, ControlKey,
-    ControlSettings, EnvelopeParts, FirmwareVersionString, Intent, ManifestImage, Nonce, PowParams,
-    RawSerial, RerenderGroupId, SimKey, StepIndex, Tagged, WebAuthnAssertion, encode_envelope,
-    manifest_hash, solve,
+    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, ContributionKind, ControlEntry,
+    ControlKey, ControlSettings, EnvelopeParts, FirmwareId, FirmwareVersion, FirmwareVersionString,
+    Intent, ManifestHash, ManifestImage, Nonce, POW_K, PowParams, RawSerial, RerenderGroupId,
+    SimKey, StepIndex, Tagged, WebAuthnAssertion, encode_envelope, manifest_hash, parse_render_tag,
+    solve,
 };
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use serde_json::{Value, json};
@@ -51,12 +52,20 @@ struct Fixture {
 }
 
 fn fixture() -> &'static Fixture {
-    static FIXTURE: LazyLock<Fixture> = LazyLock::new(build_fixture);
+    static FIXTURE: LazyLock<Fixture> = LazyLock::new(|| build_fixture_in("verify-payload", None));
     &FIXTURE
 }
 
-fn build_fixture() -> Fixture {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("verify-payload");
+const CARD_TAG: &str = "looklab-card/1 fw=acme-sim/2.0.1 look=provia@1.0.0 cid=0123456789abcdef";
+
+fn card_fixture() -> &'static Fixture {
+    static FIXTURE: LazyLock<Fixture> =
+        LazyLock::new(|| build_fixture_in("verify-payload-card", Some(CARD_TAG)));
+    &FIXTURE
+}
+
+fn build_fixture_in(name: &str, render_tag: Option<&str>) -> Fixture {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     std::fs::create_dir_all(&dir).expect("fixture directory");
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -68,10 +77,17 @@ fn build_fixture() -> Fixture {
 
     let embedded = raf_jpeg(&raw);
     let decoded = decode_jpeg(&embedded).expect("the embedded JPEG decodes");
-    let renders = vec![
+    let untagged = vec![
         embedded.clone(),
         splice_exif(&embedded, &jpeg_from_image(&decoded.image, 0.7)),
     ];
+    let renders: Vec<Vec<u8>> = match render_tag {
+        Some(token) => untagged
+            .iter()
+            .map(|jpeg| with_render_tag(jpeg, token))
+            .collect(),
+        None => untagged,
+    };
     let jpegs: Vec<PathBuf> = ["render-a.jpg", "render-b.jpg"]
         .iter()
         .map(|name| dir.join(name))
@@ -100,7 +116,7 @@ fn build_fixture() -> Fixture {
     );
     std::fs::write(&seeds, seed_text).expect("seed file");
 
-    let module = build_module();
+    let module = module();
     let images = prepare(&module, &raw, &renders);
     Fixture {
         dir,
@@ -111,6 +127,11 @@ fn build_fixture() -> Fixture {
         seeds,
         images,
     }
+}
+
+fn module() -> PathBuf {
+    static MODULE: LazyLock<PathBuf> = LazyLock::new(build_module);
+    MODULE.clone()
 }
 
 fn build_module() -> PathBuf {
@@ -194,6 +215,83 @@ fn splice_exif(original: &[u8], render: &[u8]) -> Vec<u8> {
     out.extend_from_slice(segment);
     out.extend_from_slice(&render[2..]);
     out
+}
+
+fn with_render_tag(jpeg: &[u8], token: &str) -> Vec<u8> {
+    let segment = exif_segment(jpeg).expect("EXIF segment");
+    let start = segment.as_ptr() as usize - jpeg.as_ptr() as usize;
+    let tiff = &segment[10..];
+    let little = match &tiff[..2] {
+        b"II" => true,
+        b"MM" => false,
+        other => panic!("unknown TIFF byte order {other:?}"),
+    };
+    let read_u16 = |at: usize| {
+        let bytes: [u8; 2] = tiff[at..at + 2].try_into().expect("two bytes");
+        if little {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        }
+    };
+    let read_u32 = |at: usize| {
+        let bytes: [u8; 4] = tiff[at..at + 4].try_into().expect("four bytes");
+        if little {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        }
+    };
+
+    let mut payload = b"ASCII\0\0\0".to_vec();
+    payload.extend_from_slice(token.as_bytes());
+
+    let ifd0 = read_u32(4) as usize;
+    let count0 = read_u16(ifd0) as usize;
+    let mut exif_ifd = None;
+    for index in 0..count0 {
+        let at = ifd0 + 2 + index * 12;
+        if read_u16(at) == 0x8769 {
+            exif_ifd = Some(read_u32(at + 8) as usize);
+        }
+    }
+    let ifd = exif_ifd.unwrap_or(ifd0);
+    let count = read_u16(ifd) as usize;
+    let mut chosen = None;
+    for index in 0..count {
+        let at = ifd + 2 + index * 12;
+        let offset = read_u32(at + 8) as usize;
+        if read_u16(at) == 0x9286
+            && read_u16(at + 2) == 7
+            && read_u32(at + 4) as usize >= payload.len()
+            && offset + payload.len() <= tiff.len()
+        {
+            chosen = Some((at, offset));
+            break;
+        }
+    }
+    let (entry, offset) = chosen.expect("a UserComment entry with room for the tag");
+
+    let mut tagged = jpeg.to_vec();
+    let base = start + 10;
+    let put_u16 = |out: &mut [u8], at: usize, value: u16| {
+        let bytes = if little {
+            value.to_le_bytes()
+        } else {
+            value.to_be_bytes()
+        };
+        out[at..at + 2].copy_from_slice(&bytes);
+    };
+    put_u16(&mut tagged, base + entry, 0x9286);
+    put_u16(&mut tagged, base + entry + 2, 7);
+    let length = if little {
+        (payload.len() as u32).to_le_bytes()
+    } else {
+        (payload.len() as u32).to_be_bytes()
+    };
+    tagged[base + entry + 4..base + entry + 8].copy_from_slice(&length);
+    tagged[base + offset..base + offset + payload.len()].copy_from_slice(&payload);
+    tagged
 }
 
 fn jpeg_from_image(image: &Image3, exposure: f64) -> Vec<u8> {
@@ -320,7 +418,10 @@ struct Site {
 
 impl Site {
     fn new() -> Self {
-        let fixture = fixture();
+        Self::from_fixture(fixture())
+    }
+
+    fn from_fixture(fixture: &Fixture) -> Self {
         let images = fixture
             .images
             .iter()
@@ -354,6 +455,11 @@ impl Site {
             challenge: None,
             serial: None,
         }
+    }
+
+    fn with_intent(mut self, intent: Intent) -> Self {
+        self.manifest.intent = intent;
+        self
     }
 
     fn with_credential(mut self, credential: &[u8]) -> Self {
@@ -607,6 +713,15 @@ fn entry(method: &str, url: &str, body: Option<&[u8]>) -> Value {
 }
 
 fn run(fixture: &Fixture, hars: &[&Path], state: &Path) -> (bool, String) {
+    run_with(fixture, hars, state, &["--intent", "native"])
+}
+
+fn run_with(
+    fixture: &Fixture,
+    hars: &[&Path],
+    state: &Path,
+    intent_args: &[&str],
+) -> (bool, String) {
     let mut command = Command::cargo_bin("looklab").expect("built binary");
     command
         .args(["verify-payload", "--seeds"])
@@ -619,7 +734,8 @@ fn run(fixture: &Fixture, hars: &[&Path], state: &Path) -> (bool, String) {
         .arg(&fixture.module)
         .args(["--origin", ORIGIN, "--rp-id", RP_ID, "--data"])
         .arg(&fixture.data)
-        .args(["--kind", "library", "--intent", "native"])
+        .args(["--kind", "library"])
+        .args(intent_args)
         .arg("--state")
         .arg(state)
         .args([
@@ -670,6 +786,32 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn session_body(site: &Site, digest: [u8; 32], extra: Option<(&str, Value)>) -> Vec<u8> {
+    let nonce = Nonce::from_bytes([0x24; 32]);
+    let challenge = Challenge::new(&nonce, &ManifestHash::from_bytes(digest));
+    let assertion = assertion(
+        &challenge,
+        &site.origin,
+        &site.rp_id,
+        &site.credential_id,
+        None,
+        None,
+    );
+    let base64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut value = json!({
+        "nonce": base64.encode(nonce.as_bytes()),
+        "credential_id": base64.encode(&assertion.credential_id),
+        "authenticator_data": base64.encode(&assertion.authenticator_data),
+        "client_data_json": base64.encode(&assertion.client_data_json),
+        "signature": base64.encode(&assertion.signature),
+        "pow": vec![0_u64; POW_K],
+    });
+    if let Some((key, extra)) = extra {
+        value[key] = extra;
+    }
+    serde_json::to_vec(&value).expect("session body JSON")
+}
+
 #[test]
 fn reproduces_an_upload_and_passes() {
     let fixture = fixture();
@@ -715,6 +857,109 @@ fn fails_on_a_fabricated_batch_field() {
     assert!(!success, "{output}");
     assert!(output.contains("firmware version is 1.01"), "{output}");
     assert!(output.contains("reproduced 1.00"), "{output}");
+}
+
+#[test]
+fn reproduces_a_tagged_card_upload_and_passes() {
+    let fixture = card_fixture();
+    assert!(
+        fixture
+            .images
+            .iter()
+            .all(|image| image.metadata.render_tag.is_some()),
+        "the fixture JPEGs carry render tags"
+    );
+    let tag = parse_render_tag(CARD_TAG).expect("render tag");
+    let site = Site::from_fixture(fixture).with_intent(Intent::Card(CardDeclaration::tagged(tag)));
+    let har = har_path("card-tagged", &default_har(&site).json());
+    let (success, output) = run_with(
+        fixture,
+        &[har.as_path()],
+        &state_path("card-tagged"),
+        &["--intent", "card"],
+    );
+
+    assert!(success, "{output}");
+    assert!(output.contains("PASS"), "{output}");
+    assert!(
+        output.contains("card firmware: acme-sim/2.0.1 (reproduced from the render tag)"),
+        "{output}"
+    );
+    assert!(
+        output.contains("card look: provia@1.0.0 (reproduced from the render tag)"),
+        "{output}"
+    );
+    assert!(
+        output.contains("card cid: 0123456789abcdef (reproduced from the render tag)"),
+        "{output}"
+    );
+}
+
+#[test]
+fn fails_on_a_fabricated_render_tag() {
+    let fixture = card_fixture();
+    let mut tag = parse_render_tag(CARD_TAG).expect("render tag");
+    tag.cid_prefix[0] ^= 0xff;
+    let site = Site::from_fixture(fixture).with_intent(Intent::Card(CardDeclaration::tagged(tag)));
+    let har = har_path("card-fabricated", &default_har(&site).json());
+    let (success, output) = run_with(
+        fixture,
+        &[har.as_path()],
+        &state_path("card-fabricated"),
+        &["--intent", "card"],
+    );
+
+    assert!(!success, "{output}");
+    assert!(
+        output.contains("render tag does not match the batch card declaration"),
+        "{output}"
+    );
+}
+
+#[test]
+fn accepts_a_user_declared_card_with_matching_firmware() {
+    let fixture = fixture();
+    let site = Site::from_fixture(fixture).with_intent(user_declared_card("acme-sim", "2.0.1"));
+    let har = har_path("card-declared", &default_har(&site).json());
+    let (success, output) = run_with(
+        fixture,
+        &[har.as_path()],
+        &state_path("card-declared"),
+        &["--intent", "card", "--firmware", "acme-sim/2.0.1"],
+    );
+
+    assert!(success, "{output}");
+    assert!(
+        output.contains("card firmware: acme-sim/2.0.1 (declared)"),
+        "{output}"
+    );
+}
+
+#[test]
+fn fails_on_a_user_declared_card_firmware_mismatch() {
+    let fixture = fixture();
+    let site = Site::from_fixture(fixture).with_intent(user_declared_card("acme-sim", "2.0.1"));
+    let har = har_path("card-mismatch", &default_har(&site).json());
+    let (success, output) = run_with(
+        fixture,
+        &[har.as_path()],
+        &state_path("card-mismatch"),
+        &["--intent", "card", "--firmware", "acme-sim/9.9.9"],
+    );
+
+    assert!(!success, "{output}");
+    assert!(output.contains("intent is"), "{output}");
+    assert!(
+        output.contains("card firmware: acme-sim/9.9.9 (declared)"),
+        "{output}"
+    );
+}
+
+fn user_declared_card(firmware: &str, version: &str) -> Intent {
+    Intent::Card(CardDeclaration::user_declared(
+        FirmwareId::new(firmware).expect("firmware id"),
+        FirmwareVersion::new(version).expect("firmware version"),
+    ))
 }
 
 #[test]
@@ -834,6 +1079,61 @@ fn fails_on_an_unexpected_request() {
     assert!(!success, "{output}");
     assert!(output.contains("unexpected request"), "{output}");
     assert!(output.contains("/collect?d=1"), "{output}");
+}
+
+#[test]
+fn accepts_a_passkey_session_request() {
+    let fixture = fixture();
+    let site = Site::new();
+    let digest = sha256(b"looklab-request-v1:session:");
+    let body = session_body(&site, digest, None);
+    let har = default_har(&site)
+        .post_body("https://looklab.test/api/session", &body)
+        .json();
+    let har = har_path("session", &har);
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("session"));
+
+    assert!(success, "{output}");
+    assert!(
+        output.contains("[expected] POST https://looklab.test/api/session"),
+        "{output}"
+    );
+    assert!(
+        output.contains("H(nonce ‖ H(looklab-request-v1:session:)) matches client_data_json"),
+        "{output}"
+    );
+}
+
+#[test]
+fn fails_on_a_session_body_with_an_extra_field() {
+    let fixture = fixture();
+    let site = Site::new();
+    let digest = sha256(b"looklab-request-v1:session:");
+    let body = session_body(&site, digest, Some(("hidden", json!(1))));
+    let har = default_har(&site)
+        .post_body("https://looklab.test/api/session", &body)
+        .json();
+    let har = har_path("session-extra", &har);
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("session-extra"));
+
+    assert!(!success, "{output}");
+    assert!(output.contains("unaccounted key \"hidden\""), "{output}");
+}
+
+#[test]
+fn fails_on_a_session_challenge_over_another_payload() {
+    let fixture = fixture();
+    let site = Site::new();
+    let digest = sha256(b"looklab-request-v1:mod-session:");
+    let body = session_body(&site, digest, None);
+    let har = default_har(&site)
+        .post_body("https://looklab.test/api/session", &body)
+        .json();
+    let har = har_path("session-digest", &har);
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("session-digest"));
+
+    assert!(!success, "{output}");
+    assert!(output.contains("challenge"), "{output}");
 }
 
 #[test]

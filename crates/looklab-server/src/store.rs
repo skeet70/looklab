@@ -113,6 +113,7 @@ impl JobKind {
 pub enum IntentKind {
     Native,
     Recipe,
+    Card,
 }
 
 impl IntentKind {
@@ -120,6 +121,7 @@ impl IntentKind {
         match self {
             Self::Native => "native",
             Self::Recipe => "recipe",
+            Self::Card => "card",
         }
     }
 }
@@ -314,12 +316,14 @@ pub async fn insert_credential(
         .map_err(|_| sqlx::Error::Protocol("passkey does not serialize".to_owned()))?;
     sqlx::query(
         "INSERT INTO credentials (id, credential_id, webauthn_credential, display_handle, tier, roles, reputation, created_at, status)
-         VALUES (?, ?, ?, ?, 'new', '[]', 0.5, ?, 'active')",
+         VALUES (?, ?, ?, ?, ?, '[]', ?, ?, 'active')",
     )
     .bind(id.as_str())
     .bind(raw_id)
     .bind(passkey_json)
     .bind(display_handle)
+    .bind(crate::trust::NEW_CREDENTIAL_STANDING.tier.as_str())
+    .bind(crate::trust::NEW_CREDENTIAL_STANDING.reputation)
     .bind(now_unix())
     .execute(&mut **tx)
     .await?;
@@ -368,6 +372,7 @@ pub struct NewContribution {
     pub serial_hmac: Option<[u8; 32]>,
     pub intent: IntentKind,
     pub target_look: Option<String>,
+    pub card: Option<String>,
     pub body_id: String,
     pub firmware_version: String,
     pub sim_key: String,
@@ -382,8 +387,8 @@ pub async fn insert_contribution(
     sqlx::query(
         "INSERT INTO contributions
          (id, credential_id, batch_manifest_hash, signature, pow, kind, serial_hmac, intent,
-          target_look_id, body_id, firmware_version, sim_key, settings, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+          target_look_id, card, body_id, firmware_version, sim_key, settings, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
     )
     .bind(contribution.id.as_str())
     .bind(contribution.credential_id.as_str())
@@ -394,6 +399,7 @@ pub async fn insert_contribution(
     .bind(contribution.serial_hmac.map(|hmac| hmac.to_vec()))
     .bind(contribution.intent.as_str())
     .bind(contribution.target_look.as_deref())
+    .bind(contribution.card.as_deref())
     .bind(&contribution.body_id)
     .bind(&contribution.firmware_version)
     .bind(&contribution.sim_key)

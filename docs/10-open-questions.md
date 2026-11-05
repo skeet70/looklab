@@ -25,3 +25,5 @@ Decisions not yet made. Each has a default so work isn't blocked. Change a defau
 | Q20 | Threat level: when to restore the cut defenses (05 §13), e.g. server re-verification of kinds | Revisit if revert actions become frequent or a large coordinated attack is seen | 05 |
 | Q21 | Card `FIT` contents: the probe set only, or denser supported samples too? | Probe set v1 only; revisit with translator feedback | 04 §8.3 |
 | Q22 | Render tag location: EXIF `UserComment` only, or also `ImageDescription` for firmware that can't write `UserComment`? | `UserComment` only | 04 §8.4, 06 §1 |
+| Q23 | ΔE₍UCS₎ boundaries for the five closeness labels of 08 §0.4 | < 1, 1 to 2, 2 to 4, 4 to 7, ≥ 7; set by the color pipeline from perceptual evidence | 02 §7, 08 §0.4 |
+| Q24 | Status token lifetime | No expiry; a token ends at sign-out or sign out everywhere | 06 §4, 08 §4.1 |

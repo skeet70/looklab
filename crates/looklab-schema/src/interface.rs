@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! The firmware interface profile file.
+//! The interface profile file.
 
 use serde::Deserialize;
 
@@ -200,8 +200,6 @@ pub enum Format {
     NativeJson,
     #[serde(rename = "haldclut")]
     Haldclut,
-    #[serde(rename = "binary_f16")]
-    BinaryF16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

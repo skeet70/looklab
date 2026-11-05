@@ -92,6 +92,30 @@ async fn legacy_or_scope_migrates_to_rule_lists() {
 }
 
 #[tokio::test]
+async fn bounty_tables_exist_after_migration() {
+    let pool = legacy_pool().await;
+    sqlx::raw_sql(include_str!("../migrations/0008_bounties.sql"))
+        .execute(&pool)
+        .await
+        .expect("bounty migration");
+    for table in [
+        "recipe_observations",
+        "recipe_scores",
+        "recipe_residuals",
+        "bounties",
+    ] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .expect("table count");
+        assert_eq!(count, 1, "missing table {table}");
+    }
+}
+
+#[tokio::test]
 async fn new_manifest_tables_exist_after_migration() {
     let pool = legacy_pool().await;
     for table in [

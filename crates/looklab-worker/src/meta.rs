@@ -33,6 +33,8 @@ pub fn capture_tuple(meta_json: &str) -> Result<CaptureTuple> {
             .capture_month
             .and_then(|month| YearMonth::new(month.year(), month.month())),
         software: meta.software,
+        render_tag: meta.render_tag,
+        render_tag_malformed: meta.render_tag_malformed,
         // The wire mirror keeps no FujiTag, so the in-camera look slot cannot be rebuilt.
         look: None,
     };

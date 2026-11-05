@@ -45,6 +45,8 @@ pub struct FileFacts {
     pub model: Option<String>,
     pub firmware: Option<String>,
     pub has_serial: bool,
+    pub render_tag: Option<looklab_meta::RenderTag>,
+    pub render_tag_malformed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -80,6 +82,8 @@ pub fn inspect_files(files: &[(String, Vec<u8>)]) -> Result<PairingPlan, FacadeE
                     model: None,
                     firmware: None,
                     has_serial: false,
+                    render_tag: None,
+                    render_tag_malformed: false,
                 });
                 unpaired.push(UnpairedEntry {
                     name: name.clone(),
@@ -124,6 +128,8 @@ fn facts_of(name: &str, kind: FileKindView, metadata: &ParsedMetadata) -> FileFa
         model: metadata.exif.model.clone(),
         firmware: metadata.firmware.clone(),
         has_serial: metadata.body_serial().is_some(),
+        render_tag: metadata.render_tag.valid().cloned(),
+        render_tag_malformed: metadata.render_tag.is_malformed(),
     }
 }
 

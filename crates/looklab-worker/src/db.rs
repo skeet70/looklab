@@ -3,11 +3,10 @@
 
 use std::path::{Path, PathBuf};
 
-use looklab_model::realization::Settings;
 use looklab_server::admin::{self, ManifestArtifact};
 use looklab_server::{ContributionId, CredentialId};
 use looklab_trust::{CredentialId as TrustCredentialId, Reputation, Scope, Tier};
-use looklab_upload::{BodyId, ContributionKind, LookSlug};
+use looklab_upload::{BodyId, ContributionKind, ControlSettings, LookSlug};
 use sqlx::{Row, SqlitePool};
 
 use crate::error::{Result, WorkerError};
@@ -45,7 +44,7 @@ impl ContributionStatus {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    pub fn parse(value: &str) -> Result<Self> {
         Ok(match value {
             "pending" => Self::Pending,
             "accepted" => Self::Accepted,
@@ -140,6 +139,8 @@ impl LookVersionStatus {
 pub enum ContributionIntent {
     Native,
     Recipe,
+    /// A firmware card render, grouped by firmware rather than fitted.
+    Card,
 }
 
 impl ContributionIntent {
@@ -147,6 +148,7 @@ impl ContributionIntent {
         match self {
             Self::Native => "native",
             Self::Recipe => "recipe",
+            Self::Card => "card",
         }
     }
 }
@@ -161,10 +163,17 @@ pub struct ContributionRow {
     pub body: BodyId,
     pub firmware: String,
     pub sim_key: String,
-    pub settings: Settings,
+    pub settings: ControlSettings,
     pub serial_hmac: Option<[u8; 32]>,
     pub status: ContributionStatus,
     pub created_at: i64,
+}
+
+impl ContributionRow {
+    /// Canonical `settings` column text for recipe rows.
+    pub fn settings_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(&self.settings)?)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +279,7 @@ fn parse_intent(value: &str) -> Result<ContributionIntent> {
     Ok(match value {
         "native" => ContributionIntent::Native,
         "recipe" => ContributionIntent::Recipe,
+        "card" => ContributionIntent::Card,
         other => return Err(WorkerError::Data(format!("unknown intent `{other}`"))),
     })
 }
@@ -308,7 +318,7 @@ fn contribution_row(row: &sqlx::sqlite::SqliteRow) -> Result<ContributionRow> {
         body,
         firmware: row.get("firmware_version"),
         sim_key: row.get("sim_key"),
-        settings: serde_json::from_str(&row.get::<String, _>("settings"))?,
+        settings: serde_json::from_str::<ControlSettings>(&row.get::<String, _>("settings"))?,
         serial_hmac,
         status: ContributionStatus::parse(row.get::<String, _>("status").as_str())?,
         created_at: row.get("created_at"),
@@ -380,7 +390,8 @@ pub async fn body_pool(
 ) -> Result<Vec<(ContributionRow, Vec<ImageRow>)>> {
     let sql = format!(
         "SELECT {CONTRIBUTION_COLUMNS} FROM contributions c
-         WHERE c.body_id = ? AND c.status NOT IN ('withdrawn', 'quarantined') ORDER BY c.id"
+         WHERE c.body_id = ? AND c.intent != 'card'
+           AND c.status NOT IN ('withdrawn', 'quarantined') ORDER BY c.id"
     );
     let contributions = sqlx::query(&sql)
         .bind(body.as_str())
@@ -406,7 +417,7 @@ pub async fn body_pool(
 pub async fn all_contributions(pool: &SqlitePool) -> Result<Vec<ContributionRow>> {
     let sql = format!(
         "SELECT {CONTRIBUTION_COLUMNS} FROM contributions c
-         WHERE c.status != 'withdrawn' ORDER BY c.id"
+         WHERE c.status != 'withdrawn' AND c.intent != 'card' ORDER BY c.id"
     );
     let rows = sqlx::query(&sql).fetch_all(pool).await?;
     rows.iter().map(contribution_row).collect()
@@ -794,6 +805,25 @@ pub async fn store_release_body_params(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn release_body_params(
+    pool: &SqlitePool,
+    look: &str,
+    version: u32,
+    body: &str,
+    stage: BodyStage,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT params FROM release_body_params
+         WHERE look = ? AND version = ? AND body = ? AND stage = ?",
+    )
+    .bind(look)
+    .bind(i64::from(version))
+    .bind(body)
+    .bind(stage.as_str())
+    .fetch_optional(pool)
+    .await?)
 }
 
 /// Whether a version manifest was already committed for these inputs.

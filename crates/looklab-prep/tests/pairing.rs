@@ -63,7 +63,7 @@ fn metadata(
         },
         fuji,
         firmware: None,
-        render_tag: None,
+        render_tag: looklab_meta::RenderTagOutcome::Absent,
     }
 }
 

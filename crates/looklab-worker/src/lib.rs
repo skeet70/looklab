@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 pub mod body;
+pub mod bounties;
+pub mod cards;
 pub mod clock;
 pub mod config;
 pub mod consistency;

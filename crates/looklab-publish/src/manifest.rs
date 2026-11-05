@@ -72,12 +72,14 @@ pub struct ProvenanceSummary {
 
 pub const DOCUMENT_ARTIFACT: &str = "look.looklab";
 pub const PREVIEW_LUT_ARTIFACT: &str = "preview.lut33";
+pub const CARD_ARTIFACT: &str = "card.llk";
 
 /// Well-known files inside a version directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LookArtifact {
     Document,
     PreviewLut,
+    Card,
     Other,
 }
 
@@ -86,6 +88,7 @@ impl LookArtifact {
         match name.as_str() {
             DOCUMENT_ARTIFACT => Self::Document,
             PREVIEW_LUT_ARTIFACT => Self::PreviewLut,
+            CARD_ARTIFACT => Self::Card,
             _ => Self::Other,
         }
     }
