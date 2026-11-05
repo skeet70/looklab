@@ -341,6 +341,7 @@ fn merge_rendering(raw: &SanitizedMetadata, jpeg: &SanitizedMetadata) -> Sanitiz
     let mut merged = raw.clone();
     merged.look = jpeg.look.clone();
     merged.software = jpeg.software.clone();
+    merged.render_tag = jpeg.render_tag.clone();
     if merged.make.is_none() {
         merged.make = jpeg.make.clone();
     }
@@ -770,6 +771,7 @@ mod tests {
             as_shot_wb: None,
             capture_month: None,
             software: None,
+            render_tag: None,
             look: film.map(|value| LookSettings {
                 film_mode: Some(ParsedTag {
                     tag: FujiTag::FilmMode,

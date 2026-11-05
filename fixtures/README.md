@@ -14,13 +14,13 @@ The RAF is an X-Trans IV sensor, so it exercises the 6×6 tile path. The DNG is 
 
 ## Pattern fixture
 
-`fixtures/pattern/` holds a rendered contribution pattern and the page that shows it. The seed is public and fixed: the 32 bytes of SHA-256 over `looklab-fixture-pattern-v1`, which gives digest `c58d`. Regenerate both files with
+`fixtures/pattern/` holds a rendered contribution pattern and the page that shows it. The seed is public and fixed: the 32 bytes of SHA-256 over `looklab-fixture-pattern-v1`, which gives digest `c58d`. Regenerate the files with
 
 ```sh
 nix develop -c cargo run -p looklab-prep --example fixture_pattern
 ```
 
-`pattern.png` is 2560×1440, 8-bit sRGB; its 9:16 content box fills the frame height. `index.html` shows it full-screen on black and asks for fullscreen on a click or tap. `crates/looklab-prep/tests/pattern.rs` photographs the committed PNG and checks that detection recovers the digest, so a stale PNG fails the test.
+`pattern-portrait.png` is 1080×2340 and `pattern-landscape.png` is 2560×1600, both 8-bit sRGB with the pattern filling the frame. `index.html` picks the PNG that matches the screen orientation, shows it letterboxed on black, and asks for fullscreen on a click or tap. `crates/looklab-prep/tests/pattern.rs` photographs both PNGs, upright and letterboxed, and checks that detection recovers the digest, so a stale PNG fails the test.
 
 ## Fetching
 

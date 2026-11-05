@@ -2,7 +2,7 @@
 
 **Principle:** a very low bar to start, and rigor that's optional, incremental and can be added later (it applies retroactively). Leaving at any point keeps what's already contributed. Weight comes from the contribution's kind and measured coverage ([05 §5](05-trust-and-integrity.md)). Kinds are claimed by the client and bounded by the new-tier cap, and only a seeder's endorsement moves a contributor out of that capped tier.
 
-No account is needed. At the first upload the browser creates a passkey and gives the contributor a status link ([06 §4](06-privacy-and-payload.md)). Platforms without a built-in passkey store (common on Linux desktops) can use a phone via the cross-device QR flow, a security key, or a password manager that stores passkeys; the page says so before the user starts.
+No account is needed. At the first upload, or earlier from the sign-in dialog ([08 §4.1](08-ui.md)), the browser creates a passkey, and the contributor gets a status link ([06 §4](06-privacy-and-payload.md)). Platforms without a built-in passkey store (common on Linux desktops) can use a phone via the cross-device QR flow, a security key, or a password manager that stores passkeys; the page says so before the user starts.
 
 ## 1. The ladder
 
@@ -14,6 +14,8 @@ No account is needed. At the first upload the browser creates a passkey and give
 | 3 | **Phone pattern session** (QR → full-screen pattern with a server-issued seed; 3 bracketed shots) | ~3 min | 1.0 | Saturated coverage |
 | 4 | **Tone gradient:** one defocused gradient shot | ~2 min | 1.0 | Tone, neutral tint |
 | 5 | **Color chart session** | ~5 min | 2.0 | Input transform; a seeder can review it for endorsement and root admission (only endorsed/seeder charts anchor the gauge) |
+
+The UI presents the rungs as "ways to help" with time and impact (low, medium, high), without rung numbers or weights ([08 §4.2](08-ui.md)).
 
 **Rung 0 preselection.** Diminishing returns make the 500th image worth a fraction of the first, so don't fully process everything. The client estimates each pair's coverage gain cheaply from the RAW's embedded preview or the JPEG (locally, never uploaded). It fully processes the top images in order of gain, up to a default of 100 per body/sim group, and offers "process more" with the predicted marginal value.
 
@@ -38,8 +40,9 @@ Shared tips (rung 1 and above): turn off in-camera lens corrections where possib
 - The contribution flow requests a **server-issued, signed session seed** and shows a QR code to `/pattern/<seed>`. The pattern page is static and renders deterministically from the seed.
 - Layout:
   - 4 corner fiducials;
-  - a session-ID strip;
-  - a 12×8 patch grid spanning the display gamut, in seed-determined order;
+  - a session-ID strip along the short side, which also fixes the display's orientation;
+  - a 96-patch grid spanning the display gamut, in seed-determined order: 8×12 in portrait and 12×8 in landscape, so patches stay near square;
+  - a content box that follows the viewport orientation and aspect, clamped to between 9:21 and 21:9;
   - large patches, so defocus is fine.
 - Instructions: max brightness; disable night shift / true tone / adaptive color; fill ~60% of the frame; defocus slightly; 3 shots at 0, −1 and −2 EV.
 - Use: coverage only. Display primaries are unknown, so it isn't an anchor. The server-issued seed ties the shots to the session.

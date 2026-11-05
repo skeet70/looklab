@@ -3,8 +3,7 @@
 //! rung 3.
 //!
 //! [`render`] draws the pattern a phone displays for a server-issued
-//! [`PatternSeed`], and [`detect`] recovers the display's patch values from a
-//! photograph of it. Both use the same layout in a fixed 9:16 content box.
+//! [`PatternSeed`], and [`detect`] recovers the display's patches from a photo.
 
 use std::sync::LazyLock;
 
@@ -24,9 +23,7 @@ use crate::jpeg::DecodedJpeg;
 use crate::patch::PatchSampler;
 use crate::pipeline::PREP_VERSION;
 
-pub const PATCH_COLUMNS: u32 = 12;
-pub const PATCH_ROWS: u32 = 8;
-pub const PATCH_COUNT: usize = (PATCH_COLUMNS * PATCH_ROWS) as usize;
+pub const PATCH_COUNT: usize = 96;
 
 /// Digest bits in the session strip; the seed authenticates the session.
 const DIGEST_BITS: usize = 16;
@@ -34,15 +31,23 @@ const DIGEST_BYTES: usize = DIGEST_BITS / 8;
 /// One start marker, the digest bits, one stop marker.
 const STRIP_CELLS: usize = DIGEST_BITS + 2;
 
-const CONTENT_ASPECT: f64 = 9.0 / 16.0;
-const FIDUCIAL_MARGIN: f64 = 0.05;
-const FIDUCIAL_SIZE: f64 = 0.09;
+/// Content aspects outside this range are letterboxed rather than followed.
+const MIN_CONTENT_ASPECT: f64 = 9.0 / 21.0;
+const MAX_CONTENT_ASPECT: f64 = 21.0 / 9.0;
+/// Layout lengths are fractions of the content width or height, so the
+/// normalized layout is the same at every aspect.
+const FIDUCIAL_MARGIN: f64 = 0.025;
+const FIDUCIAL_SIZE: f64 = 0.08;
 const FIDUCIAL_HOLE: f64 = 0.25;
-const STRIP_TOP_GAP: f64 = 0.03;
-const STRIP_HEIGHT: f64 = 0.05;
-const STRIP_LEFT: f64 = 0.20;
-const STRIP_RIGHT: f64 = 0.80;
-const FIELD_GAP: f64 = 0.02;
+const STRIP_GAP: f64 = 0.012;
+const STRIP_THICKNESS: f64 = 0.028;
+/// The strip starts and ends short of both corner fiducials along the short
+/// side. The asymmetry is what tells a rotated layout from an upright one.
+const STRIP_START: f64 = 0.14;
+const STRIP_END: f64 = 0.74;
+const FIELD_GAP: f64 = 0.015;
+/// Fraction of the short axis left free on each side of the patch field.
+const FIELD_EDGE_MARGIN: f64 = 0.02;
 const PATCH_GAP: f64 = 0.12;
 const MIN_CONTENT_WIDTH: u32 = 320;
 
@@ -198,46 +203,130 @@ struct LayoutRects {
     patches: [Rect; PATCH_COUNT],
 }
 
-/// The pattern in a content box `width × height` whose aspect ratio is 9:16.
-fn layout_rects(width: f64, height: f64) -> LayoutRects {
-    let margin = FIDUCIAL_MARGIN * width;
-    let size = FIDUCIAL_SIZE * width;
+/// Which axis carries the extra grid cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Orientation {
+    Portrait,
+    Landscape,
+}
+
+impl Orientation {
+    fn of(width: f64, height: f64) -> Self {
+        if width >= height {
+            Self::Landscape
+        } else {
+            Self::Portrait
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Portrait => 0,
+            Self::Landscape => 1,
+        }
+    }
+
+    fn columns(self) -> u32 {
+        match self {
+            Self::Portrait => 8,
+            Self::Landscape => 12,
+        }
+    }
+
+    fn rows(self) -> u32 {
+        PATCH_COUNT as u32 / self.columns()
+    }
+}
+
+/// The pattern in a `width × height` content box; every length is a fraction
+/// of one of the two.
+fn layout_rects(orientation: Orientation, width: f64, height: f64) -> LayoutRects {
+    let margin = FIDUCIAL_MARGIN;
+    let size = FIDUCIAL_SIZE;
     let fiducials = [
-        Rect::new(margin, margin, size, size),
-        Rect::new(width - margin - size, margin, size, size),
-        Rect::new(width - margin - size, height - margin - size, size, size),
-        Rect::new(margin, height - margin - size, size, size),
+        Rect::new(margin * width, margin * height, size * width, size * height),
+        Rect::new(
+            (1.0 - margin - size) * width,
+            margin * height,
+            size * width,
+            size * height,
+        ),
+        Rect::new(
+            (1.0 - margin - size) * width,
+            (1.0 - margin - size) * height,
+            size * width,
+            size * height,
+        ),
+        Rect::new(
+            margin * width,
+            (1.0 - margin - size) * height,
+            size * width,
+            size * height,
+        ),
     ];
 
-    let strip_y = margin + size + STRIP_TOP_GAP * width;
-    let strip_height = STRIP_HEIGHT * width;
-    let strip_x = STRIP_LEFT * width;
-    let strip_width = (STRIP_RIGHT - STRIP_LEFT) * width;
-    let cell_width = strip_width / STRIP_CELLS as f64;
-    let strip = core::array::from_fn(|index| {
-        Rect::new(
-            strip_x + index as f64 * cell_width,
-            strip_y,
-            cell_width,
-            strip_height,
-        )
-    });
+    let strip_offset = margin + size + STRIP_GAP;
+    let strip = match orientation {
+        Orientation::Portrait => {
+            let y = strip_offset * height;
+            let cell_width = (STRIP_END - STRIP_START) * width / STRIP_CELLS as f64;
+            core::array::from_fn(|index| {
+                Rect::new(
+                    STRIP_START * width + index as f64 * cell_width,
+                    y,
+                    cell_width,
+                    STRIP_THICKNESS * height,
+                )
+            })
+        }
+        Orientation::Landscape => {
+            let x = strip_offset * width;
+            let cell_height = (STRIP_END - STRIP_START) * height / STRIP_CELLS as f64;
+            core::array::from_fn(|index| {
+                Rect::new(
+                    x,
+                    STRIP_START * height + index as f64 * cell_height,
+                    STRIP_THICKNESS * width,
+                    cell_height,
+                )
+            })
+        }
+    };
 
-    let field_gap = FIELD_GAP * width;
-    let field_x = margin + size + field_gap;
-    let field_y = strip_y + strip_height + field_gap;
-    let field_width = (width - margin - size - field_gap - field_x).max(1.0);
-    let field_height = (height - margin - size - field_gap - field_y).max(1.0);
-    let cell_w = field_width / f64::from(PATCH_COLUMNS);
-    let cell_h = field_height / f64::from(PATCH_ROWS);
+    let (field_x, field_y, field_width, field_height) = match orientation {
+        Orientation::Portrait => {
+            let top = (strip_offset + STRIP_THICKNESS + FIELD_GAP) * height;
+            let bottom = (1.0 - margin - size - FIELD_GAP) * height;
+            (
+                FIELD_EDGE_MARGIN * width,
+                top,
+                (1.0 - 2.0 * FIELD_EDGE_MARGIN) * width,
+                bottom - top,
+            )
+        }
+        Orientation::Landscape => {
+            let left = (strip_offset + STRIP_THICKNESS + FIELD_GAP) * width;
+            let right = (1.0 - margin - size - FIELD_GAP) * width;
+            (
+                left,
+                FIELD_EDGE_MARGIN * height,
+                right - left,
+                (1.0 - 2.0 * FIELD_EDGE_MARGIN) * height,
+            )
+        }
+    };
+    let columns = orientation.columns();
+    let rows = orientation.rows();
+    let cell_width = field_width / f64::from(columns);
+    let cell_height = field_height / f64::from(rows);
     let patches = core::array::from_fn(|index| {
-        let column = (index % PATCH_COLUMNS as usize) as f64;
-        let row = (index / PATCH_COLUMNS as usize) as f64;
+        let column = (index % columns as usize) as f64;
+        let row = (index / columns as usize) as f64;
         Rect::new(
-            field_x + column * cell_w,
-            field_y + row * cell_h,
-            cell_w,
-            cell_h,
+            field_x + column * cell_width,
+            field_y + row * cell_height,
+            cell_width,
+            cell_height,
         )
     });
 
@@ -255,32 +344,26 @@ struct Template {
 }
 
 impl Template {
-    // Rectangles as fractions of the content box.
-    fn new() -> Self {
-        let rects = layout_rects(9.0, 16.0);
-        let normalize = |rect: &Rect| {
-            Rect::new(
-                rect.x / 9.0,
-                rect.y / 16.0,
-                rect.width / 9.0,
-                rect.height / 16.0,
-            )
-        };
+    fn new(orientation: Orientation) -> Self {
+        let rects = layout_rects(orientation, 1.0, 1.0);
         Self {
-            fiducial_centers: rects.fiducials.map(|rect| {
-                let rect = normalize(&rect);
-                rect.center()
-            }),
-            strip: rects.strip.map(|rect| normalize(&rect)),
-            patches: rects.patches.map(|rect| normalize(&rect)),
+            fiducial_centers: rects.fiducials.map(|rect| rect.center()),
+            strip: rects.strip,
+            patches: rects.patches,
         }
     }
 }
 
-static TEMPLATE: LazyLock<Template> = LazyLock::new(Template::new);
+/// Indexed by [`Orientation::index`].
+static TEMPLATES: LazyLock<[Template; 2]> = LazyLock::new(|| {
+    [
+        Template::new(Orientation::Portrait),
+        Template::new(Orientation::Landscape),
+    ]
+});
 
-/// The rendered pattern: a 9:16 content box centred in the viewport, black
-/// elsewhere.
+/// The rendered pattern: a content box with the viewport's orientation and a
+/// clamped aspect, black elsewhere.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PatternLayout {
     pub width: u32,
@@ -293,21 +376,37 @@ pub struct PatternLayout {
 
 impl PatternLayout {
     pub fn new(width: u32, height: u32) -> Result<Self, PatternError> {
-        let content_width = (f64::from(width)).min(f64::from(height) * CONTENT_ASPECT);
-        if width == 0 || height == 0 || content_width < f64::from(MIN_CONTENT_WIDTH) {
+        if width == 0 || height == 0 {
             return Err(PatternError::TooSmall {
                 min_width: MIN_CONTENT_WIDTH,
-                min_height: (f64::from(MIN_CONTENT_WIDTH) / CONTENT_ASPECT).ceil() as u32,
+                min_height: MIN_CONTENT_WIDTH,
             });
         }
-        let content_height = content_width / CONTENT_ASPECT;
+        let viewport_width = f64::from(width);
+        let viewport_height = f64::from(height);
+        let viewport_aspect = viewport_width / viewport_height;
+        let content_aspect = viewport_aspect.clamp(MIN_CONTENT_ASPECT, MAX_CONTENT_ASPECT);
+        let (content_width, content_height) = if content_aspect < viewport_aspect {
+            (content_aspect * viewport_height, viewport_height)
+        } else if content_aspect > viewport_aspect {
+            (viewport_width, viewport_width / content_aspect)
+        } else {
+            (viewport_width, viewport_height)
+        };
+        if content_width < f64::from(MIN_CONTENT_WIDTH) {
+            return Err(PatternError::TooSmall {
+                min_width: MIN_CONTENT_WIDTH,
+                min_height: (f64::from(MIN_CONTENT_WIDTH) / content_aspect).ceil() as u32,
+            });
+        }
         let content = Rect::new(
-            (f64::from(width) - content_width) * 0.5,
-            (f64::from(height) - content_height) * 0.5,
+            (viewport_width - content_width) * 0.5,
+            (viewport_height - content_height) * 0.5,
             content_width,
             content_height,
         );
-        let rects = layout_rects(content_width, content_height);
+        let orientation = Orientation::of(content_width, content_height);
+        let rects = layout_rects(orientation, content_width, content_height);
         let shift = |rect: &Rect| {
             Rect::new(
                 rect.x + content.x,
@@ -604,7 +703,6 @@ pub fn detect(
         return Err(PatternError::FiducialsNotFound);
     }
     let centers = gray.fiducials(white, params)?;
-    let template_centers = TEMPLATE.fiducial_centers;
 
     let fiducial_quad: Quad = [
         gray.to_full(centers[0]),
@@ -612,8 +710,13 @@ pub fn detect(
         gray.to_full(centers[2]),
         gray.to_full(centers[3]),
     ];
-    let homography = Homography::from_quad(&template_centers, &fiducial_quad)?;
-    let mapped = homography
+    // Any corner assignment sends the template centre to the quad's diagonal
+    // intersection, so the frame checks do not depend on the rotation tried.
+    let frame = Homography::from_quad(
+        &TEMPLATES[Orientation::Portrait.index()].fiducial_centers,
+        &fiducial_quad,
+    )?;
+    let mapped = frame
         .map(Point::new(0.5, 0.5))
         .ok_or(PatternError::FiducialGeometry)?;
     let width = f64::from(jpeg.image.width);
@@ -628,16 +731,35 @@ pub fn detect(
         return Err(PatternError::FiducialGeometry);
     }
 
-    let digest = gray
-        .decode_strip(&homography, white)
-        .ok_or(PatternError::StripUndecodable)?;
     let expected = seed.digest();
-    if digest != expected {
-        return Err(PatternError::SessionMismatch {
-            found: digest,
-            expected,
-        });
+    let mut found = None;
+    let mut matched = None;
+    for orientation in [Orientation::Portrait, Orientation::Landscape] {
+        let template = &TEMPLATES[orientation.index()];
+        for rotation in 0..4usize {
+            let quad: Quad = core::array::from_fn(|index| fiducial_quad[(index + rotation) % 4]);
+            let Ok(homography) = Homography::from_quad(&template.fiducial_centers, &quad) else {
+                continue;
+            };
+            let Some(digest) = gray.decode_strip(template, &homography, white) else {
+                continue;
+            };
+            if digest == expected {
+                matched = Some((template, homography, digest));
+                break;
+            }
+            found.get_or_insert(digest);
+        }
+        if matched.is_some() {
+            break;
+        }
     }
+    let Some((template, homography, digest)) = matched else {
+        return Err(match found {
+            Some(found) => PatternError::SessionMismatch { found, expected },
+            None => PatternError::StripUndecodable,
+        });
+    };
 
     let sampler = PatchSampler {
         jpeg,
@@ -650,7 +772,7 @@ pub fn detect(
     let order = patch_order(seed);
     let mut rows = Vec::with_capacity(PATCH_COUNT);
     for (cell, color_index) in order.iter().enumerate() {
-        let rect = TEMPLATE.patches[cell];
+        let rect = template.patches[cell];
         let half = Point::new(rect.width * 0.5, rect.height * 0.5);
         let Some(sample) = sampler.sample(&homography, rect.center(), half) else {
             continue;
@@ -808,6 +930,8 @@ impl Gray {
         let total = (self.width * self.height) as f64;
         let min_area = ((params.min_fiducial_area * total) as usize).max(8);
         let blobs = self.components(&bright, min_area);
+        // A fiducial is a fixed fraction of each axis, so its image aspect
+        // follows the display's, including when the display is rotated.
         let candidates: Vec<&Blob> = blobs
             .iter()
             .filter(|blob| {
@@ -817,7 +941,7 @@ impl Gray {
                 let aspect = box_width / box_height;
                 fraction >= params.min_fiducial_area
                     && fraction <= params.max_fiducial_area
-                    && (0.5..=2.0).contains(&aspect)
+                    && (0.25..=4.0).contains(&aspect)
                     && blob.mean >= 0.4 * white
                     && blob.centre_mean < params.fiducial_hole_ratio * blob.mean
             })
@@ -889,10 +1013,15 @@ impl Gray {
         blobs
     }
 
-    fn decode_strip(&self, homography: &Homography, white: f64) -> Option<PatternDigest> {
+    fn decode_strip(
+        &self,
+        template: &Template,
+        homography: &Homography,
+        white: f64,
+    ) -> Option<PatternDigest> {
         let threshold = 0.4 * white;
         let mut cells = [0.0f64; STRIP_CELLS];
-        for (index, cell) in TEMPLATE.strip.iter().enumerate() {
+        for (index, cell) in template.strip.iter().enumerate() {
             let mut sum = 0.0;
             let mut count = 0.0;
             for (sx, sy) in inner_offsets(3) {
@@ -971,10 +1100,10 @@ impl BlobBuilder {
 
     fn finish(self, gray: &Gray) -> Blob {
         let area = self.area as f64;
-        let centre_x0 = self.x0 + (self.x1 - self.x0) * 3 / 10;
-        let centre_x1 = self.x0 + (self.x1 - self.x0) * 7 / 10;
-        let centre_y0 = self.y0 + (self.y1 - self.y0) * 3 / 10;
-        let centre_y1 = self.y0 + (self.y1 - self.y0) * 7 / 10;
+        let centre_x0 = self.x0 + (self.x1 - self.x0) * 2 / 5;
+        let centre_x1 = self.x0 + (self.x1 - self.x0) * 3 / 5;
+        let centre_y0 = self.y0 + (self.y1 - self.y0) * 2 / 5;
+        let centre_y1 = self.y0 + (self.y1 - self.y0) * 3 / 5;
         let mut sum = 0.0;
         let mut count = 0.0;
         for y in centre_y0..=centre_y1 {
@@ -1062,18 +1191,49 @@ mod tests {
     }
 
     #[test]
-    fn the_layout_covers_the_content_box() {
-        let layout = PatternLayout::new(1080, 2400).expect("layout");
-        assert_eq!(layout.patches().len(), PATCH_COUNT);
-        assert_eq!(layout.strip().len(), STRIP_CELLS);
-        let content = layout.content;
-        assert!((content.width / content.height - 9.0 / 16.0).abs() < 1e-9);
-        for patch in layout.patches() {
-            assert!(patch.x >= content.x);
-            assert!(patch.y >= content.y);
-            assert!(patch.x + patch.width <= content.x + content.width + 1e-6);
-            assert!(patch.y + patch.height <= content.y + content.height + 1e-6);
+    fn the_layout_fills_the_viewport_and_keeps_cells_near_square() {
+        for (width, height) in [(1080, 2340), (2560, 1600), (1080, 1920), (1920, 1080)] {
+            let layout = PatternLayout::new(width, height).expect("layout");
+            assert_eq!(layout.patches().len(), PATCH_COUNT);
+            assert_eq!(layout.strip().len(), STRIP_CELLS);
+            let content = layout.content;
+            assert_eq!(content.x, 0.0);
+            assert_eq!(content.y, 0.0);
+            assert_eq!(content.width, f64::from(width));
+            assert_eq!(content.height, f64::from(height));
+            for patch in layout.patches() {
+                assert!(patch.x >= content.x);
+                assert!(patch.y >= content.y);
+                assert!(patch.x + patch.width <= content.x + content.width + 1e-6);
+                assert!(patch.y + patch.height <= content.y + content.height + 1e-6);
+            }
+            let cell = layout.patches()[0].width / layout.patches()[0].height;
+            assert!(
+                (0.7..=1.4).contains(&cell),
+                "{width}×{height} has cells of aspect {cell}"
+            );
         }
+    }
+
+    #[test]
+    fn an_extreme_viewport_is_letterboxed() {
+        let wide = PatternLayout::new(3000, 1000).expect("layout");
+        assert_eq!(wide.content.height, 1000.0);
+        assert!(
+            (wide.content.width / wide.content.height - 21.0 / 9.0).abs() < 1e-9,
+            "{}",
+            wide.content.width / wide.content.height
+        );
+        assert!(wide.content.x > 0.0);
+
+        let tall = PatternLayout::new(1000, 3000).expect("layout");
+        assert_eq!(tall.content.width, 1000.0);
+        assert!(
+            (tall.content.width / tall.content.height - 9.0 / 21.0).abs() < 1e-9,
+            "{}",
+            tall.content.width / tall.content.height
+        );
+        assert!(tall.content.y > 0.0);
         assert!(PatternLayout::new(100, 100).is_err());
     }
 

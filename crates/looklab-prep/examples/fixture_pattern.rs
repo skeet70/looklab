@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Writes the committed pattern fixture and its viewer page.
-//!
-//! The seed is fixed and public: the 32 bytes of SHA-256 over
-//! `looklab-fixture-pattern-v1`. `cargo run -p looklab-prep --example
-//! fixture_pattern` regenerates `fixtures/pattern/pattern.png` and
-//! `fixtures/pattern/index.html`.
+//! Writes the committed pattern fixtures and their viewer page.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use looklab_color::RgbSpace;
 use looklab_prep::Image3;
@@ -15,8 +10,8 @@ use looklab_prep::pattern::{self, PatternSeed};
 use sha2::{Digest, Sha256};
 
 const SEED_TEXT: &str = "looklab-fixture-pattern-v1";
-const WIDTH: u32 = 2560;
-const HEIGHT: u32 = 1440;
+const PORTRAIT: (u32, u32) = (1080, 2340);
+const LANDSCAPE: (u32, u32) = (2560, 1600);
 
 const PAGE: &str = r#"<!doctype html>
 <html lang="en">
@@ -30,9 +25,17 @@ const PAGE: &str = r#"<!doctype html>
       color: #8a8a8a; background: #000; font: 14px system-ui, sans-serif; text-align: center; }
   :fullscreen p, :-webkit-full-screen p { display: none; }
 </style>
-<img src="pattern.png" alt="Contribution pattern">
+<img id="pattern" alt="Contribution pattern">
 <p>Tap or click for full screen, then raise the brightness.</p>
 <script>
+  var image = document.getElementById("pattern");
+  var query = window.matchMedia("(orientation: portrait)");
+  function show() {
+    image.src = query.matches ? "pattern-portrait.png" : "pattern-landscape.png";
+  }
+  show();
+  if (query.addEventListener) { query.addEventListener("change", show); }
+  else { query.addListener(show); }
   document.addEventListener("click", function () {
     if (!document.fullscreenElement && !document.webkitFullscreenElement) {
       var root = document.documentElement;
@@ -71,18 +74,35 @@ fn encode_png(image: &Image3) -> Vec<u8> {
 }
 
 #[allow(clippy::disallowed_methods)]
+fn write_fixture(directory: &Path, seed: &PatternSeed, name: &str, size: (u32, u32)) {
+    let image = pattern::render(seed, size.0, size.1).expect("the fixture size renders");
+    let bytes = encode_png(&image);
+    let path = directory.join(name);
+    fs::write(&path, &bytes).expect("writes the fixture");
+    println!(
+        "{} {}×{} {} bytes",
+        path.display(),
+        size.0,
+        size.1,
+        bytes.len()
+    );
+}
+
+#[allow(clippy::disallowed_methods)]
 fn main() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let directory = root.join("fixtures/pattern");
     fs::create_dir_all(&directory).expect("fixtures/pattern exists");
 
     let seed = fixture_seed();
-    let image = pattern::render(&seed, WIDTH, HEIGHT).expect("the fixture size renders");
-    fs::write(directory.join("pattern.png"), encode_png(&image)).expect("writes pattern.png");
-    fs::write(directory.join("index.html"), PAGE).expect("writes index.html");
+    write_fixture(&directory, &seed, "pattern-portrait.png", PORTRAIT);
+    write_fixture(&directory, &seed, "pattern-landscape.png", LANDSCAPE);
+    let page = directory.join("index.html");
+    fs::write(&page, PAGE).expect("writes index.html");
     println!(
-        "wrote {} ({WIDTH}×{HEIGHT}) for seed {} digest {}",
-        directory.display(),
+        "{} {} bytes for seed {} digest {}",
+        page.display(),
+        PAGE.len(),
         seed.to_hex(),
         seed.digest()
     );

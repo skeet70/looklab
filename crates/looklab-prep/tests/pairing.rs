@@ -63,6 +63,7 @@ fn metadata(
         },
         fuji,
         firmware: None,
+        render_tag: None,
     }
 }
 

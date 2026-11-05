@@ -31,7 +31,7 @@ A few library shots at DR200 (ISO ≥ 320) and DR400 (ISO ≥ 640), same scene a
 ### No chart?
 Shoot these instead. They help with tone, white balance and saturated coverage, but they can't calibrate the camera's colour transform. That still needs a real chart.
 - **Neutral reference:** a matte grey card, or plain white printer paper, filling about half the frame in even daylight. WB on Daylight. Bracket 0, −1, −2 EV, then re-render the 0 EV RAW through every film simulation.
-- **Screen pattern:** on a phone or laptop, open [the pattern image](https://raw.githubusercontent.com/skeet70/looklab/main/fixtures/pattern/pattern.png) and view it full-screen, black background, landscape. Set brightness to maximum and turn off night shift, True Tone and adaptive colour. Fill about 60% of the frame, defocus slightly, and bracket 0, −1, −2 EV. Note the device model.
+- **Screen pattern:** on a phone held upright, open [the portrait pattern](https://raw.githubusercontent.com/skeet70/looklab/main/fixtures/pattern/pattern-portrait.png); on a laptop or tablet, open [the landscape pattern](https://raw.githubusercontent.com/skeet70/looklab/main/fixtures/pattern/pattern-landscape.png). Tap the image so the browser hides its toolbars if it does, and fill most of the frame. Set brightness to maximum and turn off night shift, True Tone and adaptive colour; defocus slightly and bracket 0, −1, −2 EV. Note the device model.
 
 ## 5. Tone gradient
 One defocused shot of a smooth gradient running from clipped white to black under a single light, WB set to that light, rough uniform histogram, clipping in the RAW.

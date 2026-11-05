@@ -10,9 +10,17 @@
       color: #8a8a8a; background: #000; font: 14px system-ui, sans-serif; text-align: center; }
   :fullscreen p, :-webkit-full-screen p { display: none; }
 </style>
-<img src="pattern.png" alt="Contribution pattern">
+<img id="pattern" alt="Contribution pattern">
 <p>Tap or click for full screen, then raise the brightness.</p>
 <script>
+  var image = document.getElementById("pattern");
+  var query = window.matchMedia("(orientation: portrait)");
+  function show() {
+    image.src = query.matches ? "pattern-portrait.png" : "pattern-landscape.png";
+  }
+  show();
+  if (query.addEventListener) { query.addEventListener("change", show); }
+  else { query.addListener(show); }
   document.addEventListener("click", function () {
     if (!document.fullscreenElement && !document.webkitFullscreenElement) {
       var root = document.documentElement;
