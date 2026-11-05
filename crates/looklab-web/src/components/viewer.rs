@@ -142,7 +142,10 @@ pub enum DifferenceSupport {
 }
 
 fn paint(canvas: &HtmlCanvasElement, lut: &[u8], scene: &PreparedScene) -> Result<(), String> {
-    let rgba = render_preview(lut, scene).map_err(|error| error.to_string())?;
+    let rgba = crate::data::timed(crate::data::PreviewStage::LutApply, || {
+        render_preview(lut, scene)
+    })
+    .map_err(|error| error.to_string())?;
     let context = canvas
         .get_context("2d")
         .map_err(|_| "2D canvas is unavailable".to_owned())?
@@ -154,9 +157,11 @@ fn paint(canvas: &HtmlCanvasElement, lut: &[u8], scene: &PreparedScene) -> Resul
             .map_err(|_| "Could not prepare the simulated image".to_owned())?;
     canvas.set_width(scene.width());
     canvas.set_height(scene.height());
-    context
-        .put_image_data(&image, 0.0, 0.0)
-        .map_err(|_| "Could not draw the simulated image".to_owned())
+    crate::data::timed(crate::data::PreviewStage::CanvasPaint, || {
+        context
+            .put_image_data(&image, 0.0, 0.0)
+            .map_err(|_| "Could not draw the simulated image".to_owned())
+    })
 }
 
 #[component]

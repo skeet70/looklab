@@ -3,7 +3,8 @@
 
 use looklab_meta::ParsedMetadata;
 use looklab_schema::{
-    MakernoteValues, settings_from_makernote_partial, sim_from_makernote, validate_control_schema,
+    MakernoteValues, settings_from_makernote_partial, sim_from_makernote, unmapped_controls,
+    validate_control_schema,
 };
 use serde::Serialize;
 
@@ -18,6 +19,8 @@ pub struct SettingsPrefill {
     pub controls: Vec<(String, i64)>,
     /// Controls the tags did not determine, with the reason.
     pub unavailable: Vec<String>,
+    /// Look-affecting controls the schema maps from no tag.
+    pub unmapped: Vec<String>,
 }
 
 /// Derives the settings of `files` through the body's control schema.
@@ -48,6 +51,10 @@ pub fn prefill_settings(
             .map(|setting| (setting.key.to_string(), setting.step))
             .collect(),
         unavailable: problems.iter().map(ToString::to_string).collect(),
+        unmapped: unmapped_controls(epoch)
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
     })
 }
 
@@ -85,5 +92,6 @@ mod tests {
         assert_eq!(prefill.sim.as_deref(), Some("provia"));
         assert_eq!(prefill.controls.len(), 12);
         assert!(prefill.unavailable.is_empty(), "{:?}", prefill.unavailable);
+        assert!(prefill.unmapped.is_empty(), "{:?}", prefill.unmapped);
     }
 }

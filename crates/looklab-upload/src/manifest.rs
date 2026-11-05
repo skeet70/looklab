@@ -7,8 +7,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::ids::{
-    BodyId, CardDeclaration, ContributionKind, ControlSettings, FirmwareVersionString, Intent,
-    SimKey,
+    BodyId, CardDeclaration, CommunitySnapshotVersion, ContributionKind, ControlKey,
+    ControlSettings, FirmwareVersionString, Intent, SettingSource, SimKey,
 };
 use crate::metadata::ManifestMetadata;
 use crate::nonce::ManifestHash;
@@ -54,8 +54,26 @@ pub struct BatchManifest {
     pub body: BodyId,
     pub firmware_version: FirmwareVersionString,
     pub sim_key: SimKey,
+    pub community_snapshot_version: CommunitySnapshotVersion,
     pub settings: ControlSettings,
     pub images: Vec<ManifestImage>,
+}
+
+/// The look-affecting controls of the named snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingReach {
+    /// Controls the schema maps from a makernote tag.
+    pub mapped: Vec<ControlKey>,
+    /// Controls the schema maps from no tag.
+    pub unmapped: Vec<ControlKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SettingsSourceError {
+    #[error("look-affecting control `{key}` has no value; declare it")]
+    MissingLookAffectingControl { key: ControlKey },
+    #[error("control `{key}` is reproduced but its snapshot maps no tag for it")]
+    ReproducedWithoutMapping { key: ControlKey },
 }
 
 /// A batch whose intent disagrees with its images' render tags.
@@ -75,7 +93,44 @@ pub enum IntentError {
     MissingCardTag,
 }
 
+/// Rejects settings the named snapshot cannot support. A card render
+/// (`card`) is exempt from covering every look-affecting control.
+pub fn validate_setting_sources(
+    settings: &ControlSettings,
+    card: bool,
+    reach: &SettingReach,
+) -> Result<(), SettingsSourceError> {
+    for entry in settings.entries() {
+        if entry.source == SettingSource::Reproduced && reach.unmapped.contains(&entry.key) {
+            return Err(SettingsSourceError::ReproducedWithoutMapping {
+                key: entry.key.clone(),
+            });
+        }
+    }
+    if card {
+        return Ok(());
+    }
+    for key in reach.mapped.iter().chain(&reach.unmapped) {
+        if settings.get(key).is_none() {
+            return Err(SettingsSourceError::MissingLookAffectingControl { key: key.clone() });
+        }
+    }
+    Ok(())
+}
+
 impl BatchManifest {
+    /// Rejects settings the named snapshot cannot support.
+    pub fn validate_setting_sources(
+        &self,
+        reach: &SettingReach,
+    ) -> Result<(), SettingsSourceError> {
+        validate_setting_sources(
+            &self.settings,
+            matches!(self.intent, Intent::Card(_)),
+            reach,
+        )
+    }
+
     /// Rejects a batch whose render tags and card declaration disagree
     /// ([docs/07 §4](../../../docs/07-contribution.md)).
     pub fn validate_intent(&self) -> Result<(), IntentError> {

@@ -6,9 +6,10 @@ use looklab_samples::{
     PrepVersion, PriorTransformVersion, RerenderGroupId, SampleFlags, SampleHeader, SampleSet,
 };
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, ContributionKind, ControlEntry, ControlKey, ControlSettings,
-    EnvelopeParts, FirmwareVersionString, Intent, Limits, ManifestImage, ManifestMetadata, Nonce,
-    PowSolutions, RawSerial, SimKey, StepIndex, WebAuthnAssertion, encode_envelope,
+    BatchManifest, BlobKind, BodyId, CommunitySnapshotVersion, ContributionKind, ControlEntry,
+    ControlKey, ControlSettings, EnvelopeParts, FirmwareVersionString, Intent, Limits,
+    ManifestImage, ManifestMetadata, Nonce, PowSolutions, RawSerial, SimKey, StepIndex,
+    WebAuthnAssertion, encode_envelope,
 };
 use sha2::{Digest, Sha256};
 
@@ -93,15 +94,16 @@ pub fn manifest(images: Vec<ManifestImage>) -> BatchManifest {
         body: BodyId::new("fujifilm/x-t5").expect("fixture body id"),
         firmware_version: FirmwareVersionString::new("2.10").expect("fixture firmware"),
         sim_key: SimKey::new("classic_chrome").expect("fixture sim key"),
+        community_snapshot_version: CommunitySnapshotVersion::SHIPPED,
         settings: ControlSettings::new(vec![
-            ControlEntry {
-                key: ControlKey::new("highlight_tone").expect("fixture control key"),
-                step: StepIndex::new(2),
-            },
-            ControlEntry {
-                key: ControlKey::new("shadow_tone").expect("fixture control key"),
-                step: StepIndex::new(-1),
-            },
+            ControlEntry::reproduced(
+                ControlKey::new("highlight_tone").expect("fixture control key"),
+                StepIndex::new(2),
+            ),
+            ControlEntry::reproduced(
+                ControlKey::new("shadow_tone").expect("fixture control key"),
+                StepIndex::new(-1),
+            ),
         ])
         .expect("fixture settings are unique"),
         images,
@@ -233,6 +235,8 @@ pub fn images_count_offset(manifest: &BatchManifest) -> usize {
         postcard::to_allocvec(&manifest.body).expect("body serializes"),
         postcard::to_allocvec(&manifest.firmware_version).expect("firmware serializes"),
         postcard::to_allocvec(&manifest.sim_key).expect("sim key serializes"),
+        postcard::to_allocvec(&manifest.community_snapshot_version)
+            .expect("snapshot version serializes"),
         postcard::to_allocvec(&manifest.settings).expect("settings serialize"),
     ];
     parts.iter().map(Vec::len).sum()

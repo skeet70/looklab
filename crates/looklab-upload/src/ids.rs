@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use looklab_meta::{FirmwareId, FirmwareVersion, RenderTag};
 pub use looklab_schema::{
-    BodyId, ControlKey, IdError, MAX_BODY_ID_LEN, MAX_SLUG_LEN, SimKey, validate_slug,
+    BodyId, ControlKey, IdError, MAX_BODY_ID_LEN, MAX_SLUG_LEN, SettingSource, SimKey,
+    validate_slug,
 };
 
 pub const MAX_FIRMWARE_LEN: usize = MAX_SLUG_LEN;
@@ -186,10 +187,48 @@ impl StepIndex {
     }
 }
 
+/// The community data snapshot whose schema a batch's settings were read against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CommunitySnapshotVersion(u64);
+
+impl CommunitySnapshotVersion {
+    pub const SHIPPED: Self = Self(0);
+
+    pub const fn new(version: u64) -> Self {
+        Self(version)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for CommunitySnapshotVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "v{}", self.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ControlEntry {
     pub key: ControlKey,
     pub step: StepIndex,
+    pub source: SettingSource,
+}
+
+impl ControlEntry {
+    pub const fn new(key: ControlKey, step: StepIndex, source: SettingSource) -> Self {
+        Self { key, step, source }
+    }
+
+    pub const fn reproduced(key: ControlKey, step: StepIndex) -> Self {
+        Self::new(key, step, SettingSource::Reproduced)
+    }
+
+    pub const fn declared(key: ControlKey, step: StepIndex) -> Self {
+        Self::new(key, step, SettingSource::Declared)
+    }
 }
 
 /// Rejected settings lists.
@@ -215,6 +254,10 @@ impl ControlSettings {
 
     pub fn entries(&self) -> &[ControlEntry] {
         &self.0
+    }
+
+    pub fn get(&self, key: &ControlKey) -> Option<&ControlEntry> {
+        self.0.iter().find(|entry| &entry.key == key)
     }
 
     pub fn is_empty(&self) -> bool {

@@ -1587,6 +1587,17 @@ pub struct FailedGate {
 #[serde(transparent)]
 pub struct GateReport(pub Value);
 
+/// A Look whose native fit keeps failing to converge ([docs/02 §4.3]).
+#[derive(Debug, Clone, Serialize)]
+pub struct FitHold {
+    pub look: LookSlug,
+    pub consecutive: u32,
+    pub first_attempt: i64,
+    pub last_attempt: i64,
+    /// Worker-owned diagnostics of the last non-converged batch.
+    pub diagnostics: Value,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SerialReuseFlag {
     pub flag: String,
@@ -1606,6 +1617,7 @@ pub struct Nomination {
 pub struct ModQueue {
     pub proposals: Vec<QueueProposal>,
     pub failed_gates: Vec<FailedGate>,
+    pub fit_holds: Vec<FitHold>,
     pub serial_reuse: Vec<SerialReuseFlag>,
     pub nominations: Vec<Nomination>,
 }
@@ -1647,6 +1659,27 @@ pub async fn mod_queue(db: &SqlitePool, tier: Tier) -> Result<ModQueue, AdminErr
                 .map_err(|_| AdminError::Corrupt)?,
             report: GateReport(serde_json::from_str(&report).map_err(|_| AdminError::Corrupt)?),
             created_at: row.get("created_at"),
+        })
+    })
+    .collect::<Result<Vec<_>, AdminError>>()?;
+
+    let fit_holds = sqlx::query(
+        "SELECT look, consecutive, first_attempt, last_attempt, diagnostics FROM fit_holds
+         WHERE status = 'pending' ORDER BY last_attempt, look",
+    )
+    .fetch_all(db)
+    .await?
+    .into_iter()
+    .map(|row| {
+        let diagnostics: String = row.get("diagnostics");
+        Ok(FitHold {
+            look: LookSlug::try_from(row.get::<String, _>("look"))
+                .map_err(|_| AdminError::Corrupt)?,
+            consecutive: u32::try_from(row.get::<i64, _>("consecutive"))
+                .map_err(|_| AdminError::Corrupt)?,
+            first_attempt: row.get("first_attempt"),
+            last_attempt: row.get("last_attempt"),
+            diagnostics: serde_json::from_str(&diagnostics).map_err(|_| AdminError::Corrupt)?,
         })
     })
     .collect::<Result<Vec<_>, AdminError>>()?;
@@ -1719,6 +1752,7 @@ pub async fn mod_queue(db: &SqlitePool, tier: Tier) -> Result<ModQueue, AdminErr
     Ok(ModQueue {
         proposals,
         failed_gates,
+        fit_holds,
         serial_reuse,
         nominations,
     })

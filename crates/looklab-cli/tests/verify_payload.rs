@@ -15,11 +15,11 @@ use looklab_prep_module::{
     Function, ModuleError, PrepareRequest, PreparedImageView, PriorTransformSpec, Response,
 };
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, ContributionKind, ControlEntry,
-    ControlKey, ControlSettings, EnvelopeParts, FirmwareId, FirmwareVersion, FirmwareVersionString,
-    Intent, ManifestHash, ManifestImage, Nonce, POW_K, PowParams, RawSerial, RerenderGroupId,
-    SimKey, StepIndex, Tagged, WebAuthnAssertion, encode_envelope, manifest_hash, parse_render_tag,
-    solve,
+    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion,
+    ContributionKind, ControlEntry, ControlKey, ControlSettings, EnvelopeParts, FirmwareId,
+    FirmwareVersion, FirmwareVersionString, Intent, ManifestHash, ManifestImage, Nonce, POW_K,
+    PowParams, RawSerial, RerenderGroupId, SimKey, StepIndex, Tagged, WebAuthnAssertion,
+    encode_envelope, manifest_hash, parse_render_tag, solve,
 };
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use serde_json::{Value, json};
@@ -61,6 +61,23 @@ const CARD_TAG: &str = "looklab-card/1 fw=acme-sim/2.0.1 look=provia@1.0.0 cid=0
 fn card_fixture() -> &'static Fixture {
     static FIXTURE: LazyLock<Fixture> =
         LazyLock::new(|| build_fixture_in("verify-payload-card", Some(CARD_TAG)));
+    &FIXTURE
+}
+
+/// A fixture whose schema maps no makernote tag for `color_chrome_effect`.
+fn declared_fixture() -> &'static Fixture {
+    static FIXTURE: LazyLock<Fixture> = LazyLock::new(|| {
+        let fixture = build_fixture_in("verify-payload-declared", None);
+        let schema_path = fixture.data.join("bodies/fujifilm-x-s10.yaml");
+        let schema = std::fs::read_to_string(&schema_path).expect("schema");
+        let unmapped = schema.replace(
+            "        makernote: { tag: ColorChromeEffect, values: { off: 0, weak: 32, strong: 64 } }\n",
+            "",
+        );
+        assert_ne!(unmapped, schema, "the mapping line moved");
+        std::fs::write(&schema_path, unmapped).expect("schema without the mapping");
+        fixture
+    });
     &FIXTURE
 }
 
@@ -396,9 +413,11 @@ fn settings() -> ControlSettings {
         "noise_reduction",
     ]
     .into_iter()
-    .map(|key| ControlEntry {
-        key: ControlKey::new(key).expect("control key"),
-        step: StepIndex::new(0),
+    .map(|key| {
+        ControlEntry::reproduced(
+            ControlKey::new(key).expect("control key"),
+            StepIndex::new(0),
+        )
     })
     .collect();
     ControlSettings::new(entries).expect("unique settings")
@@ -439,6 +458,7 @@ impl Site {
                 body: BodyId::new(BODY).expect("body id"),
                 firmware_version: FirmwareVersionString::new(FIRMWARE).expect("firmware"),
                 sim_key: SimKey::new(SIM).expect("sim key"),
+                community_snapshot_version: CommunitySnapshotVersion::SHIPPED,
                 settings: settings(),
                 images,
             },
@@ -507,12 +527,23 @@ impl Site {
         self
     }
 
+    fn with_declared_color_chrome_effect(mut self, step: i64) -> Self {
+        let mut entries = self.manifest.settings.entries().to_vec();
+        entries.retain(|entry| entry.key.as_str() != "color_chrome_effect");
+        entries.push(ControlEntry::declared(
+            ControlKey::new("color_chrome_effect").expect("control key"),
+            StepIndex::new(step),
+        ));
+        self.manifest.settings = ControlSettings::new(entries).expect("unique settings");
+        self
+    }
+
     fn with_hidden_setting(mut self) -> Self {
         let mut entries = self.manifest.settings.entries().to_vec();
-        entries.push(ControlEntry {
-            key: ControlKey::new("hidden").expect("control key"),
-            step: StepIndex::new(12_345),
-        });
+        entries.push(ControlEntry::reproduced(
+            ControlKey::new("hidden").expect("control key"),
+            StepIndex::new(12_345),
+        ));
         self.manifest.settings = ControlSettings::new(entries).expect("unique settings");
         self
     }
@@ -630,7 +661,7 @@ fn default_har(site: &Site) -> HarBuilder {
         )
         .post_body(
             "https://looklab.test/api/passkey/register/finish",
-            br#"{"handle":"registration-handle","credential":{"id":"Y3JlZA"}}"#,
+            br#"{"handle":"registration-handle","credential":{"id":"Y3JlZA","rawId":"Y3JlZA","type":"public-key","response":{"clientDataJSON":"e30","attestationObject":"oA"},"clientExtensionResults":{}}}"#,
         )
 }
 
@@ -722,6 +753,16 @@ fn run_with(
     state: &Path,
     intent_args: &[&str],
 ) -> (bool, String) {
+    run_extra(fixture, hars, state, intent_args, &[])
+}
+
+fn run_extra(
+    fixture: &Fixture,
+    hars: &[&Path],
+    state: &Path,
+    intent_args: &[&str],
+    extra: &[&str],
+) -> (bool, String) {
     let mut command = Command::cargo_bin("looklab").expect("built binary");
     command
         .args(["verify-payload", "--seeds"])
@@ -736,6 +777,7 @@ fn run_with(
         .arg(&fixture.data)
         .args(["--kind", "library"])
         .args(intent_args)
+        .args(extra)
         .arg("--state")
         .arg(state)
         .args([
@@ -845,6 +887,60 @@ fn reproduces_an_upload_and_passes() {
     let recorded: Value =
         serde_json::from_str(&std::fs::read_to_string(&state).expect("state file")).expect("json");
     assert_eq!(recorded["credentials"][0]["credential_id"], hex(CREDENTIAL));
+}
+
+#[test]
+fn a_matching_declare_setting_passes() {
+    let fixture = declared_fixture();
+    let site = Site::from_fixture(fixture).with_declared_color_chrome_effect(2);
+    let har = har_path("declared-pass", &default_har(&site).json());
+    let (success, output) = run_extra(
+        fixture,
+        &[har.as_path()],
+        &state_path("declared-pass"),
+        &["--intent", "native"],
+        &["--declare-setting", "color_chrome_effect=2"],
+    );
+
+    assert!(success, "{output}");
+    assert!(output.contains("PASS"), "{output}");
+    assert!(
+        output.contains("color_chrome_effect = 2 (declared)"),
+        "{output}"
+    );
+    assert!(output.contains("11 reproduced, 1 declared"), "{output}");
+}
+
+#[test]
+fn a_missing_declare_setting_fails() {
+    let fixture = declared_fixture();
+    let site = Site::from_fixture(fixture).with_declared_color_chrome_effect(2);
+    let har = har_path("declared-missing", &default_har(&site).json());
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("declared-missing"));
+
+    assert!(!success, "{output}");
+    assert!(
+        output.contains("color_chrome_effect has no value"),
+        "{output}"
+    );
+    assert!(output.contains("--declare-setting"), "{output}");
+}
+
+#[test]
+fn a_different_declare_setting_fails() {
+    let fixture = declared_fixture();
+    let site = Site::from_fixture(fixture).with_declared_color_chrome_effect(2);
+    let har = har_path("declared-wrong", &default_har(&site).json());
+    let (success, output) = run_extra(
+        fixture,
+        &[har.as_path()],
+        &state_path("declared-wrong"),
+        &["--intent", "native"],
+        &["--declare-setting", "color_chrome_effect=1"],
+    );
+
+    assert!(!success, "{output}");
+    assert!(output.contains("color_chrome_effect"), "{output}");
 }
 
 #[test]
@@ -971,7 +1067,10 @@ fn fails_on_a_setting_outside_the_schema() {
 
     assert!(!success, "{output}");
     assert!(output.contains("hidden"), "{output}");
-    assert!(output.contains("not reproduced"), "{output}");
+    assert!(
+        output.contains("neither reproduced nor declared"),
+        "{output}"
+    );
 }
 
 #[test]
@@ -1134,6 +1233,122 @@ fn fails_on_a_session_challenge_over_another_payload() {
 
     assert!(!success, "{output}");
     assert!(output.contains("challenge"), "{output}");
+}
+
+#[test]
+fn session_restoration_requires_the_upload_capability_and_no_body_or_query() {
+    let fixture = fixture();
+    let site = Site::new();
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x31; 32]);
+    let other = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x32; 32]);
+    for (name, authorization, url, body, expected) in [
+        (
+            "valid",
+            format!("Bearer {token}"),
+            "https://looklab.test/api/session",
+            None,
+            None,
+        ),
+        (
+            "mismatch",
+            format!("Bearer {other}"),
+            "https://looklab.test/api/session",
+            None,
+            Some("differs from the upload response"),
+        ),
+        (
+            "invalid",
+            "Bearer payload".to_owned(),
+            "https://looklab.test/api/session",
+            None,
+            Some("32-byte base64url status token"),
+        ),
+        (
+            "query",
+            format!("Bearer {token}"),
+            "https://looklab.test/api/session?payload=secret",
+            None,
+            Some("unexpected request"),
+        ),
+        (
+            "body",
+            format!("Bearer {token}"),
+            "https://looklab.test/api/session",
+            Some(b"payload".as_slice()),
+            Some("carries a body"),
+        ),
+    ] {
+        let mut har = default_har(&site);
+        let upload = har
+            .entries
+            .iter_mut()
+            .find(|entry| entry["request"]["url"] == "https://looklab.test/api/upload")
+            .expect("upload request");
+        upload["response"] =
+            json!({"content": {"text": json!({"status_token": token}).to_string()}});
+        har.entries.push(entry("GET", url, body));
+        let har = har.header("Authorization", &authorization);
+        let har = har_path(&format!("restore-{name}"), &har.json());
+        let (success, output) = run(
+            fixture,
+            &[har.as_path()],
+            &state_path(&format!("restore-{name}")),
+        );
+        assert_eq!(success, expected.is_none(), "{name}: {output}");
+        if let Some(finding) = expected {
+            assert!(output.contains(finding), "{name}: {output}");
+        }
+    }
+}
+
+#[test]
+fn fails_on_payload_bytes_in_a_session_body() {
+    let fixture = fixture();
+    let site = Site::new();
+    let body = session_body(
+        &site,
+        sha256(b"looklab-request-v1:session:"),
+        Some((
+            "payload",
+            json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(site.body())),
+        )),
+    );
+    let har = default_har(&site)
+        .post_body("https://looklab.test/api/session", &body)
+        .json();
+    let har = har_path("session-payload", &har);
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("session-payload"));
+    assert!(!success, "{output}");
+    assert!(output.contains("unaccounted key \"payload\""), "{output}");
+}
+
+#[test]
+fn fails_on_payload_bytes_inside_registration_credentials() {
+    let fixture = fixture();
+    let site = Site::new();
+    let body = serde_json::to_vec(&json!({
+        "handle": "registration-handle",
+        "credential": {
+            "id": "Y3JlZA", "rawId": "Y3JlZA", "type": "public-key",
+            "response": {"clientDataJSON": "e30", "attestationObject": "oA", "payload": [1, 2, 3]},
+            "clientExtensionResults": {}
+        }
+    }))
+    .expect("registration JSON");
+    let har = default_har(&site)
+        .post_body("https://looklab.test/api/passkey/register/finish", &body)
+        .json();
+    let har = har_path("registration-payload", &har);
+    let (success, output) = run(
+        fixture,
+        &[har.as_path()],
+        &state_path("registration-payload"),
+    );
+    assert!(!success, "{output}");
+    assert!(
+        output.contains("registration response carries an unaccounted key \"payload\""),
+        "{output}"
+    );
 }
 
 #[test]

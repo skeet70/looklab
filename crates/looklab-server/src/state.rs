@@ -155,7 +155,7 @@ impl AppState {
         config.validate()?;
         let db = open(&config.db_path).await?;
         let blobs: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(&config.blob_dir)?);
-        let bodies = Bodies::load(&config.bodies_dir)?;
+        let bodies = Bodies::load(&config.bodies_dir, &config.snapshot_dir)?;
         let secret = ServerSecret::load(&config.server_secret_path)?;
         let origin =
             Url::parse(&config.origin).map_err(|error| StateError::Webauthn(error.to_string()))?;

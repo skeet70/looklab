@@ -102,7 +102,7 @@ pub fn MatchPage() -> impl IntoView {
                     .ok_or("Choose a published look.")?
                     .version
                     .to_string();
-                let loaded = data::version(slug.as_str(), &version).await?;
+                let loaded = data::match_version(slug.as_str(), &version).await?;
                 let inputs = match_data::inputs_for_camera(
                     &loaded,
                     &camera_id,
@@ -708,8 +708,14 @@ pub fn MatchResultPage() -> impl IntoView {
     let application =
         Memo::new(move |_| Application::from_query(query.get().get("apply").as_deref()));
     let state = RwSignal::new(Load::<MatchReply>::Loading);
+    let pending_target = RwSignal::new(None::<(Arc<Vec<u8>>, Arc<looklab_publish::PreparedScene>)>);
+    let generation = RwSignal::new(0_u32);
     Effect::new(move |_| {
         let raw = params.get().get("permalink").unwrap_or_default();
+        let mine = generation.get_untracked().wrapping_add(1);
+        generation.set(mine);
+        state.set(Load::Loading);
+        pending_target.set(None);
         leptos::task::spawn_local_scoped_with_cancellation(async move {
             let result = async {
                 let bytes = crate::webauthn::decode_base64url(&raw)
@@ -717,6 +723,28 @@ pub fn MatchResultPage() -> impl IntoView {
                 let text =
                     String::from_utf8(bytes).map_err(|_| "This share link is not readable.")?;
                 let pinned = Permalink::parse(&text).map_err(|error| error.to_string())?;
+                let target_slug = pinned.target_slug.clone();
+                let target_version = pinned.target_version.clone();
+                spawn_local(async move {
+                    let photo = async {
+                        let index = data::index().await?;
+                        let scene = index
+                            .scenes
+                            .iter()
+                            .find(|scene| scene.kind == looklab_publish::SceneKind::Photo)
+                            .or_else(|| index.scenes.first())
+                            .ok_or("No sample photos are available.")?;
+                        let lut = data::preview(&target_slug, &target_version).await?;
+                        let photo = data::scene_thumbnail(scene.name.as_str()).await?;
+                        Ok::<_, String>((lut, Arc::new(photo)))
+                    }
+                    .await;
+                    if generation.try_get_untracked() == Some(mine)
+                        && let Ok(photo) = photo
+                    {
+                        let _ = pending_target.try_set(Some(photo));
+                    }
+                });
                 let inputs = match_data::inputs_from_permalink(&pinned).await?;
                 let reply = match_worker(&inputs).await?;
                 if reply.permalink != pinned.canonical() {
@@ -735,7 +763,13 @@ pub fn MatchResultPage() -> impl IntoView {
         <div class="match-page">
             <h1>"Your camera recipe"</h1>
             {move || match state.get() {
-                Load::Loading => ui::loading().into_any(),
+                Load::Loading => view! {
+                    <p role="status">"Calculating your camera settings…"</p>
+                    {move || pending_target.get().map(|(lut, scene)| view! {
+                        <ui::Viewer lut_a=Signal::stored(lut) scene=Signal::stored(scene) label_a="Target look".to_owned()/>
+                        <p>"Target look. Your camera’s result will appear when the calculation finishes."</p>
+                    })}
+                }.into_any(),
                 Load::Failed(error) => ui::failure(&error).into_any(),
                 Load::Ready(reply) => view! {
                     <MatchResult reply application=application.get()/>

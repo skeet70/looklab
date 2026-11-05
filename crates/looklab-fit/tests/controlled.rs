@@ -196,13 +196,18 @@ fn held_out_vs_sweeps() {
     let library = library_settings();
     let dataset = controlled_dataset(&config);
     let train = &dataset.images[..library.len()];
-    for max_sweeps in [4usize, 8, 12] {
+    for max_sweeps in [1usize, 2, 3, 4] {
         let fit_options = FitOptions {
             max_sweeps,
             ..options()
         };
         let result = fit_controlled(train, &dataset.schema, 1, &sim(), &fit_options).expect("fit");
-        let model = result.control_response.as_ref().expect("model").model.clone();
+        let model = result
+            .control_response
+            .as_ref()
+            .expect("model")
+            .model
+            .clone();
         let mut held = Vec::new();
         for (index, settings) in held_out.iter().enumerate() {
             let image = &dataset.images[library.len() + index];
@@ -256,7 +261,12 @@ fn held_out_vs_sweeps() {
             ..options()
         };
         let result = fit_controlled(train, &dataset.schema, 1, &sim(), &fit_options).expect("fit");
-        let model = result.control_response.as_ref().expect("model").model.clone();
+        let model = result
+            .control_response
+            .as_ref()
+            .expect("model")
+            .model
+            .clone();
         let mut held = Vec::new();
         for (index, settings) in held_out.iter().enumerate() {
             let image = &dataset.images[library.len() + index];
@@ -344,9 +354,9 @@ fn predicts_held_out_rerenders_at_unseen_settings() {
         result.lambdas,
         elapsed
     );
-    // Converged refinement trades some held-out response smoothness for lower
-    // training bias; measured 2.21 ΔE on this fixture.
-    assert!(median(errors) <= 2.5);
+    // GCV response smoothness with a floor of 1.0 (not 100) keeps held-out
+    // prediction at 1.15 ΔE on this fixture.
+    assert!(median(errors) <= 1.5);
 }
 
 #[test]

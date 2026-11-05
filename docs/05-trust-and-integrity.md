@@ -129,7 +129,7 @@ A candidate LookVersion is published only if:
    - **no** probe present in both versions exceeds the post-clip ceiling C (absolute; no allowance, and it applies outside the gated union too);
    - ≤ 2% of gated probes exceed their b_p (these may only land between b_p and C);
    - the p95 of |Δ_p|/b_p ≤ 1.0;
-   - **every** probe whose pre-clip value is identified in both versions (the reference encoding's soft clip keeps a per-channel derivative of at least 0.25 at the prediction) keeps its pre-clip lightness shift |ΔJ′| and hue-angle shift `ΔH_ab = 2·sqrt(C₁·C₂)·sin(Δh/2)` (CIEDE2000's hue difference, UCS units scaled by chroma) within C. An unidentified pre-clip value takes its variance through the prior floor and is gated on its post-clip ΔE only; `J′` and hue survive the reference encoding into exports, where post-clip ΔE alone can hide a pre-clip change behind the clip;
+   - **every** probe the reference version identifies keeps its pre-clip lightness shift |ΔJ′| and hue-angle shift `ΔH_ab = 2·sqrt(C₁·C₂)·sin(Δh/2)` (CIEDE2000's hue difference, UCS units scaled by chroma) within C; identification is the reference encoding's soft clip keeping a per-channel derivative of at least 0.25 at the reference prediction, so a candidate cannot exempt a probe by pushing its own prediction into the clip shoulder. An unidentified pre-clip value takes its variance through the prior floor and is gated on its post-clip ΔE only; `J′` and hue survive the reference encoding into exports and card renders ([04 §8.1](04-matching-and-export.md));
    - **no** probe that was supported leaves support because its σ rose: the candidate fails the σ test at the exit threshold (`σ_cand > 1.65`) and `σ_cand > (1 + 0.1)·σ_ref`, where σ_ref is the post-clip σ in the version that supported it. Conflicting uploads raise σ well past that margin; honest boundary jitter does not. Since b_p sits at its ceiling for such a probe, only C bounds it. Such probes count as violations and go to moderation.
 
    A support loss for any other cause (density floor, cluster count, bias, or σ within the margin) is a **coverage change**: it is reported in the gate report and stays in the gated union. Neither kind of loss removes a probe from drift gating.
@@ -138,7 +138,7 @@ A candidate LookVersion is published only if:
 
 3. **Changelog:** data added (counts by tier), largest contributors by weight (internal ids), gate metrics, bodies/epochs affected, input-transform versions.
 
-A failed gate leaves the candidate provisional and opens a moderation item.
+A failed gate leaves the candidate provisional and opens a moderation item. A native fit that does not converge never reaches the gate: nothing is published, the worker resumes that Look from the stored fit state in the next batch, and 3 consecutive non-converged batches *(tentative)* open one "Fit not converging" moderation item, resolved by the next published version.
 
 **Rollback:** one moderator action, "revert to version N, exclude credential(s) K, refit". The revert publishes N's content as a new version immediately, then schedules the refit without K. Published versions stay immutable and pinnable. A revert is not a re-anchor: the gated union continues across it.
 

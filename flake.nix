@@ -75,7 +75,7 @@
         };
         # cargo-fuzz needs a nightly compiler for sanitizer instrumentation.
         devShells.fuzz = pkgs.mkShell {
-          buildInputs = [ nightly pkgs.cargo-fuzz ];
+          buildInputs = [ nightly pkgs.cargo-fuzz pkgs.git ];
           shellHook = buildShellHook;
         };
       });

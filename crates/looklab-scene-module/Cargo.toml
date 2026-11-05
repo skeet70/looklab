@@ -1,0 +1,21 @@
+[package]
+name = "looklab-scene-module"
+description = "Scalar scene PNG preparation and preview rendering with an import-free worker ABI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+looklab-publish.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+wasmtime.workspace = true
+
+[lints]
+workspace = true

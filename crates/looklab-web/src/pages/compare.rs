@@ -20,8 +20,6 @@ struct CompareReady {
     b_version: looklab_model::file::LookVersion,
     a_lut: Arc<Vec<u8>>,
     b_lut: Arc<Vec<u8>>,
-    a_document: looklab_model::LookDocument,
-    b_document: looklab_model::LookDocument,
     thumbnail: Arc<PreparedScene>,
 }
 
@@ -142,8 +140,8 @@ async fn load_pair(
         .map_err(|error| error.to_string())?
         .or_else(|| b.latest().map(|version| version.version().clone()))
         .ok_or("No published version for the second look")?;
-    let a_loaded = data::version(&a_slug, a_version.as_str()).await?;
-    let b_loaded = data::version(&b_slug, b_version.as_str()).await?;
+    let a_lut = data::preview(&a_slug, a_version.as_str()).await?;
+    let b_lut = data::preview(&b_slug, b_version.as_str()).await?;
     let scene_name = if scene.is_empty() {
         index
             .scenes
@@ -162,10 +160,8 @@ async fn load_pair(
         b,
         a_version,
         b_version,
-        a_lut: a_loaded.lut,
-        b_lut: b_loaded.lut,
-        a_document: a_loaded.document,
-        b_document: b_loaded.document,
+        a_lut,
+        b_lut,
         thumbnail,
     })
 }
@@ -190,7 +186,7 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
     for (key, value) in [
         (CompareField::LookA, ready.a.slug.as_str()),
         (CompareField::LookB, ready.b.slug.as_str()),
-        (CompareField::Scene, ready.scene.scene.name.as_str()),
+        (CompareField::Scene, ready.thumbnail.scene.name.as_str()),
         (CompareField::View, mode.query()),
     ] {
         mode_url.search_params().set(key.key(), value);
@@ -248,20 +244,145 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
     let swap_av = ready.a_version.to_string();
     let swap_bv = ready.b_version.to_string();
     let swap_navigate = use_navigate();
-    let comparison = &ready.comparison;
+    let scene = RwSignal::new(Arc::clone(&ready.thumbnail));
+    let scene_error = RwSignal::new(None::<String>);
+    let scene_strip_ready = RwSignal::new(false);
+    let comparison = RwSignal::new(Load::<Arc<Comparison>>::Loading);
+    let measurements = RwSignal::new(None::<Arc<Comparison>>);
+    let scene_name = ready.thumbnail.scene.name.clone();
+    let a_slug = ready.a.slug.clone();
+    let b_slug = ready.b.slug.clone();
+    let a_version = ready.a_version.clone();
+    let b_version = ready.b_version.clone();
+    let a_name = ready.a.name.clone();
+    let b_name = ready.b.name.clone();
+    let summary_a = a_name.clone();
+    let summary_b = b_name.clone();
+    Effect::new(move |_| {
+        let scene_name = scene_name.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            ui::paint_browser().await;
+            let _ = scene_strip_ready.try_set(true);
+            match data::scene(scene_name.as_str()).await {
+                Ok(full) => {
+                    let _ = scene.try_set(Arc::new(full));
+                }
+                Err(error) => {
+                    let _ = scene_error.try_set(Some(error));
+                }
+            }
+        });
+    });
+    Effect::new(move |_| {
+        let a_slug = a_slug.clone();
+        let b_slug = b_slug.clone();
+        let a_version = a_version.clone();
+        let b_version = b_version.clone();
+        let a_name = a_name.clone();
+        let b_name = b_name.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            ui::paint_browser().await;
+            if comparison.is_disposed() {
+                return;
+            }
+            let documents = async {
+                let a = data::version(a_slug.as_str(), a_version.as_str()).await?;
+                let b = data::version(b_slug.as_str(), b_version.as_str()).await?;
+                Ok::<_, String>((a.document, b.document))
+            }
+            .await;
+            let (a_document, b_document) = match documents {
+                Ok(documents) => documents,
+                Err(error) => {
+                    let _ = comparison.try_set(Load::Failed(error));
+                    return;
+                }
+            };
+            let probes = looklab_model::probes::v1();
+            let a_look = crate::diagnostics::DocumentLook::new(&a_document, &probes);
+            let b_look = crate::diagnostics::DocumentLook::new(&b_document, &probes);
+            let result = compare(&ComparisonInput {
+                a: &a_look,
+                b: &b_look,
+                probes: &probes,
+                a_name: &FunctionName::new(a_name),
+                b_name: &FunctionName::new(b_name),
+            });
+            let result = Arc::new(result);
+            let _ = comparison.try_set(Load::Ready(Arc::clone(&result)));
+            ui::paint_browser().await;
+            let _ = measurements.try_set(Some(result));
+        });
+    });
+    view! {
+        <div class="compare-look-pickers">
+            <div class="compare-look-chip">
+                <ui::PreviewCanvas lut=Signal::stored(Some(Arc::clone(&ready.a_lut))) scene=Signal::stored(Arc::clone(&ready.thumbnail)) label=format!("Simulated: {}", ready.a.name) style=Signal::stored("width:4rem;height:3rem;object-fit:cover".to_owned())/>
+                <ui::LookPicker items=items.clone() scene=Arc::clone(&ready.thumbnail) label=format!("A · {}", ready.a.name) on_select=Callback::new(move |item: ui::LookCardItem| change.run((CompareField::LookA, item.slug.to_string())))/>
+            </div>
+            <button type="button" class="compare-swap" aria-label="Swap looks" on:click=move |_| {
+                let url = web_sys::Url::new(&window().location().href().unwrap_or_default()).expect("current URL");
+                for (key, value) in [("a", &swap_b), ("b", &swap_a), ("av", &swap_bv), ("bv", &swap_av)] { url.search_params().set(key, value); }
+                swap_navigate(&format!("{}{}", url.pathname(), url.search()), leptos_router::NavigateOptions { replace: true, scroll: false, ..Default::default() });
+            }>"⇄"</button>
+            <div class="compare-look-chip">
+                <ui::PreviewCanvas lut=Signal::stored(Some(Arc::clone(&ready.b_lut))) scene=Signal::stored(Arc::clone(&ready.thumbnail)) label=format!("Simulated: {}", ready.b.name) style=Signal::stored("width:4rem;height:3rem;object-fit:cover".to_owned())/>
+                <ui::LookPicker items scene=Arc::clone(&ready.thumbnail) label=format!("B · {}", ready.b.name) on_select=Callback::new(move |item: ui::LookCardItem| change.run((CompareField::LookB, item.slug.to_string())))/>
+            </div>
+        </div>
+        <ui::Viewer lut_a=Signal::stored(Arc::clone(&ready.a_lut)) lut_b=Signal::stored(ready.b_lut) scene=Signal::derive(move || scene.get()) label_a=ready.a.name.clone() label_b=ready.b.name.clone() mode on_mode_change=mode_change/>
+        {move || scene_error.get().map(|error| view! { <p class="error" role="alert">{format!("The full-size photo could not load. Showing the smaller preview. {error}")}</p> })}
+        {move || match comparison.get() {
+            Load::Ready(comparison) => view! { <ComparisonSummary comparison a_name=summary_a.clone() b_name=summary_b.clone()/> }.into_any(),
+            Load::Loading => view! { <p class="muted" role="status">"Preparing comparison…"</p> }.into_any(),
+            Load::Failed(error) => ui::failure(&error).into_any(),
+        }}
+        <div class="compare-scenes" aria-label="Sample photos">
+            <Show when=move || scene_strip_ready.get()>
+            {[SceneKind::Photo, SceneKind::TestChart].into_iter().map(|kind| {
+                let scenes = ready.index.scenes.iter().filter(|scene| scene.kind == kind).cloned().collect::<Vec<_>>();
+                view! { <section><h2>{if kind == SceneKind::Photo { "Sample photos" } else { "Test charts" }}</h2><div class="compare-scene-strip">{scenes.into_iter().map(|scene| {
+                    let name = scene.name.to_string();
+                    let selected = ready.thumbnail.scene.name == scene.name;
+                    view! { <SceneChip scene lut=Arc::clone(&ready.a_lut) selected on_select=Callback::new(move |()| change.run((CompareField::Scene, name.clone())))/> }
+                }).collect_view()}</div></section> }
+            }).collect_view()}
+            </Show>
+        </div>
+        <ui::Disclosure summary="More options".to_owned()>
+            <div class="compare-versions">
+                <label>
+                    "First look version"
+                    <select prop:value=ready.a_version.to_string()
+                        on:change=move |event| change.run((CompareField::VersionA, event_target_value(&event)))>
+                        {ready.a.versions.into_iter().map(|version| view! {
+                            <option value=version.version().to_string()>
+                                {version.version().to_string()}
+                            </option>
+                        }).collect_view()}
+                    </select>
+                </label>
+                <label>
+                    "Second look version"
+                    <select prop:value=ready.b_version.to_string()
+                        on:change=move |event| change.run((CompareField::VersionB, event_target_value(&event)))>
+                        {ready.b.versions.into_iter().map(|version| view! {
+                            <option value=version.version().to_string()>
+                                {version.version().to_string()}
+                            </option>
+                        }).collect_view()}
+                    </select>
+                </label>
+            </div>
+        </ui::Disclosure>
+        {move || measurements.get().map(|comparison| view! { <ComparisonMeasurements comparison/> })}
+    }
+}
+
+#[component]
+fn ComparisonSummary(comparison: Arc<Comparison>, a_name: String, b_name: String) -> impl IntoView {
     let has_measurements =
         comparison.delta_e.count > 0 && comparison.delta_e.count >= comparison.delta_e.excluded;
-    let tone = tone_comparison_svg(&comparison.tone);
-    let tint = tint_comparison_svg(&comparison.tint);
-    let grl = comparison.grl.as_ref().map(grl_svg);
-    let histogram = delta_e_histogram_svg(&comparison.delta_e);
-    let ciede = delta_e_histogram_svg(&comparison.ciede2000);
-    let measurement_rows = [&comparison.delta_e, &comparison.ciede2000].into_iter().map(|distribution| view! {
-        <tr><th scope="row">{distribution.metric.label()}</th>
-            <td>{format!("{:.2}", distribution.median)}</td><td>{format!("{:.2}", distribution.p95)}</td>
-            <td>{format!("{:.2}", distribution.max)}</td><td>{format!("{:.2}", distribution.weighted_mean)}</td><td>{distribution.count}</td></tr>
-    }).collect_view();
-    let region = region_map_svg(&comparison.region_map);
     let estimate = if has_measurements {
         ui::ClosenessEstimate::new(
             comparison.delta_e.median,
@@ -324,26 +445,6 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
         }
     })
     .collect_view();
-    let attribution = comparison
-        .attribution
-        .iter()
-        .map(|row| {
-            view! {
-                <tr>
-                    <th scope="row">{row.layer.name()}</th>
-                    <td>{format!("{:.3}", row.contribution)}</td>
-                </tr>
-            }
-        })
-        .collect_view();
-    let measurement_summary = if has_measurements {
-        format!(
-            "CAM16-UCS ΔE median {:.2}, p95 {:.2}. Uncertainty bands are not available for this comparison.",
-            comparison.delta_e.median, comparison.delta_e.p95
-        )
-    } else {
-        "Too few supported measurement samples overlap. The overlays show model predictions, not a measured rating.".to_owned()
-    };
     let tone_delta = comparison
         .tone
         .points
@@ -375,69 +476,56 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
     let summary = if has_measurements {
         format!(
             "{} has {brightness} and {warmth} compared with {}.",
-            ready.b.name, ready.a.name
+            b_name, a_name
         )
     } else {
         "Not enough measured data to rate this difference yet. Compare the simulated photos above."
             .to_owned()
     };
     view! {
-        <div class="compare-look-pickers">
-            <div class="compare-look-chip">
-                <ui::PreviewCanvas lut=Signal::stored(Some(Arc::clone(&ready.a_lut))) scene=Signal::stored(Arc::clone(&ready.thumbnail)) label=format!("Simulated: {}", ready.a.name) style=Signal::stored("width:4rem;height:3rem;object-fit:cover".to_owned())/>
-                <ui::LookPicker items=items.clone() scene=Arc::clone(&ready.thumbnail) label=format!("A · {}", ready.a.name) on_select=Callback::new(move |item: ui::LookCardItem| change.run((CompareField::LookA, item.slug.to_string())))/>
-            </div>
-            <button type="button" class="compare-swap" aria-label="Swap looks" on:click=move |_| {
-                let url = web_sys::Url::new(&window().location().href().unwrap_or_default()).expect("current URL");
-                for (key, value) in [("a", &swap_b), ("b", &swap_a), ("av", &swap_bv), ("bv", &swap_av)] { url.search_params().set(key, value); }
-                swap_navigate(&format!("{}{}", url.pathname(), url.search()), leptos_router::NavigateOptions { replace: true, scroll: false, ..Default::default() });
-            }>"⇄"</button>
-            <div class="compare-look-chip">
-                <ui::PreviewCanvas lut=Signal::stored(Some(Arc::clone(&ready.b_lut))) scene=Signal::stored(Arc::clone(&ready.thumbnail)) label=format!("Simulated: {}", ready.b.name) style=Signal::stored("width:4rem;height:3rem;object-fit:cover".to_owned())/>
-                <ui::LookPicker items scene=Arc::clone(&ready.thumbnail) label=format!("B · {}", ready.b.name) on_select=Callback::new(move |item: ui::LookCardItem| change.run((CompareField::LookB, item.slug.to_string())))/>
-            </div>
-        </div>
-        <ui::Viewer lut_a=Signal::stored(Arc::clone(&ready.a_lut)) lut_b=Signal::stored(ready.b_lut) scene=Signal::stored(Arc::clone(&ready.scene)) label_a=ready.a.name.clone() label_b=ready.b.name.clone() mode on_mode_change=mode_change/>
         <section class="compare-summary" aria-label="Comparison summary">
             <div class="compare-summary-line"><p>{summary}</p>{estimate.map(|estimate| view! { <ui::Closeness estimate/> })}</div>
             <div class="compare-breakdown">{rows}</div>
         </section>
-        <div class="compare-scenes" aria-label="Sample photos">
-            {[SceneKind::Photo, SceneKind::TestChart].into_iter().map(|kind| {
-                let scenes = ready.index.scenes.iter().filter(|scene| scene.kind == kind).cloned().collect::<Vec<_>>();
-                view! { <section><h2>{if kind == SceneKind::Photo { "Sample photos" } else { "Test charts" }}</h2><div class="compare-scene-strip">{scenes.into_iter().map(|scene| {
-                    let name = scene.name.to_string();
-                    let selected = ready.scene.scene.name == scene.name;
-                    view! { <SceneChip scene lut=Arc::clone(&ready.a_lut) selected on_select=Callback::new(move |()| change.run((CompareField::Scene, name.clone())))/> }
-                }).collect_view()}</div></section> }
-            }).collect_view()}
-        </div>
-        <ui::Disclosure summary="More options".to_owned()>
-            <div class="compare-versions">
-                <label>
-                    "First look version"
-                    <select prop:value=ready.a_version.to_string()
-                        on:change=move |event| change.run((CompareField::VersionA, event_target_value(&event)))>
-                        {ready.a.versions.into_iter().map(|version| view! {
-                            <option value=version.version().to_string()>
-                                {version.version().to_string()}
-                            </option>
-                        }).collect_view()}
-                    </select>
-                </label>
-                <label>
-                    "Second look version"
-                    <select prop:value=ready.b_version.to_string()
-                        on:change=move |event| change.run((CompareField::VersionB, event_target_value(&event)))>
-                        {ready.b.versions.into_iter().map(|version| view! {
-                            <option value=version.version().to_string()>
-                                {version.version().to_string()}
-                            </option>
-                        }).collect_view()}
-                    </select>
-                </label>
-            </div>
-        </ui::Disclosure>
+    }
+}
+
+#[component]
+fn ComparisonMeasurements(comparison: Arc<Comparison>) -> impl IntoView {
+    let has_measurements =
+        comparison.delta_e.count > 0 && comparison.delta_e.count >= comparison.delta_e.excluded;
+    let tone = tone_comparison_svg(&comparison.tone);
+    let tint = tint_comparison_svg(&comparison.tint);
+    let grl = comparison.grl.as_ref().map(grl_svg);
+    let histogram = delta_e_histogram_svg(&comparison.delta_e);
+    let ciede = delta_e_histogram_svg(&comparison.ciede2000);
+    let measurement_rows = [&comparison.delta_e, &comparison.ciede2000].into_iter().map(|distribution| view! {
+        <tr><th scope="row">{distribution.metric.label()}</th>
+            <td>{format!("{:.2}", distribution.median)}</td><td>{format!("{:.2}", distribution.p95)}</td>
+            <td>{format!("{:.2}", distribution.max)}</td><td>{format!("{:.2}", distribution.weighted_mean)}</td><td>{distribution.count}</td></tr>
+    }).collect_view();
+    let region = region_map_svg(&comparison.region_map);
+    let attribution = comparison
+        .attribution
+        .iter()
+        .map(|row| {
+            view! {
+                <tr>
+                    <th scope="row">{row.layer.name()}</th>
+                    <td>{format!("{:.3}", row.contribution)}</td>
+                </tr>
+            }
+        })
+        .collect_view();
+    let measurement_summary = if has_measurements {
+        format!(
+            "CAM16-UCS ΔE median {:.2}, p95 {:.2}. Uncertainty bands are not available for this comparison.",
+            comparison.delta_e.median, comparison.delta_e.p95
+        )
+    } else {
+        "Too few supported measurement samples overlap. The overlays show model predictions, not a measured rating.".to_owned()
+    };
+    view! {
         <ui::Disclosure summary="Show measurements".to_owned()>
             <p>"Model estimates on supported colour samples. The difference image compares the displayed sRGB previews; these measurements compare the underlying looks."</p>
             <p>{measurement_summary}</p>

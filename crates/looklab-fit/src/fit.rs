@@ -15,8 +15,8 @@ use crate::problem::{ActiveColumns, BlockAcc, IntentFilter, PassOutput, Problem,
 use crate::solve::{factor_in_place, select_lambda, select_lambda_diagonal, solve_in_place};
 use crate::types::{
     ControlResponseFit, Diagnostics, ExcludeReason, ExcludedImage, ExposureOffset, FitImage,
-    FitOptions, FitResult, ImageIntent, ImageNuisances, PreviousSupport, ProbeUncertainty,
-    Realization, Result, StageLambdas, Verdict,
+    FitOptions, FitResult, FitState, ImageIntent, ImageNuisances, PreviousSupport,
+    ProbeUncertainty, Realization, Result, StageLambdas, Verdict,
 };
 use crate::uncertainty;
 
@@ -121,12 +121,45 @@ const STAGES: [Stage; 5] = [
     },
 ];
 
+fn subsample_images(images: &[FitImage], limit: usize) -> Vec<FitImage> {
+    images
+        .iter()
+        .map(|image| {
+            let n = image.samples.n().min(limit);
+            if n == image.samples.n() {
+                return image.clone();
+            }
+            let mut header = image.samples.header().clone();
+            header.n = n as u32;
+            let samples = looklab_samples::SampleSet::new(
+                header,
+                image.samples.in_rgb()[..n].to_vec(),
+                image.samples.out_rgb()[..n].to_vec(),
+                image.samples.density_w()[..n].to_vec(),
+                image.samples.flags()[..n].to_vec(),
+            )
+            .unwrap_or_else(|_| unreachable!("a subset of a valid sample set is valid"));
+            let mut out = image.clone();
+            out.samples = samples;
+            if let Some(trust) = out.sample_trust.as_mut() {
+                trust.truncate(n);
+            }
+            out
+        })
+        .collect()
+}
+
 fn accepted(previous: f64, cost: f64) -> bool {
     cost.is_finite() && cost <= previous + 1e-12 * previous.abs().max(1.0)
 }
 
-fn converged(previous: f64, cost: f64, step: f64) -> bool {
-    (previous - cost).abs() <= 1e-9 * previous.abs().max(1.0) && step <= 1e-7
+fn converged(recent: &[f64]) -> bool {
+    if recent.len() < 5 {
+        return false;
+    }
+    let oldest = recent[0];
+    let newest = recent[recent.len() - 1];
+    (oldest - newest).abs() <= 1e-3 * oldest.abs().max(1.0)
 }
 
 pub(crate) fn filter_spatial(
@@ -226,7 +259,7 @@ pub(crate) fn run_with(
     model: Option<ControlResponseModel>,
     excluded: Vec<ExcludedImage>,
 ) -> Result<FitResult> {
-    run_inner(images, options, model, excluded, None, true, None)
+    run_inner(images, options, model, excluded, None, true, None, None).map(|(result, _)| result)
 }
 
 pub(crate) fn run_with_history(
@@ -236,7 +269,21 @@ pub(crate) fn run_with_history(
     excluded: Vec<ExcludedImage>,
     previous: Option<&PreviousSupport>,
 ) -> Result<FitResult> {
-    run_inner(images, options, model, excluded, None, true, previous)
+    run_inner(images, options, model, excluded, None, true, previous, None)
+        .map(|(result, _)| result)
+}
+
+pub(crate) fn run_with_history_resumable(
+    images: &[FitImage],
+    options: &FitOptions,
+    model: Option<ControlResponseModel>,
+    excluded: Vec<ExcludedImage>,
+    previous: Option<&PreviousSupport>,
+    resume: Option<&FitState>,
+) -> Result<(FitResult, Option<FitState>)> {
+    run_inner(
+        images, options, model, excluded, None, true, previous, resume,
+    )
 }
 
 /// Result of a conditional Look-only solve.
@@ -305,8 +352,7 @@ pub(crate) fn run_look_only(
         let mut damping: f64 = 1e-3;
         let mut previous: Option<(f64, Params)> = None;
         let mut gcv_done = false;
-        let mut previous_step = f64::INFINITY;
-        let mut stable = 0usize;
+        let mut recent: Vec<f64> = Vec::new();
         let stage_sweeps = if stage.converge {
             options.max_sweeps.max(1)
         } else {
@@ -337,19 +383,22 @@ pub(crate) fn run_look_only(
                 if !accepted(*previous_cost, cost) {
                     params = previous_params.clone();
                     damping = (damping * 10.0).min(1e6);
-                    stable = 0;
                     if damping >= 1e6 {
                         break;
                     }
                     continue;
                 }
-                if converged(*previous_cost, cost, previous_step) {
-                    stable += 1;
-                    if stable >= 2 {
-                        break;
-                    }
-                } else {
-                    stable = 0;
+            }
+            if previous
+                .as_ref()
+                .is_none_or(|(previous_cost, _)| cost < *previous_cost)
+            {
+                recent.push(cost);
+                if recent.len() > 5 {
+                    recent.remove(0);
+                }
+                if converged(&recent) {
+                    break;
                 }
             }
             previous = Some((cost, params.clone()));
@@ -402,7 +451,6 @@ pub(crate) fn run_look_only(
                     step[layout.residual.start + index] = *value;
                 }
             }
-            previous_step = step.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
             apply_step(&mut params, &step);
             if kinds.contains(&BlockKind::Residual) {
                 pin_residual(&mut params, &layout, &pass.residual_samples);
@@ -473,9 +521,20 @@ pub(crate) fn run_quick(
     options: &FitOptions,
     initial: Option<&looklab_model::Look>,
 ) -> Result<FitResult> {
-    run_inner(images, options, None, Vec::new(), initial, false, None)
+    run_inner(
+        images,
+        options,
+        None,
+        Vec::new(),
+        initial,
+        false,
+        None,
+        None,
+    )
+    .map(|(result, _)| result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     images: &[FitImage],
     options: &FitOptions,
@@ -484,7 +543,8 @@ fn run_inner(
     initial: Option<&looklab_model::Look>,
     want_uncertainty: bool,
     previous: Option<&PreviousSupport>,
-) -> Result<FitResult> {
+    resume: Option<&FitState>,
+) -> Result<(FitResult, Option<FitState>)> {
     let mut native_positions: Vec<Option<usize>> = vec![None; images.len()];
     let mut native = Vec::new();
     for (index, image) in images.iter().enumerate() {
@@ -497,6 +557,14 @@ fn run_inner(
         return Err(crate::types::FitError::NoNativeImages);
     }
     let mut problem = Problem::new_with(&native, model.as_ref(), options)?;
+    let early_problem = if options.early_samples_per_image > 0
+        && options.early_samples_per_image < options.max_samples_per_image
+    {
+        let early = subsample_images(&native, options.early_samples_per_image);
+        Some(Problem::new_with(&early, model.as_ref(), options)?)
+    } else {
+        None
+    };
     let mut layout = problem.layout.clone();
     let mut params = initial_params(&problem);
     if let Some(look) = initial {
@@ -505,6 +573,12 @@ fn run_inner(
     let mut roles = prior_roles(&problem, &layout);
     let mut lambdas = options.initial_lambdas;
     let mut evaluations = 0usize;
+    if let Some(state) = resume {
+        if state.theta.len() == params.theta.len() {
+            params.theta.copy_from_slice(&state.theta);
+        }
+        lambdas = state.lambdas;
+    }
 
     if model.is_some() {
         let reference: Vec<FitImage> = native
@@ -535,8 +609,13 @@ fn run_inner(
     let warmup_allowed =
         (options.sweep_budget / problem.samples.len().max(1) as f64).clamp(8.0, 64.0) as usize;
     let mut final_converged = false;
+    let mut resume_state: Option<FitState> = None;
     let mut sample_evaluations = 0.0_f64;
-    for stage in &STAGES {
+    let start_stage = resume.map_or(0, |state| state.stage.min(STAGES.len()));
+    for (stage_index, stage) in STAGES.iter().enumerate() {
+        if stage_index < start_stage {
+            continue;
+        }
         let stage_sweeps = if stage.converge {
             options.max_sweeps.max(1)
         } else {
@@ -545,6 +624,11 @@ fn run_inner(
                 .min(options.max_sweeps.max(1))
                 .min(warmup_allowed)
         };
+        let stage_problem = if stage.converge {
+            &problem
+        } else {
+            early_problem.as_ref().unwrap_or(&problem)
+        };
         let kinds: Vec<BlockKind> = stage
             .blocks
             .iter()
@@ -552,14 +636,14 @@ fn run_inner(
             .filter(|kind| options.fit_residual || *kind != BlockKind::Residual)
             .filter(|kind| !is_response_kind(*kind))
             .collect();
-        let split_nuisances = problem.images.len() > 64;
+        let split_nuisances = stage_problem.images.len() > 64;
         let mut blocks: Vec<BlockAcc> = kinds
             .iter()
             .map(|kind| {
                 if *kind == BlockKind::Tone && !split_nuisances {
-                    make_joint_tone_block(&problem, stage.active)
+                    make_joint_tone_block(stage_problem, stage.active)
                 } else {
-                    make_block(&problem, *kind, stage.active)
+                    make_block(stage_problem, *kind, stage.active)
                 }
             })
             .collect();
@@ -569,26 +653,47 @@ fn run_inner(
             }
         }
         if split_nuisances && (stage.active.mode || stage.active.clip) {
-            blocks.push(make_shared_nuisance_block(&problem, &layout, stage.active));
+            blocks.push(make_shared_nuisance_block(
+                stage_problem,
+                &layout,
+                stage.active,
+            ));
         }
         let penalties: Vec<Vec<f64>> = blocks
             .iter()
-            .map(|block| block_penalty(&problem, block))
+            .map(|block| block_penalty(stage_problem, block))
             .collect();
-        let mut damping: f64 = 1e-3;
+        let resuming = resume.is_some_and(|state| state.stage == stage_index);
+        let start_sweep = if resuming {
+            resume.map_or(0, |state| state.sweep).min(stage_sweeps)
+        } else {
+            0
+        };
+        let mut damping: f64 = if resuming {
+            resume.map_or(1e-3, |state| state.damping)
+        } else {
+            1e-3
+        };
         let mut previous: Option<(f64, Params)> = None;
         let mut gcv_done = false;
-        let mut previous_step = f64::INFINITY;
-        let mut stable = 0usize;
-        for _ in 0..stage_sweeps {
-            if sample_evaluations + problem.samples.len() as f64 > options.sweep_budget {
+        let mut recent: Vec<f64> = Vec::new();
+        for sweep_index in start_sweep..stage_sweeps {
+            if sample_evaluations + stage_problem.samples.len() as f64 > options.sweep_budget {
+                resume_state = Some(FitState {
+                    theta: params.theta.clone(),
+                    lambdas,
+                    stage: stage_index,
+                    sweep: sweep_index,
+                    damping,
+                    converged: false,
+                });
                 break;
             }
-            sample_evaluations += problem.samples.len() as f64;
+            sample_evaluations += stage_problem.samples.len() as f64;
             for block in &mut blocks {
                 block.reset();
             }
-            let pass = problem.pass(
+            let pass = stage_problem.pass(
                 &params,
                 stage.active,
                 &mut blocks,
@@ -605,20 +710,27 @@ fn run_inner(
                 if !accepted(*previous_cost, cost) {
                     params = previous_params.clone();
                     damping = (damping * 10.0).min(1e6_f64);
-                    stable = 0;
                     if damping >= 1e6 {
+                        resume_state = Some(FitState {
+                            theta: params.theta.clone(),
+                            lambdas,
+                            stage: stage_index,
+                            sweep: sweep_index,
+                            damping,
+                            converged: false,
+                        });
                         break;
                     }
                     continue;
                 }
-                if converged(*previous_cost, cost, previous_step) {
-                    stable += 1;
-                    if stable >= 2 {
-                        final_converged = stage.converge;
-                        break;
-                    }
-                } else {
-                    stable = 0;
+            }
+            if previous
+                .as_ref()
+                .is_none_or(|(previous_cost, _)| cost < *previous_cost)
+            {
+                recent.push(cost);
+                if recent.len() > 5 {
+                    recent.remove(0);
                 }
             }
             previous = Some((cost, params.clone()));
@@ -673,13 +785,30 @@ fn run_inner(
                     step[layout.residual.start + index] = *value;
                 }
             }
-            previous_step = step.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
             apply_step(&mut params, &step);
             if kinds.contains(&BlockKind::Residual) {
                 pin_residual(&mut params, &layout, &pass.residual_samples);
             }
-            update_sigma(&problem, &mut params, &pass, options);
+            update_sigma(stage_problem, &mut params, &pass, options);
             damping = (damping * 0.3).max(1e-6);
+            if converged(&recent) {
+                final_converged = stage.converge;
+                break;
+            }
+        }
+        if resume_state.is_some() {
+            break;
+        }
+        if stage.converge && !final_converged {
+            resume_state = Some(FitState {
+                theta: params.theta.clone(),
+                lambdas,
+                stage: stage_index,
+                sweep: 0,
+                damping,
+                converged: false,
+            });
+            break;
         }
     }
 
@@ -977,25 +1106,28 @@ fn run_inner(
     };
     diagnostics.sweeps = evaluations;
 
-    Ok(FitResult {
-        look,
-        output_space: problem
-            .images
-            .first()
-            .map_or(looklab_color::RgbSpace::Srgb, |image| image.space),
-        images: images_out,
-        realization: Realization {
-            clip_k,
-            exposure_offsets,
+    Ok((
+        FitResult {
+            look,
+            output_space: problem
+                .images
+                .first()
+                .map_or(looklab_color::RgbSpace::Srgb, |image| image.space),
+            images: images_out,
+            realization: Realization {
+                clip_k,
+                exposure_offsets,
+            },
+            lambdas,
+            probes: probe_result,
+            density,
+            image_stats,
+            diagnostics,
+            control_response,
+            excluded,
         },
-        lambdas,
-        probes: probe_result,
-        density,
-        image_stats,
-        diagnostics,
-        control_response,
-        excluded,
-    })
+        resume_state,
+    ))
 }
 
 fn carry_params(
@@ -1805,7 +1937,7 @@ type ResponseGroup = (
     Vec<(u32, i64, usize)>,
 );
 
-const RESPONSE_LAMBDA_FLOOR: f64 = 100.0;
+const RESPONSE_LAMBDA_FLOOR: f64 = 1.0;
 
 /// Shrinkage plus second differences over adjacent steps, per control, component and feature.
 fn response_penalty(
@@ -2022,7 +2154,8 @@ pub(crate) fn identity_matrix(layout: &Layout, block: &BlockAcc) -> Vec<f64> {
     let n = block.len();
     let mut out = vec![0.0_f64; n * n];
     for (local, global) in block.params.iter().enumerate() {
-        out[local * n + local] = kind_of(layout, *global).map_or(0.0, identity_weight);
+        out[local * n + local] =
+            layout.identity_scale * kind_of(layout, *global).map_or(0.0, identity_weight);
     }
     out
 }
@@ -2031,7 +2164,9 @@ pub(crate) fn identity_matrix(layout: &Layout, block: &BlockAcc) -> Vec<f64> {
 pub(crate) fn identity_apply(layout: &Layout, block: &BlockAcc, x: &[f64]) -> Vec<f64> {
     let mut out = vec![0.0_f64; block.len()];
     for (local, global) in block.params.iter().enumerate() {
-        out[local] = kind_of(layout, *global).map_or(0.0, identity_weight) * x[*global];
+        out[local] = layout.identity_scale
+            * kind_of(layout, *global).map_or(0.0, identity_weight)
+            * x[*global];
     }
     out
 }
@@ -2040,7 +2175,8 @@ pub(crate) fn identity_apply(layout: &Layout, block: &BlockAcc, x: &[f64]) -> Ve
 pub(crate) fn identity_curvature(layout: &Layout, block: &BlockAcc) -> Vec<f64> {
     let mut diagonal = vec![0.0_f64; block.len()];
     for (local, global) in block.params.iter().enumerate() {
-        diagonal[local] = kind_of(layout, *global).map_or(0.0, identity_weight);
+        diagonal[local] =
+            layout.identity_scale * kind_of(layout, *global).map_or(0.0, identity_weight);
     }
     diagonal
 }

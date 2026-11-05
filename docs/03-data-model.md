@@ -230,7 +230,7 @@ The model serializes as `crm.json`:
 
 ### Contribution and ContributionImage
 - `Contribution`: `id`, `credential_id`, `batch_manifest_hash`, `signature`, `pow`, `kind` (client-claimed: `library` | `rerender` | `pattern` | `gradient` | `chart`), `serial_hmac?` (server-computed; absent if the contributor opted out), (the effective contributor is **resolved at fit time** from current serial links, like epochs, and never stored on the contribution; [05 §2](05-trust-and-integrity.md)), `intent` (`native` | `recipe` | `card`), `target_look_id?`, `card?` (for intent `card`: firmware id and version, look version, content-id prefix, and whether the tag was present or user-declared; [04 §8.4](04-matching-and-export.md)), `body_id`, `firmware_version`, `sim_key`, `settings`, `status` (`pending` | `accepted` | `quarantined` | `withdrawn`), `created_at`.
-- `ContributionImage`: `id`, `contribution_id`, `samples_hash`, `n_samples`, `meta` (sanitized), `rerender_group?` (client-assigned id, see §2.1), `duplicate_of?`, `fit_stats` (`rms_de`, `z`, `reason?`), `weight_components`.
+- `ContributionImage`: `id`, `contribution_id`, `samples_hash`, `n_samples`, `meta` (sanitized), `rerender_group?` (client-assigned id, see §2.1), `setting_source` (per control: `reproduced` from the makernote through the named snapshot's schema, or `declared` by the contributor; [06 §1](06-privacy-and-payload.md), [07 §4](07-contribution.md)), `duplicate_of?`, `fit_stats` (`rms_de`, `z`, `reason?`), `weight_components`.
 
 ### Proposal and ModerationDecision
 - `Proposal`: `id`, `credential_id`, `type` (`body` | `schema_change` | `mapping` | `interface_profile` | `lut_look` | `epoch_split` | `look_split` | `gate_override`), `payload` (validated YAML/JSON), `human_summary` (a menu-level description, e.g. "adds Reala Ace to X-T5 firmware 2.0+"), `evidence[]` (confirmations carrying parsed whitelisted tag values; fixture donations; worker evidence), `status`, `created_at`.
@@ -324,6 +324,8 @@ blobs            count:u16, then count × (len:u32 + sample blob)   // order = m
 ```
 
 The challenge signed by WebAuthn is `H(nonce ‖ sha256(manifest))`. The server parses this strictly and rejects anything non-canonical. All of it is produced by the `looklab-wasm` module; the JavaScript layer only moves bytes ([AGENTS.md](../AGENTS.md)).
+
+`BatchManifest` carries `community_snapshot_version`, the snapshot whose control schema its settings were read against. The server keeps every snapshot it has published and resolves the batch body and settings against that version, not the current one; an unknown version fails with `SNAPSHOT_UNKNOWN` and one older than the retained snapshots with `SNAPSHOT_TOO_OLD`. Each settings entry also carries its source, `reproduced` or `declared` ([07 §4](07-contribution.md)).
 
 ## 3. Look file format
 

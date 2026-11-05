@@ -21,6 +21,8 @@ pub enum ErrorCode {
     PowInvalid,
     BodyUnknown,
     SchemaInvalid,
+    SnapshotUnknown,
+    SnapshotTooOld,
     CredentialUnknown,
     CredentialConflict,
     RegistrationUnknown,
@@ -46,7 +48,10 @@ impl ErrorCode {
             Self::NonceReplayed => StatusCode::CONFLICT,
             Self::SignatureInvalid => StatusCode::UNAUTHORIZED,
             Self::PowInvalid => StatusCode::BAD_REQUEST,
-            Self::BodyUnknown | Self::SchemaInvalid => StatusCode::BAD_REQUEST,
+            Self::BodyUnknown
+            | Self::SchemaInvalid
+            | Self::SnapshotUnknown
+            | Self::SnapshotTooOld => StatusCode::BAD_REQUEST,
             Self::CredentialUnknown => StatusCode::UNAUTHORIZED,
             Self::CredentialConflict => StatusCode::CONFLICT,
             Self::RegistrationUnknown => StatusCode::NOT_FOUND,
@@ -75,6 +80,8 @@ impl ErrorCode {
             Self::PowInvalid => "POW_INVALID",
             Self::BodyUnknown => "BODY_UNKNOWN",
             Self::SchemaInvalid => "SCHEMA_INVALID",
+            Self::SnapshotUnknown => "SNAPSHOT_UNKNOWN",
+            Self::SnapshotTooOld => "SNAPSHOT_TOO_OLD",
             Self::CredentialUnknown => "CREDENTIAL_UNKNOWN",
             Self::CredentialConflict => "CREDENTIAL_CONFLICT",
             Self::RegistrationUnknown => "REGISTRATION_UNKNOWN",

@@ -11,7 +11,7 @@
 | Color samples | ≤ 50k (camera RGB, JPEG RGB) pairs + density weight + flags, **shuffled, no coordinates** | The fit |
 | Chart/pattern patches | Patch id + mean + std | Anchoring and coverage |
 | Body / firmware / lens | Make, model, firmware string, lens model, focal length | Pooling, epochs, consistency |
-| Look settings | Whitelisted parsed makernote fields | Realization and control models |
+| Look settings | Whitelisted parsed makernote fields, each marked `reproduced` (decoded through the snapshot's schema) or `declared` (entered by the contributor) | Realization and control models; claim provenance |
 | Exposure | ISO, shutter, aperture, EC, as-shot WB multipliers | Nuisance priors, CCT |
 | Capture date | **Month only** | Epoch sanity, drift analysis |
 | Software tag | String | Edited-JPEG detection |
@@ -53,7 +53,7 @@
   3. Run `looklab-cli verify-payload --seeds seeds.json --har upload.har --module looklab_prep_module.wasm --origin https://site.example --rp-id site.example --data data --kind library --intent native <files>`. Export the HAR with the network panel filtered to the upload session's API requests; any other request in it is flagged. It runs the source-built prep module under wasmtime ([03 §2.1](03-data-model.md)), then:
      - **parses the upload body strictly** as the canonical envelope ([03 §2.3](03-data-model.md)) and rejects any deviation or trailing bytes;
      - checks that the **manifest and every sample blob reproduce byte for byte**. There's no tolerance, since a tolerance could hide data in low-order bits;
-     - requires the **batch fields the files determine** to equal the manifest's: body from EXIF make/model against the `--data` snapshot, firmware from EXIF, sim and settings from the makernotes through the body's control schema. `--kind` and `--intent` supply what only you declare; every batch field is printed with its source, and anything neither reproduced nor declared fails;
+     - requires the **batch fields the files determine** to equal the manifest's: body from EXIF make/model against the `--data` snapshot, firmware from EXIF, sim and settings from the makernotes through the body's control schema. `--kind` and `--intent` supply what only you declare, and `--declare-setting key=step` (repeatable) supplies each control value you entered by hand; every batch field is printed with its source, and anything neither reproduced nor declared fails. A setting the files reproduce cannot also be declared, the declared set must match the manifest's `declared` entries, and the `--data` snapshot must contain the version the manifest names;
      - for **intent `card`**, reproduces the card declaration from the files' EXIF `UserComment` render tags; with no tag, `--firmware <id>/<version>` supplies what you declared, and it must equal the manifest's declaration;
      - checks that the remaining fields are the expected set:
        - **nonce:** 32 bytes;
@@ -69,7 +69,7 @@
          - **signature:** must be well-formed for a supported algorithm (Ed25519 64 bytes; ECDSA as valid DER; RSA at the key size). There's no fixed length rule. An optional check against the credential key, if you have it from your own records, is a sanity check for an honest site only; the guarantee doesn't rest on it.
        - **proof-of-work:** k solutions, each verified;
        - **serial:** equal to your files' EXIF serial, or absent;
-     - lists **every request** in the HAR, flags any that aren't part of the expected API (nonce, upload, status, passkey registration), and audits what was recorded: a body on an endpoint that takes none, a passkey registration body with keys outside its schema (printed), or a request header outside the browser's own set (printed) is reported.
+     - lists **every request** in the HAR, flags any that aren't part of the expected API (nonce, upload, status, passkey registration, signed session creation/sign-in and session restoration), and audits what was recorded. Signed session requests contain only the signed-request fields and optional proof-of-work, with a challenge bound to the session domain and empty payload. Session restoration takes no body or query, requires a 32-byte base64url bearer capability, and compares it with the upload response's status token when recorded. Registration bodies must match the client schema, including nested credential and response fields; client extensions are printed for review. A body on an endpoint that takes none, a registration key outside its schema, or a request header outside the browser's own set is reported.
 
      **Residual channels (documented, not closed):**
      - a client can choose *which* valid proof-of-work solutions it sends, leaking a few bits per batch at exponentially more work;

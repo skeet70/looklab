@@ -7,7 +7,7 @@ use looklab_export::{OutputSpace, in_gamut, perceptual_clip, ucs_to_xyz};
 use looklab_model::{Look, LookDocument};
 
 use crate::PublishError;
-use crate::scene::Scene;
+use crate::scene::{Scene, SceneKind, SceneName};
 
 pub const LUT_SIZE: usize = 33;
 /// `LUT_SIZE³` RGB entries of `f32`.
@@ -150,7 +150,7 @@ fn preview_lightness_ceiling() -> f64 {
 #[derive(Clone, Debug)]
 pub struct PreparedScene {
     pub scene: Scene,
-    samples: Vec<Sample>,
+    samples: std::sync::Arc<Vec<Sample>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -163,7 +163,69 @@ impl PreparedScene {
     pub fn new(mut scene: Scene) -> Self {
         let samples = scene.xyz.iter().map(|xyz| sample(*xyz)).collect::<Vec<_>>();
         scene.xyz = Vec::new();
-        Self { scene, samples }
+        Self {
+            scene,
+            samples: std::sync::Arc::new(samples),
+        }
+    }
+
+    /// Little-endian dimensions followed by four corner indices and four weight bit patterns per pixel.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8 + self.samples.len() * 32);
+        bytes.extend_from_slice(&self.width().to_le_bytes());
+        bytes.extend_from_slice(&self.height().to_le_bytes());
+        for sample in self.samples.iter() {
+            for corner in sample.corners {
+                bytes.extend_from_slice(&corner.to_le_bytes());
+            }
+            for weight in sample.weights {
+                bytes.extend_from_slice(&weight.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    /// # Errors
+    /// Rejects malformed lengths, dimensions outside `1..=1600`, invalid LUT corners and invalid weights.
+    pub fn from_bytes(name: SceneName, bytes: &[u8]) -> Result<Self, PublishError> {
+        let header = bytes.get(..8).ok_or(PublishError::PreparedScene)?;
+        let width = u32::from_le_bytes(header[..4].try_into().expect("four-byte width"));
+        let height = u32::from_le_bytes(header[4..].try_into().expect("four-byte height"));
+        if !(1..=1600).contains(&width) || !(1..=1600).contains(&height) {
+            return Err(PublishError::PreparedScene);
+        }
+        let pixels = width as usize * height as usize;
+        if bytes.len() != 8 + pixels * 32 {
+            return Err(PublishError::PreparedScene);
+        }
+        let mut samples = Vec::with_capacity(pixels);
+        for pixel in bytes[8..].as_chunks::<32>().0 {
+            let words = pixel.as_chunks::<4>().0;
+            let corners = std::array::from_fn(|i| u32::from_le_bytes(words[i]));
+            let weights = std::array::from_fn(|i| f32::from_le_bytes(words[i + 4]));
+            if corners.iter().any(|corner| {
+                *corner as usize > LUT_SIZE * LUT_SIZE * LUT_SIZE * 3 - 3 || corner % 3 != 0
+            }) || weights
+                .iter()
+                .any(|weight| !weight.is_finite() || !(0.0..=1.0).contains(weight))
+                || (weights.iter().sum::<f32>() - 1.0).abs() > 4.0 * f32::EPSILON
+            {
+                return Err(PublishError::PreparedScene);
+            }
+            samples.push(Sample { corners, weights });
+        }
+        Ok(Self {
+            scene: Scene {
+                title: name.as_str().replace('-', " "),
+                name,
+                kind: SceneKind::TestChart,
+                credit: None,
+                width,
+                height,
+                xyz: Vec::new(),
+            },
+            samples: std::sync::Arc::new(samples),
+        })
     }
 
     pub fn width(&self) -> u32 {
@@ -194,7 +256,7 @@ pub fn render_preview(lut: &[u8], scene: &PreparedScene) -> Result<Vec<u8>, Publ
         .map(|chunk| f32::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
     let mut out = Vec::with_capacity(scene.samples.len() * 4);
-    for sample in &scene.samples {
+    for sample in scene.samples.iter() {
         let [c0, c1, c2, c3] = sample.corners.map(|corner| corner as usize);
         let [w0, w1, w2, w3] = sample.weights;
         for channel in 0..3 {
@@ -284,6 +346,109 @@ mod tests {
 
     use super::*;
     use crate::scene::SceneName;
+
+    #[test]
+    fn prepared_scene_round_trip_preserves_wire_bits_and_rendered_rgba() {
+        let scene = Scene::new(
+            SceneName::new("codec").expect("name"),
+            3,
+            2,
+            vec![
+                [0.0, 0.0, 0.0],
+                [0.2, 0.3, 0.1],
+                [-1.0, 0.01, 2.0],
+                [10.0, 5.0, 3.0],
+                [0.001, 0.002, 0.003],
+                [1.0, 1.0, 1.0],
+            ],
+        )
+        .expect("scene");
+        let prepared = PreparedScene::new(scene);
+        let bytes = prepared.to_bytes();
+        assert_eq!(&bytes[..8], &[3, 0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(bytes.len(), 8 + 6 * 32);
+        let restored = PreparedScene::from_bytes(SceneName::new("restored").expect("name"), &bytes)
+            .expect("prepared scene");
+        assert_eq!(restored.to_bytes(), bytes);
+        assert_eq!(
+            (restored.width(), restored.height(), restored.pixels()),
+            (3, 2, 6)
+        );
+        assert_eq!(restored.scene.name.as_str(), "restored");
+        let lut = (0..LUT_BYTES / 4)
+            .flat_map(|i| ((i % 257) as f32 / 256.0).to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            render_preview(&lut, &restored).expect("restored render"),
+            render_preview(&lut, &prepared).expect("original render"),
+        );
+    }
+
+    #[test]
+    fn prepared_scene_wire_layout_is_little_endian() {
+        let mut bytes = vec![1, 0, 0, 0, 1, 0, 0, 0];
+        for corner in [0u32, 3, 6, 9] {
+            bytes.extend_from_slice(&corner.to_le_bytes());
+        }
+        for weight in [0.125f32, 0.25, 0.5, 0.125] {
+            bytes.extend_from_slice(&weight.to_le_bytes());
+        }
+        let prepared = PreparedScene::from_bytes(SceneName::new("wire").expect("name"), &bytes)
+            .expect("prepared scene");
+        assert_eq!(prepared.to_bytes(), bytes);
+        let mut lut = vec![0; LUT_BYTES];
+        for (node, value) in [0.0f32, 0.25, 0.5, 1.0].into_iter().enumerate() {
+            for channel in 0..3 {
+                let offset = (node * 3 + channel) * 4;
+                lut[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        assert_eq!(
+            render_preview(&lut, &prepared).expect("render"),
+            [112, 112, 112, 255]
+        );
+    }
+
+    #[test]
+    fn prepared_scene_rejects_malformed_bytes() {
+        let mut valid = vec![1, 0, 0, 0, 1, 0, 0, 0];
+        valid.extend_from_slice(&[0; 16]);
+        valid.extend_from_slice(&1.0f32.to_le_bytes());
+        valid.extend_from_slice(&[0; 12]);
+        let rejects = |bytes: &[u8]| {
+            assert!(matches!(
+                PreparedScene::from_bytes(SceneName::new("bad").expect("name"), bytes),
+                Err(PublishError::PreparedScene),
+            ));
+        };
+        for length in 0..valid.len() {
+            rejects(&valid[..length]);
+        }
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        rejects(&trailing);
+        for offset in [0, 4] {
+            for dimension in [0u32, 1601, u32::MAX] {
+                let mut bytes = valid.clone();
+                bytes[offset..offset + 4].copy_from_slice(&dimension.to_le_bytes());
+                rejects(&bytes);
+            }
+        }
+        for offset in [8, 12, 16, 20] {
+            for corner in [1u32, (LUT_BYTES / 4) as u32, u32::MAX] {
+                let mut bytes = valid.clone();
+                bytes[offset..offset + 4].copy_from_slice(&corner.to_le_bytes());
+                rejects(&bytes);
+            }
+        }
+        for offset in [24, 28, 32, 36] {
+            for weight in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.1, 1.1, 0.5] {
+                let mut bytes = valid.clone();
+                bytes[offset..offset + 4].copy_from_slice(&weight.to_le_bytes());
+                rejects(&bytes);
+            }
+        }
+    }
 
     #[test]
     fn identity_lut_reproduces_srgb() {

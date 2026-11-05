@@ -51,6 +51,7 @@ impl ReviewTab {
 enum ReviewTarget {
     Proposal(ProposalRef),
     FailedGate(usize),
+    FitHold(usize),
     SerialReuse(usize),
 }
 
@@ -59,6 +60,7 @@ enum QueueFilter {
     All,
     Proposal(looklab_schema::ProposalKind),
     FailedGates,
+    FitHolds,
     SharedCameras,
 }
 
@@ -66,6 +68,7 @@ impl QueueFilter {
     fn parse(value: &str) -> Self {
         match value {
             "failed-gates" => Self::FailedGates,
+            "fit-holds" => Self::FitHolds,
             "shared-cameras" => Self::SharedCameras,
             _ => value.parse().map(Self::Proposal).unwrap_or(Self::All),
         }
@@ -345,6 +348,9 @@ pub fn ModQueuePage() -> impl IntoView {
                 <option value="failed-gates">{move || format!("Release checks ({})", match queue.get() {
                     Load::Ready(items) => items.failed_gates.len(), _ => 0,
                 })}</option>
+                <option value="fit-holds">{move || format!("Fit not converging ({})", match queue.get() {
+                    Load::Ready(items) => items.fit_holds.len(), _ => 0,
+                })}</option>
                 <option value="shared-cameras">{move || format!("Shared camera flags ({})", match queue.get() {
                     Load::Ready(items) => items.serial_reuse.len(), _ => 0,
                 })}</option>
@@ -359,7 +365,7 @@ pub fn ModQueuePage() -> impl IntoView {
             match queue.get() {
                 Load::Loading => ui::loading().into_any(),
                 Load::Failed(error) => ui::failure(&error).into_any(),
-                Load::Ready(queue) if queue.proposals.is_empty() && queue.failed_gates.is_empty() && queue.serial_reuse.is_empty() => {
+                Load::Ready(queue) if queue.proposals.is_empty() && queue.failed_gates.is_empty() && queue.fit_holds.is_empty() && queue.serial_reuse.is_empty() => {
                     view! { <p class="muted">"Nothing is waiting for moderation."</p> }.into_any()
                 }
                 Load::Ready(queue) => {
@@ -413,6 +419,16 @@ pub fn ModQueuePage() -> impl IntoView {
                                         {format!("Review {} version {} release checks", gate.look, gate.version.get())}
                                     </button>
                                     <small>{ui::timestamp(gate.created_at)}</small>
+                                </li>
+                            }).collect_view()}
+                        </ul>
+                        <ul class="activity-list" hidden=move || !matches!(filter.get(), QueueFilter::All | QueueFilter::FitHolds)>
+                            {queue.fit_holds.into_iter().enumerate().map(|(index, hold)| view! {
+                                <li>
+                                    <button type="button" on:click=move |_| activate(ReviewTarget::FitHold(index))>
+                                        {format!("Fit not converging: {} after {} batches", hold.look, hold.consecutive)}
+                                    </button>
+                                    <small>{ui::timestamp(hold.last_attempt)}</small>
                                 </li>
                             }).collect_view()}
                         </ul>
@@ -557,6 +573,20 @@ pub fn ModQueuePage() -> impl IntoView {
                         </section>
                     }.into_any()
                 }).unwrap_or_else(|| ().into_any()),
+                Some(ReviewTarget::FitHold(index)) => queue.fit_holds.get(index).map(|hold| {
+                    let diagnostics = serde_json::to_string_pretty(&hold.diagnostics).unwrap_or_default();
+                    view! {
+                        <section>
+                            <button type="button" class="review-back" on:click=move |_| selected_alert.set(None)>"Back to queue"</button>
+                            <h2>"Fit not converging"</h2>
+                            <p>{format!("{} has not converged in {} consecutive batches. Nothing was published for those batches.", hold.look, hold.consecutive)}</p>
+                            <p class="muted">{ui::timestamp(hold.first_attempt)}" to "{ui::timestamp(hold.last_attempt)}</p>
+                            <h3>"Last diagnostics"</h3>
+                            <pre class="json">{diagnostics}</pre>
+                            <p>"The worker keeps resuming from the last state. This item resolves on the next published version."</p>
+                        </section>
+                    }.into_any()
+                }).unwrap_or_else(|| ().into_any()),
                 Some(ReviewTarget::SerialReuse(index)) => queue.serial_reuse.get(index).map(|flag| view! {
                     <section>
                         <button type="button" class="review-back" on:click=move |_| selected_alert.set(None)>"Back to queue"</button>
@@ -665,6 +695,9 @@ fn review_targets(queue: &ReviewQueue, filter: QueueFilter) -> Vec<ReviewTarget>
         .collect();
     if matches!(filter, QueueFilter::All | QueueFilter::FailedGates) {
         targets.extend((0..queue.failed_gates.len()).map(ReviewTarget::FailedGate));
+    }
+    if matches!(filter, QueueFilter::All | QueueFilter::FitHolds) {
+        targets.extend((0..queue.fit_holds.len()).map(ReviewTarget::FitHold));
     }
     if matches!(filter, QueueFilter::All | QueueFilter::SharedCameras) {
         targets.extend((0..queue.serial_reuse.len()).map(ReviewTarget::SerialReuse));

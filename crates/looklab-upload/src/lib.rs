@@ -22,8 +22,9 @@ pub use envelope::{
     parse_envelope_strict, peek_nonce,
 };
 pub use ids::{
-    BodyId, CardDeclaration, ContributionKind, ControlEntry, ControlKey, ControlSettings,
-    FirmwareVersionString, IdError, Intent, LookSlug, SettingsError, SimKey, StepIndex,
+    BodyId, CardDeclaration, CommunitySnapshotVersion, ContributionKind, ControlEntry, ControlKey,
+    ControlSettings, FirmwareVersionString, IdError, Intent, LookSlug, SettingSource,
+    SettingsError, SimKey, StepIndex,
 };
 pub use looklab_meta::{
     FirmwareId, FirmwareVersion, RawSerial, RenderTag, RenderTagError, SerialHmac, SerialHmacKey,
@@ -31,7 +32,8 @@ pub use looklab_meta::{
 };
 pub use looklab_samples::RerenderGroupId;
 pub use manifest::{
-    BatchManifest, BlobKind, IntentError, ManifestImage, canonical_manifest_bytes, manifest_hash,
+    BatchManifest, BlobKind, IntentError, ManifestImage, SettingReach, SettingsSourceError,
+    canonical_manifest_bytes, manifest_hash, validate_setting_sources,
 };
 pub use metadata::{
     BadMonth, CaptureMonth, DynamicRange, DynamicRangeSetting, EffectStrength, FilmMode,

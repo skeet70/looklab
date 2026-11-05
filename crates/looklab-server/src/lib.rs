@@ -31,10 +31,11 @@ pub use config::{Config, PowConfig};
 pub use db::{DbError, open as open_database};
 pub use ids::{
     ContributionId, CredentialId, EndorsementId, GrantId, LookVersionId, ModerationDecisionId,
-    ProposalId, RootAdmissionId,
+    ProposalId, RootAdmissionId, StatusToken,
 };
 pub use state::{AppState, ModSessions};
 pub use trust::{CredentialStanding, DefaultTrustPolicy, Tier, TrustPolicy};
+pub use verify::{RequestDomain, request_digest};
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use looklab_color::RgbSpace;
 use looklab_export::card::{CardMeta, CardOptions, write_card};
 use looklab_fit::{
-    ExposureGauge, FitOptions, FitResult, ImageIntent, PreviousSupport,
-    fit_controlled_with_history, post_clip, refit_responses,
+    ExposureGauge, FitOptions, FitResult, FitState, ImageIntent, PreviousSupport,
+    fit_controlled_with_history_resumable, post_clip, refit_responses,
 };
 use looklab_model::realization::{ControlResponseModel, decode_crm, encode_crm};
 use looklab_model::{
@@ -100,6 +100,8 @@ struct RecipeStageParams {
 pub enum RefitOutcome {
     Published(u32),
     Held(u32),
+    /// The native fit exhausted its budget; nothing was published.
+    NotConverged(u32),
     Skipped,
 }
 
@@ -155,6 +157,9 @@ async fn is_dirty(
     body: &BodyId,
     look: &LookSlug,
 ) -> Result<bool> {
+    if db::fit_attempt(db_pool, look.as_str()).await?.is_some() {
+        return Ok(true);
+    }
     let pool = pool::build(db_pool, config, body, look).await?;
     if pool.images.is_empty() {
         return Ok(false);
@@ -233,11 +238,14 @@ async fn refit_look(
     }
     lap(&mut at, "pool");
     let roots = roots::load(db_pool, config, &pool).await?;
-    let options = FitOptions {
+    let mut options = FitOptions {
         seed: config.seed,
         max_samples_per_image: config.max_samples_per_image,
         ..FitOptions::default()
     };
+    if let Some(budget) = config.sweep_budget {
+        options.sweep_budget = budget;
+    }
     let params = TrustParams {
         support_sigma_exit: options.support_sigma_exit,
         ..TrustParams::default()
@@ -266,11 +274,16 @@ async fn refit_look(
 
     let fingerprint = pool_fingerprint(&pool)?;
     let stored = db::pool_fingerprint(db_pool, look.as_str(), body.as_str()).await?;
+    let prior_attempt = db::fit_attempt(db_pool, look.as_str()).await?;
     lap(&mut at, "fingerprint");
-    if stored.as_deref() == Some(fingerprint.as_str()) && previous_version.is_some() {
+    if stored.as_deref() == Some(fingerprint.as_str())
+        && previous_version.is_some()
+        && prior_attempt.is_none()
+    {
         return Ok(RefitOutcome::Skipped);
     }
     if stored.is_none()
+        && prior_attempt.is_none()
         && let Some(latest) = previous_version
     {
         let newest = pool
@@ -294,6 +307,8 @@ async fn refit_look(
     }
     if db::manifest_exists(db_pool, look.as_str(), next_version).await? {
         update_reputation(db_pool, look, next_version, &pool, &previous).await?;
+        db::clear_fit_attempt(db_pool, look.as_str()).await?;
+        db::resolve_fit_hold(db_pool, look.as_str()).await?;
         return Ok(RefitOutcome::Published(next_version));
     }
     if db::gate_failure_pending(db_pool, look.as_str(), next_version).await? {
@@ -324,13 +339,19 @@ async fn refit_look(
     }
     let (epoch, sim) = roots::base_sim(&pool)?;
     let support_history = previous_support(&previous);
-    let native_result = fit_controlled_with_history(
+    let warm_state = prior_attempt
+        .as_ref()
+        .and_then(|attempt| attempt.states.get(body.as_str()))
+        .map(|state| serde_json::from_str::<FitState>(state.as_str()))
+        .transpose()?;
+    let (native_result, resume_state) = fit_controlled_with_history_resumable(
         &native_images,
         &pool.resources.schema,
         epoch,
         &sim,
         &options,
         support_history.as_ref(),
+        warm_state.as_ref(),
     )?;
     let converged = native_result.diagnostics.converged;
     if !converged {
@@ -341,7 +362,36 @@ async fn refit_look(
             evaluations = native_result.diagnostics.evaluations,
             "native fit exhausted its sweep budget"
         );
+        let now = now_unix();
+        let state = resume_state
+            .as_ref()
+            .map(|state| serde_json::to_string(state).map(db::FitState::new))
+            .transpose()?;
+        let consecutive = db::record_fit_attempt(
+            db_pool,
+            look.as_str(),
+            body.as_str(),
+            state.as_ref(),
+            now,
+        )
+        .await?;
+        if consecutive >= config.max_consecutive_nonconverged {
+            let attempt = db::fit_attempt(db_pool, look.as_str())
+                .await?
+                .unwrap_or_default();
+            db::open_fit_hold(
+                db_pool,
+                look.as_str(),
+                consecutive,
+                attempt.started_at,
+                now,
+                &fit_diagnostics(&native_result, &options),
+            )
+            .await?;
+        }
+        return Ok(RefitOutcome::NotConverged(next_version));
     }
+    db::clear_fit_attempt(db_pool, look.as_str()).await?;
     if std::env::var_os("LOOKLAB_TIMING").is_some() {
         eprintln!(
             "native fit diagnostics: converged={} sweeps={} evaluations={} cost={} samples={}",
@@ -528,6 +578,7 @@ async fn refit_look(
         now,
     )
     .await?;
+    db::resolve_fit_hold(db_pool, look.as_str()).await?;
     Ok(RefitOutcome::Published(next_version))
 }
 
@@ -823,6 +874,19 @@ fn gated_since_anchor(
         }
         _ => GatedUnion::at_anchor(anchor_probes),
     }
+}
+
+fn fit_diagnostics(result: &FitResult, options: &FitOptions) -> String {
+    serde_json::json!({
+        "converged": result.diagnostics.converged,
+        "sweeps": result.diagnostics.sweeps,
+        "evaluations": result.diagnostics.evaluations,
+        "objective_samples": result.diagnostics.objective_samples,
+        "final_cost": result.diagnostics.final_cost,
+        "sweep_budget": options.sweep_budget,
+        "max_sweeps": options.max_sweeps,
+    })
+    .to_string()
 }
 
 fn previous_support(previous: &Option<Snapshot>) -> Option<PreviousSupport> {

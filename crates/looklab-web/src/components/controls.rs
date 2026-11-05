@@ -645,7 +645,19 @@ pub fn Dialog(title: String, open: RwSignal<bool>, children: Children) -> impl I
     });
     view! {
         <div node_ref=root>
-            <dialog class="dialog" aria-label=title.clone() on:close=move |_| open.set(false)>
+            <dialog
+                class="dialog"
+                aria-label=title.clone()
+                on:cancel=move |_: web_sys::Event| open.set(false)
+                on:close=move |event| {
+                    if let Some(dialog) = event.target().and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                        && dialog.is_connected()
+                        && !dialog.has_attribute("open")
+                    {
+                        open.set(false);
+                    }
+                }
+            >
                 <header><h2>{title.clone()}</h2><button type="button" aria-label="Close dialog" on:click=move |_| open.set(false)>"Close"</button></header>
                 {children()}
             </dialog>
@@ -682,8 +694,9 @@ pub fn DropZone(
     #[prop(default = "Drop files or a folder here. Files stay on this device until you choose to send.".to_owned())]
     prompt: String,
     #[prop(into, default = Signal::derive(|| false))] disabled: Signal<bool>,
+    #[prop(optional)] file_picker: Option<NodeRef<leptos::html::Input>>,
 ) -> impl IntoView {
-    let files = NodeRef::<leptos::html::Input>::new();
+    let files = file_picker.unwrap_or_default();
     let directory = NodeRef::<leptos::html::Input>::new();
     let dragging = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);

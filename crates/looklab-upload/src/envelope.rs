@@ -481,6 +481,10 @@ fn scan_manifest_images(bytes: &[u8]) -> Result<Option<usize>, EnvelopeError> {
             return Ok(None);
         }
     }
+    // community_snapshot_version
+    if scan.varint().is_none() {
+        return Ok(None);
+    }
     let Some(controls) = scan.varint() else {
         return Ok(None);
     };
@@ -495,7 +499,7 @@ fn scan_manifest_images(bytes: &[u8]) -> Result<Option<usize>, EnvelopeError> {
         if !scan.skip(len) {
             return Ok(None);
         }
-        if scan.varint().is_none() {
+        if scan.varint().is_none() || scan.varint().is_none() {
             return Ok(None);
         }
     }

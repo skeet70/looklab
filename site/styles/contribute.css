@@ -7,6 +7,13 @@
 .help-card, .wanted-card, .pairing-card { padding: 1.25rem; border: 1px solid var(--line); border-radius: .6rem; background: var(--panel); min-width: 0; }
 .help-card h3, .wanted-card h2 { margin: .35rem 0 .6rem; }
 .help-meta { color: var(--muted); font-size: .85rem; margin: 0; }
+.help-card-button { display: flex; flex-direction: column; gap: .65rem; width: 100%; text-align: left; }
+.help-card-button .help-meta, .help-description { font-weight: 400; }
+.help-title { font-size: 1.15rem; line-height: 1.3; font-weight: 650; }
+.help-steps { padding-left: 1.4rem; margin-block: 1.25rem; }
+.help-steps li { margin-block: .85rem; padding-left: .2rem; }
+.help-walkthrough .wanted-grid { grid-template-columns: 1fr; margin-block: 1.25rem; }
+.help-walkthrough .button-primary { margin-top: .75rem; }
 .ways-to-help { margin-block: 2rem; }
 .contribute-page .step { margin-block: 1.5rem; padding: 1.5rem; border: 1px solid var(--line); border-radius: .6rem; }
 .contribute-page .step > label:not(:has(input[type=checkbox])) { display: block; margin-top: 1rem; }
@@ -26,5 +33,12 @@
 .menu-setting input { width: 7rem; }
 .contribution-done > a { display: inline-block; margin: .5rem 1rem .5rem 0; }
 .contribution-done a { overflow-wrap: anywhere; max-width: 100%; }
+.batch-list, .batch-serial { list-style: none; padding: 0; display: grid; gap: .5rem; }
+.batch-choice { display: flex; flex-direction: column; gap: .2rem; width: 100%; text-align: left; padding: .75rem 1rem; border: 1px solid var(--line); border-radius: .5rem; background: var(--panel); color: inherit; cursor: pointer; }
+.batch-choice.selected { border-color: var(--accent); }
+.batch-choice-title { font-weight: 650; }
+.batch-choice-meta { color: var(--muted); font-size: .85rem; overflow-wrap: anywhere; }
+.batch-editor { max-width: 42rem; margin-block: 1rem 1.5rem; }
+.batch-serial label { margin-block: .2rem; font-weight: 400; }
 .wanted-intro { max-width: 70ch; margin-bottom: 2rem; }
 @media (max-width: 600px) { .contribute-page .step { padding: 1rem; } .help-grid { gap: .75rem; } }

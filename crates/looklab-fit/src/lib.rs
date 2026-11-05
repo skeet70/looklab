@@ -49,9 +49,9 @@ pub use model_error::{
 pub use predict::post_clip;
 pub use types::{
     ContributorId, ControlResponseFit, Density, Diagnostics, ExcludeReason, ExcludedImage,
-    ExposureModeId, ExposureOffset, FitError, FitImage, FitOptions, FitResult, ImageFitStats,
-    ImageIntent, ImageNuisances, OutlierReason, PreviousSupport, ProbeEstimate, ProbeUncertainty,
-    Realization, Result, StageLambdas, Verdict,
+    ExposureModeId, ExposureOffset, FitError, FitImage, FitOptions, FitResult, FitState,
+    ImageFitStats, ImageIntent, ImageNuisances, OutlierReason, PreviousSupport, ProbeEstimate,
+    ProbeUncertainty, Realization, Result, StageLambdas, Verdict,
 };
 pub use uncertainty::small_cluster_factor;
 
@@ -85,6 +85,15 @@ pub fn fit_controlled(
     fit::run_with(&kept, options, Some(model), excluded)
 }
 
+pub fn fit_with_history_resumable(
+    images: &[FitImage],
+    options: &FitOptions,
+    previous: Option<&PreviousSupport>,
+    state: Option<&FitState>,
+) -> Result<(FitResult, Option<FitState>)> {
+    fit::run_with_history_resumable(images, options, None, Vec::new(), previous, state)
+}
+
 /// Joint θ/D fit over all native settings on one body, with previous probe support.
 pub fn fit_controlled_with_history(
     images: &[FitImage],
@@ -100,6 +109,23 @@ pub fn fit_controlled_with_history(
         return Err(FitError::NoNativeImages);
     }
     fit::run_with_history(&kept, options, Some(model), excluded, previous)
+}
+
+pub fn fit_controlled_with_history_resumable(
+    images: &[FitImage],
+    schema: &looklab_schema::ControlSchema,
+    epoch: u32,
+    base_sim: &looklab_schema::SimKey,
+    options: &FitOptions,
+    previous: Option<&PreviousSupport>,
+    state: Option<&FitState>,
+) -> Result<(FitResult, Option<FitState>)> {
+    let model = ControlResponseModel::zeroed(schema, epoch, base_sim, 1)?;
+    let (kept, excluded) = fit::filter_spatial(images, schema, epoch)?;
+    if !kept.iter().any(|image| image.intent == ImageIntent::Native) {
+        return Err(FitError::NoNativeImages);
+    }
+    fit::run_with_history_resumable(&kept, options, Some(model), excluded, previous, state)
 }
 
 /// Refit the control response with θ_L fixed.

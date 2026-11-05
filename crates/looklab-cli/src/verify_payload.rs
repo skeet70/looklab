@@ -5,7 +5,7 @@
 //! The flow is [docs/06 §5](../../../docs/06-privacy-and-payload.md) steps 1-4.
 //! Nothing the site served beyond the HAR itself is consulted, and no keys.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -17,16 +17,20 @@ use looklab_prep_module::{
     BuildManifestRequest, BuildManifestResponse, Function, ManifestImageInput, ModuleError,
     PrepareRequest, PrepareResponse, PriorTransformSpec, Response, VersionResponse,
 };
-use looklab_schema::{MakernoteValues, SimKey, settings_from_makernote, sim_from_makernote};
-use looklab_server::body_schema::{Bodies, resolve_epoch, validate_settings};
-use looklab_server::verify::{RequestDomain, request_digest};
+use looklab_schema::{
+    MakernoteValues, MappingError, SettingSource, SimKey, settings_from_makernote_partial,
+    sim_from_makernote,
+};
+use looklab_server::body_schema::{Bodies, BodyRecord, resolve_epoch, validate_settings};
+use looklab_server::{RequestDomain, StatusToken, request_digest};
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, ContributionKind, ControlEntry,
-    ControlKey, ControlSettings, Envelope, EnvelopeParts, ExpectedAssertion, FirmwareId,
-    FirmwareVersion, FirmwareVersionString, Intent, Limits, LookSlug, ManifestHash, ManifestImage,
-    ManifestMetadata, Nonce, PowParams, RawSerial as UploadSerial, RenderTag, SignatureAlgorithm,
-    StepIndex, StructuralVerdict, TopOriginReview, WebAuthnAssertion, check_structure,
-    encode_envelope, parse_envelope_strict, verify as verify_pow,
+    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion,
+    ContributionKind, ControlEntry, ControlKey, ControlSettings, Envelope, EnvelopeParts,
+    ExpectedAssertion, FirmwareId, FirmwareVersion, FirmwareVersionString, Intent, Limits,
+    LookSlug, ManifestImage, ManifestMetadata, Nonce, PowParams, RawSerial as UploadSerial,
+    RenderTag, SignatureAlgorithm, StepIndex, StructuralVerdict, TopOriginReview,
+    WebAuthnAssertion, check_structure, encode_envelope, parse_envelope_strict,
+    verify as verify_pow,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -112,6 +116,9 @@ pub struct VerifyPayloadArgs {
     /// when no image carries a render tag.
     #[arg(long, value_name = "ID/VERSION")]
     pub firmware: Option<String>,
+    /// A control value you entered by hand, as `key=step`. Repeat for each.
+    #[arg(long = "declare-setting", value_name = "KEY=STEP")]
+    pub declare_setting: Vec<String>,
     /// Where the credential id is recorded between runs. Defaults to
     /// `$XDG_STATE_HOME/looklab/verify.json`, else `~/.local/state/looklab/verify.json`.
     #[arg(long, value_name = "FILE")]
@@ -215,7 +222,7 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         bail!("--rp-id must not be empty");
     }
     let intent = intent_before_files(args)?;
-    let bodies = Bodies::load(&args.data.join("bodies"))
+    let bodies = Bodies::load(&args.data.join("bodies"), &args.data.join("community"))
         .with_context(|| format!("loading bodies from {}", args.data.display()))?;
     if bodies.is_empty() {
         bail!(
@@ -223,6 +230,12 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
             args.data.join("bodies").display()
         );
     }
+    let declarations = parse_declared_settings(&args.declare_setting)?;
+    let hars: Vec<(PathBuf, Har)> = args
+        .har
+        .iter()
+        .map(|path| Ok((path.clone(), Har::load(path)?)))
+        .collect::<Result<_>>()?;
 
     let seeds_text = std::fs::read_to_string(&args.seeds)
         .with_context(|| format!("reading {}", args.seeds.display()))?;
@@ -267,12 +280,21 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         Some(intent) => intent,
         None => resolve_card_intent(args, &reproduced, &mut findings)?,
     };
-    let derived = derive_batch(&reproduced, &bodies, &mut findings);
+    let card = args.intent == DeclaredIntent::Card;
+    let snapshot = manifest_snapshot_version(&hars, &origin, &mut findings);
+    let derived = derive_batch(
+        &reproduced,
+        &bodies,
+        snapshot,
+        &declarations,
+        card,
+        &mut findings,
+    );
     let declared = DeclaredFields {
         kind: args.kind.into(),
         intent: intent.clone(),
     };
-    print_batch_fields(derived.as_ref(), &declared, &mut findings);
+    print_batch_fields(derived.as_ref(), &declared, &bodies, &mut findings);
     let expected = derived
         .as_ref()
         .map(|fields| expected_manifest(fields, &declared, &reproduced));
@@ -285,11 +307,11 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         serials: &serials,
         pow: pow_params(args),
         expected: expected.as_ref(),
+        bodies: &bodies,
     };
 
     let mut credentials: Vec<(String, Vec<u8>)> = Vec::new();
-    for path in &args.har {
-        let har = Har::load(path)?;
+    for (path, har) in &hars {
         findings.note("");
         findings.note(format!(
             "har: {} ({} requests)",
@@ -319,6 +341,9 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
             }
             if UrlParts::parse(&entry.request.url).is_some_and(|parts| parts.origin() == origin.0) {
                 audit_request(&entry.request, class, &service, &mut findings);
+                if class == RequestClass::SessionStatus {
+                    audit_session_status(&entry.request, &har, &origin, &mut findings);
+                }
             }
         }
         if uploads.is_empty() {
@@ -367,6 +392,59 @@ fn intent_before_files(args: &VerifyPayloadArgs) -> Result<Option<Intent>> {
             )?))
         }
     }
+}
+
+fn parse_declared_settings(args: &[String]) -> Result<BTreeMap<ControlKey, StepIndex>> {
+    let mut declarations = BTreeMap::new();
+    for text in args {
+        let (key, step) = text
+            .split_once('=')
+            .with_context(|| format!("--declare-setting {text:?} is not <key>=<step>"))?;
+        let key = ControlKey::new(key.trim())
+            .with_context(|| format!("--declare-setting {text:?}: invalid control key"))?;
+        let step: i64 = step
+            .trim()
+            .parse()
+            .with_context(|| format!("--declare-setting {text:?}: the step is not an integer"))?;
+        if declarations
+            .insert(key.clone(), StepIndex::new(step))
+            .is_some()
+        {
+            bail!("--declare-setting names {key} twice");
+        }
+    }
+    Ok(declarations)
+}
+
+/// The community snapshot the uploads name. One run may only name one.
+fn manifest_snapshot_version(
+    hars: &[(PathBuf, Har)],
+    origin: &Origin,
+    findings: &mut Findings,
+) -> CommunitySnapshotVersion {
+    let mut named = None;
+    for (_, har) in hars {
+        for entry in &har.log.entries {
+            if classify(&entry.request, origin) != RequestClass::Upload {
+                continue;
+            }
+            let Ok(body) = entry.request.body() else {
+                continue;
+            };
+            let Ok(envelope) = parse_envelope_strict(&body, &Limits::default()) else {
+                continue;
+            };
+            let version = envelope.manifest.community_snapshot_version;
+            match named {
+                None => named = Some(version),
+                Some(existing) if existing != version => findings.fail(format!(
+                    "the uploads name different community snapshots ({existing} and {version})"
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+    named.unwrap_or(CommunitySnapshotVersion::SHIPPED)
 }
 
 fn resolve_card_intent(
@@ -452,23 +530,47 @@ struct DeclaredFields {
     intent: Intent,
 }
 
-/// The batch fields the files determine, with the makernote each came from.
+/// One control value in the batch settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BatchSetting {
+    key: ControlKey,
+    step: StepIndex,
+    source: SettingSource,
+    /// The makernote tag a reproduced value came from; empty when declared.
+    tag: &'static str,
+}
+
+/// The batch fields the files determine, with each setting's source.
 #[derive(Debug, Clone, PartialEq)]
 struct BatchFields {
+    version: CommunitySnapshotVersion,
     body: BodyId,
     firmware: FirmwareVersionString,
     sim: SimKey,
     settings: ControlSettings,
-    sources: Vec<(ControlKey, StepIndex, &'static str)>,
+    settings_sources: Vec<BatchSetting>,
 }
 
 fn derive_batch(
     reproduced: &[ReproducedImage],
     bodies: &Bodies,
+    version: CommunitySnapshotVersion,
+    declarations: &BTreeMap<ControlKey, StepIndex>,
+    card: bool,
     findings: &mut Findings,
 ) -> Option<BatchFields> {
+    let records = match bodies.at(version) {
+        Ok(records) => records,
+        Err(error) => {
+            findings.fail(format!(
+                "the manifest names community snapshot {version}: {error}; --data has up to {}",
+                bodies.current_version()
+            ));
+            return None;
+        }
+    };
     let first = reproduced.first()?;
-    let fields = match derive_one(&first.metadata, bodies) {
+    let fields = match derive_one(&first.metadata, records, version, declarations, card) {
         Ok(fields) => fields,
         Err(reason) => {
             findings.fail(format!(
@@ -478,7 +580,7 @@ fn derive_batch(
         }
     };
     for image in &reproduced[1..] {
-        match derive_one(&image.metadata, bodies) {
+        match derive_one(&image.metadata, records, version, declarations, card) {
             Ok(other) if other == fields => {}
             Ok(_) => {
                 findings.fail(
@@ -497,7 +599,13 @@ fn derive_batch(
     Some(fields)
 }
 
-fn derive_one(metadata: &ManifestMetadata, bodies: &Bodies) -> Result<BatchFields, String> {
+fn derive_one(
+    metadata: &ManifestMetadata,
+    records: &BTreeMap<String, BodyRecord>,
+    version: CommunitySnapshotVersion,
+    declarations: &BTreeMap<ControlKey, StepIndex>,
+    card: bool,
+) -> Result<BatchFields, String> {
     let make = metadata
         .make
         .as_deref()
@@ -506,10 +614,10 @@ fn derive_one(metadata: &ManifestMetadata, bodies: &Bodies) -> Result<BatchField
         .model
         .as_deref()
         .ok_or("the image carries no EXIF model")?;
-    let body = match_body(bodies, make, model)?;
-    let record = bodies
-        .get(&body)
-        .ok_or_else(|| format!("the data snapshot has no control schema for {body}"))?;
+    let body = match_body(records, make, model)?;
+    let record = records
+        .get(body.as_str())
+        .ok_or_else(|| format!("snapshot {version} has no control schema for {body}"))?;
     let firmware_text = metadata
         .firmware
         .as_deref()
@@ -521,44 +629,97 @@ fn derive_one(metadata: &ManifestMetadata, bodies: &Bodies) -> Result<BatchField
         .ok_or_else(|| format!("no epoch covers firmware {firmware_text}"))?;
     let values = MakernoteValues::from(metadata);
     let sim = sim_from_makernote(epoch, &values).map_err(|error| error.to_string())?;
-    let derived = settings_from_makernote(&record.schema, epoch.id, &values)
-        .map_err(|error| error.to_string())?;
-    let sources: Vec<(ControlKey, StepIndex, &'static str)> = derived
+    let (derived, problems) = settings_from_makernote_partial(&record.schema, epoch.id, &values);
+    let mut sources: Vec<BatchSetting> = derived
         .entries()
         .iter()
-        .map(|setting| {
-            (
-                setting.key.clone(),
-                StepIndex::new(setting.step),
-                setting.source.name(),
-            )
+        .map(|setting| BatchSetting {
+            key: setting.key.clone(),
+            step: StepIndex::new(setting.step),
+            source: SettingSource::Reproduced,
+            tag: setting.source.name(),
         })
         .collect();
-    let entries: Vec<ControlEntry> = sources
-        .iter()
-        .map(|(key, step, _)| ControlEntry {
+    for (key, step) in declarations {
+        if sources.iter().any(|setting| &setting.key == key) {
+            return Err(format!(
+                "{key} is reproduced from its makernote; it cannot also be declared"
+            ));
+        }
+        if !epoch.controls.iter().any(|control| &control.key == key) {
+            return Err(format!(
+                "snapshot {version} has no control {key} for {body}"
+            ));
+        }
+        sources.push(BatchSetting {
             key: key.clone(),
             step: *step,
-        })
+            source: SettingSource::Declared,
+            tag: "",
+        });
+    }
+    sources.sort_by(|left, right| left.key.cmp(&right.key));
+    if !card {
+        for missing in epoch
+            .controls
+            .iter()
+            .filter(|control| control.look_affecting)
+        {
+            if sources.iter().any(|setting| setting.key == missing.key) {
+                continue;
+            }
+            let detail = problems.iter().find_map(|problem| match problem {
+                MappingError::MissingTag { control, .. }
+                | MappingError::UnmappedValue { control, .. }
+                | MappingError::ScaleNotNumeric { control, .. }
+                | MappingError::NotOnStep { control, .. }
+                    if control.as_str() == missing.key.as_str() =>
+                {
+                    Some(problem.to_string())
+                }
+                _ => None,
+            });
+            let reason = if missing.makernote.is_some() {
+                "the makernote did not determine it"
+            } else {
+                "this snapshot maps no makernote tag for it"
+            };
+            let detail = detail
+                .map(|detail| format!(" ({detail})"))
+                .unwrap_or_default();
+            return Err(format!(
+                "control {key} has no value: {reason}{detail}; declare it with --declare-setting {key}=<step>",
+                key = missing.key
+            ));
+        }
+    }
+    let entries: Vec<ControlEntry> = sources
+        .iter()
+        .map(|setting| ControlEntry::new(setting.key.clone(), setting.step, setting.source))
         .collect();
     let settings = ControlSettings::new(entries).map_err(|error| error.to_string())?;
-    validate_settings(record, firmware_text, &sim, &settings)
-        .map_err(|problem| format!("the derived settings are not valid for {body}: {problem:?}"))?;
+    validate_settings(record, firmware_text, &sim, &settings, card)
+        .map_err(|problem| format!("the derived settings are not valid for {body}: {problem}"))?;
 
     Ok(BatchFields {
+        version,
         body,
         firmware,
         sim,
         settings,
-        sources,
+        settings_sources: sources,
     })
 }
 
-fn match_body(bodies: &Bodies, make: &str, model: &str) -> Result<BodyId, String> {
+fn match_body(
+    records: &BTreeMap<String, BodyRecord>,
+    make: &str,
+    model: &str,
+) -> Result<BodyId, String> {
     let make = make.trim();
     let model = model.trim();
     let mut matches = Vec::new();
-    for (id, record) in bodies.records() {
+    for (id, record) in records {
         if record.make.eq_ignore_ascii_case(make)
             && (record.model.eq_ignore_ascii_case(model)
                 || record
@@ -583,12 +744,18 @@ fn match_body(bodies: &Bodies, make: &str, model: &str) -> Result<BodyId, String
 fn print_batch_fields(
     derived: Option<&BatchFields>,
     declared: &DeclaredFields,
+    bodies: &Bodies,
     findings: &mut Findings,
 ) {
     findings.note("");
     findings.note("batch fields");
     match derived {
         Some(fields) => {
+            findings.note(format!(
+                "  community snapshot: {} (named by the manifest; --data has up to {})",
+                fields.version,
+                bodies.current_version()
+            ));
             findings.note(format!(
                 "  body: {} (reproduced from EXIF make/model)",
                 fields.body
@@ -601,15 +768,30 @@ fn print_batch_fields(
                 "  sim: {} (reproduced from the {FILM_MODE_TAG} makernote)",
                 fields.sim
             ));
+            let reproduced = fields
+                .settings_sources
+                .iter()
+                .filter(|setting| setting.source == SettingSource::Reproduced)
+                .count();
+            let declared_count = fields.settings_sources.len() - reproduced;
             findings.note(format!(
-                "  settings: {} controls (reproduced from makernotes)",
-                fields.sources.len()
+                "  settings: {} controls ({reproduced} reproduced, {declared_count} declared)",
+                fields.settings_sources.len()
             ));
-            for (key, step, source) in &fields.sources {
-                findings.note(format!("    {key} = {} (from {source})", step.get()));
+            for setting in &fields.settings_sources {
+                let origin = match setting.source {
+                    SettingSource::Reproduced => format!("reproduced from {}", setting.tag),
+                    SettingSource::Declared => "declared".to_owned(),
+                };
+                findings.note(format!(
+                    "    {} = {} ({origin})",
+                    setting.key,
+                    setting.step.get()
+                ));
             }
         }
-        None => findings.note("  body, firmware, sim, settings: not reproduced (see FAIL)"),
+        None => findings
+            .note("  community snapshot, body, firmware, sim, settings: not reproduced (see FAIL)"),
     }
     findings.note(format!("  kind: {:?} (declared)", declared.kind));
     match &declared.intent {
@@ -657,6 +839,7 @@ fn expected_manifest(
         body: fields.body.clone(),
         firmware_version: fields.firmware.clone(),
         sim_key: fields.sim.clone(),
+        community_snapshot_version: fields.version,
         settings: fields.settings.clone(),
         images: reproduced
             .iter()
@@ -680,6 +863,7 @@ struct Service<'a> {
     serials: &'a [(&'a str, &'a UploadSerial)],
     pow: PowParams,
     expected: Option<&'a BatchManifest>,
+    bodies: &'a Bodies,
 }
 
 #[derive(Debug)]
@@ -742,6 +926,16 @@ fn check_images(envelope: &Envelope, service: &Service<'_>, findings: &mut Findi
         findings.fail("the manifest cannot be reproduced: the batch fields are not determined");
         return;
     };
+    if let Err(error) = service
+        .bodies
+        .at(envelope.manifest.community_snapshot_version)
+    {
+        findings.fail(format!(
+            "the manifest names community snapshot {}: {error}; --data has up to {}",
+            envelope.manifest.community_snapshot_version,
+            service.bodies.current_version()
+        ));
+    }
 
     let request = BuildManifestRequest {
         kind: expected.kind,
@@ -749,6 +943,7 @@ fn check_images(envelope: &Envelope, service: &Service<'_>, findings: &mut Findi
         body: expected.body.clone(),
         firmware: expected.firmware_version.clone(),
         sim: expected.sim_key.clone(),
+        community_snapshot_version: expected.community_snapshot_version,
         settings: expected.settings.clone(),
         images: service
             .reproduced
@@ -836,30 +1031,42 @@ fn manifest_differences(site: &BatchManifest, expected: &BatchManifest) -> Vec<S
             site.sim_key, expected.sim_key
         ));
     }
+    if site.community_snapshot_version != expected.community_snapshot_version {
+        differences.push(format!(
+            "community snapshot is {}, the files' snapshot is {}",
+            site.community_snapshot_version, expected.community_snapshot_version
+        ));
+    }
     if site.settings != expected.settings {
         differences.push(format!(
-            "control settings are {} entries, reproduced {}",
+            "control settings are {} entries, reproduced and declared {}",
             site.settings.entries().len(),
             expected.settings.entries().len()
         ));
         for entry in site.settings.entries() {
-            let reproduced = expected
+            let ours = expected
                 .settings
                 .entries()
                 .iter()
                 .find(|candidate| candidate.key == entry.key);
-            match reproduced {
+            match ours {
                 None => differences.push(format!(
-                    "setting {} = {} is not reproduced from a makernote",
+                    "setting {} = {} is neither reproduced nor declared",
                     entry.key,
                     entry.step.get()
                 )),
-                Some(reproduced) if reproduced.step != entry.step => {
+                Some(ours) if ours.step != entry.step => {
                     differences.push(format!(
-                        "setting {} = {}, reproduced {}",
+                        "setting {} = {}, expected {}",
                         entry.key,
                         entry.step.get(),
-                        reproduced.step.get()
+                        ours.step.get()
+                    ));
+                }
+                Some(ours) if ours.source != entry.source => {
+                    differences.push(format!(
+                        "setting {} is {}, expected {}",
+                        entry.key, entry.source, ours.source
                     ));
                 }
                 Some(_) => {}
@@ -1447,6 +1654,23 @@ struct HarLog {
 #[derive(Debug, Deserialize)]
 struct HarEntry {
     request: HarRequest,
+    response: Option<HarResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HarResponse {
+    content: HarResponseContent,
+}
+
+#[derive(Debug, Deserialize)]
+struct HarResponseContent {
+    text: Option<String>,
+    encoding: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UploadStatus {
+    status_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1549,6 +1773,10 @@ fn audit_request(
     findings: &mut Findings,
 ) {
     for header in &request.headers {
+        if class == RequestClass::SessionStatus && header.name.eq_ignore_ascii_case("authorization")
+        {
+            continue;
+        }
         if !is_browser_header(&header.name) {
             findings.review(format!(
                 "request {} {} carries header {:?}: {:?}",
@@ -1557,19 +1785,21 @@ fn audit_request(
         }
     }
     match class {
-        RequestClass::Nonce | RequestClass::Status => match request.body() {
-            Ok(body) if body.is_empty() => {}
-            Ok(body) => findings.fail(format!(
-                "request {} {} carries a body, but this endpoint takes none: {:?}",
-                request.method,
-                request.url,
-                String::from_utf8_lossy(&body)
-            )),
-            Err(error) => findings.fail(format!(
-                "request {} {} body: {error}",
-                request.method, request.url
-            )),
-        },
+        RequestClass::Nonce | RequestClass::Status | RequestClass::SessionStatus => {
+            match request.body() {
+                Ok(body) if body.is_empty() => {}
+                Ok(body) => findings.fail(format!(
+                    "request {} {} carries a body, but this endpoint takes none: {:?}",
+                    request.method,
+                    request.url,
+                    String::from_utf8_lossy(&body)
+                )),
+                Err(error) => findings.fail(format!(
+                    "request {} {} body: {error}",
+                    request.method, request.url
+                )),
+            }
+        }
         RequestClass::Session => audit_session(request, service, findings),
         RequestClass::RegisterStart => {
             audit_registration(request, &["display_handle"], findings);
@@ -1578,6 +1808,48 @@ fn audit_request(
             audit_registration(request, &["handle", "credential"], findings);
         }
         RequestClass::Upload | RequestClass::Unexpected => {}
+    }
+}
+
+fn audit_session_status(request: &HarRequest, har: &Har, origin: &Origin, findings: &mut Findings) {
+    let mut headers = request
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("authorization"));
+    let token = headers
+        .next()
+        .and_then(|header| header.value.strip_prefix("Bearer "))
+        .and_then(StatusToken::from_base64url);
+    let Some(token) = token else {
+        findings.fail("session restoration requires Authorization: Bearer with a 32-byte base64url status token");
+        return;
+    };
+    if headers.next().is_some() {
+        findings.fail("session restoration carries multiple Authorization headers");
+    }
+    for entry in &har.log.entries {
+        if classify(&entry.request, origin) != RequestClass::Upload {
+            continue;
+        }
+        let Some(content) = entry.response.as_ref().map(|response| &response.content) else {
+            continue;
+        };
+        let Some(text) = &content.text else {
+            continue;
+        };
+        let bytes = if content.encoding.as_deref() == Some("base64") {
+            decode_base64(text)
+        } else {
+            Ok(text.as_bytes().to_vec())
+        };
+        let uploaded = bytes
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<UploadStatus>(&bytes).ok());
+        if let Some(uploaded) = uploaded
+            && StatusToken::from_base64url(&uploaded.status_token).as_ref() != Some(&token)
+        {
+            findings.fail("session restoration status token differs from the upload response");
+        }
     }
 }
 
@@ -1777,7 +2049,10 @@ fn audit_registration(request: &HarRequest, allowed: &[&str], findings: &mut Fin
         }
         return;
     }
-    if !object.get("handle").is_some_and(serde_json::Value::is_string) {
+    if !object
+        .get("handle")
+        .is_some_and(serde_json::Value::is_string)
+    {
         findings.fail("registration handle must be a string");
     }
     let Some(credential) = object.get("credential") else {
@@ -1793,16 +2068,31 @@ fn audit_registration_credential(credential: &serde_json::Value, findings: &mut 
     };
     for key in object.keys() {
         if ![
-            "id", "rawId", "type", "response", "authenticatorAttachment", "clientExtensionResults",
-        ].contains(&key.as_str()) {
-            findings.fail(format!("registration credential carries an unaccounted key {key:?}"));
+            "id",
+            "rawId",
+            "type",
+            "response",
+            "authenticatorAttachment",
+            "clientExtensionResults",
+        ]
+        .contains(&key.as_str())
+        {
+            findings.fail(format!(
+                "registration credential carries an unaccounted key {key:?}"
+            ));
         }
     }
     for key in ["id", "rawId"] {
-        if !object.get(key).and_then(serde_json::Value::as_str).is_some_and(|text| {
-            decode_url_field(text).is_ok_and(|bytes| !bytes.is_empty() && bytes.len() <= 255)
-        }) {
-            findings.fail(format!("registration credential {key} must be a base64url credential ID"));
+        if !object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| {
+                decode_url_field(text).is_ok_and(|bytes| !bytes.is_empty() && bytes.len() <= 255)
+            })
+        {
+            findings.fail(format!(
+                "registration credential {key} must be a base64url credential ID"
+            ));
         }
     }
     if object.get("id") != object.get("rawId") {
@@ -1817,28 +2107,52 @@ fn audit_registration_credential(credential: &serde_json::Value, findings: &mut 
     {
         findings.fail("registration authenticatorAttachment is not a WebAuthn attachment");
     }
-    match object.get("clientExtensionResults").and_then(serde_json::Value::as_object) {
+    match object
+        .get("clientExtensionResults")
+        .and_then(serde_json::Value::as_object)
+    {
         Some(extensions) if extensions.is_empty() => {}
-        Some(extensions) => findings.review(format!("registration client extensions: {extensions:?}")),
+        Some(extensions) => {
+            findings.review(format!("registration client extensions: {extensions:?}"))
+        }
         None => findings.fail("registration clientExtensionResults must be an object"),
     }
-    let Some(response) = object.get("response").and_then(serde_json::Value::as_object) else {
+    let Some(response) = object
+        .get("response")
+        .and_then(serde_json::Value::as_object)
+    else {
         findings.fail("registration credential response must be an object");
         return;
     };
     for key in response.keys() {
         if ![
-            "clientDataJSON", "attestationObject", "authenticatorData", "publicKey",
-            "publicKeyAlgorithm", "transports",
-        ].contains(&key.as_str()) {
-            findings.fail(format!("registration response carries an unaccounted key {key:?}"));
+            "clientDataJSON",
+            "attestationObject",
+            "authenticatorData",
+            "publicKey",
+            "publicKeyAlgorithm",
+            "transports",
+        ]
+        .contains(&key.as_str())
+        {
+            findings.fail(format!(
+                "registration response carries an unaccounted key {key:?}"
+            ));
         }
     }
-    for key in ["clientDataJSON", "attestationObject", "authenticatorData", "publicKey"] {
+    for key in [
+        "clientDataJSON",
+        "attestationObject",
+        "authenticatorData",
+        "publicKey",
+    ] {
         match response.get(key) {
             None if matches!(key, "authenticatorData" | "publicKey") => {}
             Some(value) if key == "publicKey" && value.is_null() => {}
-            Some(value) if value.as_str().is_some_and(|text| decode_url_field(text).is_ok()) => {}
+            Some(value)
+                if value
+                    .as_str()
+                    .is_some_and(|text| decode_url_field(text).is_ok()) => {}
             _ => findings.fail(format!("registration response {key} must be base64url")),
         }
     }
@@ -1848,9 +2162,14 @@ fn audit_registration_credential(credential: &serde_json::Value, findings: &mut 
         findings.fail("registration publicKeyAlgorithm must be an integer");
     }
     if let Some(transports) = response.get("transports")
-        && !transports.as_array().is_some_and(|values| values.iter().all(|value| {
-            matches!(value.as_str(), Some("usb" | "nfc" | "ble" | "internal" | "hybrid" | "smart-card"))
-        }))
+        && !transports.as_array().is_some_and(|values| {
+            values.iter().all(|value| {
+                matches!(
+                    value.as_str(),
+                    Some("usb" | "nfc" | "ble" | "internal" | "hybrid" | "smart-card")
+                )
+            })
+        })
     {
         findings.fail("registration transports must contain WebAuthn transports");
     }
@@ -1862,6 +2181,7 @@ enum RequestClass {
     Upload,
     Status,
     Session,
+    SessionStatus,
     RegisterStart,
     RegisterFinish,
     Unexpected,
@@ -1874,10 +2194,14 @@ fn classify(request: &HarRequest, origin: &Origin) -> RequestClass {
     if parts.origin() != origin.0 {
         return RequestClass::Unexpected;
     }
+    if parts.path_and_query != parts.path() {
+        return RequestClass::Unexpected;
+    }
     match (request.method.as_str(), parts.path()) {
         ("POST", NONCE_PATH) => RequestClass::Nonce,
         ("POST", UPLOAD_PATH) => RequestClass::Upload,
         ("POST", SESSION_PATH) => RequestClass::Session,
+        ("GET", SESSION_PATH) => RequestClass::SessionStatus,
         ("POST", REGISTER_START_PATH) => RequestClass::RegisterStart,
         ("POST", REGISTER_FINISH_PATH) => RequestClass::RegisterFinish,
         ("GET", path) if status_token(path).is_some() => RequestClass::Status,

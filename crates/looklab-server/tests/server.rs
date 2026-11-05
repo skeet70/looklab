@@ -24,11 +24,11 @@ use looklab_schema::{
 };
 use looklab_server::{AppState, Config, PowConfig, router};
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, ContributionKind, ControlEntry,
-    ControlKey, ControlSettings, EnvelopeParts, FirmwareVersionString, Intent, Limits,
-    ManifestHash, ManifestImage, ManifestMetadata, Nonce, PowParams, PowSolutions, RawSerial,
-    SerialHmacKey, SimKey, StepIndex, WebAuthnAssertion, encode_envelope, manifest_hash,
-    parse_render_tag, solve,
+    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion,
+    ContributionKind, ControlEntry, ControlKey, ControlSettings, EnvelopeParts,
+    FirmwareVersionString, Intent, Limits, ManifestHash, ManifestImage, ManifestMetadata, Nonce,
+    PowParams, PowSolutions, RawSerial, SerialHmacKey, SettingSource, SimKey, StepIndex,
+    WebAuthnAssertion, encode_envelope, manifest_hash, parse_render_tag, solve,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -98,10 +98,16 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_with_community(|_| {}).await
+    }
+
+    async fn start_with_community(build: impl FnOnce(&Path)) -> Self {
         let _ = logs();
         let dir = tempfile::tempdir().expect("temp dir");
         let secret = dir.path().join("server-secret");
         std::fs::write(&secret, [9u8; 32]).expect("write secret");
+        let community = dir.path().join("community");
+        build(&community);
         let config = Config {
             bind: "127.0.0.1:0".parse().expect("bind"),
             db_path: dir.path().join("looklab.sqlite3"),
@@ -110,7 +116,7 @@ impl TestServer {
             origin: ORIGIN.to_owned(),
             server_secret_path: secret,
             bodies_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies"),
-            snapshot_dir: dir.path().join("community"),
+            snapshot_dir: community,
             nonce_ttl: Duration::from_secs(300),
             registration_ttl: Duration::from_secs(300),
             body_timeout: Duration::from_secs(30),
@@ -556,28 +562,125 @@ fn image(blob: &[u8], kind: BlobKind, rerender_group: Option<RerenderGroupId>) -
     }
 }
 
-fn entry(key: &str, step: i64) -> ControlEntry {
-    ControlEntry {
-        key: ControlKey::new(key).expect("control key"),
-        step: StepIndex::new(step),
-    }
+fn entry(key: &str, step: i64, source: SettingSource) -> ControlEntry {
+    ControlEntry::new(
+        ControlKey::new(key).expect("control key"),
+        StepIndex::new(step),
+        source,
+    )
+}
+
+fn reproduced(key: &str, step: i64) -> ControlEntry {
+    entry(key, step, SettingSource::Reproduced)
+}
+
+fn declared(key: &str, step: i64) -> ControlEntry {
+    entry(key, step, SettingSource::Declared)
 }
 
 fn valid_settings() -> ControlSettings {
-    ControlSettings::new(vec![
-        entry("color", 0),
-        entry("color_chrome_effect", 0),
-        entry("color_chrome_fx_blue", 0),
-        entry("dynamic_range", 0),
-        entry("highlight_tone", 0),
-        entry("shadow_tone", 0),
-        entry("wb_shift_b", 0),
-        entry("wb_shift_r", 0),
+    settings_at(&[
+        ("color", 0),
+        ("color_chrome_effect", 0),
+        ("color_chrome_fx_blue", 0),
+        ("dynamic_range", 0),
+        ("highlight_tone", 0),
+        ("shadow_tone", 0),
+        ("wb_shift_b", 0),
+        ("wb_shift_r", 0),
     ])
+}
+
+fn settings_at(entries: &[(&str, i64)]) -> ControlSettings {
+    ControlSettings::new(
+        entries
+            .iter()
+            .map(|(key, step)| reproduced(key, *step))
+            .collect(),
+    )
     .expect("settings")
 }
 
+fn with_source(settings: &ControlSettings, entry: ControlEntry) -> ControlSettings {
+    let mut entries = settings
+        .entries()
+        .iter()
+        .filter(|candidate| candidate.key != entry.key)
+        .cloned()
+        .collect::<Vec<_>>();
+    entries.push(entry);
+    ControlSettings::new(entries).expect("settings")
+}
+
+fn write_snapshot(dir: &Path, version: u64, color: &str) {
+    let bodies = dir.join(format!("v{version}/bodies"));
+    std::fs::create_dir_all(&bodies).expect("snapshot bodies");
+    std::fs::write(
+        bodies.join("fujifilm-x-t5.body.yaml"),
+        "id: fujifilm/x-t5\nmake: Fujifilm\nmodel: X-T5\nexif_aliases: [X-T5]\n\
+         kind: camera\ncapabilities:\n  in_camera_raw_conversion: true\n  \
+         jpeg_color_spaces: [srgb]\n  heif: false\nstatus: active\n\
+         mapping_status: provisional\n",
+    )
+    .expect("body entity");
+    std::fs::write(bodies.join("fujifilm-x-t5.yaml"), snapshot_schema(color)).expect("schema");
+}
+
+fn snapshot_schema(color: &str) -> String {
+    let mut text = String::from(
+        "body: fujifilm/x-t5\nepochs:\n  - id: 1\n    firmware: { from: \"1.00\", to: \"9.99\" }\n    \
+         native_sims:\n      - key: classic_chrome\n        look: classic-chrome\n        \
+         makernote: { tag: FilmMode, value: 0x0700 }\n    exposure_modes:\n      - key: dr100\n    \
+         controls:\n      - key: dynamic_range\n        type: enum\n        \
+         values: [dr100, dr200, dr400]\n        default: dr100\n        look_affecting: true\n        \
+         affects: [tone, exposure]\n        makernote:\n          tag: DevelopmentDynamicRange\n          \
+         values: { dr100: 100, dr200: 200, dr400: 400 }\n      - key: highlight_tone\n        \
+         type: decimal\n        range: [-2.0, 4.0]\n        step: 0.5\n        default: 0.0\n        \
+         look_affecting: true\n        affects: [tone]\n        \
+         makernote: { tag: HighlightTone, encoding: { scale: -16 } }\n      - key: shadow_tone\n        \
+         type: decimal\n        range: [-2.0, 4.0]\n        step: 0.5\n        default: 0.0\n        \
+         look_affecting: true\n        affects: [tone]\n        \
+         makernote: { tag: ShadowTone, encoding: { scale: -16 } }\n",
+    );
+    text.push_str(color);
+    text.push_str(
+        "      - key: color_chrome_effect\n        type: enum\n        values: [off, weak, strong]\n        \
+         default: off\n        look_affecting: true\n        affects: [chroma]\n        \
+         makernote: { tag: ColorChromeEffect, values: { off: 0, weak: 32, strong: 64 } }\n      \
+         - key: color_chrome_fx_blue\n        type: enum\n        values: [off, weak, strong]\n        \
+         default: off\n        look_affecting: true\n        affects: [chroma]\n        \
+         makernote: { tag: ColorChromeFXBlue, values: { off: 0, weak: 32, strong: 64 } }\n      \
+         - key: wb_shift_r\n        type: int\n        range: [-9, 9]\n        step: 1\n        \
+         default: 0\n        look_affecting: true\n        affects: [wb]\n        \
+         makernote: { tag: WhiteBalanceFineTune, component: 0, encoding: { scale: 20 } }\n      \
+         - key: wb_shift_b\n        type: int\n        range: [-9, 9]\n        step: 1\n        \
+         default: 0\n        look_affecting: true\n        affects: [wb]\n        \
+         makernote: { tag: WhiteBalanceFineTune, component: 1, encoding: { scale: 20 } }\n    \
+         solve_plan:\n      - stage: tone\n        controls: [highlight_tone]\n",
+    );
+    text
+}
+
+fn unmapped_color() -> &'static str {
+    "      - key: color\n        type: int\n        range: [0, 9]\n        step: 1\n        \
+     default: 0\n        look_affecting: true\n        affects: [chroma]\n"
+}
+
+fn mapped_color() -> &'static str {
+    "      - key: color\n        type: int\n        range: [-4, 4]\n        step: 1\n        \
+     default: 0\n        look_affecting: true\n        affects: [chroma]\n        makernote:\n          \
+     tag: Saturation\n          values: { -4: 0x4e0, -3: 0x4c0, -2: 0x400, -1: 0x180, 0: 0, \
+     1: 0x80, 2: 0x100, 3: 0xc0, 4: 0xe0 }\n"
+}
+
 fn manifest(settings: ControlSettings) -> (BatchManifest, Vec<Vec<u8>>) {
+    manifest_at(CommunitySnapshotVersion::SHIPPED, settings)
+}
+
+fn manifest_at(
+    version: CommunitySnapshotVersion,
+    settings: ControlSettings,
+) -> (BatchManifest, Vec<Vec<u8>>) {
     let blobs = vec![sample_blob(), patch_blob()];
     let images = vec![
         image(
@@ -593,6 +696,7 @@ fn manifest(settings: ControlSettings) -> (BatchManifest, Vec<Vec<u8>>) {
         body: BodyId::new("fujifilm/x-t5").expect("body id"),
         firmware_version: FirmwareVersionString::new("2.10").expect("firmware"),
         sim_key: SimKey::new("classic_chrome").expect("sim key"),
+        community_snapshot_version: version,
         settings,
         images,
     };
@@ -837,8 +941,7 @@ async fn non_canonical_envelope_is_rejected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_invalid_settings_are_rejected() {
     let mut server = TestServer::start().await;
-    let settings = ControlSettings::new(vec![entry("highlight_tone", 0)]).expect("settings");
-    let (manifest, blobs) = manifest(settings);
+    let (manifest, blobs) = manifest(settings_at(&[("highlight_tone", 0)]));
     let nonce = server.nonce().await;
     let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
     let assertion = server.assertion(&challenge).await;
@@ -846,6 +949,114 @@ async fn schema_invalid_settings_are_rejected() {
     let bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     let (status, body) = server.upload_bytes(bytes).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "SCHEMA_INVALID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_declared_look_affecting_control_is_accepted_and_stored() {
+    let mut server = TestServer::start().await;
+    let settings = with_source(&valid_settings(), declared("color", 1));
+    let (manifest, blobs) = manifest(settings);
+    let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT setting_source FROM contribution_images")
+        .fetch_all(&server.db)
+        .await
+        .expect("setting sources");
+    assert_eq!(rows.len(), 2);
+    for (text,) in rows {
+        let pairs: Vec<(String, String)> = serde_json::from_str(&text).expect("source pairs");
+        assert!(
+            pairs
+                .iter()
+                .any(|(key, source)| key == "color" && source == "declared"),
+            "{pairs:?}"
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(key, source)| key == "highlight_tone" && source == "reproduced"),
+            "{pairs:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_look_affecting_control_is_rejected_unless_it_is_a_card() {
+    let mut server = TestServer::start().await;
+    let incomplete = settings_at(&[
+        ("color_chrome_effect", 0),
+        ("color_chrome_fx_blue", 0),
+        ("dynamic_range", 0),
+        ("highlight_tone", 0),
+        ("shadow_tone", 0),
+        ("wb_shift_b", 0),
+        ("wb_shift_r", 0),
+    ]);
+    let (undeclared, blobs) = manifest(incomplete.clone());
+    let (status, body) = server.upload_manifest(&undeclared, &blobs, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upload: {body}");
+    assert_eq!(body["error"], "SCHEMA_INVALID");
+
+    let (mut card, blobs) = manifest(incomplete);
+    let tag = render_tag();
+    card.intent = Intent::Card(CardDeclaration::Tagged(tag.clone()));
+    for image in &mut card.images {
+        image.meta.render_tag = Some(tag.clone());
+    }
+    let (status, body) = server.upload_manifest(&card, &blobs, None).await;
+    assert_eq!(status, StatusCode::CREATED, "card upload: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_manifest_snapshot_version_decides_which_settings_are_reproducible() {
+    let mut server = TestServer::start_with_community(|dir| {
+        write_snapshot(dir, 2, unmapped_color());
+        write_snapshot(dir, 3, mapped_color());
+    })
+    .await;
+
+    let declared_color = with_source(&valid_settings(), declared("color", 7));
+    let (old, blobs) = manifest_at(CommunitySnapshotVersion::new(2), declared_color.clone());
+    let (status, body) = server.upload_manifest(&old, &blobs, None).await;
+    assert_eq!(status, StatusCode::CREATED, "v2 upload: {body}");
+
+    let (current, blobs) = manifest_at(CommunitySnapshotVersion::new(3), declared_color);
+    let (status, body) = server.upload_manifest(&current, &blobs, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "v3 upload: {body}");
+    assert_eq!(body["error"], "SCHEMA_INVALID");
+
+    let (stale, blobs) = manifest_at(CommunitySnapshotVersion::new(1), valid_settings());
+    let (status, body) = server.upload_manifest(&stale, &blobs, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "v1 upload: {body}");
+    assert_eq!(body["error"], "SNAPSHOT_TOO_OLD");
+
+    let (unknown, blobs) = manifest_at(CommunitySnapshotVersion::new(9), valid_settings());
+    let (status, body) = server.upload_manifest(&unknown, &blobs, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "v9 upload: {body}");
+    assert_eq!(body["error"], "SNAPSHOT_UNKNOWN");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reproduced_claim_for_an_unmapped_control_is_rejected() {
+    let mut server = TestServer::start_with_community(|dir| {
+        write_snapshot(dir, 2, unmapped_color());
+    })
+    .await;
+    let settings = settings_at(&[
+        ("color", 1),
+        ("color_chrome_effect", 0),
+        ("color_chrome_fx_blue", 0),
+        ("dynamic_range", 0),
+        ("highlight_tone", 0),
+        ("shadow_tone", 0),
+        ("wb_shift_b", 0),
+        ("wb_shift_r", 0),
+    ]);
+    let (manifest, blobs) = manifest_at(CommunitySnapshotVersion::new(2), settings);
+    let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upload: {body}");
     assert_eq!(body["error"], "SCHEMA_INVALID");
 }
 

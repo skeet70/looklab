@@ -67,6 +67,8 @@ pub enum PublishError {
     SceneDimensions,
     #[error("scene contains a value that is not finite")]
     SceneValue,
+    #[error("invalid prepared scene bytes")]
+    PreparedScene,
     #[error("preview LUT has {0} bytes")]
     PreviewLut(usize),
     #[error("scene PNG: {0}")]

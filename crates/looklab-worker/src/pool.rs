@@ -7,12 +7,12 @@ use looklab_fit::ExposureModeId;
 use looklab_model::LookInput;
 use looklab_model::realization::{ControlValue, Settings};
 use looklab_samples::{SampleFlags, SampleSet};
-use looklab_schema::{Affects, ControlDefault, ControlSchema, ControlType};
+use looklab_schema::{Affects, ControlDefault, ControlKey, ControlSchema, ControlType};
 use looklab_trust::{
     CredentialId as TrustCredentialId, EffectiveContributorId, Region, RegionCoverage, SerialLink,
     resolve_effective_contributors,
 };
-use looklab_upload::ControlSettings;
+use looklab_upload::{ControlSettings, SettingSource};
 use looklab_upload::{BodyId, LookSlug};
 use sqlx::SqlitePool;
 
@@ -35,6 +35,8 @@ pub struct PoolImage {
     pub transform: Mat3,
     pub epoch: u32,
     pub settings: Settings,
+    /// Which controls came from the file and which the contributor entered.
+    pub setting_source: BTreeMap<ControlKey, SettingSource>,
     pub exposure_mode: ExposureModeId,
     pub outcome: Option<ImageOutcome>,
     pub capture: looklab_trust::CaptureTuple,
@@ -133,6 +135,12 @@ pub async fn build(
             .unwrap_or_else(|| EffectiveContributorId::from(credential.trust));
         let epoch = epoch_for(&resources.schema, &contribution.firmware)?.id;
         let settings = model_settings(&contribution.settings);
+        let setting_source: BTreeMap<ControlKey, SettingSource> = contribution
+            .settings
+            .entries()
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.source))
+            .collect();
         let exposure_mode = exposure_mode(&resources.schema, epoch, &settings)?;
         for row in rows {
             let path = db::blob_path(&config.blobs, &row.samples_hash);
@@ -154,6 +162,7 @@ pub async fn build(
                 transform,
                 epoch,
                 settings: settings.clone(),
+                setting_source: setting_source.clone(),
                 exposure_mode,
                 outcome,
                 capture,

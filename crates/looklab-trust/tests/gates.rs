@@ -50,7 +50,7 @@ fn with_sigma(probe: &ProbeEstimate, sigma: f64) -> ProbeEstimate {
         bias_de: probe.bias_de,
         density: 10.0,
         clusters: 5,
-        pre_clip_identified: true,
+        pre_clip_identified: probe.pre_clip_identified,
     };
     ProbeEstimate::new(prediction, None, &THRESHOLDS)
 }
@@ -493,6 +493,28 @@ fn the_ceilings_apply_to_probes_outside_the_union() {
             ..
         } if probe == &ProbeId::new("p50")
     )));
+}
+
+#[test]
+fn a_candidate_cannot_exempt_itself_from_the_pre_clip_ceilings() {
+    let mut input = baseline();
+    input.candidate.probes[50].pre_clip = [52.5, 0.0, 0.0];
+    input.candidate.probes[50].pre_clip_identified = false;
+    let report = gate_release(&TrustParams::default(), &input);
+
+    assert_eq!(
+        report.drift_previous.pre_clip_over_ceiling[0].probe,
+        ProbeId::new("p50")
+    );
+    assert!(!report.drift_previous.pass);
+
+    let mut input = baseline();
+    input.previous.probes[50].pre_clip_identified = false;
+    input.anchor.probes[50].pre_clip_identified = false;
+    input.candidate.probes[50].pre_clip = [52.5, 0.0, 0.0];
+    let report = gate_release(&TrustParams::default(), &input);
+    assert!(report.drift_previous.pre_clip_over_ceiling.is_empty());
+    assert!(report.drift_anchor.pre_clip_over_ceiling.is_empty());
 }
 
 #[test]

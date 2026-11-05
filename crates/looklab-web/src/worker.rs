@@ -273,6 +273,37 @@ impl MatchWorker {
     }
 }
 
+#[repr(u32)]
+enum SceneOperation {
+    Prepare = 1,
+}
+
+pub(crate) async fn prepare_scene(
+    name: looklab_publish::SceneName,
+    png: &[u8],
+) -> Result<looklab_publish::PreparedScene, String> {
+    let link = WorkerLink::spawn(&site_url("/workers/scene-worker.js"))?;
+    link.post(&[
+        ("type", "init"),
+        (
+            "url",
+            &site_url("/generated/wasm/looklab_scene_module.wasm"),
+        ),
+    ])?;
+    let reply = link
+        .call(SceneOperation::Prepare as u32, png, FILE_TIMEOUT_MS)
+        .await
+        .map_err(|failure| match failure {
+            WorkerFailure::Timeout => "Sample photo preparation timed out.".to_owned(),
+            WorkerFailure::Trap => "The sample photo decoder stopped.".to_owned(),
+            WorkerFailure::Module(message) => message,
+        })?;
+    crate::data::timed(crate::data::PreviewStage::SceneReceive, || {
+        looklab_publish::PreparedScene::from_bytes(name, &reply.bytes)
+    })
+    .map_err(|error| error.to_string())
+}
+
 struct Deadline {
     promise: Promise,
     handle: Rc<Cell<i32>>,

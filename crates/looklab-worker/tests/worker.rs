@@ -38,6 +38,13 @@ async fn fixture() -> Fixture {
 }
 
 async fn fixture_with_transform(write_transform: bool) -> Fixture {
+    fixture_with(write_transform, |_| {}).await
+}
+
+async fn fixture_with(
+    write_transform: bool,
+    configure: impl FnOnce(&mut WorkerConfig),
+) -> Fixture {
     let dir = TempDir::new().expect("temp dir");
     let db = dir.path().join("looklab.sqlite3");
     let blobs = dir.path().join("blobs");
@@ -52,6 +59,7 @@ async fn fixture_with_transform(write_transform: bool) -> Fixture {
     config.data = data;
     config.site = site.clone();
     config.transforms = transforms;
+    configure(&mut config);
     let worker = Worker::open(config).await.expect("worker");
     Fixture {
         _dir: dir,
@@ -1782,6 +1790,107 @@ async fn a_firmware_split_opens_a_worker_proposal_with_evidence() {
 }
 
 #[tokio::test]
+async fn a_non_converged_batch_publishes_nothing_and_resumes_to_convergence() {
+    let fixture = fixture_with(true, |config| {
+        config.sweep_budget = Some(2_000.0);
+    })
+    .await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 2,
+        samples_per_image: 200,
+        ..SynthConfig::default()
+    });
+    let credential = add_credential(worker, "seeder", 1.2).await;
+    add_contribution(worker, &credential, &dataset, &[0, 1], 100).await;
+
+    refit(worker).await;
+    assert_eq!(
+        count(
+            worker,
+            "SELECT COUNT(*) FROM look_versions WHERE look = 'classic-chrome'",
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            worker,
+            "SELECT COUNT(*) FROM fit_attempts WHERE look = 'classic-chrome'",
+        )
+        .await,
+        1
+    );
+
+    let mut resumed_config = worker.config().clone();
+    resumed_config.sweep_budget = None;
+    let resumed = Worker::open(resumed_config).await.expect("worker");
+    refit(&resumed).await;
+    assert_eq!(
+        count(
+            worker,
+            "SELECT COUNT(*) FROM look_versions WHERE look = 'classic-chrome'",
+        )
+        .await,
+        1
+    );
+    assert!(read_release(&fixture, 1).converged);
+    assert_eq!(
+        count(
+            worker,
+            "SELECT COUNT(*) FROM fit_attempts WHERE look = 'classic-chrome'",
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            worker,
+            "SELECT COUNT(*) FROM fit_holds WHERE status = 'pending'",
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn three_non_converged_batches_open_one_moderation_item() {
+    let fixture = fixture_with(true, |config| {
+        config.sweep_budget = Some(1.0);
+        config.max_consecutive_nonconverged = 3;
+    })
+    .await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 2,
+        samples_per_image: 200,
+        ..SynthConfig::default()
+    });
+    let credential = add_credential(worker, "seeder", 1.2).await;
+    add_contribution(worker, &credential, &dataset, &[0, 1], 100).await;
+
+    for _ in 0..4 {
+        refit(worker).await;
+    }
+    assert_eq!(
+        count(
+            worker,
+            "SELECT COUNT(*) FROM look_versions WHERE look = 'classic-chrome'",
+        )
+        .await,
+        0
+    );
+    assert_eq!(count(worker, "SELECT COUNT(*) FROM fit_holds").await, 1);
+    let queue = looklab_server::admin::mod_queue(worker.pool(), looklab_server::Tier::Seeder)
+        .await
+        .expect("moderation queue");
+    assert_eq!(queue.fit_holds.len(), 1);
+    assert_eq!(queue.fit_holds[0].consecutive, 4);
+}
+
+#[tokio::test]
 #[ignore = "release-mode timing check for 1000 images"]
 async fn refit_1000_images_under_target() {
     let fixture = fixture().await;
@@ -1810,4 +1919,18 @@ async fn refit_1000_images_under_target() {
     let elapsed = started.elapsed();
     println!("1000-image Look refit: {elapsed:?}");
     assert!(elapsed.as_secs() < 900, "{elapsed:?}");
+    assert_eq!(
+        count(
+            worker,
+            "SELECT COUNT(*) FROM look_versions WHERE look = 'classic-chrome' AND status = 'published'",
+        )
+        .await,
+        1,
+        "one 1k batch published no version in {elapsed:?}",
+    );
+    let release = read_release(&fixture, 1);
+    assert!(
+        release.converged,
+        "the 1k batch did not converge in {elapsed:?}",
+    );
 }

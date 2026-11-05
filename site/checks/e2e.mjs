@@ -3,6 +3,7 @@
 
 import { copyFile, link, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
@@ -18,6 +19,8 @@ const USAGE = `usage: node site/checks/e2e.mjs [options]
   --body ID --firmware V --sim KEY
   --controls "key=step,..."    control steps, comma separated
   --workers N                  worker count for the contribute run
+  --verifier FILE              native looklab binary for contribution HAR checks
+  --verify-module FILE         source-built prep module for HAR checks
   --count N                    files for the flatness run (default 100)
   --expected FILE              canonical permalink to compare against
   --status TOKEN               status token for the /status screenshot
@@ -27,6 +30,7 @@ needs the built site behind the stub server and Playwright from nix:
 
   cd site && nix develop -c env CARGO_TARGET_DIR=target-ui trunk build --release
   CARGO_TARGET_DIR=target-ui nix develop -c cargo run -j 6 -p looklab-web --features stub --example stub_server -- --port 8099 --state /tmp/looklab-e2e/stub-state
+  CARGO_TARGET_DIR=target-ui nix develop -c cargo test -j 6 -p looklab-cli --test verify_payload reproduces_an_upload_and_passes -- --exact
   nix develop -c env \\
     PLAYWRIGHT_MODULE=$(nix eval --raw nixpkgs#playwright-driver)/index.js \\
     PLAYWRIGHT_BROWSERS_PATH=$(nix eval --raw nixpkgs#playwright-driver.browsers) \\
@@ -41,10 +45,12 @@ const options = {
   raw: 'fixtures/fujifilm-x-s10.raf',
   jpeg: 'fixtures/generated/fujifilm-x-s10.jpg',
   body: 'fujifilm/x-s10',
-  firmware: '1.10',
+  firmware: '1.00',
   sim: 'provia',
   controls: '',
   workers: 1,
+  verifier: 'target-ui/debug/looklab',
+  'verify-module': 'target-ui/verify-payload-wasm/wasm32-unknown-unknown/release/looklab_prep_module.wasm',
   count: 100,
   expected: 'site/data/looks/synthetic-match/1.0.0/match.permalink',
   status: '',
@@ -299,11 +305,11 @@ async function contribute(size) {
     await session.authenticator.cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
   }
   const summary = {};
-  const capture = async (name) => {
+  const capture = async (name, fullPage = true) => {
     for (const colorScheme of ['light', 'dark']) {
       await page.emulateMedia({ colorScheme });
-      await page.screenshot({ path: `${options.out}/${name}-${size}-${colorScheme}.png`, fullPage: true });
-      check(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${size} ${colorScheme}: ${name} fits viewport`);
+      await page.screenshot({ path: `${options.out}/${name}-${size}-${colorScheme}.png`, fullPage });
+      check(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth && [...document.querySelectorAll('dialog[open]')].every(dialog => dialog.scrollWidth <= dialog.clientWidth)), `${size} ${colorScheme}: ${name} fits viewport`);
     }
     await page.emulateMedia({ colorScheme: 'light' });
   };
@@ -311,7 +317,51 @@ async function contribute(size) {
     await page.goto(`${options.origin}/contribute`);
     await page.getByRole('heading', { name: 'Help build looks', exact: true }).waitFor();
     await capture('contribute-landing');
-    await page.setInputFiles('.drop-zone input[type=file]:not([webkitdirectory])', [options.raw, options.jpeg]);
+    const catalog = await (await page.request.get(`${options.origin}/data/index.json`)).json();
+    const wantedLook = catalog.looks.find(look => look.visibility !== 'test_fixture');
+    const wantedCamera = catalog.bodies.find(camera => camera.kind === 'camera');
+    check(Boolean(wantedLook && wantedCamera), `${size}: wanted-shot fixture uses published names`);
+    const wantedBounties = [0.01, 0.1, 0.5, 0.9].map((reduction, index) => ({
+      look: wantedLook.slug,
+      look_version: 1,
+      body: wantedCamera.id,
+      region: `h${index}/e3`,
+      expected_variance_reduction: reduction,
+      reason: { kind: 'unverified_region', sigma: 0.2 },
+      status: 'open',
+    }));
+    await page.route('**/bounties.json', route => route.fulfill({ json: { bounties: wantedBounties } }));
+    const guideNames = [
+      'Share photos you already have',
+      'Take a few wanted shots',
+      'Re-render a few RAWs in camera',
+      'Photograph a pattern on your phone',
+      'Photograph a gradient',
+      'Photograph a color chart',
+    ];
+    for (const [index, name] of guideNames.entries()) {
+      const card = page.getByRole('button', { name, exact: true });
+      await card.focus();
+      await page.keyboard.press('Enter');
+      const dialog = page.getByRole('dialog', { name, exact: true });
+      await dialog.waitFor();
+      check(await dialog.getByRole('list').first().getByRole('listitem').count() >= 3, `${size}: ${name} has numbered guidance`);
+      if (index === 1) {
+        await dialog.getByRole('article').nth(2).waitFor();
+        check(await dialog.getByRole('article').count() === 3, `${size}: wanted guide shows the top three requests`);
+        check(await dialog.getByRole('article').first().textContent().then(text => text.includes(wantedLook.name) && text.includes(`${wantedCamera.make} ${wantedCamera.model}`)), `${size}: wanted guide shows published look and camera names`);
+      }
+      await capture(`contribute-help-${index}`, false);
+      await page.keyboard.press('Escape');
+      await dialog.waitFor({ state: 'hidden' });
+      check(await card.evaluate(button => button === document.activeElement), `${size}: ${name} returns keyboard focus`);
+    }
+    await page.getByRole('button', { name: guideNames[0], exact: true }).click();
+    const [chooser] = await Promise.all([
+      page.waitForEvent('filechooser'),
+      page.getByRole('dialog', { name: guideNames[0], exact: true }).getByRole('button', { name: 'Choose photos', exact: true }).click(),
+    ]);
+    await chooser.setFiles([options.raw, options.jpeg]);
     await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).waitFor({ timeout: 120_000 });
     await capture('contribute-1-drop');
 
@@ -404,6 +454,47 @@ async function contribute(size) {
   } finally {
     await close(session);
     await patchHar(harPath, session.bodies);
+  }
+}
+
+async function verifyContributionPayload(size, summary) {
+  const log = `${options.out}/verify-payload-${size}.txt`;
+  const state = `${options.out}/verify-state-${size}-${randomUUID()}.json`;
+  const snapshot = `${options.out}/verification-data-${size}`;
+  const response = await fetch(`${options.origin}/data/bodies/${options.body}.json`);
+  if (!response.ok) throw new Error(`Cannot load verification camera: HTTP ${response.status}`);
+  const { id, make, model, exif_aliases, kind, capabilities, status, mapping_status, schema } = await response.json();
+  const entity = { id, make, model, exif_aliases, kind, capabilities, status, mapping_status };
+  const filename = id.replace('/', '-');
+  await mkdir(`${snapshot}/bodies`, { recursive: true });
+  await writeFile(`${snapshot}/bodies/${filename}.body.yaml`, JSON.stringify(entity));
+  await writeFile(`${snapshot}/bodies/${filename}.yaml`, schema);
+  const args = [
+    'verify-payload',
+    '--seeds', summary.seeds,
+    '--har', `${options.out}/session-${size}.har`,
+    '--module', options['verify-module'],
+    '--origin', options.origin,
+    '--rp-id', new URL(options.origin).hostname,
+    '--data', snapshot,
+    '--kind', 'library',
+    '--intent', 'native',
+    '--pow-memory-kib', '8',
+    '--pow-iterations', '1',
+    '--pow-difficulty', '0',
+    '--state', state,
+    options.raw,
+    options.jpeg,
+  ];
+  try {
+    const output = execFileSync(options.verifier, args, { cwd: REPO_ROOT, encoding: 'utf8' });
+    await writeFile(log, output);
+    summary.verification = { log, state, snapshot };
+    check(true, `${size}: restored upload passes verify-payload`);
+  } catch (error) {
+    const output = [error.stdout, error.stderr, error.message].filter(Boolean).map(String).join('\n');
+    await writeFile(log, output);
+    throw new Error(`${size}: restored upload failed verify-payload; see ${log}`, { cause: error });
   }
 }
 
@@ -924,6 +1015,7 @@ async function compareViews() {
             await viewer.locator('.difference-timing').filter({ hasText: 'Difference computed' }).waitFor({ timeout: 120_000 });
             timing.push({ size, colorScheme, text: await viewer.locator('.difference-timing').textContent() });
           }
+          await page.getByRole('region', { name: 'Comparison summary', exact: true }).waitFor({ timeout: 120_000 });
           check(await page.locator('.compare-breakdown-row').count() === 5, 'Compare five-row summary');
           if (await page.getByText('Not enough measured data to rate this difference yet.', { exact: false }).count()) {
             check(await page.locator('.compare-summary meter').count() === 0, 'Compare unsupported data has no rating bars');
@@ -1093,7 +1185,9 @@ if (options.flow === 'all' || options.flow === 'match') {
 }
 if (options.flow === 'all' || options.flow === 'contribute') {
   result.contribute = await contribute('desktop');
+  await verifyContributionPayload('desktop', result.contribute);
   result.contribute_mobile = await contribute('mobile');
+  await verifyContributionPayload('mobile', result.contribute_mobile);
 }
 if (options.flow === 'all' || options.flow === 'pages') {
   if (!options.permalink && result.permalink) {

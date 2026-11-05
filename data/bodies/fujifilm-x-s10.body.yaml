@@ -1,0 +1,11 @@
+id: fujifilm/x-s10
+make: Fujifilm
+model: X-S10
+exif_aliases: [X-S10]
+kind: camera
+capabilities:
+  in_camera_raw_conversion: true
+  jpeg_color_spaces: [srgb, adobe_rgb]
+  heif: false
+status: active
+mapping_status: provisional

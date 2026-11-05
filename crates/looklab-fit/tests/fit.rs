@@ -116,6 +116,49 @@ fn mislabelled_image_is_quarantined() {
 }
 
 #[test]
+#[ignore = "tone leak identity ablation; run with --ignored --nocapture"]
+fn tone_leak_identity_ablation() {
+    let config = SynthConfig {
+        seed: 31,
+        images: 20,
+        samples_per_image: 10_000,
+        ..SynthConfig::default()
+    };
+    let truth = synth::truth_look(config.seed);
+    let variant = synth::tone_only_variant(&truth);
+    let baseline = synth::dataset_with(&config, &truth, &LookSelector::Single(&truth));
+    let shifted = synth::dataset_with(&config, &variant, &LookSelector::Single(&variant));
+    for scale in [1.0_f64, 0.0] {
+        let options = FitOptions {
+            identity_scale: scale,
+            ..layered_options(7)
+        };
+        let a = fit(&baseline.images, &options).expect("fit a");
+        let b = fit(&shifted.images, &options).expect("fit b");
+        let left_shift = libm::pow(2.0, gauge(&a, &baseline));
+        let right_shift = libm::pow(2.0, gauge(&b, &shifted));
+        let mut worst_gain: f64 = 0.0;
+        let mut worst_rotation: f64 = 0.0;
+        let mut worst_lightness: f64 = 0.0;
+        for probe in probes_v1().probes {
+            let left = a
+                .look
+                .layer_values(&LookInput::new(probe.xyz.scale(left_shift)));
+            let right = b
+                .look
+                .layer_values(&LookInput::new(probe.xyz.scale(right_shift)));
+            worst_gain = worst_gain.max((left.log_g - right.log_g).abs());
+            worst_rotation = worst_rotation.max((left.r - right.r).abs());
+            worst_lightness = worst_lightness.max((left.lambda - right.lambda).abs());
+        }
+        eprintln!(
+            "identity scale {scale}: worst log G {worst_gain:.4}, rotation {worst_rotation:.3}, lightness {worst_lightness:.3}, lambdas {:.2}/{:.2}",
+            a.lambdas.grl, b.lambdas.grl
+        );
+    }
+}
+
+#[test]
 fn tone_only_difference_leaves_the_colour_layers_alone() {
     let config = SynthConfig {
         seed: 31,
@@ -187,7 +230,9 @@ fn tone_only_difference_leaves_the_colour_layers_alone() {
         a.lambdas,
         b.lambdas
     );
-    assert!(worst_gain < 0.05, "log G difference {worst_gain}");
+    // The identity prior is what holds G fixed under a tone-only change; with it
+    // ablated the same fixture leaks 0.38 (see tone_leak_identity_ablation).
+    assert!(worst_gain < 0.02, "log G difference {worst_gain}");
     assert!(
         worst_rotation < 1.8,
         "rotation difference {worst_rotation} deg"

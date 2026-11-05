@@ -124,6 +124,9 @@ fn LookPageView(page: LookPage) -> impl IntoView {
     let scene_index = RwSignal::new(Load::<SceneIndex>::Loading);
     let scene_name = RwSignal::new(String::new());
     let scene = RwSignal::new(Load::<Arc<PreparedScene>>::Loading);
+    let full_scene = RwSignal::new(None::<Arc<PreparedScene>>);
+    let full_scene_error = RwSignal::new(None::<String>);
+    let photo_strip_ready = RwSignal::new(false);
     let index = RwSignal::new(Load::<SiteIndex>::Loading);
     let version_generation = RwSignal::new(0_u32);
     let scene_generation = RwSignal::new(0_u32);
@@ -177,20 +180,47 @@ fn LookPageView(page: LookPage) -> impl IntoView {
         let name = scene_name.get();
         let mine = scene_generation.get_untracked() + 1;
         scene_generation.set(mine);
+        full_scene.set(None);
+        full_scene_error.set(None);
         if name.is_empty() {
             scene.set(Load::Loading);
             return;
         }
         scene.set(Load::Loading);
         leptos::task::spawn_local_scoped_with_cancellation(async move {
-            let loaded = data::scene(&name).await;
+            let loaded = data::scene_thumbnail(&name).await;
             if scene_generation.try_get_untracked() != Some(mine) {
                 return;
             }
-            scene.set(match loaded {
-                Ok(scene) => Load::Ready(Arc::new(scene)),
-                Err(error) => Load::Failed(error),
-            });
+            match loaded {
+                Ok(thumbnail) => scene.set(Load::Ready(Arc::new(thumbnail))),
+                Err(error) => {
+                    scene.set(Load::Failed(error));
+                }
+            }
+        });
+    });
+
+    Effect::new(move |_| {
+        if !version.with(|loaded| matches!(loaded, Load::Ready(_))) {
+            return;
+        }
+        let Some(name) = scene.with(|loaded| loaded.ready().map(|photo| photo.scene.name.clone()))
+        else {
+            return;
+        };
+        let mine = scene_generation.get_untracked();
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
+            ui::paint_browser().await;
+            photo_strip_ready.set(true);
+            let loaded = data::scene(name.as_str()).await;
+            if scene_generation.try_get_untracked() != Some(mine) {
+                return;
+            }
+            match loaded {
+                Ok(photo) => full_scene.set(Some(Arc::new(photo))),
+                Err(error) => full_scene_error.set(Some(error)),
+            }
         });
     });
 
@@ -209,6 +239,9 @@ fn LookPageView(page: LookPage) -> impl IntoView {
     let details_for_version = details.clone();
     let tab = RwSignal::new(LookTab::Overview.id());
     let active_tab = Signal::derive(move || LookTab::from_id(&tab.get()));
+    let measurements_opened = Memo::new(move |opened: Option<&bool>| {
+        opened.copied().unwrap_or(false) || active_tab.get() == LookTab::Measurements
+    });
     let tabs = [LookTab::Overview, LookTab::Measurements, LookTab::History]
         .into_iter()
         .map(|tab| ui::TabSpec {
@@ -300,15 +333,24 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                 {move || match (version.get(), scene.get()) {
                     (Load::Ready(loaded), Load::Ready(scene)) => {
                         let label = look_name.clone();
-                        view! { <ui::Viewer lut_a=Signal::stored(loaded.lut.clone()) scene=Signal::stored(scene) label_a=label/> }.into_any()
+                        let displayed = Signal::derive(move || full_scene.get().unwrap_or_else(|| Arc::clone(&scene)));
+                        view! { <ui::Viewer lut_a=Signal::stored(loaded.lut.clone()) scene=displayed label_a=label/> }.into_any()
                     }
                     (Load::Failed(error), _) => ui::failure(&error).into_any(),
                     (_, Load::Failed(error)) => ui::failure(&error).into_any(),
                     _ => ui::loading().into_any(),
                 }}
-                <div class="photo-strip" aria-label="Sample photos">{move || match scene_index.get() {
-                    Load::Ready(index) => index.scenes.into_iter().filter(|scene| scene.kind == looklab_publish::SceneKind::Photo).map(|summary| view! { <PhotoChoice summary selected=scene_name version/> }).collect_view().into_any(), _ => ().into_any()
-                }}</div>
+                {move || full_scene_error.get().map(|error| view! {
+                    <p role="status">"The full-size photo could not load. The smaller preview is still visible."</p>
+                    <ui::Disclosure summary="Photo loading details".to_owned()><p>{error}</p></ui::Disclosure>
+                })}
+                <div class="photo-strip" aria-label="Sample photos">
+                    <Show when=move || photo_strip_ready.get()>
+                        {move || match scene_index.get() {
+                            Load::Ready(index) => index.scenes.into_iter().filter(|scene| scene.kind == looklab_publish::SceneKind::Photo).map(|summary| view! { <PhotoChoice summary selected=scene_name version/> }).collect_view().into_any(), _ => ().into_any()
+                        }}
+                    </Show>
+                </div>
                 <p>
                     <a href=crate::base::site_url(&format!("/compare?a={slug}"))>"Compare with another look →"</a>
                 </p>
@@ -361,6 +403,7 @@ fn LookPageView(page: LookPage) -> impl IntoView {
             <super::recipes::RecipeSection look=page.slug.clone()/>
             </div>
             <div hidden=move || active_tab.get() != LookTab::Measurements>
+                <Show when=move || measurements_opened.get()>
                 {move || match version.get() {
                     Load::Ready(loaded) => view! { <Measurements loaded/> }.into_any(),
                     Load::Failed(error) => ui::failure(&error).into_any(),
@@ -372,6 +415,7 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                     (Load::Failed(error), _) | (_, Load::Failed(error)) => ui::failure(&error).into_any(),
                     _ => ui::loading().into_any(),
                 }}
+                </Show>
             </div>
             </ui::Tabs>
         </article>

@@ -360,6 +360,8 @@ pub struct NewImage {
     pub n_samples: i64,
     pub meta_json: String,
     pub rerender_group: Option<String>,
+    /// `(control key, source)` JSON ([docs/03 §1]).
+    pub setting_source: String,
 }
 
 pub struct NewContribution {
@@ -419,8 +421,9 @@ pub async fn insert_contribution(
         let id = ContributionImageId::new();
         sqlx::query(
             "INSERT INTO contribution_images
-             (id, contribution_id, samples_hash, n_samples, meta, rerender_group, status)
-             VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+             (id, contribution_id, samples_hash, n_samples, meta, rerender_group, setting_source,
+              status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
         )
         .bind(id.as_str())
         .bind(contribution.id.as_str())
@@ -428,6 +431,7 @@ pub async fn insert_contribution(
         .bind(image.n_samples)
         .bind(&image.meta_json)
         .bind(image.rerender_group.as_deref())
+        .bind(&image.setting_source)
         .execute(&mut **tx)
         .await?;
     }

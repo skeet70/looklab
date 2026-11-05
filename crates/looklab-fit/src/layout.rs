@@ -10,7 +10,7 @@ pub const GRL_COEFS: usize = S_COEFS + HUE_COEFS * S_COEFS * 3;
 /// Three nuisances per image: exposure, `log w_R`, `log w_B`.
 pub const NUISANCE_PER_IMAGE: usize = 3;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Layout {
     pub tone_c0: usize,
     pub tone_beta: Range<usize>,
@@ -26,6 +26,8 @@ pub struct Layout {
     pub sigma: Range<usize>,
     pub response: Range<usize>,
     pub total: usize,
+    /// Scale on the identity prior curvature; set from `FitOptions::identity_scale`.
+    pub identity_scale: f64,
 }
 
 impl Layout {
@@ -69,6 +71,7 @@ impl Layout {
             sigma,
             response,
             total,
+            identity_scale: 1.0,
         }
     }
 

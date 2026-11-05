@@ -3228,6 +3228,7 @@ dependencies = [
  "looklab-samples",
  "looklab-schema",
  "rand_chacha 0.9.0",
+ "serde",
  "thiserror 2.0.21",
 ]
 
@@ -3377,6 +3378,15 @@ dependencies = [
  "ruzstd",
  "serde",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "looklab-scene-module"
+version = "0.1.0"
+dependencies = [
+ "looklab-publish",
+ "thiserror 2.0.21",
+ "wasmtime",
 ]
 
 [[package]]

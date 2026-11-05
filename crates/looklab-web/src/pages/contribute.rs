@@ -5,42 +5,337 @@ use leptos::html::Canvas;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use looklab_prep::LocalImageKey;
-use looklab_upload::{CardDeclaration, ContributionKind, FirmwareId, FirmwareVersion, RenderTag};
+use looklab_upload::{
+    CardDeclaration, ContributionKind, FirmwareId, FirmwareVersion, RenderTag, SettingSource,
+};
 use looklab_wasm::coverage::{CoverageMap, coverage_map, sample_points};
 use looklab_wasm::prep::{ModuleFunction, default_pow};
 use looklab_wasm::{
-    CardCheckError, GroupSettings, IntentChoice, PairingPlan, PowParamsSpec, PrepSummary,
-    PreparedImageView, SettingsPrefill, build_manifest_request, check_card,
+    CardCheckError, ControlSetting, GroupSettings, IntentChoice, PairingPlan, PowParamsSpec,
+    PrepSummary, PreparedImageView, build_manifest_request, check_card,
     decode_build_manifest_reply, decode_encode_reply, decode_pow_reply, decode_prepare_reply,
     encode_envelope_request, module_fn_id, prefill_settings, prepare_request,
     serial_ascii_for_file, solve_pow_request,
 };
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
+use super::bounties::{Impact, WantedCards};
 use crate::data;
 use crate::files::{
     ContributionDraftStore, DraftFile, LocalFile, download, draft_file_entries, read_draft_file,
     read_files,
 };
-use crate::ui::{Disclosure, DropZone, StepIndex, Stepper, WizardStep};
+use crate::ui::{Dialog, Disclosure, DropZone, StepIndex, Stepper, WizardStep};
 use crate::worker::{PrepWorker, default_worker_count, max_worker_count};
 use crate::{idb, webauthn};
 
 const PRIOR_VERSION: u32 = 1;
 
+/// Identifies one upload manifest within a drop.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub(crate) struct BatchId(u64);
+
+/// The manifest fields the confirm step edits; one set per batch.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct GroupFields {
+    pub(crate) body: String,
+    pub(crate) firmware: String,
+    pub(crate) sim: String,
+    pub(crate) controls: String,
+    pub(crate) recipe: bool,
+    pub(crate) target: String,
+    pub(crate) card: bool,
+    pub(crate) card_firmware_id: String,
+    pub(crate) card_firmware_version: String,
+}
+
+/// One manifest: the pairs that share a body, firmware epoch, look and settings.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct ContributionGroup {
+    pub(crate) id: BatchId,
+    pub(crate) raws: Vec<String>,
+    pub(crate) fields: GroupFields,
+    pub(crate) serial_opt_in: bool,
+    pub(crate) malformed: bool,
+    pub(crate) unavailable: Vec<String>,
+    pub(crate) notes: Vec<String>,
+    /// Controls the makernotes reproduced; every other control in the settings is declared.
+    pub(crate) reproduced: Vec<(String, i64)>,
+    /// Look-affecting controls the schema maps from no tag; each needs a declared value.
+    pub(crate) unmapped: Vec<String>,
+}
+
+/// The batches one drop uploads.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct BatchSet {
+    groups: Vec<ContributionGroup>,
+    next: u64,
+}
+
+impl BatchSet {
+    fn from_groups(groups: Vec<ContributionGroup>) -> Self {
+        let next = groups.iter().map(|group| group.id.0).max().unwrap_or(0);
+        Self { groups, next }
+    }
+
+    /// Splits pairs into one batch per body, firmware epoch, look, settings and card declaration.
+    fn from_readings(readings: &[PairReading]) -> Self {
+        let mut set = Self::default();
+        let mut seen: HashMap<GroupKey, usize> = HashMap::new();
+        for reading in readings {
+            if let Some(&index) = seen.get(&reading.key()) {
+                set.groups[index].raws.push(reading.raw.clone());
+                set.groups[index].absorb(reading);
+                continue;
+            }
+            seen.insert(reading.key(), set.groups.len());
+            let id = set.allocate();
+            set.groups
+                .push(ContributionGroup::from_reading(id, reading));
+        }
+        set
+    }
+
+    /// One batch covering every pair, for flows that send no batch fields.
+    fn covering(pairing: &PairingPlan) -> Self {
+        let mut set = Self::default();
+        if !pairing.groups.is_empty() {
+            let id = set.allocate();
+            set.groups.push(ContributionGroup {
+                id,
+                raws: pairing.groups.iter().map(|pair| pair.raw.clone()).collect(),
+                ..ContributionGroup::default()
+            });
+        }
+        set
+    }
+
+    fn allocate(&mut self) -> BatchId {
+        self.next += 1;
+        BatchId(self.next)
+    }
+
+    pub(crate) fn groups(&self) -> &[ContributionGroup] {
+        &self.groups
+    }
+
+    pub(crate) fn get(&self, id: BatchId) -> Option<&ContributionGroup> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    pub(crate) fn batch_of(&self, raw: &str) -> Option<BatchId> {
+        self.groups
+            .iter()
+            .find(|group| group.raws.iter().any(|name| name == raw))
+            .map(|group| group.id)
+    }
+
+    fn update(&mut self, id: BatchId, edit: impl FnOnce(&mut ContributionGroup)) {
+        if let Some(group) = self.groups.iter_mut().find(|group| group.id == id) {
+            edit(group);
+        }
+    }
+
+    fn set_serial(&mut self, id: BatchId, opt_in: bool) {
+        self.update(id, |group| group.serial_opt_in = opt_in);
+    }
+
+    /// Ends the upload so the next drop starts over, with serial sending off.
+    fn finish(&mut self) {
+        self.groups.clear();
+        self.next = 0;
+    }
+}
+
+impl ContributionGroup {
+    fn from_reading(id: BatchId, reading: &PairReading) -> Self {
+        let mut group = Self {
+            id,
+            raws: vec![reading.raw.clone()],
+            fields: GroupFields {
+                body: reading.body.clone(),
+                firmware: reading.firmware.clone(),
+                sim: reading.sim.clone().unwrap_or_default(),
+                controls: reading.controls_text(),
+                recipe: false,
+                target: String::new(),
+                card: reading.card.is_some(),
+                card_firmware_id: reading
+                    .card
+                    .as_ref()
+                    .map(|tag| tag.firmware_id.as_str().to_owned())
+                    .unwrap_or_default(),
+                card_firmware_version: reading
+                    .card
+                    .as_ref()
+                    .map(|tag| tag.firmware_version.as_str().to_owned())
+                    .unwrap_or_default(),
+            },
+            serial_opt_in: false,
+            malformed: reading.malformed,
+            unavailable: Vec::new(),
+            notes: Vec::new(),
+            reproduced: reading.controls.clone(),
+            unmapped: Vec::new(),
+        };
+        group.absorb(reading);
+        group
+    }
+
+    fn absorb(&mut self, reading: &PairReading) {
+        self.malformed |= reading.malformed;
+        for key in &reading.unmapped {
+            if !self.unmapped.contains(key) {
+                self.unmapped.push(key.clone());
+            }
+        }
+        for reason in &reading.unavailable {
+            if !self.unavailable.contains(reason) {
+                self.unavailable.push(reason.clone());
+            }
+        }
+        if let Some(note) = &reading.note {
+            let note = format!("{}: {note}", reading.raw);
+            if !self.notes.contains(&note) {
+                self.notes.push(note);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CameraKey {
+    make: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct GroupKey {
+    camera: Option<CameraKey>,
+    epoch: Option<u32>,
+    sim: Option<String>,
+    controls: Vec<(String, i64)>,
+    card: Option<RenderTag>,
+    malformed: bool,
+}
+
+/// One pair's settings as read from its makernotes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PairReading {
+    pub(crate) raw: String,
+    pub(crate) camera: Option<CameraKey>,
+    pub(crate) body: String,
+    pub(crate) epoch: Option<u32>,
+    pub(crate) firmware: String,
+    pub(crate) sim: Option<String>,
+    pub(crate) controls: Vec<(String, i64)>,
+    pub(crate) unavailable: Vec<String>,
+    pub(crate) unmapped: Vec<String>,
+    pub(crate) card: Option<RenderTag>,
+    pub(crate) malformed: bool,
+    pub(crate) note: Option<String>,
+}
+
+impl PairReading {
+    fn key(&self) -> GroupKey {
+        GroupKey {
+            camera: self.camera.clone(),
+            epoch: self.epoch,
+            sim: self.sim.clone(),
+            controls: self.controls.clone(),
+            card: self.card.clone(),
+            malformed: self.malformed,
+        }
+    }
+
+    fn controls_text(&self) -> String {
+        self.controls
+            .iter()
+            .map(|(key, step)| format!("{key}={step}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Identifies one prefill request, so a slower earlier answer cannot replace a newer one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PrefillTicket {
+    raw: String,
+    epoch: u64,
+    token: u64,
+}
+
+/// Tracks which prefill answer is current, per file and per drop.
+#[derive(Debug, Default)]
+pub(crate) struct PrefillLedger {
+    epoch: u64,
+    next: u64,
+    latest: HashMap<String, (u64, u64)>,
+}
+
+impl PrefillLedger {
+    /// Starts a new drop; every answer from an earlier one is stale.
+    fn reset(&mut self) -> u64 {
+        self.epoch += 1;
+        self.next = 0;
+        self.latest.clear();
+        self.epoch
+    }
+
+    fn begin(&mut self, epoch: u64, raw: &str) -> PrefillTicket {
+        if epoch != self.epoch {
+            return PrefillTicket {
+                raw: raw.to_owned(),
+                epoch,
+                token: 0,
+            };
+        }
+        self.next += 1;
+        self.latest.insert(raw.to_owned(), (epoch, self.next));
+        PrefillTicket {
+            raw: raw.to_owned(),
+            epoch,
+            token: self.next,
+        }
+    }
+
+    fn accept(&self, ticket: &PrefillTicket) -> bool {
+        self.epoch == ticket.epoch
+            && ticket.token != 0
+            && self.latest.get(&ticket.raw) == Some(&(ticket.epoch, ticket.token))
+    }
+
+    fn is_current(&self, epoch: u64) -> bool {
+        self.epoch == epoch
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ContributionDraft {
+    #[serde(default)]
     files: Vec<DraftFile>,
-    camera: String,
-    firmware: String,
-    look: String,
-    controls: String,
-    recipe: bool,
-    target: String,
-    custom_firmware: bool,
-    firmware_id: String,
-    firmware_version: String,
+    #[serde(default)]
+    batches: Vec<ContributionGroup>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -76,17 +371,61 @@ fn menu_settings(text: &str) -> Vec<MenuSetting> {
         .collect()
 }
 
-#[wasm_bindgen::prelude::wasm_bindgen(
-    inline_js = "export async function contributePlatformStore() { return !!globalThis.PublicKeyCredential && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable(); }"
-)]
+fn control_step(text: &str, key: &looklab_schema::ControlKey) -> Option<i64> {
+    menu_settings(text)
+        .into_iter()
+        .find(|setting| setting.key == *key)
+        .map(|setting| setting.step)
+}
+
+fn set_control_step(
+    batches: RwSignal<BatchSet>,
+    id: BatchId,
+    key: &looklab_schema::ControlKey,
+    step: i64,
+) {
+    batches.update(|set| {
+        set.update(id, |group| {
+            let mut fields = menu_settings(&group.fields.controls);
+            match fields.iter_mut().find(|field| field.key == *key) {
+                Some(field) => field.step = step,
+                None => fields.push(MenuSetting {
+                    key: key.clone(),
+                    step,
+                }),
+            }
+            group.fields.controls = fields
+                .into_iter()
+                .map(|field| format!("{}={}", field.key, field.step))
+                .collect::<Vec<_>>()
+                .join("\n");
+        });
+    });
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export async function contributePlatformStore() {
+    return !!globalThis.PublicKeyCredential && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+}
+export function contributeChoosePhotos(button, input) {
+    button.closest("dialog").close();
+    input.click();
+}
+"#)]
 extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(catch, js_name = contributePlatformStore)]
     async fn platform_store() -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
+    #[wasm_bindgen::prelude::wasm_bindgen(catch, js_name = contributeChoosePhotos)]
+    fn choose_photos(
+        button: &wasm_bindgen::JsValue,
+        input: &wasm_bindgen::JsValue,
+    ) -> Result<(), wasm_bindgen::JsValue>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProcessedGroup {
     pub(crate) raw: String,
+    pub(crate) batch: Option<BatchId>,
     pub(crate) images: Vec<PrepSummary>,
     pub(crate) blobs: Vec<Vec<u8>>,
     pub(crate) bytes_in: u64,
@@ -117,11 +456,159 @@ enum Stage {
     Done,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HelpWay {
+    ExistingPhotos,
+    WantedShots,
+    Rerender,
+    PhonePattern,
+    Gradient,
+    ColorChart,
+}
+
+struct HelpGuide {
+    title: &'static str,
+    time: &'static str,
+    impact: Impact,
+    description: &'static str,
+    steps: &'static [&'static str],
+    action: &'static str,
+}
+
+impl HelpWay {
+    const ALL: [Self; 6] = [
+        Self::ExistingPhotos,
+        Self::WantedShots,
+        Self::Rerender,
+        Self::PhonePattern,
+        Self::Gradient,
+        Self::ColorChart,
+    ];
+
+    fn guide(self) -> HelpGuide {
+        match self {
+            Self::ExistingPhotos => HelpGuide {
+                title: "Share photos you already have",
+                time: "About a minute",
+                impact: Impact::Medium,
+                description: "Start with RAW+JPEG pairs from your library.",
+                steps: &[
+                    "Find matching RAW and JPEG files straight from your camera, shot with a built-in look. Use the original JPEG, not an edited or exported copy.",
+                    "Look in your memory card's DCIM folder or the folder where you keep camera originals. If you use a photo library, export the unmodified originals.",
+                    "Choose both files in each pair, or add their folder. We pair them and read their camera settings on this device.",
+                    "Check the groups, then review the color samples. Nothing is sent until you confirm the upload.",
+                ],
+                action: "Choose photos",
+            },
+            Self::WantedShots => HelpGuide {
+                title: "Take a few wanted shots",
+                time: "5 to 10 minutes",
+                impact: Impact::High,
+                description: "Fill a gap with colors we need to measure.",
+                steps: &[
+                    "Choose a request for your camera and the built-in look you will use.",
+                    "Shoot RAW+JPEG at the lowest native ISO. Turn off lens corrections where possible and avoid motion.",
+                    "Photograph the requested colors and lighting. Keep the original RAW+JPEG pairs to add below.",
+                ],
+                action: "I've got them, add photos",
+            },
+            Self::Rerender => HelpGuide {
+                title: "Re-render a few RAWs in camera",
+                time: "About 2 minutes",
+                impact: Impact::High,
+                description: "Try the same photos with other built-in looks.",
+                steps: &[
+                    "Choose 3 RAW photos with a mix of colors, shadows and highlights. Keep the original RAW files.",
+                    "Use your camera's playback menu to open RAW conversion. Select a built-in look and save a new JPEG.",
+                    "Repeat with other built-in looks for the same 3 RAWs. Save each JPEG without overwriting the earlier versions.",
+                    "Add the original RAWs and all the re-rendered JPEGs together. We group the versions on this device.",
+                ],
+                action: "Add the re-rendered JPEGs",
+            },
+            Self::PhonePattern => HelpGuide {
+                title: "Photograph a pattern on your phone",
+                time: "About 3 minutes",
+                impact: Impact::Medium,
+                description: "Add a wider range of saturated colors.",
+                steps: &[
+                    "Use a phone displaying the measurement pattern. Set its brightness to maximum.",
+                    "Turn off Night Shift, True Tone and adaptive color on the phone.",
+                    "Fill about 60% of the camera frame with the pattern and defocus slightly.",
+                    "Shoot RAW+JPEG at your lowest native ISO, with lens corrections off where possible. Take 3 shots at 0, −1 and −2 EV exposure compensation.",
+                ],
+                action: "Add the pattern shots",
+            },
+            Self::Gradient => HelpGuide {
+                title: "Photograph a gradient",
+                time: "About 2 minutes",
+                impact: Impact::Medium,
+                description: "Help measure contrast and neutral tint.",
+                steps: &[
+                    "Find a smooth gradient from white to black, lit by a single light source.",
+                    "Set white balance for that light. Shoot RAW+JPEG at the lowest native ISO, with lens corrections off where possible.",
+                    "Defocus the gradient so the change from light to dark is smooth and covers the frame evenly.",
+                    "Take one shot with the white end bright enough to clip in the RAW. Keep both the original RAW and JPEG.",
+                ],
+                action: "Add the gradient shot",
+            },
+            Self::ColorChart => HelpGuide {
+                title: "Photograph a color chart",
+                time: "About 5 minutes",
+                impact: Impact::High,
+                description: "Help measure how your camera sees color.",
+                steps: &[
+                    "Use a ColorChecker Classic 24, SG 140 or Passport chart.",
+                    "Light the chart evenly without glare. Keep it still and fill 30 to 60% of the frame.",
+                    "Shoot RAW+JPEG at the lowest native ISO. Turn off lens corrections where possible.",
+                    "Take 3 shots at 0, −1 and −2 EV exposure compensation. Keep the original RAW+JPEG pairs.",
+                ],
+                action: "Add the chart shots",
+            },
+        }
+    }
+}
+
+#[component]
+fn HelpWalkthrough(
+    way: HelpWay,
+    open: RwSignal<bool>,
+    on_choose: Callback<leptos::ev::MouseEvent>,
+) -> impl IntoView {
+    let guide = way.guide();
+    view! {
+        <Dialog title=guide.title.to_owned() open>
+            <div class="help-walkthrough">
+                <p class="help-meta">{guide.time} " · " {guide.impact.label()}</p>
+                <ol class="help-steps">
+                    {guide.steps.iter().map(|step| view! { <li>{*step}</li> }).collect_view()}
+                </ol>
+                {(way == HelpWay::WantedShots).then(|| view! {
+                    <WantedCards limit=3 show_actions=false/>
+                    <p>
+                        <a href=crate::base::site_url("/contribute/wanted")>
+                            "See all wanted shots"
+                        </a>
+                    </p>
+                })}
+                {(way == HelpWay::PhonePattern).then(|| view! {
+                    <p class="muted">"These are capture instructions. A phone pattern cannot be opened from this page."</p>
+                })}
+                <button class="button-primary" on:click=move |event| on_choose.run(event)>
+                    {guide.action}
+                </button>
+            </div>
+        </Dialog>
+    }
+}
+
 #[component]
 pub fn ContributePage() -> impl IntoView {
     let session_context = crate::session::use_session();
     let stage = RwSignal::new(Stage::Drop);
     let current = RwSignal::new(StepIndex(0));
+    let file_picker = NodeRef::<leptos::html::Input>::new();
+    let selected_help = RwSignal::new(HelpWay::ExistingPhotos);
+    let help_open = RwSignal::new(false);
     Effect::new(move |_| {
         stage.set(match current.get().0 {
             0 => Stage::Drop,
@@ -134,35 +621,46 @@ pub fn ContributePage() -> impl IntoView {
     });
     let plan = RwSignal::new(None::<PairingPlan>);
     let all_files = RwSignal::new(Vec::<LocalFile>::new());
-    let body = RwSignal::new("fujifilm/x-s10".to_owned());
-    let firmware = RwSignal::new("1.10".to_owned());
-    let sim = RwSignal::new("provia".to_owned());
-    let controls = RwSignal::new(String::new());
-    let recipe_target = RwSignal::new(String::new());
-    let intent_recipe = RwSignal::new(false);
-    let intent_card = RwSignal::new(false);
-    let card_firmware_id = RwSignal::new(String::new());
-    let card_firmware_version = RwSignal::new(String::new());
-    let card_firmware_ids = RwSignal::new(Vec::<String>::new());
-    let malformed_tag = RwSignal::new(false);
+    let batches = RwSignal::new(BatchSet::default());
+    let batch_epoch = RwSignal::new(0_u64);
+    let selected_batch = RwSignal::new(None::<BatchId>);
+    let catalog = RwSignal::new(None::<GroupCatalog>);
+    let snapshot_version = RwSignal::new(0_u64);
+    let prefill_ledger = StoredValue::new_local(PrefillLedger::default());
     let worker_count = RwSignal::new(default_worker_count());
     let processed = RwSignal::new(Vec::<ProcessedGroup>::new());
+    let completed = RwSignal::new(Vec::<BatchId>::new());
     let seeds = RwSignal::new(Vec::<SeedRow>::new());
     let coverage = RwSignal::new(None::<CoverageMap>);
     let points = RwSignal::new(Vec::<[f32; 3]>::new());
     let failures = RwSignal::new(Vec::<FailureRow>::new());
     let busy = RwSignal::new(false);
     let message = RwSignal::new(None::<String>);
-    let status_link = RwSignal::new(None::<String>);
-    let serial_opt_in = RwSignal::new(false);
-    let serial_present = RwSignal::new(false);
-    let prefill_note = RwSignal::new(None::<String>);
+    let on_help_choose = Callback::new(move |event: leptos::ev::MouseEvent| {
+        help_open.set(false);
+        current.set(StepIndex(0));
+        if let (Some(button), Some(input)) = (event.current_target(), file_picker.get())
+            && choose_photos(button.as_ref(), input.as_ref()).is_err()
+        {
+            message.set(Some(
+                "Choose files in the drop area to continue.".to_owned(),
+            ));
+        }
+    });
+    let status_links = RwSignal::new(Vec::<String>::new());
     let available = crate::base::server_available();
     let no_platform_store = RwSignal::new(false);
     let draft_loaded = RwSignal::new(false);
     let draft_complete = RwSignal::new(false);
     let draft_files = RwSignal::new(Vec::<DraftFile>::new());
     let draft_store = StoredValue::new_local(ContributionDraftStore::new());
+    let replace_batches = move |readings: Vec<PairReading>| {
+        let set = BatchSet::from_readings(&readings);
+        let first = set.groups().first().map(|group| group.id);
+        batches.set(set);
+        selected_batch.set(first);
+        batch_epoch.update(|epoch| *epoch += 1);
+    };
     on_cleanup(move || draft_store.with_value(ContributionDraftStore::flush));
     spawn_local(async move {
         let _ = idb::remove(idb::StorageKey::DRAFT).await;
@@ -193,20 +691,24 @@ pub fn ContributePage() -> impl IntoView {
             if let Ok(pairing) = looklab_wasm::inspect_files(&entries)
                 && !pairing.groups.is_empty()
             {
-                serial_present.set(pairing.facts.iter().any(|fact| fact.has_serial));
-                malformed_tag.set(pairing.facts.iter().any(|fact| fact.render_tag_malformed));
+                let set = if draft.batches.is_empty() {
+                    let Some(epoch) = prefill_ledger.try_update_value(PrefillLedger::reset) else {
+                        draft_loaded.set(true);
+                        return;
+                    };
+                    let readings = read_pairs(&pairing, &files, prefill_ledger, epoch).await;
+                    BatchSet::from_readings(&readings)
+                } else {
+                    BatchSet::from_groups(draft.batches)
+                };
+                let routing = set.clone();
+                let first = set.groups().first().map(|group| group.id);
+                batches.set(set);
+                selected_batch.set(first);
+                batch_epoch.update(|epoch| *epoch += 1);
                 all_files.set(files);
-                plan.set(Some(pairing));
-                body.set(draft.camera);
-                firmware.set(draft.firmware);
-                sim.set(draft.look);
-                controls.set(draft.controls);
-                intent_recipe.set(draft.recipe);
-                recipe_target.set(draft.target);
-                intent_card.set(draft.custom_firmware);
-                card_firmware_id.set(draft.firmware_id);
-                card_firmware_version.set(draft.firmware_version);
                 draft_files.set(draft.files);
+                plan.set(Some(pairing));
                 let prepared = wasm_bindgen_futures::JsFuture::from(
                     draft_store.with_value(ContributionDraftStore::samples),
                 )
@@ -226,6 +728,7 @@ pub fn ContributePage() -> impl IntoView {
                 let groups = groups
                     .into_iter()
                     .map(|group| ProcessedGroup {
+                        batch: routing.batch_of(&group.raw),
                         raw: group.raw,
                         images: looklab_wasm::prep::summarize(&group.images),
                         blobs: group.images.into_iter().map(|image| image.blob).collect(),
@@ -268,15 +771,7 @@ pub fn ContributePage() -> impl IntoView {
         }
         let draft = ContributionDraft {
             files: draft_files.get(),
-            camera: body.get(),
-            firmware: firmware.get(),
-            look: sim.get(),
-            controls: controls.get(),
-            recipe: intent_recipe.get(),
-            target: recipe_target.get(),
-            custom_firmware: intent_card.get(),
-            firmware_id: card_firmware_id.get(),
-            firmware_version: card_firmware_version.get(),
+            batches: batches.with(|set| set.groups().to_vec()),
         };
         if let Ok(text) = serde_json::to_string(&draft) {
             draft_store.with_value(|store| store.schedule(&text));
@@ -290,6 +785,27 @@ pub fn ContributePage() -> impl IntoView {
                 .and_then(|value| value.as_bool())
                 == Some(false),
         );
+    });
+    Effect::new(move |_| {
+        let Some(facts) = plan.with(|plan| plan.as_ref().map(|plan| plan.facts.clone())) else {
+            return;
+        };
+        spawn_local(async move {
+            if let Ok(index) = data::index().await {
+                snapshot_version.set(index.community_snapshot_version);
+                let mut schemas = Vec::new();
+                for camera in &index.bodies {
+                    if facts.iter().any(|fact| {
+                        matching_camera(fact, &index).is_some_and(|matched| matched.id == camera.id)
+                    }) && let Ok(page) = data::body(camera.id.make(), camera.id.model()).await
+                        && let Ok(schema) = looklab_schema::validate_control_schema(&page.schema)
+                    {
+                        schemas.push(schema);
+                    }
+                }
+                catalog.set(Some(GroupCatalog { index, schemas }));
+            }
+        });
     });
 
     let on_files = Callback::new(move |selected: Vec<web_sys::File>| {
@@ -309,13 +825,7 @@ pub fn ContributePage() -> impl IntoView {
                             coverage.set(None);
                             points.set(Vec::new());
                             draft_complete.set(false);
-                            let body_key = pairing.facts.iter().find_map(|fact| {
-                                Some((
-                                    fact.make.clone()?,
-                                    fact.model.clone()?,
-                                    fact.firmware.clone()?,
-                                ))
-                            });
+                            status_links.set(Vec::new());
                             match draft_file_entries(&files) {
                                 Ok((references, entries)) => {
                                     let pending = draft_store
@@ -325,60 +835,18 @@ pub fn ContributePage() -> impl IntoView {
                                 }
                                 Err(error) => message.set(Some(error)),
                             }
-                            all_files.set(files);
-                            serial_present.set(pairing.facts.iter().any(|fact| fact.has_serial));
-                            let mut ids = Vec::new();
-                            let mut first_tag = None;
-                            for fact in &pairing.facts {
-                                if let Some(tag) = &fact.render_tag {
-                                    let id = tag.firmware_id.as_str().to_owned();
-                                    if !ids.contains(&id) {
-                                        ids.push(id);
-                                    }
-                                    first_tag.get_or_insert(tag);
-                                }
-                            }
-                            if let Some(tag) = first_tag {
-                                intent_card.set(true);
-                                intent_recipe.set(false);
-                                card_firmware_id.set(tag.firmware_id.as_str().to_owned());
-                                card_firmware_version.set(tag.firmware_version.as_str().to_owned());
-                            } else {
-                                intent_card.set(false);
-                                card_firmware_id.set(String::new());
-                                card_firmware_version.set(String::new());
-                            }
-                            card_firmware_ids.set(ids);
-                            malformed_tag
-                                .set(pairing.facts.iter().any(|fact| fact.render_tag_malformed));
-                            plan.set(Some(pairing));
                             current.set(StepIndex(1));
-                            prefill_note.set(None);
-                            if let Some((make, model, _)) = body_key {
-                                match prefill_from_site(&make, &model, &entries).await {
-                                    Ok((body_id, prefill)) => {
-                                        body.set(body_id);
-                                        firmware.set(prefill.firmware);
-                                        if let Some(chosen) = prefill.sim {
-                                            sim.set(chosen);
-                                        }
-                                        controls.set(
-                                            prefill
-                                                .controls
-                                                .iter()
-                                                .map(|(key, step)| format!("{key}={step}"))
-                                                .collect::<Vec<_>>()
-                                                .join("\n"),
-                                        );
-                                        if !prefill.unavailable.is_empty() {
-                                            prefill_note.set(Some(format!(
-                                                "Please check these settings, which could not be read: {}",
-                                                prefill.unavailable.join("; ")
-                                            )));
-                                        }
-                                    }
-                                    Err(error) => prefill_note.set(Some(error)),
-                                }
+                            plan.set(Some(pairing.clone()));
+                            let Some(epoch) = prefill_ledger.try_update_value(PrefillLedger::reset)
+                            else {
+                                busy.set(false);
+                                return;
+                            };
+                            let readings =
+                                read_pairs(&pairing, &files, prefill_ledger, epoch).await;
+                            all_files.set(files);
+                            if prefill_ledger.with_value(|ledger| ledger.is_current(epoch)) {
+                                replace_batches(readings);
                             }
                         }
                         Err(error) => message.set(Some(error.to_string())),
@@ -395,6 +863,7 @@ pub fn ContributePage() -> impl IntoView {
             return;
         };
         let files = all_files.get();
+        let batches = batches.get_untracked();
         let count = worker_count.get().max(1);
         busy.set(true);
         processed.set(Vec::new());
@@ -405,6 +874,7 @@ pub fn ContributePage() -> impl IntoView {
         spawn_local(async move {
             let result = run_files_progress(
                 &pairing,
+                &batches,
                 &files,
                 count,
                 Some(Callback::new(move |group: ProcessedGroup| {
@@ -466,94 +936,123 @@ pub fn ContributePage() -> impl IntoView {
     };
 
     let upload = move |_| {
-        let groups = processed.get();
-        if groups.is_empty() || busy.get() || draft_complete.get() {
+        let processed_groups = processed.get();
+        let set = batches.get_untracked();
+        if processed_groups.is_empty()
+            || set.groups().is_empty()
+            || busy.get()
+            || draft_complete.get()
+        {
             return;
         }
-        let images = prepared_images(&groups);
-        let card_tag = images
-            .iter()
-            .find_map(|image| image.metadata.render_tag.clone());
-        let malformed = images
-            .iter()
-            .any(|image| image.metadata.render_tag_malformed);
-        let settings = match group_settings(DraftGroup {
-            body: &body.get(),
-            firmware: &firmware.get(),
-            sim: &sim.get(),
-            controls: &controls.get(),
-            recipe: intent_recipe.get(),
-            target: &recipe_target.get(),
-            card: intent_card.get() || card_tag.is_some(),
-            tag: card_tag.as_ref(),
-            malformed,
-            card_firmware_id: &card_firmware_id.get(),
-            card_firmware_version: &card_firmware_version.get(),
-        }) {
-            Ok(settings) => settings,
-            Err(error) => {
-                message.set(Some(error));
-                return;
+        let mut pending = Vec::new();
+        let version = snapshot_version.get_untracked();
+        for group in set.groups() {
+            if completed.with(|done| done.contains(&group.id)) {
+                continue;
             }
-        };
+            let images = prepared_images_of(&processed_groups, group.id);
+            if images.is_empty() {
+                continue;
+            }
+            let settings = match group_settings_for(group, &images, version) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    message.set(Some(format!("Batch {}: {error}", group.id.0)));
+                    return;
+                }
+            };
+            let seed_rows = seeds
+                .get()
+                .into_iter()
+                .filter(|row| group.raws.iter().any(|raw| raw == &row.name))
+                .collect();
+            pending.push((group.id, settings, images, seed_rows, group.serial_opt_in));
+        }
+        if pending.is_empty() {
+            message.set(Some("Nothing is left to send.".to_owned()));
+            return;
+        }
         let files = all_files.get();
-        let seed_rows = seeds.get();
-        let opt_in = serial_opt_in.get();
+        let total = pending.len();
         busy.set(true);
-        message.set(Some(
-            "Confirm this batch on your device. Preparing upload (this keeps spam out).".to_owned(),
-        ));
         spawn_local(async move {
-            match upload_batch(session_context, settings, images, files, seed_rows, opt_in).await {
-                Ok(reply) => {
-                    if let Some(token) = reply.status_token.as_ref()
-                        && let Ok(token) = webauthn::StatusToken::try_from(token.clone())
-                    {
-                        let context = session_context;
-                        if let crate::session::SessionState::SignedIn(mut profile) =
-                            context.state.get_untracked()
+            let mut sent = Vec::new();
+            for (position, (id, settings, images, seed_rows, opt_in)) in
+                pending.into_iter().enumerate()
+            {
+                let number = position + 1;
+                message.set(Some(format!(
+                    "Batch {number} of {total}: confirm on your device. Preparing upload (this keeps spam out)."
+                )));
+                match upload_batch(session_context, settings, images, &files, seed_rows, opt_in)
+                    .await
+                {
+                    Ok(reply) => {
+                        if let Some(token) = reply.status_token.as_ref()
+                            && let Ok(token) = webauthn::StatusToken::try_from(token.clone())
                         {
-                            profile.status_token = token;
-                            if context.set_signed_in(profile.clone()).await.is_err() {
-                                context
-                                    .state
-                                    .set(crate::session::SessionState::SignedIn(profile));
+                            let context = session_context;
+                            if let crate::session::SessionState::SignedIn(mut profile) =
+                                context.state.get_untracked()
+                            {
+                                profile.status_token = token;
+                                if context.set_signed_in(profile.clone()).await.is_err() {
+                                    context
+                                        .state
+                                        .set(crate::session::SessionState::SignedIn(profile));
+                                }
                             }
                         }
+                        if let Some(token) = reply.status_token.as_ref() {
+                            let link = crate::base::site_url(&format!("/status/{token}"));
+                            status_links.update(|links| links.push(link));
+                        }
+                        completed.update(|done| done.push(id));
+                        sent.push(reply.contribution_id);
                     }
-                    let link = reply
-                        .status_token
-                        .as_ref()
-                        .map(|token| crate::base::site_url(&format!("/status/{token}")));
-                    status_link.set(link);
-                    draft_complete.set(true);
-                    let pending = draft_store.with_value(ContributionDraftStore::clear);
-                    let _ = wasm_bindgen_futures::JsFuture::from(pending).await;
-                    processed.set(Vec::new());
-                    seeds.set(Vec::new());
-                    all_files.set(Vec::new());
-                    points.set(Vec::new());
-                    current.set(StepIndex(5));
-                    message.set(Some(format!(
-                        "Uploaded contribution {}.",
-                        reply.contribution_id
-                    )));
+                    Err(error) => {
+                        message.set(Some(format!("Batch {} of {total}: {error}", position + 1)));
+                        busy.set(false);
+                        return;
+                    }
                 }
-                Err(error) => message.set(Some(error)),
             }
+            draft_complete.set(true);
+            let pending = draft_store.with_value(ContributionDraftStore::clear);
+            let _ = wasm_bindgen_futures::JsFuture::from(pending).await;
+            batches.update(BatchSet::finish);
+            completed.set(Vec::new());
+            processed.set(Vec::new());
+            seeds.set(Vec::new());
+            all_files.set(Vec::new());
+            points.set(Vec::new());
+            current.set(StepIndex(5));
+            message.set(Some(format!(
+                "Uploaded {} in {} {}.",
+                sent.join(", "),
+                sent.len(),
+                if sent.len() == 1 { "batch" } else { "batches" }
+            )));
             busy.set(false);
         });
     };
 
     let download_payload = move |_| {
         let groups = processed.get();
+        let set = batches.get_untracked();
         let payload = serde_json::json!({
             "format": "looklab-payload-view/1",
             "authoritative": false,
             "note": "A convenience view, not a trust anchor. Verify the request body actually sent against the HAR.",
-            "body": body.get(),
-            "firmware": firmware.get(),
-            "sim": sim.get(),
+            "batches": set.groups().iter().map(|group| serde_json::json!({
+                "body": group.fields.body,
+                "firmware": group.fields.firmware,
+                "sim": group.fields.sim,
+                "controls": group.fields.controls,
+                "raws": group.raws,
+                "serial": group.serial_opt_in,
+            })).collect::<Vec<_>>(),
             "images": groups
                 .iter()
                 .flat_map(|group| group.images.iter())
@@ -630,33 +1129,35 @@ pub fn ContributePage() -> impl IntoView {
         <section class="ways-to-help" hidden=move || stage.get() != Stage::Drop>
             <h2>"Ways to help"</h2>
             <div class="help-grid">
-                {[
-                    ("Share photos you already have", "About a minute", "Medium", "Start with RAW+JPEG pairs from your library."),
-                    ("Take a few wanted shots", "5 to 10 minutes", "High", "Fill a gap with colors we need to measure."),
-                    ("Re-render a few RAWs in camera", "About 2 minutes", "High", "Try the same photos with other built-in looks."),
-                    ("Photograph a pattern on your phone", "About 3 minutes", "Medium", "Add a wider range of saturated colors."),
-                    ("Photograph a gradient", "About 2 minutes", "Medium", "Help measure contrast and neutral tint."),
-                    ("Photograph a color chart", "About 5 minutes", "High", "Help measure how your camera sees color."),
-                ].into_iter().enumerate().map(|(index, (title, time, impact, description))| view! {
-                    <article class="help-card">
-                        <p class="help-meta">{time} " · " {impact} " impact"</p>
-                        <h3>{title}</h3>
-                        <p>{description}</p>
-                        {(index == 1).then(|| view! {
-                            <a href=crate::base::site_url("/contribute/wanted")>
-                                "See wanted shots →"
-                            </a>
-                        })}
-                    </article>
+                {HelpWay::ALL.into_iter().map(|way| {
+                    let guide = way.guide();
+                    view! {
+                        <button
+                            type="button"
+                            class="help-card help-card-button"
+                            aria-label=guide.title
+                            aria-haspopup="dialog"
+                            disabled=move || busy.get() || !draft_loaded.get()
+                            on:click=move |_| {
+                                selected_help.set(way);
+                                help_open.set(true);
+                            }
+                        >
+                            <span class="help-meta">{guide.time} " · " {guide.impact.label()}</span>
+                            <span class="help-title">{guide.title}</span>
+                            <span class="help-description">{guide.description}</span>
+                        </button>
+                    }
                 }).collect_view()}
             </div>
-            <Disclosure summary="Capture tips".to_owned()>
-                <p>"Shoot RAW+JPEG at your camera's lowest native ISO. Avoid motion and turn off lens corrections where possible."</p>
-                <p>"For phone patterns: use maximum brightness, turn off adaptive color, fill about 60% of the frame, defocus slightly, and shoot at 0, −1 and −2 exposure compensation."</p>
-                <p>"For a gradient: photograph a smooth fade from clipped white to black under one light, with white balance set to that light."</p>
-                <p>"For a color chart: use even light without glare, fill 30 to 60% of the frame, and shoot at 0, −1 and −2 exposure compensation."</p>
-            </Disclosure>
         </section>
+        {move || view! {
+            <HelpWalkthrough
+                way=selected_help.get()
+                open=help_open
+                on_choose=on_help_choose
+            />
+        }}
         <Stepper
             current
             steps=[
@@ -703,6 +1204,7 @@ pub fn ContributePage() -> impl IntoView {
             <h2>"Drop files or a folder"</h2>
             <DropZone
                 on_files
+                file_picker
                 accept=".raf,.dng,.jpg,.jpeg,.arw,.cr2,.nef,.orf,.rw2".to_owned()
                 disabled=Signal::derive(move || busy.get() || !draft_loaded.get())
                 prompt="Drop RAW+JPEG files or a folder here. Photos stay on this device, even when you send color samples.".to_owned()
@@ -712,77 +1214,69 @@ pub fn ContributePage() -> impl IntoView {
 
         <section class="step" hidden=move || stage.get() != Stage::Confirm>
             <h2>"Check the groups"</h2>
-            {move || plan.get().map(|pairing| view! { <Pairing plan=pairing look=sim/> })}
-            <p>"Check the camera, built-in look and settings below. If these photos use a recipe to match another look, choose that option and name the target."</p>
-            <label for="body-id">"Camera"</label>
-            <input id="body-id" type="text" prop:value=move || body.get()
-                on:input=move |event| body.set(event_target_value(&event))/>
-            <label for="firmware">"Firmware"</label>
-            <input id="firmware" type="text" prop:value=move || firmware.get()
-                on:input=move |event| firmware.set(event_target_value(&event))/>
-            <label for="sim">"Film simulation"</label>
-            <input id="sim" type="text" prop:value=move || sim.get()
-                on:input=move |event| sim.set(event_target_value(&event))/>
-            <label>
-                <input type="checkbox" prop:checked=move || intent_recipe.get()
-                    on:change=move |event| intent_recipe.set(event_target_checked(&event))/>
-                " Recipe contribution"
-            </label>
-            <div hidden=move || !intent_recipe.get()>
-            <label for="recipe-target">"Look this recipe is trying to match"</label>
-            <input id="recipe-target" type="text" prop:value=move || recipe_target.get()
-                on:input=move |event| recipe_target.set(event_target_value(&event))/>
-            </div>
-            <label>
-                <input type="checkbox" prop:checked=move || intent_card.get()
-                    on:change=move |event| intent_card.set(event_target_checked(&event))/>
-                " Rendered by custom firmware"
-            </label>
-            <div hidden=move || !intent_card.get()>
-            <p class="muted">
-                "The JPEG's custom-firmware label fills this in when available. Otherwise, enter the firmware you used."
-            </p>
-            <label for="card-firmware-id">"Custom firmware name"</label>
-            <input id="card-firmware-id" type="text" list="card-firmware-ids"
-                prop:value=move || card_firmware_id.get()
-                on:input=move |event| card_firmware_id.set(event_target_value(&event))/>
-            <datalist id="card-firmware-ids">
-                {move || card_firmware_ids.get().into_iter().map(|id| view! {
-                    <option value=id></option>
-                }).collect_view()}
-            </datalist>
-            <label for="card-firmware-version">"Custom firmware version"</label>
-            <input id="card-firmware-version" type="text"
-                prop:value=move || card_firmware_version.get()
-                on:input=move |event| card_firmware_version.set(event_target_value(&event))/>
-            </div>
-            {move || malformed_tag.get().then(|| view! {
-                <p class="warn" role="alert">
-                    "Some photos have an unreadable custom-firmware label. Choose custom firmware and enter its name and version, or remove those files."
-                </p>
+            {move || plan.get().map(|pairing| view! {
+                <Pairing plan=pairing batches=batches catalog=catalog/>
             })}
-            <h3>"Camera settings"</h3>
-            {move || menu_settings(&controls.get()).into_iter().map(|setting| {
-                let key = setting.key;
-                let label = key.as_str().replace('_', " ");
-                view! {
-                    <label class="menu-setting">{label}
-                        <input type="number" prop:value=setting.step on:input=move |event| {
-                            if let Ok(step) = event_target_value(&event).parse::<i64>() {
-                                let mut fields = menu_settings(&controls.get());
-                                if let Some(field) = fields.iter_mut().find(|field| field.key == key) { field.step = step; }
-                                controls.set(fields.into_iter().map(|field| format!("{}={}", field.key, field.step)).collect::<Vec<_>>().join("\n"));
-                            }
-                        }/>
-                    </label>
+            <p>"Each group of photos that share a camera, built-in look and settings is sent as one batch. Check every batch below. If a batch uses a recipe to match another look, choose that option and name the target."</p>
+            <h3>"Batches"</h3>
+            <ul class="batch-list">
+                {move || {
+                    let _ = batch_epoch.get();
+                    let set = batches.get_untracked();
+                    set.groups().iter().map(|group| {
+                        let id = group.id;
+                        let title = move || {
+                            batches.with(|set| {
+                                set.get(id).map_or_else(String::new, |group| {
+                                    format!("Batch {}: {} photos, {}", id.0, group.raws.len(), if group.fields.sim.is_empty() { "no look set".to_owned() } else { title_case_words(&group.fields.sim) })
+                                })
+                            })
+                        };
+                        view! {
+                            <li>
+                                <button type="button" class="batch-choice"
+                                    class:selected=move || selected_batch.get() == Some(id)
+                                    aria-pressed=move || if selected_batch.get() == Some(id) { "true" } else { "false" }
+                                    on:click=move |_| selected_batch.set(Some(id))
+                                >
+                                    <span class="batch-choice-title">{title}</span>
+                                    <span class="batch-choice-meta">{move || batches.with(|set| {
+                                        set.get(id).map(|group| group.raws.join(", ")).unwrap_or_default()
+                                    })}</span>
+                                </button>
+                            </li>
+                        }
+                    }).collect_view()
+                }}
+            </ul>
+            {move || {
+                let _ = batch_epoch.get();
+                let set = batches.get_untracked();
+                let Some(id) = selected_batch.get() else {
+                    return view! { <p class="muted">"No batches yet. Add photos to build them."</p> }.into_any();
+                };
+                if set.get(id).is_none() {
+                    return view! { <p class="muted">"No batches yet. Add photos to build them."</p> }.into_any();
                 }
-            }).collect_view()}
-            <Disclosure summary="Technical settings editor".to_owned()>
-            <label for="controls">"Settings (key=step, one per line)"</label>
-            <textarea id="controls" rows="3" prop:value=move || controls.get()
-                on:input=move |event| controls.set(event_target_value(&event))></textarea>
-            </Disclosure>
-            {move || prefill_note.get().map(|note| view! { <p class="muted" role="status">{note}</p> })}
+                let first = set.groups().first().map(|group| group.id) == Some(id);
+                let firmware_ids = plan.with(|plan| {
+                    let mut ids = Vec::new();
+                    if let Some(plan) = plan {
+                        for fact in &plan.facts {
+                            if let Some(tag) = &fact.render_tag {
+                                let id = tag.firmware_id.as_str().to_owned();
+                                if !ids.contains(&id) {
+                                    ids.push(id);
+                                }
+                            }
+                        }
+                    }
+                    ids
+                });
+                view! {
+                    <BatchEditor id=id first=first batches=batches firmware_ids=firmware_ids/>
+                }.into_any()
+            }}
             <Disclosure summary="Processing options".to_owned()>
             <label for="workers">"Parallel processing tasks"</label>
             <select id="workers" on:change=move |event| {
@@ -850,14 +1344,28 @@ pub fn ContributePage() -> impl IntoView {
                     })).collect_view()}
                 </tbody>
             </table>
-            <p>
-                "Serial: sent once, converted to a keyed hash on arrival, never stored. "
-                <label>
-                    <input type="checkbox" prop:checked=move || serial_opt_in.get()
-                        on:change=move |event| serial_opt_in.set(event_target_checked(&event))/>
-                    {move || if serial_present.get() { " Include my camera serial" } else { " No serial found" }}
-                </label>
-            </p>
+            <p>"Serial: sent once, converted to a keyed hash on arrival, never stored. Choose it per batch; each batch starts with serial sending off."</p>
+            <ul class="batch-serial">
+                {move || batches.get().groups().iter().map(|group| {
+                    let id = group.id;
+                    let title = format!("Batch {}", id.0);
+                    let has_serial = plan.with(|plan| plan.as_ref().is_some_and(|plan| batch_has_serial(plan, group)));
+                    let checked = move || batches.with(|set| set.get(id).is_some_and(|group| group.serial_opt_in));
+                    view! {
+                        <li>
+                            <span>{title}</span>
+                            <label>
+                                <input type="checkbox" prop:checked=checked disabled=!has_serial
+                                    on:change=move |event| {
+                                        let opt_in = event_target_checked(&event);
+                                        batches.update(|set| set.set_serial(id, opt_in));
+                                    }/>
+                                {if has_serial { " Include my camera serial in this batch" } else { " No serial found in this batch" }}
+                            </label>
+                        </li>
+                    }
+                }).collect_view()}
+            </ul>
             <p class="muted">
                 "Download payload is a convenience view with a JSON rendering, not a trust anchor. To check what was actually sent, export the HAR and run "
                 <code>"looklab verify-payload"</code> "."
@@ -923,8 +1431,258 @@ pub fn ContributePage() -> impl IntoView {
             <a href=crate::base::site_url("/contribute/wanted")>
                 "Next way to help: take a few wanted shots"
             </a>
-            {move || status_link.get().map(|link| view! { <p>"Status link: " <a href=link.clone()>{link.clone()}</a></p> })}
+            {move || {
+                let links = status_links.get();
+                (!links.is_empty()).then(|| view! {
+                    <ul class="status-links">
+                        {links.into_iter().map(|link| view! {
+                            <li>"Status link: " <a href=link.clone()>{link.clone()}</a></li>
+                        }).collect_view()}
+                    </ul>
+                })
+            }}
         </section>
+        </div>
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TextField {
+    Body,
+    Firmware,
+    Sim,
+    Target,
+    CardId,
+    CardVersion,
+    Controls,
+}
+
+impl TextField {
+    fn get(self, fields: &GroupFields) -> &String {
+        match self {
+            Self::Body => &fields.body,
+            Self::Firmware => &fields.firmware,
+            Self::Sim => &fields.sim,
+            Self::Target => &fields.target,
+            Self::CardId => &fields.card_firmware_id,
+            Self::CardVersion => &fields.card_firmware_version,
+            Self::Controls => &fields.controls,
+        }
+    }
+
+    fn get_mut(self, fields: &mut GroupFields) -> &mut String {
+        match self {
+            Self::Body => &mut fields.body,
+            Self::Firmware => &mut fields.firmware,
+            Self::Sim => &mut fields.sim,
+            Self::Target => &mut fields.target,
+            Self::CardId => &mut fields.card_firmware_id,
+            Self::CardVersion => &mut fields.card_firmware_version,
+            Self::Controls => &mut fields.controls,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FlagField {
+    Recipe,
+    Card,
+}
+
+impl FlagField {
+    fn get(self, fields: &GroupFields) -> bool {
+        match self {
+            Self::Recipe => fields.recipe,
+            Self::Card => fields.card,
+        }
+    }
+
+    fn get_mut(self, fields: &mut GroupFields) -> &mut bool {
+        match self {
+            Self::Recipe => &mut fields.recipe,
+            Self::Card => &mut fields.card,
+        }
+    }
+}
+
+#[component]
+fn BatchEditor(
+    id: BatchId,
+    first: bool,
+    batches: RwSignal<BatchSet>,
+    firmware_ids: Vec<String>,
+) -> impl IntoView {
+    let suffix = if first {
+        String::new()
+    } else {
+        format!("-{}", id.0)
+    };
+    let snapshot = batches
+        .with_untracked(|set| set.get(id).cloned())
+        .unwrap_or_default();
+    let text = move |field: TextField| {
+        move || {
+            batches.with(|set| {
+                set.get(id)
+                    .map_or_else(String::new, |group| field.get(&group.fields).clone())
+            })
+        }
+    };
+    let write = move |field: TextField| {
+        move |value: String| {
+            batches.update(|set| set.update(id, |group| *field.get_mut(&mut group.fields) = value));
+        }
+    };
+    let flag = move |field: FlagField| {
+        move || batches.with(|set| set.get(id).is_some_and(|group| field.get(&group.fields)))
+    };
+    let write_flag = move |field: FlagField| {
+        move |value: bool| {
+            batches.update(|set| set.update(id, |group| *field.get_mut(&mut group.fields) = value));
+        }
+    };
+
+    let body = text(TextField::Body);
+    let firmware = text(TextField::Firmware);
+    let sim = text(TextField::Sim);
+    let target = text(TextField::Target);
+    let card_firmware_id = text(TextField::CardId);
+    let card_firmware_version = text(TextField::CardVersion);
+    let controls = text(TextField::Controls);
+    let write_body = write(TextField::Body);
+    let write_firmware = write(TextField::Firmware);
+    let write_sim = write(TextField::Sim);
+    let write_target = write(TextField::Target);
+    let write_card_id = write(TextField::CardId);
+    let write_card_version = write(TextField::CardVersion);
+    let write_controls = write(TextField::Controls);
+    let recipe = flag(FlagField::Recipe);
+    let card = flag(FlagField::Card);
+    let write_recipe = write_flag(FlagField::Recipe);
+    let write_card = write_flag(FlagField::Card);
+    let malformed = move || batches.with(|set| set.get(id).is_some_and(|group| group.malformed));
+    let menu = menu_settings(&snapshot.fields.controls);
+    let raws = snapshot.raws.join(", ");
+    let unavailable = snapshot.unavailable.clone();
+    let unmapped = snapshot.unmapped.clone();
+    let notes = snapshot.notes.clone();
+    let body_id = format!("body-id{suffix}");
+    let firmware_id = format!("firmware{suffix}");
+    let sim_id = format!("sim{suffix}");
+    let target_id = format!("recipe-target{suffix}");
+    let card_id = format!("card-firmware-id{suffix}");
+    let card_list_id = format!("card-firmware-ids{suffix}");
+    let card_version_id = format!("card-firmware-version{suffix}");
+    let controls_id = format!("controls{suffix}");
+
+    view! {
+        <div class="batch-editor">
+            <p class="muted">{raws}</p>
+            <label for=body_id.clone()>"Camera"</label>
+            <input id=body_id type="text" prop:value=body
+                on:input=move |event| write_body(event_target_value(&event))/>
+            <label for=firmware_id.clone()>"Firmware"</label>
+            <input id=firmware_id type="text" prop:value=firmware
+                on:input=move |event| write_firmware(event_target_value(&event))/>
+            <label for=sim_id.clone()>"Film simulation"</label>
+            <input id=sim_id type="text" prop:value=sim
+                on:input=move |event| write_sim(event_target_value(&event))/>
+            <label>
+                <input type="checkbox" prop:checked=recipe
+                    on:change=move |event| write_recipe(event_target_checked(&event))/>
+                " Recipe contribution"
+            </label>
+            <div hidden=move || !recipe()>
+                <label for=target_id.clone()>"Look this recipe is trying to match"</label>
+                <input id=target_id type="text" prop:value=target
+                    on:input=move |event| write_target(event_target_value(&event))/>
+            </div>
+            <label>
+                <input type="checkbox" prop:checked=card
+                    on:change=move |event| write_card(event_target_checked(&event))/>
+                " Rendered by custom firmware"
+            </label>
+            <div hidden=move || !card()>
+                <p class="muted">
+                    "The JPEG's custom-firmware label fills this in when available. Otherwise, enter the firmware you used."
+                </p>
+                <label for=card_id.clone()>"Custom firmware name"</label>
+                <input id=card_id type="text" list=card_list_id.clone() prop:value=card_firmware_id
+                    on:input=move |event| write_card_id(event_target_value(&event))/>
+                <datalist id=card_list_id>
+                    {firmware_ids.into_iter().map(|id| view! { <option value=id></option> }).collect_view()}
+                </datalist>
+                <label for=card_version_id.clone()>"Custom firmware version"</label>
+                <input id=card_version_id type="text" prop:value=card_firmware_version
+                    on:input=move |event| write_card_version(event_target_value(&event))/>
+            </div>
+            {move || malformed().then(|| view! {
+                <p class="warn" role="alert">
+                    "Some photos have an unreadable custom-firmware label. Choose custom firmware and enter its name and version, or remove those files."
+                </p>
+            })}
+            <h3>"Camera settings"</h3>
+            {menu.into_iter().map(|setting| {
+                let key = setting.key;
+                let read_key = key.clone();
+                let label = key.as_str().replace('_', " ");
+                let text = controls;
+                let read = move || {
+                    control_step(&text(), &read_key)
+                        .map(|step| step.to_string())
+                        .unwrap_or_default()
+                };
+                view! {
+                    <label class="menu-setting">{label}
+                        <input type="number" prop:value=read on:input=move |event| {
+                            if let Ok(step) = event_target_value(&event).parse::<i64>() {
+                                set_control_step(batches, id, &key, step);
+                            }
+                        }/>
+                    </label>
+                }
+            }).collect_view()}
+            {(!unmapped.is_empty()).then(|| view! {
+                <p class="warn" role="alert">
+                    "This camera's firmware does not record these settings. Enter the values you used: a batch cannot be sent until each one has a value."
+                </p>
+                <div class="unmapped-controls">
+                    {unmapped.into_iter().filter_map(|raw| looklab_schema::ControlKey::new(&raw).ok()).map(|key| {
+                        let read_key = key.clone();
+                        let label = key.as_str().replace('_', " ");
+                        let text = controls;
+                        let read = move || {
+                            control_step(&text(), &read_key)
+                                .map(|step| step.to_string())
+                                .unwrap_or_default()
+                        };
+                        view! {
+                            <label class="menu-setting">{label}
+                                <input type="number" prop:value=read on:input=move |event| {
+                                    if let Ok(step) = event_target_value(&event).parse::<i64>() {
+                                        set_control_step(batches, id, &key, step);
+                                    }
+                                }/>
+                            </label>
+                        }
+                    }).collect_view()}
+                </div>
+            })}
+            <Disclosure summary="Technical settings editor".to_owned()>
+            <label for=controls_id.clone()>"Settings (key=step, one per line)"</label>
+            <textarea id=controls_id rows="3" prop:value=controls
+                on:input=move |event| write_controls(event_target_value(&event))></textarea>
+            </Disclosure>
+            {(!unavailable.is_empty()).then(|| view! {
+                <p class="muted" role="status">
+                    "Please check these settings, which could not be read: " {unavailable.join("; ")}
+                </p>
+            })}
+            {(!notes.is_empty()).then(|| view! {
+                <ul class="muted">
+                    {notes.into_iter().map(|note| view! { <li>{note}</li> }).collect_view()}
+                </ul>
+            })}
         </div>
     }
 }
@@ -1021,7 +1779,11 @@ fn sim_menu_label(
 }
 
 #[component]
-fn Pairing(plan: PairingPlan, look: RwSignal<String>) -> impl IntoView {
+fn Pairing(
+    plan: PairingPlan,
+    batches: RwSignal<BatchSet>,
+    catalog: RwSignal<Option<GroupCatalog>>,
+) -> impl IntoView {
     let PairingPlan {
         groups,
         unpaired,
@@ -1029,23 +1791,6 @@ fn Pairing(plan: PairingPlan, look: RwSignal<String>) -> impl IntoView {
     } = plan;
     let pair_count = groups.len();
     let unpaired_count = unpaired.len();
-    let catalog = RwSignal::new(None::<GroupCatalog>);
-    let camera_facts = facts.clone();
-    spawn_local(async move {
-        if let Ok(index) = data::index().await {
-            let mut schemas = Vec::new();
-            for camera in &index.bodies {
-                if camera_facts.iter().any(|fact| {
-                    matching_camera(fact, &index).is_some_and(|matched| matched.id == camera.id)
-                }) && let Ok(page) = data::body(camera.id.make(), camera.id.model()).await
-                    && let Ok(schema) = looklab_schema::validate_control_schema(&page.schema)
-                {
-                    schemas.push(schema);
-                }
-            }
-            catalog.set(Some(GroupCatalog { index, schemas }));
-        }
-    });
     view! {
         <div class="pairing">
             <h3>{format!("{pair_count} {} found", if pair_count == 1 { "pair" } else { "pairs" })}</h3>
@@ -1053,12 +1798,21 @@ fn Pairing(plan: PairingPlan, look: RwSignal<String>) -> impl IntoView {
                 {groups.into_iter().map(|group| {
                     let fact = facts.iter().find(|fact| fact.name == group.raw).cloned();
                     let camera_fact = fact.clone();
+                    let look_fact = fact.clone();
+                    let raw = group.raw.clone();
                     view! {
                     <article class="pairing-card">
                         <h4>{move || catalog.with(|catalog| camera_display(camera_fact.as_ref(), catalog.as_ref()))}</h4>
                         <p class="help-meta">{move || {
-                            let value = look.get();
-                            let name = looklab_schema::SimKey::new(&value).map(|key| catalog.with(|catalog| sim_menu_label(&key, fact.as_ref(), catalog.as_ref()))).unwrap_or_else(|_| title_case_words(&value));
+                            let sim = batches.with(|set| {
+                                set.batch_of(&raw)
+                                    .and_then(|id| set.get(id))
+                                    .map(|group| group.fields.sim.clone())
+                                    .unwrap_or_default()
+                            });
+                            let name = looklab_schema::SimKey::new(&sim)
+                                .map(|key| catalog.with(|catalog| sim_menu_label(&key, look_fact.as_ref(), catalog.as_ref())))
+                                .unwrap_or_else(|_| title_case_words(&sim));
                             format!("Built-in look: {name}")
                         }}</p>
                         <p><strong>{group.raw}</strong></p>
@@ -1236,11 +1990,106 @@ fn metadata_rows(image: &PrepSummary) -> Vec<(String, String)> {
         .collect()
 }
 
-async fn prefill_from_site(
-    make: &str,
-    model: &str,
-    files: &[(String, Vec<u8>)],
-) -> Result<(String, SettingsPrefill), String> {
+struct SiteBody {
+    body: String,
+    yaml: String,
+    schema: looklab_schema::ControlSchema,
+}
+
+/// Reads each pair's settings from its makernotes, keeping only the latest answer per file and drop.
+async fn read_pairs(
+    pairing: &PairingPlan,
+    files: &[LocalFile],
+    ledger: StoredValue<PrefillLedger, leptos::prelude::LocalStorage>,
+    epoch: u64,
+) -> Vec<PairReading> {
+    let mut bodies: HashMap<(String, String), Result<SiteBody, String>> = HashMap::new();
+    let mut readings = Vec::with_capacity(pairing.groups.len());
+    for pair in &pairing.groups {
+        let Some(ticket) = ledger.try_update_value(|ledger| ledger.begin(epoch, &pair.raw)) else {
+            return readings;
+        };
+        let reading = reading_for_pair(pairing, pair, files, &mut bodies).await;
+        if ledger.with_value(|ledger| ledger.accept(&ticket)) {
+            readings.push(reading);
+        }
+    }
+    readings
+}
+
+async fn reading_for_pair(
+    pairing: &PairingPlan,
+    pair: &looklab_wasm::PairGroup,
+    files: &[LocalFile],
+    bodies: &mut HashMap<(String, String), Result<SiteBody, String>>,
+) -> PairReading {
+    let facts = std::iter::once(&pair.raw)
+        .chain(pair.jpegs.iter())
+        .filter_map(|name| pairing.facts.iter().find(|fact| &fact.name == name))
+        .collect::<Vec<_>>();
+    let mut reading = PairReading {
+        raw: pair.raw.clone(),
+        camera: facts.first().map(|fact| CameraKey {
+            make: fact.make.clone(),
+            model: fact.model.clone(),
+        }),
+        body: String::new(),
+        epoch: None,
+        firmware: facts
+            .first()
+            .and_then(|fact| fact.firmware.clone())
+            .unwrap_or_default(),
+        sim: None,
+        controls: Vec::new(),
+        unavailable: Vec::new(),
+        unmapped: Vec::new(),
+        card: facts.iter().find_map(|fact| fact.render_tag.clone()),
+        malformed: facts.iter().any(|fact| fact.render_tag_malformed),
+        note: None,
+    };
+    let Some((make, model)) = reading
+        .camera
+        .as_ref()
+        .and_then(|camera| Some((camera.make.clone()?, camera.model.clone()?)))
+    else {
+        reading.note = Some("the files do not name a camera".to_owned());
+        return reading;
+    };
+    let Some(raw) = find_file(files, &pair.raw) else {
+        reading.note = Some("the RAW is no longer available".to_owned());
+        return reading;
+    };
+    let key = (make.trim().to_lowercase(), model.trim().to_lowercase());
+    if !bodies.contains_key(&key) {
+        bodies.insert(key.clone(), site_body(&make, &model).await);
+    }
+    let site = match bodies.get(&key) {
+        Some(Ok(site)) => site,
+        Some(Err(error)) => {
+            reading.note = Some(error.clone());
+            return reading;
+        }
+        None => return reading,
+    };
+    reading.body = site.body.clone();
+    match prefill_settings(&site.yaml, &[(pair.raw.clone(), raw.bytes.clone())]) {
+        Ok(prefill) => {
+            reading.epoch = site
+                .schema
+                .epoch_for(&prefill.firmware)
+                .map(|epoch| epoch.id);
+            reading.firmware = prefill.firmware;
+            reading.sim = prefill.sim;
+            reading.controls = prefill.controls;
+            reading.unavailable = prefill.unavailable;
+            reading.unmapped = prefill.unmapped;
+        }
+        Err(error) => reading.note = Some(error.to_string()),
+    }
+    reading
+}
+
+async fn site_body(make: &str, model: &str) -> Result<SiteBody, String> {
     let index = data::index().await?;
     let summary = index
         .bodies
@@ -1248,8 +2097,18 @@ async fn prefill_from_site(
         .find(|body| body.make.eq_ignore_ascii_case(make) && body.model.eq_ignore_ascii_case(model))
         .ok_or_else(|| format!("the site data has no camera for {make} {model}"))?;
     let page = data::body(summary.id.make(), summary.id.model()).await?;
-    let prefill = prefill_settings(&page.schema, files).map_err(|error| error.to_string())?;
-    Ok((page.id.to_string(), prefill))
+    let schema = looklab_schema::validate_control_schema(&page.schema).map_err(|errors| {
+        errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    })?;
+    Ok(SiteBody {
+        body: page.id.to_string(),
+        yaml: page.schema,
+        schema,
+    })
 }
 
 struct DraftGroup<'a> {
@@ -1257,6 +2116,9 @@ struct DraftGroup<'a> {
     firmware: &'a str,
     sim: &'a str,
     controls: &'a str,
+    reproduced: &'a [(String, i64)],
+    unmapped: &'a [String],
+    snapshot_version: u64,
     recipe: bool,
     target: &'a str,
     card: bool,
@@ -1277,11 +2139,36 @@ fn group_settings(draft: DraftGroup<'_>) -> Result<GroupSettings, String> {
         let (key, step) = line
             .split_once('=')
             .ok_or_else(|| format!("{line}: expected key=step"))?;
-        entries.push((
-            key.trim().to_owned(),
-            step.trim()
-                .parse::<i64>()
-                .map_err(|_| format!("{line}: step is not an integer"))?,
+        let key = key.trim();
+        let step = step
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| format!("{line}: step is not an integer"))?;
+        let source = if draft
+            .reproduced
+            .iter()
+            .any(|(reproduced, reproduced_step)| reproduced == key && *reproduced_step == step)
+        {
+            SettingSource::Reproduced
+        } else {
+            SettingSource::Declared
+        };
+        entries.push(ControlSetting {
+            key: key.to_owned(),
+            step,
+            source,
+        });
+    }
+    let missing = draft
+        .unmapped
+        .iter()
+        .filter(|key| !entries.iter().any(|entry| &entry.key == *key))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "This camera's {} isn't mapped yet. Enter the value you used under Camera settings, or remove those photos from the batch.",
+            missing.join(", ")
         ));
     }
     let intent = if let Some(tag) = draft.tag {
@@ -1308,11 +2195,14 @@ fn group_settings(draft: DraftGroup<'_>) -> Result<GroupSettings, String> {
         body: draft.body.trim().to_owned(),
         firmware: draft.firmware.trim().to_owned(),
         sim: draft.sim.trim().to_owned(),
+        community_snapshot_version: draft.snapshot_version,
         controls: entries,
     })
 }
 
-fn prepared_images(groups: &[ProcessedGroup]) -> Vec<PreparedImageView> {
+fn prepared_images<'a>(
+    groups: impl IntoIterator<Item = &'a ProcessedGroup>,
+) -> Vec<PreparedImageView> {
     let mut images = Vec::new();
     for group in groups {
         for (index, summary) in group.images.iter().enumerate() {
@@ -1330,136 +2220,274 @@ fn prepared_images(groups: &[ProcessedGroup]) -> Vec<PreparedImageView> {
     images
 }
 
+fn prepared_images_of(groups: &[ProcessedGroup], batch: BatchId) -> Vec<PreparedImageView> {
+    prepared_images(groups.iter().filter(|group| group.batch == Some(batch)))
+}
+
+fn group_settings_for(
+    group: &ContributionGroup,
+    images: &[PreparedImageView],
+    snapshot_version: u64,
+) -> Result<GroupSettings, String> {
+    let card_tag = images
+        .iter()
+        .find_map(|image| image.metadata.render_tag.clone());
+    let malformed = group.malformed
+        || images
+            .iter()
+            .any(|image| image.metadata.render_tag_malformed);
+    group_settings(DraftGroup {
+        body: &group.fields.body,
+        firmware: &group.fields.firmware,
+        sim: &group.fields.sim,
+        controls: &group.fields.controls,
+        reproduced: &group.reproduced,
+        unmapped: &group.unmapped,
+        snapshot_version,
+        recipe: group.fields.recipe,
+        target: &group.fields.target,
+        card: group.fields.card || card_tag.is_some(),
+        tag: card_tag.as_ref(),
+        malformed,
+        card_firmware_id: &group.fields.card_firmware_id,
+        card_firmware_version: &group.fields.card_firmware_version,
+    })
+}
+
+fn batch_has_serial(pairing: &PairingPlan, group: &ContributionGroup) -> bool {
+    pairing
+        .groups
+        .iter()
+        .filter(|pair| group.raws.iter().any(|raw| raw == &pair.raw))
+        .any(|pair| {
+            std::iter::once(&pair.raw)
+                .chain(pair.jpegs.iter())
+                .any(|name| {
+                    pairing
+                        .facts
+                        .iter()
+                        .any(|fact| &fact.name == name && fact.has_serial)
+                })
+        })
+}
+
 pub(crate) async fn run_files(
     pairing: &PairingPlan,
     files: &[LocalFile],
     count: u32,
 ) -> Result<(Vec<ProcessedGroup>, Vec<SeedRow>, Vec<FailureRow>), String> {
-    run_files_progress(pairing, files, count, None).await
+    let batches = BatchSet::covering(pairing);
+    run_files_progress(pairing, &batches, files, count, None).await
+}
+
+enum PairOutcome {
+    Prepared {
+        group: ProcessedGroup,
+        seed: SeedRow,
+    },
+    Failed(FailureRow),
+}
+
+async fn prepare_pair(
+    worker: &mut PrepWorker,
+    pair: &looklab_wasm::PairGroup,
+    files: &[LocalFile],
+    batch: Option<BatchId>,
+    progress: &Option<Callback<ProcessedGroup>>,
+) -> PairOutcome {
+    let failed = |name: String, message: &str| {
+        PairOutcome::Failed(FailureRow {
+            name,
+            message: message.to_owned(),
+            donated: false,
+        })
+    };
+    let Some(raw) = find_file(files, &pair.raw) else {
+        return failed(pair.raw.clone(), "the file is no longer available");
+    };
+    let mut jpegs = Vec::with_capacity(pair.jpegs.len());
+    for name in &pair.jpegs {
+        let Some(file) = find_file(files, name) else {
+            return failed(name.clone(), "the file is no longer available");
+        };
+        jpegs.push(file.bytes.clone());
+    }
+    if jpegs.is_empty() {
+        return failed(pair.raw.clone(), "no JPEG is paired with this RAW");
+    }
+    let mut seed = [0u8; 32];
+    let Some(crypto) = web_sys::window().and_then(|window| window.crypto().ok()) else {
+        return failed(pair.raw.clone(), "crypto.getRandomValues is unavailable");
+    };
+    if crypto.get_random_values_with_u8_array(&mut seed).is_err() {
+        return failed(pair.raw.clone(), "crypto.getRandomValues failed");
+    }
+    let bytes_in = raw.bytes.len() as u64 + jpegs.iter().map(|jpeg| jpeg.len() as u64).sum::<u64>();
+    let request = prepare_request(raw.bytes.clone(), jpegs, PRIOR_VERSION, seed);
+    let start = performance_now();
+    let reply = worker
+        .call(module_fn_id(ModuleFunction::Prepare), request)
+        .await;
+    let millis = performance_now() - start;
+    match reply {
+        Ok(reply) => match decode_prepare_reply(&reply.bytes) {
+            Ok(response) => {
+                let group = ProcessedGroup {
+                    raw: pair.raw.clone(),
+                    batch,
+                    images: looklab_wasm::prep::summarize(&response.images),
+                    blobs: response
+                        .images
+                        .iter()
+                        .map(|image| image.blob.clone())
+                        .collect(),
+                    bytes_in,
+                    millis,
+                    memory: reply.memory,
+                };
+                if let Some(progress) = progress {
+                    progress.run(group.clone());
+                }
+                PairOutcome::Prepared {
+                    group,
+                    seed: SeedRow {
+                        name: pair.raw.clone(),
+                        seed,
+                    },
+                }
+            }
+            Err(error) => failed(pair.raw.clone(), &error.to_string()),
+        },
+        Err(error) => failed(pair.raw.clone(), &error.message()),
+    }
+}
+
+fn lane_indices(count: usize, lanes: usize) -> Vec<Vec<usize>> {
+    let mut lanes: Vec<Vec<usize>> = (0..lanes.max(1).min(count.max(1)))
+        .map(|_| Vec::new())
+        .collect();
+    let lane_count = lanes.len();
+    for index in 0..count {
+        lanes[index % lane_count].push(index);
+    }
+    lanes
 }
 
 async fn run_files_progress(
     pairing: &PairingPlan,
+    batches: &BatchSet,
     files: &[LocalFile],
     count: u32,
     progress: Option<Callback<ProcessedGroup>>,
 ) -> Result<(Vec<ProcessedGroup>, Vec<SeedRow>, Vec<FailureRow>), String> {
-    let mut workers = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        workers.push(PrepWorker::spawn()?);
+    if pairing.groups.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
+    let lanes = lane_indices(
+        pairing.groups.len(),
+        usize::try_from(count.max(1)).unwrap_or(1),
+    );
+    let mut futures: Vec<Lane<'_, PairOutcomes>> = Vec::with_capacity(lanes.len());
+    for indices in lanes {
+        futures.push(Box::pin(async move {
+            let mut worker = PrepWorker::spawn()?;
+            let mut outcomes = Vec::with_capacity(indices.len());
+            for index in indices {
+                if worker.should_recycle() {
+                    worker.terminate();
+                    worker = PrepWorker::spawn()?;
+                }
+                let pair = &pairing.groups[index];
+                let batch = batches.batch_of(&pair.raw);
+                outcomes.push((
+                    index,
+                    prepare_pair(&mut worker, pair, files, batch, &progress).await,
+                ));
+            }
+            worker.terminate();
+            Ok(outcomes)
+        }));
+    }
+    let mut outcomes = Vec::new();
+    for lane in join_all(futures).await {
+        outcomes.extend(lane?);
+    }
+    outcomes.sort_by_key(|(index, _)| *index);
     let mut groups = Vec::new();
     let mut seed_rows = Vec::new();
     let mut failures = Vec::new();
-    for (index, group) in pairing.groups.iter().enumerate() {
-        let slot = index % workers.len();
-        if workers[slot].should_recycle() {
-            workers[slot].terminate();
-            workers[slot] = PrepWorker::spawn()?;
-        }
-        let Some(raw) = find_file(files, &group.raw) else {
-            failures.push(FailureRow {
-                name: group.raw.clone(),
-                message: "the file is no longer available".to_owned(),
-                donated: false,
-            });
-            continue;
-        };
-        let mut jpegs = Vec::with_capacity(group.jpegs.len());
-        let mut missing = None;
-        for name in &group.jpegs {
-            match find_file(files, name) {
-                Some(file) => jpegs.push(file.bytes.clone()),
-                None => missing = Some(name.clone()),
+    for (_, outcome) in outcomes {
+        match outcome {
+            PairOutcome::Prepared { group, seed } => {
+                groups.push(group);
+                seed_rows.push(seed);
             }
-        }
-        if let Some(name) = missing {
-            failures.push(FailureRow {
-                name,
-                message: "the file is no longer available".to_owned(),
-                donated: false,
-            });
-            continue;
-        }
-        if jpegs.is_empty() {
-            failures.push(FailureRow {
-                name: group.raw.clone(),
-                message: "no JPEG is paired with this RAW".to_owned(),
-                donated: false,
-            });
-            continue;
-        }
-        let mut seed = [0u8; 32];
-        web_sys::window()
-            .and_then(|window| window.crypto().ok())
-            .ok_or_else(|| "crypto.getRandomValues is unavailable".to_owned())?
-            .get_random_values_with_u8_array(&mut seed)
-            .map_err(|error| format!("{error:?}"))?;
-        let request = prepare_request(raw.bytes.clone(), jpegs.clone(), PRIOR_VERSION, seed);
-        let bytes_in =
-            raw.bytes.len() as u64 + jpegs.iter().map(|jpeg| jpeg.len() as u64).sum::<u64>();
-        let start = performance_now();
-        let reply = workers[slot]
-            .call(module_fn_id(ModuleFunction::Prepare), request)
-            .await;
-        let millis = performance_now() - start;
-        match reply {
-            Ok(reply) => match decode_prepare_reply(&reply.bytes) {
-                Ok(response) => {
-                    seed_rows.push(SeedRow {
-                        name: group.raw.clone(),
-                        seed,
-                    });
-                    groups.push(ProcessedGroup {
-                        raw: group.raw.clone(),
-                        images: looklab_wasm::prep::summarize(&response.images),
-                        blobs: response
-                            .images
-                            .iter()
-                            .map(|image| image.blob.clone())
-                            .collect(),
-                        bytes_in,
-                        millis,
-                        memory: reply.memory,
-                    });
-                    if let Some(progress) = progress
-                        && let Some(group) = groups.last()
-                    {
-                        progress.run(group.clone());
-                    }
-                }
-                Err(error) => failures.push(FailureRow {
-                    name: group.raw.clone(),
-                    message: error.to_string(),
-                    donated: false,
-                }),
-            },
-            Err(error) => failures.push(FailureRow {
-                name: group.raw.clone(),
-                message: error.message(),
-                donated: false,
-            }),
+            PairOutcome::Failed(row) => failures.push(row),
         }
     }
     let mut card_failures = check_card_tags(&mut groups).await;
     failures.append(&mut card_failures);
-    for worker in &workers {
-        worker.terminate();
-    }
     Ok((groups, seed_rows, failures))
 }
 
+type Lane<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+type PairOutcomes = Result<Vec<(usize, PairOutcome)>, String>;
+
+struct JoinAll<'a, T> {
+    futures: Vec<Lane<'a, T>>,
+    results: Vec<Option<T>>,
+}
+
+impl<T: Unpin> Future for JoinAll<'_, T> {
+    type Output = Vec<T>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut ready = 0;
+        for (index, future) in this.futures.iter_mut().enumerate() {
+            if this.results[index].is_some() {
+                ready += 1;
+                continue;
+            }
+            if let Poll::Ready(value) = future.as_mut().poll(context) {
+                this.results[index] = Some(value);
+                ready += 1;
+            }
+        }
+        if ready == this.futures.len() {
+            Poll::Ready(this.results.iter_mut().filter_map(Option::take).collect())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+async fn join_all<'a, T: Unpin>(futures: Vec<Lane<'a, T>>) -> Vec<T> {
+    JoinAll {
+        results: futures.iter().map(|_| None).collect(),
+        futures,
+    }
+    .await
+}
+
 async fn check_card_tags(groups: &mut [ProcessedGroup]) -> Vec<FailureRow> {
-    let expected = groups
-        .iter()
-        .flat_map(|group| group.images.iter())
-        .find_map(|image| image.metadata.render_tag.clone());
+    let mut expected: HashMap<Option<BatchId>, RenderTag> = HashMap::new();
+    for group in groups.iter() {
+        let tag = group
+            .images
+            .iter()
+            .find_map(|image| image.metadata.render_tag.clone());
+        if let Some(tag) = tag {
+            expected.entry(group.batch).or_insert(tag);
+        }
+    }
     let mut failures = Vec::new();
     for group in groups {
+        let batch_tag = expected.get(&group.batch);
         let mut drop = Vec::new();
         for (index, image) in group.images.iter().enumerate() {
             if image.metadata.render_tag_malformed {
-                if expected.is_some() {
+                if batch_tag.is_some() {
                     drop.push((
                         index,
                         "the render tag is malformed; declare the firmware or exclude this file"
@@ -1471,7 +2499,7 @@ async fn check_card_tags(groups: &mut [ProcessedGroup]) -> Vec<FailureRow> {
             let Some(tag) = image.metadata.render_tag.as_ref() else {
                 continue;
             };
-            if expected.as_ref().is_some_and(|first| first != tag) {
+            if batch_tag.is_some_and(|first| first != tag) {
                 drop.push((
                     index,
                     "the render tag differs from the first tag in this batch".to_owned(),
@@ -1512,7 +2540,7 @@ async fn upload_batch(
     session: crate::session::SessionContext,
     settings: GroupSettings,
     images: Vec<PreparedImageView>,
-    files: Vec<LocalFile>,
+    files: &[LocalFile],
     seeds: Vec<SeedRow>,
     serial_opt_in: bool,
 ) -> Result<webauthn::UploadReply, String> {
@@ -1615,6 +2643,8 @@ fn performance_now() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn draft(card: bool, malformed: bool) -> DraftGroup<'static> {
         DraftGroup {
@@ -1622,6 +2652,9 @@ mod tests {
             firmware: "1.00",
             sim: "provia",
             controls: "",
+            reproduced: &[],
+            unmapped: &[],
+            snapshot_version: 0,
             recipe: false,
             target: "",
             card,
@@ -1629,6 +2662,26 @@ mod tests {
             malformed,
             card_firmware_id: "acme-sim",
             card_firmware_version: "2.0.1",
+        }
+    }
+
+    fn reading(raw: &str, make: &str, model: &str, sim: &str, control: i64) -> PairReading {
+        PairReading {
+            raw: raw.to_owned(),
+            camera: Some(CameraKey {
+                make: Some(make.to_owned()),
+                model: Some(model.to_owned()),
+            }),
+            body: format!("{make}/{model}"),
+            epoch: Some(1),
+            firmware: "1.00".to_owned(),
+            sim: Some(sim.to_owned()),
+            controls: vec![("color".to_owned(), control)],
+            unavailable: Vec::new(),
+            unmapped: Vec::new(),
+            card: None,
+            malformed: false,
+            note: None,
         }
     }
 
@@ -1645,5 +2698,213 @@ mod tests {
             settings.intent,
             IntentChoice::Card(CardDeclaration::UserDeclared { .. })
         ));
+    }
+
+    #[test]
+    fn controls_keep_their_source() {
+        let reproduced = vec![
+            ("color".to_owned(), 0),
+            ("color_chrome_effect".to_owned(), 1),
+        ];
+        let settings = group_settings(DraftGroup {
+            controls: "color=0\ncolor_chrome_effect=2\nshadow_tone=1",
+            reproduced: &reproduced,
+            ..draft(false, false)
+        })
+        .expect("settings");
+        assert_eq!(settings.controls[0].source, SettingSource::Reproduced);
+        assert_eq!(
+            settings.controls[1].source,
+            SettingSource::Declared,
+            "an edited step is declared"
+        );
+        assert_eq!(
+            settings.controls[2].source,
+            SettingSource::Declared,
+            "a control the makernotes did not supply is declared"
+        );
+    }
+
+    #[test]
+    fn a_restored_batch_still_marks_reproduced_controls() {
+        let mut reading = reading("a.raf", "fujifilm", "x-s10", "provia", 0);
+        reading.controls = vec![("color".to_owned(), 0), ("clarity".to_owned(), 0)];
+        let group = ContributionGroup::from_reading(BatchId(1), &reading);
+        let json = serde_json::to_string(&group).expect("json");
+        let restored: ContributionGroup = serde_json::from_str(&json).expect("restore");
+        assert_eq!(restored.reproduced, reading.controls);
+        let settings = group_settings_for(&restored, &[], 0).expect("settings");
+        assert_eq!(settings.controls[0].source, SettingSource::Reproduced);
+        assert_eq!(settings.controls[1].source, SettingSource::Reproduced);
+    }
+
+    #[test]
+    fn the_batch_carries_the_index_snapshot_version() {
+        let index: looklab_publish::SiteIndex = serde_json::from_str(
+            r#"{"format":"looklab-site/1","community_snapshot_version":7,"bodies":[],"looks":[],"scenes":[]}"#,
+        )
+        .expect("index");
+        let settings = group_settings(DraftGroup {
+            snapshot_version: index.community_snapshot_version,
+            ..draft(false, false)
+        })
+        .expect("settings");
+        assert_eq!(settings.community_snapshot_version, 7);
+        let legacy: looklab_publish::SiteIndex = serde_json::from_str(
+            r#"{"format":"looklab-site/1","bodies":[],"looks":[],"scenes":[]}"#,
+        )
+        .expect("legacy index");
+        assert_eq!(legacy.community_snapshot_version, 0);
+    }
+
+    #[test]
+    fn an_unmapped_look_affecting_control_blocks_the_batch() {
+        let unmapped = vec!["color_chrome_fx_blue".to_owned()];
+        let error = group_settings(DraftGroup {
+            controls: "color=0",
+            unmapped: &unmapped,
+            ..draft(false, false)
+        })
+        .expect_err("the batch is blocked");
+        assert!(error.contains("color_chrome_fx_blue"), "{error}");
+        assert!(error.contains("isn't mapped yet"), "{error}");
+        let settings = group_settings(DraftGroup {
+            controls: "color=0\ncolor_chrome_fx_blue=0",
+            unmapped: &unmapped,
+            ..draft(false, false)
+        })
+        .expect("a declared value unblocks it");
+        assert_eq!(
+            settings.controls[1].source,
+            SettingSource::Declared,
+            "{:?}",
+            settings.controls[1]
+        );
+    }
+
+    #[test]
+    fn mixed_cameras_looks_and_settings_get_their_own_batch() {
+        let readings = vec![
+            reading("a.raf", "fujifilm", "x-t5", "provia", 0),
+            reading("b.raf", "fujifilm", "x-t5", "provia", 0),
+            reading("c.raf", "fujifilm", "x-t5", "velvia", 0),
+            reading("d.raf", "sony", "a7", "provia", 0),
+            reading("e.raf", "fujifilm", "x-t5", "provia", 1),
+        ];
+        let set = BatchSet::from_readings(&readings);
+        assert_eq!(set.groups().len(), 4);
+        assert_eq!(
+            set.groups()[0].raws,
+            vec!["a.raf".to_owned(), "b.raf".to_owned()]
+        );
+        assert_eq!(set.groups()[0].fields.body, "fujifilm/x-t5");
+        assert_eq!(set.groups()[0].fields.sim, "provia");
+        assert_eq!(set.groups()[0].fields.controls, "color=0");
+        assert_eq!(set.groups()[1].fields.sim, "velvia");
+        assert_eq!(set.groups()[1].fields.controls, "color=0");
+        assert_eq!(set.groups()[2].fields.body, "sony/a7");
+        assert_eq!(set.groups()[3].fields.controls, "color=1");
+        assert!(set.groups().iter().all(|group| !group.serial_opt_in));
+    }
+
+    #[test]
+    fn serial_opt_in_starts_off_for_every_batch() {
+        let mut set = BatchSet::from_readings(&[reading("a.raf", "fujifilm", "x-t5", "provia", 0)]);
+        let id = set.groups()[0].id;
+        set.set_serial(id, true);
+        assert!(set.get(id).is_some_and(|group| group.serial_opt_in));
+        set.finish();
+        assert!(set.groups().is_empty());
+        let next = BatchSet::from_readings(&[reading("a.raf", "fujifilm", "x-t5", "provia", 0)]);
+        assert!(next.groups().iter().all(|group| !group.serial_opt_in));
+    }
+
+    #[test]
+    fn a_stale_prefill_answer_is_dropped() {
+        let mut ledger = PrefillLedger::default();
+        let epoch = ledger.reset();
+        let first = ledger.begin(epoch, "a.raf");
+        let second = ledger.begin(epoch, "a.raf");
+        assert!(!ledger.accept(&first), "a newer request supersedes it");
+        assert!(ledger.accept(&second));
+        let other = ledger.begin(epoch, "b.raf");
+        assert!(ledger.accept(&other), "another file is unaffected");
+
+        let stale = ledger.begin(epoch, "c.raf");
+        let epoch = ledger.reset();
+        assert!(!ledger.accept(&stale), "a new drop invalidates it");
+        let old_epoch = ledger.begin(epoch - 1, "a.raf");
+        assert!(!ledger.accept(&old_epoch));
+        let fresh = ledger.begin(epoch, "a.raf");
+        assert!(ledger.accept(&fresh), "the new drop still owns the file");
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = Box::pin(future);
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        for _ in 0..10_000 {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return value;
+            }
+        }
+        panic!("the test future did not finish");
+    }
+
+    struct YieldOnce(bool);
+
+    impl Future for YieldOnce {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    #[test]
+    fn lanes_are_assigned_round_robin() {
+        assert_eq!(
+            lane_indices(7, 3),
+            vec![vec![0, 3, 6], vec![1, 4], vec![2, 5],]
+        );
+        assert_eq!(lane_indices(2, 4), vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn the_pool_runs_lanes_concurrently_and_keeps_their_order() {
+        let in_flight = Rc::new(RefCell::new((0_usize, 0_usize)));
+        let mut lanes: Vec<Pin<Box<dyn Future<Output = Vec<(usize, usize)>>>>> = Vec::new();
+        for lane in 0..3 {
+            let counter = Rc::clone(&in_flight);
+            lanes.push(Box::pin(async move {
+                let mut out = Vec::new();
+                for item in 0..2 {
+                    {
+                        let mut state = counter.borrow_mut();
+                        state.0 += 1;
+                        state.1 = state.1.max(state.0);
+                    }
+                    YieldOnce(false).await;
+                    counter.borrow_mut().0 -= 1;
+                    out.push((lane, item));
+                }
+                out
+            }));
+        }
+        let collected = block_on(join_all(lanes));
+        assert_eq!(in_flight.borrow().1, 3, "all three lanes were in flight");
+        assert_eq!(
+            collected,
+            vec![
+                vec![(0, 0), (0, 1)],
+                vec![(1, 0), (1, 1)],
+                vec![(2, 0), (2, 1)],
+            ]
+        );
     }
 }

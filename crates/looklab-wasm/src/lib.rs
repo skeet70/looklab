@@ -36,10 +36,10 @@ pub use pairing::{PairGroup, PairingPlan, UnpairedEntry, inspect_files};
 pub use pattern::{PatternImage, render_pattern};
 pub use prefill::{SettingsPrefill, prefill_settings};
 pub use prep::{
-    GroupSettings, IntentChoice, PrepSummary, build_manifest_request, decode_build_manifest_reply,
-    decode_encode_reply, decode_parse_reply, decode_pow_reply, decode_prepare_reply,
-    encode_envelope_request, module_fn_id, parse_envelope_request, prepare_request, serial_ascii,
-    serial_ascii_for_file, solve_pow_request, version_request,
+    ControlSetting, GroupSettings, IntentChoice, PrepSummary, build_manifest_request,
+    decode_build_manifest_reply, decode_encode_reply, decode_parse_reply, decode_pow_reply,
+    decode_prepare_reply, encode_envelope_request, module_fn_id, parse_envelope_request,
+    prepare_request, serial_ascii, serial_ascii_for_file, solve_pow_request, version_request,
 };
 pub use seedfile::build_seed_file;
 

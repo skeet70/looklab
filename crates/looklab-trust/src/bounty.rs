@@ -594,10 +594,10 @@ mod tests {
     }
 
     fn key(exposure: i64) -> RecipeKey {
-        let settings = ControlSettings::new(vec![ControlEntry {
-            key: looklab_upload::ControlKey::new("exposure").expect("valid control key"),
-            step: StepIndex::new(exposure),
-        }])
+        let settings = ControlSettings::new(vec![ControlEntry::reproduced(
+            looklab_upload::ControlKey::new("exposure").expect("valid control key"),
+            StepIndex::new(exposure),
+        )])
         .expect("valid settings");
         RecipeKey {
             body: body(),

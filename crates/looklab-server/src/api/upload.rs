@@ -14,7 +14,7 @@ use tokio::task;
 
 use crate::api::consume_nonce;
 use crate::blob::{BlobHash, BlobStore};
-use crate::body_schema::validate_settings;
+use crate::body_schema::{SnapshotVersionError, validate_settings};
 use crate::error::{ApiError, ApiResult, ErrorCode};
 use crate::ids::{ContributionId, CredentialId, RawCredentialId, StatusToken};
 use crate::preparse::parse_header;
@@ -137,15 +137,22 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         return Err(ApiError::new(ErrorCode::MalformedEnvelope));
     }
 
-    let body_record = state
+    let records = state
         .bodies
-        .get(&envelope.manifest.body)
+        .at(envelope.manifest.community_snapshot_version)
+        .map_err(|error| match error {
+            SnapshotVersionError::Unknown { .. } => ApiError::new(ErrorCode::SnapshotUnknown),
+            SnapshotVersionError::TooOld { .. } => ApiError::new(ErrorCode::SnapshotTooOld),
+        })?;
+    let body_record = records
+        .get(envelope.manifest.body.as_str())
         .ok_or_else(|| ApiError::new(ErrorCode::BodyUnknown))?;
     validate_settings(
         body_record,
         envelope.manifest.firmware_version.as_str(),
         &envelope.manifest.sim_key,
         &envelope.manifest.settings,
+        matches!(envelope.manifest.intent, looklab_upload::Intent::Card(_)),
     )
     .map_err(|_| ApiError::new(ErrorCode::SchemaInvalid))?;
 
@@ -167,6 +174,15 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         ..
     } = envelope;
 
+    let setting_source = serde_json::to_string(
+        &manifest
+            .settings
+            .entries()
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.source))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| ApiError::new(ErrorCode::Internal))?;
     let images = manifest
         .images
         .iter()
@@ -178,6 +194,7 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
                 meta_json: serde_json::to_string(&image.meta)
                     .map_err(|_| ApiError::new(ErrorCode::Internal))?,
                 rerender_group: image.rerender_group.map(|group| hex(group.as_bytes())),
+                setting_source: setting_source.clone(),
             })
         })
         .collect::<ApiResult<Vec<_>>>()?;

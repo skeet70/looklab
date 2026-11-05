@@ -59,6 +59,8 @@ pub struct FitImage {
     pub exposure_mode: ExposureModeId,
     pub contributor: ContributorId,
     pub settings: Settings,
+    /// Per-control source of `settings`; provenance only, no weight effect in v1.
+    pub setting_source: std::collections::BTreeMap<ControlKey, looklab_schema::SettingSource>,
     pub intent: ImageIntent,
 }
 
@@ -73,6 +75,7 @@ impl FitImage {
             exposure_mode: ExposureModeId::default(),
             contributor: ContributorId::default(),
             settings: Settings::default(),
+            setting_source: std::collections::BTreeMap::new(),
             intent: ImageIntent::Native,
         }
     }
@@ -92,6 +95,8 @@ pub struct FitOptions {
     pub n_eff: f64,
     pub nu: f64,
     pub max_samples_per_image: usize,
+    /// Samples per image for the warm-up stages; 0 uses the full set.
+    pub early_samples_per_image: usize,
     /// Normal-equation rows per sweep; caps the quadrature cost, not the likelihood.
     pub hessian_samples: usize,
     pub max_sweeps: usize,
@@ -114,6 +119,8 @@ pub struct FitOptions {
     pub min_probe_clusters: usize,
     /// Add the prior curvature floor to the probe covariance (the recovery study ablates it).
     pub prior_floor: bool,
+    /// Scale on the identity prior curvature; 0 disables it (diagnostic ablation).
+    pub identity_scale: f64,
     /// Scale the image-clustered sandwich for few clusters (Cameron & Miller 2015).
     pub sandwich_correction: bool,
     pub run_gcv: bool,
@@ -131,6 +138,7 @@ impl Default for FitOptions {
             n_eff: 500.0,
             nu: 4.0,
             max_samples_per_image: 10_000,
+            early_samples_per_image: 64,
             hessian_samples: 8_000,
             max_sweeps: 128,
             sweep_budget: 2_000_000.0,
@@ -145,6 +153,7 @@ impl Default for FitOptions {
             bias_fraction: 0.33,
             min_probe_clusters: 3,
             prior_floor: true,
+            identity_scale: 1.0,
             sandwich_correction: true,
             run_gcv: true,
             initial_lambdas: StageLambdas::default(),
@@ -177,7 +186,7 @@ pub struct Realization {
     pub exposure_offsets: Vec<ExposureOffset>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StageLambdas {
     pub tone: f64,
     pub tint: f64,
@@ -252,6 +261,8 @@ pub struct ProbeEstimate {
     pub bias_de: f64,
     /// `min` per-channel clip derivative is at least 0.25, so pre-clip J′ is identifiable.
     pub pre_clip_reliable: bool,
+    /// Outermost hue-grid chroma knot (c=3), where G/R/Λ leverage is largest.
+    pub gamut_edge: bool,
     /// Absolute tempered effective weight per KDE bin.
     pub density: f64,
     pub supported_sigma: bool,
@@ -268,6 +279,18 @@ pub struct ProbeEstimate {
 pub struct PreviousSupport {
     pub sigma: Vec<bool>,
     pub bias: Vec<bool>,
+}
+
+/// Everything needed to continue a fit that exhausted its budget.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FitState {
+    pub theta: Vec<f64>,
+    pub lambdas: StageLambdas,
+    /// Stage to resume at, and the first sweep within it.
+    pub stage: usize,
+    pub sweep: usize,
+    pub damping: f64,
+    pub converged: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

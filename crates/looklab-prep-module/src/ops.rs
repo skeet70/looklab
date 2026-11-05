@@ -203,6 +203,7 @@ pub(crate) fn build_manifest(
         body: request.body,
         firmware_version: request.firmware,
         sim_key: request.sim,
+        community_snapshot_version: request.community_snapshot_version,
         settings: request.settings,
         images,
     };

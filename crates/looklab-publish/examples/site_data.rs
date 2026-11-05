@@ -58,6 +58,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }];
         bodies.push(second);
     }
+    bodies.push(fixture_body()?);
 
     let looks = synthetic_looks(&bodies)?;
     for body in &mut bodies {
@@ -131,6 +132,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let site = SiteData {
+        community_snapshot_version: 0,
         bodies,
         looks,
         audit_log: AuditLog::new(audit),
@@ -235,6 +237,26 @@ fn source_body() -> Result<BodyPage, Box<dyn Error>> {
                 text: "Brightness stays the same across firmware versions; Color Chrome Blue changes the shadows.".to_owned(),
             },
         ],
+    };
+    Ok(BodyPage::from_schema(&body, &schema, &extras)?)
+}
+
+fn fixture_body() -> Result<BodyPage, Box<dyn Error>> {
+    let entity = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml")
+        .replace("id: fujifilm/x-t5", "id: fujifilm/x-s10")
+        .replace("model: X-T5", "model: X-S10")
+        .replace("exif_aliases: [X-T5]", "exif_aliases: [X-S10]");
+    let controls = include_str!("../../../data/bodies/fujifilm-x-t5.yaml")
+        .replace("body: fujifilm/x-t5", "body: fujifilm/x-s10");
+    let body = validate_body(&entity).map_err(|errors| format!("fixture body: {errors:?}"))?;
+    let schema = validate_control_schema(&controls)
+        .map_err(|errors| format!("fixture schema: {errors:?}"))?;
+    let extras = BodyExtras {
+        input_transform: None,
+        realization_notes: vec![RealizationNote {
+            epoch: None,
+            text: "Sample data for the committed X-S10 RAW fixture. Camera entity and menu mappings are copied from the X-T5.".to_owned(),
+        }],
     };
     Ok(BodyPage::from_schema(&body, &schema, &extras)?)
 }

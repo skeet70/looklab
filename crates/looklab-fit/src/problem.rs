@@ -318,12 +318,13 @@ impl Problem {
             })
             .count()
             .max(1);
-        let layout = Layout::with_response(
+        let mut layout = Layout::with_response(
             entries.len(),
             mode_list.len(),
             contributors.len(),
             parameter_ids.len(),
         );
+        layout.identity_scale = options.identity_scale;
         let settings = images.iter().map(|image| image.settings.clone()).collect();
         let defaults = model.map_or_else(Vec::new, |model| {
             model

@@ -180,7 +180,7 @@ The total objective is:
 3. Add G, R, Λ.
 4. Fit the residual on the residuals, then do a short joint refinement.
 
-**Regularization:** choose each λ **within its own stage** by generalized cross-validation (GCV) on that stage's linearized problem, using a 1-D search over ~8 log-spaced values. K-fold CV over images is a periodic quality check on a per-image subsample, not part of every fit. Store the chosen λ in the Look file.
+**Regularization:** choose each λ **within its own stage** by generalized cross-validation (GCV) on that stage's linearized problem, using a 1-D search over ~8 log-spaced values. K-fold CV over images is a periodic quality check on a per-image subsample, not part of every fit. Store the chosen λ in the Look file. The response block's λ carries a floor of 1.0: the frozen response pass at a floor of 100 over-smoothed `D` and raised held-out re-render error from 1.15 to 2.21 ΔE on the controlled fixture.
 
 **Identity prior:** shrinkage toward the identity Look is a fixed Gaussian prior on each layer, not a smoothness term: energy `0.5·θ²/sd²`, curvature `1/sd²`. SDs are tone 1 J′ per stop, tint 2 J′a′b′, `log G` 0.3, hue rotation 15°, lightness 8 J′, residual 0.5 ΔE. These weights do not weaken as the pool grows. Their curvature enters `H`, the covariance floor and the prior-bias test (§5).
 
@@ -264,7 +264,7 @@ Each probe carries both the **pre-clip** J′a′b′ the Look defines and the *
 
 **Small clusters:** for the sandwich path the meat is scaled by `G/(G−1)` and `σ_ΔE` by `t_{0.95,G−1}/z_{0.95}`, where `G` is the number of active image clusters in the fit (Cameron & Miller 2015, *J. Hum. Resour.* 50(2), eq. 10-11; MacKinnon & White 1985). Published versions use the bootstrap when available.
 
-**Convergence:** the final refinement stage runs to objective and step tolerances, up to `max_sweeps`, and reports nonconvergence when the sample budget is exhausted. On the Velvia-like noise-free fixture the all-probe bias converges to 0.20 ΔE at `n_eff` 500 and 0.28 at `n_eff` 5000; the earlier flat 0.9–1.5 ΔE bias was truncated optimization, not a model floor. The residual sits on probes with data (0.22 ΔE) more than in empty density bins (0.13 ΔE), and the post-clip covariance with the clip-`k` column covers it (2σ coverage 0.95 or better). The worker records the outcome as `ReleaseRecord.converged` and as a `converged` check in the version's gate summary. A fit that exhausts the budget still publishes, flagged.
+**Convergence:** the final refinement stage stops when the objective changes by less than `1e-3` relative over the last five improving sweeps, or at `max_sweeps`; budget exhaustion and the sweep cap report nonconvergence. Warm-up stages use `early_samples_per_image` (default 64), while the final stage, frozen response pass and uncertainty pass use the full set. On the Velvia-like noise-free fixture the all-probe bias converges to 0.20 ΔE at `n_eff` 500 and 0.28 at `n_eff` 5000; the earlier flat 0.9–1.5 ΔE bias was truncated optimization, not a model floor. The residual sits on probes with data (0.22 ΔE) more than in empty density bins (0.13 ΔE), and the post-clip covariance with the clip-`k` column covers it (2σ coverage 0.95 or better). The worker records the outcome as `ReleaseRecord.converged` and as a `converged` check in the version's gate summary. A fit that exhausts its budget returns a `FitState`, is resumed on the next batch, and does not publish until the final stage converges.
 
 ## 6. Probe set (v1)
 

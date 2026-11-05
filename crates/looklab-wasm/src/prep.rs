@@ -10,11 +10,20 @@ use looklab_prep_module::{
     PriorTransformSpec, Response, SolvePowRequest, SolvePowResponse,
 };
 use looklab_upload::{
-    BlobKind, BodyId, CardDeclaration, Challenge, ContributionKind, ControlEntry, ControlSettings,
-    Intent, Limits, LookSlug, ManifestHash, Nonce, SimKey, StepIndex,
+    BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion, ContributionKind,
+    ControlEntry, ControlKey, ControlSettings, Intent, Limits, LookSlug, ManifestHash, Nonce,
+    SettingSource, SimKey, StepIndex,
 };
 
 use crate::error::FacadeError;
+
+/// One control in a batch's settings, in any order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlSetting {
+    pub key: String,
+    pub step: i64,
+    pub source: SettingSource,
+}
 
 /// Whole-group settings shared by every image of one batch.
 #[derive(Clone, Debug, PartialEq)]
@@ -24,8 +33,8 @@ pub struct GroupSettings {
     pub body: String,
     pub firmware: String,
     pub sim: String,
-    /// `(control key, step index)`, any order.
-    pub controls: Vec<(String, i64)>,
+    pub community_snapshot_version: u64,
+    pub controls: Vec<ControlSetting>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,12 +149,13 @@ pub fn build_manifest_request(
     let entries = settings
         .controls
         .iter()
-        .map(|(key, step)| {
-            Ok(ControlEntry {
-                key: looklab_schema::ControlKey::new(key)
+        .map(|control| {
+            Ok(ControlEntry::new(
+                ControlKey::new(&control.key)
                     .map_err(|error| FacadeError::Id(error.to_string()))?,
-                step: StepIndex::new(*step),
-            })
+                StepIndex::new(control.step),
+                control.source,
+            ))
         })
         .collect::<Result<Vec<_>, FacadeError>>()?;
     let request = BuildManifestRequest {
@@ -155,6 +165,9 @@ pub fn build_manifest_request(
         firmware: looklab_upload::FirmwareVersionString::new(&settings.firmware)
             .map_err(|error| FacadeError::Id(error.to_string()))?,
         sim: SimKey::new(&settings.sim).map_err(|error| FacadeError::Id(error.to_string()))?,
+        community_snapshot_version: CommunitySnapshotVersion::new(
+            settings.community_snapshot_version,
+        ),
         settings: ControlSettings::new(entries)?,
         images: images
             .iter()

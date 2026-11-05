@@ -5,12 +5,39 @@ use core::fmt;
 use core::str::FromStr;
 
 use serde::Deserialize;
+use serde::Serialize;
 use serde::de::value::SeqAccessDeserializer;
 use serde::de::{self, Visitor};
 
 use crate::ids::{ControlKey, EnumValue};
 use crate::makernote::ControlMakernote;
 use crate::rational::Rational;
+
+/// How a control's value reached a batch's settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingSource {
+    /// Decoded from the file's makernote through the control's schema mapping.
+    Reproduced,
+    /// Entered by the contributor because the snapshot maps no tag for the
+    /// control, or the file's tag was unreadable.
+    Declared,
+}
+
+impl SettingSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reproduced => "reproduced",
+            Self::Declared => "declared",
+        }
+    }
+}
+
+impl fmt::Display for SettingSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]

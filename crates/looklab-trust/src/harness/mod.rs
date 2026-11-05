@@ -6,8 +6,8 @@ mod population;
 mod release;
 
 pub use population::{
-    SampleAxes, artifact_hash, axes, capture_tuple, evidence_grid, hue_band_look, region_coverage,
-    render,
+    SampleAxes, artifact_hash, axes, capture_tuple, evidence_grid, hue_band_look, raised_g_look,
+    region_coverage, render,
 };
 pub use release::{
     Batch, CaptureSpec, HarnessParams, ModerationCause, ModerationItem, ProbeShift, ReleaseOutcome,

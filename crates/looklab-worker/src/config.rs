@@ -18,6 +18,10 @@ pub struct WorkerConfig {
     pub nightly_interval: i64,
     pub poll_seconds: u64,
     pub max_samples_per_image: usize,
+    /// Consecutive non-converged batches before a Look opens a moderation item.
+    pub max_consecutive_nonconverged: u32,
+    /// Sample-evaluation budget override; `None` keeps the fit's default.
+    pub sweep_budget: Option<f64>,
 }
 
 impl WorkerConfig {
@@ -34,6 +38,8 @@ impl WorkerConfig {
             nightly_interval: 86_400,
             poll_seconds: 5,
             max_samples_per_image: 10_000,
+            max_consecutive_nonconverged: 3,
+            sweep_budget: None,
         }
     }
 }

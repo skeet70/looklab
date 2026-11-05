@@ -12,6 +12,33 @@ fn looklab() -> Command {
     Command::cargo_bin("looklab").expect("built binary")
 }
 
+/// A 17^3 grid is too coarse to represent a fitted Look within 1.0 ΔE p95.
+const COARSE_PROFILE: &str = "\
+id: example-app/lut3d-coarse
+name: \"Coarse 3D LUT module\"
+version: 1
+bodies: [vendor/model-a]
+insertion:
+  point: camera_rgb_wb_linear
+  encoding:
+    transfer: log2_shaper
+    shaper: { min_ev: -12, max_ev: 6, mid_gray: 0.18 }
+    primaries: camera_native
+    range: [0.0, 1.0]
+  illuminant_handling: single
+accepts:
+  - type: lut3d
+    sizes: [17]
+    interpolation: tetrahedral
+    precision: f16
+    with_shaper: true
+downstream:
+  - output_transform: { primaries: srgb, transfer: srgb }
+  - gamut_clip: hard
+formats: [cube]
+limits: { max_bytes: 8388608 }
+";
+
 fn ok(mut command: Command) -> (String, String) {
     let output = command.output().expect("run");
     let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
@@ -114,42 +141,60 @@ fn synthetic_flow_fits_reports_compares_exports_and_validates() {
 
     let profile = workspace().join("data/interfaces/example-app-lut3d-v1.yaml");
     let cube = temp.path().join("look-a.cube");
-    let export = |force: bool| {
+    let export = |profile: &Path, out: &Path, force: bool| {
         let mut command = looklab();
         command
             .args(["export"])
             .arg(&look_a)
             .arg("--profile")
-            .arg(&profile)
+            .arg(profile)
             .arg("--body-transform")
             .arg(a.join("transform.yaml"))
             .args(["--format", "cube", "--out"])
-            .arg(&cube);
+            .arg(out);
         if force {
             command.arg("--force");
         }
         command.output().expect("run export")
     };
-    let forced_refusal = export(false);
-    let first_stdout = String::from_utf8_lossy(&forced_refusal.stdout);
-    assert!(first_stdout.contains("median"), "{first_stdout}");
-    assert!(first_stdout.contains("flagged: yes"), "{first_stdout}");
+    let clean = export(&profile, &cube, false);
+    let clean_stdout = String::from_utf8_lossy(&clean.stdout);
+    assert!(clean_stdout.contains("median"), "{clean_stdout}");
+    assert!(clean_stdout.contains("flagged: no"), "{clean_stdout}");
     assert!(
-        !forced_refusal.status.success(),
-        "a flagged export wrote {} anyway",
-        cube.display()
+        clean.status.success(),
+        "an unflagged export failed: {}",
+        String::from_utf8_lossy(&clean.stderr)
     );
-    let stderr = String::from_utf8_lossy(&forced_refusal.stderr);
-    assert!(stderr.contains("flagged"), "{stderr}");
-    assert!(!cube.exists(), "a flagged export wrote {}", cube.display());
+    assert!(cube.exists(), "an unflagged export wrote no cube");
 
-    let forced = export(true);
+    // A 17^3 grid cannot represent this Look, so the export is flagged.
+    let coarse = temp.path().join("coarse.yaml");
+    std::fs::write(&coarse, COARSE_PROFILE).expect("coarse profile");
+    let coarse_cube = temp.path().join("look-a-coarse.cube");
+    let refused = export(&coarse, &coarse_cube, false);
+    let refused_stdout = String::from_utf8_lossy(&refused.stdout);
+    assert!(refused_stdout.contains("flagged: yes"), "{refused_stdout}");
+    assert!(
+        !refused.status.success(),
+        "a flagged export wrote {} anyway",
+        coarse_cube.display()
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("flagged"), "{stderr}");
+    assert!(
+        !coarse_cube.exists(),
+        "a flagged export wrote {}",
+        coarse_cube.display()
+    );
+
+    let forced = export(&coarse, &coarse_cube, true);
     assert!(
         forced.status.success(),
         "forced export failed: {}",
         String::from_utf8_lossy(&forced.stderr)
     );
-    let text = std::fs::read_to_string(&cube).expect("cube");
+    let text = std::fs::read_to_string(&coarse_cube).expect("cube");
     assert!(text.contains("LUT_3D_SIZE"));
     assert!(text.contains("TITLE"));
 

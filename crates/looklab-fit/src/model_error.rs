@@ -267,6 +267,7 @@ pub fn apply_model_error(
             crate::predict::post_clip(look, probes_v1.probes[index].xyz, space, clip_k);
         probe.pre_clip_reliable =
             crate::predict::clip_derivative_min(prediction, space, clip_k) >= 0.25;
+        probe.gamut_edge = probes_v1.probes[index].id.as_str().split('-').nth(2) == Some("80");
         let previous_sigma = previous
             .and_then(|state| state.sigma.get(index).copied())
             .unwrap_or(false);
@@ -349,6 +350,7 @@ mod review_tests {
                 post_sigma_de: 0.0,
                 bias_de: 0.0,
                 pre_clip_reliable: true,
+                gamut_edge: false,
                 density: 1.0,
                 supported_sigma: false,
                 supported_density: false,

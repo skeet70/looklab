@@ -24,6 +24,39 @@ use crate::request_digest::{RequestDomain, challenge, request_digest};
 use crate::webauthn::{self, PowParameters, SignedFields};
 use crate::worker;
 
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export function looklabNow() { return performance.now(); }
+export function looklabMeasure(name, start) { performance.measure(name, {start, end: performance.now()}); }
+"#)]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = looklabNow)]
+    fn performance_now() -> f64;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = looklabMeasure)]
+    fn performance_measure(name: &str, start: f64);
+}
+
+pub(crate) enum PreviewStage {
+    SceneDecode,
+    ScenePrepare,
+    SceneReceive,
+    LutApply,
+    CanvasPaint,
+}
+
+pub(crate) fn timed<T>(stage: PreviewStage, operation: impl FnOnce() -> T) -> T {
+    let start = performance_now();
+    let result = operation();
+    let name = match stage {
+        PreviewStage::SceneDecode => "looklab.scene.decode",
+        PreviewStage::ScenePrepare => "looklab.scene.prepare",
+        PreviewStage::SceneReceive => "looklab.scene.receive",
+        PreviewStage::LutApply => "looklab.lut.apply",
+        PreviewStage::CanvasPaint => "looklab.canvas.paint",
+    };
+    performance_measure(name, start);
+    result
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Load<T> {
     Loading,
@@ -38,6 +71,11 @@ impl<T> Load<T> {
             _ => None,
         }
     }
+}
+
+thread_local! {
+    static SITE_INDEX: std::cell::OnceCell<SiteIndex> = const { std::cell::OnceCell::new() };
+    static PREPARED_SCENES: std::cell::RefCell<std::collections::VecDeque<(SceneName, bool, PreparedScene)>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
 async fn get(path: &str) -> Result<Vec<u8>, String> {
@@ -61,6 +99,9 @@ async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
 
 /// The site index, verified against the digest embedded in this build.
 pub async fn index() -> Result<SiteIndex, String> {
+    if let Some(index) = SITE_INDEX.with(|cache| cache.get().cloned()) {
+        return Ok(index);
+    }
     let bytes = get(&site_url("/data/index.json")).await?;
     let expected = crate::site_root();
     if expected.is_empty() {
@@ -72,7 +113,12 @@ pub async fn index() -> Result<SiteIndex, String> {
             "site index does not match the embedded root: expected {expected}, got {actual}"
         ));
     }
-    serde_json::from_slice(&bytes).map_err(|error| format!("/data/index.json: {error}"))
+    let index: SiteIndex =
+        serde_json::from_slice(&bytes).map_err(|error| format!("/data/index.json: {error}"))?;
+    SITE_INDEX.with(|cache| {
+        let _ = cache.set(index.clone());
+    });
+    Ok(index)
 }
 
 pub async fn body(make: &str, model: &str) -> Result<BodyPage, String> {
@@ -120,7 +166,35 @@ pub async fn scene_thumbnail(name: &str) -> Result<PreparedScene, String> {
     load_scene(name, true).await
 }
 
+fn reference_scene(png: &[u8]) -> Result<PreparedScene, JsValue> {
+    let name =
+        SceneName::new("scene-reference").map_err(|error| JsValue::from_str(&error.to_string()))?;
+    Scene::from_png(name, png)
+        .map(PreparedScene::new)
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn looklab_prepare_scene_reference(png: &[u8]) -> Result<Vec<u8>, JsValue> {
+    reference_scene(png).map(|scene| scene.to_bytes())
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn looklab_render_scene_reference(png: &[u8], lut: &[u8]) -> Result<Vec<u8>, JsValue> {
+    looklab_publish::render_preview(lut, &reference_scene(png)?)
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
 async fn load_scene(name: &str, thumbnail: bool) -> Result<PreparedScene, String> {
+    if let Some(scene) = PREPARED_SCENES.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(key, small, _)| key.as_str() == name && *small == thumbnail)
+            .map(|(_, _, scene)| scene.clone())
+    }) {
+        return Ok(scene);
+    }
     let index = index().await?;
     let summary = index
         .scenes
@@ -147,20 +221,37 @@ async fn load_scene(name: &str, thumbnail: bool) -> Result<PreparedScene, String
             hash
         ));
     }
-    let mut scene = Scene::from_png(
-        SceneName::new(name).map_err(|error| error.to_string())?,
-        &bytes,
-    )
-    .map_err(|error| error.to_string())?;
-    if scene.width != width || scene.height != height {
+    let scene_name = SceneName::new(name).map_err(|error| error.to_string())?;
+    let mut prepared = if thumbnail {
+        let scene = timed(PreviewStage::SceneDecode, || {
+            Scene::from_png(scene_name, &bytes)
+        })
+        .map_err(|error| error.to_string())?;
+        timed(PreviewStage::ScenePrepare, || PreparedScene::new(scene))
+    } else {
+        worker::prepare_scene(scene_name, &bytes).await?
+    };
+    if prepared.width() != width || prepared.height() != height {
         return Err(format!(
             "scene `{name}` dimensions do not match the site index"
         ));
     }
-    scene.kind = summary.kind;
-    scene.title = summary.title.clone();
-    scene.credit = summary.credit.clone();
-    Ok(PreparedScene::new(scene))
+    prepared.scene.kind = summary.kind;
+    prepared.scene.title = summary.title.clone();
+    prepared.scene.credit = summary.credit.clone();
+    PREPARED_SCENES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.push_back((prepared.scene.name.clone(), thumbnail, prepared.clone()));
+        while cache
+            .iter()
+            .map(|(_, _, scene)| scene.pixels())
+            .sum::<usize>()
+            > 2_000_000
+        {
+            cache.pop_front();
+        }
+    });
+    Ok(prepared)
 }
 
 pub fn artifact<'a>(version: &'a LoadedVersion, name: &str) -> Option<&'a [u8]> {
@@ -264,6 +355,24 @@ pub async fn card(slug: &str, version: &str) -> Result<Vec<u8>, String> {
 }
 
 pub async fn version(slug: &str, version: &str) -> Result<LoadedVersion, String> {
+    load_version(slug, version, VersionPurpose::Browse).await
+}
+
+pub async fn match_version(slug: &str, version: &str) -> Result<LoadedVersion, String> {
+    load_version(slug, version, VersionPurpose::Match).await
+}
+
+#[derive(Clone, Copy)]
+enum VersionPurpose {
+    Browse,
+    Match,
+}
+
+async fn load_version(
+    slug: &str,
+    version: &str,
+    purpose: VersionPurpose,
+) -> Result<LoadedVersion, String> {
     let index = index().await?;
     let summary = version_summary(&index, slug, version)?;
     let manifest = verified_manifest(slug, version, summary).await?;
@@ -277,6 +386,14 @@ pub async fn version(slug: &str, version: &str) -> Result<LoadedVersion, String>
     let mut lut = None;
     let mut artifacts = Vec::with_capacity(manifest.artifacts.len());
     for entry in &manifest.artifacts {
+        if matches!(purpose, VersionPurpose::Browse)
+            && !matches!(
+                LookArtifact::of(&entry.name),
+                LookArtifact::Document | LookArtifact::PreviewLut
+            )
+        {
+            continue;
+        }
         let bytes = get(&site_url(&format!(
             "/data/looks/{slug}/{version}/{}",
             entry.name.as_str()
@@ -360,9 +477,20 @@ pub struct ReviewQueue {
     #[serde(default)]
     pub failed_gates: Vec<FailedGate>,
     #[serde(default)]
+    pub fit_holds: Vec<FitHold>,
+    #[serde(default)]
     pub serial_reuse: Vec<SerialReuseFlag>,
     #[serde(default)]
     pub nominations: Vec<EndorsementNomination>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct FitHold {
+    pub look: looklab_upload::LookSlug,
+    pub consecutive: u32,
+    pub first_attempt: i64,
+    pub last_attempt: i64,
+    pub diagnostics: serde_json::Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]

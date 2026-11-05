@@ -174,6 +174,7 @@ async fn site_data(pool: &SqlitePool, config: &PublishConfig) -> Result<SiteData
         .collect::<Result<Vec<_>>>()?;
 
     Ok(SiteData {
+        community_snapshot_version: 0,
         bodies,
         looks,
         audit_log: audit_log(pool).await?,

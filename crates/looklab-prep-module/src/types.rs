@@ -3,8 +3,9 @@
 use looklab_color::linalg::Mat3;
 use looklab_prep::PrepParams;
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, Challenge, ContributionKind, ControlSettings,
-    FirmwareVersionString, Intent, Limits, ManifestHash, ManifestMetadata, Nonce, POW_K, SimKey,
+    BatchManifest, BlobKind, BodyId, Challenge, CommunitySnapshotVersion, ContributionKind,
+    ControlSettings, FirmwareVersionString, Intent, Limits, ManifestHash, ManifestMetadata, Nonce,
+    POW_K, SimKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,7 @@ pub struct BuildManifestRequest {
     pub body: BodyId,
     pub firmware: FirmwareVersionString,
     pub sim: SimKey,
+    pub community_snapshot_version: CommunitySnapshotVersion,
     pub settings: ControlSettings,
     pub images: Vec<ManifestImageInput>,
     pub nonce: Nonce,

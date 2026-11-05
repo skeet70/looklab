@@ -288,6 +288,7 @@ pub fn published_uncertainty(
             bias_de,
             pre_clip_reliable: crate::predict::clip_derivative_min(prediction, space, clip_k)
                 >= 0.25,
+            gamut_edge: probe.id.as_str().split('-').nth(2) == Some("80"),
             density: local_density,
             supported_sigma: flags.sigma,
             supported_density: flags.density,

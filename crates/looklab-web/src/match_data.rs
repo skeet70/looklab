@@ -62,7 +62,7 @@ pub fn inputs_for_camera(
 }
 
 pub async fn inputs_from_permalink(permalink: &Permalink) -> Result<MatchInputs, String> {
-    let target = data::version(
+    let target = data::match_version(
         permalink.target_slug.as_str(),
         permalink.target_version.as_str(),
     )
@@ -75,7 +75,7 @@ pub async fn inputs_from_permalink(permalink: &Permalink) -> Result<MatchInputs,
     {
         target.clone()
     } else {
-        data::version(
+        data::match_version(
             permalink.base_slug.as_str(),
             permalink.base_version.as_str(),
         )

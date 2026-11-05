@@ -9,6 +9,7 @@ use looklab_fit::{ComponentGauge, ExposureModeId, WbGaugeChange, WbModeClass, me
 use looklab_model::{LookInput, ProbeId, probes};
 use looklab_trust::harness::{
     Batch, CaptureSpec, HarnessParams, ModerationCause, ProbeShift, Sim, hue_band_look,
+    raised_g_look,
 };
 use looklab_trust::{
     CapReason, CredentialId, GateInput, GateReference, GatedUnion, ImageRef, LookWeightReport,
@@ -222,7 +223,6 @@ fn honest_releases_penalize_no_honest_image() {
 }
 
 #[test]
-#[ignore = "blocked: the honest release is held; hue-045-80-s+03 moves 2.023 past C = 2.0"]
 fn many_new_tier_credentials_shifting_one_hue_band() {
     let mut sim = rooted(12, 2);
     let anchor = sim.release().expect("anchor release");
@@ -277,7 +277,6 @@ fn many_new_tier_credentials_shifting_one_hue_band() {
 }
 
 #[test]
-#[ignore = "blocked: 2 of 10 releases published; the first loses support at σ 4.08-10.69 against anchor σ 0.49-0.52"]
 fn slow_drift_across_ten_releases_stays_inside_the_anchor_bound() {
     let mut sim = rooted(13, 2);
     let anchor = sim.release().expect("anchor release");
@@ -331,7 +330,6 @@ fn slow_drift_across_ten_releases_stays_inside_the_anchor_bound() {
 }
 
 #[test]
-#[ignore = "blocked: 3 of 10 releases pass; hue-285-80-s+03 rises to σ 1.968 against anchor σ 0.635"]
 fn honest_data_after_a_thin_rooted_version_needs_no_re_anchor() {
     let mut sim = rooted(14, 1);
     let anchor = sim.release().expect("anchor release");
@@ -498,6 +496,72 @@ fn conflicting_uploads_that_make_a_region_unsupported_fail_the_gate() {
             .iter()
             .any(|item| item.cause == ModerationCause::SupportedRegionLost),
         "no moderation item for the lost region"
+    );
+}
+
+/// Identification comes from the reference version (docs/05 §8).
+#[test]
+fn a_candidate_cannot_hide_an_identified_region_in_the_clip_shoulder() {
+    let mut sim = rooted(23, 2);
+    let anchor = sim.release().expect("anchor release");
+    assert!(anchor.published, "{:?}", anchor.gate.violations);
+    let previous = anchor.version;
+
+    let truth = sim.truth().clone();
+    let attack = raised_g_look(&truth, 1.0);
+    for index in 0..32u32 {
+        let batch = Batch {
+            images: 1,
+            seed: 30_000 + index as u64,
+            samples: 300,
+            noise_ucs: HONEST_NOISE,
+            ..Batch::new(&attack, ContributionKind::Rerender)
+        };
+        sim.add(credential(9000 + index), batch)
+            .expect("shoulder image");
+    }
+    let outcome = sim.release().expect("release");
+    let candidate = sim.version(outcome.version).expect("candidate version");
+    let reference = sim.version(previous).expect("previous version");
+    let identified = reference
+        .probes
+        .iter()
+        .filter(|probe| probe.pre_clip_identified)
+        .count();
+    let max_shift = candidate
+        .probes
+        .iter()
+        .zip(&reference.probes)
+        .map(|(candidate, reference)| (candidate.pre_clip[0] - reference.pre_clip[0]).abs())
+        .fold(0.0, f64::max);
+    let hidden: Vec<String> = candidate
+        .probes
+        .iter()
+        .zip(&reference.probes)
+        .filter(|(candidate, reference)| {
+            !candidate.pre_clip_identified && reference.pre_clip_identified
+        })
+        .map(|(candidate, reference)| {
+            format!(
+                "{:?} {:.3} J'",
+                reference.id,
+                (candidate.pre_clip[0] - reference.pre_clip[0]).abs()
+            )
+        })
+        .collect();
+    assert!(
+        !outcome.published,
+        "a shoulder-pushing candidate published: {:?}",
+        outcome.gate.violations
+    );
+    assert!(
+        !hidden.is_empty(),
+        "the candidate pushed no reference-identified probe into the shoulder; {identified} identified, max pre-clip shift {max_shift:.3}, violations {:?}",
+        outcome.gate.drift_previous.pre_clip_over_ceiling
+    );
+    assert!(
+        !outcome.gate.drift_previous.pre_clip_over_ceiling.is_empty(),
+        "no pre-clip ceiling violation with {identified} identified probes and max shift {max_shift:.3}"
     );
 }
 
@@ -786,9 +850,9 @@ fn reverting_and_excluding_restores_the_pre_attack_version() {
     let pre_attack = base.version;
 
     let truth = sim.truth().clone();
-    let attack = hue_band_look(&truth, 0, &[3], 3.0);
+    let attack = hue_band_look(&truth, 0, &[3], 1.0);
     let attacker = credential(950);
-    for index in 0..8 {
+    for index in 0..4 {
         let batch = Batch {
             images: 1,
             seed: 24_000 + index as u64,

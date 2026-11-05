@@ -70,9 +70,21 @@ fn HomeChoices(index: SiteIndex, scene: Arc<PreparedScene>) -> impl IntoView {
     });
     let hero_scene = RwSignal::new(scene.clone());
     let hero_name = scene.scene.name.to_string();
+    let upgrade_started = StoredValue::new(false);
+    let gallery_ready = RwSignal::new(false);
     Effect::new(move |_| {
+        if preview.with(|state| matches!(state, Load::Failed(_))) {
+            gallery_ready.set(true);
+            return;
+        }
+        if !preview.with(|state| matches!(state, Load::Ready(_))) || upgrade_started.get_value() {
+            return;
+        }
+        upgrade_started.set_value(true);
         let name = hero_name.clone();
         wasm_bindgen_futures::spawn_local(async move {
+            ui::paint_browser().await;
+            gallery_ready.set(true);
             if let Ok(photo) = data::scene(&name).await {
                 hero_scene.set(Arc::new(photo));
             }
@@ -115,9 +127,11 @@ fn HomeChoices(index: SiteIndex, scene: Arc<PreparedScene>) -> impl IntoView {
                 <a href=crate::base::site_url("/looks")>"Explore all looks →"</a>
             </div>
             <div class="look-gallery">
-                {items.into_iter().map(|item| view! {
-                    <super::looks::CharacterCard item scene=scene.clone()/>
-                }).collect_view()}
+                <Show when=move || gallery_ready.get()>
+                    {items.clone().into_iter().map(|item| view! {
+                        <super::looks::CharacterCard item scene=scene.clone()/>
+                    }).collect_view()}
+                </Show>
             </div>
         </section>
     }

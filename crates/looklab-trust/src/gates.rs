@@ -618,7 +618,7 @@ fn drift_gate(
             over_ceiling.push(GatedProbe {
                 probe: probe_id.clone(),
                 shift,
-                bound,
+                bound: ceiling,
             });
         } else if bounded {
             ratios.push(shift / bound);
@@ -631,7 +631,7 @@ fn drift_gate(
             }
         }
 
-        if !(candidate_probe.pre_clip_identified && reference_probe.pre_clip_identified) {
+        if !reference_probe.pre_clip_identified {
             continue;
         }
         let pre_clip_lightness = (candidate_probe.pre_clip[0] - reference_probe.pre_clip[0]).abs();
@@ -709,7 +709,7 @@ fn collect_drift_violations(report: &DriftGateReport, violations: &mut Vec<Viola
                 reference: report.reference,
                 probe: gated.probe.clone(),
                 shift: gated.shift,
-                ceiling: report.ceiling,
+                ceiling: gated.bound,
             }),
     );
     violations.extend(report.over_bound.iter().map(|gated| Violation::OverBound {

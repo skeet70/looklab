@@ -8,6 +8,20 @@ use looklab_publish::{GateCheck, LookStatus};
 pub mod components;
 pub use components::*;
 
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export function looklabPaint() {
+    return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = looklabPaint)]
+    fn paint_frame() -> js_sys::Promise;
+}
+
+pub(crate) async fn paint_browser() {
+    let _ = wasm_bindgen_futures::JsFuture::from(paint_frame()).await;
+}
+
 pub fn camera_kind_label(kind: looklab_publish::BodyKind) -> &'static str {
     match kind {
         looklab_publish::BodyKind::Camera => "Camera",

@@ -19,6 +19,7 @@ looklab-samples.workspace = true
 looklab-model.workspace = true
 looklab-schema.workspace = true
 libm.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 rand_chacha = { workspace = true, optional = true }
 

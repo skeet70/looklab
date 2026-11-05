@@ -179,6 +179,9 @@ pub struct BodySummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SiteIndex {
     pub format: String,
+    /// The community data snapshot the site was built from.
+    #[serde(default)]
+    pub community_snapshot_version: u64,
     pub bodies: Vec<BodySummary>,
     pub looks: Vec<LookSummary>,
     pub scenes: Vec<SceneSummary>,
@@ -186,6 +189,8 @@ pub struct SiteIndex {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SiteData {
+    /// The community data snapshot the site is built from.
+    pub community_snapshot_version: u64,
     pub bodies: Vec<BodyPage>,
     pub looks: Vec<LookPage>,
     pub audit_log: AuditLog,
@@ -420,6 +425,7 @@ fn site_index(site: &SiteData, scenes: Vec<SceneSummary>) -> Result<SiteIndex, P
         .collect::<Result<Vec<_>, PublishError>>()?;
     Ok(SiteIndex {
         format: SITE_FORMAT.to_owned(),
+        community_snapshot_version: site.community_snapshot_version,
         bodies,
         looks,
         scenes,
@@ -560,6 +566,7 @@ mod tests {
     #[test]
     fn writer_emits_every_indexed_file() {
         let site = SiteData {
+            community_snapshot_version: 0,
             bodies: vec![body()],
             looks: vec![look()],
             audit_log: AuditLog::default(),
@@ -585,6 +592,7 @@ mod tests {
     #[test]
     fn index_links_the_manifest_and_the_body_gets_the_latest_version() {
         let site = SiteData {
+            community_snapshot_version: 3,
             bodies: vec![body()],
             looks: vec![look()],
             audit_log: AuditLog::default(),
@@ -594,6 +602,7 @@ mod tests {
         write_site(&mut sink, &site).expect("write");
         let index: SiteIndex =
             serde_json::from_slice(&sink.0["data/index.json"]).expect("index json");
+        assert_eq!(index.community_snapshot_version, 3);
         assert_eq!(
             index.looks[0].versions[0].manifest.as_str(),
             "data/looks/provia/1.0.0/manifest.json"
@@ -613,6 +622,7 @@ mod tests {
     #[test]
     fn writer_rejects_duplicate_looks() {
         let site = SiteData {
+            community_snapshot_version: 0,
             bodies: Vec::new(),
             looks: vec![look(), look()],
             audit_log: AuditLog::default(),

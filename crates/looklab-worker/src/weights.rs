@@ -387,6 +387,7 @@ fn base_image(
             .unwrap_or_default(),
     );
     fit.settings = image.settings.clone();
+    fit.setting_source = image.setting_source.clone();
     fit
 }
 

@@ -235,6 +235,26 @@ pub fn sim_from_makernote(epoch: &Epoch, values: &MakernoteValues) -> Result<Sim
     }
 }
 
+/// The look-affecting controls of `epoch` that a makernote can supply.
+pub fn mapped_controls(epoch: &Epoch) -> Vec<ControlKey> {
+    epoch
+        .controls
+        .iter()
+        .filter(|control| control.look_affecting && control.makernote.is_some())
+        .map(|control| control.key.clone())
+        .collect()
+}
+
+/// The look-affecting controls of `epoch` with no makernote mapping.
+pub fn unmapped_controls(epoch: &Epoch) -> Vec<ControlKey> {
+    epoch
+        .controls
+        .iter()
+        .filter(|control| control.look_affecting && control.makernote.is_none())
+        .map(|control| control.key.clone())
+        .collect()
+}
+
 impl Control {
     /// The step this control takes from the file's tags, with the tag it came
     /// from. `None` when the schema gives the control no mapping.

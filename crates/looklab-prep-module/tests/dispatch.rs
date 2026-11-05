@@ -11,8 +11,9 @@ use looklab_samples::{
     SampleHeader, SampleSet,
 };
 use looklab_upload::{
-    BlobKind, BodyId, Challenge, ContributionKind, ControlSettings, FirmwareVersionString, Intent,
-    Limits, ManifestMetadata, Nonce, POW_K, SimKey, manifest_hash, verify,
+    BlobKind, BodyId, Challenge, CommunitySnapshotVersion, ContributionKind, ControlSettings,
+    FirmwareVersionString, Intent, Limits, ManifestMetadata, Nonce, POW_K, SimKey, manifest_hash,
+    verify,
 };
 
 fn call<T: serde::Serialize, U: serde::de::DeserializeOwned>(
@@ -78,6 +79,7 @@ fn manifest_request(nonce: Nonce, blob: Vec<u8>) -> BuildManifestRequest {
         body: BodyId::new("fujifilm/x-t5").expect("body id is valid"),
         firmware: FirmwareVersionString::new("2.10").expect("firmware is valid"),
         sim: SimKey::new("classic-chrome").expect("sim key is valid"),
+        community_snapshot_version: CommunitySnapshotVersion::SHIPPED,
         settings: ControlSettings::new(Vec::new()).expect("empty settings are valid"),
         images: vec![ManifestImageInput {
             metadata: metadata(),

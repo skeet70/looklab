@@ -55,7 +55,7 @@ Phases are ordered by dependency. Each task has an ID, the docs it implements an
 | ID | Task | Deps | AC |
 |---|---|---|---|
 | P4.1 | Input transform priors: dual-illuminant DNG matrices, database matrices, SSF import; CCT estimation from multipliers; chart anchor term | P1.5 | Prior chart ΔE reported per source; anchoring reduces chart ΔE; CCT within 150 K of reference on fixtures *(tentative)* |
-| P4.2 | Global hierarchical fit: block coordinate descent (bodies ↔ Looks), global gauge from anchored bodies, per-firmware offsets, σ_v; refit cascade with dirty-body batching; provenance versions | P4.1, P2.2 | Synthetic bodies: known Δ_c, ξ, ω recovered within prior σ; Look within 0.5 ΔE median; one body update triggers exactly the dependent Look refits |
+| P4.2 | Global hierarchical fit: block coordinate descent (bodies ↔ Looks), global gauge from anchored bodies, per-firmware offsets, σ_v; refit cascade with dirty-body batching; provenance versions | P4.1, P2.2 | Synthetic bodies: known Δ_c, ξ, ω recovered within prior σ; Look within 0.5 ΔE median; one body update triggers exactly the dependent Look refits; the 1k-image refit converges within the time bound, and a non-converged batch publishes nothing and resumes from its stored state |
 | P4.3 | Uncertainty: bootstrap (B = 32), sandwich, leave-one-body-out; support marking | P4.2 | On held-out bodies, true error inside the 90% band ≥ 85% of the time *(tentative)*; synthetic out-of-gamut targets are marked unsupported |
 | P4.4 | Epoch + look split detection (image-level permutation T²) | P4.2 | Synthetic silent change detected; no false split on same-version data at 10⁶ samples |
 

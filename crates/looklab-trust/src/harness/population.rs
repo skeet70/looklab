@@ -66,6 +66,15 @@ pub fn hue_band_look(truth: &Look, hue: usize, chroma: &[usize], delta: f64) -> 
     look
 }
 
+/// `truth` with a uniform `log G` shift.
+pub fn raised_g_look(truth: &Look, delta: f64) -> Look {
+    let mut look = truth.clone();
+    for value in &mut look.color.g.plane {
+        *value += delta;
+    }
+    look
+}
+
 pub fn artifact_hash(look: &Look) -> ArtifactHash {
     let mut state = [
         0xcbf2_9ce4_8422_2325_u64,

@@ -487,6 +487,33 @@ fn singular_controlled_repro() {
 }
 
 #[test]
+#[ignore = "convergence shapes; run with --ignored --nocapture"]
+fn convergence_shapes() {
+    for (images, samples) in [(2usize, 200usize), (4, 300), (6, 400), (8, 500)] {
+        let data = looklab_fit::synth::dataset(&SynthConfig {
+            seed: 21,
+            images,
+            samples_per_image: samples,
+            ..SynthConfig::default()
+        });
+        let result = fit(
+            &data.images,
+            &FitOptions {
+                seed: 0x5eed_1a5e,
+                ..FitOptions::default()
+            },
+        )
+        .expect("fit");
+        eprintln!(
+            "{images}x{samples}: converged {} evaluations {} cost {:.1}",
+            result.diagnostics.converged,
+            result.diagnostics.evaluations,
+            result.diagnostics.final_cost
+        );
+    }
+}
+
+#[test]
 fn convergence_removes_the_noise_free_bias_floor() {
     let look = injected(0x51e2_0101, 0.47, 4.0, 1.0);
     let config = SynthConfig {
@@ -508,6 +535,68 @@ fn convergence_removes_the_noise_free_bias_floor() {
     // `converged` stays false when the sweep cap or sample budget binds; the
     // regression is the bias floor, not a stationary point on this fixture.
     assert!(bias <= 0.35, "bias {bias}");
+}
+
+#[test]
+#[ignore = "thin coverage diagnostic; run with --ignored --nocapture"]
+fn thin_coverage_diagnostic() {
+    let look = injected(0x51e2_0101, 0.47, 4.0, 1.0);
+    let config = SynthConfig {
+        seed: 0x51e2_0800,
+        images: 20,
+        samples_per_image: 800,
+        noise_ucs: 0.35,
+        ..SynthConfig::default()
+    };
+    let data = dataset_with(&config, &look, &LookSelector::Single(&look));
+    let all: Vec<usize> = (0..probes_v1().probes.len()).collect();
+    let full = fit(&data.images, &options(false)).expect("full fit");
+    let plain = fit(
+        &data.images,
+        &FitOptions {
+            prior_floor: false,
+            ..options(false)
+        },
+    )
+    .expect("plain fit");
+    let mut classes: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for index in &all {
+        let probe = &full.probes.probes[*index];
+        if probe.density < 0.05 {
+            classes[0].push(*index);
+        }
+        if probe.clusters <= 3 {
+            classes[1].push(*index);
+        }
+        if probe.supported_sigma && !probe.supported {
+            classes[2].push(*index);
+        }
+    }
+    let errors = |result: &FitResult| post_errors(result, &look, &data, &all);
+    let full_errors = errors(&full);
+    let plain_errors = errors(&plain);
+    for (name, indices) in [
+        ("low density", &classes[0]),
+        ("<=3 clusters", &classes[1]),
+        ("support boundary", &classes[2]),
+    ] {
+        for (label, result, errors) in [
+            ("full", &full, &full_errors),
+            ("plain", &plain, &plain_errors),
+        ] {
+            let mut inside = 0usize;
+            for index in indices {
+                if errors[*index] <= 2.0 * result.probes.probes[*index].post_sigma_de {
+                    inside += 1;
+                }
+            }
+            eprintln!(
+                "thin {name} {label}: {} probes, coverage {:.3}",
+                indices.len(),
+                inside as f64 / indices.len().max(1) as f64
+            );
+        }
+    }
 }
 
 #[test]
@@ -743,9 +832,11 @@ fn identity_prior_recovery_study() {
             let mut all_errors = post_errors(&after, look, &data, &all);
             let mut fixed_errors = post_errors(&after, look, &data, fixed.as_ref().unwrap_or(&all));
             eprintln!(
-                "{name:<14} n={images:<2} before bias {bias_before:.3} cov {cov_before:.3} unsup {unsup_before:.3} | after supported {bias_after:.3} cov {cov_after:.3} unsup {unsup_after:.3} all {:.3} fixed {:.3} sigma {mean_sigma:.3}",
+                "{name:<14} n={images:<2} before bias {bias_before:.3} cov {cov_before:.3} unsup {unsup_before:.3} | after supported {bias_after:.3} cov {cov_after:.3} unsup {unsup_after:.3} all {:.3} fixed {:.3} sigma {mean_sigma:.3} sweeps {} converged {}",
                 median(&mut all_errors),
                 median(&mut fixed_errors),
+                after.diagnostics.evaluations,
+                after.diagnostics.converged,
             );
             if images >= 5 {
                 worst_after = worst_after.max(bias_after);

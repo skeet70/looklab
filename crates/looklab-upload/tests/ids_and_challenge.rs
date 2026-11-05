@@ -75,10 +75,10 @@ fn firmware_version_is_printable_ascii() {
 }
 
 fn entry(key: &str, step: i64) -> ControlEntry {
-    ControlEntry {
-        key: ControlKey::new(key).expect("fixture key"),
-        step: StepIndex::new(step),
-    }
+    ControlEntry::reproduced(
+        ControlKey::new(key).expect("fixture key"),
+        StepIndex::new(step),
+    )
 }
 
 #[test]
