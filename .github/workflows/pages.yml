@@ -1,6 +1,8 @@
 name: Pages
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -40,8 +42,11 @@ jobs:
         env:
           LOOKLAB_PREVIEW: "1"
         run: nix develop -c trunk build --release --public-url /looklab/
-      - name: SPA deep-link fallback
-        run: cp site/dist/index.html site/dist/404.html
+      - name: SPA deep-link fallback and fixture pattern page
+        run: |
+          cp site/dist/index.html site/dist/404.html
+          mkdir -p site/dist/fixture-pattern
+          cp fixtures/pattern/index.html fixtures/pattern/pattern-portrait.png fixtures/pattern/pattern-landscape.png site/dist/fixture-pattern/
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site/dist
