@@ -21,16 +21,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
-      - name: Enable Pages
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          if nix shell nixpkgs#gh -c gh api "repos/$REPO/pages" > /dev/null 2>&1; then
-            nix shell nixpkgs#gh -c gh api -X PUT "repos/$REPO/pages" -f build_type=workflow
-          else
-            nix shell nixpkgs#gh -c gh api -X POST "repos/$REPO/pages" -f build_type=workflow
-          fi
       - name: Fetch CC0 scene sources
         run: nix develop -c tools/fetch-fixtures.sh
       - name: Public site data and camera match bundles
