@@ -28,7 +28,7 @@ pub use bootstrap::{
 };
 pub use epoch::{
     ImageProjection, PROJECTION_DIM, SampleProjection, SplitDecision, SplitOptions, SplitSample,
-    detect_split, project_images,
+    detect_split, detect_split_with_effect, predicted_effect, project_images,
 };
 pub use gauge::{
     ComponentGauge, ExposureGauge, GaugeChange, WbGaugeChange, WbModeClass, merge_gauges,
@@ -36,7 +36,7 @@ pub use gauge::{
 pub use hierarchical::{
     BodyData, BodyGroup, BodyParameters, FIRMWARE_PARAMETERS, FirmwareId, HierDiagnostics,
     HierImage, HierOptions, HierarchicalFit, LookFamilyId, LookParameters, LookProvenance,
-    firmware_images, firmware_look, fit_hierarchical,
+    firmware_images, firmware_look, firmware_probe_basis, fit_hierarchical,
 };
 pub use looklab_color::{Mat3, RgbSpace, Xyz};
 pub use looklab_model::realization::{

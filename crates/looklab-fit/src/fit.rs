@@ -214,6 +214,205 @@ pub(crate) fn run_with(
     run_inner(images, options, model, excluded, None, true)
 }
 
+/// Result of a conditional Look-only solve.
+#[derive(Clone)]
+pub(crate) struct LookOnlyResult {
+    pub look: looklab_model::Look,
+    pub probes: ProbeUncertainty,
+    pub density: crate::types::Density,
+    pub clip_k: f64,
+    pub evaluations: usize,
+}
+
+/// Optimize only θ_L, with per-image nuisances, clip, scales and control
+/// responses frozen at the body-block values.
+pub(crate) fn run_look_only(
+    images: &[FitImage],
+    options: &FitOptions,
+    initial: Option<&looklab_model::Look>,
+    clip_k: f64,
+    model: Option<&ControlResponseModel>,
+) -> Result<LookOnlyResult> {
+    let problem = Problem::new_with(images, model, options)?;
+    let layout = problem.layout.clone();
+    let mut params = match initial {
+        Some(look) => params_from_look(&problem, look),
+        None => initial_params(&problem),
+    };
+    for index in 0..problem.images.len() {
+        let range = layout.image(index);
+        params.theta[range.start] = problem.images[index].exposure_hint.clamp(-8.0, 8.0);
+        params.theta[range.start + 1] = 0.0;
+        params.theta[range.start + 2] = 0.0;
+    }
+    params.theta[layout.clip] = crate::layout::zeta_from_clip(clip_k);
+    if let Some(model) = model {
+        seed_response_params(&problem, &mut params, model);
+    }
+    let active = ActiveColumns {
+        image: false,
+        mode: false,
+        wb: false,
+        clip: false,
+        response: false,
+    };
+    let mut lambdas = StageLambdas::default();
+    let roles = prior_roles(&problem, &layout);
+    let mut evaluations = 0usize;
+    for stage in &STAGES {
+        let kinds: Vec<BlockKind> = stage
+            .blocks
+            .iter()
+            .copied()
+            .filter(|kind| !is_response_kind(*kind))
+            .filter(|kind| options.fit_residual || *kind != BlockKind::Residual)
+            .collect();
+        let mut blocks: Vec<BlockAcc> = kinds
+            .iter()
+            .map(|kind| make_block(&problem, *kind, active))
+            .collect();
+        let penalties: Vec<Vec<f64>> = blocks
+            .iter()
+            .map(|block| block_penalty(&problem, block))
+            .collect();
+        let mut damping: f64 = 1e-3;
+        let mut previous: Option<(f64, Params)> = None;
+        let mut gcv_done = false;
+        for _ in 0..stage.sweeps.min(options.max_sweeps.max(1)) {
+            for block in &mut blocks {
+                block.reset();
+            }
+            let pass = problem.pass(
+                &params,
+                active,
+                &mut blocks,
+                false,
+                false,
+                stage.neutral,
+                IntentFilter::NativeOnly,
+            );
+            evaluations += 1;
+            let cost =
+                pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
+            if let Some((previous_cost, previous_params)) = &previous
+                && cost > previous_cost * (1.0 + 1e-12)
+            {
+                params = previous_params.clone();
+                damping = (damping * 10.0).min(1e6);
+                if damping >= 1e6 {
+                    break;
+                }
+                continue;
+            }
+            previous = Some((cost, params.clone()));
+            if stage.gcv && !gcv_done && options.run_gcv {
+                choose_lambdas(
+                    &problem,
+                    &params,
+                    &pass,
+                    &blocks,
+                    &penalties,
+                    &mut lambdas,
+                    options,
+                );
+                gcv_done = true;
+                previous = Some((
+                    pass.cost
+                        + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options),
+                    params.clone(),
+                ));
+            }
+            let mut step = vec![0.0_f64; layout.total];
+            for (index, block) in blocks.iter().enumerate() {
+                if block.kind == BlockKind::Residual {
+                    continue;
+                }
+                let (prior_gradient, prior_curvature) =
+                    prior_terms(&problem, &roles, &params, options, block);
+                solve_block(
+                    &layout,
+                    block,
+                    &mut step,
+                    &penalties[index],
+                    &prior_gradient,
+                    &prior_curvature,
+                    &params,
+                    &lambdas,
+                    damping,
+                );
+            }
+            if kinds.contains(&BlockKind::Residual) {
+                let lambda = lam(&lambdas, BlockKind::Residual);
+                let delta = residual_step(
+                    &pass.residual_samples,
+                    &params.theta[layout.residual.clone()],
+                    lambda,
+                    damping,
+                    1.0,
+                );
+                for (index, value) in delta.iter().enumerate() {
+                    step[layout.residual.start + index] = *value;
+                }
+            }
+            apply_step(&mut params, &step);
+            if kinds.contains(&BlockKind::Residual) {
+                pin_residual(&mut params, &layout, &pass.residual_samples);
+            }
+            damping = (damping * 0.3).max(1e-6);
+        }
+    }
+    let look = params.look();
+    let density = density::build(&problem, &params, options.density_floor_fraction);
+    let frozen = ActiveColumns {
+        image: false,
+        mode: false,
+        wb: false,
+        clip: false,
+        response: false,
+    };
+    let mut uncertainty_blocks = vec![
+        make_look_block(&layout, frozen),
+        make_block(&problem, BlockKind::Residual, frozen),
+    ];
+    let uncertainty_pass = problem.pass(
+        &params,
+        frozen,
+        &mut uncertainty_blocks,
+        false,
+        true,
+        false,
+        IntentFilter::All,
+    );
+    evaluations += 1;
+    let penalty = double(combined_look_penalty(
+        &problem,
+        &layout,
+        &lambdas,
+        uncertainty_blocks[0].len(),
+        false,
+    ));
+    let probes = uncertainty::probe_uncertainty(
+        &problem,
+        &params,
+        &look,
+        &uncertainty_blocks[0],
+        &penalty,
+        uncertainty_pass.active_samples.max(1) as f64 / uncertainty_pass.hessian_rows.max(1) as f64,
+        &lambdas,
+        &uncertainty_pass.per_image_gradient,
+        &density,
+        &uncertainty_pass.residual_samples,
+        options,
+    )?;
+    Ok(LookOnlyResult {
+        look,
+        probes,
+        density,
+        clip_k,
+        evaluations,
+    })
+}
+
 /// Fit without the probe/response uncertainty.
 pub(crate) fn run_quick(
     images: &[FitImage],
@@ -293,10 +492,25 @@ fn run_inner(
             .filter(|kind| options.fit_residual || *kind != BlockKind::Residual)
             .filter(|kind| !is_response_kind(*kind))
             .collect();
+        let split_nuisances = problem.images.len() > 64;
         let mut blocks: Vec<BlockAcc> = kinds
             .iter()
-            .map(|kind| make_block(&problem, *kind, stage.active))
+            .map(|kind| {
+                if *kind == BlockKind::Tone && !split_nuisances {
+                    make_joint_tone_block(&problem, stage.active)
+                } else {
+                    make_block(&problem, *kind, stage.active)
+                }
+            })
             .collect();
+        if split_nuisances && (stage.active.image || stage.active.wb) {
+            for index in 0..problem_image_count(&layout) {
+                blocks.push(make_image_block(&layout, index, stage.active));
+            }
+        }
+        if split_nuisances && (stage.active.mode || stage.active.clip) {
+            blocks.push(make_shared_nuisance_block(&problem, &layout, stage.active));
+        }
         let penalties: Vec<Vec<f64>> = blocks
             .iter()
             .map(|block| block_penalty(&problem, block))
@@ -959,7 +1173,11 @@ fn apply_look(problem: &Problem, params: &mut Params, look: &looklab_model::Look
     params.theta[problem.layout.clip] = crate::layout::zeta_from_clip(look.clip.k);
 }
 
-fn seed_response_params(problem: &Problem, params: &mut Params, model: &ControlResponseModel) {
+pub(crate) fn seed_response_params(
+    problem: &Problem,
+    params: &mut Params,
+    model: &ControlResponseModel,
+) {
     for (index, id) in problem.parameter_ids.iter().enumerate() {
         let value = match id.component {
             ResponseComponent::WbR | ResponseComponent::WbB => model
@@ -1005,7 +1223,7 @@ fn seed_response_params(problem: &Problem, params: &mut Params, model: &ControlR
     }
 }
 
-fn build_control_response(
+pub(crate) fn build_control_response(
     mut model: ControlResponseModel,
     problem: &Problem,
     params: &Params,
@@ -1140,22 +1358,6 @@ fn make_block(problem: &Problem, kind: BlockKind, active: ActiveColumns) -> Bloc
         BlockKind::Tone => {
             let mut out = vec![layout.tone_c0];
             out.extend(layout.tone_beta.clone());
-            for index in 0..problem_image_count(layout) {
-                let range = layout.image(index);
-                if active.image {
-                    out.push(range.start);
-                }
-                if active.wb {
-                    out.push(range.start + 1);
-                    out.push(range.start + 2);
-                }
-            }
-            if active.mode {
-                out.extend(layout.modes.clone());
-            }
-            if active.clip {
-                out.push(layout.clip);
-            }
             out
         }
         BlockKind::Tint => {
@@ -1214,6 +1416,64 @@ fn make_block(problem: &Problem, kind: BlockKind, active: ActiveColumns) -> Bloc
         }
     };
     BlockAcc::new(kind, params, layout.total)
+}
+
+/// Tone block with the concatenated nuisances, for pools below the split
+/// threshold where the joint conditioning is better.
+fn make_joint_tone_block(problem: &Problem, active: ActiveColumns) -> BlockAcc {
+    let layout = &problem.layout;
+    let mut out = vec![layout.tone_c0];
+    out.extend(layout.tone_beta.clone());
+    for index in 0..problem_image_count(layout) {
+        let range = layout.image(index);
+        if active.image {
+            out.push(range.start);
+        }
+        if active.wb {
+            out.push(range.start + 1);
+            out.push(range.start + 2);
+        }
+    }
+    if active.mode {
+        out.extend(layout.modes.clone());
+    }
+    if active.clip {
+        out.push(layout.clip);
+    }
+    BlockAcc::new(BlockKind::Tone, out, layout.total)
+}
+
+/// Nuisance block for one image: exposure, `log w_R`, `log w_B`.
+fn make_image_block(layout: &Layout, index: usize, active: ActiveColumns) -> BlockAcc {
+    let range = layout.image(index);
+    let mut params = Vec::with_capacity(3);
+    if active.image {
+        params.push(range.start);
+    }
+    if active.wb {
+        params.push(range.start + 1);
+        params.push(range.start + 2);
+    }
+    let mut block = BlockAcc::new(BlockKind::Nuisance, params, layout.total);
+    block.image = Some(index);
+    block
+}
+
+/// Mode offsets and the clip parameter.
+fn make_shared_nuisance_block(
+    problem: &Problem,
+    layout: &Layout,
+    active: ActiveColumns,
+) -> BlockAcc {
+    let mut params = Vec::new();
+    if active.mode {
+        params.extend(layout.modes.clone());
+    }
+    if active.clip {
+        params.push(layout.clip);
+    }
+    let _ = problem;
+    BlockAcc::new(BlockKind::Nuisance, params, layout.total)
 }
 
 fn is_response_kind(kind: BlockKind) -> bool {
@@ -1639,18 +1899,29 @@ pub(crate) fn identity_weight(kind: BlockKind) -> f64 {
     }
 }
 
-/// Identity-prior curvature per block coordinate (doubled, fixed across pools).
+/// Identity-prior curvature per block coordinate, selected by the coordinate's
+/// own layer because the joint covariance block carries every Look layer.
 pub(crate) fn identity_curvature(layout: &Layout, block: &BlockAcc) -> Vec<f64> {
-    let weight = 2.0 * identity_weight(block.kind);
     block
         .params
         .iter()
         .map(|global| {
-            if *global < layout.residual.end {
-                weight
+            let kind = if layout.tone_beta.contains(global) || *global == layout.tone_c0 {
+                BlockKind::Tone
+            } else if layout.tint_a.contains(global) || layout.tint_b.contains(global) {
+                BlockKind::Tint
+            } else if layout.g.contains(global) {
+                BlockKind::G
+            } else if layout.r.contains(global) {
+                BlockKind::R
+            } else if layout.lambda.contains(global) {
+                BlockKind::Lambda
+            } else if layout.residual.contains(global) {
+                BlockKind::Residual
             } else {
-                0.0
-            }
+                return 0.0;
+            };
+            2.0 * identity_weight(kind)
         })
         .collect()
 }
@@ -1812,7 +2083,7 @@ fn choose_lambdas(
     // `3 * n_eff * n_images`, not the raw sample count (docs/02 §4.1).
     let observations = 3.0 * options.n_eff * problem.active_images.max(1) as f64;
     for (index, block) in blocks.iter().enumerate() {
-        if lam(lambdas, block.kind) != 0.0 {
+        if block.kind == BlockKind::Nuisance || lam(lambdas, block.kind) != 0.0 {
             continue;
         }
         let choice = if block.kind == BlockKind::Residual {
@@ -2226,4 +2497,37 @@ fn residual_step(
         1e-6,
     );
     solution
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn identity_curvature_follows_each_layer() {
+        let layout = Layout::with_response(1, 0, 1, 0);
+        let block = BlockAcc::new(
+            BlockKind::Tone,
+            vec![
+                layout.tone_c0,
+                layout.tint_a.start,
+                layout.g.start,
+                layout.r.start,
+                layout.lambda.start,
+                layout.residual.start,
+                layout.image(0).start,
+                layout.clip,
+            ],
+            layout.total,
+        );
+        let curvature = identity_curvature(&layout, &block);
+        assert_eq!(curvature[0], 2.0 * identity_weight(BlockKind::Tone));
+        assert_eq!(curvature[1], 2.0 * identity_weight(BlockKind::Tint));
+        assert_eq!(curvature[2], 2.0 * identity_weight(BlockKind::G));
+        assert_eq!(curvature[3], 2.0 * identity_weight(BlockKind::R));
+        assert_eq!(curvature[4], 2.0 * identity_weight(BlockKind::Lambda));
+        assert_eq!(curvature[5], 2.0 * identity_weight(BlockKind::Residual));
+        assert_eq!(curvature[6], 0.0);
+        assert_eq!(curvature[7], 0.0);
+    }
 }

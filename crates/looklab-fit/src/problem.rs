@@ -95,6 +95,8 @@ pub(crate) struct BlockAcc {
     pub kind: BlockKind,
     pub params: Vec<usize>,
     pub local: Vec<u32>,
+    /// `Some(index)` for a block whose columns belong to image `index` alone.
+    pub image: Option<usize>,
     pub hessian: Vec<f64>,
     pub gradient: Vec<f64>,
 }
@@ -110,6 +112,7 @@ impl BlockAcc {
             kind,
             params,
             local,
+            image: None,
             hessian: vec![0.0; n * n],
             gradient: vec![0.0; n],
         }
@@ -566,6 +569,9 @@ impl Problem {
                 continue;
             }
             for (slot, block) in blocks.iter_mut().enumerate() {
+                if block.image.is_some_and(|other| other != image) {
+                    continue;
+                }
                 let buffer = &mut block_buffers[slot];
                 buffer.clear();
                 for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {

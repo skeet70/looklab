@@ -14,6 +14,7 @@ const CLUSTER_S: f64 = 0.75;
 const CLUSTER_HUE_DEG: f64 = 20.0;
 const CLUSTER_C: f64 = 12.0;
 
+#[derive(Clone, Copy)]
 struct ClusterSample {
     image: u32,
     s: f64,
@@ -47,11 +48,16 @@ fn cluster_samples(problem: &Problem, params: &Params) -> Vec<ClusterSample> {
         .collect()
 }
 
-fn probe_cluster_count(samples: &[ClusterSample], xyz: looklab_color::Xyz, images: usize) -> usize {
+fn probe_cluster_count(
+    samples: &[ClusterSample],
+    xyz: looklab_color::Xyz,
+    images: usize,
+    token: usize,
+) -> usize {
     let input = LookInput::new(xyz);
     let mut last = vec![usize::MAX; images];
     let mut count = 0usize;
-    for (index, sample) in samples.iter().enumerate() {
+    for sample in samples {
         if sample.weight <= 0.0 || (sample.s - input.s).abs() > CLUSTER_S {
             continue;
         }
@@ -63,8 +69,8 @@ fn probe_cluster_count(samples: &[ClusterSample], xyz: looklab_color::Xyz, image
             continue;
         }
         let image = sample.image as usize;
-        if last[image] != index {
-            last[image] = index;
+        if last[image] != token {
+            last[image] = token;
             count += 1;
         }
     }
@@ -82,8 +88,19 @@ pub fn small_cluster_factor(clusters: usize) -> f64 {
     g / (g - 1.0) * t * t / (1.644_853_626_951_472_2 * 1.644_853_626_951_472_2)
 }
 
-/// Student-t 95th percentile, Cornish-Fisher expansion (Abramowitz & Stegun 26.7.5).
-fn student_t_95(dof: f64) -> f64 {
+/// Exact for 1-5 dof; Cornish-Fisher above (Abramowitz & Stegun 26.7.5).
+pub(crate) fn student_t_95(dof: f64) -> f64 {
+    let degrees = dof.round() as u32;
+    if (1..=5).contains(&degrees) {
+        return [
+            0.0,
+            12.706_204_6,
+            4.302_652_7,
+            3.182_446_0,
+            2.776_445_1,
+            2.570_581_9,
+        ][degrees as usize];
+    }
     let z = 1.644_853_626_951_472_2;
     let v = dof.max(1.0);
     let z3 = z * z * z;
@@ -265,7 +282,12 @@ pub(crate) fn probe_uncertainty(
                 covariance[a][b] = covariance[b][a];
             }
         }
-        let clusters = probe_cluster_count(&cluster_samples, probe.xyz, problem.images.len());
+        let clusters = probe_cluster_count(
+            &cluster_samples,
+            probe.xyz,
+            problem.images.len(),
+            estimates.len(),
+        );
         let factor = if options.sandwich_correction {
             small_cluster_factor(problem.active_images)
         } else {
@@ -315,7 +337,7 @@ pub(crate) fn probe_uncertainty(
         let is_supported = sigma_de <= options.support_sigma
             && local_density >= density.floor
             && clusters >= options.min_probe_clusters
-            && !crate::predict::in_clip_shoulder(pre, space, look.clip.k);
+            && !crate::predict::in_clip_shoulder(pre, space, params.clip_k());
         if is_supported {
             supported += 1;
         }
@@ -462,4 +484,42 @@ fn residual_inverse_diagonal(samples: &[ResidualSample], lambda: f64) -> Vec<f64
         };
     }
     diagonal
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn clusters_count_images_not_samples() {
+        let probe = looklab_model::probes::v1().probes[0].xyz;
+        let input = LookInput::new(probe);
+        let samples: Vec<ClusterSample> = (0..3)
+            .map(|_| ClusterSample {
+                image: 0,
+                s: input.s,
+                h: input.h_in,
+                c: input.c_in,
+                weight: 1.0,
+            })
+            .collect();
+        assert_eq!(probe_cluster_count(&samples, probe, 1, 0), 1);
+        let mut two = samples.clone();
+        two.push(ClusterSample {
+            image: 1,
+            ..samples[0]
+        });
+        assert_eq!(probe_cluster_count(&samples, probe, 2, 0), 1);
+        assert_eq!(probe_cluster_count(&two, probe, 2, 0), 2);
+    }
+
+    #[test]
+    fn small_cluster_factor_is_largest_at_two() {
+        assert!(small_cluster_factor(2) > small_cluster_factor(3));
+        assert!(small_cluster_factor(3) > small_cluster_factor(40));
+        assert_eq!(small_cluster_factor(1), 1.0);
+        let ratio = 12.706_204_6 / 1.644_853_626_951_472_2;
+        let expected = 2.0 * ratio * ratio;
+        assert!((small_cluster_factor(2) - expected).abs() < 1e-9);
+    }
 }

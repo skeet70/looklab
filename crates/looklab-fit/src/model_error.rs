@@ -8,11 +8,14 @@ use looklab_model::Look;
 use crate::hierarchical::BodyGroup;
 use crate::problem::Problem;
 use crate::types::{FitImage, FitOptions, ProbeUncertainty, Result};
+use crate::uncertainty::student_t_95;
 
 pub const MODEL_HUE_BINS: usize = 12;
 pub const MODEL_S_BINS: usize = 6;
 pub const MODEL_S_MIN: f64 = -12.0;
 pub const MODEL_S_MAX: f64 = 6.0;
+/// Tentative inflation of the cross-validated excess for a new body.
+pub const MODEL_SAFETY: f64 = 1.3;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelErrorField {
@@ -83,27 +86,37 @@ fn smooth(values: &[f64]) -> Vec<f64> {
     out.into_iter().map(|value| value.max(0.0)).collect()
 }
 
-/// K-fold over bodies: hold one body out, refit the Look on the rest, and take
-/// the excess squared error over what the fit variance predicted.
+/// K-fold over bodies, or over images for a single-body pool.
 pub fn estimate_model_error(
     images: &[FitImage],
     groups: &[BodyGroup],
     reference_variance: &[f64],
     options: &FitOptions,
+    clip_k: f64,
 ) -> Result<ModelErrorField> {
     let mut field = ModelErrorField::empty();
-    if groups.len() < 2 {
+    let folds: Vec<BodyGroup> = if groups.len() >= 2 {
+        groups.to_vec()
+    } else {
+        let chunk_size = images.len().div_ceil(5).max(1);
+        let mut folds = Vec::new();
+        for (index, slice) in images.chunks(chunk_size).enumerate() {
+            let start = index * chunk_size;
+            let id = looklab_body::BodyId::new(format!("image-fold-{index}"))
+                .map_err(|error| crate::types::FitError::Hierarchy(error.to_string()))?;
+            folds.push(BodyGroup {
+                body: id,
+                images: (start..start + slice.len()).collect(),
+            });
+        }
+        folds
+    };
+    if folds.len() < 2 {
         return Ok(field);
     }
-    let mut squared = vec![0.0_f64; field.variance.len()];
-    let mut counts = vec![0.0_f64; field.variance.len()];
-    let space = images.first().map_or(RgbSpace::Srgb, |image| {
-        match image.samples.header().output_space {
-            looklab_samples::OutputSpace::Srgb => RgbSpace::Srgb,
-            looklab_samples::OutputSpace::AdobeRgb => RgbSpace::AdobeRgb,
-        }
-    });
-    for held in groups {
+    let mut fold_squared: Vec<Vec<f64>> = Vec::new();
+    let mut fold_counts: Vec<Vec<f64>> = Vec::new();
+    for held in &folds {
         let kept: Vec<FitImage> = images
             .iter()
             .enumerate()
@@ -124,40 +137,92 @@ pub fn estimate_model_error(
         let Ok(problem) = Problem::new_with(&held_images, None, options) else {
             continue;
         };
+        let slopes = tone_slopes(&result.look);
+        let mut jac = crate::predict::Jac::default();
+        let mut squared = vec![0.0_f64; field.variance.len()];
+        let mut counts = vec![0.0_f64; field.variance.len()];
         for sample in &problem.samples {
             let index = sample.image as usize;
             let image = &held_images[index];
-            let exposure = image.exposure_hint;
-            let scale = libm::pow(2.0, exposure);
+            let scale = libm::pow(2.0, image.exposure_hint);
             let xyz = looklab_color::Xyz::from_array(image.transform.mul_vec([
                 sample.rgb[0] * scale,
                 sample.rgb[1] * scale,
                 sample.rgb[2] * scale,
             ]));
             let input = looklab_model::LookInput::new(xyz);
-            let prediction = result.look.eval(xyz);
-            let error = delta_e_ucs(prediction, sample.target);
+            let context = crate::predict::ImageCtx {
+                transform: image.transform,
+                a0: image.transform,
+                space: problem.images[index].space,
+                exposure: image.exposure_hint,
+                wb_r: 1.0,
+                wb_b: 1.0,
+            };
+            let evaluated = crate::predict::evaluate_sample(
+                &result.look,
+                &problem.layout,
+                &context,
+                &crate::predict::ColumnMap::default(),
+                sample.rgb,
+                clip_k,
+                1.0,
+                &slopes,
+                &[],
+                &mut jac,
+            );
+            let error = delta_e_ucs(evaluated.prediction, sample.target);
             let bin = region(input.s, input.h_in);
             let weight = sample.weight.max(0.0);
             squared[bin] += weight * error * error;
             counts[bin] += weight;
         }
-        let _ = space;
+        fold_squared.push(squared);
+        fold_counts.push(counts);
     }
     let mut raw = vec![0.0_f64; field.variance.len()];
     for bin in 0..raw.len() {
-        if counts[bin] > 0.0 {
-            let held_mse = squared[bin] / counts[bin];
-            field.held_out_rms[bin] = held_mse.sqrt();
-            raw[bin] = (held_mse - reference_variance[bin]).max(0.0);
+        let mut values = Vec::new();
+        for (squared, counts) in fold_squared.iter().zip(fold_counts.iter()) {
+            if counts[bin] > 0.0 {
+                values.push(squared[bin] / counts[bin]);
+            }
         }
+        if values.is_empty() {
+            continue;
+        }
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        field.held_out_rms[bin] = mean.sqrt();
+        let mut excess = (mean - reference_variance[bin]).max(0.0);
+        if values.len() > 1 {
+            let variance = values
+                .iter()
+                .map(|value| (value - mean) * (value - mean))
+                .sum::<f64>()
+                / (values.len() - 1) as f64;
+            let t = student_t_95((values.len() - 1) as f64);
+            excess += t * variance.sqrt() * (1.0 + 1.0 / values.len() as f64).sqrt();
+        }
+        raw[bin] = excess * MODEL_SAFETY;
         field.reference_rms[bin] = reference_variance[bin].max(0.0).sqrt();
     }
     field.variance = smooth(&raw);
     Ok(field)
 }
 
+fn tone_slopes(look: &Look) -> [f64; looklab_model::basis::TONE_COEFS] {
+    use crate::layout::{softplus_inverse, softplus_slope};
+    let mut slopes = [1.0_f64; looklab_model::basis::TONE_COEFS];
+    if let looklab_model::Tone::Spline { beta, .. } = &look.tone {
+        for (slope, value) in slopes.iter_mut().zip(beta.iter()) {
+            *slope = softplus_slope(softplus_inverse(*value));
+        }
+    }
+    slopes
+}
+
 /// Add the stored model variance to an interactive probe set and re-mark support.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_model_error(
     probes: &mut ProbeUncertainty,
     field: &ModelErrorField,
@@ -166,12 +231,13 @@ pub fn apply_model_error(
     space: RgbSpace,
     support_sigma: f64,
     min_clusters: usize,
+    clip_k: f64,
 ) {
     let probes_v1 = looklab_model::probes::v1();
     let mut supported = 0usize;
     for (index, probe) in probes.probes.iter_mut().enumerate() {
         let input = looklab_model::LookInput::new(probes_v1.probes[index].xyz);
-        let extra = field.at(input.s, input.h_in);
+        let extra = field.at(input.s, input.h_in) / 3.0;
         for (channel, row) in probe.covariance.iter_mut().enumerate() {
             row[channel] += extra;
         }
@@ -182,7 +248,7 @@ pub fn apply_model_error(
         probe.supported = probe.sigma_de <= support_sigma
             && probe.density >= density.floor
             && probe.clusters >= min_clusters
-            && !crate::predict::in_clip_shoulder(prediction, space, look.clip.k);
+            && !crate::predict::in_clip_shoulder(prediction, space, clip_k);
         if probe.supported {
             supported += 1;
         }
@@ -210,4 +276,118 @@ pub fn image_errors(
         out.push((delta_e_ucs(look.eval(xyz), sample.target), sample.target));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use crate::types::{Density, ProbeEstimate, ProbeUncertainty};
+
+    fn density() -> Density {
+        Density {
+            s_bins: 36,
+            hue_bins: 24,
+            c_bins: 12,
+            counts: vec![1.0; 36 * 24 * 12],
+            total: 1.0,
+            floor: 0.0,
+        }
+    }
+
+    fn probes() -> ProbeUncertainty {
+        let ids = looklab_model::probes::v1();
+        let probes = ids
+            .probes
+            .iter()
+            .enumerate()
+            .map(|(index, _)| ProbeEstimate {
+                id_hint: index,
+                ucs: looklab_color::ucs::Ucs::new(50.0, 0.0, 0.0),
+                covariance: [[0.0; 3]; 3],
+                sigma_de: 0.0,
+                density: 1.0,
+                supported: false,
+                clusters: 5,
+            })
+            .collect();
+        ProbeUncertainty {
+            probes,
+            ids: ids.probes.iter().map(|probe| probe.id.clone()).collect(),
+            supported_fraction: 0.0,
+        }
+    }
+
+    #[test]
+    fn radial_model_variance_is_divided_across_three_axes() {
+        let look = Look::colorimetric_spline().expect("look");
+        let mut field = ModelErrorField::empty();
+        field.variance.fill(3.0);
+        let mut estimates = probes();
+        apply_model_error(
+            &mut estimates,
+            &field,
+            &look,
+            &density(),
+            RgbSpace::Srgb,
+            1.5,
+            3,
+            0.03,
+        );
+        let sigma = estimates.probes[0].sigma_de;
+        assert!((sigma * sigma - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn support_uses_the_requested_clip_parameter() {
+        let look = Look::colorimetric_spline().expect("look");
+        let field = ModelErrorField::empty();
+        let mut narrow = probes();
+        apply_model_error(
+            &mut narrow,
+            &field,
+            &look,
+            &density(),
+            RgbSpace::Srgb,
+            1.5,
+            3,
+            0.005,
+        );
+        let mut wide = probes();
+        apply_model_error(
+            &mut wide,
+            &field,
+            &look,
+            &density(),
+            RgbSpace::Srgb,
+            1.5,
+            3,
+            0.45,
+        );
+        assert!(narrow.supported_fraction > wide.supported_fraction);
+    }
+
+    #[cfg(feature = "synth")]
+    #[test]
+    fn single_body_pools_use_image_folds() {
+        let data = crate::synth::dataset(&crate::synth::SynthConfig {
+            images: 4,
+            samples_per_image: 200,
+            ..crate::synth::SynthConfig::default()
+        });
+        let options = FitOptions {
+            max_samples_per_image: 200,
+            hessian_samples: 500,
+            max_sweeps: 3,
+            ..FitOptions::default()
+        };
+        let field = estimate_model_error(
+            &data.images,
+            &[],
+            &vec![0.0; MODEL_HUE_BINS * MODEL_S_BINS],
+            &options,
+            0.03,
+        )
+        .expect("image folds");
+        assert!(field.held_out_rms.iter().any(|value| *value > 0.0));
+    }
 }

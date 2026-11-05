@@ -10,21 +10,24 @@ use looklab_body::{
 };
 use looklab_color::Mat3;
 use looklab_model::basis::TONE_COEFS;
+use looklab_model::realization::{ControlResponseModel, Delta, ResponseComponent};
 use looklab_model::{Look, Tone};
 
 use crate::fit;
 use crate::gauge::{ComponentGauge, WbModeClass};
-use crate::layout::{Layout, softplus_inverse, softplus_slope};
+use crate::layout::{Layout, Params, softplus_inverse, softplus_slope};
 use crate::predict::{ColumnMap, ImageCtx, Jac, evaluate_sample};
 use crate::problem::Problem;
 use crate::solve::{factor_in_place, solve_in_place};
 use crate::types::{
     ContributorId, Density, ExposureModeId, ExposureOffset, FitError, FitImage, FitOptions,
-    FitResult, ImageIntent, ImageNuisances, ProbeUncertainty, Result,
+    ImageIntent, ImageNuisances, ProbeUncertainty, Result,
 };
 
 /// Two firmware offset coordinates: a constant `T` shift and a constant `log G` shift.
 pub const FIRMWARE_PARAMETERS: usize = 2;
+
+const RESPONSE_PRIOR_PRECISION: f64 = 10.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FirmwareId(pub u32);
@@ -48,6 +51,8 @@ pub struct BodyData {
     pub default_wb_mode: WbModeClass,
     pub images: Vec<HierImage>,
     pub charts: Vec<looklab_body::ChartSession>,
+    /// Control response for this body's native sim, fitted in the body block.
+    pub model: Option<ControlResponseModel>,
 }
 
 impl BodyData {
@@ -72,6 +77,8 @@ pub struct HierOptions {
     pub body_iterations: usize,
     pub firmware_prior_sd: [f64; FIRMWARE_PARAMETERS],
     pub anchor: AnchorOptions,
+    /// Persisted component gauges; a designated body in the member set is kept.
+    pub gauges: Vec<ComponentGauge>,
 }
 
 impl Default for HierOptions {
@@ -82,6 +89,7 @@ impl Default for HierOptions {
             body_iterations: 6,
             firmware_prior_sd: [0.5, 0.03],
             anchor: AnchorOptions::default(),
+            gauges: Vec::new(),
         }
     }
 }
@@ -96,6 +104,8 @@ pub struct BodyParameters {
     pub clip_k: f64,
     pub images: Vec<ImageNuisances>,
     pub recipe_fitted: bool,
+    /// Fitted control response, if the body supplied a model.
+    pub model: Option<ControlResponseModel>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,8 +131,10 @@ pub struct LookParameters {
     pub firmware: Vec<(FirmwareId, [f64; FIRMWARE_PARAMETERS])>,
     pub probes: ProbeUncertainty,
     pub density: Density,
+    /// Clip parameter of the published realization.
+    pub clip_k: f64,
     pub provenance: Vec<LookProvenance>,
-    /// Native images with the published body parameters folded in.
+    /// Native images with the native-stage body parameters the Look was fitted against.
     pub pool: Vec<FitImage>,
     pub groups: Vec<BodyGroup>,
 }
@@ -132,6 +144,7 @@ pub struct HierDiagnostics {
     pub evaluations: usize,
     pub outer_iterations: usize,
     pub sigma_v: Vec<(ContributorId, f64)>,
+    pub converged: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -189,6 +202,8 @@ struct BodyState {
     omega: Vec<(WbModeClass, [f64; 2])>,
     clip: f64,
     nuisances: Vec<[f64; 3]>,
+    response: Option<ControlResponseModel>,
+    coefficients: Vec<f64>,
 }
 
 impl BodyState {
@@ -201,6 +216,8 @@ impl BodyState {
                 omega: Vec::new(),
                 clip,
                 nuisances: vec![[0.0; 3]; body.images.len()],
+                response: body.model.clone(),
+                coefficients: Vec::new(),
             },
         }
     }
@@ -228,6 +245,8 @@ struct BodyLayout {
     wb_ids: Vec<WbModeClass>,
     clip: usize,
     image: Vec<[usize; 3]>,
+    active: Vec<usize>,
+    response: Vec<usize>,
     total: usize,
     offset: usize,
 }
@@ -275,6 +294,7 @@ fn body_layout(
     wb_modes: &[WbModeClass],
     gauge: &ComponentGauge,
     designated: bool,
+    response_count: usize,
     offset: usize,
 ) -> BodyLayout {
     let mut next = 0usize;
@@ -306,6 +326,7 @@ fn body_layout(
         .collect();
     let clip = alloc();
     let image = active.iter().map(|_| [alloc(), alloc(), alloc()]).collect();
+    let response = (0..response_count).map(|_| alloc()).collect();
     BodyLayout {
         delta,
         xi,
@@ -314,6 +335,8 @@ fn body_layout(
         wb_ids: wb_modes.to_vec(),
         clip,
         image,
+        active: active.to_vec(),
+        response,
         total: next,
         offset,
     }
@@ -336,6 +359,7 @@ fn body_pass(
     samples: &[crate::problem::Sample],
     problem_layout: &Layout,
     spaces: &[looklab_color::RgbSpace],
+    terms: &[Vec<crate::predict::ResponseTerm>],
     looks: &BTreeMap<LookFamilyId, Look>,
     firmware: &BTreeMap<FirmwareId, [f64; FIRMWARE_PARAMETERS]>,
     layout: &BodyLayout,
@@ -351,8 +375,13 @@ fn body_pass(
     let mut cost = 0.0;
     let mut pairs: Vec<Vec<(f64, f64)>> = vec![Vec::new(); contributors.len()];
     let mut map = vec![u32::MAX; problem_layout.total + total];
+    let mut local_of = vec![u32::MAX; total];
     for (local, global) in local_indices(layout).iter().enumerate() {
         map[layout.offset + global] = local as u32;
+        local_of[*global] = local as u32;
+    }
+    for (index, global) in layout.response.iter().enumerate() {
+        map[problem_layout.response.start + index] = local_of[*global];
     }
 
     let a0 = *body.transform.a0_d65();
@@ -361,14 +390,23 @@ fn body_pass(
     let wb_modes = unique_wb_modes(&body.images, active);
     let active_looks: Vec<(Look, [f64; TONE_COEFS])> = active
         .iter()
-        .map(|index| {
+        .enumerate()
+        .map(|(position, index)| {
             let tag = &body.images[*index];
             let base = looks
                 .get(&tag.look)
                 .cloned()
                 .unwrap_or_else(Look::colorimetric);
             let offset = firmware.get(&tag.firmware).copied().unwrap_or([0.0; 2]);
-            let look = firmware_look(&base, offset);
+            let mut look = firmware_look(&base, offset);
+            let mut delta = Delta::default();
+            for term in &terms[position] {
+                if let Some(layer) = term.component.layer() {
+                    let value = state.coefficients.get(term.index).copied().unwrap_or(0.0);
+                    delta.add(layer, term.feature, value * term.phi);
+                }
+            }
+            look = delta.apply(&look).unwrap_or(look);
             let slopes = tone_slopes(&look);
             (look, slopes)
         })
@@ -390,14 +428,24 @@ fn body_pass(
             .unwrap_or(0);
         let xi = state.xi(tag.image.exposure_mode);
         let omega = state.omega(tag.wb_mode);
+        let mut log_r = omega[0] + nuisance[1];
+        let mut log_b = omega[1] + nuisance[2];
+        for term in &terms[position] {
+            let value = state.coefficients.get(term.index).copied().unwrap_or(0.0) * term.phi;
+            match term.component {
+                ResponseComponent::WbR => log_r += value,
+                ResponseComponent::WbB => log_b += value,
+                _ => {}
+            }
+        }
         let (look, slopes) = &active_looks[position];
         let context = ImageCtx {
             transform,
             a0,
             space: spaces[position],
             exposure: xi + nuisance[0],
-            wb_r: libm::exp(omega[0] + nuisance[1]),
-            wb_b: libm::exp(omega[1] + nuisance[2]),
+            wb_r: libm::exp(log_r),
+            wb_b: libm::exp(log_b),
         };
         let columns = ColumnMap {
             mode: None,
@@ -420,7 +468,7 @@ fn body_pass(
             state.clip,
             1.0,
             slopes,
-            &[],
+            &terms[position],
             &mut jac,
         );
         let target = sample.target;
@@ -538,6 +586,16 @@ fn body_pass(
         }
     }
 
+    for (local, value) in state.coefficients.iter().enumerate() {
+        if local >= layout.response.len() {
+            break;
+        }
+        let slot = layout.response[local];
+        gradient[slot] += RESPONSE_PRIOR_PRECISION * value;
+        hessian[slot * total + slot] += RESPONSE_PRIOR_PRECISION;
+        cost += 0.5 * RESPONSE_PRIOR_PRECISION * value * value;
+    }
+
     Ok(BodyPass {
         gradient,
         hessian,
@@ -556,6 +614,7 @@ fn local_indices(layout: &BodyLayout) -> Vec<usize> {
     for image in &layout.image {
         indices.extend(image.iter().copied());
     }
+    indices.extend(layout.response.iter().copied());
     indices
 }
 
@@ -613,9 +672,15 @@ fn apply_body_step_values(state: &mut BodyState, layout: &BodyLayout, step: &[f6
         }
     }
     state.clip = (state.clip + factor * step[layout.clip]).clamp(0.005, 0.1);
+    for (position, local) in layout.response.iter().enumerate() {
+        if position < state.coefficients.len() {
+            state.coefficients[position] += factor * step[*local];
+        }
+    }
     for (position, columns) in layout.image.iter().enumerate() {
+        let image = layout.active[position];
         for channel in 0..3 {
-            state.nuisances[position][channel] += factor * step[columns[channel]];
+            state.nuisances[image][channel] += factor * step[columns[channel]];
         }
     }
     true
@@ -685,10 +750,18 @@ fn fit_body(
             image
         })
         .collect();
-    let problem = Problem::new_with(&filtered, None, &options.fit)?;
+    let problem = Problem::new_with(&filtered, body.model.as_ref(), &options.fit)?;
     let problem_layout = problem.layout.clone();
     let spaces: Vec<looklab_color::RgbSpace> =
         problem.images.iter().map(|image| image.space).collect();
+    let response_count = problem.parameter_ids.len();
+    if state.coefficients.len() != response_count {
+        let mut params = Params::initial(problem.layout.clone(), problem.contributors.len());
+        if let Some(model) = &body.model {
+            fit::seed_response_params(&problem, &mut params, model);
+        }
+        state.coefficients = params.theta[problem.layout.response.clone()].to_vec();
+    }
 
     let modes = unique_modes(&body.images, &active);
     let wb_modes = unique_wb_modes(&body.images, &active);
@@ -698,6 +771,7 @@ fn fit_body(
         &wb_modes,
         gauge,
         designated,
+        response_count,
         problem_layout.total,
     );
     let precision = body
@@ -714,6 +788,7 @@ fn fit_body(
         &problem.samples,
         &problem_layout,
         &spaces,
+        &problem.terms,
         looks,
         firmware,
         &layout,
@@ -743,6 +818,7 @@ fn fit_body(
             &problem.samples,
             &problem_layout,
             &spaces,
+            &problem.terms,
             looks,
             firmware,
             &layout,
@@ -763,6 +839,22 @@ fn fit_body(
                 break;
             }
         }
+    }
+    if let Some(template) = &body.model {
+        let mut params = Params::initial(problem.layout.clone(), problem.contributors.len());
+        for (index, value) in state.coefficients.iter().enumerate() {
+            params.theta[problem.layout.response.start + index] = *value;
+        }
+        state.response = Some(
+            fit::build_control_response(
+                template.clone(),
+                &problem,
+                &params,
+                problem.parameter_ids.clone(),
+                Vec::new(),
+            )
+            .model,
+        );
     }
     Ok((state, pass, evaluations))
 }
@@ -900,6 +992,33 @@ pub fn firmware_images(
         .collect())
 }
 
+/// Firmware basis at every v1 probe, for the predicted-difference effect gate.
+pub fn firmware_probe_basis(look: &Look) -> Vec<[[f64; 3]; FIRMWARE_PARAMETERS]> {
+    let layout = Layout::with_response(1, 0, 1, 0);
+    let slopes = tone_slopes(look);
+    let probes = looklab_model::probes::v1();
+    let mut jac = Jac::default();
+    let mut out = Vec::with_capacity(probes.probes.len());
+    for probe in &probes.probes {
+        let _ = crate::predict::evaluate_probe(look, &layout, probe.xyz, &slopes, &mut jac);
+        let mut basis = [[0.0_f64; 3]; FIRMWARE_PARAMETERS];
+        for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
+            let column = *column as usize;
+            if column == layout.tone_c0 {
+                for channel in 0..3 {
+                    basis[0][channel] += derivative[channel];
+                }
+            } else if layout.g.contains(&column) {
+                for channel in 0..3 {
+                    basis[1][channel] += derivative[channel];
+                }
+            }
+        }
+        out.push(basis);
+    }
+    out
+}
+
 fn pool_images(
     family: LookFamilyId,
     bodies: &[&BodyData],
@@ -952,10 +1071,10 @@ fn estimate_firmware(
     base_look: &Look,
     pool: &[FitImage],
     firmware: &[FirmwareId],
-    fit_result: &FitResult,
     sigma: &[f64],
     contributors: &[ContributorId],
     options: &FitOptions,
+    clip_k: f64,
     firmware_prior_sd: [f64; FIRMWARE_PARAMETERS],
 ) -> Vec<(FirmwareId, [f64; FIRMWARE_PARAMETERS])> {
     if pool.is_empty() {
@@ -970,16 +1089,13 @@ fn estimate_firmware(
     let mut jac = Jac::default();
     for sample in &problem.samples {
         let index = sample.image as usize;
-        let Some(result) = fit_result.images.get(index) else {
-            continue;
-        };
         let context = ImageCtx {
             transform: pool[index].transform,
             a0: pool[index].transform,
             space: problem.images[index].space,
-            exposure: result.exposure,
-            wb_r: libm::exp(result.wb_log_r),
-            wb_b: libm::exp(result.wb_log_b),
+            exposure: pool[index].exposure_hint,
+            wb_r: 1.0,
+            wb_b: 1.0,
         };
         let columns = ColumnMap::default();
         let evaluated = evaluate_sample(
@@ -988,7 +1104,7 @@ fn estimate_firmware(
             &context,
             &columns,
             sample.rgb,
-            fit_result.realization.clip_k,
+            clip_k,
             1.0,
             &slopes,
             &[],
@@ -1006,17 +1122,23 @@ fn estimate_firmware(
         let variance = libm::exp(2.0 * sigma[contributor]);
         let alpha = (options.nu + 3.0) / (options.nu * variance + squared);
         let weight = sample.weight * alpha;
-        let mut derivative = [0.0_f64; FIRMWARE_PARAMETERS];
+        let mut basis = [[0.0_f64; 3]; FIRMWARE_PARAMETERS];
         for (column, value) in jac.cols.iter().zip(jac.derivs.iter()) {
             let column = *column as usize;
             if column == layout.tone_c0 {
                 for channel in 0..3 {
-                    derivative[0] += value[channel] * residual[channel];
+                    basis[0][channel] += value[channel];
                 }
             } else if layout.g.contains(&column) {
                 for channel in 0..3 {
-                    derivative[1] += value[channel] * residual[channel];
+                    basis[1][channel] += value[channel];
                 }
+            }
+        }
+        let mut derivative = [0.0_f64; FIRMWARE_PARAMETERS];
+        for (index, row) in basis.iter().enumerate() {
+            for channel in 0..3 {
+                derivative[index] += row[channel] * residual[channel];
             }
         }
         let entry = blocks
@@ -1025,14 +1147,18 @@ fn estimate_firmware(
         for a in 0..2 {
             entry.1[a] += weight * derivative[a];
             for b in 0..2 {
-                entry.0[a][b] += weight * derivative[a] * derivative[b];
+                let mut dot = 0.0;
+                for channel in 0..3 {
+                    dot += basis[a][channel] * basis[b][channel];
+                }
+                entry.0[a][b] += weight * dot;
             }
         }
     }
     let mut out = Vec::new();
     for (id, (hessian, gradient)) in blocks {
         let mut matrix = hessian;
-        let rhs = gradient;
+        let rhs = [-gradient[0], -gradient[1]];
         for (index, sd) in firmware_prior_sd.iter().enumerate() {
             matrix[index][index] += 1.0 / (sd * sd);
         }
@@ -1167,7 +1293,74 @@ fn body_parameter(body: &BodyData, state: &BodyState, recipe_fitted: bool) -> Bo
         clip_k: state.clip,
         images,
         recipe_fitted,
+        model: state.response.clone(),
     }
+}
+
+fn contribution_clip(members: &[&BodyState]) -> f64 {
+    let sum: f64 = members.iter().map(|state| state.clip).sum();
+    sum / members.len().max(1) as f64
+}
+
+fn shared_model(states: &[&BodyState]) -> Option<ControlResponseModel> {
+    let first = states.iter().find_map(|state| state.response.as_ref())?;
+    if states
+        .iter()
+        .all(|state| state.response.as_ref() == Some(first))
+    {
+        Some(first.clone())
+    } else {
+        None
+    }
+}
+
+fn look_distance(a: &Look, b: &Look) -> f64 {
+    let left = a.coef_vector();
+    let right = b.coef_vector();
+    if left.len() != right.len() {
+        return f64::INFINITY;
+    }
+    left.iter()
+        .zip(right.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f64, f64::max)
+}
+
+fn body_distance(a: &BodyState, b: &BodyState) -> f64 {
+    let mut change = 0.0_f64;
+    for (left, right) in a.delta.params().iter().zip(b.delta.params().iter()) {
+        change = change.max((left - right).abs());
+    }
+    for ((_, left), (_, right)) in a.xi.iter().zip(b.xi.iter()) {
+        change = change.max((left - right).abs());
+    }
+    for ((_, left), (_, right)) in a.omega.iter().zip(b.omega.iter()) {
+        for channel in 0..2 {
+            change = change.max((left[channel] - right[channel]).abs());
+        }
+    }
+    change = change.max((a.clip - b.clip).abs());
+    for (left, right) in a.nuisances.iter().zip(b.nuisances.iter()) {
+        for channel in 0..3 {
+            change = change.max((left[channel] - right[channel]).abs());
+        }
+    }
+    for (left, right) in a.coefficients.iter().zip(b.coefficients.iter()) {
+        change = change.max((left - right).abs());
+    }
+    change
+}
+
+fn family_members(bodies: &[BodyData], groups: &[Vec<usize>], family: LookFamilyId) -> Vec<usize> {
+    groups
+        .iter()
+        .find(|members| {
+            members
+                .iter()
+                .any(|index| bodies[*index].images.iter().any(|tag| tag.look == family))
+        })
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Fit every connected component: native stage alternating bodies and Looks,
@@ -1191,19 +1384,30 @@ pub fn fit_hierarchical(bodies: &[BodyData], options: &HierOptions) -> Result<Hi
     let mut gauges = Vec::new();
     let mut designated = vec![false; bodies.len()];
     for members in &groups {
-        let chosen = designated_body(bodies, members);
-        designated[chosen] = true;
-        gauges.push(ComponentGauge {
-            designated: bodies[chosen].id.clone(),
-            exposure_mode: bodies[chosen].default_mode,
-            wb_mode: bodies[chosen].default_wb_mode,
-            anchored_delta: members.iter().any(|index| bodies[*index].anchored()),
+        let persisted = options.gauges.iter().find(|gauge| {
+            members
+                .iter()
+                .any(|index| bodies[*index].id == gauge.designated)
         });
+        let gauge = match persisted {
+            Some(gauge) => gauge.clone(),
+            None => {
+                let chosen = designated_body(bodies, members);
+                ComponentGauge {
+                    designated: bodies[chosen].id.clone(),
+                    exposure_mode: bodies[chosen].default_mode,
+                    wb_mode: bodies[chosen].default_wb_mode,
+                    anchored_delta: members.iter().any(|index| bodies[*index].anchored()),
+                }
+            }
+        };
+        for index in members {
+            if bodies[*index].id == gauge.designated {
+                designated[*index] = true;
+            }
+        }
+        gauges.push(gauge);
     }
-    let mut look_map: BTreeMap<LookFamilyId, Look> = BTreeMap::new();
-    let mut look_firmware: BTreeMap<LookFamilyId, Vec<(FirmwareId, [f64; FIRMWARE_PARAMETERS])>> =
-        BTreeMap::new();
-    let mut firmware: BTreeMap<FirmwareId, [f64; FIRMWARE_PARAMETERS]> = BTreeMap::new();
     let mut family_ids: Vec<LookFamilyId> = bodies
         .iter()
         .flat_map(|body| body.images.iter().map(|tag| tag.look))
@@ -1211,33 +1415,34 @@ pub fn fit_hierarchical(bodies: &[BodyData], options: &HierOptions) -> Result<Hi
     family_ids.sort();
     family_ids.dedup();
 
-    // Initial Look fit with the prior body transforms.
+    let mut look_map: BTreeMap<LookFamilyId, Look> = BTreeMap::new();
+    let mut look_results: BTreeMap<LookFamilyId, fit::LookOnlyResult> = BTreeMap::new();
+    let mut look_firmware: BTreeMap<LookFamilyId, Vec<(FirmwareId, [f64; FIRMWARE_PARAMETERS])>> =
+        BTreeMap::new();
+    let mut firmware: BTreeMap<FirmwareId, [f64; FIRMWARE_PARAMETERS]> = BTreeMap::new();
+    let mut evaluations = 0usize;
+
     for family in &family_ids {
-        let component = groups
-            .iter()
-            .find(|members| {
-                members
-                    .iter()
-                    .any(|index| bodies[*index].images.iter().any(|tag| tag.look == *family))
-            })
-            .cloned()
-            .unwrap_or_default();
-        let members: Vec<&BodyData> = component.iter().map(|index| &bodies[*index]).collect();
-        let member_states: Vec<&BodyState> =
-            component.iter().map(|index| &states[*index]).collect();
-        let (pool, _groups, _fw) = pool_images(*family, &members, &member_states, false);
+        let members = family_members(bodies, &groups, *family);
+        let member_bodies: Vec<&BodyData> = members.iter().map(|index| &bodies[*index]).collect();
+        let member_states: Vec<&BodyState> = members.iter().map(|index| &states[*index]).collect();
+        let (pool, _groups, _tags) = pool_images(*family, &member_bodies, &member_states, false);
         if pool.is_empty() {
             continue;
         }
-        let result = fit::run_quick(&pool, &options.fit, None)?;
-        look_map.insert(*family, result.look);
+        let clip = contribution_clip(&member_states);
+        let model = shared_model(&member_states);
+        let result = fit::run_look_only(&pool, &options.fit, None, clip, model.as_ref())?;
+        evaluations += result.evaluations;
+        look_map.insert(*family, result.look.clone());
+        look_results.insert(*family, result);
     }
 
-    let mut evaluations = 0usize;
+    let mut converged = false;
     let mut outer_iterations = 0usize;
     for _ in 0..options.outer_iterations.max(1) {
         outer_iterations += 1;
-        // (a) bodies, given the Looks.
+        let previous_states = states.clone();
         let mut all_pairs: Vec<Vec<(f64, f64)>> = vec![Vec::new(); contributors.len()];
         for (component, members) in groups.iter().enumerate() {
             let gauge = &gauges[component];
@@ -1262,8 +1467,6 @@ pub fn fit_hierarchical(bodies: &[BodyData], options: &HierOptions) -> Result<Hi
                 }
             }
             if !gauge.anchored_delta {
-                let member_states: Vec<BodyState> =
-                    members.iter().map(|index| states[*index].clone()).collect();
                 let active: Vec<Vec<usize>> = members
                     .iter()
                     .map(|index| {
@@ -1276,178 +1479,162 @@ pub fn fit_hierarchical(bodies: &[BodyData], options: &HierOptions) -> Result<Hi
                             .collect()
                     })
                     .collect();
-                let mut local_states = member_states;
-                apply_delta_gauge(&mut local_states, &active);
+                let mut local: Vec<BodyState> =
+                    members.iter().map(|index| states[*index].clone()).collect();
+                apply_delta_gauge(&mut local, &active);
                 for (position, index) in members.iter().enumerate() {
-                    states[*index] = local_states[position].clone();
+                    states[*index] = local[position].clone();
                 }
             }
         }
         update_sigma(&mut sigma, &all_pairs, &options.fit);
 
-        // (b) Looks, given the bodies.
+        let mut change = states
+            .iter()
+            .zip(previous_states.iter())
+            .map(|(current, previous)| body_distance(current, previous))
+            .fold(0.0_f64, f64::max);
         for family in &family_ids {
-            let component = groups
-                .iter()
-                .find(|members| {
-                    members
-                        .iter()
-                        .any(|index| bodies[*index].images.iter().any(|tag| tag.look == *family))
-                })
-                .cloned()
-                .unwrap_or_default();
-            let members: Vec<&BodyData> = component.iter().map(|index| &bodies[*index]).collect();
+            let members = family_members(bodies, &groups, *family);
+            let member_bodies: Vec<&BodyData> =
+                members.iter().map(|index| &bodies[*index]).collect();
             let member_states: Vec<&BodyState> =
-                component.iter().map(|index| &states[*index]).collect();
+                members.iter().map(|index| &states[*index]).collect();
             let (pool, _groups, firmware_tags) =
-                pool_images(*family, &members, &member_states, false);
+                pool_images(*family, &member_bodies, &member_states, false);
             if pool.is_empty() {
                 continue;
             }
-            let warm = look_map.get(family).cloned();
-            let result = fit::run_quick(&pool, &options.fit, warm.as_ref())?;
-            evaluations += result.diagnostics.evaluations;
+            let clip = contribution_clip(&member_states);
+            let model = shared_model(&member_states);
+            let warm = look_map.get(family);
+            let result = fit::run_look_only(&pool, &options.fit, warm, clip, model.as_ref())?;
+            evaluations += result.evaluations;
+            if let Some(previous) = warm {
+                change = change.max(look_distance(previous, &result.look));
+            }
             let offsets = estimate_firmware(
                 &result.look,
                 &pool,
                 &firmware_tags,
-                &result,
                 &sigma,
                 &contributors,
                 &options.fit,
+                result.clip_k,
                 options.firmware_prior_sd,
             );
             for (id, offset) in &offsets {
                 firmware.insert(*id, *offset);
             }
             look_firmware.insert(*family, offsets);
-            look_map.insert(*family, result.look);
+            look_map.insert(*family, result.look.clone());
+            look_results.insert(*family, result);
+        }
+        if change < 1e-5 {
+            converged = true;
+            break;
         }
     }
 
-    // Recipe stage: every `θ_L` stays at its native-stage value.
+    let native_states = states.clone();
+    let native_looks = look_map.clone();
+    let native_results = look_results.clone();
+
     let has_recipe = bodies.iter().any(|body| {
         body.images
             .iter()
             .any(|tag| tag.image.intent == ImageIntent::Recipe)
     });
-    for (component, members) in groups.iter().enumerate() {
-        if !has_recipe {
-            continue;
-        }
-        let gauge = &gauges[component];
-        for index in members {
-            let body = &bodies[*index];
-            let (state, _pass, count) = fit_body(
-                body,
-                &look_map,
-                &firmware,
-                gauge,
-                designated[*index],
-                &sigma,
-                &contributors,
-                options,
-                Some(&states[*index]),
-                true,
-            )?;
-            states[*index] = state;
-            evaluations += count;
-        }
-        if !gauge.anchored_delta {
-            let active: Vec<Vec<usize>> = members
-                .iter()
-                .map(|index| {
-                    bodies[*index]
-                        .images
-                        .iter()
-                        .enumerate()
-                        .map(|(position, _)| position)
-                        .collect()
-                })
-                .collect();
-            let mut local: Vec<BodyState> =
-                members.iter().map(|index| states[*index].clone()).collect();
-            apply_delta_gauge(&mut local, &active);
-            for (position, index) in members.iter().enumerate() {
-                states[*index] = local[position].clone();
+    if has_recipe {
+        for (component, members) in groups.iter().enumerate() {
+            let gauge = &gauges[component];
+            for index in members {
+                let body = &bodies[*index];
+                let (state, _pass, count) = fit_body(
+                    body,
+                    &look_map,
+                    &firmware,
+                    gauge,
+                    designated[*index],
+                    &sigma,
+                    &contributors,
+                    options,
+                    Some(&states[*index]),
+                    true,
+                )?;
+                states[*index] = state;
+                evaluations += count;
+            }
+            if !gauge.anchored_delta {
+                let active: Vec<Vec<usize>> = members
+                    .iter()
+                    .map(|index| {
+                        bodies[*index]
+                            .images
+                            .iter()
+                            .enumerate()
+                            .map(|(position, _)| position)
+                            .collect()
+                    })
+                    .collect();
+                let mut local: Vec<BodyState> =
+                    members.iter().map(|index| states[*index].clone()).collect();
+                apply_delta_gauge(&mut local, &active);
+                for (position, index) in members.iter().enumerate() {
+                    states[*index] = local[position].clone();
+                }
             }
         }
     }
 
     let mut looks = Vec::new();
     for family in &family_ids {
-        let component = groups
-            .iter()
-            .find(|members| {
-                members
-                    .iter()
-                    .any(|index| bodies[*index].images.iter().any(|tag| tag.look == *family))
-            })
-            .cloned()
-            .unwrap_or_default();
-        let members: Vec<&BodyData> = component.iter().map(|index| &bodies[*index]).collect();
-        let member_states: Vec<&BodyState> =
-            component.iter().map(|index| &states[*index]).collect();
-        let (pool, groups, _firmware) = pool_images(*family, &members, &member_states, false);
-        let fallback = look_map
-            .get(family)
-            .cloned()
-            .unwrap_or_else(Look::colorimetric);
-        let result = if pool.is_empty() {
-            None
-        } else {
-            fit::run(&pool, &options.fit, None).ok()
+        let members = family_members(bodies, &groups, *family);
+        let member_bodies: Vec<&BodyData> = members.iter().map(|index| &bodies[*index]).collect();
+        let native_member_states: Vec<&BodyState> =
+            members.iter().map(|index| &native_states[*index]).collect();
+        let (pool, groups, _tags) =
+            pool_images(*family, &member_bodies, &native_member_states, false);
+        let Some(result) = native_results.get(family) else {
+            continue;
         };
-        let look = result
-            .as_ref()
-            .map_or(fallback, |result| result.look.clone());
-        let provenance = members
+        let provenance = member_bodies
             .iter()
-            .zip(member_states.iter())
-            .flat_map(|(body, state)| {
-                (body.images.iter().any(|tag| tag.look == *family)).then(|| LookProvenance {
-                    body: body.id.clone(),
-                    transform_version: body.transform.version(),
-                    delta: state.delta,
-                    exposure: body
-                        .images
-                        .iter()
-                        .map(|tag| tag.image.exposure_mode)
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .map(|mode| ExposureOffset {
-                            mode,
-                            offset: state.xi(mode),
-                        })
-                        .collect(),
-                    wb: state.omega.clone(),
-                })
+            .zip(native_member_states.iter())
+            .filter(|(body, _)| {
+                body.images
+                    .iter()
+                    .any(|tag| tag.look == *family && tag.image.intent == ImageIntent::Native)
+            })
+            .map(|(body, state)| LookProvenance {
+                body: body.id.clone(),
+                transform_version: body.transform.version(),
+                delta: state.delta,
+                exposure: body
+                    .images
+                    .iter()
+                    .filter(|tag| tag.look == *family && tag.image.intent == ImageIntent::Native)
+                    .map(|tag| tag.image.exposure_mode)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .map(|mode| ExposureOffset {
+                        mode,
+                        offset: state.xi(mode),
+                    })
+                    .collect(),
+                wb: state.omega.clone(),
             })
             .collect();
-        let (probes, density) = match &result {
-            Some(result) => (result.probes.clone(), result.density.clone()),
-            None => (
-                ProbeUncertainty {
-                    probes: Vec::new(),
-                    ids: Vec::new(),
-                    supported_fraction: 0.0,
-                },
-                Density {
-                    s_bins: 0,
-                    hue_bins: 0,
-                    c_bins: 0,
-                    counts: Vec::new(),
-                    total: 0.0,
-                    floor: 0.0,
-                },
-            ),
-        };
         looks.push(LookParameters {
             id: *family,
-            look,
+            look: native_looks
+                .get(family)
+                .cloned()
+                .unwrap_or_else(Look::colorimetric),
             firmware: look_firmware.get(family).cloned().unwrap_or_default(),
-            probes,
-            density,
+            probes: result.probes.clone(),
+            density: result.density.clone(),
+            clip_k: result.clip_k,
             provenance,
             pool,
             groups,
@@ -1457,7 +1644,7 @@ pub fn fit_hierarchical(bodies: &[BodyData], options: &HierOptions) -> Result<Hi
     let bodies_out = bodies
         .iter()
         .zip(states.iter())
-        .map(|(body, state)| body_parameter(body, state, true))
+        .map(|(body, state)| body_parameter(body, state, has_recipe))
         .collect();
 
     Ok(HierarchicalFit {
@@ -1472,6 +1659,43 @@ pub fn fit_hierarchical(bodies: &[BodyData], options: &HierOptions) -> Result<Hi
                 .zip(sigma.iter())
                 .map(|(id, log)| (*id, libm::exp(*log)))
                 .collect(),
+            converged,
         },
     })
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn body_steps_write_to_original_image_indices() {
+        let layout = BodyLayout {
+            delta: [0, 1, 2, 3, 4, 5],
+            xi: Vec::new(),
+            omega: Vec::new(),
+            mode_ids: Vec::new(),
+            wb_ids: Vec::new(),
+            clip: 6,
+            image: vec![[7, 8, 9]],
+            active: vec![1],
+            response: Vec::new(),
+            total: 10,
+            offset: 0,
+        };
+        let mut state = BodyState {
+            delta: Delta6::ZERO,
+            xi: Vec::new(),
+            omega: Vec::new(),
+            clip: 0.03,
+            nuisances: vec![[0.0; 3]; 2],
+            response: None,
+            coefficients: Vec::new(),
+        };
+        let mut step = vec![0.0_f64; 10];
+        step[7] = 1.0;
+        assert!(apply_body_step_values(&mut state, &layout, &step));
+        assert!((state.nuisances[1][0] - 1.0).abs() < 1e-12);
+        assert_eq!(state.nuisances[0][0], 0.0);
+    }
 }

@@ -750,6 +750,7 @@ impl MultiBodyDataset {
                     default_wb_mode: WbModeClass(0),
                     images: body.images.clone(),
                     charts: Vec::new(),
+                    model: None,
                 }
             })
             .collect()

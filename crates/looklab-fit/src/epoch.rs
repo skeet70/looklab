@@ -40,6 +40,33 @@ pub struct SplitDecision {
 
 /// Two-sample permutation test on Hotelling's T², gated by effect size.
 pub fn detect_split(samples: &[SplitSample], options: &SplitOptions) -> Option<SplitDecision> {
+    let decision = best_pair(samples, options)?;
+    if decision.p_value < options.alpha && decision.effect_de >= options.min_effect_de {
+        Some(decision)
+    } else {
+        None
+    }
+}
+
+/// Permutation test gated on a caller-supplied appearance effect, for firmware
+/// offsets whose difference is not the residual-magnitude difference.
+pub fn detect_split_with_effect(
+    samples: &[SplitSample],
+    options: &SplitOptions,
+    effect_de: f64,
+) -> Option<SplitDecision> {
+    let decision = best_pair(samples, options)?;
+    if decision.p_value < options.alpha && effect_de >= options.min_effect_de {
+        Some(SplitDecision {
+            effect_de,
+            ..decision
+        })
+    } else {
+        None
+    }
+}
+
+fn best_pair(samples: &[SplitSample], options: &SplitOptions) -> Option<SplitDecision> {
     let mut groups: Vec<u32> = samples.iter().map(|sample| sample.group).collect();
     groups.sort_unstable();
     groups.dedup();
@@ -62,11 +89,33 @@ pub fn detect_split(samples: &[SplitSample], options: &SplitOptions) -> Option<S
             }
         }
     }
-    let decision = best?;
-    if decision.p_value < options.alpha && decision.effect_de >= options.min_effect_de {
-        Some(decision)
+    best
+}
+
+/// Median ΔE of the predicted difference between two firmware offset vectors.
+pub fn predicted_effect(
+    basis: &[[[f64; 3]; PROJECTION_DIM]],
+    left: [f64; 2],
+    right: [f64; 2],
+) -> f64 {
+    let mut values: Vec<f64> = basis
+        .iter()
+        .map(|probe| {
+            let mut delta = [0.0_f64; 3];
+            for coordinate in 0..PROJECTION_DIM {
+                for channel in 0..3 {
+                    delta[channel] +=
+                        (left[coordinate] - right[coordinate]) * probe[coordinate][channel];
+                }
+            }
+            (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt()
+        })
+        .collect();
+    values.sort_by(f64::total_cmp);
+    if values.is_empty() {
+        0.0
     } else {
-        None
+        values[values.len() / 2]
     }
 }
 
@@ -372,5 +421,41 @@ mod tests {
         let first = detect_split(&samples, &options);
         let second = detect_split(&samples, &options);
         assert_eq!(first.is_none(), second.is_none());
+    }
+
+    #[test]
+    fn the_effect_gate_uses_the_predicted_firmware_difference() {
+        let samples: Vec<SplitSample> = (0..16)
+            .map(|index| SplitSample {
+                group: (index % 2) as u32,
+                projection: if index % 2 == 0 {
+                    [2.0, 0.2]
+                } else {
+                    [-2.0, -0.2]
+                },
+                effect_de: 1.0,
+            })
+            .collect();
+        let options = SplitOptions {
+            permutations: 2000,
+            seed: 7,
+            ..SplitOptions::default()
+        };
+        assert!(detect_split(&samples, &options).is_none());
+        let decision =
+            detect_split_with_effect(&samples, &options, 3.0).expect("predicted effect gates");
+        assert_eq!(decision.effect_de, 3.0);
+    }
+
+    #[test]
+    fn predicted_effect_is_the_probe_difference() {
+        let basis = vec![
+            [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            [[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        ];
+        let effect = predicted_effect(&basis, [1.0, 0.0], [0.0, 0.0]);
+        assert!((effect - 1.0).abs() < 1e-12);
+        assert_eq!(predicted_effect(&basis, [1.0, 0.0], [1.0, 0.0]), 0.0);
     }
 }

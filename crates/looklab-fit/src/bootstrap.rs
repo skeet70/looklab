@@ -108,6 +108,7 @@ fn refit(_look: &Look, images: &[FitImage], options: &FitOptions) -> Result<FitR
 }
 
 /// `Σ_fit` is the bootstrap covariance when available, else the sandwich; `Σ_total` adds the leave-one-body-out disagreement.
+#[allow(clippy::too_many_arguments)]
 pub fn published_uncertainty(
     look: &Look,
     images: &[FitImage],
@@ -116,23 +117,25 @@ pub fn published_uncertainty(
     density: &Density,
     options: &FitOptions,
     bootstrap: &BootstrapOptions,
+    clip_k: f64,
 ) -> Result<PublishedUncertainty> {
     let space = images.first().map_or(RgbSpace::Srgb, |image| {
         space_of(image.samples.header().output_space)
     });
     let mut rng = Xorshift::new(bootstrap.seed ^ 0x6d5a_56b1_1c37_9f03);
     let mut bootstrap_rows = Vec::new();
-    let cluster_count = groups.len().max(1);
     for _ in 0..bootstrap.resamples {
         let mut sample = Vec::with_capacity(images.len());
-        for _ in 0..cluster_count {
-            if groups.is_empty() {
-                sample.push(images[rng.below(images.len())].clone());
-            } else {
+        if groups.len() >= 2 {
+            for _ in 0..groups.len() {
                 let group = &groups[rng.below(groups.len())];
                 for index in &group.images {
                     sample.push(images[*index].clone());
                 }
+            }
+        } else {
+            for _ in 0..images.len() {
+                sample.push(images[rng.below(images.len())].clone());
             }
         }
         if sample.is_empty() {
@@ -194,7 +197,7 @@ pub fn published_uncertainty(
         .zip(reference_counts.iter())
         .map(|(sum, count)| if *count > 0.0 { sum / count } else { 0.0 })
         .collect();
-    let model = estimate_model_error(images, groups, &reference_variance, options)?;
+    let model = estimate_model_error(images, groups, &reference_variance, options, clip_k)?;
 
     let mut probes = Vec::with_capacity(probes_v1.probes.len());
     let mut supported = 0usize;
@@ -209,7 +212,7 @@ pub fn published_uncertainty(
             }
         }
         for (channel, row) in covariance.iter_mut().enumerate() {
-            row[channel] += model_variance;
+            row[channel] += model_variance / 3.0;
         }
         let sigma_de = (covariance[0][0] + covariance[1][1] + covariance[2][2])
             .max(0.0)
@@ -224,7 +227,7 @@ pub fn published_uncertainty(
         let is_supported = sigma_de <= options.support_sigma
             && local_density >= density.floor
             && clusters >= options.min_probe_clusters
-            && !in_clip_shoulder(prediction, space, look.clip.k);
+            && !in_clip_shoulder(prediction, space, clip_k);
         if is_supported {
             supported += 1;
         }
