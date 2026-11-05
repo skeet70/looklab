@@ -75,6 +75,7 @@ impl<T> Load<T> {
 
 thread_local! {
     static SITE_INDEX: std::cell::OnceCell<SiteIndex> = const { std::cell::OnceCell::new() };
+    static REFERENCE_PREVIEW: std::cell::OnceCell<Arc<Vec<u8>>> = const { std::cell::OnceCell::new() };
     static PREPARED_SCENES: std::cell::RefCell<std::collections::VecDeque<(SceneName, bool, PreparedScene)>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
@@ -335,6 +336,28 @@ pub async fn preview(slug: &str, version: &str) -> Result<Arc<Vec<u8>>, String> 
     Ok(Arc::new(bytes))
 }
 
+pub async fn reference_preview() -> Result<Option<Arc<Vec<u8>>>, String> {
+    if let Some(preview) = REFERENCE_PREVIEW.with(|cache| cache.get().cloned()) {
+        return Ok(Some(preview));
+    }
+    let index = index().await?;
+    let Some(preview) = index.reference_preview else {
+        return Ok(None);
+    };
+    let bytes = get(&site_url(&format!("/{}", preview.path.as_str()))).await?;
+    if bytes.len() != LUT_BYTES
+        || bytes.len() as u64 != preview.bytes
+        || ArtifactHash::of(&bytes) != preview.sha256
+    {
+        return Err("The neutral preview could not be verified. Reload to try again.".to_owned());
+    }
+    let bytes = Arc::new(bytes);
+    REFERENCE_PREVIEW.with(|cache| {
+        let _ = cache.set(bytes.clone());
+    });
+    Ok(Some(bytes))
+}
+
 pub async fn card(slug: &str, version: &str) -> Result<Vec<u8>, String> {
     let index = index().await?;
     let summary = version_summary(&index, slug, version)?;
@@ -375,6 +398,11 @@ async fn load_version(
 ) -> Result<LoadedVersion, String> {
     let index = index().await?;
     let summary = version_summary(&index, slug, version)?;
+    if matches!(purpose, VersionPurpose::Match) && !summary.matchable {
+        return Err(format!(
+            "{slug} {version}: this version is a preview only and cannot be matched."
+        ));
+    }
     let manifest = verified_manifest(slug, version, summary).await?;
     if manifest.look.as_str() != slug || manifest.version.as_str() != version {
         return Err(format!(
@@ -418,6 +446,11 @@ async fn load_version(
     }
     let document =
         LookDocument::decode(&look_bytes).map_err(|error| format!("{slug} {version}: {error}"))?;
+    if matches!(purpose, VersionPurpose::Match) && !document.is_matchable() {
+        return Err(format!(
+            "{slug} {version}: this version is a preview only and cannot be matched."
+        ));
+    }
     let probes = looklab_model::probes::v1();
     let adapter = crate::diagnostics::DocumentLook::new(&document, &probes);
     let diagnostics = looklab_report::look_diagnostics(&adapter, &probes);
@@ -647,6 +680,35 @@ struct ModerationMessageRequest<'a> {
     body: &'a str,
 }
 
+#[derive(Serialize)]
+struct LookListingRequest<'a> {
+    look: &'a str,
+    reason: &'a str,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LookListingAction {
+    Hide,
+    Remove,
+    Relist,
+}
+
+impl LookListingAction {
+    fn path(self) -> String {
+        format!("/api/mod/look/{self}")
+    }
+}
+
+impl core::fmt::Display for LookListingAction {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Hide => "hide",
+            Self::Remove => "remove",
+            Self::Relist => "relist",
+        })
+    }
+}
+
 #[derive(Clone)]
 struct ModeratorToken(String);
 
@@ -752,6 +814,24 @@ pub async fn decide(
         .body(Some(json_body(&body)?))
         .map_err(|error| error.to_string())?;
     moderation_send(&path, request).await
+}
+
+/// # Errors
+/// Reports a closed session or a server failure.
+pub async fn set_look_listing(
+    action: LookListingAction,
+    look: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let token = moderation_token()?;
+    let path = api_url(&action.path());
+    let request = Request::post(&path)
+        .header("Content-Type", "application/json")
+        .header("Authorization", &format!("Bearer {}", token.0))
+        .body(Some(json_body(&LookListingRequest { look, reason })?))
+        .map_err(|error| error.to_string())?;
+    let _: EmptyReply = moderation_send(&path, request).await?;
+    Ok(())
 }
 
 /// # Errors

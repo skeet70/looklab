@@ -198,6 +198,28 @@ pub fn normalised_primary_matrix(primaries: Primaries, white: (f64, f64)) -> Mat
     primary_matrix.mul(&Mat3::diag(scale))
 }
 
+/// Fujifilm F-Gamut primaries and D65 white from *F-Log2 Data Sheet Ver.1.1* §3.
+pub const FGAMUT_PRIMARIES: Primaries = Primaries {
+    red: (0.708, 0.292),
+    green: (0.170, 0.797),
+    blue: (0.131, 0.046),
+};
+
+static FGAMUT_MATRICES: LazyLock<SpaceMatrices> = LazyLock::new(|| {
+    let to_xyz = normalised_primary_matrix(FGAMUT_PRIMARIES, Illuminant::D65.xy());
+    let from_xyz = to_xyz.inverse().expect("primary matrix is non-singular");
+    SpaceMatrices { to_xyz, from_xyz }
+});
+
+/// `normalised_primary_matrix` of [`FGAMUT_PRIMARIES`].
+pub fn fgamut_to_xyz_matrix() -> Mat3 {
+    FGAMUT_MATRICES.to_xyz
+}
+
+pub fn fgamut_from_xyz_matrix() -> Mat3 {
+    FGAMUT_MATRICES.from_xyz
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

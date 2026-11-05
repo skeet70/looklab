@@ -2,6 +2,7 @@
 .home-heading h1 { font-size: clamp(2.1rem, 4.6vw, 4rem); line-height: 1.08; letter-spacing: -.04em; }
 .eyebrow { font-size: .8rem; text-transform: uppercase; letter-spacing: .12em; }
 .home-preview { margin-bottom: 3rem; }
+.home-preview-labels { display: flex; justify-content: space-between; gap: 1rem; margin-bottom: .5rem; color: var(--muted); font-size: .9rem; }
 .look-chips { display: flex; gap: .5rem; flex-wrap: wrap; padding-top: .8rem; }
 .look-chips button { border-radius: 2rem; }
 .look-chips button[aria-pressed=true] { outline: 2px solid currentColor; outline-offset: 2px; }

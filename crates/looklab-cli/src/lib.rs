@@ -9,6 +9,7 @@ mod card;
 mod compare;
 mod export;
 mod fit;
+mod lut_look;
 mod match_cmd;
 mod prep;
 mod publish;
@@ -50,6 +51,8 @@ pub enum Command {
     Export(export::ExportArgs),
     /// Inspect or evaluate a firmware card file.
     Card(card::CardArgs),
+    /// Import a community LUT.
+    LutLook(lut_look::LutLookArgs),
     /// Validate a data directory and its probe set files.
     Validate(validate::ValidateArgs),
     /// Validate a community data snapshot directory and its content hash.
@@ -79,6 +82,7 @@ pub fn run_with(cli: Cli) -> Result<()> {
         Command::Compare(args) => compare::run(&args),
         Command::Export(args) => export::run(&args),
         Command::Card(args) => card::run(&args),
+        Command::LutLook(args) => lut_look::run(&args),
         Command::Validate(args) => validate::run(&args),
         Command::ValidateSnapshot(args) => validate::run_snapshot(&args),
         Command::Synth(args) => synth::run(&args),

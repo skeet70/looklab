@@ -1,0 +1,2 @@
+fixtures/donated/** filter=lfs diff=lfs merge=lfs -text
+fixtures/donated/README.md !filter !diff !merge text

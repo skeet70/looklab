@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! CCT against the LibRaw/colour-science reference on the committed fixtures
+//! CCT against the LibRaw/colour-science reference on the manifest fixtures
 //! (docs/09 P4.1). Fixtures are CC0 samples from raw.pixls.us.
 #![allow(clippy::disallowed_methods)]
 
@@ -33,10 +33,19 @@ fn reference(name: &str) -> Reference {
 }
 
 fn decode(name: &str) -> DecodedRaw {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures")
-        .join(name);
-    let bytes = std::fs::read(path).expect("committed fixture");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let committed = root.join(name);
+    let path = if committed.exists() {
+        committed
+    } else {
+        root.join("cache").join(name)
+    };
+    let bytes = std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "read {}: {error}; run tools/fetch-fixtures.sh",
+            path.display()
+        )
+    });
     RawlerDecoder.decode(&bytes).expect("decodes")
 }
 

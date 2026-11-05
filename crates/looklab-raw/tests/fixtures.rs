@@ -13,14 +13,23 @@ const GRID: usize = 8;
 const TOLERANCE: f64 = 0.005;
 
 fn fixture_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures")
-        .join(name)
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+    let committed = root.join(name);
+    if committed.exists() {
+        committed
+    } else {
+        root.join("cache").join(name)
+    }
 }
 
-fn decode_committed(name: &str) -> DecodedRaw {
+fn decode_fixture(name: &str) -> DecodedRaw {
     let path = fixture_path(name);
-    let bytes = std::fs::read(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let bytes = std::fs::read(&path).unwrap_or_else(|err| {
+        panic!(
+            "read {}: {err}; run tools/fetch-fixtures.sh",
+            path.display()
+        )
+    });
     RawlerDecoder
         .decode(&bytes)
         .unwrap_or_else(|err| panic!("decode {}: {err}", path.display()))
@@ -133,7 +142,7 @@ fn compare_with_reference(name: &str, json: &str) {
 
 #[test]
 fn fujifilm_x_s10_digest() {
-    let img = decode_committed("fujifilm-x-s10.raf");
+    let img = decode_fixture("fujifilm-x-s10.raf");
     assert_eq!(size(&img), (1042, 696));
     assert_eq!(img.make, "FUJIFILM");
     assert_eq!(img.model, "X-S10");
@@ -144,7 +153,7 @@ fn fujifilm_x_s10_digest() {
 
 #[test]
 fn canon_eos_60d_digest() {
-    let img = decode_committed("canon-eos-60d.dng");
+    let img = decode_fixture("canon-eos-60d.dng");
     assert_eq!(size(&img), (480, 270));
     assert_eq!(img.make, "Canon");
     assert_eq!(img.model, "Canon EOS 60D");
@@ -155,7 +164,7 @@ fn canon_eos_60d_digest() {
 
 #[test]
 fn canon_forward_matrices_are_exposed() {
-    let img = decode_committed("canon-eos-60d.dng");
+    let img = decode_fixture("canon-eos-60d.dng");
     let matrices = img.color_matrices.as_ref().expect("colour matrices");
     let forward = matrices.forward_matrices();
     assert_eq!(forward.len(), 2);
@@ -192,7 +201,7 @@ fn canon_eos_60d_matches_libraw() {
 
 #[test]
 fn fetch_only_fixture_decodes_when_present() {
-    let path = fixture_path("cache/sigma-fp-8bit.dng");
+    let path = fixture_path("sigma-fp-8bit.dng");
     let Ok(bytes) = std::fs::read(&path) else {
         eprintln!(
             "skipping fetch-only fixture check: {} is absent; run tools/fetch-fixtures.sh",

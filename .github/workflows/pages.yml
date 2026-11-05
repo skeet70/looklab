@@ -19,8 +19,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Git LFS object list
+        id: lfs
+        run: echo "key=$(git lfs ls-files -l | cut -d' ' -f1 | sort | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: .git/lfs
+          key: lfs-${{ steps.lfs.outputs.key }}
+      - name: Fetch Git LFS fixtures
+        run: git lfs pull
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+      - uses: actions/cache@v4
+        with:
+          path: fixtures/cache
+          key: fixtures-${{ hashFiles('fixtures/manifest.toml') }}
       - name: Fetch CC0 scene sources
         run: nix develop -c tools/fetch-fixtures.sh
       - name: Public site data and camera match bundles

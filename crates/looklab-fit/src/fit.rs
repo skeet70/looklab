@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Staged Gauss-Newton/Levenberg-Marquardt with block solves and per-stage GCV.
 
+use looklab_model::LookInput;
 use looklab_model::basis::{RESIDUAL_COEFS, S_COEFS, TONE_COEFS};
 use looklab_model::realization::{
     ControlResponseModel, ControlValue, LayerKind, ResponseComponent, ResponseParamId,
@@ -10,6 +11,7 @@ use looklab_schema::{Control, ControlDefault, ControlSchema, ScalarValue, Tolera
 use crate::basis;
 use crate::density;
 use crate::layout::{BlockKind, Layout, Params};
+use crate::model_error::{MODEL_HUE_BINS, MODEL_S_BINS, estimate_model_error, region};
 use crate::outlier;
 use crate::problem::{ActiveColumns, BlockAcc, IntentFilter, PassOutput, Problem, ResidualSample};
 use crate::solve::{factor_in_place, select_lambda, select_lambda_diagonal, solve_in_place};
@@ -379,15 +381,15 @@ pub(crate) fn run_look_only(
             evaluations += 1;
             let cost =
                 pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
-            if let Some((previous_cost, previous_params)) = &previous {
-                if !accepted(*previous_cost, cost) {
-                    params = previous_params.clone();
-                    damping = (damping * 10.0).min(1e6);
-                    if damping >= 1e6 {
-                        break;
-                    }
-                    continue;
+            if let Some((previous_cost, previous_params)) = &previous
+                && !accepted(*previous_cost, cost)
+            {
+                params = previous_params.clone();
+                damping = (damping * 10.0).min(1e6);
+                if damping >= 1e6 {
+                    break;
                 }
+                continue;
             }
             if previous
                 .as_ref()
@@ -419,6 +421,7 @@ pub(crate) fn run_look_only(
                     params.clone(),
                 ));
             }
+
             let mut step = vec![0.0_f64; layout.total];
             for (index, block) in blocks.iter().enumerate() {
                 if block.kind == BlockKind::Residual {
@@ -557,7 +560,13 @@ fn run_inner(
         return Err(crate::types::FitError::NoNativeImages);
     }
     let mut problem = Problem::new_with(&native, model.as_ref(), options)?;
-    let early_problem = if options.early_samples_per_image > 0
+    // Warm-up subsampling only saves time on large pools; small many-image pools pay
+    // little for the full set and start the final stage from a converged point.
+    let subsample_warmup = model.is_some()
+        || problem.images.len() < 24
+        || problem.samples.len() as f64 > options.sweep_budget / 64.0;
+    let early_problem = if subsample_warmup
+        && options.early_samples_per_image > 0
         && options.early_samples_per_image < options.max_samples_per_image
     {
         let early = subsample_images(&native, options.early_samples_per_image);
@@ -706,23 +715,23 @@ fn run_inner(
             let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
             let cost =
                 pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
-            if let Some((previous_cost, previous_params)) = &previous {
-                if !accepted(*previous_cost, cost) {
-                    params = previous_params.clone();
-                    damping = (damping * 10.0).min(1e6_f64);
-                    if damping >= 1e6 {
-                        resume_state = Some(FitState {
-                            theta: params.theta.clone(),
-                            lambdas,
-                            stage: stage_index,
-                            sweep: sweep_index,
-                            damping,
-                            converged: false,
-                        });
-                        break;
-                    }
-                    continue;
+            if let Some((previous_cost, previous_params)) = &previous
+                && !accepted(*previous_cost, cost)
+            {
+                params = previous_params.clone();
+                damping = (damping * 10.0).min(1e6_f64);
+                if damping >= 1e6 {
+                    resume_state = Some(FitState {
+                        theta: params.theta.clone(),
+                        lambdas,
+                        stage: stage_index,
+                        sweep: sweep_index,
+                        damping,
+                        converged: false,
+                    });
+                    break;
                 }
+                continue;
             }
             if previous
                 .as_ref()
@@ -971,7 +980,7 @@ fn run_inner(
     let density = density::build(&problem, &params, options.density_floor);
     let image_stats = outlier::score(&problem, &final_pass, options);
     let mut grl_precision_ratio = Vec::new();
-    let (probe_result, parameter_ids, covariance) =
+    let (mut probe_result, parameter_ids, covariance) =
         match (uncertainty_blocks.as_ref(), uncertainty_pass.as_ref()) {
             (Some(uncertainty_blocks), Some(uncertainty_pass)) => {
                 let uncertainty_penalty = double(combined_look_penalty(
@@ -1081,6 +1090,31 @@ fn run_inner(
                 Vec::new(),
             ),
         };
+    if want_uncertainty && (4..=64).contains(&native.len()) && !probe_result.probes.is_empty() {
+        // The published σ includes the same body/image K-fold model-error term the
+        // bootstrap path uses, so systematic basis misfit widens support probes.
+        let probes_v1 = looklab_model::probes::v1();
+        let mut sums = vec![0.0_f64; MODEL_HUE_BINS * MODEL_S_BINS];
+        let mut counts = vec![0.0_f64; MODEL_HUE_BINS * MODEL_S_BINS];
+        for (index, probe) in probe_result.probes.iter().enumerate() {
+            let input = LookInput::new(probes_v1.probes[index].xyz);
+            let bin = region(input.s, input.h_in);
+            sums[bin] += probe.post_sigma_de * probe.post_sigma_de;
+            counts[bin] += 1.0;
+        }
+        let reference_variance: Vec<f64> = sums
+            .iter()
+            .zip(counts.iter())
+            .map(|(sum, count)| if *count > 0.0 { sum / count } else { 0.0 })
+            .collect();
+        let clip_k = params.clip_k();
+        let field = estimate_model_error(&native, &[], &reference_variance, options, clip_k)?;
+        for (index, probe) in probe_result.probes.iter_mut().enumerate() {
+            let input = LookInput::new(probes_v1.probes[index].xyz);
+            let variance = field.at(input.s, input.h_in);
+            probe.post_sigma_de = (probe.post_sigma_de * probe.post_sigma_de + variance).sqrt();
+        }
+    }
     let control_response = model.map(|template| {
         build_control_response(template, &problem, &params, parameter_ids, covariance)
     });

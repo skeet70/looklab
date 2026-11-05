@@ -240,7 +240,16 @@ fn the_params_hash_covers_the_params() {
     assert_ne!(a.hash().expect("hash"), changed.hash().expect("hash"));
 }
 
-const X_S10_RAF: &[u8] = include_bytes!("../../../fixtures/fujifilm-x-s10.raf");
+fn x_s10_raf() -> Vec<u8> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/cache/fujifilm-x-s10.raf");
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "read {}: {error}; run tools/fetch-fixtures.sh",
+            path.display()
+        )
+    })
+}
 
 fn jpeg_bytes_from(image: &Image3, quality: u8) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -281,7 +290,7 @@ fn meta_orientation(orientation: Orientation) -> looklab_meta::Orientation {
 
 #[test]
 fn the_dng_prior_takes_white_balanced_input() {
-    let decoded = RawlerDecoder.decode(X_S10_RAF).expect("fixture decodes");
+    let decoded = RawlerDecoder.decode(&x_s10_raf()).expect("fixture decodes");
     let matrices = decoded
         .color_matrices
         .as_ref()
@@ -397,8 +406,8 @@ fn samples_average_the_jpeg_over_the_raw_footprint() {
 
 #[test]
 fn prepares_the_x_s10_fixture_with_a_rendered_jpeg() {
-    let raw_bytes = X_S10_RAF;
-    let decoded = RawlerDecoder.decode(raw_bytes).expect("fixture decodes");
+    let raw_bytes = x_s10_raf();
+    let decoded = RawlerDecoder.decode(&raw_bytes).expect("fixture decodes");
     let wb = decoded.as_shot_wb;
     let (pixels, _) = decoded.rgb.as_chunks::<3>();
     let data: Vec<[f32; 3]> = pixels
@@ -425,7 +434,7 @@ fn prepares_the_x_s10_fixture_with_a_rendered_jpeg() {
     assert!((2000.0..=10_000.0).contains(&dng_prior.cct_k()));
 
     let prepared = prepare_pair(
-        X_S10_RAF,
+        &raw_bytes,
         &jpeg_bytes,
         &dng_prior,
         fixed_seed(0x10),

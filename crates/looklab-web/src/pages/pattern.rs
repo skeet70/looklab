@@ -4,9 +4,19 @@
 use leptos::html::Canvas;
 use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
+use looklab_prep::PatternSeed;
+use sha2::{Digest, Sha256};
+use std::sync::LazyLock;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
+
+static PUBLIC_PATTERN: LazyLock<PatternSeed> =
+    LazyLock::new(|| PatternSeed::from_bytes(Sha256::digest(b"looklab-fixture-pattern-v1").into()));
+
+pub(super) fn fixture_seed() -> &'static PatternSeed {
+    &PUBLIC_PATTERN
+}
 
 #[component]
 pub fn PatternPage() -> impl IntoView {
@@ -33,11 +43,29 @@ pub fn PatternPage() -> impl IntoView {
 
     view! {
         <div class="pattern-page">
-            <canvas node_ref=canvas aria-label="Seeded calibration pattern"></canvas>
+            <canvas
+                node_ref=canvas
+                role="button"
+                tabindex="0"
+                aria-label="Measurement pattern. Tap or press Enter for fullscreen."
+                on:click=move |_| request_fullscreen(canvas)
+                on:keydown=move |event: leptos::ev::KeyboardEvent| {
+                    if matches!(event.key().as_str(), "Enter" | " ") {
+                        event.prevent_default();
+                        request_fullscreen(canvas);
+                    }
+                }
+            ></canvas>
             {move || error.get().map(|message| view! {
                 <p class="error" role="alert">{message}</p>
             })}
         </div>
+    }
+}
+
+fn request_fullscreen(canvas: NodeRef<Canvas>) {
+    if let Some(canvas) = canvas.get() {
+        let _ = canvas.request_fullscreen();
     }
 }
 

@@ -9,12 +9,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Git LFS object list
+        id: lfs
+        run: echo "key=$(git lfs ls-files -l | cut -d' ' -f1 | sort | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: .git/lfs
+          key: lfs-${{ steps.lfs.outputs.key }}
+      - name: Fetch Git LFS fixtures
+        run: git lfs pull
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+      - uses: actions/cache@v4
+        with:
+          path: fixtures/cache
+          key: fixtures-${{ hashFiles('fixtures/manifest.toml') }}
+      - name: Fetch CC0 fixtures
+        run: nix develop -c tools/fetch-fixtures.sh
       - name: Format
         run: nix develop -c cargo fmt --all --check
       - name: Clippy
         run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+      - name: Web client clippy (wasm32)
+        run: nix develop -c cargo clippy -p looklab-web --target wasm32-unknown-unknown -- -D warnings
       - name: Scene worker test artifact
         run: LOOKLAB_SCENE_WASM=only nix develop -c sh site/scripts/wasm-assets.sh
       - name: Test

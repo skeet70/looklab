@@ -6,11 +6,11 @@ RAW samples for `looklab-raw` and the CLI. `fixtures/manifest.toml` is the autho
 
 Every sample here is CC0 1.0. raw.pixls.us marks each file's license column with the CC0 public-domain dedication (`https://creativecommons.org/publicdomain/zero/1.0/`), and the manifest records `consent = "CC0 public sample (raw.pixls.us)"`. The files are unmodified downloads; only the local file names are shortened.
 
-## Committed subset
+## Storage
 
-`fujifilm-x-s10.raf` (18,675,216 bytes, 1042×696 reduced) and `canon-eos-60d.dng` (471,476 bytes, 480×270 reduced) total 19,146,692 bytes, within the 20 MB committed cap.
+`fixtures/manifest.toml` records `committed` per file. `true` files live in this directory in plain git: only vectors small enough to embed, such as `canon-eos-60d.dng` (471,476 bytes, 480×270 reduced RGGB crop) and the fuzz seed prefixes under `fuzz/corpus/`. `false` files are fetch-only and land in `fixtures/cache/` (gitignored). `"lfs"` files are donated RAWs stored in Git LFS under `fixtures/donated/`, which holds its own note on the consent rule.
 
-The RAF is an X-Trans IV sensor, so it exercises the 6×6 tile path. The DNG is a small RGGB crop, so it exercises the 2×2 path and the DNG ColorMatrix1/2 path. Other samples in the manifest are fetch-only and land in `fixtures/cache/` (gitignored); `sigma-fp-8bit.dng` is an 8-bit Sigma fp DNG used as a smoke test when present.
+`fujifilm-x-s10.raf` (18,675,216 bytes, 1042×696 reduced) is fetch-only. Its X-Trans IV sensor exercises the 6×6 tile path; the Canon DNG exercises the 2×2 path and the DNG ColorMatrix1/2 path. `sigma-fp-8bit.dng` is an 8-bit Sigma fp DNG used as a smoke test when present.
 
 ## Preview photographs
 
@@ -43,11 +43,11 @@ nix develop -c cargo run -p looklab-prep --example fixture_pattern
 ## Fetching
 
 ```sh
-tools/fetch-fixtures.sh          # download missing or corrupt files
-tools/fetch-fixtures.sh --check  # verify only
+tools/fetch-fixtures.sh          # download missing or corrupt fetch-only files
+tools/fetch-fixtures.sh --check  # verify every entry
 ```
 
-The script reads the manifest with `python3`, downloads with `curl`, and verifies size and sha256 with `sha256sum`; whichever of those is missing from PATH is run through `nix shell`.
+The script reads the manifest with `python3`, downloads with `curl`, and verifies size and sha256 with `sha256sum`; whichever of those is missing from PATH is run through `nix shell`. A Git LFS entry is verified in place and never downloaded, so run `git lfs pull` first.
 
 ## Reference decode
 
@@ -55,7 +55,7 @@ The reference reduced image is produced with LibRaw, independently of rawler:
 
 ```sh
 nix shell nixpkgs#libraw nixpkgs#python3 -c \
-    python3 tools/ref-decode.py --file fixtures/fujifilm-x-s10.raf \
+    python3 tools/ref-decode.py --file fixtures/cache/fujifilm-x-s10.raf \
     --pattern GGRGGBGGBGGRBRGRBGGGBGGRGGRGGBRBGBRG --tile 6 \
     --crop 0,5,6252,4176 --black 1022 --white 16382 \
     --out crates/looklab-raw/tests/golden/fujifilm-x-s10.json
@@ -77,7 +77,9 @@ nix develop -c cargo test -p looklab-raw                                  # nati
 nix develop -c cargo test -p looklab-raw --target wasm32-unknown-unknown  # Node wasm32, digest parity with native
 ```
 
-The wasm test embeds the committed RAF and DNG with `include_bytes!` and compares the FNV-1a-64 digest of the reduced f32 image against the same constants the native tests use. The Canon DNG test also checks that DNG `ForwardMatrix1`/`ForwardMatrix2` are exposed with their calibration illuminants. `.cargo/config.toml` selects `wasm-bindgen-test-runner`, which runs under Node.
+The wasm test embeds the fetched RAF and the committed DNG with `include_bytes!`, so `tools/fetch-fixtures.sh` must run before it compiles, and compares the FNV-1a-64 digest of the reduced f32 image against the same constants the native tests use. The Canon DNG test also checks that DNG `ForwardMatrix1`/`ForwardMatrix2` are exposed with their calibration illuminants. `.cargo/config.toml` selects `wasm-bindgen-test-runner`, which runs under Node.
+
+Native tests read fixtures from this directory or from `fixtures/cache/` at runtime and fail with the fetch command when a file is absent.
 
 ## Fuzzing
 

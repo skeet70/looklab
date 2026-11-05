@@ -19,8 +19,8 @@ use looklab_samples::{
     PrepVersion, PriorTransformVersion, RerenderGroupId, SampleFlags, SampleHeader, SampleSet,
 };
 use looklab_schema::{
-    Date, FixtureDonation, FixtureLicense, FixtureUpload, LabeledTag, MakernoteValue, Sha256Hex,
-    frame_fixture_upload,
+    Date, FixtureDonation, FixtureLicense, FixtureUpload, LabeledTag, MakernoteValue, Placement,
+    Sha256Hex, frame_fixture_upload,
 };
 use looklab_server::{AppState, Config, PowConfig, router};
 use looklab_upload::{
@@ -2754,7 +2754,7 @@ makernote: { tag: FilmMode, value: 1792 }
         donator: Some("tester".to_owned()),
         donated_on: Date::parse("2026-11-04").expect("date"),
         license: FixtureLicense::Cc0_1_0,
-        committed: false,
+        placement: Placement::Fetch,
     };
     let (status, body) = server
         .submit_proposal("mapping", mapping, std::slice::from_ref(&fixture), true)
@@ -2849,7 +2849,7 @@ async fn an_uploaded_fixture_is_exported_on_approval() {
         donator: Some("tester".to_owned()),
         donated_on: Date::parse("2026-11-04").expect("date"),
         license: FixtureLicense::Cc0_1_0,
-        committed: false,
+        placement: Placement::Fetch,
     };
     let body_yaml = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
     let (status, body) = server
@@ -2872,7 +2872,7 @@ async fn an_uploaded_fixture_is_exported_on_approval() {
     );
     let manifest =
         std::fs::read_to_string(snapshot.join("fixtures/manifest.toml")).expect("manifest");
-    assert!(manifest.contains("committed = true"), "{manifest}");
+    assert!(manifest.contains("committed = \"lfs\""), "{manifest}");
     assert!(!manifest.contains("source ="), "{manifest}");
     let failures = looklab_schema::validate_snapshot_dir(&snapshot).expect("snapshot walk");
     assert!(failures.is_empty(), "{failures:?}");
@@ -2898,7 +2898,7 @@ async fn a_fixture_source_needs_an_upload_by_the_proposer() {
         donator: None,
         donated_on: Date::parse("2026-11-04").expect("date"),
         license: FixtureLicense::Cc0_1_0,
-        committed: false,
+        placement: Placement::Fetch,
     };
     let body_yaml = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
     let (status, body) = server
@@ -3022,7 +3022,7 @@ async fn a_fixture_backed_body_needs_a_fixture_donation() {
         donator: None,
         donated_on: Date::parse("2026-11-04").expect("date"),
         license: FixtureLicense::Cc0_1_0,
-        committed: false,
+        placement: Placement::Fetch,
     };
     let (status, body) = server
         .submit_proposal("body", &body_yaml, std::slice::from_ref(&donation), true)

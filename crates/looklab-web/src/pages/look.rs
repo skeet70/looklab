@@ -261,6 +261,20 @@ fn LookPageView(page: LookPage) -> impl IntoView {
     let origin_kind = page.kind;
     let description = page.description.clone();
     let card_slug = page.slug.to_string();
+    let superseded_by = page.superseded_by.clone();
+    let version_matchability = {
+        let versions: Vec<(String, bool)> = page
+            .versions
+            .iter()
+            .map(|entry| (entry.version().to_string(), entry.matchable))
+            .collect();
+        Signal::derive(move || {
+            versions
+                .iter()
+                .find(|(version, _)| *version == selected.get())
+                .is_none_or(|(_, matchable)| *matchable)
+        })
+    };
 
     view! {
         <article class="look">
@@ -279,6 +293,11 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                     };
                     view! { <p class="muted">{origin}</p> }.into_any()
                 }, _ => ().into_any() }}
+                {superseded_by.map(|pin| {
+                    let href = crate::base::site_url(&format!("/looks/{}", pin.slug.as_str()));
+                    let label = format!("{} {}", pin.slug.as_str(), pin.version.as_str());
+                    view! { <p class="notice">"Superseded by " <a href=href>{label}</a></p> }
+                })}
             </header>
             <ui::Tabs tabs selected=tab>
             <div hidden=move || active_tab.get() != LookTab::History>
@@ -372,18 +391,28 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                     }.into_any()
                 }, _ => ().into_any()
             }}
-            {move || match index.get() { Load::Ready(index) => {
-                let slug = match_slug.clone();
-                let href = move || crate::base::site_url(&format!(
-                    "/match?camera={}&look={slug}",
-                    camera.get().map(|id| id.to_string()).unwrap_or_default(),
-                ));
-                view! {
-                    <h2>"Get this look"</h2>
-                    <ui::CameraPicker cameras=index.bodies selected=camera/>
-                    <a class="button" href=href>"Find my settings"</a>
-                }.into_any()
-            }, _ => ().into_any() }}
+            {move || {
+                if !version_matchability.get() {
+                    return view! {
+                        <p class="muted">"This version is a preview only and cannot be matched."</p>
+                    }.into_any();
+                }
+                match index.get() {
+                    Load::Ready(index) => {
+                        let slug = match_slug.clone();
+                        let href = move || crate::base::site_url(&format!(
+                            "/match?camera={}&look={slug}",
+                            camera.get().map(|id| id.to_string()).unwrap_or_default(),
+                        ));
+                        view! {
+                            <h2>"Get this look"</h2>
+                            <ui::CameraPicker cameras=index.bodies selected=camera/>
+                            <a class="button" href=href>"Find my settings"</a>
+                        }.into_any()
+                    }
+                    _ => ().into_any(),
+                }
+            }}
             {move || match version.get() {
                 Load::Ready(loaded) if loaded.manifest.artifacts.iter().any(|artifact| artifact.name.as_str() == looklab_publish::CARD_ARTIFACT) => {
                     let slug = card_slug.clone();

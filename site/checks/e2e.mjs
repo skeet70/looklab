@@ -42,7 +42,7 @@ const options = {
   origin: 'http://localhost:8099',
   out: '/tmp/looklab-e2e',
   state: '/tmp/looklab-stub-state',
-  raw: 'fixtures/fujifilm-x-s10.raf',
+  raw: 'fixtures/cache/fujifilm-x-s10.raf',
   jpeg: 'fixtures/generated/fujifilm-x-s10.jpg',
   body: 'fujifilm/x-s10',
   firmware: '1.00',
@@ -351,6 +351,49 @@ async function contribute(size) {
         check(await dialog.getByRole('article').count() === 3, `${size}: wanted guide shows the top three requests`);
         check(await dialog.getByRole('article').first().textContent().then(text => text.includes(wantedLook.name) && text.includes(`${wantedCamera.make} ${wantedCamera.model}`)), `${size}: wanted guide shows published look and camera names`);
       }
+      if (index === 3) {
+        const { createHash } = await import('node:crypto');
+        const fixtureSeed = createHash('sha256').update('looklab-fixture-pattern-v1').digest('hex');
+        const link = dialog.getByRole('link', { name: 'Open the measurement pattern on your phone', exact: true });
+        const address = await dialog.getByRole('textbox', { name: 'Pattern URL', exact: true }).inputValue();
+        const expected = new URL(`pattern/${fixtureSeed}`, `${options.origin}/`).href;
+        check(address === expected, `${size}: phone link uses the public fixture and deployment prefix`);
+        check(await link.evaluate(anchor => anchor.href) === address, `${size}: phone link and selectable URL agree`);
+        await writeFile(`${options.out}/pattern-${size}.url`, `${address}\n`);
+        await dialog.getByRole('img', { name: 'Scan to open the measurement pattern', exact: true }).screenshot({ path: `${options.out}/pattern-qr-${size}.png` });
+        const [pattern] = await Promise.all([page.waitForEvent('popup'), link.click()]);
+        try {
+          if (options.browser === 'chromium') {
+            const cdp = await page.context().newCDPSession(pattern);
+            await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
+          }
+          await pattern.reload();
+          const canvas = pattern.getByRole('button', { name: 'Measurement pattern. Tap or press Enter for fullscreen.', exact: true });
+          await canvas.waitFor();
+          check(pattern.url() === address, `${size}: phone link opens its pattern in a new tab`);
+          const rendered = () => pattern.locator('canvas').evaluate(canvas => canvas.width === innerWidth && canvas.height === innerHeight && canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data.some((channel, index) => index % 4 !== 3 && channel !== 0));
+          check(await rendered(), `${size}: phone pattern fills the viewport with rendered pixels`);
+          check(!await pattern.locator('.site-header').isVisible() && !await pattern.locator('footer').isVisible(), `${size}: phone pattern has no site chrome`);
+          for (const colorScheme of ['light', 'dark']) {
+            await pattern.emulateMedia({ colorScheme });
+            await pattern.screenshot({ path: `${options.out}/phone-pattern-${size}-${colorScheme}.png` });
+          }
+          if (await pattern.evaluate(() => document.fullscreenEnabled)) {
+            await canvas.focus();
+            await pattern.keyboard.press('Enter');
+            await pattern.waitForFunction(() => document.fullscreenElement !== null);
+            check(true, `${size}: pattern supports keyboard fullscreen`);
+            await pattern.evaluate(() => document.exitFullscreen());
+          }
+          const other = new URL(address);
+          other.pathname = other.pathname.replace(/[a-f0-9]{64}$/, 'ab'.repeat(32));
+          await pattern.goto(other.href);
+          await canvas.waitFor();
+          check(await rendered(), `${size}: pattern route renders another 64-hex seed`);
+        } finally {
+          await pattern.close();
+        }
+      }
       await capture(`contribute-help-${index}`, false);
       await page.keyboard.press('Escape');
       await dialog.waitFor({ state: 'hidden' });
@@ -586,6 +629,19 @@ async function pages() {
             check(await page.getByRole('group', { name: 'Comparison view', exact: true }).count() === 0, `${size}: ${theme} home hides view-mode controls`);
             check(await page.getByRole('group', { name: 'Image surround', exact: true }).count() === 0, `${size}: ${theme} home hides surround controls`);
             check(await page.getByRole('slider', { name: 'Comparison divider', exact: true }).count() === 1, `${size}: ${theme} home retains the split divider`);
+            const index = await (await page.request.get(`${options.origin}/data/index.json`)).json();
+            const publicLooks = index.looks.filter(look => look.visibility === undefined || look.visibility === 'public');
+            const baseline = index.reference_preview ? 'Neutral' : publicLooks[0].name;
+            const initialLook = index.reference_preview ? publicLooks[0] : (publicLooks[1] ?? publicLooks[0]);
+            const hero = page.getByRole('figure').filter({ has: page.getByRole('slider', { name: 'Comparison divider', exact: true }) });
+            check(await hero.getByRole('img', { name: `Simulated: ${baseline}`, exact: true }).count() > 0, `${size}: ${theme} hero uses its published baseline or the older-index fallback`);
+            check(await page.getByRole('button', { name: initialLook.name, exact: true }).getAttribute('aria-pressed') === 'true', `${size}: ${theme} hero starts with the expected right-hand look`);
+            const chip = publicLooks.at(-1);
+            await page.getByRole('button', { name: chip.name, exact: true }).click();
+            await hero.getByRole('img', { name: `Simulated: ${chip.name}`, exact: true }).first().waitFor();
+            check(await hero.getByRole('img', { name: `Simulated: ${baseline}`, exact: true }).count() > 0, `${size}: ${theme} switching chips retains the left baseline`);
+            await page.getByRole('button', { name: initialLook.name, exact: true }).click();
+            await hero.getByRole('img', { name: `Simulated: ${initialLook.name}`, exact: true }).first().waitFor();
           } else if (name === 'look') {
             check(await page.getByRole('group', { name: 'Image surround', exact: true }).count() === 1, `${size}: ${theme} look retains viewer controls`);
           }

@@ -37,7 +37,9 @@ Existing tools each cover part of this. darktable-lut-generator fits a LUT from 
 | **Firmware version / Epoch** | Firmware versions are grouped into **epochs**. Within an epoch, the control schema and sim behavior are assumed identical. Epochs split at breaking changes. |
 | **Control schema** | Versioned definition of a body/epoch's look-related controls: names, ranges, steps, dependencies, makernote mappings. |
 | **Native sim** | A look built into a body's firmware (e.g. Classic Chrome on X-T5, epoch 2). |
-| **Look** | A target: function from adapted scene colorimetry to CAM16-UCS appearance. Versioned. Kinds: `native_family` (defined by native sims across bodies), `lut_defined` (defined by an uploaded LUT plus declared encoding). |
+| **Look** | A target: function from adapted scene colorimetry to CAM16-UCS appearance. Versioned. Kinds: `native_family` (defined by native sims across bodies), `lut_defined` (defined by an uploaded LUT plus its declared encodings and base rendering; it may emulate a camera rendering or a film stock, and a camera-rendering emulation is superseded once the native Look is published). |
+| **Declared encoding** | What a submitted LUT consumes and emits: a scene-referred log (transfer + gamut), or a display-referred image with a pinned base rendering; plus the output encoding. |
+| **Base rendering** | For a display-referred LUT, the published Look version (`look@version`) or body realization that maps scene colorimetry to the image the LUT expects. Pinned and frozen into the layered approximation. |
 | **Realization** | A Look as produced by a specific body + native sim + settings. |
 | **Input transform** | Per-body map from linear camera RGB (white-balanced) to scene XYZ. Initialized from published matrices, refined by the crowd and anchored by charts or spectral data. |
 | **Recipe** | Settings on a body that *attempt* a look not native to it (or a different one). Measured, never used to define the target. |

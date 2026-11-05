@@ -157,6 +157,8 @@ fn document(look: Look, slug: &str) -> LookDocument {
             admissions: vec!["example-admission".to_string()],
             anchor_version: "2026.1".to_string(),
         },
+        base: None,
+        needs_rebase: false,
         community_snapshot_version: 7,
         prep_versions: vec![1],
         created: "2026-01-01T00:00:00Z".to_string(),

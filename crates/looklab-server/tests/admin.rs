@@ -588,3 +588,78 @@ async fn public_lists_page_with_a_hard_cap() {
     assert_eq!(second.endorsements.len(), 1);
     assert!(second.next_after.is_none());
 }
+
+#[tokio::test]
+async fn hiding_removing_and_relisting_a_look_records_each_state() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    let look_slug = "superseded-lut";
+    sqlx::query(
+        "INSERT INTO look_versions (id, look, version, status, changelog, created_at)
+         VALUES (?, ?, 1, 'published', NULL, 0)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(look_slug)
+    .execute(db)
+    .await
+    .expect("look version");
+    let look = LookSlug::try_from(look_slug.to_owned()).expect("look");
+
+    let hidden = admin::hide_look(db, &moderator, &look, "superseded by a native Look")
+        .await
+        .expect("hide");
+    assert_eq!(hidden.listing, admin::ListingState::Hidden);
+    assert_eq!(hidden.superseded_by, None);
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'publish_site' AND status = 'queued'",
+    )
+    .fetch_one(db)
+    .await
+    .expect("publication job");
+    assert_eq!(queued, 1);
+    let error = admin::hide_look(db, &moderator, &look, "again")
+        .await
+        .expect_err("already hidden");
+    assert!(matches!(error, AdminError::LookState(_)));
+
+    let removed = admin::remove_look(db, &moderator, &look, "the LUT is retracted")
+        .await
+        .expect("remove");
+    assert_eq!(removed.listing, admin::ListingState::Removed);
+
+    let relisted = admin::relist_look(db, &moderator, &look, "moderator restored it")
+        .await
+        .expect("relist");
+    assert_eq!(relisted.listing, admin::ListingState::Listed);
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'publish_site' AND status = 'queued'",
+    )
+    .fetch_one(db)
+    .await
+    .expect("publication job");
+    assert_eq!(queued, 1);
+
+    let audits: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT type, COUNT(*) FROM audit_log
+         WHERE type IN ('look_hidden', 'look_removed', 'look_relisted')
+         GROUP BY type ORDER BY type",
+    )
+    .fetch_all(db)
+    .await
+    .expect("audit rows");
+    assert_eq!(
+        audits,
+        vec![
+            ("look_hidden".to_owned(), 1),
+            ("look_relisted".to_owned(), 1),
+            ("look_removed".to_owned(), 1),
+        ]
+    );
+
+    let missing = LookSlug::try_from("no-such-look".to_owned()).expect("look");
+    let error = admin::hide_look(db, &moderator, &missing, "unknown")
+        .await
+        .expect_err("unknown Look");
+    assert!(matches!(error, AdminError::UnknownLook));
+}

@@ -213,8 +213,17 @@ pub fn align(
     alignment.gain = fit_gain(&gain_samples(raw_wb_linear, jpeg, &alignment));
 
     let (u, v) = normalized_coords(grid, grid);
+    // The reduced decode integrates a CFA tile per pixel, so JPEG detail finer
+    // than a raw pixel has no counterpart and aliases the correlation score.
+    let score_jpeg = jpeg.image.downsample_area(
+        raw_wb_linear
+            .width
+            .saturating_mul(raw_wb_linear.height)
+            .max(1),
+    );
+    let score_luma = normalized_luma(&score_jpeg, grid, grid);
     let (central_correlation, central_count, central_eligible) =
-        correlation_at(raw_wb_linear, &jpeg_luma, &alignment, &u, &v)
+        correlation_at(raw_wb_linear, &score_luma, &alignment, &u, &v)
             .ok_or(PrepError::AlignNoOverlap)?;
     if central_count == 0
         || (central_count as f64) < params.min_overlap_fraction * central_eligible as f64
@@ -1484,6 +1493,62 @@ mod tests {
         }
     }
 
+    /// A pair whose JPEG is `scale` times the raw's linear size and carries a
+    /// two-pixel pattern that averages out within one raw pixel.
+    fn make_detailed_pair(raw_width: u32, raw_height: u32, scale: u32) -> (Image3, DecodedJpeg) {
+        let truth = ground_truth();
+        let (cx, cy) = centre(raw_width, raw_height);
+        let mut raw_data = Vec::with_capacity((raw_width * raw_height) as usize);
+        for y in 0..raw_height {
+            for x in 0..raw_width {
+                let u = (f64::from(x) - cx) / cx;
+                let v = (f64::from(y) - cy) / cy;
+                let radius = libm::hypot(u, v);
+                let color = scene(u, v);
+                let shading = 1.0 / true_gain(radius);
+                raw_data.push([
+                    (color[0] * shading) as f32,
+                    (color[1] * shading) as f32,
+                    (color[2] * shading) as f32,
+                ]);
+            }
+        }
+        let raw = Image3::new(raw_width, raw_height, raw_data).expect("raw image");
+        let jpeg_width = raw_width * scale;
+        let jpeg_height = raw_height * scale;
+        let mut linear = Vec::with_capacity((jpeg_width * jpeg_height) as usize);
+        for y in 0..jpeg_height {
+            for x in 0..jpeg_width {
+                let (rx, ry) = truth.jpeg_to_raw(
+                    f64::from(x),
+                    f64::from(y),
+                    jpeg_width,
+                    jpeg_height,
+                    raw_width,
+                    raw_height,
+                );
+                let u = (rx - cx) / cx;
+                let v = (ry - cy) / cy;
+                let color = scene(u, v);
+                let detail = if x % 2 == 0 { 0.3 } else { -0.3 };
+                linear.push([
+                    (tone(color[0]) * (1.0 + detail)).clamp(0.0, 1.0) as f32,
+                    (tone(color[1]) * (1.0 + detail)).clamp(0.0, 1.0) as f32,
+                    (tone(color[2]) * (1.0 + detail)).clamp(0.0, 1.0) as f32,
+                ]);
+            }
+        }
+        (
+            raw,
+            DecodedJpeg {
+                image: Image3::new(jpeg_width, jpeg_height, linear).expect("jpeg image"),
+                space: OutputSpace::Srgb,
+                space_assumed: true,
+                code_values_near_clip: vec![false; (jpeg_width * jpeg_height) as usize],
+            },
+        )
+    }
+
     fn encode_jpeg(data: Vec<[f32; 3]>, width: u32, height: u32) -> DecodedJpeg {
         let mut bytes = Vec::with_capacity(data.len() * 3);
         for pixel in data {
@@ -1550,6 +1615,14 @@ mod tests {
         assert!(alignment.central_correlation >= 0.98);
         assert!((alignment.gain[0] - TRUE_GAIN[0]).abs() < 0.08);
         assert!((alignment.gain[1] - TRUE_GAIN[1]).abs() < 0.08);
+    }
+
+    #[test]
+    fn a_detailed_jpeg_aligns_to_a_reduced_raw() {
+        let (raw, jpeg) = make_detailed_pair(450, 300, 4);
+        let alignment = align(&raw, &jpeg, &AlignParams::default()).expect("alignment");
+        assert!(alignment.central_correlation >= 0.98);
+        assert!(mapping_error(&alignment, 1800, 1200, 450, 300) < 0.3);
     }
 
     #[test]

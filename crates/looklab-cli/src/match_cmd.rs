@@ -106,6 +106,9 @@ pub fn run_match(args: &MatchArgs) -> Result<()> {
         }
     }
     let document = util::load_document(&args.look)?;
+    if !document.is_matchable() {
+        bail!("this Look's display base is not pinned; it is stored and listed but not matchable");
+    }
     let schema = load_schema(&args.body)?;
     let crm = load_crm(&args.crm)?;
     let base_document = match &args.base_look {

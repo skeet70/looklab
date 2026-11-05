@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
+use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,59 @@ pub async fn queue(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Ap
     let tier = auth::roles(&state, &actor).await?.tier;
     let queue: ModQueue = admin::mod_queue(&state.db, tier).await?;
     Ok(Json(queue).into_response())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListingAction {
+    Hide,
+    Remove,
+    Relist,
+}
+
+impl std::str::FromStr for ListingAction {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "hide" => Ok(Self::Hide),
+            "remove" => Ok(Self::Remove),
+            "relist" => Ok(Self::Relist),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ListingRequest {
+    look: String,
+    reason: String,
+}
+
+pub async fn look_listing(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(action): Path<String>,
+    payload: Result<Json<ListingRequest>, JsonRejection>,
+) -> ApiResult<Response> {
+    let moderator = auth::moderator_session(&state, &headers).await?;
+    let action: ListingAction = action
+        .parse()
+        .map_err(|()| ApiError::new(ErrorCode::NotFound))?;
+    let Json(payload) = payload.map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
+    let look = looklab_upload::LookSlug::try_from(payload.look)
+        .map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
+    let record = match action {
+        ListingAction::Hide => {
+            admin::hide_look(&state.db, &moderator, &look, &payload.reason).await?
+        }
+        ListingAction::Remove => {
+            admin::remove_look(&state.db, &moderator, &look, &payload.reason).await?
+        }
+        ListingAction::Relist => {
+            admin::relist_look(&state.db, &moderator, &look, &payload.reason).await?
+        }
+    };
+    Ok(Json(record).into_response())
 }
 
 #[derive(Deserialize)]

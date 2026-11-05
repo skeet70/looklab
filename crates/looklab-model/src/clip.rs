@@ -63,7 +63,7 @@ pub fn output_encode_clip(ucs: Ucs, output_space: RgbSpace, k: f64) -> Ucs {
 fn encode_once(ucs: Ucs, output_space: RgbSpace, k: f64) -> Option<Ucs> {
     let model = solve::reference_model();
     let jmh = ucs_to_jmh(ucs, UcsSpace::Ucs);
-    if !(jmh.j.is_finite() && jmh.m.is_finite() && jmh.h.is_finite()) {
+    if !(jmh.j.is_finite() && jmh.m.is_finite() && jmh.h.is_finite()) || jmh.j < 0.0 {
         return None;
     }
     let xyz = model.cam16_to_xyz(jmh.j, Chroma::M(jmh.m), jmh.h);
@@ -99,6 +99,18 @@ mod tests {
                 assert!((right - 1.0).abs() < 1e-5, "k={k} right={right}");
             }
         }
+    }
+
+    #[test]
+    fn negative_lightness_contracts_to_the_neutral() {
+        let neutral = output_encode_clip(Ucs::new(0.0, 0.0, 0.0), RgbSpace::Srgb, 0.03);
+        let negative = output_encode_clip(Ucs::new(-0.16, 12.0, -8.0), RgbSpace::Srgb, 0.03);
+        assert!(
+            (negative.j - neutral.j).abs() < 1e-9,
+            "{negative:?} vs {neutral:?}"
+        );
+        assert!((negative.a - neutral.a).abs() < 1e-9);
+        assert!((negative.b - neutral.b).abs() < 1e-9);
     }
 
     #[test]

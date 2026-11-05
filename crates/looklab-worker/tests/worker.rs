@@ -41,10 +41,7 @@ async fn fixture_with_transform(write_transform: bool) -> Fixture {
     fixture_with(write_transform, |_| {}).await
 }
 
-async fn fixture_with(
-    write_transform: bool,
-    configure: impl FnOnce(&mut WorkerConfig),
-) -> Fixture {
+async fn fixture_with(write_transform: bool, configure: impl FnOnce(&mut WorkerConfig)) -> Fixture {
     let dir = TempDir::new().expect("temp dir");
     let db = dir.path().join("looklab.sqlite3");
     let blobs = dir.path().join("blobs");
@@ -1522,7 +1519,7 @@ async fn non_tolerated_spatial_settings_exclude_every_image() {
         ContributionKind::Library,
         ContributionIntent::Native,
         None,
-        r#"[{"key":"clarity","step":2}]"#,
+        r#"[{"key":"clarity","step":2,"source":"reproduced"}]"#,
     )
     .await;
     worker

@@ -8,7 +8,7 @@ use looklab_color::dng::{CalibrationMatrix, DngColorSpec};
 use looklab_export::{Artifact, BakeOutput, DngInputTransform, Lut3d};
 use looklab_model::{Look, ProbeSet};
 
-/// X-S10 ColorMatrix1/2 from the committed fixture, as a dual-illuminant body.
+/// ColorMatrix1/2 of the X-S10 fixture, as a dual-illuminant body.
 pub fn body() -> DngInputTransform {
     let spec = DngColorSpec::new(
         vec![

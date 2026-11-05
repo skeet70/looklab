@@ -9,11 +9,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use looklab_export::card::{CardMeta, CardOptions, write_card};
+use looklab_export::{LutLookOptions, import_lut_look, lut_data_from_cube, read_cube};
 use looklab_fit::synth::{SynthConfig, SyntheticDataset, dataset};
 use looklab_fit::{FitOptions, fit};
 use looklab_match::{ControlCovariance, synth};
 use looklab_model::file::{
-    BodyProvenance, LookIdentity, LookKind, Provenance, RootProvenance, WbPolicy,
+    BaseReference, BaseStatus, BodyProvenance, DeclaredEncoding, DynamicRange, LicenseRecord,
+    LookIdentity, LookKind, LookVersion, LutDefinition, LutEmulation, LutRecord, OutputEncoding,
+    Provenance, Renderer, RootProvenance, Slug, WbPolicy,
 };
 use looklab_model::realization::{ControlResponseModel, encode_crm};
 use looklab_model::{
@@ -22,16 +25,18 @@ use looklab_model::{
 use looklab_publish::{
     ArtifactBlob, ArtifactHash, ArtifactName, AuditEntry, AuditEvent, AuditLog, BodyExtras,
     BodyPage, BodyUse, CARD_ARTIFACT, CredentialRef, CredentialTier, DOCUMENT_ARTIFACT, Decision,
-    GateCheck, GateSummary, InputTransformPage, LicensePage, LookPage, LookRef, LookStatus,
-    LookVersionPage, PREVIEW_LUT_ARTIFACT, ProposalRef, ProvenanceSummary, RealizationNote, Role,
-    Scene, SceneName, SiteData, SitePath, Timestamp, TransformSource, VersionNotes, VersionRef,
-    WeakSpot, bake_preview_lut, write_site,
+    GateCheck, GateSummary, InputTransformPage, LicensePage, LookListing, LookPage, LookRef,
+    LookStatus, LookVersionPage, PREVIEW_LUT_ARTIFACT, ProposalRef, ProvenanceSummary,
+    RealizationNote, Role, Scene, SceneName, SiteData, SitePath, Timestamp, TransformSource,
+    VersionNotes, VersionRef, WeakSpot, bake_lut, bake_preview_lut, write_site,
 };
 use looklab_report::compare::{ComparisonInput, FunctionName, compare};
-use looklab_schema::{validate_body, validate_control_schema};
+use looklab_schema::{BodyId, SimKey, validate_body, validate_control_schema};
 
 const SIZE: u32 = 1414;
 const CREATED: &str = "2026-11-04T00:00:00Z";
+const DONOR_ATTRIBUTION: &str = "mistycycles (Discord), donated 2026-11-05";
+const DONOR_LICENSE: &str = "CC0-1.0";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let out = PathBuf::from(
@@ -60,7 +65,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     bodies.push(fixture_body()?);
 
-    let looks = synthetic_looks(&bodies)?;
+    let mut looks = synthetic_looks(&bodies)?;
     for body in &mut bodies {
         for card in &mut body.native_looks {
             if let Some(look) = looks.get(if card.sim_key.as_str() == "classic_chrome" {
@@ -83,6 +88,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    looks.extend(community_looks()?);
     let mut audit = vec![
         AuditEntry {
             seq: 1,
@@ -137,6 +143,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         looks,
         audit_log: AuditLog::new(audit),
         scenes: canonical_scenes()?,
+        reference_preview: Some(ArtifactBlob::new(
+            ArtifactName::new("neutral.lut33")?,
+            bake_lut(&Look::colorimetric(), |xyz| xyz),
+        )),
     };
 
     let mut sink = |path: &SitePath, bytes: &[u8]| -> std::io::Result<()> {
@@ -259,6 +269,238 @@ fn fixture_body() -> Result<BodyPage, Box<dyn Error>> {
         }],
     };
     Ok(BodyPage::from_schema(&body, &schema, &extras)?)
+}
+
+fn community_looks() -> Result<Vec<LookPage>, Box<dyn Error>> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/luts");
+    let mut looks = Vec::new();
+    looks.push(community_look(
+        &dir,
+        "Ricoh_GRIV_Cinema_Green_SRGB.cube",
+        "ricoh-griv-cinema-green",
+        "Ricoh GR IV Cinema Green",
+        "Cinema Green",
+        "Cinema Green from the Ricoh GR IV, the donor's original sRGB grade. The graded image is not stated, so the preview uses the neutral baseline and the Look is not matchable.",
+        x_e3_base(None, DynamicRange::Dr200)?,
+        Some(LutEmulation::CameraRendering {
+            maker: "ricoh".to_owned(),
+            rendering: "Cinema (Green)".to_owned(),
+        }),
+        "AI-tool approximation of Ricoh GR stock Cinema (Green) image control, sRGB variant; not graded by a person.",
+        Some("base incomplete: film simulation not declared"),
+    )?);
+    looks.push(community_look(
+        &dir,
+        "CineStill_800T_1600T_sRGB_V4.cube",
+        "cinestill-800t-pushed-1600",
+        "CineStill 800T pushed to 1600",
+        "CineStill 800T 1600",
+        "Parametric approximation of CineStill 800T pushed one stop, built from published descriptions rather than measured scans. The intended base is Fujifilm Classic Negative at DR400, declared by the donor but not applied (their X-E3 lacks the sim); the preview uses the neutral baseline and the Look is not matchable until the base Look is published.",
+        family_base("Classic Negative", DynamicRange::Dr400),
+        Some(LutEmulation::FilmStock {
+            name: "CineStill 800T".to_owned(),
+        }),
+        "Intended base declared by the donor; the LUT was authored for this base and not applied on it (donor body X-E3 lacks the sim).",
+        Some("base identified, unmeasured: fujifilm / Classic Negative at DR400"),
+    )?);
+    looks.push(community_look(
+        &dir,
+        "Leica_Classic_Gold_200.cube",
+        "leica-classic-gold-200",
+        "Leica Classic Gold 200",
+        "Gold 200",
+        "Classic Gold 200 from a Leica Classic. The intended base is Fujifilm Eterna at DR200, declared by the donor but not applied (their X-E3 lacks the sim); the preview uses the neutral baseline and the Look is not matchable until the base Look is published.",
+        family_base("Eterna", DynamicRange::Dr200),
+        Some(LutEmulation::CameraRendering {
+            maker: "leica".to_owned(),
+            rendering: "Classic".to_owned(),
+        }),
+        "Intended base declared by the donor; the LUT was authored for this base and not applied on it (donor body X-E3 lacks the sim).",
+        Some("base identified, unmeasured: fujifilm / Eterna at DR200"),
+    )?);
+    Ok(looks)
+}
+
+fn family_base(rendering: &str, dr: DynamicRange) -> DeclaredEncoding {
+    DeclaredEncoding::DisplayReferred {
+        base: BaseReference::FamilyRendering {
+            maker: "fujifilm".to_owned(),
+            rendering: rendering.to_owned(),
+            dynamic_range: Some(dr),
+            notes: "Donor body: fujifilm/x-e3. The LUT was authored for this intended base and not applied on it."
+                .to_owned(),
+        },
+        status: BaseStatus::BaseIdentifiedUnmeasured,
+    }
+}
+
+fn x_e3_base(sim: Option<&str>, dr: DynamicRange) -> Result<DeclaredEncoding, Box<dyn Error>> {
+    let reference = BaseReference::BodyRealization {
+        body: BodyId::new("fujifilm/x-e3")?,
+        renderer: Renderer::XRawStudio,
+        film_simulation: sim.map(SimKey::new).transpose()?,
+        dynamic_range: Some(dr),
+        notes: "X-RAW Studio (camera engine); other settings at camera defaults as far as known."
+            .to_owned(),
+    };
+    let schema = validate_control_schema(include_str!("../../../data/bodies/fujifilm-x-e3.yaml"))
+        .map_err(|errors| format!("{errors:?}"))?;
+    let status = reference.resolve_status(Some(&schema));
+    Ok(DeclaredEncoding::DisplayReferred {
+        base: reference,
+        status,
+    })
+}
+
+fn community_look(
+    dir: &Path,
+    file: &str,
+    slug: &str,
+    name: &str,
+    short_name: &str,
+    description: &str,
+    encoding: DeclaredEncoding,
+    emulation: Option<LutEmulation>,
+    provenance_note: &str,
+    base_note: Option<&str>,
+) -> Result<LookPage, Box<dyn Error>> {
+    let text = fs::read_to_string(dir.join(file))?;
+    let cube = read_cube(&text)?;
+    let lut = lut_data_from_cube(&cube)?;
+    let definition = LutDefinition {
+        name: name.to_owned(),
+        license: LicenseRecord {
+            own_work: false,
+            source_license: Some(DONOR_LICENSE.to_owned()),
+            source_url: None,
+            attribution: DONOR_ATTRIBUTION.to_owned(),
+        },
+        encoding,
+        output: OutputEncoding::Srgb,
+        lut: LutRecord {
+            size: lut.size,
+            domain_min: lut.domain_min,
+            domain_max: lut.domain_max,
+            values_ref: looklab_model::BinRef::new("bin:lut")?,
+        },
+        emulates: emulation,
+        superseded_by: None,
+        notes: vec![
+            "Imported from a community-donated LUT.".to_owned(),
+            provenance_note.to_owned(),
+        ],
+    };
+    let identity = LookIdentity::new(slug, "1.0.0", LookKind::LutDefined, WbPolicy::Adaptive)?;
+    let imported = import_lut_look(identity, definition, &cube, None, LutLookOptions::default())?;
+    let mut document = imported.document;
+    document.file.provenance.created = CREATED.to_owned();
+    document.file.provenance.software = "looklab-publish site_data".to_owned();
+    let look_bytes = document.encode()?;
+    let preview = bake_preview_lut(&document);
+    let mut artifacts = vec![
+        ArtifactBlob::new(ArtifactName::new(DOCUMENT_ARTIFACT)?, look_bytes),
+        ArtifactBlob::new(ArtifactName::new(PREVIEW_LUT_ARTIFACT)?, preview),
+    ];
+    if document.is_matchable() {
+        let card = write_card(
+            &document,
+            &CardMeta::new(name, short_name)
+                .with_description(description)
+                .with_license(DONOR_LICENSE),
+            &CardOptions::default(),
+        )?;
+        artifacts.push(ArtifactBlob::new(ArtifactName::new(CARD_ARTIFACT)?, card));
+    }
+    let p95 = imported.approximation.p95;
+    let approximation_ok = p95.is_finite() && p95 <= 1.0;
+    let mut checks = vec![
+        GateCheck {
+            name: "license declaration".to_owned(),
+            passed: true,
+            detail: Some(format!("{DONOR_LICENSE}; {DONOR_ATTRIBUTION}")),
+        },
+        GateCheck {
+            name: "approximation".to_owned(),
+            passed: approximation_ok,
+            detail: Some(format!(
+                "p95 {:.3} ΔE on {} probes",
+                p95, imported.approximation.probes
+            )),
+        },
+    ];
+    if document.is_matchable() {
+        checks.push(GateCheck {
+            name: "declared encoding".to_owned(),
+            passed: true,
+            detail: Some("matches the imported LUT".to_owned()),
+        });
+    } else {
+        checks.push(GateCheck {
+            name: "base".to_owned(),
+            passed: false,
+            detail: Some(base_note.unwrap_or("base unknown").to_owned()),
+        });
+    }
+    let status = if document.is_matchable() && approximation_ok {
+        LookStatus::Published
+    } else {
+        LookStatus::Provisional
+    };
+    let mut changelog = vec![format!(
+        "Imported from {file} ({DONOR_LICENSE}, {DONOR_ATTRIBUTION})."
+    )];
+    if let Some(note) = base_note {
+        changelog.push(note.to_owned());
+    }
+    let notice = if document.is_matchable() {
+        None
+    } else {
+        Some(format!(
+            "Not matchable and no card file: {}. The preview is approximate, not a target.",
+            base_note.unwrap_or("base unknown")
+        ))
+    };
+    let mut version = LookVersionPage::new(
+        Slug::new(slug)?,
+        LookVersion::new("1.0.0")?,
+        status,
+        GateSummary { checks },
+        community_provenance_summary(),
+        artifacts,
+        VersionNotes {
+            changelog,
+            weak_spots: Vec::new(),
+            notice,
+        },
+    )?;
+    version.matchable = document.is_matchable();
+    Ok(LookPage {
+        slug: Slug::new(slug)?,
+        name: name.to_owned(),
+        kind: LookKind::LutDefined,
+        wb_policy: WbPolicy::Adaptive,
+        description: description.to_owned(),
+        aliases: Vec::new(),
+        license: Some(LicensePage {
+            declaration: format!("Licensed for redistribution under {DONOR_LICENSE}"),
+            attribution: DONOR_ATTRIBUTION.to_owned(),
+        }),
+        listing: LookListing::Listed,
+        superseded_by: None,
+        versions: vec![version],
+    })
+}
+
+fn community_provenance_summary() -> ProvenanceSummary {
+    ProvenanceSummary {
+        bodies: Vec::new(),
+        root_admissions: Vec::new(),
+        anchor_version: String::new(),
+        community_snapshot_version: 0,
+        prep_versions: Vec::new(),
+        created: CREATED.to_owned(),
+        software: "looklab-publish site_data".to_owned(),
+    }
 }
 
 fn synthetic_looks(bodies: &[BodyPage]) -> Result<Vec<LookPage>, Box<dyn Error>> {
@@ -396,6 +638,8 @@ fn synthetic_looks(bodies: &[BodyPage]) -> Result<Vec<LookPage>, Box<dyn Error>>
                 declaration: "Project-owned synthetic data".to_owned(),
                 attribution: "looklab".to_owned(),
             }),
+            listing: LookListing::Listed,
+            superseded_by: None,
             versions: vec![version],
         });
     }
@@ -552,6 +796,35 @@ fn report_recovery(
         );
         errors.push(looklab_color::ucs::delta_e_ucs(truth, recovered));
     }
+    let mut supported: Vec<(f64, f64)> = Vec::new();
+    let mut covered_index = 0usize;
+    for (index, probe) in probes.probes.iter().enumerate() {
+        if gap.excludes(probe.xyz) {
+            continue;
+        }
+        if let Some(estimate) = result.probes.probes.get(index) {
+            if estimate.supported {
+                supported.push((errors[covered_index], estimate.post_sigma_de));
+            }
+        }
+        covered_index += 1;
+    }
+    let inside = supported
+        .iter()
+        .filter(|(error, sigma)| error <= &(2.0 * sigma))
+        .count();
+    let mut ratios: Vec<f64> = supported
+        .iter()
+        .map(|(error, sigma)| error / sigma.max(1e-9))
+        .collect();
+    ratios.sort_by(f64::total_cmp);
+    let ratio = ratios.get(ratios.len() / 2).copied().unwrap_or(0.0);
+    println!(
+        "{slug}: supported coverage {}/{} = {:.3}, median error/sigma {ratio:.3}",
+        inside,
+        supported.len(),
+        inside as f64 / supported.len().max(1) as f64,
+    );
     errors.sort_by(f64::total_cmp);
     let mean = errors.iter().sum::<f64>() / errors.len() as f64;
     let p95 = errors[(errors.len() - 1) * 95 / 100];
@@ -753,6 +1026,8 @@ fn provenance(
             admissions: Vec::new(),
             anchor_version: "1.0.0".to_owned(),
         },
+        base: None,
+        needs_rebase: false,
         community_snapshot_version: 1,
         prep_versions,
         created: CREATED.to_owned(),
@@ -852,8 +1127,8 @@ fn canonical_scenes() -> Result<Vec<Scene>, Box<dyn Error>> {
     let mut scenes = Vec::new();
     if !std::env::args().any(|arg| arg == "--charts-only") {
         for (id, title) in [
-            ("1955", "Riverside light"),
             ("3115", "Coastal dunes"),
+            ("1955", "Riverside light"),
             ("1824", "Autumn canopy"),
             ("1797", "Blue boat on a green waterway"),
             ("3094", "Frog among lily pads"),

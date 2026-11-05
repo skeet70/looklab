@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Download and verify the RAW fixtures listed in fixtures/manifest.toml.
-# `--check` verifies without downloading.
-# Committed fixtures land in fixtures/, fetch-only ones in fixtures/cache/.
-# curl and sha256sum come from PATH, or from nix when absent.
+# Download and verify the RAW fixtures in fixtures/manifest.toml; `--check` verifies only.
+# Plain-git files live in fixtures/, Git LFS in fixtures/donated/ (verified, never fetched),
+# fetch-only in fixtures/cache/. curl and sha256sum come from PATH, or from nix when absent.
 
 set -euo pipefail
 
@@ -44,11 +43,25 @@ read_manifest() {
   reader=$(cat <<'PY'
 import sys, tomllib
 
+PLACEMENTS = {True: "git", False: "fetch", "lfs": "lfs"}
+
 with open(sys.argv[1], "rb") as fh:
     manifest = tomllib.load(fh)
 for fixture in manifest["fixture"]:
-    committed = "true" if fixture["committed"] else "false"
-    print("\t".join([fixture["file"], fixture["source_url"], fixture["sha256"], str(fixture["size"]), committed]))
+    committed = fixture["committed"]
+    if committed not in PLACEMENTS:
+        raise SystemExit(f"{fixture['file']}: unknown committed value {committed!r}")
+    print(
+        "\t".join(
+            [
+                fixture["file"],
+                fixture.get("source_url") or "-",
+                fixture["sha256"],
+                str(fixture["size"]),
+                PLACEMENTS[committed],
+            ]
+        )
+    )
 PY
 )
   if command -v python3 >/dev/null 2>&1; then
@@ -59,12 +72,17 @@ PY
 }
 
 status=0
-while IFS=$'\t' read -r file url sha size committed; do
-  if [[ $committed == "true" ]]; then
-    dest="$root/fixtures/$file"
-  else
-    dest="$root/fixtures/cache/$file"
-  fi
+while IFS=$'\t' read -r file url sha size placement; do
+  case $placement in
+    git) dest="$root/fixtures/$file" ;;
+    lfs) dest="$root/fixtures/donated/$file" ;;
+    fetch) dest="$root/fixtures/cache/$file" ;;
+    *)
+      echo "unknown placement '$placement' for $file" >&2
+      status=1
+      continue
+      ;;
+  esac
 
   if [[ -f $dest ]]; then
     actual_size=$(wc -c <"$dest")
@@ -74,12 +92,22 @@ while IFS=$'\t' read -r file url sha size committed; do
       continue
     fi
     echo "corrupt  $file" >&2
-    if [[ $check_only == 1 ]]; then
-      status=1
+    status=1
+    if [[ $placement != "fetch" || $check_only == 1 ]]; then
       continue
     fi
-  elif [[ $check_only == 1 ]]; then
-    echo "missing  $file" >&2
+  elif [[ $check_only == 1 || $placement != "fetch" ]]; then
+    if [[ $placement == "lfs" ]]; then
+      echo "missing  $file (run git lfs pull)" >&2
+    else
+      echo "missing  $file" >&2
+    fi
+    status=1
+    continue
+  fi
+
+  if [[ $url == "-" ]]; then
+    echo "no source_url for $file" >&2
     status=1
     continue
   fi

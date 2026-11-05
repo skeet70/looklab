@@ -68,7 +68,7 @@ data/
   probes/           # probe set definitions (versioned)
   charts/           # chart reference values (with source/licensing notes)
 tools/golden/       # dev-only Python scripts producing golden test vectors from colour-science
-fixtures/           # manifest + small committed subset (see AGENTS.md)
+fixtures/           # manifest + fetched/LFS/plain-git fixture policy (see AGENTS.md)
 xtask/              # cargo xtask: float-method allow-list, SPDX headers, wasm32 core build, native/wasm bit identity
 fuzz/               # cargo-fuzz project (its own workspace, excluded from the crate workspace); runs the sample reader
 ```

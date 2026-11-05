@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 
 use looklab_color::cam16::ViewingConditions;
+use looklab_schema::{BodyId, SimKey};
 use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 
@@ -118,6 +119,507 @@ impl From<BinRef> for String {
 pub enum LookKind {
     NativeFamily,
     LutDefined,
+}
+
+pub const NEUTRAL_BASELINE_SRGB_V1: &str = "looklab-neutral-srgb-v1";
+
+/// Largest stored LUT side.
+pub const MAX_LUT_SIDE: u32 = 64;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// The submitter's license declaration and the credit shown on the Look page.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LicenseRecord {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub own_work: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_license: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+    pub attribution: String,
+}
+
+impl LicenseRecord {
+    pub fn validate(&self) -> Result<()> {
+        match (&self.source_license, self.own_work) {
+            (Some(source), false) if !source.trim().is_empty() && source.chars().count() <= 200 => {
+            }
+            (None, true) => {}
+            _ => {
+                return Err(ModelError::Invalid(
+                    "license needs exactly one of own_work or source_license".to_string(),
+                ));
+            }
+        }
+        if self.source_url.is_some() && self.source_license.is_none() {
+            return Err(ModelError::Invalid(
+                "license source_url without a source_license".to_string(),
+            ));
+        }
+        if self.attribution.trim().is_empty() || self.attribution.chars().count() > 500 {
+            return Err(ModelError::Invalid("license attribution".to_string()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogTransfer {
+    #[serde(rename = "flog2")]
+    Flog2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gamut {
+    Fgamut,
+}
+
+pub const NEUTRAL_BASELINE_SLUG: &str = "looklab-neutral-srgb-v1";
+pub const NEUTRAL_BASELINE_VERSION: &str = "1.0.0";
+
+/// The Look version or body realization a display-referred LUT expects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BaseReference {
+    Look {
+        slug: Slug,
+        version: LookVersion,
+    },
+    BodyRealization {
+        body: BodyId,
+        renderer: Renderer,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        film_simulation: Option<SimKey>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dynamic_range: Option<DynamicRange>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        notes: String,
+    },
+    /// An intended family rendering with no published Look version yet.
+    FamilyRendering {
+        maker: String,
+        rendering: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dynamic_range: Option<DynamicRange>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        notes: String,
+    },
+}
+
+impl BaseReference {
+    pub fn neutral_baseline() -> Self {
+        Self::Look {
+            slug: Slug::new(NEUTRAL_BASELINE_SLUG).expect("static neutral baseline slug"),
+            version: LookVersion::new(NEUTRAL_BASELINE_VERSION)
+                .expect("static neutral baseline version"),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if let Self::FamilyRendering {
+            maker, rendering, ..
+        } = self
+            && (maker.trim().is_empty() || rendering.trim().is_empty())
+        {
+            return Err(ModelError::Invalid("family rendering base".to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn resolve_status(&self, schema: Option<&looklab_schema::ControlSchema>) -> BaseStatus {
+        let Self::BodyRealization {
+            body,
+            film_simulation,
+            dynamic_range,
+            ..
+        } = self
+        else {
+            return match self {
+                Self::Look { .. } => BaseStatus::Pinned,
+                Self::FamilyRendering { .. } => BaseStatus::BaseIdentifiedUnmeasured,
+                Self::BodyRealization { .. } => unreachable!(),
+            };
+        };
+        let Some(schema) = schema else {
+            return BaseStatus::BaseIncomplete {
+                missing: BaseField::Body,
+            };
+        };
+        if schema.body != *body {
+            return BaseStatus::BaseInconsistent {
+                field: BaseField::Body,
+            };
+        }
+        let Some(sim) = film_simulation else {
+            return BaseStatus::BaseIncomplete {
+                missing: BaseField::FilmSimulation,
+            };
+        };
+        let Some(dynamic_range) = dynamic_range else {
+            return BaseStatus::BaseIncomplete {
+                missing: BaseField::DynamicRange,
+            };
+        };
+        let has_sim = schema.epochs.iter().any(|epoch| {
+            epoch
+                .native_sims
+                .iter()
+                .any(|declared| declared.key == *sim)
+        });
+        if !has_sim {
+            return BaseStatus::BaseInconsistent {
+                field: BaseField::FilmSimulation,
+            };
+        }
+        let dr = dynamic_range.as_str();
+        let has_dr = schema.epochs.iter().any(|epoch| {
+            epoch.controls.iter().any(|control| {
+                control.key.as_str() == "dynamic_range"
+                    && control
+                        .values
+                        .as_ref()
+                        .is_some_and(|values| values.iter().any(|value| value.as_str() == dr))
+            })
+        });
+        if !has_dr {
+            return BaseStatus::BaseInconsistent {
+                field: BaseField::DynamicRange,
+            };
+        }
+        BaseStatus::BaseIdentifiedUnmeasured
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Renderer {
+    #[serde(rename = "x_raw_studio")]
+    XRawStudio,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicRange {
+    Dr100,
+    Dr200,
+    Dr400,
+}
+
+impl DynamicRange {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dr100 => "dr100",
+            Self::Dr200 => "dr200",
+            Self::Dr400 => "dr400",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseField {
+    Body,
+    Renderer,
+    FilmSimulation,
+    DynamicRange,
+}
+
+/// Whether a display-referred base is known and fitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BaseStatus {
+    Pinned,
+    BaseIdentifiedUnmeasured,
+    BaseIncomplete { missing: BaseField },
+    BaseInconsistent { field: BaseField },
+}
+
+impl BaseStatus {
+    fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        matches!(self, Self::Pinned)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DeclaredEncoding {
+    SceneReferred {
+        transfer: LogTransfer,
+        gamut: Gamut,
+    },
+    DisplayReferred {
+        base: BaseReference,
+        status: BaseStatus,
+    },
+}
+
+impl DeclaredEncoding {
+    pub fn is_scene_referred(&self) -> bool {
+        matches!(self, Self::SceneReferred { .. })
+    }
+
+    pub fn base(&self) -> Option<&BaseReference> {
+        match self {
+            Self::SceneReferred { .. } => None,
+            Self::DisplayReferred { base, .. } => Some(base),
+        }
+    }
+
+    pub fn is_matchable(&self) -> bool {
+        match self {
+            Self::SceneReferred { .. } => true,
+            Self::DisplayReferred { status, .. } => status.is_pinned(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputEncoding {
+    Srgb,
+}
+
+/// What a LUT reproduces, when it is not an original grade.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LutEmulation {
+    CameraRendering { maker: String, rendering: String },
+    FilmStock { name: String },
+}
+
+impl LutEmulation {
+    fn validate(&self) -> Result<()> {
+        let fields: Vec<&str> = match self {
+            Self::CameraRendering { maker, rendering } => vec![maker.as_str(), rendering.as_str()],
+            Self::FilmStock { name } => vec![name.as_str()],
+        };
+        if fields
+            .iter()
+            .any(|value| value.trim().is_empty() || value.chars().count() > 120)
+        {
+            return Err(ModelError::Invalid("lut emulation".to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// The camera rendering a native-family Look reproduces.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CameraRendering {
+    pub maker: String,
+    pub name: String,
+}
+
+impl CameraRendering {
+    fn validate(&self) -> Result<()> {
+        for value in [&self.maker, &self.name] {
+            if value.trim().is_empty() || value.chars().count() > 120 {
+                return Err(ModelError::Invalid("camera rendering".to_string()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A `look slug@version` reference.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LookPin {
+    pub slug: Slug,
+    pub version: LookVersion,
+}
+
+impl LookPin {
+    pub fn new(slug: &str, version: &str) -> Result<Self> {
+        Ok(Self {
+            slug: Slug::new(slug)?,
+            version: LookVersion::new(version)?,
+        })
+    }
+}
+
+impl core::fmt::Display for LookPin {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}@{}", self.slug, self.version)
+    }
+}
+
+fn normalized_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Whether a native Look's declared camera rendering supersedes this emulation.
+pub fn emulation_matches_camera_rendering(
+    emulation: &LutEmulation,
+    maker: &str,
+    rendering: &str,
+) -> bool {
+    match emulation {
+        LutEmulation::CameraRendering {
+            maker: declared_maker,
+            rendering: declared_rendering,
+        } => {
+            normalized_label(declared_maker) == normalized_label(maker)
+                && normalized_label(declared_rendering) == normalized_label(rendering)
+        }
+        LutEmulation::FilmStock { .. } => false,
+    }
+}
+
+/// The stored LUT's grid declaration; values live in `bin:lut`, red fastest.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LutRecord {
+    pub size: u32,
+    pub domain_min: [f64; 3],
+    pub domain_max: [f64; 3],
+    pub values_ref: BinRef,
+}
+
+impl LutRecord {
+    pub fn validate(&self) -> Result<()> {
+        if !(2..=MAX_LUT_SIDE).contains(&self.size) {
+            return Err(ModelError::Invalid("lut size".to_string()));
+        }
+        for channel in 0..3 {
+            let (min, max) = (self.domain_min[channel], self.domain_max[channel]);
+            if !(min.is_finite() && max.is_finite() && min < max) {
+                return Err(ModelError::Invalid("lut domain".to_string()));
+            }
+        }
+        if self.values_ref.as_str() != "bin:lut" {
+            return Err(ModelError::Invalid("lut values_ref".to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn expected_values(&self) -> usize {
+        lut_value_count(self.size)
+    }
+}
+
+/// Stored LUT nodes, red fastest.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LutData {
+    pub size: u32,
+    pub domain_min: [f64; 3],
+    pub domain_max: [f64; 3],
+    pub values: Vec<f64>,
+}
+
+pub fn lut_value_count(size: u32) -> usize {
+    (size as usize).pow(3) * 3
+}
+
+impl LutData {
+    pub fn new(
+        size: u32,
+        domain_min: [f64; 3],
+        domain_max: [f64; 3],
+        values: Vec<f64>,
+    ) -> Result<Self> {
+        let data = Self {
+            size,
+            domain_min,
+            domain_max,
+            values,
+        };
+        data.validate()?;
+        Ok(data)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        LutRecord {
+            size: self.size,
+            domain_min: self.domain_min,
+            domain_max: self.domain_max,
+            values_ref: BinRef::new("bin:lut").expect("static bin reference"),
+        }
+        .validate()?;
+        if self.values.len() != lut_value_count(self.size) {
+            return Err(ModelError::CoefficientLength {
+                name: "lut".to_string(),
+                found: self.values.len(),
+                expected: lut_value_count(self.size),
+            });
+        }
+        if self.values.iter().any(|value| !value.is_finite()) {
+            return Err(ModelError::Invalid("non-finite lut value".to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn record(&self) -> LutRecord {
+        LutRecord {
+            size: self.size,
+            domain_min: self.domain_min,
+            domain_max: self.domain_max,
+            values_ref: BinRef::new("bin:lut").expect("static bin reference"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LutDefinition {
+    pub name: String,
+    pub license: LicenseRecord,
+    pub encoding: DeclaredEncoding,
+    pub output: OutputEncoding,
+    pub lut: LutRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emulates: Option<LutEmulation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<LookPin>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+impl LutDefinition {
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() || self.name.chars().count() > 120 {
+            return Err(ModelError::Invalid("lut name".to_string()));
+        }
+        self.license.validate()?;
+        self.lut.validate()?;
+        if let Some(emulation) = &self.emulates {
+            emulation.validate()?;
+        }
+        if self.notes.len() > 16
+            || self
+                .notes
+                .iter()
+                .any(|note| note.trim().is_empty() || note.chars().count() > 1000)
+        {
+            return Err(ModelError::Invalid("lut notes".to_string()));
+        }
+        if let DeclaredEncoding::DisplayReferred { status, base } = &self.encoding {
+            base.validate()?;
+            status.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn is_matchable(&self) -> bool {
+        self.encoding.is_matchable()
+    }
+
+    pub fn base(&self) -> Option<&BaseReference> {
+        self.encoding.base()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +871,10 @@ pub struct RootProvenance {
 pub struct Provenance {
     pub bodies: Vec<BodyProvenance>,
     pub root: RootProvenance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<BaseReference>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub needs_rebase: bool,
     pub community_snapshot_version: u32,
     pub prep_versions: Vec<u32>,
     pub created: String,
@@ -383,6 +889,8 @@ impl Provenance {
                 admissions: Vec::new(),
                 anchor_version: String::new(),
             },
+            base: None,
+            needs_rebase: false,
             community_snapshot_version: 0,
             prep_versions: Vec::new(),
             created: "1970-01-01T00:00:00Z".to_string(),
@@ -395,6 +903,10 @@ impl Provenance {
 pub struct LookFile {
     pub format: FormatId,
     pub look: LookIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<LutDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendering: Option<CameraRendering>,
     pub viewing_conditions: ViewingConditionsRecord,
     pub probe_set: ProbeSetVersion,
     pub layers: LayersRecord,
@@ -409,6 +921,8 @@ impl LookFile {
         Ok(Self {
             format: FormatId::LookV1,
             look: identity,
+            definition: None,
+            rendering: None,
             viewing_conditions: ViewingConditionsRecord::reference(),
             probe_set: ProbeSetVersion::V1,
             layers: LayersRecord::from_look(look),
@@ -422,6 +936,30 @@ impl LookFile {
     fn validate(&self) -> Result<()> {
         if self.format != FormatId::LookV1 {
             return Err(ModelError::Format(format!("{:?}", self.format)));
+        }
+        match (self.look.kind, &self.definition) {
+            (LookKind::LutDefined, Some(definition)) => definition.validate()?,
+            (LookKind::LutDefined, None) => {
+                return Err(ModelError::Invalid(
+                    "lut_defined look has no definition".to_string(),
+                ));
+            }
+            (LookKind::NativeFamily, Some(_)) => {
+                return Err(ModelError::Invalid(
+                    "native_family look has a LUT definition".to_string(),
+                ));
+            }
+            (LookKind::NativeFamily, None) => {}
+        }
+        match (self.look.kind, &self.rendering) {
+            (LookKind::NativeFamily, Some(rendering)) => rendering.validate()?,
+            (LookKind::NativeFamily, None) => {}
+            (LookKind::LutDefined, Some(_)) => {
+                return Err(ModelError::Invalid(
+                    "lut_defined look has a camera rendering".to_string(),
+                ));
+            }
+            (LookKind::LutDefined, None) => {}
         }
         self.viewing_conditions.validate()?;
         if self.layers.tone.knots != TONE_KNOTS || self.layers.tint.knots != TINT_KNOTS {
@@ -645,22 +1183,90 @@ pub struct LookDocument {
     pub file: LookFile,
     pub look: Look,
     pub uncertainty: UncertaintyData,
+    pub lut: Option<LutData>,
 }
 
 impl LookDocument {
     pub fn new(file: LookFile, look: Look) -> Result<Self> {
-        file.validate()?;
-        look.validate()?;
-        Ok(Self {
+        Self {
             file,
             look,
             uncertainty: UncertaintyData::default(),
-        })
+            lut: None,
+        }
+        .validated()
+    }
+
+    fn validated(self) -> Result<Self> {
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.file.validate()?;
+        self.look.validate()?;
+        self.uncertainty
+            .validate(self.file.probe_set.probe_count())?;
+        match (&self.file.definition, &self.lut) {
+            (Some(definition), Some(lut)) => {
+                if lut.record() != definition.lut {
+                    return Err(ModelError::Invalid(
+                        "stored LUT does not match definition".to_string(),
+                    ));
+                }
+            }
+            (Some(_), None) => {
+                return Err(ModelError::Invalid(
+                    "lut_defined look has no stored LUT".to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ModelError::Invalid(
+                    "stored LUT without a definition".to_string(),
+                ));
+            }
+            (None, None) => {}
+        }
+        Ok(())
     }
 
     pub fn from_look(identity: LookIdentity, look: Look) -> Result<Self> {
         let file = LookFile::from_look(identity, &look)?;
         Self::new(file, look)
+    }
+
+    pub fn from_lut_definition(
+        identity: LookIdentity,
+        look: Look,
+        definition: LutDefinition,
+        lut: LutData,
+    ) -> Result<Self> {
+        let mut file = LookFile::from_look(identity, &look)?;
+        file.provenance.base = definition.base().cloned();
+        file.definition = Some(definition);
+        Self {
+            file,
+            look,
+            uncertainty: UncertaintyData::default(),
+            lut: Some(lut),
+        }
+        .validated()
+    }
+
+    pub fn with_lut(mut self, lut: LutData) -> Result<Self> {
+        self.lut = Some(lut);
+        self.validated()
+    }
+
+    pub fn is_matchable(&self) -> bool {
+        match &self.file.definition {
+            Some(definition) => definition.is_matchable(),
+            None => self.file.look.kind == LookKind::NativeFamily,
+        }
+    }
+
+    pub fn base(&self) -> Option<&BaseReference> {
+        self.file.definition.as_ref().and_then(LutDefinition::base)
     }
 
     pub fn with_uncertainty(mut self, uncertainty: UncertaintyData) -> Result<Self> {
@@ -702,10 +1308,7 @@ impl LookDocument {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
-        self.file.validate()?;
-        self.look.validate()?;
-        self.uncertainty
-            .validate(self.file.probe_set.probe_count())?;
+        self.validate()?;
         if self.file.uncertainty.probe_cov_ref.is_some() != self.uncertainty.probe_cov.is_some()
             || self.file.uncertainty.probe_cov_post_ref.is_some()
                 != self.uncertainty.probe_cov_post.is_some()
@@ -723,7 +1326,7 @@ impl LookDocument {
             return Err(ModelError::Invalid("uncertainty refs".to_string()));
         }
         let json = serde_json::to_vec_pretty(&self.file)?;
-        let bin = encode_bin(&self.look, &self.uncertainty)?;
+        let bin = encode_bin(&self.look, &self.uncertainty, self.lut.as_ref())?;
 
         let options = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored)
@@ -761,13 +1364,34 @@ impl LookDocument {
         let file: LookFile = serde_json::from_slice(&json)?;
         file.validate()?;
         let mut arrays = decode_bin(&bin)?;
+        let lut = match &file.definition {
+            Some(definition) => {
+                let values = arrays
+                    .remove(&BinArray::Lut)
+                    .ok_or_else(|| ModelError::MissingCoefficient("lut".to_string()))?;
+                Some(LutData::new(
+                    definition.lut.size,
+                    definition.lut.domain_min,
+                    definition.lut.domain_max,
+                    values,
+                )?)
+            }
+            None => {
+                if arrays.contains_key(&BinArray::Lut) {
+                    return Err(ModelError::UnknownCoefficient("lut".to_string()));
+                }
+                None
+            }
+        };
         let uncertainty = uncertainty_from_arrays(&file, &mut arrays)?;
         let look = look_from_arrays(&file, arrays)?;
-        Ok(Self {
+        Self {
             file,
             look,
             uncertainty,
-        })
+            lut,
+        }
+        .validated()
     }
 }
 
@@ -787,6 +1411,7 @@ enum BinArray {
     ProbePreReliable,
     Support,
     Density,
+    Lut,
 }
 
 impl BinArray {
@@ -806,6 +1431,7 @@ impl BinArray {
             Self::ProbePreReliable => "probe_pre_reliable",
             Self::Support => "support",
             Self::Density => "kde",
+            Self::Lut => "lut",
         }
     }
 
@@ -822,7 +1448,8 @@ impl BinArray {
             | Self::ProbeSigmaPost
             | Self::ProbePreReliable
             | Self::Support
-            | Self::Density => return None,
+            | Self::Density
+            | Self::Lut => return None,
         })
     }
 
@@ -842,13 +1469,21 @@ impl BinArray {
             "probe_pre_reliable" => Self::ProbePreReliable,
             "support" => Self::Support,
             "kde" => Self::Density,
+            "lut" => Self::Lut,
             _ => return None,
         })
     }
 }
 
-fn encode_bin(look: &Look, uncertainty: &UncertaintyData) -> Result<Vec<u8>> {
+fn encode_bin(
+    look: &Look,
+    uncertainty: &UncertaintyData,
+    lut: Option<&LutData>,
+) -> Result<Vec<u8>> {
     let mut arrays = look_into_arrays(look);
+    if let Some(data) = lut {
+        arrays.insert(BinArray::Lut, data.values.clone());
+    }
     if let Some(covariance) = &uncertainty.probe_cov {
         arrays.insert(BinArray::ProbeCovariance, covariance.values.clone());
     }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Renders the committed X-S10 RAW into a synthetic JPEG for the browser flow.
+//! Renders the X-S10 RAW fixture into a synthetic JPEG for the browser flow.
 
 use std::path::Path;
 
@@ -15,13 +15,18 @@ fn main() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let raw_path = match args.next() {
         Some(path) => std::path::PathBuf::from(path),
-        None => root.join("fixtures/fujifilm-x-s10.raf"),
+        None => root.join("fixtures/cache/fujifilm-x-s10.raf"),
     };
     let output = match args.next() {
         Some(path) => std::path::PathBuf::from(path),
         None => root.join("fixtures/generated/fujifilm-x-s10.jpg"),
     };
-    let raw = std::fs::read(&raw_path).map_err(|error| error.to_string())?;
+    let raw = std::fs::read(&raw_path).map_err(|error| {
+        format!(
+            "read {}: {error}; run tools/fetch-fixtures.sh",
+            raw_path.display()
+        )
+    })?;
     let decoded = RawlerDecoder
         .decode(&raw)
         .map_err(|error| error.to_string())?;

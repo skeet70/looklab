@@ -10,7 +10,9 @@ publish = false
 [dependencies]
 libm.workspace = true
 looklab-color.workspace = true
+looklab-fit.workspace = true
 looklab-model.workspace = true
+looklab-samples.workspace = true
 looklab-schema.workspace = true
 png.workspace = true
 serde.workspace = true

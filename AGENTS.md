@@ -50,8 +50,9 @@ For anyone (human or agent) implementing looklab. Read [README](README.md) and t
 - Raw serial numbers exist only in a type that implements neither `Serialize` nor `Debug`, and are HMAC'd on arrival. A test scans the DB and logs for raw serials.
 
 ## Data and fixtures
-- Large fixtures aren't in git. `fixtures/manifest.toml` lists files, checksums, source and consent; `tools/fetch-fixtures` downloads them. A ≤ 20 MB committed subset supports CI.
-- Fixtures must be project-owned, or donated with explicit recorded consent (in-app fixture donation writes consent to the manifest).
+- RAW samples with a stable public CC0 host are fetch-only: `fixtures/manifest.toml` records file, sha256, size, source and consent, and `tools/fetch-fixtures.sh` downloads them into the gitignored `fixtures/cache/`.
+- A donated RAW with no other host goes in Git LFS under `fixtures/donated/` with `committed = "lfs"` and explicit recorded consent in the manifest; an approved in-app fixture donation writes both.
+- Test vectors under 1 MB that a test needs as a compile-time input (fuzz seeds, card conformance `.llk`, golden JSON, DNG crops, pattern PNGs) stay in plain git.
 - Prefer synthetic tests (injected look deltas, simulated bodies, simulated attackers) for correctness. Use real fixtures for realism.
 
 ## Tests that must exist

@@ -95,6 +95,8 @@ pub fn ModQueuePage() -> impl IntoView {
     let profile = crate::session::use_session();
     let dialog = RwSignal::new(false);
     let pending_decision = RwSignal::new(Decision::Approve);
+    let look_slug = RwSignal::new(String::new());
+    let listing_notice = RwSignal::new(None::<String>);
     let filter = RwSignal::new(QueueFilter::All);
     let expiry_timer = StoredValue::new(None::<leptos::leptos_dom::helpers::TimeoutHandle>);
     on_cleanup(move || {
@@ -256,6 +258,36 @@ pub fn ModQueuePage() -> impl IntoView {
         });
     };
 
+    let moderate_listing = move |action: data::LookListingAction| {
+        let look = look_slug.get_untracked().trim().to_owned();
+        if look.is_empty() {
+            listing_notice.set(Some("Enter the Look slug.".to_owned()));
+            return;
+        }
+        let reason = reason.get_untracked().trim().to_owned();
+        if reason.is_empty() {
+            listing_notice.set(Some("A reason is required.".to_owned()));
+            return;
+        }
+        busy.set(true);
+        listing_notice.set(None);
+        spawn_local(async move {
+            let outcome = data::set_look_listing(action, &look, &reason).await;
+            busy.set(false);
+            listing_notice.set(Some(match outcome {
+                Ok(()) => format!(
+                    "{} {look}.",
+                    match action {
+                        data::LookListingAction::Hide => "Hidden",
+                        data::LookListingAction::Remove => "Removed",
+                        data::LookListingAction::Relist => "Relisted",
+                    }
+                ),
+                Err(error) => error,
+            }));
+        });
+    };
+
     let send_message = move |_| {
         let Some(id) = selected_id.get() else {
             return;
@@ -320,6 +352,20 @@ pub fn ModQueuePage() -> impl IntoView {
                     .get()
                     .map(|text| view! { <p class="error" role="alert">{text}</p> })
             }}
+        </section>
+        <section aria-labelledby="look-listing" hidden=move || !available || !can_moderate() || !session.get()>
+            <h2 id="look-listing">"Look listing"</h2>
+            <p class="muted">"Hide or remove a LUT Look that a native Look supersedes, or relist one."</p>
+            <label for="mod-look-slug">"Look slug"</label>
+            <input id="mod-look-slug" type="text" on:input=move |event| look_slug.set(event_target_value(&event))/>
+            <label for="mod-look-reason">"Reason"</label>
+            <input id="mod-look-reason" type="text" on:input=move |event| reason.set(event_target_value(&event))/>
+            <div class="field-row">
+                <button type="button" id="mod-look-hide" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Hide)>"Hide"</button>
+                <button type="button" id="mod-look-remove" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Remove)>"Remove"</button>
+                <button type="button" id="mod-look-relist" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Relist)>"Relist"</button>
+            </div>
+            {move || listing_notice.get().map(|text| view! { <p class="muted" role="status">{text}</p> })}
         </section>
         <ui::Tabs tabs=tabs() selected=tab_ui>
         <div tabindex="0" aria-label="Proposal queue, use j and k to navigate" hidden=move || tab.get() != ReviewTab::Queue on:keydown=move |event| {

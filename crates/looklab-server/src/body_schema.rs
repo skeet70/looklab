@@ -418,10 +418,6 @@ epochs:
         sourced(entries, looklab_upload::SettingSource::Reproduced)
     }
 
-    fn declared(entries: Vec<(&str, i64)>) -> ControlSettings {
-        sourced(entries, looklab_upload::SettingSource::Declared)
-    }
-
     fn sourced(
         entries: Vec<(&str, i64)>,
         source: looklab_upload::SettingSource,

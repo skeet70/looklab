@@ -27,6 +27,15 @@ pub fn srgb_decode(encoded: f64) -> f64 {
     }
 }
 
+/// ITU-R BT.709-6 Table 1; colour-science `oetf_BT709`.
+pub fn bt709_encode(linear: f64) -> f64 {
+    if linear < 0.018 {
+        4.5 * linear
+    } else {
+        1.099 * libm::pow(linear, 0.45) - 0.099
+    }
+}
+
 /// Adobe RGB (1998) gamma, 563/256.
 const ADOBE_RGB_GAMMA: f64 = 563.0 / 256.0;
 

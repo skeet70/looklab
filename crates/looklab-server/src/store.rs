@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use looklab_upload::Nonce;
 use serde::Serialize;
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 use webauthn_rs::prelude::Passkey;
 
 use crate::db::now_unix;
@@ -98,6 +98,7 @@ impl ContributionKind {
 pub enum JobKind {
     ConsistencyScore,
     HardDeleteBlobs,
+    PublishSite,
 }
 
 impl JobKind {
@@ -105,6 +106,7 @@ impl JobKind {
         match self {
             Self::ConsistencyScore => "consistency_score",
             Self::HardDeleteBlobs => "hard_delete_blobs",
+            Self::PublishSite => "publish_site",
         }
     }
 }
@@ -302,7 +304,7 @@ pub async fn enqueue_consistency_score(
     }
     let payload = serde_json::to_string(&Payload { contribution_id })
         .map_err(|_| sqlx::Error::Protocol("job payload does not serialize".to_owned()))?;
-    enqueue_job(tx, JobKind::ConsistencyScore, &payload, now_unix()).await
+    enqueue_job(&mut **tx, JobKind::ConsistencyScore, &payload, now_unix()).await
 }
 
 pub async fn insert_credential(
@@ -444,7 +446,7 @@ struct BlobDeletionPayload<'a> {
 }
 
 pub async fn enqueue_job(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conn: &mut SqliteConnection,
     kind: JobKind,
     payload: &str,
     run_after: i64,
@@ -459,9 +461,26 @@ pub async fn enqueue_job(
     .bind(payload)
     .bind(run_after)
     .bind(now_unix())
-    .execute(&mut **tx)
+    .execute(conn)
     .await?;
     Ok(id)
+}
+
+pub async fn enqueue_publish_if_idle(
+    conn: &mut SqliteConnection,
+) -> Result<Option<JobId>, sqlx::Error> {
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = ? AND status IN ('queued', 'running')",
+    )
+    .bind(JobKind::PublishSite.as_str())
+    .fetch_one(&mut *conn)
+    .await?;
+    if pending > 0 {
+        return Ok(None);
+    }
+    Ok(Some(
+        enqueue_job(conn, JobKind::PublishSite, "{}", now_unix()).await?,
+    ))
 }
 
 #[derive(Debug, Serialize)]
@@ -587,7 +606,7 @@ pub async fn withdraw(
     .await?;
     let payload = serde_json::to_string(&BlobDeletionPayload { contribution_id })
         .map_err(|_| sqlx::Error::Protocol("job payload does not serialize".to_owned()))?;
-    enqueue_job(&mut tx, JobKind::HardDeleteBlobs, &payload, delete_after).await?;
+    enqueue_job(&mut *tx, JobKind::HardDeleteBlobs, &payload, delete_after).await?;
     tx.commit().await?;
     Ok(Some(delete_after))
 }

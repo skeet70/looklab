@@ -82,7 +82,7 @@
 
 - **Per-image samples aren't published.** Only fitted targets, body parameters, control-response models and aggregate statistics are, under the data license ([10 Q2](10-open-questions.md)). This avoids linking pseudonymous credentials to photos posted elsewhere, and keeps withdrawal meaningful.
 - Fixture donation (for makernote mappings, [08 §4](08-ui.md)) is a separate, explicit, per-file opt-in. It **does** share the file, and the consent is recorded in the fixture manifest.
-- The upload is signed over the file's name, size and sha256, with its own proof-of-work and a 64 MiB per-file cap. The server stores the bytes privately, keyed by sha256, and the proposal cites them as `committed = false` with a `source` naming that blob. A moderator approval exports the file into the community snapshot under `fixtures/` and marks its manifest entry `committed = true`.
+- The upload is signed over the file's name, size and sha256, with its own proof-of-work and a 64 MiB per-file cap. The server stores the bytes privately, keyed by sha256, and the proposal cites them as `committed = false` with a `source` naming that blob. A moderator approval exports the file into the community snapshot under `fixtures/` and marks its manifest entry `committed = "lfs"`, so the donated RAW is stored in Git LFS rather than plain git.
 
 ## 7. Payload inspector (required before every upload)
 

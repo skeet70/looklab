@@ -14,6 +14,13 @@
 .help-steps li { margin-block: .85rem; padding-left: .2rem; }
 .help-walkthrough .wanted-grid { grid-template-columns: 1fr; margin-block: 1.25rem; }
 .help-walkthrough .button-primary { margin-top: .75rem; }
+.phone-pattern-target { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; margin-top: 1rem; }
+.phone-pattern-target figure { flex: 0 1 14rem; margin: 0; }
+.pattern-qr { display: block; width: 14rem; max-width: 100%; height: auto; }
+.phone-pattern-target figcaption { color: var(--muted); font-size: .85rem; margin-top: .5rem; }
+.phone-pattern-target label { flex: 1 1 12rem; min-width: 0; }
+.phone-pattern-target input { box-sizing: border-box; width: 100%; margin-top: .5rem; font-size: .85rem; }
+.pattern-page canvas { cursor: pointer; touch-action: manipulation; }
 .ways-to-help { margin-block: 2rem; }
 .contribute-page .step { margin-block: 1.5rem; padding: 1.5rem; border: 1px solid var(--line); border-radius: .6rem; }
 .contribute-page .step > label:not(:has(input[type=checkbox])) { display: block; margin-top: 1rem; }

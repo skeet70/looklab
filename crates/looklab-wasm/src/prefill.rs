@@ -84,7 +84,14 @@ mod tests {
 
     #[test]
     fn prefills_the_fixture_from_its_makernotes() {
-        let raw = include_bytes!("../../../fixtures/fujifilm-x-s10.raf").to_vec();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/cache/fujifilm-x-s10.raf");
+        let raw = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "read {}: {error}; run tools/fetch-fixtures.sh",
+                path.display()
+            )
+        });
         let schema = include_str!("../../../data/bodies/fujifilm-x-t5.yaml");
         let prefill =
             prefill_settings(schema, &[("fujifilm-x-s10.raf".to_owned(), raw)]).expect("prefill");

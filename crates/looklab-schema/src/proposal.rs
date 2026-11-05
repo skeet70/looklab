@@ -507,6 +507,68 @@ pub enum Evidence {
     },
 }
 
+/// Where a published fixture is stored, written as `committed` in
+/// `fixtures/manifest.toml`: `true` = plain git, `"lfs"` = Git LFS, `false` = fetch-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Placement {
+    Git,
+    #[default]
+    Fetch,
+    Lfs,
+}
+
+impl Placement {
+    /// The `committed` value in `fixtures/manifest.toml`.
+    const fn toml_value(self) -> &'static str {
+        match self {
+            Self::Git => "true",
+            Self::Fetch => "false",
+            Self::Lfs => "\"lfs\"",
+        }
+    }
+}
+
+impl Serialize for Placement {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Git => serializer.serialize_bool(true),
+            Self::Fetch => serializer.serialize_bool(false),
+            Self::Lfs => serializer.serialize_str("lfs"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Placement {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PlacementVisitor;
+
+        impl serde::de::Visitor<'_> for PlacementVisitor {
+            type Value = Placement;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("true, false or \"lfs\"")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Placement, E> {
+                Ok(if value {
+                    Placement::Git
+                } else {
+                    Placement::Fetch
+                })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Placement, E> {
+                match value {
+                    "lfs" => Ok(Placement::Lfs),
+                    other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(PlacementVisitor)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FixtureDonation {
@@ -524,8 +586,8 @@ pub struct FixtureDonation {
     pub donator: Option<String>,
     pub donated_on: Date,
     pub license: FixtureLicense,
-    #[serde(default)]
-    pub committed: bool,
+    #[serde(default, rename = "committed")]
+    pub placement: Placement,
 }
 
 impl FixtureDonation {
@@ -548,13 +610,13 @@ impl FixtureDonation {
             (Some(_), Some(_)) => {
                 errors.extend(invalid("source", "either source_url or source, not both"))
             }
-            (None, None) if !self.committed => errors.extend(invalid(
+            (None, None) if self.placement == Placement::Fetch => errors.extend(invalid(
                 "source",
-                "an uploaded source or an https URL for a fixture that is not committed",
+                "an uploaded source or an https URL for a fetch-only fixture",
             )),
             _ => {}
         }
-        if self.committed && self.source.is_some() {
+        if self.placement != Placement::Fetch && self.source.is_some() {
             errors.extend(invalid(
                 "source",
                 "a blob source only before the donation is published",
@@ -858,8 +920,8 @@ impl FixtureLicense {
 pub fn fixture_manifest_toml(donations: &[FixtureDonation]) -> String {
     let mut out = String::from(
         "# Donated by contributors; the consent record is the donation's opt-in.\n\
-         # `committed = true` files live in this directory, the rest are download-only\n\
-         # into fixtures/cache/ (gitignored).\n",
+         # `committed`: true = plain git, \"lfs\" = Git LFS under fixtures/donated/,\n\
+         # false = fetched into fixtures/cache/ (gitignored).\n",
     );
     for donation in donations {
         out.push_str("\n[[fixture]]\n");
@@ -886,7 +948,10 @@ pub fn fixture_manifest_toml(donations: &[FixtureDonation]) -> String {
             toml_string(donation.license.as_str())
         ));
         out.push_str(&format!("consent = {}\n", toml_string(&donation.consent())));
-        out.push_str(&format!("committed = {}\n", donation.committed));
+        out.push_str(&format!(
+            "committed = {}\n",
+            donation.placement.toml_value()
+        ));
     }
     out
 }

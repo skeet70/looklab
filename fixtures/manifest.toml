@@ -1,9 +1,9 @@
-# `committed = true` files live in this directory; the rest are download-only
-# into fixtures/cache/ (gitignored). tools/fetch-fixtures.sh verifies both sets.
+# `committed`: true = plain git here, "lfs" = Git LFS under fixtures/donated/,
+# false = fetched into fixtures/cache/ (gitignored). tools/fetch-fixtures.sh verifies all.
 
 [[fixture]]
 file = "fujifilm-x-s10.raf"
-description = "Fujifilm X-S10, 14-bit compressed RAF, X-Trans IV"
+description = "Fujifilm X-S10, 14-bit compressed RAF, X-Trans IV, fetch-only"
 make = "Fujifilm"
 model = "X-S10"
 sha256 = "9419d1408ebf850395e5dd563beb96309466546252caf541466034c9cb7e9724"
@@ -11,7 +11,7 @@ size = 18675216
 source_url = "https://raw.pixls.us/getfile.php/4190/nice/Fujifilm%20-%20X-S10%20-%2014bit%2014bit%20compressed%20(3:2).RAF"
 license = "CC0-1.0"
 consent = "CC0 public sample (raw.pixls.us)"
-committed = true
+committed = false
 
 [[fixture]]
 file = "canon-eos-60d.dng"

@@ -154,13 +154,14 @@ impl From<crate::admin::AdminError> for ApiError {
             | E::UnknownRootAdmission
             | E::UnknownVersion
             | E::UnknownProposal
+            | E::UnknownLook
             | E::NoActiveRecord(_) => ErrorCode::NotFound,
             E::NotAuthorized => ErrorCode::Forbidden,
             E::Trust(T::NotAuthorized { .. } | T::ScopeNotWithinIssuer) => ErrorCode::Forbidden,
             E::Trust(T::UnknownCredential(_)) => ErrorCode::NotFound,
             E::Trust(T::CannotEndorseSeeder(_)) => ErrorCode::Conflict,
             E::Trust(_) => ErrorCode::MalformedEnvelope,
-            E::ProposalDecided | E::ManifestExists => ErrorCode::Conflict,
+            E::ProposalDecided | E::ManifestExists | E::LookState(_) => ErrorCode::Conflict,
             E::InvalidReason
             | E::InvalidEvidence
             | E::EmptyScope

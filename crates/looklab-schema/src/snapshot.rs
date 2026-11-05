@@ -78,6 +78,7 @@ mod dir {
     use crate::error::{ErrorKind, ValidationError};
     use crate::fs::{FileErrors, Kind, classified_yaml_files, classify, validate_dir};
     use crate::interface::validate_interface_profile;
+    use crate::proposal::Placement;
     use crate::schema::validate_control_schema;
 
     use super::{
@@ -97,8 +98,8 @@ mod dir {
         model: String,
         #[serde(default)]
         source_url: Option<String>,
-        #[serde(default)]
-        committed: bool,
+        #[serde(default, rename = "committed")]
+        placement: Placement,
     }
 
     /// # Errors
@@ -260,14 +261,15 @@ mod dir {
                     "make and model, so the fixture names a body",
                 ));
             }
+            let fetch_only = entry.placement == Placement::Fetch;
             match &entry.source_url {
-                Some(url) if !entry.committed && !url.starts_with("https://") => {
+                Some(url) if fetch_only && !url.starts_with("https://") => {
                     errors.push(fixture_entry_error(index, "an https source URL"));
                 }
-                None if !entry.committed => {
+                None if fetch_only => {
                     errors.push(fixture_entry_error(
                         index,
-                        "a source URL for a fixture that is not committed",
+                        "a source URL for a fetch-only fixture",
                     ));
                 }
                 _ => {}

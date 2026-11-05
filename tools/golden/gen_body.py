@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Generate the CCT reference for the committed RAW fixtures.
+"""Generate the CCT reference for the manifest RAW fixtures.
 
 Writes ``crates/looklab-body/tests/golden/fixtures_cct.json``. The reference
 reads the file's as-shot white-balance coefficients and colour matrices with
@@ -124,10 +124,17 @@ def neutral_to_xy(neutral: np.ndarray, found) -> np.ndarray:
     return xy
 
 
+def fixture_path(name: str) -> Path:
+    committed = common.ROOT / "fixtures" / name
+    if committed.exists():
+        return committed
+    return common.ROOT / "fixtures" / "cache" / name
+
+
 def main() -> None:
     payload = {"meta": common.meta("gen_body.py"), "fixtures": {}}
     for name in FIXTURES:
-        text = identify(common.ROOT / "fixtures" / name)
+        text = identify(fixture_path(name))
         coefficients = as_shot_coefficients(text)
         neutral = np.asarray([1.0 / coefficients[0], 1.0 / coefficients[1], 1.0 / coefficients[2]])
         found = matrices(text)

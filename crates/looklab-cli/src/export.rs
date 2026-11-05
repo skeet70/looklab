@@ -71,6 +71,7 @@ pub fn run(args: &ExportArgs) -> Result<()> {
         other => bail!("--cct must be 6500, 5500 or 3200, not {other}"),
     };
     let document = util::load_document(&args.look)?;
+    ensure_matchable(&document)?;
     let profile = load_profile(&args.profile)?;
     let format = args.format.schema();
     if !profile.formats.contains(&format) {
@@ -112,6 +113,16 @@ pub fn run(args: &ExportArgs) -> Result<()> {
         bail!("export flagged: p95 exceeds 1.0 ΔE at a bake CCT; rerun with --force to write it");
     }
     write_output(args, &document, &profile, &output, format, cct)
+}
+
+fn ensure_matchable(document: &LookDocument) -> Result<()> {
+    if !document.is_matchable() {
+        bail!(
+            "{} is not matchable: its display base is not pinned",
+            document.file.look.slug
+        );
+    }
+    Ok(())
 }
 
 fn load_profile(path: &Path) -> Result<InterfaceProfile> {
@@ -239,5 +250,52 @@ fn extension(format: Format) -> &'static str {
         Format::Cube => "cube",
         Format::Haldclut => "png",
         Format::NativeJson => "json",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use looklab_model::file::{
+        BaseField, BaseReference, BaseStatus, DeclaredEncoding, LicenseRecord, LutData,
+        LutDefinition, OutputEncoding,
+    };
+    use looklab_model::{Look, LookIdentity, LookKind, WbPolicy};
+
+    fn non_matchable() -> LookDocument {
+        let lut = LutData::new(2, [0.0; 3], [1.0; 3], vec![0.0; 24]).expect("lut");
+        let definition = LutDefinition {
+            name: "Pending base".to_string(),
+            license: LicenseRecord {
+                own_work: true,
+                source_license: None,
+                source_url: None,
+                attribution: "test".to_string(),
+            },
+            encoding: DeclaredEncoding::DisplayReferred {
+                base: BaseReference::neutral_baseline(),
+                status: BaseStatus::BaseIncomplete {
+                    missing: BaseField::FilmSimulation,
+                },
+            },
+            output: OutputEncoding::Srgb,
+            lut: lut.record(),
+            emulates: None,
+            superseded_by: None,
+            notes: Vec::new(),
+        };
+        LookDocument::from_lut_definition(
+            LookIdentity::new("pending", "1.0.0", LookKind::LutDefined, WbPolicy::Adaptive)
+                .expect("identity"),
+            Look::colorimetric(),
+            definition,
+            lut,
+        )
+        .expect("document")
+    }
+
+    #[test]
+    fn export_rejects_a_non_matchable_look() {
+        assert!(ensure_matchable(&non_matchable()).is_err());
     }
 }

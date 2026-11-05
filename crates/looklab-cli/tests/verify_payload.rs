@@ -88,7 +88,13 @@ fn build_fixture_in(name: &str, render_tag: Option<&str>) -> Fixture {
         .join("../..")
         .canonicalize()
         .expect("workspace root");
-    let raw = std::fs::read(workspace.join("fixtures/fujifilm-x-s10.raf")).expect("RAF fixture");
+    let fixture = workspace.join("fixtures/cache/fujifilm-x-s10.raf");
+    let raw = std::fs::read(&fixture).unwrap_or_else(|error| {
+        panic!(
+            "read {}: {error}; run tools/fetch-fixtures.sh",
+            fixture.display()
+        )
+    });
     let raw_path = dir.join("fujifilm-x-s10.raf");
     std::fs::write(&raw_path, &raw).expect("RAW copy");
 

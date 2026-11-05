@@ -53,6 +53,7 @@ wasm-bindgen-test = "=0.3.79"
 toml = "0.8"
 rand_chacha = "0.9"
 sha2 = "0.10"
+qrcodegen = "1.8"
 hmac = "0.12"
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 ciborium = "0.2"

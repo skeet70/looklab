@@ -37,6 +37,6 @@ Commit the regenerated JSON with the code change that requires it. Never hand-ed
 
 `gen_basics.py` covers XYZ/xyY, the five RGB transfer functions, RGB/XYZ conversions per space, the three chromatic adaptation transforms, CIELAB, LCh, CIEDE2000 and the standard illuminants. The chart file holds `CCS_COLOURCHECKERS["ColorChecker24 - After November 2014"]`: xyY under D50, BabelColor/X-Rite reference values.
 
-`gen_spectral.py` writes the BabelColor ColorChecker reflectances, the CIE 1931 2 degree observer and the A and D65 power distributions on one 5 nm grid. `gen_body.py` reads the committed fixtures with LibRaw's `raw-identify` (nixpkgs `libraw` in `devShells.golden`) and solves the DNG neutral with colour-science's Robertson (1968) conversion.
+`gen_spectral.py` writes the BabelColor ColorChecker reflectances, the CIE 1931 2 degree observer and the A and D65 power distributions on one 5 nm grid. `gen_body.py` reads the manifest fixtures with LibRaw's `raw-identify` (nixpkgs `libraw` in `devShells.golden`) and solves the DNG neutral with colour-science's Robertson (1968) conversion.
 
 The Rust tests are `crates/looklab-color/tests/golden_basics.rs` and `golden_cam16.rs`, which load the JSON with `include_str!`.

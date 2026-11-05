@@ -67,6 +67,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/mod/session", post(api::moderation::session))
         .route("/api/mod/queue", get(api::moderation::queue))
         .route("/api/mod/decision", post(api::moderation::decision))
+        .route(
+            "/api/mod/look/{action}",
+            post(api::moderation::look_listing),
+        )
         .route("/api/proposals", post(api::proposals::submit))
         .route("/api/proposals/confirm", post(api::proposals::confirm))
         .route("/api/proposals/thread", post(api::proposals::thread))

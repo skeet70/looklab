@@ -18,6 +18,7 @@ use looklab_wasm::{
     serial_ascii_for_file, solve_pow_request,
 };
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -531,7 +532,7 @@ impl HelpWay {
                 impact: Impact::Medium,
                 description: "Add a wider range of saturated colors.",
                 steps: &[
-                    "Use a phone displaying the measurement pattern. Set its brightness to maximum.",
+                    "Open the measurement pattern on your phone",
                     "Turn off Night Shift, True Tone and adaptive color on the phone.",
                     "Fill about 60% of the camera frame with the pattern and defocus slightly.",
                     "Shoot RAW+JPEG at your lowest native ISO, with lens corrections off where possible. Take 3 shots at 0, −1 and −2 EV exposure compensation.",
@@ -580,7 +581,13 @@ fn HelpWalkthrough(
             <div class="help-walkthrough">
                 <p class="help-meta">{guide.time} " · " {guide.impact.label()}</p>
                 <ol class="help-steps">
-                    {guide.steps.iter().map(|step| view! { <li>{*step}</li> }).collect_view()}
+                    {guide.steps.iter().enumerate().map(|(index, step)| {
+                        if way == HelpWay::PhonePattern && index == 0 {
+                            view! { <li><PhonePatternLink label=*step/></li> }.into_any()
+                        } else {
+                            view! { <li>{*step}</li> }.into_any()
+                        }
+                    }).collect_view()}
                 </ol>
                 {(way == HelpWay::WantedShots).then(|| view! {
                     <WantedCards limit=3 show_actions=false/>
@@ -590,14 +597,89 @@ fn HelpWalkthrough(
                         </a>
                     </p>
                 })}
-                {(way == HelpWay::PhonePattern).then(|| view! {
-                    <p class="muted">"These are capture instructions. A phone pattern cannot be opened from this page."</p>
-                })}
                 <button class="button-primary" on:click=move |event| on_choose.run(event)>
                     {guide.action}
                 </button>
             </div>
         </Dialog>
+    }
+}
+
+#[component]
+fn PhonePatternLink(label: &'static str) -> impl IntoView {
+    let path = crate::base::site_url(&format!(
+        "/pattern/{}",
+        super::pattern::fixture_seed().to_hex()
+    ));
+    let absolute = web_sys::window()
+        .and_then(|window| window.location().href().ok())
+        .and_then(|base| web_sys::Url::new_with_base(&path, &base).ok());
+    view! {
+        <a href=path target="_blank" rel="noopener noreferrer">{label}</a>
+        <p>"Tap the pattern to hide browser toolbars where supported. Set the screen brightness to maximum."</p>
+        {match absolute {
+            Some(url) => {
+                let address = url.href();
+                let qr = qrcodegen::QrCode::encode_text(
+                    &address,
+                    qrcodegen::QrCodeEcc::Medium,
+                );
+                view! {
+                    <div class="phone-pattern-target">
+                        <figure>
+                            {match qr {
+                                Ok(code) => pattern_qr(code).into_any(),
+                                Err(_) => view! {
+                                    <p role="alert">"This address is too long for a QR code. Open or copy the link instead."</p>
+                                }.into_any(),
+                            }}
+                            <figcaption>"Scan with your phone"</figcaption>
+                        </figure>
+                        <label>
+                            "Or copy this link"
+                            <input type="text" readonly aria-label="Pattern URL" prop:value=address/>
+                        </label>
+                    </div>
+                }.into_any()
+            },
+            None => view! {
+                <p role="alert">"The phone link is unavailable in this browser."</p>
+            }.into_any(),
+        }}
+    }
+}
+
+fn pattern_qr(code: qrcodegen::QrCode) -> impl IntoView {
+    let side = code.size();
+    let extent = side + 8;
+    let mut modules = String::with_capacity((side * side * 10) as usize);
+    for y in 0..side {
+        let mut x = 0;
+        while x < side {
+            if !code.get_module(x, y) {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            while x < side && code.get_module(x, y) {
+                x += 1;
+            }
+            let length = x - start;
+            let _ = write!(modules, "M{} {}h{length}v1h-{length}z", start + 4, y + 4);
+        }
+    }
+    view! {
+        <svg
+            class="pattern-qr"
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox=format!("0 0 {extent} {extent}")
+            role="img"
+            aria-label="Scan to open the measurement pattern"
+            shape-rendering="crispEdges"
+        >
+            <rect width=extent height=extent fill="#ffffff"/>
+            <path d=modules fill="#000000"/>
+        </svg>
     }
 }
 

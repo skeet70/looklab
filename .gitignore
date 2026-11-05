@@ -2,6 +2,7 @@ target/
 /target-ui*/
 /result
 /fixtures/cache/
+/fixtures/*.raf
 /fixtures/generated/
 __pycache__/
 site/data/

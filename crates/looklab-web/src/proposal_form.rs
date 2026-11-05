@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use looklab_schema::{
     Date, FixtureDonation, FixtureLicense, LabeledFile, LabeledTag, MakernoteTag, MakernoteValue,
-    MappingInference, Sha256Hex, SimKey, infer_mapping, validate_confirmation,
+    MappingInference, Placement, Sha256Hex, SimKey, infer_mapping, validate_confirmation,
 };
 
 pub fn kind_label(kind: looklab_schema::ProposalKind) -> &'static str {
@@ -230,7 +230,7 @@ pub fn donation(
         donator: None,
         donated_on,
         license: FixtureLicense::Cc0_1_0,
-        committed: false,
+        placement: Placement::Fetch,
     };
     donation.validate().map_err(|errors| {
         errors

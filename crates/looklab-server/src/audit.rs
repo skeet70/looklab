@@ -23,6 +23,9 @@ pub(crate) enum AuditKind {
     Revert,
     Split,
     ReleaseManifest,
+    LookHidden,
+    LookRemoved,
+    LookRelisted,
 }
 
 impl AuditKind {
@@ -41,6 +44,9 @@ impl AuditKind {
             Self::Revert => "revert",
             Self::Split => "split",
             Self::ReleaseManifest => "release_manifest",
+            Self::LookHidden => "look_hidden",
+            Self::LookRemoved => "look_removed",
+            Self::LookRelisted => "look_relisted",
         }
     }
 }

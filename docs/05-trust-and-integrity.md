@@ -140,6 +140,8 @@ A candidate LookVersion is published only if:
 
 A failed gate leaves the candidate provisional and opens a moderation item. A native fit that does not converge never reaches the gate: nothing is published, the worker resumes that Look from the stored fit state in the next batch, and 3 consecutive non-converged batches *(tentative)* open one "Fit not converging" moderation item, resolved by the next published version.
 
+**Rebase.** A new version of a display base publishes a candidate rebased version of every LUT Look pinned to it. The candidate is gated against the Look's anchor (its first published version), not against the base's previous version. A base revert, like a revoked root admission, marks every pinned dependent `needs_rebase`; the dependent stays published and matchable at its old base until a rebased version passes the gate, and the dependent list is public with the revert.
+
 **Rollback:** one moderator action, "revert to version N, exclude credential(s) K, refit". The revert publishes N's content as a new version immediately, then schedules the refit without K. Published versions stay immutable and pinnable. A revert is not a re-anchor: the gated union continues across it.
 
 ## 9. Anti-spam: proof-of-work
@@ -197,6 +199,7 @@ The harness runs in CI as `cargo test -p looklab-trust --features harness --rele
   - moderation decisions;
   - re-anchors and reverts;
   - epoch/look splits;
+  - Look hiding, removal and relisting;
   - release manifests.
 - Artifacts are **content-addressed** ([03 §4](03-data-model.md)). Each version manifest lists its artifact hashes, and clients check downloaded artifacts against the manifest.
 - Entries reference credentials by internal id or display handle, never by public key or serial HMAC.

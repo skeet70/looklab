@@ -1,0 +1,15 @@
+# Source: Fujigraphy, "Film Simulations by Camera"
+# (https://fujigraphy.com/guides/film-simulations-by-camera), cross-checked
+# against Fujifilm manuals and firmware notes: X-Trans III bodies other than the
+# X-H1 have no Eterna, and no X-Trans III body has Classic Negative.
+id: fujifilm/x-e3
+make: Fujifilm
+model: X-E3
+exif_aliases: [X-E3]
+kind: camera
+capabilities:
+  in_camera_raw_conversion: true
+  jpeg_color_spaces: [srgb, adobe_rgb]
+  heif: false
+status: active
+mapping_status: provisional

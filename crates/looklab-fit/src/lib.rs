@@ -26,6 +26,7 @@ pub use bootstrap::{
     BOOTSTRAP_RESAMPLES, BootstrapOptions, Cov3, PublishedUncertainty, UncertaintyMethod,
     published_uncertainty,
 };
+pub use density::sample_density;
 pub use epoch::{
     ImageProjection, PROJECTION_DIM, SampleProjection, SplitDecision, SplitOptions, SplitSample,
     detect_split, detect_split_with_effect, predicted_effect, project_images,

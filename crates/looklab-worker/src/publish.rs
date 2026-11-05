@@ -4,14 +4,18 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use looklab_model::file::{LookKind, LookVersion, Slug, WbPolicy};
+use looklab_model::file::{
+    CameraRendering, LookKind, LookPin, LookVersion, LutEmulation, Slug, WbPolicy,
+};
+use looklab_model::{LookDocument, emulation_matches_camera_rendering};
 use looklab_publish::{
     ArtifactBlob, ArtifactHash, ArtifactName, AuditEntry, AuditEvent, AuditLog, BodyExtras,
-    BodyPage, Decision, LookPage, LookRef, LookStatus, LookVersionPage, ProposalRef, Role, Scene,
-    SceneName, SiteData, SitePath, SiteSink, SplitKind, Timestamp, VersionNotes, VersionRef,
-    write_site,
+    BodyPage, Decision, LookListing, LookPage, LookRef, LookStatus, LookVersionPage, ProposalRef,
+    Role, Scene, SceneName, SiteData, SitePath, SiteSink, SplitKind, Timestamp, VersionNotes,
+    VersionRef, compare_versions, write_site,
 };
-use looklab_server::admin::ManifestArtifact;
+use looklab_server::admin::{self, ListingState, LookListingRecord, ManifestArtifact};
+use looklab_upload::LookSlug;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 
@@ -20,7 +24,7 @@ use crate::clock::rfc3339;
 use crate::config::WorkerConfig;
 use crate::db::{self, LookVersionStatus};
 use crate::error::{Result, WorkerError};
-use crate::refit::{RELEASE_ARTIFACT, ReleaseRecord, gate_summary};
+use crate::refit::{LOOK_ARTIFACT, RELEASE_ARTIFACT, ReleaseRecord, gate_summary};
 
 #[derive(Debug, Clone)]
 pub struct PublishConfig {
@@ -59,6 +63,7 @@ pub async fn publish_with_pool(
     let site = site_data(pool, config).await?;
     let mut sink = DirSink::new(&config.out);
     let root = write_site(&mut sink, &site)?;
+    prune_unlisted(&config.out, &site)?;
     write_site_root(&config.out, root.as_str())?;
     Ok(PublishSummary {
         root: root.as_str().to_owned(),
@@ -102,6 +107,69 @@ impl SiteSink for DirSink {
     }
 }
 
+fn prune_unlisted(root: &Path, site: &SiteData) -> Result<()> {
+    for look in &site.looks {
+        if look.listing.is_listed() {
+            continue;
+        }
+        let slug = look.slug.as_str();
+        let dir = root.join("data/looks").join(slug);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        let page = root.join("data/looks").join(format!("{slug}.json"));
+        if page.exists() {
+            std::fs::remove_file(&page)?;
+        }
+    }
+    Ok(())
+}
+
+struct LookMetadata {
+    version: i64,
+    version_pin: LookVersion,
+    kind: LookKind,
+    name: Option<String>,
+    emulation: Option<LutEmulation>,
+    rendering: Option<CameraRendering>,
+}
+
+async fn supersede_looks(
+    pool: &SqlitePool,
+    metadata: &BTreeMap<String, LookMetadata>,
+) -> Result<()> {
+    let natives: Vec<(&str, &LookVersion, &CameraRendering)> = metadata
+        .iter()
+        .filter_map(|(slug, meta)| {
+            meta.rendering
+                .as_ref()
+                .map(|rendering| (slug.as_str(), &meta.version_pin, rendering))
+        })
+        .collect();
+    for (slug, meta) in metadata {
+        let Some(emulation) = &meta.emulation else {
+            continue;
+        };
+        let Some((native_slug, native_version, _)) = natives
+            .iter()
+            .filter(|(_, _, rendering)| {
+                emulation_matches_camera_rendering(emulation, &rendering.maker, &rendering.name)
+            })
+            .max_by(|left, right| {
+                compare_versions(left.1, right.1).then_with(|| left.0.cmp(right.0))
+            })
+        else {
+            continue;
+        };
+        let look = LookSlug::try_from(slug.as_str())
+            .map_err(|error| WorkerError::Data(error.to_string()))?;
+        let pin = LookPin::new(native_slug, native_version.as_str())
+            .map_err(|error| WorkerError::Data(error.to_string()))?;
+        admin::set_superseded_by(pool, &look, &pin).await?;
+    }
+    Ok(())
+}
+
 async fn site_data(pool: &SqlitePool, config: &PublishConfig) -> Result<SiteData> {
     let mut bodies = Vec::new();
     for resources in DataDir::new(&config.data).bodies()? {
@@ -122,6 +190,7 @@ async fn site_data(pool: &SqlitePool, config: &PublishConfig) -> Result<SiteData
     .await?;
 
     let mut looks: BTreeMap<String, Vec<LookVersionPage>> = BTreeMap::new();
+    let mut metadata: BTreeMap<String, LookMetadata> = BTreeMap::new();
     for row in &rows {
         let look: String = row.get("look");
         let version: i64 = row.get("version");
@@ -145,29 +214,84 @@ async fn site_data(pool: &SqlitePool, config: &PublishConfig) -> Result<SiteData
         let provenance = release
             .map(|release| release.provenance)
             .unwrap_or_default();
-        let page = LookVersionPage::new(
+        let page_version = LookVersion::new(format!("{version}.0.0"))?;
+        let mut page = LookVersionPage::new(
             Slug::new(&look)?,
-            LookVersion::new(format!("{version}.0.0"))?,
+            page_version.clone(),
             publish_status(status),
             gate,
             provenance,
             blobs,
             notes,
         )?;
+        if let Some(blob) = page
+            .blobs
+            .iter()
+            .find(|blob| blob.name.as_str() == LOOK_ARTIFACT)
+        {
+            let document = LookDocument::decode(&blob.bytes)?;
+            page.matchable = document.is_matchable();
+            if metadata
+                .get(&look)
+                .is_none_or(|known| known.version < version)
+            {
+                metadata.insert(
+                    look.clone(),
+                    LookMetadata {
+                        version,
+                        version_pin: page_version,
+                        kind: document.file.look.kind,
+                        name: document
+                            .file
+                            .definition
+                            .as_ref()
+                            .map(|definition| definition.name.clone()),
+                        emulation: document
+                            .file
+                            .definition
+                            .as_ref()
+                            .and_then(|definition| definition.emulates.clone()),
+                        rendering: document.file.rendering.clone(),
+                    },
+                );
+            }
+        }
         looks.entry(look).or_default().push(page);
     }
+
+    supersede_looks(pool, &metadata).await?;
+    let listings: BTreeMap<String, LookListingRecord> = admin::look_listings(pool)
+        .await?
+        .into_iter()
+        .map(|record| (record.look.as_str().to_owned(), record))
+        .collect();
 
     let looks = looks
         .into_iter()
         .map(|(slug, versions)| {
+            let record = listings.get(&slug);
+            let kind = metadata
+                .get(&slug)
+                .map(|meta| meta.kind)
+                .unwrap_or(LookKind::NativeFamily);
+            let name = metadata
+                .get(&slug)
+                .and_then(|meta| meta.name.clone())
+                .unwrap_or_else(|| slug.clone());
             Ok(LookPage {
                 slug: Slug::new(&slug)?,
-                name: slug,
-                kind: LookKind::NativeFamily,
+                name,
+                kind,
                 wb_policy: WbPolicy::Adaptive,
                 description: String::new(),
                 aliases: Vec::new(),
                 license: None,
+                listing: match record.map(|record| record.listing) {
+                    Some(ListingState::Hidden) => LookListing::Hidden,
+                    Some(ListingState::Removed) => LookListing::Removed,
+                    Some(ListingState::Listed) | None => LookListing::Listed,
+                },
+                superseded_by: record.and_then(|record| record.superseded_by.clone()),
                 versions,
             })
         })
@@ -179,6 +303,7 @@ async fn site_data(pool: &SqlitePool, config: &PublishConfig) -> Result<SiteData
         looks,
         audit_log: audit_log(pool).await?,
         scenes: canonical_scenes(),
+        reference_preview: None,
     })
 }
 
@@ -570,6 +695,22 @@ async fn audit_event(
                     into.join(", "),
                     text(payload, "reason").unwrap_or_default()
                 ),
+            }
+        }
+        "look_hidden" | "look_removed" | "look_relisted" => {
+            let (Some(actor), Some(look)) = (text(payload, "actor"), text(payload, "look")) else {
+                return Ok(None);
+            };
+            let state = match kind {
+                "look_hidden" => LookListing::Hidden,
+                "look_removed" => LookListing::Removed,
+                _ => LookListing::Listed,
+            };
+            AuditEvent::LookListing {
+                look: reference(look)?,
+                state,
+                moderator: credential_ref(actor)?,
+                reason: text(payload, "reason").unwrap_or_default().to_owned(),
             }
         }
         "release_manifest" => {

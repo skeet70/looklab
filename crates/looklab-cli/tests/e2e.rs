@@ -208,8 +208,13 @@ fn synthetic_flow_fits_reports_compares_exports_and_validates() {
 #[test]
 fn prep_reproduces_blobs_from_the_seed_file() {
     let workspace = workspace();
-    let fixture = workspace.join("fixtures/fujifilm-x-s10.raf");
-    let raw = std::fs::read(&fixture).expect("RAF fixture");
+    let fixture = workspace.join("fixtures/cache/fujifilm-x-s10.raf");
+    let raw = std::fs::read(&fixture).unwrap_or_else(|error| {
+        panic!(
+            "read {}: {error}; run tools/fetch-fixtures.sh",
+            fixture.display()
+        )
+    });
     let decoded = RawlerDecoder.decode(&raw).expect("decode RAF");
     let jpeg = render_jpeg(&decoded);
 

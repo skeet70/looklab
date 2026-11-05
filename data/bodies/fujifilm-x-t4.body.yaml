@@ -1,0 +1,11 @@
+id: fujifilm/x-t4
+make: Fujifilm
+model: X-T4
+exif_aliases: [X-T4]
+kind: camera
+capabilities:
+  in_camera_raw_conversion: true
+  jpeg_color_spaces: [srgb, adobe_rgb]
+  heif: false
+status: active
+mapping_status: provisional

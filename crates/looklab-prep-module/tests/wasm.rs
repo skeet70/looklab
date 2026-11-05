@@ -12,7 +12,16 @@ use looklab_prep_module::{
 use looklab_raw::{DecodedRaw, Orientation, RawDecoder, RawlerDecoder};
 use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
 
-const RAW: &[u8] = include_bytes!("../../../fixtures/fujifilm-x-s10.raf");
+fn fixture_raw() -> Vec<u8> {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/cache/fujifilm-x-s10.raf");
+    std::fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "read {}: {error}; run tools/fetch-fixtures.sh",
+            path.display()
+        )
+    })
+}
 
 struct Guest {
     store: Store<()>,
@@ -95,7 +104,9 @@ fn build_module() -> PathBuf {
 }
 
 fn jpeg_from_fixture() -> Vec<u8> {
-    let decoded = RawlerDecoder.decode(RAW).expect("fixture decodes");
+    let decoded = RawlerDecoder
+        .decode(&fixture_raw())
+        .expect("fixture decodes");
     let image = raw_image(&decoded);
     let codes: Vec<u8> = image
         .data
@@ -152,7 +163,7 @@ fn meta_orientation(orientation: Orientation) -> looklab_meta::Orientation {
 
 fn request(jpeg: Vec<u8>) -> PrepareRequest {
     PrepareRequest {
-        raw: RAW.to_vec(),
+        raw: fixture_raw(),
         jpegs: vec![jpeg],
         prior: PriorTransformSpec::CameraMatrices { version: 3 },
         seed: [0x10; 32],

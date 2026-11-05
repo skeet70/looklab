@@ -198,6 +198,8 @@ fn build_document(
             admissions: Vec::new(),
             anchor_version: String::new(),
         },
+        base: None,
+        needs_rebase: false,
         community_snapshot_version: 0,
         prep_versions,
         created: util::now_rfc3339(),

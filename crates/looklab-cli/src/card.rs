@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
-use looklab_export::card::{Card, read_card};
+use looklab_export::card::{Card, CardMeta, CardOptions, read_card, write_card};
 
 #[derive(Debug, Args)]
 pub struct CardArgs {
@@ -24,13 +24,64 @@ pub enum CardCommand {
         #[arg(required = true, num_args = 3.., value_name = "RGB")]
         rgb: Vec<f64>,
     },
+    /// Write a `card.llk` from a Look document.
+    Write {
+        look: PathBuf,
+        out: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        short_name: String,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        license: Option<String>,
+    },
 }
 
 pub fn run(args: &CardArgs) -> Result<()> {
     match &args.command {
         CardCommand::Inspect { file } => inspect(file),
         CardCommand::Eval { file, rgb } => eval(file, rgb),
+        CardCommand::Write {
+            look,
+            out,
+            name,
+            short_name,
+            description,
+            license,
+        } => write(
+            look,
+            out,
+            name,
+            short_name,
+            description.as_deref(),
+            license.as_deref(),
+        ),
     }
+}
+
+fn write(
+    look: &Path,
+    out: &Path,
+    name: &str,
+    short_name: &str,
+    description: Option<&str>,
+    license: Option<&str>,
+) -> Result<()> {
+    let document = crate::util::load_document(look)?;
+    let mut meta = CardMeta::new(name, short_name);
+    if let Some(description) = description {
+        meta = meta.with_description(description);
+    }
+    if let Some(license) = license {
+        meta = meta.with_license(license);
+    }
+    let bytes = write_card(&document, &meta, &CardOptions::default())
+        .map_err(|error| anyhow::anyhow!("{}: {error}", look.display()))?;
+    crate::write(out, &bytes)?;
+    println!("wrote {} ({} bytes)", out.display(), bytes.len());
+    Ok(())
 }
 
 fn load(path: &Path) -> Result<(Card, usize)> {

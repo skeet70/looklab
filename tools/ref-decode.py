@@ -6,7 +6,7 @@ Dumps the raw mosaic with LibRaw's `unprocessed_raw`, block-averages it like `lo
 and writes per-channel means plus an 8x8 grid of block means as JSON:
 
     nix shell nixpkgs#libraw nixpkgs#python3 -c \\
-        python3 tools/ref-decode.py --file fixtures/fujifilm-x-s10.raf \\
+        python3 tools/ref-decode.py --file fixtures/cache/fujifilm-x-s10.raf \\
         --pattern GGRGGBGGBGGRBRGRBGGGBGGRGGRGGBRBGBRG --tile 6 \\
         --crop 0,5,6252,4176 --black 1022 --white 16382 \\
         --out crates/looklab-raw/tests/golden/fujifilm-x-s10.json

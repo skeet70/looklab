@@ -12,8 +12,8 @@ use looklab_trust::{
     CredentialId as TrustCredentialId, EffectiveContributorId, Region, RegionCoverage, SerialLink,
     resolve_effective_contributors,
 };
-use looklab_upload::{ControlSettings, SettingSource};
 use looklab_upload::{BodyId, LookSlug};
+use looklab_upload::{ControlSettings, SettingSource};
 use sqlx::SqlitePool;
 
 use crate::body::{BodyResources, BodyTransforms, DataDir, TransformDir, epoch_for, resolve_look};

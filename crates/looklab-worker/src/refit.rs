@@ -10,7 +10,8 @@ use looklab_fit::{
 };
 use looklab_model::realization::{ControlResponseModel, decode_crm, encode_crm};
 use looklab_model::{
-    Density, Look, LookDocument, ProbeCovariance, ProbeId, ProbeScalars, UncertaintyData,
+    CameraRendering, Density, Look, LookDocument, ProbeCovariance, ProbeId, ProbeScalars,
+    UncertaintyData,
 };
 use looklab_publish::{
     BodyUse, CARD_ARTIFACT, GateCheck, GateSummary, PREVIEW_LUT_ARTIFACT, ProvenanceSummary,
@@ -354,6 +355,16 @@ async fn refit_look(
         warm_state.as_ref(),
     )?;
     let converged = native_result.diagnostics.converged;
+    if std::env::var_os("LOOKLAB_TIMING").is_some() {
+        eprintln!(
+            "native fit diagnostics: converged={} sweeps={} evaluations={} cost={} samples={}",
+            native_result.diagnostics.converged,
+            native_result.diagnostics.sweeps,
+            native_result.diagnostics.evaluations,
+            native_result.diagnostics.final_cost,
+            native_result.diagnostics.objective_samples
+        );
+    }
     if !converged {
         tracing::warn!(
             look = look.as_str(),
@@ -367,14 +378,9 @@ async fn refit_look(
             .as_ref()
             .map(|state| serde_json::to_string(state).map(db::FitState::new))
             .transpose()?;
-        let consecutive = db::record_fit_attempt(
-            db_pool,
-            look.as_str(),
-            body.as_str(),
-            state.as_ref(),
-            now,
-        )
-        .await?;
+        let consecutive =
+            db::record_fit_attempt(db_pool, look.as_str(), body.as_str(), state.as_ref(), now)
+                .await?;
         if consecutive >= config.max_consecutive_nonconverged {
             let attempt = db::fit_attempt(db_pool, look.as_str())
                 .await?
@@ -519,7 +525,8 @@ async fn refit_look(
     }
 
     ownership.check(db_pool).await?;
-    let (document, document_bytes) = look_document(look, next_version, &native_result)?;
+    let (document, document_bytes) =
+        look_document(look, next_version, &native_result, pool.body.make())?;
     lap(&mut at, "document");
     let release = ReleaseRecord {
         version: next_version,
@@ -737,9 +744,14 @@ fn look_document(
     look: &LookSlug,
     version: u32,
     result: &FitResult,
+    maker: &str,
 ) -> Result<(LookDocument, Vec<u8>)> {
     let identity = looklab_model::file::identity(look.as_str(), &format!("{version}.0.0"))?;
     let mut document = LookDocument::from_look(identity, result.look.clone())?;
+    document.file.rendering = Some(CameraRendering {
+        maker: maker.to_owned(),
+        name: look.as_str().to_owned(),
+    });
     let count = result.probes.probes.len();
     let mut covariance = Vec::with_capacity(count * 9);
     let mut covariance_post = Vec::with_capacity(count * 9);

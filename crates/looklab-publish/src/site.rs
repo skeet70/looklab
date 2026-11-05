@@ -3,7 +3,7 @@
 
 use std::io;
 
-use looklab_model::file::{LookKind, LookVersion, Slug, WbPolicy};
+use looklab_model::file::{LookKind, LookPin, LookVersion, Slug, WbPolicy};
 use looklab_schema::BodyId;
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +43,12 @@ pub struct LookVersionPage {
     #[serde(skip)]
     pub blobs: Vec<ArtifactBlob>,
     pub notes: VersionNotes,
+    #[serde(default = "matchable_default")]
+    pub matchable: bool,
+}
+
+fn matchable_default() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +77,7 @@ impl LookVersionPage {
             manifest,
             blobs,
             notes,
+            matchable: true,
         })
     }
 
@@ -80,6 +87,21 @@ impl LookVersionPage {
 
     pub fn artifacts(&self) -> &[ArtifactEntry] {
         &self.manifest.artifacts
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LookListing {
+    #[default]
+    Listed,
+    Hidden,
+    Removed,
+}
+
+impl LookListing {
+    pub fn is_listed(self) -> bool {
+        self == Self::Listed
     }
 }
 
@@ -93,6 +115,10 @@ pub struct LookPage {
     pub aliases: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub license: Option<LicensePage>,
+    #[serde(default)]
+    pub listing: LookListing,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<LookPin>,
     pub versions: Vec<LookVersionPage>,
 }
 
@@ -129,6 +155,8 @@ fn version_parts(version: &LookVersion) -> Vec<u64> {
 pub struct VersionSummary {
     pub version: LookVersion,
     pub status: LookStatus,
+    #[serde(default = "matchable_default")]
+    pub matchable: bool,
     pub manifest: SitePath,
     pub manifest_sha256: ArtifactHash,
     pub manifest_bytes: u64,
@@ -177,6 +205,13 @@ pub struct BodySummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferencePreview {
+    pub path: SitePath,
+    pub sha256: ArtifactHash,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SiteIndex {
     pub format: String,
     /// The community data snapshot the site was built from.
@@ -185,6 +220,8 @@ pub struct SiteIndex {
     pub bodies: Vec<BodySummary>,
     pub looks: Vec<LookSummary>,
     pub scenes: Vec<SceneSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_preview: Option<ReferencePreview>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -195,6 +232,7 @@ pub struct SiteData {
     pub looks: Vec<LookPage>,
     pub audit_log: AuditLog,
     pub scenes: Vec<Scene>,
+    pub reference_preview: Option<ArtifactBlob>,
 }
 
 /// A consumer of published files, such as a directory writer or an in-memory test sink.
@@ -276,6 +314,11 @@ pub fn write_site<S: SiteSink + ?Sized>(
 
     for body in &site.bodies {
         let mut page = body.clone();
+        page.native_looks.retain(|card| {
+            site.looks
+                .iter()
+                .all(|look| look.slug != card.look || look.listing.is_listed())
+        });
         for card in &mut page.native_looks {
             if let Some(look) = site.looks.iter().find(|look| look.slug == card.look)
                 && let Some(latest) = look.latest()
@@ -288,6 +331,9 @@ pub fn write_site<S: SiteSink + ?Sized>(
     }
 
     for look in &site.looks {
+        if !look.listing.is_listed() {
+            continue;
+        }
         let page_path = look_path(&look.slug)?;
         sink.put(&page_path, &json(look)?)?;
         for version in &look.versions {
@@ -301,6 +347,10 @@ pub fn write_site<S: SiteSink + ?Sized>(
                 &version.manifest.to_json()?,
             )?;
         }
+    }
+
+    if let Some(preview) = &site.reference_preview {
+        sink.put(&reference_preview_path(&preview.name)?, &preview.bytes)?;
     }
 
     let mut scenes = Vec::with_capacity(site.scenes.len());
@@ -362,6 +412,10 @@ impl EncodedScene {
     }
 }
 
+fn reference_preview_path(name: &ArtifactName) -> Result<SitePath, PublishError> {
+    SitePath::new(format!("data/reference/{}", name.as_str()))
+}
+
 fn site_index(site: &SiteData, scenes: Vec<SceneSummary>) -> Result<SiteIndex, PublishError> {
     let bodies = site
         .bodies
@@ -371,6 +425,11 @@ fn site_index(site: &SiteData, scenes: Vec<SceneSummary>) -> Result<SiteIndex, P
                 .native_looks
                 .iter()
                 .map(|card| card.look.clone())
+                .filter(|slug| {
+                    site.looks
+                        .iter()
+                        .all(|look| look.slug != *slug || look.listing.is_listed())
+                })
                 .collect();
             looks.sort();
             looks.dedup();
@@ -389,6 +448,7 @@ fn site_index(site: &SiteData, scenes: Vec<SceneSummary>) -> Result<SiteIndex, P
     let looks = site
         .looks
         .iter()
+        .filter(|look| look.listing.is_listed())
         .map(|look| {
             let versions =
                 look.versions
@@ -404,6 +464,7 @@ fn site_index(site: &SiteData, scenes: Vec<SceneSummary>) -> Result<SiteIndex, P
                         Ok(VersionSummary {
                             version: version.version().clone(),
                             status: version.manifest.status,
+                            matchable: version.matchable,
                             manifest: manifest_path(&look.slug, version.version())?,
                             manifest_sha256: ArtifactHash::of(&manifest),
                             manifest_bytes: manifest.len() as u64,
@@ -429,6 +490,17 @@ fn site_index(site: &SiteData, scenes: Vec<SceneSummary>) -> Result<SiteIndex, P
         bodies,
         looks,
         scenes,
+        reference_preview: site
+            .reference_preview
+            .as_ref()
+            .map(|preview| -> Result<ReferencePreview, PublishError> {
+                Ok(ReferencePreview {
+                    path: reference_preview_path(&preview.name)?,
+                    sha256: ArtifactHash::of(&preview.bytes),
+                    bytes: preview.bytes.len() as u64,
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -549,6 +621,8 @@ mod tests {
             description: "Standard".to_owned(),
             aliases: Vec::new(),
             license: None,
+            listing: LookListing::Listed,
+            superseded_by: None,
             versions: vec![version],
         }
     }
@@ -571,6 +645,7 @@ mod tests {
             looks: vec![look()],
             audit_log: AuditLog::default(),
             scenes: vec![scene()],
+            reference_preview: None,
         };
         let mut sink = MemorySink(BTreeMap::new());
         write_site(&mut sink, &site).expect("write");
@@ -597,6 +672,7 @@ mod tests {
             looks: vec![look()],
             audit_log: AuditLog::default(),
             scenes: vec![scene()],
+            reference_preview: None,
         };
         let mut sink = MemorySink(BTreeMap::new());
         write_site(&mut sink, &site).expect("write");
@@ -620,6 +696,60 @@ mod tests {
     }
 
     #[test]
+    fn hiding_a_native_look_removes_its_body_card_and_summary_entry() {
+        let mut hidden = look();
+        hidden.listing = LookListing::Hidden;
+        let site = SiteData {
+            bodies: vec![body()],
+            looks: vec![hidden],
+            ..SiteData::default()
+        };
+        let mut sink = MemorySink(BTreeMap::new());
+        write_site(&mut sink, &site).expect("write");
+        let page: BodyPage =
+            serde_json::from_slice(&sink.0["data/bodies/fujifilm/x-t5.json"]).expect("body json");
+        assert!(
+            page.native_looks
+                .iter()
+                .all(|card| card.look.as_str() != "provia")
+        );
+        assert!(
+            page.native_looks
+                .iter()
+                .any(|card| card.look.as_str() == "classic-chrome")
+        );
+        let index: SiteIndex =
+            serde_json::from_slice(&sink.0["data/index.json"]).expect("index json");
+        assert!(
+            index.bodies[0]
+                .looks
+                .iter()
+                .all(|slug| slug.as_str() != "provia")
+        );
+        assert!(
+            index.bodies[0]
+                .looks
+                .iter()
+                .any(|slug| slug.as_str() == "classic-chrome")
+        );
+    }
+
+    #[test]
+    fn index_publishes_version_matchability() {
+        let mut look = look();
+        look.versions[0].matchable = false;
+        let site = SiteData {
+            looks: vec![look],
+            ..SiteData::default()
+        };
+        let mut sink = MemorySink(BTreeMap::new());
+        write_site(&mut sink, &site).expect("write");
+        let index: SiteIndex =
+            serde_json::from_slice(&sink.0["data/index.json"]).expect("index json");
+        assert!(!index.looks[0].versions[0].matchable);
+    }
+
+    #[test]
     fn writer_rejects_duplicate_looks() {
         let site = SiteData {
             community_snapshot_version: 0,
@@ -627,6 +757,7 @@ mod tests {
             looks: vec![look(), look()],
             audit_log: AuditLog::default(),
             scenes: Vec::new(),
+            reference_preview: None,
         };
         let mut sink = MemorySink(BTreeMap::new());
         assert!(matches!(
@@ -710,5 +841,37 @@ mod tests {
         ));
         assert!(!sink.0.contains_key(path.as_str()));
         assert!(!sink.0.contains_key(INDEX_PATH));
+    }
+
+    #[test]
+    fn reference_preview_index_authenticates_the_published_identity_lut() {
+        let bytes = crate::bake_lut(&looklab_model::Look::colorimetric(), |xyz| xyz);
+        let site = SiteData {
+            reference_preview: Some(ArtifactBlob::new(
+                ArtifactName::new("neutral.lut33").expect("artifact name"),
+                bytes.clone(),
+            )),
+            ..SiteData::default()
+        };
+        let mut sink = MemorySink(BTreeMap::new());
+        let root = write_site(&mut sink, &site).expect("write");
+        let index_bytes = &sink.0[INDEX_PATH];
+        assert_eq!(root, ArtifactHash::of(index_bytes));
+        let index: SiteIndex = serde_json::from_slice(index_bytes).expect("site index");
+        let reference = index.reference_preview.expect("reference metadata");
+        let published = &sink.0[reference.path.as_str()];
+        assert_eq!(published, &bytes);
+        assert_eq!(reference.bytes, published.len() as u64);
+        assert_eq!(reference.sha256, ArtifactHash::of(published));
+        assert_eq!(published.len(), crate::LUT_BYTES);
+    }
+
+    #[test]
+    fn older_site_index_has_no_reference_preview() {
+        let index: SiteIndex = serde_json::from_str(
+            r#"{"format":"looklab-site/1","bodies":[],"looks":[],"scenes":[]}"#,
+        )
+        .expect("older site index");
+        assert!(index.reference_preview.is_none());
     }
 }

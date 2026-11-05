@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Node wasm32 check that the committed fixtures match the native digests.
+//! Node wasm32 check that the fixtures match the native digests. The RAF is
+//! fetch-only: run `tools/fetch-fixtures.sh` before building.
 //!
 //!     cargo test -p looklab-raw --target wasm32-unknown-unknown
 
@@ -10,7 +11,7 @@ use wasm_bindgen_test::wasm_bindgen_test;
 
 #[wasm_bindgen_test]
 fn fujifilm_x_s10_matches_native_digest() {
-    let bytes = include_bytes!("../../../fixtures/fujifilm-x-s10.raf");
+    let bytes = include_bytes!("../../../fixtures/cache/fujifilm-x-s10.raf");
     let img = RawlerDecoder.decode(bytes).expect("decode RAF");
     assert_eq!((img.width, img.height), (1042, 696));
     assert_eq!(digest_f32(&img.rgb), 0x14b1_973f_d0fd_c8ac);

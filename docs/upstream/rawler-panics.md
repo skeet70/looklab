@@ -16,7 +16,7 @@ std::panic::set_hook(Box::new(|info| {
 }));
 ```
 
-The committed seeds are `fixtures/canon-eos-60d.dng` and three truncated prefixes of `fixtures/fujifilm-x-s10.raf` (64, 192 and 256 KiB), 995,764 bytes in total.
+The committed seeds are `fixtures/canon-eos-60d.dng` and three truncated prefixes of the fetch-only `fujifilm-x-s10.raf` (64, 192 and 256 KiB), 995,764 bytes in total. The prefixes are committed under `fuzz/corpus/raw_decode/`; the full RAF comes from `tools/fetch-fixtures.sh`.
 
 ```sh
 nix develop .#fuzz -c cargo fuzz run raw_decode -- \

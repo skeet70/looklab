@@ -342,7 +342,7 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
             if UrlParts::parse(&entry.request.url).is_some_and(|parts| parts.origin() == origin.0) {
                 audit_request(&entry.request, class, &service, &mut findings);
                 if class == RequestClass::SessionStatus {
-                    audit_session_status(&entry.request, &har, &origin, &mut findings);
+                    audit_session_status(&entry.request, har, &origin, &mut findings);
                 }
             }
         }

@@ -181,7 +181,11 @@ epochs:
 
 ### Look and LookVersion
 - `Look`: `id`, `slug`, `name`, `kind` (`native_family` | `lut_defined`), `wb_policy`, `description`, `aliases[]`, `license` (for `lut_defined`: the submitter's declaration + attribution).
-- `LookVersion`: `version`, `status` (`provisional` | `rooted` | `published` | `deprecated`), `artifact_hash`, `probe_predictions_hash`, `metrics`, `provenance` (§3), `gate_results`, `changelog`.
+- A `lut_defined` Look's identity is the LUT bytes, its declared encoding and its base. It also stores the grid, license and attribution, and a layered approximation fitted to the composition (§3, [02 §3.8](02-color-pipeline.md)).
+- `encoding` is `scene_referred { transfer, gamut }` for a LUT that consumes scene-referred log (v1: `transfer = flog2`, `gamut = fgamut`), or `display_referred { base, status }` for a LUT that expects an already-rendered image. `output` is `srgb` in v1.
+- A display-referred `base` is `look@version` (a published Look; the neutral baseline `looklab-neutral-srgb-v1@1.0.0` is itself a fixed Look), `body_realization { body, renderer, film_simulation, dynamic_range, notes }` for an in-camera or software rendering, or `family_rendering { maker, rendering, dynamic_range, notes }` for an intended family Look that is not published yet. A family base resolves to a `look@version` pin when that family Look is published; until then it is `base_identified_unmeasured`.
+- `status` is `pinned` (published and fitted), `base_identified_unmeasured` (fully declared and consistent, not yet measured or published), `base_incomplete { missing }` (a declared field is absent), or `base_inconsistent { field }` (the declared setting does not exist on the declared body; `field` names it). Only `pinned` is matchable and gets a card file; the other three are stored and listed with an approximate preview at most.
+- `LookVersion`: `version`, `status` (`provisional` | `rooted` | `published` | `deprecated`), `artifact_hash`, `probe_predictions_hash`, `metrics`, `provenance` (§3), `gate_results`, `changelog`. Provenance records the pinned base and `needs_rebase`; a new base version creates a candidate rebased version gated against the Look's anchor, and a base revert marks every pinned dependent ([05 §8](05-trust-and-integrity.md)).
 - Same name ≠ same Look. Cross-body disagreement can propose a split.
 
 ### InputTransform
@@ -335,6 +339,7 @@ The challenge signed by WebAuthn is `H(nonce ‖ sha256(manifest))`. The server 
 {
   "format": "looklab-look/1",
   "look": { "slug": "classic-chrome", "version": "3.0.0", "kind": "native_family", "wb_policy": "adaptive" },
+  "rendering": { "maker": "Fujifilm", "name": "Classic Chrome" },
   "viewing_conditions": { "white": "D65", "L_A": 4.074, "Y_b": 20, "surround": "average", "discount_illuminant": true },
   "probe_set": "v1",
   "layers": {
@@ -363,9 +368,27 @@ The challenge signed by WebAuthn is `H(nonce ‖ sha256(manifest))`. The server 
 }
 ```
 
-A `lut_defined` Look stores the uploaded LUT, its declared encodings and license, plus a fitted layered approximation.
+A `lut_defined` Look stores the uploaded LUT, its declared encodings, base and license, plus a fitted layered approximation. The approximation is fitted to the composition and frozen, so evaluation, previews, cards and matching never read the base Look at runtime.
 
-`look.bin` is a named-array container: `LKBN`, a little-endian `u32` array count, then per array a `u8` name length, the ASCII name, a little-endian `u32` element count and that many little-endian `f64`, arrays sorted by name. v1 names are `T` (absent for a colorimetric tone), `N`, `G`, `R`, `Lambda`, `res`, and optionally `probe_cov` and `probe_cov_post` (9 `f64` per probe, row-major 3×3), `probe_sigma`, `probe_sigma_post`, `probe_bias`, `probe_pre_reliable` and `support` (one `f64` per probe) and `kde` (one `f64` per probe); `res` is channel-minor, `((s·17 + a)·17 + b)·3 + channel`. v1 fixes the knot vectors and residual domain, repeated in `look.json` for validation; the zip is stored, fixed-order and fixed-timestamp.
+```jsonc
+{
+  "look": { "slug": "ricoh-griv-cinema-green-flog2", "version": "1.0.0", "kind": "lut_defined", "wb_policy": "adaptive" },
+  "definition": {
+    "name": "Ricoh GR IV Cinema Green (F-Log2)",
+    "license": { "own_work": false, "source_license": "CC0-1.0", "attribution": "mistycycles (Discord), donated 2026-11-05" },
+    "encoding": { "kind": "scene_referred", "transfer": "flog2", "gamut": "fgamut" },
+    "output": "srgb",
+    "lut": { "size": 33, "domain_min": [0, 0, 0], "domain_max": [1, 1, 1], "values_ref": "bin:lut" },
+    "notes": []
+  }
+}
+```
+
+A `lut_defined` Look may declare what it reproduces: `emulates = camera_rendering { maker, rendering }` or `film_stock { name }`; absent means an original grade. A native-family Look declares the rendering it reproduces in `rendering = { maker, name }`; a camera-rendering emulation matches when both labels agree after case folding and ignoring spaces and punctuation. A LUT that reproduces a rendering a released camera already produces officially is interim. When a native-family Look for that rendering is published, the LUT Look gets `superseded_by` pointing at it (`slug@version`) and stays listed with that pointer until a moderator hides or removes it; both actions write an audit-log row. A film-stock emulation or an original grade is first-class and is never superseded by a camera rendering. A Look's listing state is `listed`, `hidden` or `removed`; hidden and removed Looks keep their versions and artifacts in the database but are left out of the published index, and their published pages and downloadable artifacts are removed from the site.
+
+A display-referred LUT replaces `encoding` with `{ "kind": "display_referred", "base": { "kind": "body_realization", "body": "fujifilm/x-e3", "renderer": "x_raw_studio", "film_simulation": "classic_negative", "dynamic_range": "dr400", "notes": "..." }, "status": { "kind": "base_inconsistent", "field": "film_simulation" } }`. `status.kind` is `pinned`, `base_identified_unmeasured`, `base_incomplete` or `base_inconsistent`; the last three are stored and listed but not matchable and have no card file. Provenance repeats the pinned base as `base` and carries `needs_rebase` when a base revert marks the version ([05 §8](05-trust-and-integrity.md)).
+
+`look.bin` is a named-array container: `LKBN`, a little-endian `u32` array count, then per array a `u8` name length, the ASCII name, a little-endian `u32` element count and that many little-endian `f64`, arrays sorted by name. v1 names are `T` (absent for a colorimetric tone), `N`, `G`, `R`, `Lambda`, `res`, and optionally `probe_cov` and `probe_cov_post` (9 `f64` per probe, row-major 3×3), `probe_sigma`, `probe_sigma_post`, `probe_bias`, `probe_pre_reliable` and `support` (one `f64` per probe), `kde` (one `f64` per probe) and `lut` (`size³ × 3` `f64`, red fastest, for a `lut_defined` Look); `res` is channel-minor, `((s·17 + a)·17 + b)·3 + channel`. v1 fixes the knot vectors and residual domain, repeated in `look.json` for validation; a stored LUT side is at most 64, checked before allocation; the zip is stored, fixed-order and fixed-timestamp.
 
 A body's control-response model is a separate `crm.json` (§1), versioned and referenced from provenance by `control_response_version`.
 
@@ -378,7 +401,7 @@ A body's control-response model is a separate `crm.json` (§1), versioned and re
 
 ## 5. Published static data
 
-The site is a directory of immutable files plus JSON indexes, written by `looklab-publish`. The crate has no filesystem access: `write_site` takes a `SiteSink` (one `put(path, bytes)` call per file), so the same writer runs natively and in a browser test.
+The site is a directory of immutable files plus JSON indexes, written by `looklab-publish`. The crate has no filesystem access: `write_site` takes a `SiteSink` (one `put(path, bytes)` call per file), so the same writer runs natively and in a browser test. Look pages and the index carry `matchable` per version; a non-matchable version is listed and previewed but excluded from matching controls and match requests.
 
 ```
 data/index.json                          SiteIndex: bodies, looks, versions, scenes

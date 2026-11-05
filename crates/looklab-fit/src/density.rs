@@ -41,21 +41,11 @@ fn coordinates(s: f64, hue: f64, c: f64) -> [f64; 3] {
     ]
 }
 
-pub(crate) fn build(problem: &Problem, params: &Params, floor: f64) -> Density {
+fn from_weighted(points: impl Iterator<Item = (looklab_color::Xyz, f64)>, floor: f64) -> Density {
     let mut counts = vec![0.0_f64; S_BINS * H_BINS * C_BINS];
-    for sample in &problem.samples {
-        if !sample.informative {
-            continue;
-        }
-        let image = sample.image as usize;
-        let context = problem.image_ctx(params, image);
-        let xyz = context.transform.mul_vec([
-            sample.rgb[0] * context.wb_r * libm::pow(2.0, context.exposure),
-            sample.rgb[1] * libm::pow(2.0, context.exposure),
-            sample.rgb[2] * context.wb_b * libm::pow(2.0, context.exposure),
-        ]);
-        let input = LookInput::new(looklab_color::Xyz::from_array(xyz));
-        counts[index_of([input.s, input.h_in, input.c_in])] += sample.weight;
+    for (xyz, weight) in points {
+        let input = LookInput::new(xyz);
+        counts[index_of([input.s, input.h_in, input.c_in])] += weight;
     }
     let total: f64 = counts.iter().sum();
     if total > 0.0 {
@@ -69,6 +59,32 @@ pub(crate) fn build(problem: &Problem, params: &Params, floor: f64) -> Density {
         total,
         floor: floor.max(0.0),
     }
+}
+
+/// Weighted density over arbitrary `(s, h_in, √C_in)` points, using the same bins and
+/// smoothing as a fit's sample density.
+pub fn sample_density(points: &[looklab_color::Xyz], weight: f64, floor: f64) -> Density {
+    from_weighted(points.iter().map(|xyz| (*xyz, weight)), floor)
+}
+
+pub(crate) fn build(problem: &Problem, params: &Params, floor: f64) -> Density {
+    from_weighted(
+        problem
+            .samples
+            .iter()
+            .filter(|sample| sample.informative)
+            .map(|sample| {
+                let image = sample.image as usize;
+                let context = problem.image_ctx(params, image);
+                let xyz = context.transform.mul_vec([
+                    sample.rgb[0] * context.wb_r * libm::pow(2.0, context.exposure),
+                    sample.rgb[1] * libm::pow(2.0, context.exposure),
+                    sample.rgb[2] * context.wb_b * libm::pow(2.0, context.exposure),
+                ]);
+                (looklab_color::Xyz::from_array(xyz), sample.weight)
+            }),
+        floor,
+    )
 }
 
 fn smooth(counts: &mut [f64]) {

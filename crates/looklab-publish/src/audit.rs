@@ -126,6 +126,12 @@ pub enum AuditEvent {
         kind: SplitKind,
         detail: String,
     },
+    LookListing {
+        look: LookRef,
+        state: crate::site::LookListing,
+        moderator: CredentialRef,
+        reason: String,
+    },
     Release {
         look: LookRef,
         version: VersionRef,
@@ -144,6 +150,7 @@ impl AuditEvent {
             Self::ReAnchor { .. } => "re_anchor",
             Self::Revert { .. } => "revert",
             Self::Split { .. } => "split",
+            Self::LookListing { .. } => "look_listing",
             Self::Release { .. } => "release",
         }
     }

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Look representation, evaluation, look file format and probe sets.
 
+pub mod baseline;
 pub mod basis;
 pub mod clip;
+pub mod dependency;
 mod deriv;
 pub mod error;
 pub mod file;
@@ -15,8 +17,12 @@ pub mod tone;
 pub use clip::{ClipFunction, ClipSettings, output_encode_clip, soft_clip};
 pub use error::{ModelError, Result};
 pub use file::{
-    BinRef, ChromaReference, Density, FormatId, LayersRecord, LookDocument, LookFile, LookIdentity,
-    LookKind, ProbeCovariance, ProbeScalars, ProbeSetVersion, UncertaintyData, WbPolicy,
+    BaseField, BaseReference, BaseStatus, BinRef, CameraRendering, ChromaReference,
+    DeclaredEncoding, Density, DynamicRange, FormatId, Gamut, LayersRecord, LicenseRecord,
+    LogTransfer, LookDocument, LookFile, LookIdentity, LookKind, LookPin, LutData, LutDefinition,
+    LutEmulation, LutRecord, MAX_LUT_SIDE, NEUTRAL_BASELINE_SLUG, NEUTRAL_BASELINE_VERSION,
+    OutputEncoding, ProbeCovariance, ProbeScalars, ProbeSetVersion, Renderer, UncertaintyData,
+    WbPolicy, emulation_matches_camera_rendering, lut_value_count,
 };
 pub use look::{
     CoefTerm, ColorLayer, GrlComponent, GrlWeights, LayerValues, Look, LookInput, ParamLayout,

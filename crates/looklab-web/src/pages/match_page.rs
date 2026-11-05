@@ -99,7 +99,8 @@ pub fn MatchPage() -> impl IntoView {
                     .iter()
                     .find(|look| look.slug == slug)
                     .and_then(|look| look.latest())
-                    .ok_or("Choose a published look.")?
+                    .filter(|version| version.matchable)
+                    .ok_or("Choose a matchable published look.")?
                     .version
                     .to_string();
                 let loaded = data::match_version(slug.as_str(), &version).await?;
@@ -232,7 +233,7 @@ pub fn MatchPage() -> impl IntoView {
         }.into_any() } else { match state.get() {
             Load::Loading => ui::loading().into_any(), Load::Failed(error) => ui::failure(&error).into_any(),
             Load::Ready(index) => {
-                let items = index.looks.iter().filter(|look| look.visibility == looklab_publish::LookVisibility::Public).filter_map(|look| look.latest().map(|version| ui::LookCardItem {
+                let items = index.looks.iter().filter(|look| look.visibility == looklab_publish::LookVisibility::Public).filter_map(|look| look.latest().filter(|version| version.matchable).map(|version| ui::LookCardItem {
                     slug: look.slug.clone(), version: version.version.clone(), name: look.name.clone(),
                     origin: ui::LookOrigin::BuiltIn { cameras: index.bodies.iter().filter(|body| body.looks.contains(&look.slug)).map(|body| format!("{} {}", body.make, body.model)).collect() },
                     character: String::new(), status: version.status, lut: None,

@@ -188,6 +188,7 @@ fn upsert_index(
         versions: vec![VersionSummary {
             version: LookVersion::new(VERSION).map_err(|error| error.to_string())?,
             status: LookStatus::Published,
+            matchable: true,
             manifest: SitePath::new(format!("data/looks/{SLUG}/{VERSION}/manifest.json"))
                 .map_err(|error| error.to_string())?,
             manifest_sha256: ArtifactHash::of(manifest_bytes),

@@ -10,9 +10,9 @@ use looklab_export::{BakeIlluminant, Baker, CctK, InputTransform, ValidationRepo
 use looklab_model::Look;
 use looklab_model::probes;
 use looklab_schema::{
-    AcceptedArtifact, Evidence, FIXTURE_MANIFEST, FixtureDonation, LabeledTag, ProposalKind,
-    ProposalStatus, ProposalView, SNAPSHOT_MANIFEST, SnapshotManifest, ValidatedPayload,
-    apply_sim_mapping, body_export_path, content_hash, fixture_manifest_toml,
+    AcceptedArtifact, Evidence, FIXTURE_MANIFEST, FixtureDonation, LabeledTag, Placement,
+    ProposalKind, ProposalStatus, ProposalView, SNAPSHOT_MANIFEST, SnapshotManifest,
+    ValidatedPayload, apply_sim_mapping, body_export_path, content_hash, fixture_manifest_toml,
     interface_export_path, mapping_status_supported, schema_export_path, validate_confirmation,
     validate_proposal,
 };
@@ -529,7 +529,7 @@ pub async fn fixture_manifest(db: &SqlitePool) -> Result<String, ProposalError> 
 fn published_donation(donation: &FixtureDonation) -> FixtureDonation {
     let mut published = donation.clone();
     if published.source.is_some() {
-        published.committed = true;
+        published.placement = Placement::Lfs;
         published.source = None;
     }
     published

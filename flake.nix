@@ -36,6 +36,7 @@
 
         common = with pkgs; [
           git
+          git-lfs
           pkg-config
           openssl
           sqlite

@@ -38,7 +38,13 @@ fn HomeChoices(index: SiteIndex, scene: Arc<PreparedScene>) -> impl IntoView {
     let items = cards(&index);
     let camera = RwSignal::new(index.bodies.first().map(|camera| camera.id.clone()));
     let look = RwSignal::new(items.first().map(|item| item.slug.clone()));
-    let right = RwSignal::new(items.get(1).or_else(|| items.first()).cloned());
+    let show_reference_labels = index.reference_preview.is_some();
+    let initial_right = if index.reference_preview.is_some() {
+        items.first()
+    } else {
+        items.get(1).or_else(|| items.first())
+    };
+    let right = RwSignal::new(initial_right.cloned());
     let preview = RwSignal::new(Load::<(Arc<Vec<u8>>, Arc<Vec<u8>>, String, String)>::Loading);
     let first = items.first().cloned();
     let generation = RwSignal::new(0_u32);
@@ -49,12 +55,21 @@ fn HomeChoices(index: SiteIndex, scene: Arc<PreparedScene>) -> impl IntoView {
         generation.set(mine);
         wasm_bindgen_futures::spawn_local(async move {
             let result = async {
-                let a = first.ok_or_else(|| "No looks published yet.".to_owned())?;
                 let b = right.ok_or_else(|| "Choose a look.".to_owned())?;
+                let (a_lut, a_name) = match data::reference_preview().await? {
+                    Some(lut) => (lut, "Neutral".to_owned()),
+                    None => {
+                        let a = first.ok_or_else(|| "No looks published yet.".to_owned())?;
+                        (
+                            data::preview(a.slug.as_str(), a.version.as_str()).await?,
+                            a.name,
+                        )
+                    }
+                };
                 Ok((
-                    data::preview(a.slug.as_str(), a.version.as_str()).await?,
+                    a_lut,
                     data::preview(b.slug.as_str(), b.version.as_str()).await?,
-                    a.name,
+                    a_name,
                     b.name,
                 ))
             }
@@ -97,6 +112,10 @@ fn HomeChoices(index: SiteIndex, scene: Arc<PreparedScene>) -> impl IntoView {
         <section class="home-preview">
             {move || match preview.get() {
                 Load::Ready((a, b, an, bn)) => view! {
+                    <div class="home-preview-labels" hidden=!show_reference_labels>
+                        <span>{an.clone()}</span>
+                        <span>{bn.clone()}</span>
+                    </div>
                     <ui::Viewer lut_a=Signal::stored(a) lut_b=Signal::stored(b)
                         scene=Signal::derive(move || hero_scene.get()) label_a=an label_b=bn controls=false/>
                 }.into_any(),

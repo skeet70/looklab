@@ -1,0 +1,72 @@
+# X-Trans III bootstrap schema. Film simulations are the Fujigraphy table for
+# X-Trans III; ExifTool documents the FilmMode and Saturation encodings used
+# here. Only controls needed to resolve a display base are mapped.
+body: fujifilm/x-e3
+epochs:
+  - id: 1
+    firmware: { from: "1.00", to: "1.99" }
+    native_sims:
+      - key: provia
+        look: provia
+        makernote: { tag: FilmMode, value: 0x0000 }
+      - key: velvia
+        look: velvia
+        makernote: { tag: FilmMode, value: 0x0200 }
+      - key: astia
+        look: astia
+        makernote: { tag: FilmMode, value: 0x0120 }
+      - key: classic_chrome
+        look: classic-chrome
+        makernote: { tag: FilmMode, value: 0x0600 }
+      - key: pro_neg_hi
+        look: pro-neg-hi
+        makernote: { tag: FilmMode, value: 0x0501 }
+      - key: pro_neg_std
+        look: pro-neg-std
+        makernote: { tag: FilmMode, value: 0x0500 }
+      - key: acros
+        look: acros
+        makernote: { tag: Saturation, value: 0x0500 }
+      - key: acros_ye
+        look: acros
+        makernote: { tag: Saturation, value: 0x0502 }
+      - key: acros_r
+        look: acros
+        makernote: { tag: Saturation, value: 0x0501 }
+      - key: acros_g
+        look: acros
+        makernote: { tag: Saturation, value: 0x0503 }
+      - key: monochrome
+        look: monochrome
+        makernote: { tag: Saturation, value: 0x0300 }
+      - key: monochrome_ye
+        look: monochrome
+        makernote: { tag: Saturation, value: 0x0302 }
+      - key: monochrome_r
+        look: monochrome
+        makernote: { tag: Saturation, value: 0x0301 }
+      - key: monochrome_g
+        look: monochrome
+        makernote: { tag: Saturation, value: 0x0303 }
+      - key: sepia
+        look: sepia
+        makernote: { tag: Saturation, value: 0x0310 }
+    exposure_modes:
+      - key: dr100
+      - key: dr200
+      - key: dr400
+    controls:
+      - key: dynamic_range
+        type: enum
+        values: [dr100, dr200, dr400]
+        default: dr100
+        look_affecting: true
+        affects: [tone, exposure]
+        constraints: { min_iso: { dr200: 400, dr400: 800 } }
+        makernote:
+          tag: DevelopmentDynamicRange
+          values: { dr100: 100, dr200: 200, dr400: 400 }
+          fallback:
+            tag: DynamicRangeSetting
+            values: { dr100: 0x100, dr200: 0x200, dr400: 0x201 }
+    solve_plan: []

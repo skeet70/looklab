@@ -5,6 +5,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
 
+use looklab_model::file::LookPin;
 use looklab_trust::{
     Actor, ArtifactHash, CredentialId as TrustCredentialId, CredentialState, Endorsement,
     EvidenceRef, Grant, Reputation, Role, RootAdmission as TrustRootAdmission, RootDataKind,
@@ -77,6 +78,10 @@ pub enum AdminError {
     UnknownProposal,
     #[error("the proposal is already decided")]
     ProposalDecided,
+    #[error("the Look is unknown")]
+    UnknownLook,
+    #[error("the Look is {0}")]
+    LookState(&'static str),
     #[error("the stored record is not readable")]
     Corrupt,
 }
@@ -1465,6 +1470,188 @@ pub async fn manifest_record(
         artifacts,
         created_at,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListingState {
+    Listed,
+    Hidden,
+    Removed,
+}
+
+impl ListingState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Listed => "listed",
+            Self::Hidden => "hidden",
+            Self::Removed => "removed",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, AdminError> {
+        match value {
+            "listed" => Ok(Self::Listed),
+            "hidden" => Ok(Self::Hidden),
+            "removed" => Ok(Self::Removed),
+            _ => Err(AdminError::Corrupt),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LookListingRecord {
+    pub look: LookSlug,
+    pub listing: ListingState,
+    pub superseded_by: Option<LookPin>,
+}
+
+fn parse_pin(value: &str) -> Result<LookPin, AdminError> {
+    let (slug, version) = value.split_once('@').ok_or(AdminError::Corrupt)?;
+    LookPin::new(slug, version).map_err(|_| AdminError::Corrupt)
+}
+
+fn listing_record(
+    look: &LookSlug,
+    listing: &str,
+    superseded_by: Option<String>,
+) -> Result<LookListingRecord, AdminError> {
+    Ok(LookListingRecord {
+        look: look.clone(),
+        listing: ListingState::parse(listing)?,
+        superseded_by: superseded_by.as_deref().map(parse_pin).transpose()?,
+    })
+}
+
+pub async fn look_listings(db: &SqlitePool) -> Result<Vec<LookListingRecord>, AdminError> {
+    let rows: Vec<(String, String, Option<String>)> =
+        sqlx::query_as("SELECT look, listing, superseded_by FROM look_listings ORDER BY look")
+            .fetch_all(db)
+            .await?;
+    rows.into_iter()
+        .map(|(look, listing, superseded_by)| {
+            let look = LookSlug::try_from(look).map_err(|_| AdminError::Corrupt)?;
+            listing_record(&look, &listing, superseded_by)
+        })
+        .collect()
+}
+
+/// Returns whether the stored pointer changed.
+pub async fn set_superseded_by(
+    db: &SqlitePool,
+    look: &LookSlug,
+    superseded_by: &LookPin,
+) -> Result<bool, AdminError> {
+    let pin = superseded_by.to_string();
+    let result = sqlx::query(
+        "INSERT INTO look_listings (look, listing, superseded_by, updated_at)
+         VALUES (?, 'listed', ?, ?)
+         ON CONFLICT (look) DO UPDATE
+         SET superseded_by = excluded.superseded_by, updated_at = excluded.updated_at
+         WHERE look_listings.superseded_by IS NOT excluded.superseded_by",
+    )
+    .bind(look.as_str())
+    .bind(&pin)
+    .bind(now_unix())
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn hide_look(
+    db: &SqlitePool,
+    moderator: &CredentialId,
+    look: &LookSlug,
+    reason: &str,
+) -> Result<LookListingRecord, AdminError> {
+    set_listing(db, moderator, look, reason, ListingState::Hidden).await
+}
+
+pub async fn remove_look(
+    db: &SqlitePool,
+    moderator: &CredentialId,
+    look: &LookSlug,
+    reason: &str,
+) -> Result<LookListingRecord, AdminError> {
+    set_listing(db, moderator, look, reason, ListingState::Removed).await
+}
+
+pub async fn relist_look(
+    db: &SqlitePool,
+    moderator: &CredentialId,
+    look: &LookSlug,
+    reason: &str,
+) -> Result<LookListingRecord, AdminError> {
+    set_listing(db, moderator, look, reason, ListingState::Listed).await
+}
+
+async fn set_listing(
+    db: &SqlitePool,
+    moderator: &CredentialId,
+    look: &LookSlug,
+    reason: &str,
+    target: ListingState,
+) -> Result<LookListingRecord, AdminError> {
+    let reason = normalize_reason(reason)?;
+    let mut conn = begin_write(db).await?;
+    let result = async {
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM look_versions WHERE look = ?")
+            .bind(look.as_str())
+            .fetch_one(&mut *conn)
+            .await?;
+        if exists == 0 {
+            return Err(AdminError::UnknownLook);
+        }
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT listing FROM look_listings WHERE look = ?")
+                .bind(look.as_str())
+                .fetch_optional(&mut *conn)
+                .await?;
+        let current = match current.as_deref() {
+            Some(value) => ListingState::parse(value)?,
+            None => ListingState::Listed,
+        };
+        let allowed = match target {
+            ListingState::Listed => current != ListingState::Listed,
+            ListingState::Hidden => current == ListingState::Listed,
+            ListingState::Removed => current != ListingState::Removed,
+        };
+        if !allowed {
+            return Err(AdminError::LookState(current.as_str()));
+        }
+        sqlx::query(
+            "INSERT INTO look_listings (look, listing, superseded_by, updated_at)
+             VALUES (?, ?, NULL, ?)
+             ON CONFLICT (look) DO UPDATE
+             SET listing = excluded.listing, updated_at = excluded.updated_at",
+        )
+        .bind(look.as_str())
+        .bind(target.as_str())
+        .bind(now_unix())
+        .execute(&mut *conn)
+        .await?;
+        let (kind, event) = match target {
+            ListingState::Listed => (AuditKind::LookRelisted, "look_relisted"),
+            ListingState::Hidden => (AuditKind::LookHidden, "look_hidden"),
+            ListingState::Removed => (AuditKind::LookRemoved, "look_removed"),
+        };
+        let payload = json!({
+            "event": event,
+            "actor": moderator,
+            "look": look,
+            "reason": reason,
+        });
+        audit::insert(&mut conn, kind, &payload).await?;
+        crate::store::enqueue_publish_if_idle(&mut conn).await?;
+        let (listing, superseded_by): (String, Option<String>) =
+            sqlx::query_as("SELECT listing, superseded_by FROM look_listings WHERE look = ?")
+                .bind(look.as_str())
+                .fetch_one(&mut *conn)
+                .await?;
+        listing_record(look, &listing, superseded_by)
+    }
+    .await;
+    finish(&mut conn, result).await
 }
 
 #[derive(Debug, Clone, Serialize)]

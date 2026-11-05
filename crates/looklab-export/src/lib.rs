@@ -12,6 +12,7 @@ pub mod card;
 pub mod cct;
 pub mod downstream;
 pub mod error;
+pub mod lut_look;
 pub mod native;
 pub mod quantize;
 pub mod sim;
@@ -35,6 +36,10 @@ pub use downstream::{
 };
 pub use error::{ExportError, Result};
 pub use looklab_schema::{Format, InsertionPoint, Interpolation, Precision};
+pub use lut_look::{
+    DeltaSummary, LutLookError, LutLookImport, LutLookOptions, composed_ucs, definition_delta,
+    import_lut_look, lut_data_from_cube, with_base_covariance,
+};
 pub use native::{NativeDocument, read_native_json, write_native_json};
 pub use sim::{CctReport, DeltaStats, Support, ValidationReport, validate};
 pub use writer::{

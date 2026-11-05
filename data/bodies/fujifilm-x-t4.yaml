@@ -1,0 +1,176 @@
+# X-T4 bootstrap schema. Film simulations are the Fujigraphy X-Trans IV list:
+# the X-Trans III set plus Eterna, Classic Negative and Eterna Bleach Bypass.
+body: fujifilm/x-t4
+epochs:
+  - id: 1
+    firmware: { from: "1.00", to: "1.99" }
+    native_sims:
+      - key: provia
+        look: provia
+        makernote: { tag: FilmMode, value: 0x0000 }
+      - key: velvia
+        look: velvia
+        makernote: { tag: FilmMode, value: 0x0200 }
+      - key: astia
+        look: astia
+        makernote: { tag: FilmMode, value: 0x0120 }
+      - key: classic_chrome
+        look: classic-chrome
+        makernote: { tag: FilmMode, value: 0x0600 }
+      - key: pro_neg_hi
+        look: pro-neg-hi
+        makernote: { tag: FilmMode, value: 0x0501 }
+      - key: pro_neg_std
+        look: pro-neg-std
+        makernote: { tag: FilmMode, value: 0x0500 }
+      - key: classic_negative
+        look: classic-negative
+        makernote: { tag: FilmMode, value: 0x0800 }
+      - key: eterna
+        look: eterna
+        makernote: { tag: FilmMode, value: 0x0700 }
+      - key: eterna_bleach_bypass
+        look: eterna-bleach-bypass
+        makernote: { tag: FilmMode, value: 0x0900 }
+      - key: acros
+        look: acros
+        makernote: { tag: Saturation, value: 0x0500 }
+      - key: acros_ye
+        look: acros
+        makernote: { tag: Saturation, value: 0x0502 }
+      - key: acros_r
+        look: acros
+        makernote: { tag: Saturation, value: 0x0501 }
+      - key: acros_g
+        look: acros
+        makernote: { tag: Saturation, value: 0x0503 }
+      - key: monochrome
+        look: monochrome
+        makernote: { tag: Saturation, value: 0x0300 }
+      - key: monochrome_ye
+        look: monochrome
+        makernote: { tag: Saturation, value: 0x0302 }
+      - key: monochrome_r
+        look: monochrome
+        makernote: { tag: Saturation, value: 0x0301 }
+      - key: monochrome_g
+        look: monochrome
+        makernote: { tag: Saturation, value: 0x0303 }
+      - key: sepia
+        look: sepia
+        makernote: { tag: Saturation, value: 0x0310 }
+    exposure_modes:
+      - key: dr100
+      - key: dr200
+      - key: dr400
+    controls:
+      - key: dynamic_range
+        type: enum
+        values: [dr100, dr200, dr400]
+        default: dr100
+        look_affecting: true
+        affects: [tone, exposure]
+        constraints: { min_iso: { dr200: 320, dr400: 640 } }
+        makernote:
+          tag: DevelopmentDynamicRange
+          values: { dr100: 100, dr200: 200, dr400: 400 }
+          fallback:
+            tag: DynamicRangeSetting
+            values: { dr100: 0x100, dr200: 0x200, dr400: 0x201 }
+      - key: highlight_tone
+        type: decimal
+        range: [-2.0, 4.0]
+        step: 0.5
+        default: 0.0
+        look_affecting: true
+        affects: [tone]
+        makernote: { tag: HighlightTone, encoding: { scale: -16 } }
+      - key: shadow_tone
+        type: decimal
+        range: [-2.0, 4.0]
+        step: 0.5
+        default: 0.0
+        look_affecting: true
+        affects: [tone]
+        makernote: { tag: ShadowTone, encoding: { scale: -16 } }
+      - key: color
+        type: int
+        range: [-4, 4]
+        step: 1
+        default: 0
+        look_affecting: true
+        affects: [chroma]
+        makernote:
+          tag: Saturation
+          values: { -4: 0x4e0, -3: 0x4c0, -2: 0x400, -1: 0x180, 0: 0, 1: 0x80, 2: 0x100, 3: 0xc0, 4: 0xe0 }
+      - key: color_chrome_effect
+        type: enum
+        values: [off, weak, strong]
+        default: off
+        look_affecting: true
+        affects: [chroma, lightness]
+        makernote: { tag: ColorChromeEffect, values: { off: 0, weak: 32, strong: 64 } }
+      - key: color_chrome_fx_blue
+        type: enum
+        values: [off, weak, strong]
+        default: off
+        look_affecting: true
+        affects: [chroma, lightness]
+        makernote: { tag: ColorChromeFXBlue, values: { off: 0, weak: 32, strong: 64 } }
+      - key: wb_shift_r
+        type: int
+        range: [-9, 9]
+        step: 1
+        default: 0
+        look_affecting: true
+        affects: [wb]
+        makernote: { tag: WhiteBalanceFineTune, component: 0, encoding: { scale: 20 } }
+      - key: wb_shift_b
+        type: int
+        range: [-9, 9]
+        step: 1
+        default: 0
+        look_affecting: true
+        affects: [wb]
+        makernote: { tag: WhiteBalanceFineTune, component: 1, encoding: { scale: 20 } }
+      - key: exposure_compensation
+        type: decimal
+        range: [-3.0, 3.0]
+        step: 1/3
+        default: 0.0
+        look_affecting: false
+        affects: [exposure]
+        makernote: { tag: ExposureCompensation, encoding: { scale: 3 } }
+      - key: grain
+        type: enum
+        values: [off, weak, strong]
+        default: off
+        look_affecting: false
+        spatial: true
+        tolerated: [off]
+        makernote: { tag: GrainEffectRoughness, values: { off: 0, weak: [16, 32], strong: [48, 64] } }
+      - key: clarity
+        type: int
+        range: [-5, 5]
+        step: 1
+        default: 0
+        look_affecting: false
+        spatial: true
+        tolerated: [0]
+        makernote: { tag: Clarity, encoding: { scale: 1000 } }
+      - key: noise_reduction
+        type: int
+        range: [-4, 4]
+        step: 1
+        default: 0
+        look_affecting: false
+        spatial: true
+        tolerated: any
+        makernote:
+          tag: NoiseReduction
+          values: { -4: 0x2e0, -3: 0x2c0, -2: 0x200, -1: 0x280, 0: 0, 1: 0x180, 2: 0x100, 3: 0x1c0, 4: 0x1e0 }
+    solve_plan:
+      - stage: tone
+        controls: [dynamic_range, highlight_tone, shadow_tone, exposure_compensation]
+      - stage: color
+        controls: [color, color_chrome_effect, color_chrome_fx_blue, wb_shift_r, wb_shift_b]

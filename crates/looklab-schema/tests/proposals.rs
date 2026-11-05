@@ -3,7 +3,7 @@
 
 use looklab_schema::{
     Date, Evidence, FixtureDonation, FixtureLicense, LabeledTag, LicenseDeclaration, MappingError,
-    ProposalKind, ProposalSummary, Sha256Hex, ValidatedPayload, fixture_manifest_toml,
+    Placement, ProposalKind, ProposalSummary, Sha256Hex, ValidatedPayload, fixture_manifest_toml,
     fixture_source, frame_fixture_upload, infer_mapping, split_fixture_upload, validate_proposal,
 };
 
@@ -201,21 +201,21 @@ fn donation() -> FixtureDonation {
         donator: Some("a_handle".to_owned()),
         donated_on: Date::parse("2026-11-04").expect("date"),
         license: FixtureLicense::Cc0_1_0,
-        committed: false,
+        placement: Placement::Fetch,
     }
 }
 
 #[test]
 fn a_download_only_fixture_needs_a_source() {
-    let committed = FixtureDonation {
+    let published = FixtureDonation {
         source_url: None,
-        committed: true,
+        placement: Placement::Git,
         ..donation()
     };
-    committed
+    published
         .validate()
         .expect("a committed fixture needs no URL");
-    assert!(!fixture_manifest_toml(std::slice::from_ref(&committed)).contains("source_url"));
+    assert!(!fixture_manifest_toml(std::slice::from_ref(&published)).contains("source_url"));
 
     let download_only = FixtureDonation {
         source_url: None,
@@ -249,7 +249,7 @@ fn an_uploaded_source_is_bound_to_the_file_digest() {
     assert_eq!(mismatched.validate().unwrap_err()[0].path, "source");
 
     let published = FixtureDonation {
-        committed: true,
+        placement: Placement::Git,
         ..uploaded
     };
     assert_eq!(published.validate().unwrap_err()[0].path, "source");
@@ -302,6 +302,40 @@ fn a_fixture_donation_validates_and_renders_a_manifest_table() {
     let mut unsafe_name = donation.clone();
     unsafe_name.file = "../secret.raf".to_owned();
     assert!(unsafe_name.validate().is_err());
+}
+
+#[test]
+fn fixture_placement_round_trips_as_json_and_in_the_manifest() {
+    for (placement, json, rendered) in [
+        (Placement::Git, serde_json::json!(true), "committed = true"),
+        (
+            Placement::Fetch,
+            serde_json::json!(false),
+            "committed = false",
+        ),
+        (
+            Placement::Lfs,
+            serde_json::json!("lfs"),
+            "committed = \"lfs\"",
+        ),
+    ] {
+        let encoded = serde_json::to_value(placement).expect("json");
+        assert_eq!(encoded, json);
+        let decoded: Placement = serde_json::from_value(encoded).expect("placement");
+        assert_eq!(decoded, placement);
+
+        let donation = FixtureDonation {
+            placement,
+            ..donation()
+        };
+        let value = serde_json::to_value(&donation).expect("json");
+        assert_eq!(value["committed"], json);
+        let parsed: FixtureDonation = serde_json::from_value(value).expect("donation");
+        assert_eq!(parsed, donation);
+
+        let manifest = fixture_manifest_toml(std::slice::from_ref(&donation));
+        assert!(manifest.contains(rendered), "{manifest}");
+    }
 }
 
 #[test]

@@ -69,6 +69,8 @@ pub enum CardError {
     NonFinite,
     #[error("card metadata: {0}")]
     Meta(&'static str),
+    #[error("Look is not matchable: its display base is not pinned")]
+    NotMatchable,
 }
 
 /// Input space id 1: scene-linear Rec.2020 adapted to D65 (docs/04 §8.1).
@@ -394,12 +396,15 @@ impl Card {
 }
 
 /// # Errors
-/// Rejects out-of-range metadata, a non-adaptive look, or non-finite values.
+/// Rejects out-of-range metadata, a non-adaptive or non-matchable look, or non-finite values.
 pub fn write_card(
     document: &LookDocument,
     meta: &CardMeta,
     options: &CardOptions,
 ) -> Result<Vec<u8>, CardError> {
+    if !document.is_matchable() {
+        return Err(CardError::NotMatchable);
+    }
     if document.file.look.wb_policy != LookWbPolicy::Adaptive {
         return Err(CardError::Meta("wb_policy is not adaptive"));
     }

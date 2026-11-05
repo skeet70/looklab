@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use leptos::prelude::*;
-use looklab_publish::{AuditEvent, Decision, Role, SplitKind};
+use looklab_publish::{AuditEvent, Decision, LookListing, Role, SplitKind};
 
 use crate::data::{self, Load};
 use crate::ui;
@@ -75,6 +75,19 @@ pub(super) fn event_sentence(event: &AuditEvent) -> String {
             match kind {
                 SplitKind::Epoch => "Firmware versions",
                 SplitKind::Look => "Looks",
+            }
+        ),
+        AuditEvent::LookListing {
+            look,
+            state,
+            moderator,
+            reason,
+        } => format!(
+            "{moderator} marked {look} {}: {reason}",
+            match state {
+                LookListing::Listed => "listed",
+                LookListing::Hidden => "hidden",
+                LookListing::Removed => "removed",
             }
         ),
         AuditEvent::Release { look, version, .. } => format!("{look} {version} published."),
@@ -553,6 +566,12 @@ async fn load_activity() -> Result<Vec<ActivityItem>, String> {
                         reason.clone(),
                         Some(proposal.clone()),
                         ActivityFilter::Decisions,
+                    ),
+                    AuditEvent::LookListing { look, reason, .. } => (
+                        format!("{look} changed its listing state."),
+                        reason.clone(),
+                        None,
+                        ActivityFilter::All,
                     ),
                     AuditEvent::Release { look, version, .. } => (
                         format!("{look} {version} published."),
