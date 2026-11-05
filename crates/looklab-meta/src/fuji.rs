@@ -33,6 +33,39 @@ pub enum FujiTag {
 }
 
 impl FujiTag {
+    pub const ALL: [Self; 22] = [
+        Self::Version,
+        Self::InternalSerialNumber,
+        Self::Sharpness,
+        Self::WhiteBalance,
+        Self::Saturation,
+        Self::WhiteBalanceFineTune,
+        Self::NoiseReduction,
+        Self::NoiseReductionLegacy,
+        Self::Clarity,
+        Self::ShadowTone,
+        Self::HighlightTone,
+        Self::GrainEffectRoughness,
+        Self::ColorChromeEffect,
+        Self::GrainEffectSize,
+        Self::ColorChromeFxBlue,
+        Self::DynamicRange,
+        Self::FilmMode,
+        Self::DynamicRangeSetting,
+        Self::DevelopmentDynamicRange,
+        Self::ImageGeneration,
+        Self::ImageCount,
+        Self::SequenceNumber,
+    ];
+
+    /// Both noise-reduction tags share one ExifTool name; this returns the
+    /// current tag.
+    pub fn from_exiftool_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|tag| tag.exiftool_name() == name)
+    }
+
     pub const fn id(self) -> u16 {
         match self {
             Self::Version => 0x0000,

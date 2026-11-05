@@ -10,6 +10,7 @@ pub mod error;
 pub mod match_api;
 pub mod pairing;
 pub mod pattern;
+pub mod prefill;
 pub mod prep;
 pub mod seedfile;
 
@@ -31,6 +32,7 @@ pub use match_api::{
 pub use match_api::{encode_match_request, encode_verify_request};
 pub use pairing::{PairGroup, PairingPlan, UnpairedEntry, inspect_files};
 pub use pattern::{PatternImage, render_pattern};
+pub use prefill::{SettingsPrefill, prefill_settings};
 pub use prep::{
     GroupSettings, IntentChoice, PrepSummary, build_manifest_request, decode_build_manifest_reply,
     decode_encode_reply, decode_parse_reply, decode_pow_reply, decode_prepare_reply,

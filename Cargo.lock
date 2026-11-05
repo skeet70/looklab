@@ -3372,6 +3372,7 @@ dependencies = [
 name = "looklab-schema"
 version = "0.1.0"
 dependencies = [
+ "looklab-meta",
  "saphyr-parser",
  "serde",
  "serde_json",
@@ -3508,6 +3509,7 @@ dependencies = [
  "looklab-report",
  "looklab-schema",
  "looklab-server",
+ "looklab-trust",
  "looklab-upload",
  "looklab-wasm",
  "p256",

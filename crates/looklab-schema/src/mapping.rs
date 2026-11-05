@@ -24,6 +24,24 @@ pub enum MappingError {
     TooFewFiles,
     #[error("label the files with at least two different menu answers")]
     TooFewLabels,
+    #[error("the control schema has no epoch {epoch}")]
+    UnknownEpoch { epoch: u32 },
+    #[error("the image carries no {tag} makernote for control `{control}`")]
+    MissingTag { control: String, tag: &'static str },
+    #[error("{tag} value {raw} is not a value of control `{control}`")]
+    UnmappedValue {
+        control: String,
+        tag: &'static str,
+        raw: String,
+    },
+    #[error("{tag} maps with a scale but control `{control}` is not numeric")]
+    ScaleNotNumeric { control: String, tag: &'static str },
+    #[error("{tag} does not decode to a step of control `{control}`")]
+    NotOnStep { control: String, tag: &'static str },
+    #[error("no native simulation matches the file's makernotes")]
+    UnknownSim,
+    #[error("several native simulations match the file's makernotes")]
+    AmbiguousSim,
 }
 
 #[derive(Debug, Clone, PartialEq)]

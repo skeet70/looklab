@@ -46,6 +46,34 @@ pub enum ErrorKind {
     FirmwareRangeOverlap,
     #[error("`spatial: true` requires `tolerated`")]
     SpatialToleratedRequired,
+    #[error("`{tag}` is not a known makernote tag")]
+    UnknownMakernoteTag { tag: String },
+    #[error("a makernote mapping needs `encoding` or `values`")]
+    MissingMakernoteEncoding,
+    #[error("a makernote mapping takes `encoding` or `values`, not both")]
+    ConflictingMakernoteEncoding,
+    #[error("a paired makernote tag needs `component`")]
+    MakernoteComponentRequired,
+    #[error("`component` is only meaningful for a paired makernote tag")]
+    MakernoteComponentNotAllowed,
+    #[error("`component` {component} is outside a tag of {components} values")]
+    MakernoteComponentOutOfRange { component: u8, components: u8 },
+    #[error("a scale needs a numeric control")]
+    MakernoteScaleNotNumeric,
+    #[error("the scale is zero")]
+    MakernoteScaleZero,
+    #[error("the scaled raw value of step {value} is not an integer")]
+    MakernoteRawNotInteger { value: String },
+    #[error("`{value}` is not a value of the control")]
+    MakernoteValueUnknown { value: String },
+    #[error("the control value `{value}` has no makernote value")]
+    MakernoteValueMissing { value: String },
+    #[error("the mapped value has no raw tag value")]
+    MakernoteValueHasNoRaw,
+    #[error("`{value}` is outside the control's range")]
+    MakernoteValueOutOfRange { value: String },
+    #[error("raw value {raw} maps to more than one control value")]
+    MakernoteDuplicateRaw { raw: i64 },
     #[error("snapshot manifest: {0}")]
     SnapshotManifest(String),
     #[error("snapshot content hash is {found}, the manifest declares {declared}")]

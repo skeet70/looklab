@@ -207,6 +207,8 @@ pub struct BodyPage {
     pub id: looklab_schema::BodyId,
     pub make: String,
     pub model: String,
+    /// The control-schema YAML this page was built from.
+    pub schema: String,
     pub exif_aliases: Vec<String>,
     pub kind: BodyKind,
     pub status: BodyStatus,
@@ -285,6 +287,7 @@ impl BodyPage {
             id: body.id.clone(),
             make: body.make.clone(),
             model: body.model.clone(),
+            schema: schema.source().to_owned(),
             exif_aliases: body.exif_aliases.clone(),
             kind: match body.kind {
                 SchemaBodyKind::Camera => BodyKind::Camera,

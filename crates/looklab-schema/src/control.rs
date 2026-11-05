@@ -9,6 +9,7 @@ use serde::de::value::SeqAccessDeserializer;
 use serde::de::{self, Visitor};
 
 use crate::ids::{ControlKey, EnumValue};
+use crate::makernote::ControlMakernote;
 use crate::rational::Rational;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
@@ -100,7 +101,7 @@ impl From<(Rational, Rational)> for Range {
 }
 
 /// A YAML scalar classified from its written text.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ScalarValue {
     Bool(bool),
     Number(Rational),
@@ -189,34 +190,46 @@ pub struct Control {
     pub spatial: bool,
     pub tolerated: Option<Tolerated>,
     pub constraints: Option<Constraints>,
+    pub makernote: Option<ControlMakernote>,
 }
 
 fn empty_steps() -> core::ops::RangeInclusive<i64> {
     core::ops::RangeInclusive::new(0, -1)
 }
 
+pub(crate) fn numeric_steps(
+    range: Option<&Range>,
+    step: Option<&Rational>,
+) -> core::ops::RangeInclusive<i64> {
+    let Some(range) = range else {
+        return empty_steps();
+    };
+    let Some(step) = step else {
+        return empty_steps();
+    };
+    if step.is_zero() {
+        return empty_steps();
+    }
+    let Some(lo) = range.min.div_exact(step) else {
+        return empty_steps();
+    };
+    let Some(hi) = range.max.div_exact(step) else {
+        return empty_steps();
+    };
+    lo..=hi
+}
+
+pub(crate) fn step_value(step: Option<&Rational>, index: i64) -> Option<Rational> {
+    step?.checked_mul_i64(index)
+}
+
 impl Control {
     /// Empty for non-numeric controls.
     pub fn steps(&self) -> core::ops::RangeInclusive<i64> {
-        let Some(range) = self.range.as_ref() else {
-            return empty_steps();
-        };
-        let Some(step) = self.step.as_ref() else {
-            return empty_steps();
-        };
-        if step.is_zero() {
-            return empty_steps();
-        }
-        let Some(lo) = range.min.div_exact(step) else {
-            return empty_steps();
-        };
-        let Some(hi) = range.max.div_exact(step) else {
-            return empty_steps();
-        };
-        lo..=hi
+        numeric_steps(self.range.as_ref(), self.step.as_ref())
     }
 
     pub fn value_at(&self, step_index: i64) -> Option<Rational> {
-        self.step.as_ref()?.checked_mul_i64(step_index)
+        step_value(self.step.as_ref(), step_index)
     }
 }

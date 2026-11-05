@@ -10,13 +10,14 @@ use looklab_wasm::coverage::{CoverageMap, coverage_map, sample_points};
 use looklab_wasm::prep::{ModuleFunction, default_pow};
 use looklab_wasm::{
     GroupSettings, IntentChoice, PairingPlan, PowParamsSpec, PrepSummary, PreparedImageView,
-    build_manifest_request, decode_build_manifest_reply, decode_encode_reply, decode_pow_reply,
-    decode_prepare_reply, encode_envelope_request, module_fn_id, prepare_request,
-    serial_ascii_for_file, solve_pow_request,
+    SettingsPrefill, build_manifest_request, decode_build_manifest_reply, decode_encode_reply,
+    decode_pow_reply, decode_prepare_reply, encode_envelope_request, module_fn_id,
+    prefill_settings, prepare_request, serial_ascii_for_file, solve_pow_request,
 };
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlInputElement};
 
+use crate::data;
 use crate::files::{LocalFile, download, read_input};
 use crate::worker::{PrepWorker, default_worker_count, max_worker_count};
 use crate::{idb, webauthn};
@@ -75,6 +76,7 @@ pub fn ContributePage() -> impl IntoView {
     let status_link = RwSignal::new(None::<String>);
     let serial_opt_in = RwSignal::new(false);
     let serial_present = RwSignal::new(false);
+    let prefill_note = RwSignal::new(None::<String>);
 
     let on_files = move |event: leptos::ev::Event| {
         let Some(input) = event
@@ -85,20 +87,55 @@ pub fn ContributePage() -> impl IntoView {
         };
         spawn_local(async move {
             match read_input(&input).await {
-                Ok(files) => match looklab_wasm::inspect_files(
-                    &files
+                Ok(files) => {
+                    let entries: Vec<(String, Vec<u8>)> = files
                         .iter()
                         .map(|file| (file.name.clone(), file.bytes.clone()))
-                        .collect::<Vec<_>>(),
-                ) {
-                    Ok(pairing) => {
-                        all_files.set(files);
-                        serial_present.set(pairing.facts.iter().any(|fact| fact.has_serial));
-                        plan.set(Some(pairing));
-                        stage.set(Stage::Confirm);
+                        .collect();
+                    match looklab_wasm::inspect_files(&entries) {
+                        Ok(pairing) => {
+                            let body_key = pairing.facts.iter().find_map(|fact| {
+                                Some((
+                                    fact.make.clone()?,
+                                    fact.model.clone()?,
+                                    fact.firmware.clone()?,
+                                ))
+                            });
+                            all_files.set(files);
+                            serial_present.set(pairing.facts.iter().any(|fact| fact.has_serial));
+                            plan.set(Some(pairing));
+                            stage.set(Stage::Confirm);
+                            prefill_note.set(None);
+                            if let Some((make, model, _)) = body_key {
+                                match prefill_from_site(&make, &model, &entries).await {
+                                    Ok((body_id, prefill)) => {
+                                        body.set(body_id);
+                                        firmware.set(prefill.firmware);
+                                        if let Some(chosen) = prefill.sim {
+                                            sim.set(chosen);
+                                        }
+                                        controls.set(
+                                            prefill
+                                                .controls
+                                                .iter()
+                                                .map(|(key, step)| format!("{key}={step}"))
+                                                .collect::<Vec<_>>()
+                                                .join("\n"),
+                                        );
+                                        if !prefill.unavailable.is_empty() {
+                                            prefill_note.set(Some(format!(
+                                                "Not read from the makernotes: {}",
+                                                prefill.unavailable.join("; ")
+                                            )));
+                                        }
+                                    }
+                                    Err(error) => prefill_note.set(Some(error)),
+                                }
+                            }
+                        }
+                        Err(error) => message.set(Some(error.to_string())),
                     }
-                    Err(error) => message.set(Some(error.to_string())),
-                },
+                }
                 Err(error) => message.set(Some(error)),
             }
         });
@@ -300,6 +337,7 @@ pub fn ContributePage() -> impl IntoView {
             <label for="controls">"Control steps (key=step, one per line)"</label>
             <textarea id="controls" rows="3" prop:value=move || controls.get()
                 on:input=move |event| controls.set(event_target_value(&event))></textarea>
+            {move || prefill_note.get().map(|note| view! { <p class="muted" role="status">{note}</p> })}
             <label for="workers">"Workers"</label>
             <select id="workers" on:change=move |event| {
                 worker_count.set(event_target_value(&event).parse().unwrap_or(1))
@@ -597,6 +635,22 @@ fn metadata_rows(image: &PrepSummary) -> Vec<(String, String)> {
         .filter(|(_, value)| !value.is_null())
         .map(|(key, value)| (key.clone(), value.to_string()))
         .collect()
+}
+
+async fn prefill_from_site(
+    make: &str,
+    model: &str,
+    files: &[(String, Vec<u8>)],
+) -> Result<(String, SettingsPrefill), String> {
+    let index = data::index().await?;
+    let summary = index
+        .bodies
+        .iter()
+        .find(|body| body.make.eq_ignore_ascii_case(make) && body.model.eq_ignore_ascii_case(model))
+        .ok_or_else(|| format!("the site data has no body for {make} {model}"))?;
+    let page = data::body(summary.id.make(), summary.id.model()).await?;
+    let prefill = prefill_settings(&page.schema, files).map_err(|error| error.to_string())?;
+    Ok((page.id.to_string(), prefill))
 }
 
 fn group_settings(

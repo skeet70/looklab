@@ -516,6 +516,9 @@ trait SecondBody {
 impl SecondBody for BodyPage {
     fn into_second_body(mut self) -> Option<BodyPage> {
         let id = looklab_schema::BodyId::new("fujifilm/x-m1").ok()?;
+        self.schema = self
+            .schema
+            .replacen("body: fujifilm/x-t5", "body: fujifilm/x-m1", 1);
         self.id = id;
         self.make = "Fujifilm".to_owned();
         self.model = "X-M1".to_owned();

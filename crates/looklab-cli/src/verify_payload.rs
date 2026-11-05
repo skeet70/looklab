@@ -16,15 +16,14 @@ use looklab_prep_module::{
     BuildManifestRequest, BuildManifestResponse, Function, ManifestImageInput, ModuleError,
     PrepareRequest, PrepareResponse, PriorTransformSpec, Response, VersionResponse,
 };
-use looklab_schema::{Control, ControlType, Epoch, NativeSim};
+use looklab_schema::{MakernoteValues, SimKey, settings_from_makernote, sim_from_makernote};
 use looklab_server::body_schema::{Bodies, resolve_epoch, validate_settings};
 use looklab_upload::{
     BatchManifest, BlobKind, BodyId, ContributionKind, ControlEntry, ControlKey, ControlSettings,
-    DynamicRangeSetting, EffectStrength, Envelope, EnvelopeParts, ExpectedAssertion,
-    FirmwareVersionString, GrainRoughness, Intent, Limits, LookSettings, LookSlug, ManifestImage,
-    ManifestMetadata, NoiseReduction, PowParams, RawSerial as UploadSerial, Saturation,
-    SignatureAlgorithm, SimKey, StepIndex, StructuralVerdict, Tagged, TopOriginReview,
-    check_structure, encode_envelope, parse_envelope_strict, verify as verify_pow,
+    Envelope, EnvelopeParts, ExpectedAssertion, FirmwareVersionString, Intent, Limits, LookSlug,
+    ManifestImage, ManifestMetadata, PowParams, RawSerial as UploadSerial, SignatureAlgorithm,
+    StepIndex, StructuralVerdict, TopOriginReview, check_structure, encode_envelope,
+    parse_envelope_strict, verify as verify_pow,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -425,24 +424,23 @@ fn derive_one(metadata: &ManifestMetadata, bodies: &Bodies) -> Result<BatchField
         .ok_or("the image carries no EXIF firmware")?;
     let firmware = FirmwareVersionString::new(firmware_text)
         .map_err(|error| format!("EXIF firmware {firmware_text:?}: {error}"))?;
-    let look = metadata
-        .look
-        .as_ref()
-        .ok_or("the image carries no Fujifilm makernote settings")?;
     let epoch = resolve_epoch(&record.schema, firmware_text)
         .ok_or_else(|| format!("no epoch covers firmware {firmware_text}"))?;
-    let sim = derive_sim(look, epoch)?;
-
-    let mut sources = Vec::new();
-    for control in &epoch.controls {
-        match derive_setting(control, metadata, look) {
-            Some(Ok((step, source))) => {
-                sources.push((control.key.clone(), StepIndex::new(step), source))
-            }
-            Some(Err(reason)) => return Err(reason),
-            None => {}
-        }
-    }
+    let values = MakernoteValues::from(metadata);
+    let sim = sim_from_makernote(epoch, &values).map_err(|error| error.to_string())?;
+    let derived = settings_from_makernote(&record.schema, epoch.id, &values)
+        .map_err(|error| error.to_string())?;
+    let sources: Vec<(ControlKey, StepIndex, &'static str)> = derived
+        .entries()
+        .iter()
+        .map(|setting| {
+            (
+                setting.key.clone(),
+                StepIndex::new(setting.step),
+                setting.source.name(),
+            )
+        })
+        .collect();
     let entries: Vec<ControlEntry> = sources
         .iter()
         .map(|(key, step, _)| ControlEntry {
@@ -487,257 +485,6 @@ fn match_body(bodies: &Bodies, make: &str, model: &str) -> Result<BodyId, String
             "several bodies in the data snapshot match EXIF make {make:?} and model {model:?}: {matches:?}"
         )),
     }
-}
-
-fn derive_sim(look: &LookSettings, epoch: &Epoch) -> Result<SimKey, String> {
-    let film_mode = look
-        .film_mode
-        .as_ref()
-        .ok_or("the image carries no FilmMode makernote")?;
-    let raw = u64::try_from(film_mode.raw)
-        .map_err(|_| format!("FilmMode raw value {} is negative", film_mode.raw))?;
-    let mut matches: Vec<&NativeSim> = epoch
-        .native_sims
-        .iter()
-        .filter(|sim| sim.makernote.tag.as_str() == FILM_MODE_TAG && sim.makernote.value.0 == raw)
-        .collect();
-    match matches.len() {
-        1 => Ok(matches.remove(0).key.clone()),
-        0 => Err(format!(
-            "{FILM_MODE_TAG}={raw} is not a native simulation of this body"
-        )),
-        _ => Err(format!(
-            "{FILM_MODE_TAG}={raw} maps to several native simulations"
-        )),
-    }
-}
-
-fn derive_setting(
-    control: &Control,
-    metadata: &ManifestMetadata,
-    look: &LookSettings,
-) -> Option<Result<(i64, &'static str), String>> {
-    match control.key.as_str() {
-        "dynamic_range" => Some(derive_dynamic_range(control, look)),
-        "highlight_tone" => Some(derive_tone(
-            control,
-            look.highlight_tone.as_ref(),
-            "HighlightTone",
-        )),
-        "shadow_tone" => Some(derive_tone(
-            control,
-            look.shadow_tone.as_ref(),
-            "ShadowTone",
-        )),
-        "color" => Some(derive_color(control, look)),
-        "color_chrome_effect" => Some(derive_effect(
-            control,
-            look.color_chrome_effect.as_ref(),
-            "ColorChromeEffect",
-        )),
-        "color_chrome_fx_blue" => Some(derive_effect(
-            control,
-            look.color_chrome_fx_blue.as_ref(),
-            "ColorChromeFxBlue",
-        )),
-        "wb_shift_r" => Some(derive_wb_shift(control, look, WbShift::Red)),
-        "wb_shift_b" => Some(derive_wb_shift(control, look, WbShift::Blue)),
-        "exposure_compensation" => Some(derive_exposure_compensation(control, metadata)),
-        "grain" => Some(derive_grain(control, look)),
-        "clarity" => Some(derive_clarity(control, look)),
-        "noise_reduction" => Some(derive_noise_reduction(control, look)),
-        _ => None,
-    }
-}
-
-fn derive_dynamic_range(
-    control: &Control,
-    look: &LookSettings,
-) -> Result<(i64, &'static str), String> {
-    let label = if let Some(percent) = look
-        .development_dynamic_range
-        .as_ref()
-        .and_then(|tag| tag.value)
-    {
-        format!("dr{percent}")
-    } else if let Some(setting) = look
-        .dynamic_range_setting
-        .as_ref()
-        .and_then(|tag| tag.value)
-    {
-        match setting {
-            DynamicRangeSetting::Standard100 => "dr100".to_owned(),
-            DynamicRangeSetting::Wide1_230 => "dr200".to_owned(),
-            DynamicRangeSetting::Wide2_400 => "dr400".to_owned(),
-            _ => return Err("the DynamicRangeSetting makernote is not a fixed value".to_owned()),
-        }
-    } else {
-        return Err("the image carries no dynamic range makernote".to_owned());
-    };
-    enum_step(control, &label, "DevelopmentDynamicRange")
-}
-
-fn derive_tone(
-    control: &Control,
-    tag: Option<&Tagged<f64>>,
-    source: &'static str,
-) -> Result<(i64, &'static str), String> {
-    let value = tag
-        .and_then(|tag| tag.value)
-        .ok_or_else(|| format!("the image carries no {source} makernote"))?;
-    numeric_step(control, value, source)
-}
-
-fn derive_color(control: &Control, look: &LookSettings) -> Result<(i64, &'static str), String> {
-    let value = look
-        .saturation
-        .as_ref()
-        .and_then(|tag| tag.value)
-        .ok_or("the image carries no Saturation makernote")?;
-    match value {
-        Saturation::Step(step) => numeric_step(control, f64::from(step), "Saturation"),
-        _ => Err("the Saturation makernote is not expressed as a step".to_owned()),
-    }
-}
-
-fn derive_effect(
-    control: &Control,
-    tag: Option<&Tagged<EffectStrength>>,
-    source: &'static str,
-) -> Result<(i64, &'static str), String> {
-    let value = tag
-        .and_then(|tag| tag.value)
-        .ok_or_else(|| format!("the image carries no {source} makernote"))?;
-    let label = match value {
-        EffectStrength::Off => "off",
-        EffectStrength::Weak => "weak",
-        EffectStrength::Strong => "strong",
-    };
-    enum_step(control, label, source)
-}
-
-#[derive(Debug, Clone, Copy)]
-enum WbShift {
-    Red,
-    Blue,
-}
-
-fn derive_wb_shift(
-    control: &Control,
-    look: &LookSettings,
-    which: WbShift,
-) -> Result<(i64, &'static str), String> {
-    let fine_tune = look
-        .white_balance_fine_tune
-        .as_ref()
-        .ok_or("the image carries no WhiteBalanceFineTune makernote")?;
-    let shift = fine_tune
-        .shift
-        .ok_or("the WhiteBalanceFineTune makernote does not decode")?;
-    let value = match which {
-        WbShift::Red => f64::from(shift.red) / 20.0,
-        WbShift::Blue => f64::from(shift.blue) / 20.0,
-    };
-    numeric_step(control, value, "WhiteBalanceFineTune")
-}
-
-fn derive_exposure_compensation(
-    control: &Control,
-    metadata: &ManifestMetadata,
-) -> Result<(i64, &'static str), String> {
-    let value = metadata
-        .exposure_compensation_ev
-        .ok_or("the image carries no exposure compensation")?;
-    numeric_step(control, value, "ExposureCompensation")
-}
-
-fn derive_grain(control: &Control, look: &LookSettings) -> Result<(i64, &'static str), String> {
-    let value = look
-        .grain_roughness
-        .as_ref()
-        .and_then(|tag| tag.value)
-        .ok_or("the image carries no GrainEffectRoughness makernote")?;
-    let label = match value {
-        GrainRoughness::Off => "off",
-        GrainRoughness::WeakSmall | GrainRoughness::Weak => "weak",
-        GrainRoughness::StrongSmall | GrainRoughness::Strong => "strong",
-    };
-    enum_step(control, label, "GrainEffectRoughness")
-}
-
-fn derive_clarity(control: &Control, look: &LookSettings) -> Result<(i64, &'static str), String> {
-    let value = look
-        .clarity
-        .as_ref()
-        .and_then(|tag| tag.value)
-        .ok_or("the image carries no Clarity makernote")?;
-    numeric_step(control, f64::from(value), "Clarity")
-}
-
-fn derive_noise_reduction(
-    control: &Control,
-    look: &LookSettings,
-) -> Result<(i64, &'static str), String> {
-    let value = look
-        .noise_reduction
-        .as_ref()
-        .and_then(|tag| tag.value)
-        .ok_or("the image carries no NoiseReduction makernote")?;
-    match value {
-        NoiseReduction::Step(step) => numeric_step(control, f64::from(step), "NoiseReduction"),
-        _ => Err("the NoiseReduction makernote is not expressed as a step".to_owned()),
-    }
-}
-
-fn numeric_step(
-    control: &Control,
-    value: f64,
-    source: &'static str,
-) -> Result<(i64, &'static str), String> {
-    if !value.is_finite() {
-        return Err(format!("{source} is not finite"));
-    }
-    if !matches!(control.kind, ControlType::Int | ControlType::Decimal) {
-        return Err(format!(
-            "{source} is a number but control {} is not numeric",
-            control.key
-        ));
-    }
-    for step in control.steps() {
-        if control
-            .value_at(step)
-            .is_some_and(|candidate| candidate.to_f64() == value)
-        {
-            return Ok((step, source));
-        }
-    }
-    Err(format!(
-        "{source} value {value} is not a step of control {}",
-        control.key
-    ))
-}
-
-fn enum_step(
-    control: &Control,
-    label: &str,
-    source: &'static str,
-) -> Result<(i64, &'static str), String> {
-    let values = control.values.as_ref().ok_or_else(|| {
-        format!(
-            "the {source} makernote is an enum but control {} has no values",
-            control.key
-        )
-    })?;
-    let index = values
-        .iter()
-        .position(|value| value.as_str() == label)
-        .ok_or_else(|| {
-            format!(
-                "{source} value {label:?} is not a value of control {}",
-                control.key
-            )
-        })?;
-    Ok((i64::try_from(index).unwrap_or(i64::MAX), source))
 }
 
 fn print_batch_fields(

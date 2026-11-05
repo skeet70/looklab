@@ -62,6 +62,12 @@ epochs:
         look_affecting: true
         affects: [tone, exposure]
         constraints: { min_iso: { dr200: 320, dr400: 640 } }   # placeholder
+        makernote:
+          tag: DevelopmentDynamicRange
+          values: { dr100: 100, dr200: 200, dr400: 400 }
+          fallback:
+            tag: DynamicRangeSetting
+            values: { dr100: 0x100, dr200: 0x200, dr400: 0x201 }
       - key: highlight_tone
         type: decimal
         range: [-2.0, 4.0]
@@ -69,6 +75,7 @@ epochs:
         default: 0.0
         look_affecting: true
         affects: [tone]
+        makernote: { tag: HighlightTone, encoding: { scale: -16 } }
       - key: shadow_tone
         type: decimal
         range: [-2.0, 4.0]
@@ -76,6 +83,7 @@ epochs:
         default: 0.0
         look_affecting: true
         affects: [tone]
+        makernote: { tag: ShadowTone, encoding: { scale: -16 } }
       - key: color
         type: int
         range: [-4, 4]
@@ -89,6 +97,7 @@ epochs:
         default: off
         look_affecting: true
         affects: [chroma, lightness]
+        makernote: { tag: ColorChromeEffect, values: { off: 0, weak: 32, strong: 64 } }
       - key: color_chrome_fx_blue
         type: enum
         values: [off, weak, strong]
@@ -102,6 +111,7 @@ epochs:
         default: 0
         look_affecting: true
         affects: [wb]
+        makernote: { tag: WhiteBalanceFineTune, component: 0, encoding: { scale: 20 } }
       - key: wb_shift_b
         type: int
         range: [-9, 9]
@@ -109,6 +119,7 @@ epochs:
         default: 0
         look_affecting: true
         affects: [wb]
+        makernote: { tag: WhiteBalanceFineTune, component: 1, encoding: { scale: 20 } }
       - key: exposure_compensation
         type: decimal
         range: [-3.0, 3.0]
@@ -116,6 +127,7 @@ epochs:
         default: 0.0
         look_affecting: false        # shot-time setting; optimizer may recommend it
         affects: [exposure]
+        makernote: { tag: ExposureCompensation, encoding: { scale: 3 } }
       - key: grain
         type: enum
         values: [off, weak, strong]
@@ -123,6 +135,7 @@ epochs:
         look_affecting: false
         spatial: true
         tolerated: [off]
+        makernote: { tag: GrainEffectRoughness, values: { off: 0, weak: [16, 32], strong: [48, 64] } }
       - key: clarity
         type: int
         range: [-5, 5]
@@ -148,6 +161,7 @@ epochs:
 
 **Rules:**
 - `type ∈ {int, decimal, enum, bool}`. `decimal` requires `step`, given as an exact rational (`0.5`, `1/3`). Values are stored as integer multiples of the step, so ranges tile exactly.
+- `makernote` (optional) names a `looklab-meta` FujiFilm tag, or the EXIF `ExposureCompensation` field, and how its raw value encodes the control: `encoding: { scale }` with `value = raw / scale` (exact rationals, integer raws on every step), or `values` mapping each declared value to the raw value(s) that mean it; `component: 0|1` indexes a paired tag such as `WhiteBalanceFineTune`, and `fallback` names the tag tried when the first is absent. Validation rejects unknown tags, incomplete enum coverage, duplicate raw values, keys off the step grid, and a scale that does not land on whole raws. A control without a mapping is not derived from a file, so `verify-payload` fails closed ([06 §5](06-privacy-and-payload.md)).
 - `affects` vocabulary, and what each value moves:
 
   | `affects` | Moves |

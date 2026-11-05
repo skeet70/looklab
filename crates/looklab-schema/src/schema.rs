@@ -5,24 +5,50 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::str::FromStr;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::Deserialize;
 use serde::de::{self, Visitor};
 
 use crate::control::{
     Affects, Constraints, Control, ControlDefault, ControlType, Range, ScalarValue, Tolerated,
+    numeric_steps,
 };
 use crate::error::{ErrorKind, ValidationError};
 use crate::ids::{
     BodyId, ControlKey, EnumValue, ExposureModeKey, LookId, MakernoteTag, SimKey, StageName,
 };
+use crate::makernote::{ControlMakernote, MakernoteEncoding, MakernoteSource};
 use crate::rational::Rational;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlSchema {
     pub body: BodyId,
     pub epochs: Vec<Epoch>,
+    source: String,
+}
+
+impl ControlSchema {
+    /// The YAML document this schema was validated from.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// An unknown firmware version takes the nearest lower epoch's range.
+    pub fn epoch_for(&self, firmware: &str) -> Option<&Epoch> {
+        let version: FirmwareVersion = firmware.parse().ok()?;
+        if let Some(epoch) = self
+            .epochs
+            .iter()
+            .find(|epoch| epoch.firmware.from <= version && version <= epoch.firmware.to)
+        {
+            return Some(epoch);
+        }
+        self.epochs
+            .iter()
+            .filter(|epoch| epoch.firmware.to < version)
+            .max_by(|left, right| left.firmware.to.cmp(&right.firmware.to))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +256,43 @@ struct RawControl {
     spatial: bool,
     tolerated: Option<Tolerated>,
     constraints: Option<Constraints>,
+    makernote: Option<RawControlMakernote>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawControlMakernote {
+    tag: MakernoteTag,
+    #[serde(default)]
+    component: Option<u8>,
+    #[serde(default)]
+    encoding: Option<RawMakernoteScale>,
+    #[serde(default)]
+    values: Option<BTreeMap<String, OneOrMany>>,
+    #[serde(default)]
+    fallback: Option<Box<RawControlMakernote>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMakernoteScale {
+    scale: Rational,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(i64),
+    Many(Vec<i64>),
+}
+
+impl OneOrMany {
+    fn into_vec(self) -> Vec<i64> {
+        match self {
+            Self::One(value) => vec![value],
+            Self::Many(values) => values,
+        }
+    }
 }
 
 pub fn validate_control_schema(yaml: &str) -> Result<ControlSchema, Vec<ValidationError>> {
@@ -238,7 +301,9 @@ pub fn validate_control_schema(yaml: &str) -> Result<ControlSchema, Vec<Validati
     let mut errors = Vec::new();
     validate_schema(&raw, &mut errors);
     if errors.is_empty() {
-        Ok(build_schema(raw))
+        let mut schema = build_schema(raw);
+        schema.source = yaml.to_owned();
+        Ok(schema)
     } else {
         Err(errors)
     }
@@ -522,6 +587,249 @@ fn validate_control(control: &RawControl, path: &str, errors: &mut Vec<Validatio
             ErrorKind::SpatialToleratedRequired,
         ));
     }
+    if let Some(mapping) = control.makernote.as_ref() {
+        validate_makernote(control, mapping, &field("makernote"), errors);
+    }
+}
+
+fn validate_makernote(
+    control: &RawControl,
+    mapping: &RawControlMakernote,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    let field = |name: &str| format!("{path}.{name}");
+    let source = MakernoteSource::from_name(mapping.tag.as_str());
+    match source {
+        Some(source) => {
+            let components = source.components();
+            match mapping.component {
+                Some(component) if component >= components => {
+                    errors.push(ValidationError::new(
+                        field("component"),
+                        ErrorKind::MakernoteComponentOutOfRange {
+                            component,
+                            components,
+                        },
+                    ));
+                }
+                Some(_) if components == 1 => errors.push(ValidationError::new(
+                    field("component"),
+                    ErrorKind::MakernoteComponentNotAllowed,
+                )),
+                None if components > 1 => errors.push(ValidationError::new(
+                    field("component"),
+                    ErrorKind::MakernoteComponentRequired,
+                )),
+                _ => {}
+            }
+        }
+        None => errors.push(ValidationError::new(
+            field("tag"),
+            ErrorKind::UnknownMakernoteTag {
+                tag: mapping.tag.to_string(),
+            },
+        )),
+    }
+    match (&mapping.encoding, &mapping.values) {
+        (None, None) => errors.push(ValidationError::new(
+            path,
+            ErrorKind::MissingMakernoteEncoding,
+        )),
+        (Some(_), Some(_)) => errors.push(ValidationError::new(
+            path,
+            ErrorKind::ConflictingMakernoteEncoding,
+        )),
+        (Some(scale), None) => validate_makernote_scale(control, scale, path, errors),
+        (None, Some(values)) => validate_makernote_values(control, values, path, errors),
+    }
+    if let Some(fallback) = mapping.fallback.as_deref() {
+        validate_makernote(control, fallback, &field("fallback"), errors);
+    }
+}
+
+fn validate_makernote_scale(
+    control: &RawControl,
+    scale: &RawMakernoteScale,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    if !matches!(control.kind, ControlType::Int | ControlType::Decimal) {
+        errors.push(ValidationError::new(
+            format!("{path}.encoding"),
+            ErrorKind::MakernoteScaleNotNumeric,
+        ));
+        return;
+    }
+    if scale.scale.is_zero() {
+        errors.push(ValidationError::new(
+            format!("{path}.encoding.scale"),
+            ErrorKind::MakernoteScaleZero,
+        ));
+        return;
+    }
+    let Some(step) = raw_step(control) else {
+        return;
+    };
+    for index in raw_control_steps(control) {
+        let Some(value) = step.checked_mul_i64(index) else {
+            continue;
+        };
+        if scaled_raw(value, scale.scale).is_none() {
+            errors.push(ValidationError::new(
+                format!("{path}.encoding.scale"),
+                ErrorKind::MakernoteRawNotInteger {
+                    value: value.to_string(),
+                },
+            ));
+            return;
+        }
+    }
+}
+
+fn validate_makernote_values(
+    control: &RawControl,
+    values: &BTreeMap<String, OneOrMany>,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    let key_path = |key: &str| format!("{path}.values.{key}");
+    let mut seen_raws: BTreeMap<i64, String> = BTreeMap::new();
+    let mut covered: Vec<ScalarValue> = Vec::new();
+    for (key, raws) in values {
+        let raws = raws.clone().into_vec();
+        if raws.is_empty() {
+            errors.push(ValidationError::new(
+                key_path(key),
+                ErrorKind::MakernoteValueHasNoRaw,
+            ));
+        }
+        for raw in &raws {
+            if seen_raws.insert(*raw, key.clone()).is_some() {
+                errors.push(ValidationError::new(
+                    key_path(key),
+                    ErrorKind::MakernoteDuplicateRaw { raw: *raw },
+                ));
+            }
+        }
+        let value = ScalarValue::from_raw(key);
+        match control.kind {
+            ControlType::Enum => match &value {
+                ScalarValue::Text(name)
+                    if control.values.as_ref().is_some_and(|declared| {
+                        declared.iter().any(|value| value.as_str() == name)
+                    }) =>
+                {
+                    covered.push(value);
+                }
+                _ => errors.push(ValidationError::new(
+                    key_path(key),
+                    ErrorKind::MakernoteValueUnknown { value: key.clone() },
+                )),
+            },
+            ControlType::Bool => match value {
+                ScalarValue::Bool(_) => covered.push(value),
+                _ => errors.push(ValidationError::new(
+                    key_path(key),
+                    ErrorKind::InvalidValue {
+                        expected: "boolean",
+                    },
+                )),
+            },
+            ControlType::Int | ControlType::Decimal => match value {
+                ScalarValue::Number(number) => {
+                    let Some(step) = raw_step(control) else {
+                        continue;
+                    };
+                    match number.div_exact(&step) {
+                        Some(index) if raw_control_steps(control).contains(&index) => {
+                            covered.push(ScalarValue::Number(number));
+                        }
+                        Some(_) => errors.push(ValidationError::new(
+                            key_path(key),
+                            ErrorKind::MakernoteValueOutOfRange { value: key.clone() },
+                        )),
+                        None => {
+                            errors.push(ValidationError::new(key_path(key), ErrorKind::NotOnStep))
+                        }
+                    }
+                }
+                _ => errors.push(ValidationError::new(
+                    key_path(key),
+                    ErrorKind::InvalidValue { expected: "number" },
+                )),
+            },
+        }
+    }
+    match control.kind {
+        ControlType::Enum => {
+            for value in control.values.iter().flatten() {
+                if !covered.contains(&ScalarValue::Text(value.to_string())) {
+                    errors.push(ValidationError::new(
+                        path,
+                        ErrorKind::MakernoteValueMissing {
+                            value: value.to_string(),
+                        },
+                    ));
+                }
+            }
+        }
+        ControlType::Bool => {
+            for flag in [true, false] {
+                if !covered.contains(&ScalarValue::Bool(flag)) {
+                    errors.push(ValidationError::new(
+                        path,
+                        ErrorKind::MakernoteValueMissing {
+                            value: flag.to_string(),
+                        },
+                    ));
+                }
+            }
+        }
+        ControlType::Int | ControlType::Decimal => {
+            if let Some(ScalarValue::Number(default)) = control.default.as_ref()
+                && !covered.contains(&ScalarValue::Number(*default))
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    ErrorKind::MakernoteValueMissing {
+                        value: default.to_string(),
+                    },
+                ));
+            }
+        }
+    }
+}
+
+fn raw_step(control: &RawControl) -> Option<Rational> {
+    match control.kind {
+        ControlType::Int => Some(control.step.unwrap_or_else(|| Rational::from_integer(1))),
+        ControlType::Decimal => control.step,
+        ControlType::Enum | ControlType::Bool => None,
+    }
+}
+
+fn raw_control_steps(control: &RawControl) -> core::ops::RangeInclusive<i64> {
+    let range = control
+        .range
+        .as_ref()
+        .and_then(|values| match values.as_slice() {
+            [min, max] => Some(Range {
+                min: *min,
+                max: *max,
+            }),
+            _ => None,
+        });
+    numeric_steps(range.as_ref(), raw_step(control).as_ref())
+}
+
+fn scaled_raw(value: Rational, scale: Rational) -> Option<i64> {
+    let num = i128::from(value.num) * i128::from(scale.num);
+    let den = i128::from(value.den) * i128::from(scale.den);
+    if den == 0 || num % den != 0 {
+        return None;
+    }
+    i64::try_from(num / den).ok()
 }
 
 fn validate_numeric(
@@ -612,6 +920,7 @@ fn build_schema(raw: RawSchema) -> ControlSchema {
     ControlSchema {
         body: raw.body,
         epochs: raw.epochs.into_iter().map(build_epoch).collect(),
+        source: String::new(),
     }
 }
 
@@ -661,5 +970,30 @@ fn build_control(raw: RawControl) -> Control {
         spatial: raw.spatial,
         tolerated: raw.tolerated,
         constraints: raw.constraints,
+        makernote: raw.makernote.and_then(build_makernote),
     }
+}
+
+/// `None` only for a document [`validate_control_schema`] rejected.
+fn build_makernote(raw: RawControlMakernote) -> Option<ControlMakernote> {
+    let tag = MakernoteSource::from_name(raw.tag.as_str())?;
+    let encoding = match (raw.encoding, raw.values) {
+        (Some(scale), None) => MakernoteEncoding::Scale(scale.scale),
+        (None, Some(values)) => MakernoteEncoding::Values(
+            values
+                .into_iter()
+                .map(|(key, raws)| (ScalarValue::from_raw(&key), raws.into_vec()))
+                .collect(),
+        ),
+        _ => return None,
+    };
+    Some(ControlMakernote {
+        tag,
+        component: raw.component,
+        encoding,
+        fallback: raw
+            .fallback
+            .and_then(|fallback| build_makernote(*fallback))
+            .map(Box::new),
+    })
 }

@@ -7,10 +7,11 @@
 use looklab_meta::{
     ColorSaturation as MetaSaturation, DevelopmentDynamicRange, DynamicRange as MetaDynamicRange,
     DynamicRangeSetting as MetaDynamicRangeSetting, EffectStrength as MetaEffectStrength,
-    FilmMode as MetaFilmMode, GrainRoughness as MetaGrainRoughness, GrainSize as MetaGrainSize,
-    LookSettings as MetaLookSettings, MonochromeFilter as MetaMonochromeFilter,
-    NoiseReduction as MetaNoiseReduction, ParsedPair, ParsedTag, SanitizedMetadata,
-    Sharpness as MetaSharpness, WhiteBalanceMode as MetaWhiteBalanceMode,
+    FilmMode as MetaFilmMode, FujiTag, GrainRoughness as MetaGrainRoughness,
+    GrainSize as MetaGrainSize, LookSettings as MetaLookSettings,
+    MonochromeFilter as MetaMonochromeFilter, NoiseReduction as MetaNoiseReduction, ParsedPair,
+    ParsedTag, SanitizedMetadata, Sharpness as MetaSharpness,
+    WhiteBalanceMode as MetaWhiteBalanceMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -345,6 +346,85 @@ fn check_positive(value: f64, field: MetadataField) -> Result<(), MetadataError>
         Ok(())
     } else {
         Err(MetadataError::NotPositive { field })
+    }
+}
+
+impl From<&ManifestMetadata> for looklab_schema::MakernoteValues {
+    fn from(metadata: &ManifestMetadata) -> Self {
+        let mut values = Self::new();
+        if let Some(look) = metadata.look.as_ref() {
+            put(&mut values, FujiTag::FilmMode, look.film_mode.as_ref());
+            put(
+                &mut values,
+                FujiTag::DynamicRange,
+                look.dynamic_range.as_ref(),
+            );
+            put(
+                &mut values,
+                FujiTag::DynamicRangeSetting,
+                look.dynamic_range_setting.as_ref(),
+            );
+            put(
+                &mut values,
+                FujiTag::DevelopmentDynamicRange,
+                look.development_dynamic_range.as_ref(),
+            );
+            put(&mut values, FujiTag::Saturation, look.saturation.as_ref());
+            put(
+                &mut values,
+                FujiTag::WhiteBalance,
+                look.white_balance.as_ref(),
+            );
+            put(
+                &mut values,
+                FujiTag::HighlightTone,
+                look.highlight_tone.as_ref(),
+            );
+            put(&mut values, FujiTag::ShadowTone, look.shadow_tone.as_ref());
+            put(&mut values, FujiTag::Sharpness, look.sharpness.as_ref());
+            put(
+                &mut values,
+                FujiTag::NoiseReduction,
+                look.noise_reduction.as_ref(),
+            );
+            put(&mut values, FujiTag::Clarity, look.clarity.as_ref());
+            put(
+                &mut values,
+                FujiTag::GrainEffectRoughness,
+                look.grain_roughness.as_ref(),
+            );
+            put(
+                &mut values,
+                FujiTag::GrainEffectSize,
+                look.grain_size.as_ref(),
+            );
+            put(
+                &mut values,
+                FujiTag::ColorChromeEffect,
+                look.color_chrome_effect.as_ref(),
+            );
+            put(
+                &mut values,
+                FujiTag::ColorChromeFxBlue,
+                look.color_chrome_fx_blue.as_ref(),
+            );
+            if let Some(pair) = look.white_balance_fine_tune.as_ref() {
+                values.insert(
+                    FujiTag::WhiteBalanceFineTune,
+                    pair.raw.iter().map(|value| i64::from(*value)).collect(),
+                );
+            }
+        }
+        if let Some(ev) = metadata.exposure_compensation_ev {
+            values.set_exposure_compensation_ev(ev);
+        }
+        values
+    }
+}
+
+fn put<T>(values: &mut looklab_schema::MakernoteValues, tag: FujiTag, tagged: Option<&Tagged<T>>) {
+    if let Some(tagged) = tagged {
+        values.insert(tag, vec![tagged.raw]);
     }
 }
 

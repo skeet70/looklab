@@ -21,6 +21,12 @@ epochs:
         look_affecting: true
         affects: [tone, exposure]
         constraints: { min_iso: { dr200: 320, dr400: 640 } }
+        makernote:
+          tag: DevelopmentDynamicRange
+          values: { dr100: 100, dr200: 200, dr400: 400 }
+          fallback:
+            tag: DynamicRangeSetting
+            values: { dr100: 0x100, dr200: 0x200, dr400: 0x201 }
       - key: highlight_tone
         type: decimal
         range: [-2.0, 4.0]
@@ -28,6 +34,7 @@ epochs:
         default: 0.0
         look_affecting: true
         affects: [tone]
+        makernote: { tag: HighlightTone, encoding: { scale: -16 } }
       - key: shadow_tone
         type: decimal
         range: [-2.0, 4.0]
@@ -35,6 +42,7 @@ epochs:
         default: 0.0
         look_affecting: true
         affects: [tone]
+        makernote: { tag: ShadowTone, encoding: { scale: -16 } }
       - key: color
         type: int
         range: [-4, 4]
@@ -42,18 +50,23 @@ epochs:
         default: 0
         look_affecting: true
         affects: [chroma]
+        makernote:
+          tag: Saturation
+          values: { -4: 0x4e0, -3: 0x4c0, -2: 0x400, -1: 0x180, 0: 0, 1: 0x80, 2: 0x100, 3: 0xc0, 4: 0xe0 }
       - key: color_chrome_effect
         type: enum
         values: [off, weak, strong]
         default: off
         look_affecting: true
         affects: [chroma, lightness]
+        makernote: { tag: ColorChromeEffect, values: { off: 0, weak: 32, strong: 64 } }
       - key: color_chrome_fx_blue
         type: enum
         values: [off, weak, strong]
         default: off
         look_affecting: true
         affects: [chroma, lightness]
+        makernote: { tag: ColorChromeFXBlue, values: { off: 0, weak: 32, strong: 64 } }
       - key: wb_shift_r
         type: int
         range: [-9, 9]
@@ -61,6 +74,7 @@ epochs:
         default: 0
         look_affecting: true
         affects: [wb]
+        makernote: { tag: WhiteBalanceFineTune, component: 0, encoding: { scale: 20 } }
       - key: wb_shift_b
         type: int
         range: [-9, 9]
@@ -68,6 +82,7 @@ epochs:
         default: 0
         look_affecting: true
         affects: [wb]
+        makernote: { tag: WhiteBalanceFineTune, component: 1, encoding: { scale: 20 } }
       - key: exposure_compensation
         type: decimal
         range: [-3.0, 3.0]
@@ -75,6 +90,7 @@ epochs:
         default: 0.0
         look_affecting: false
         affects: [exposure]
+        makernote: { tag: ExposureCompensation, encoding: { scale: 3 } }
       - key: grain
         type: enum
         values: [off, weak, strong]
@@ -82,6 +98,7 @@ epochs:
         look_affecting: false
         spatial: true
         tolerated: [off]
+        makernote: { tag: GrainEffectRoughness, values: { off: 0, weak: [16, 32], strong: [48, 64] } }
       - key: clarity
         type: int
         range: [-5, 5]
@@ -90,6 +107,7 @@ epochs:
         look_affecting: false
         spatial: true
         tolerated: [0]
+        makernote: { tag: Clarity, encoding: { scale: 1000 } }
       - key: noise_reduction
         type: int
         range: [-4, 4]
@@ -98,6 +116,9 @@ epochs:
         look_affecting: false
         spatial: true
         tolerated: any
+        makernote:
+          tag: NoiseReduction
+          values: { -4: 0x2e0, -3: 0x2c0, -2: 0x200, -1: 0x280, 0: 0, 1: 0x180, 2: 0x100, 3: 0x1c0, 4: 0x1e0 }
     solve_plan:
       - stage: tone
         controls: [dynamic_range, highlight_tone, shadow_tone, exposure_compensation]
