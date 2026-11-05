@@ -2948,6 +2948,8 @@ mod tests {
         }
     }
 
+    type LaneFutures = Vec<Pin<Box<dyn Future<Output = Vec<(usize, usize)>>>>>;
+
     #[test]
     fn lanes_are_assigned_round_robin() {
         assert_eq!(
@@ -2960,7 +2962,7 @@ mod tests {
     #[test]
     fn the_pool_runs_lanes_concurrently_and_keeps_their_order() {
         let in_flight = Rc::new(RefCell::new((0_usize, 0_usize)));
-        let mut lanes: Vec<Pin<Box<dyn Future<Output = Vec<(usize, usize)>>>>> = Vec::new();
+        let mut lanes: LaneFutures = Vec::new();
         for lane in 0..3 {
             let counter = Rc::clone(&in_flight);
             lanes.push(Box::pin(async move {

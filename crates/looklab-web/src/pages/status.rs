@@ -147,7 +147,7 @@ pub fn StatusPage(#[prop(optional)] token_override: Option<String>) -> impl Into
                 match result {
                     Ok(profile) => {
                         match session.set_status_link(profile).await {
-                            Ok(()) => navigate(&crate::base::site_url("/me"), Default::default()),
+                            Ok(()) => navigate("/me", Default::default()),
                             Err(_) => state.set(Load::Failed("This browser couldn't save the sign-in link. Allow site storage and try again.".to_owned())),
                         }
                     }

@@ -46,7 +46,7 @@ impl CompareField {
     }
 }
 
-fn update_url(key: CompareField, value: &str) -> String {
+fn updated_url(key: CompareField, value: &str) -> web_sys::Url {
     let url =
         web_sys::Url::new(&window().location().href().unwrap_or_default()).expect("current URL");
     url.search_params().set(key.key(), value);
@@ -55,7 +55,7 @@ fn update_url(key: CompareField, value: &str) -> String {
         CompareField::LookB => url.search_params().delete("bv"),
         _ => {}
     }
-    format!("{}{}", url.pathname(), url.search())
+    url
 }
 
 #[component]
@@ -171,7 +171,7 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
     let navigate = use_navigate();
     let change = Callback::new(move |(key, value): (CompareField, String)| {
         navigate(
-            &update_url(key, &value),
+            &crate::base::route_of(&updated_url(key, &value)),
             leptos_router::NavigateOptions {
                 replace: true,
                 scroll: false,
@@ -199,11 +199,12 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
         )
     });
     let mode_change = Callback::new(move |mode: ui::ViewerMode| {
+        let url = updated_url(CompareField::View, mode.query());
         let _ = window().history().and_then(|history| {
             history.replace_state_with_url(
                 &wasm_bindgen::JsValue::NULL,
                 "",
-                Some(&update_url(CompareField::View, mode.query())),
+                Some(&format!("{}{}", url.pathname(), url.search())),
             )
         });
     });
@@ -323,7 +324,7 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
             <button type="button" class="compare-swap" aria-label="Swap looks" on:click=move |_| {
                 let url = web_sys::Url::new(&window().location().href().unwrap_or_default()).expect("current URL");
                 for (key, value) in [("a", &swap_b), ("b", &swap_a), ("av", &swap_bv), ("bv", &swap_av)] { url.search_params().set(key, value); }
-                swap_navigate(&format!("{}{}", url.pathname(), url.search()), leptos_router::NavigateOptions { replace: true, scroll: false, ..Default::default() });
+                swap_navigate(&crate::base::route_of(&url), leptos_router::NavigateOptions { replace: true, scroll: false, ..Default::default() });
             }>"⇄"</button>
             <div class="compare-look-chip">
                 <ui::PreviewCanvas lut=Signal::stored(Some(Arc::clone(&ready.b_lut))) scene=Signal::stored(Arc::clone(&ready.thumbnail)) label=format!("Simulated: {}", ready.b.name) style=Signal::stored("width:4rem;height:3rem;object-fit:cover".to_owned())/>

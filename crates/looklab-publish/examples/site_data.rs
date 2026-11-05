@@ -273,52 +273,60 @@ fn fixture_body() -> Result<BodyPage, Box<dyn Error>> {
 
 fn community_looks() -> Result<Vec<LookPage>, Box<dyn Error>> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/luts");
-    let mut looks = Vec::new();
-    looks.push(community_look(
-        &dir,
-        "Ricoh_GRIV_Cinema_Green_SRGB.cube",
-        "ricoh-griv-cinema-green",
-        "Ricoh GR IV Cinema Green",
-        "Cinema Green",
-        "Cinema Green from the Ricoh GR IV, the donor's original sRGB grade. The graded image is not stated, so the preview uses the neutral baseline and the Look is not matchable.",
-        x_e3_base(None, DynamicRange::Dr200)?,
-        Some(LutEmulation::CameraRendering {
-            maker: "ricoh".to_owned(),
-            rendering: "Cinema (Green)".to_owned(),
-        }),
-        "AI-tool approximation of Ricoh GR stock Cinema (Green) image control, sRGB variant; not graded by a person.",
-        Some("base incomplete: film simulation not declared"),
-    )?);
-    looks.push(community_look(
-        &dir,
-        "CineStill_800T_1600T_sRGB_V4.cube",
-        "cinestill-800t-pushed-1600",
-        "CineStill 800T pushed to 1600",
-        "CineStill 800T 1600",
-        "Parametric approximation of CineStill 800T pushed one stop, built from published descriptions rather than measured scans. The intended base is Fujifilm Classic Negative at DR400, declared by the donor but not applied (their X-E3 lacks the sim); the preview uses the neutral baseline and the Look is not matchable until the base Look is published.",
-        family_base("Classic Negative", DynamicRange::Dr400),
-        Some(LutEmulation::FilmStock {
-            name: "CineStill 800T".to_owned(),
-        }),
-        "Intended base declared by the donor; the LUT was authored for this base and not applied on it (donor body X-E3 lacks the sim).",
-        Some("base identified, unmeasured: fujifilm / Classic Negative at DR400"),
-    )?);
-    looks.push(community_look(
-        &dir,
-        "Leica_Classic_Gold_200.cube",
-        "leica-classic-gold-200",
-        "Leica Classic Gold 200",
-        "Gold 200",
-        "Classic Gold 200 from a Leica Classic. The intended base is Fujifilm Eterna at DR200, declared by the donor but not applied (their X-E3 lacks the sim); the preview uses the neutral baseline and the Look is not matchable until the base Look is published.",
-        family_base("Eterna", DynamicRange::Dr200),
-        Some(LutEmulation::CameraRendering {
-            maker: "leica".to_owned(),
-            rendering: "Classic".to_owned(),
-        }),
-        "Intended base declared by the donor; the LUT was authored for this base and not applied on it (donor body X-E3 lacks the sim).",
-        Some("base identified, unmeasured: fujifilm / Eterna at DR200"),
-    )?);
-    Ok(looks)
+    Ok(vec![
+        community_look(
+            &dir,
+            CommunityLookSpec {
+                file: "Ricoh_GRIV_Cinema_Green_SRGB.cube",
+                slug: "ricoh-griv-cinema-green",
+                name: "Ricoh GR IV Cinema Green",
+                short_name: "Cinema Green",
+                description: "Cinema Green from the Ricoh GR IV, the donor's original sRGB grade. The graded image is not stated, so the preview uses the neutral baseline and the Look is not matchable.",
+                encoding: x_e3_base(None, DynamicRange::Dr200)?,
+                emulation: Some(LutEmulation::CameraRendering {
+                    maker: "ricoh".to_owned(),
+                    rendering: "Cinema (Green)".to_owned(),
+                }),
+                provenance_note: "AI-tool approximation of Ricoh GR stock Cinema (Green) image control, sRGB variant; not graded by a person.",
+                base_note: Some("base incomplete: film simulation not declared"),
+            },
+        )?,
+        community_look(
+            &dir,
+            CommunityLookSpec {
+                file: "CineStill_800T_1600T_sRGB_V4.cube",
+                slug: "cinestill-800t-pushed-1600",
+                name: "CineStill 800T pushed to 1600",
+                short_name: "CineStill 800T 1600",
+                description: "Parametric approximation of CineStill 800T pushed one stop, built from published descriptions rather than measured scans. The intended base is Fujifilm Classic Negative at DR400, declared by the donor but not applied (their X-E3 lacks the sim); the preview uses the neutral baseline and the Look is not matchable until the base Look is published.",
+                encoding: family_base("Classic Negative", DynamicRange::Dr400),
+                emulation: Some(LutEmulation::FilmStock {
+                    name: "CineStill 800T".to_owned(),
+                }),
+                provenance_note: "Intended base declared by the donor; the LUT was authored for this base and not applied on it (donor body X-E3 lacks the sim).",
+                base_note: Some(
+                    "base identified, unmeasured: fujifilm / Classic Negative at DR400",
+                ),
+            },
+        )?,
+        community_look(
+            &dir,
+            CommunityLookSpec {
+                file: "Leica_Classic_Gold_200.cube",
+                slug: "leica-classic-gold-200",
+                name: "Leica Classic Gold 200",
+                short_name: "Gold 200",
+                description: "Classic Gold 200 from a Leica Classic. The intended base is Fujifilm Eterna at DR200, declared by the donor but not applied (their X-E3 lacks the sim); the preview uses the neutral baseline and the Look is not matchable until the base Look is published.",
+                encoding: family_base("Eterna", DynamicRange::Dr200),
+                emulation: Some(LutEmulation::CameraRendering {
+                    maker: "leica".to_owned(),
+                    rendering: "Classic".to_owned(),
+                }),
+                provenance_note: "Intended base declared by the donor; the LUT was authored for this base and not applied on it (donor body X-E3 lacks the sim).",
+                base_note: Some("base identified, unmeasured: fujifilm / Eterna at DR200"),
+            },
+        )?,
+    ])
 }
 
 fn family_base(rendering: &str, dr: DynamicRange) -> DeclaredEncoding {
@@ -352,18 +360,30 @@ fn x_e3_base(sim: Option<&str>, dr: DynamicRange) -> Result<DeclaredEncoding, Bo
     })
 }
 
-fn community_look(
-    dir: &Path,
-    file: &str,
-    slug: &str,
-    name: &str,
-    short_name: &str,
-    description: &str,
+struct CommunityLookSpec<'a> {
+    file: &'a str,
+    slug: &'a str,
+    name: &'a str,
+    short_name: &'a str,
+    description: &'a str,
     encoding: DeclaredEncoding,
     emulation: Option<LutEmulation>,
-    provenance_note: &str,
-    base_note: Option<&str>,
-) -> Result<LookPage, Box<dyn Error>> {
+    provenance_note: &'a str,
+    base_note: Option<&'a str>,
+}
+
+fn community_look(dir: &Path, spec: CommunityLookSpec<'_>) -> Result<LookPage, Box<dyn Error>> {
+    let CommunityLookSpec {
+        file,
+        slug,
+        name,
+        short_name,
+        description,
+        encoding,
+        emulation,
+        provenance_note,
+        base_note,
+    } = spec;
     let text = fs::read_to_string(dir.join(file))?;
     let cube = read_cube(&text)?;
     let lut = lut_data_from_cube(&cube)?;
@@ -802,10 +822,10 @@ fn report_recovery(
         if gap.excludes(probe.xyz) {
             continue;
         }
-        if let Some(estimate) = result.probes.probes.get(index) {
-            if estimate.supported {
-                supported.push((errors[covered_index], estimate.post_sigma_de));
-            }
+        if let Some(estimate) = result.probes.probes.get(index)
+            && estimate.supported
+        {
+            supported.push((errors[covered_index], estimate.post_sigma_de));
         }
         covered_index += 1;
     }

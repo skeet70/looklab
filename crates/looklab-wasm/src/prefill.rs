@@ -83,6 +83,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn prefills_the_fixture_from_its_makernotes() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../fixtures/cache/fujifilm-x-s10.raf");

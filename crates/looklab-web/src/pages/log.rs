@@ -199,7 +199,7 @@ fn ActivityList(#[prop(default = false)] recent: bool) -> impl IntoView {
                             url.search_params().set("show", selected.query_value());
                         }
                         navigate(
-                            &format!("{}{}{}", url.pathname(), url.search(), url.hash()),
+                            &crate::base::route_of(&url),
                             leptos_router::NavigateOptions {
                                 scroll: false,
                                 ..Default::default()

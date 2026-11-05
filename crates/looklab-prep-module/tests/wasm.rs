@@ -12,6 +12,7 @@ use looklab_prep_module::{
 use looklab_raw::{DecodedRaw, Orientation, RawDecoder, RawlerDecoder};
 use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
 
+#[allow(clippy::disallowed_methods)]
 fn fixture_raw() -> Vec<u8> {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/cache/fujifilm-x-s10.raf");

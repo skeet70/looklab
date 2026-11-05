@@ -240,6 +240,7 @@ fn the_params_hash_covers_the_params() {
     assert_ne!(a.hash().expect("hash"), changed.hash().expect("hash"));
 }
 
+#[allow(clippy::disallowed_methods)]
 fn x_s10_raf() -> Vec<u8> {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/cache/fujifilm-x-s10.raf");

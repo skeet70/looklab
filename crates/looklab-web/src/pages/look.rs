@@ -316,7 +316,7 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                         selected.set(chosen.clone());
                         if let Ok(url) = web_sys::Url::new(&window().location().href().unwrap_or_default()) {
                             url.search_params().set("version", &chosen);
-                            navigate(&format!("{}{}{}", url.pathname(), url.search(), url.hash()), leptos_router::NavigateOptions { scroll: false, ..Default::default() });
+                            navigate(&crate::base::route_of(&url), leptos_router::NavigateOptions { scroll: false, ..Default::default() });
                         }
                     }
                 >

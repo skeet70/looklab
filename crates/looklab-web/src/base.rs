@@ -61,6 +61,15 @@ pub fn page_path(pathname: &str) -> String {
     path_after_prefix(pathname, public_prefix()).into_owned()
 }
 
+/// The router target for a full URL: the page path plus query and fragment. `navigate` adds the prefix itself.
+pub fn route_of(url: &web_sys::Url) -> String {
+    route(public_prefix(), &url.pathname(), &url.search(), &url.hash())
+}
+
+fn route(prefix: &str, pathname: &str, search: &str, hash: &str) -> String {
+    format!("{}{search}{hash}", path_after_prefix(pathname, prefix))
+}
+
 fn join(prefix: &str, path: &str) -> String {
     format!("{prefix}{}", path.trim_start_matches('/'))
 }
@@ -120,7 +129,7 @@ fn prefix_of_pathname(pathname: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{join, path_after_prefix, prefix_of_pathname};
+    use super::{join, path_after_prefix, prefix_of_pathname, route};
 
     #[test]
     fn prefix_is_the_asset_directory() {
@@ -154,5 +163,18 @@ mod tests {
         );
         assert_eq!(path_after_prefix("/looklab/", "/looklab/"), "/");
         assert_eq!(path_after_prefix("/pattern/ab", "/"), "/pattern/ab");
+    }
+
+    #[test]
+    fn routes_drop_the_prefix_and_keep_query_and_fragment() {
+        assert_eq!(
+            route("/looklab/", "/looklab/compare", "?a=x&b=y", ""),
+            "/compare?a=x&b=y"
+        );
+        assert_eq!(
+            route("/looklab/", "/looklab/log", "?show=moderation", "#top"),
+            "/log?show=moderation#top"
+        );
+        assert_eq!(route("/", "/compare", "?a=x", ""), "/compare?a=x");
     }
 }
