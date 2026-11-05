@@ -4,7 +4,7 @@
 use looklab_schema::{
     Date, Evidence, FixtureDonation, FixtureLicense, LabeledTag, LicenseDeclaration, MappingError,
     ProposalKind, ProposalSummary, Sha256Hex, ValidatedPayload, fixture_manifest_toml,
-    infer_mapping, validate_proposal,
+    fixture_source, frame_fixture_upload, infer_mapping, split_fixture_upload, validate_proposal,
 };
 
 const BODY: &str = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
@@ -193,6 +193,7 @@ fn donation() -> FixtureDonation {
         sha256: Sha256Hex::parse(&"ab".repeat(32)).expect("sha256"),
         size: 24_000_000,
         source_url: Some("https://example.com/fujifilm-x-t5-2.00.raf".to_owned()),
+        source: None,
         donator: Some("a_handle".to_owned()),
         donated_on: Date::parse("2026-11-04").expect("date"),
         license: FixtureLicense::Cc0_1_0,
@@ -201,7 +202,7 @@ fn donation() -> FixtureDonation {
 }
 
 #[test]
-fn a_download_only_fixture_needs_a_source_url() {
+fn a_download_only_fixture_needs_a_source() {
     let committed = FixtureDonation {
         source_url: None,
         committed: true,
@@ -217,7 +218,47 @@ fn a_download_only_fixture_needs_a_source_url() {
         ..donation()
     };
     let errors = download_only.validate().unwrap_err();
-    assert_eq!(errors[0].path, "source_url");
+    assert_eq!(errors[0].path, "source");
+}
+
+#[test]
+fn an_uploaded_source_is_bound_to_the_file_digest() {
+    let uploaded = FixtureDonation {
+        source_url: None,
+        source: Some(fixture_source(donation().sha256)),
+        ..donation()
+    };
+    uploaded.validate().expect("an uploaded source is valid");
+    let manifest = fixture_manifest_toml(std::slice::from_ref(&uploaded));
+    assert!(manifest.contains(&format!(
+        "source = \"{}\"",
+        fixture_source(donation().sha256)
+    )));
+    assert!(!manifest.contains("source_url"));
+
+    let mismatched = FixtureDonation {
+        source: Some(fixture_source(
+            Sha256Hex::parse(&"cd".repeat(32)).expect("sha256"),
+        )),
+        ..uploaded.clone()
+    };
+    assert_eq!(mismatched.validate().unwrap_err()[0].path, "source");
+
+    let published = FixtureDonation {
+        committed: true,
+        ..uploaded
+    };
+    assert_eq!(published.validate().unwrap_err()[0].path, "source");
+}
+
+#[test]
+fn a_fixture_upload_frame_round_trips() {
+    let header = br#"{"file":"a.raf","sha256":"00","size":1}"#;
+    let frame = frame_fixture_upload(header, b"fixture bytes").expect("frame");
+    let (parsed, bytes) = split_fixture_upload(&frame).expect("split");
+    assert_eq!(parsed, header);
+    assert_eq!(bytes, b"fixture bytes");
+    assert!(split_fixture_upload(b"not a frame").is_err());
 }
 
 #[test]

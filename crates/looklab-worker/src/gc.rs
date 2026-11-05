@@ -15,9 +15,15 @@ pub async fn run(
     config: &WorkerConfig,
     contribution: Option<&ContributionId>,
 ) -> Result<()> {
-    for withdrawal in db::withdrawals_due(db_pool, contribution, now_unix()).await? {
+    let now = now_unix();
+    for withdrawal in db::withdrawals_due(db_pool, contribution, now).await? {
         for image in db::images(db_pool, &withdrawal.contribution).await? {
-            let remaining = db::release_blob(db_pool, &image.samples_hash).await?;
+            let released =
+                db::release_blob_once(db_pool, &withdrawal.id, &image.id, &image.samples_hash, now)
+                    .await?;
+            let Some(remaining) = released else {
+                continue;
+            };
             if remaining > 0 {
                 continue;
             }

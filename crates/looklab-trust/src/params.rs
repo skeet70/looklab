@@ -87,6 +87,8 @@ pub struct TrustParams {
     pub gate_over_bound_fraction: f64,
     /// Allowed p95 of `|Δ|/b`.
     pub gate_p95_ratio: f64,
+    /// Relative σ rise above which losing support is a violation (docs/05 §8).
+    pub gate_support_margin: f64,
 }
 
 impl TrustParams {
@@ -146,6 +148,7 @@ impl Default for TrustParams {
             gate_root_p95_anchor: 0.8,
             gate_over_bound_fraction: 0.02,
             gate_p95_ratio: 1.0,
+            gate_support_margin: 0.1,
         }
     }
 }

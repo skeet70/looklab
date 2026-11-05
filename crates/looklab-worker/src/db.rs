@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+use looklab_model::realization::Settings;
 use looklab_server::admin::{self, ManifestArtifact};
 use looklab_server::{ContributionId, CredentialId};
 use looklab_trust::{CredentialId as TrustCredentialId, Reputation, Scope, Tier};
@@ -35,6 +36,15 @@ pub enum ContributionStatus {
 }
 
 impl ContributionStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Quarantined => "quarantined",
+            Self::Withdrawn => "withdrawn",
+        }
+    }
+
     fn parse(value: &str) -> Result<Self> {
         Ok(match value {
             "pending" => Self::Pending,
@@ -132,6 +142,15 @@ pub enum ContributionIntent {
     Recipe,
 }
 
+impl ContributionIntent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Recipe => "recipe",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ContributionRow {
     pub id: ContributionId,
@@ -142,6 +161,7 @@ pub struct ContributionRow {
     pub body: BodyId,
     pub firmware: String,
     pub sim_key: String,
+    pub settings: Settings,
     pub serial_hmac: Option<[u8; 32]>,
     pub status: ContributionStatus,
     pub created_at: i64,
@@ -155,6 +175,8 @@ pub struct ImageRow {
     pub n_samples: i64,
     pub meta_json: String,
     pub duplicate_of: Option<ImageId>,
+    /// `None` until a consistency pass has scored the image.
+    pub status: Option<ImageOutcome>,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +308,7 @@ fn contribution_row(row: &sqlx::sqlite::SqliteRow) -> Result<ContributionRow> {
         body,
         firmware: row.get("firmware_version"),
         sim_key: row.get("sim_key"),
+        settings: serde_json::from_str(&row.get::<String, _>("settings"))?,
         serial_hmac,
         status: ContributionStatus::parse(row.get::<String, _>("status").as_str())?,
         created_at: row.get("created_at"),
@@ -311,6 +334,14 @@ fn image_row(row: &sqlx::sqlite::SqliteRow) -> Result<ImageRow> {
                 .ok_or_else(|| WorkerError::Data("duplicate id is not a UUID".to_owned()))
         })
         .transpose()?;
+    let status: String = row.get("status");
+    let status = match status.as_str() {
+        "pending" => None,
+        other => Some(
+            ImageOutcome::parse(other)
+                .ok_or_else(|| WorkerError::Data(format!("unknown image status `{other}`")))?,
+        ),
+    };
     Ok(ImageRow {
         id,
         contribution,
@@ -318,11 +349,12 @@ fn image_row(row: &sqlx::sqlite::SqliteRow) -> Result<ImageRow> {
         n_samples: row.get("n_samples"),
         meta_json: row.get("meta"),
         duplicate_of,
+        status,
     })
 }
 
 const CONTRIBUTION_COLUMNS: &str = "c.id, c.credential_id, c.kind, c.intent, c.target_look_id,
-    c.body_id, c.firmware_version, c.sim_key, c.serial_hmac, c.status, c.created_at";
+    c.body_id, c.firmware_version, c.sim_key, c.settings, c.serial_hmac, c.status, c.created_at";
 
 pub async fn contribution(pool: &SqlitePool, id: &ContributionId) -> Result<ContributionRow> {
     let sql = format!("SELECT {CONTRIBUTION_COLUMNS} FROM contributions c WHERE c.id = ?");
@@ -422,15 +454,18 @@ pub struct ImageStatsWrite {
     pub status_reason: Option<String>,
 }
 
+/// Writes the score and outcome, leaving withdrawn contributions untouched. A
+/// withdrawal committed during the fit wins the race; the write reports it.
 pub async fn write_image_stats(
     pool: &SqlitePool,
     id: &ImageId,
     stats: &ImageStatsWrite,
-) -> Result<()> {
-    sqlx::query(
+) -> Result<bool> {
+    let result = sqlx::query(
         "UPDATE contribution_images
          SET rms_de = ?, z = ?, reason = ?, weight_components = ?, status = ?, status_reason = ?
-         WHERE id = ?",
+         WHERE id = ?
+           AND contribution_id IN (SELECT id FROM contributions WHERE status != 'withdrawn')",
     )
     .bind(stats.rms_de)
     .bind(stats.z)
@@ -441,20 +476,22 @@ pub async fn write_image_stats(
     .bind(id.as_str())
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
+/// Withdrawal is terminal for automated status writes.
 pub async fn set_contribution_status(
     pool: &SqlitePool,
     id: &ContributionId,
     outcome: ContributionOutcome,
-) -> Result<()> {
-    sqlx::query("UPDATE contributions SET status = ? WHERE id = ?")
-        .bind(outcome.as_str())
-        .bind(id.as_str())
-        .execute(pool)
-        .await?;
-    Ok(())
+) -> Result<bool> {
+    let result =
+        sqlx::query("UPDATE contributions SET status = ? WHERE id = ? AND status != 'withdrawn'")
+            .bind(outcome.as_str())
+            .bind(id.as_str())
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected() == 1)
 }
 
 pub async fn clear_duplicates(pool: &SqlitePool) -> Result<()> {
@@ -555,8 +592,24 @@ pub async fn insert_gate_failure(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WithdrawalId(String);
+
+impl WithdrawalId {
+    pub fn parse(text: &str) -> Option<Self> {
+        uuid::Uuid::parse_str(text)
+            .ok()
+            .map(|_| Self(text.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WithdrawalRow {
+    pub id: WithdrawalId,
     pub contribution: ContributionId,
     pub delete_after: i64,
 }
@@ -567,7 +620,7 @@ pub async fn withdrawals_due(
     now: i64,
 ) -> Result<Vec<WithdrawalRow>> {
     let rows = sqlx::query(
-        "SELECT contribution_id, delete_after FROM withdrawals
+        "SELECT id, contribution_id, delete_after FROM withdrawals
          WHERE status = 'pending' AND delete_after <= ? AND (? IS NULL OR contribution_id = ?)
          ORDER BY delete_after",
     )
@@ -581,7 +634,11 @@ pub async fn withdrawals_due(
             let id: String = row.get("contribution_id");
             let contribution = ContributionId::try_from(id)
                 .map_err(|_| WorkerError::Data("contribution id is not a UUID".to_owned()))?;
+            let id: String = row.get("id");
+            let id = WithdrawalId::parse(&id)
+                .ok_or_else(|| WorkerError::Data("withdrawal id is not a UUID".to_owned()))?;
             Ok(WithdrawalRow {
+                id,
                 contribution,
                 delete_after: row.get("delete_after"),
             })
@@ -600,8 +657,30 @@ pub async fn mark_withdrawal_deleted(
     Ok(())
 }
 
-pub async fn release_blob(pool: &SqlitePool, hash: &[u8; 32]) -> Result<i64> {
+/// Releases one image's reference once per withdrawal. `None` means the reference
+/// was already released by an earlier attempt, so the caller must not delete again.
+pub async fn release_blob_once(
+    pool: &SqlitePool,
+    withdrawal: &WithdrawalId,
+    image: &ImageId,
+    hash: &[u8; 32],
+    now: i64,
+) -> Result<Option<i64>> {
     let mut tx = pool.begin().await?;
+    let inserted = sqlx::query(
+        "INSERT INTO withdrawal_releases (withdrawal_id, image_id, released_at)
+         VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+    )
+    .bind(withdrawal.as_str())
+    .bind(image.as_str())
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
     sqlx::query("UPDATE blobs SET ref_count = ref_count - 1 WHERE hash = ?")
         .bind(hash.as_slice())
         .execute(&mut *tx)
@@ -618,18 +697,147 @@ pub async fn release_blob(pool: &SqlitePool, hash: &[u8; 32]) -> Result<i64> {
             .await?;
     }
     tx.commit().await?;
-    Ok(remaining)
+    Ok(Some(remaining))
 }
 
-pub async fn update_reputation(
+/// Versions a moderator explicitly re-anchored (docs/05 §8).
+pub async fn re_anchor_versions(pool: &SqlitePool, look: &str) -> Result<Vec<u32>> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT payload FROM audit_log WHERE type = 're_anchor' ORDER BY seq")
+            .fetch_all(pool)
+            .await?;
+    let mut versions = Vec::new();
+    for (payload,) in rows {
+        let payload: serde_json::Value = serde_json::from_str(&payload)?;
+        if payload.get("look").and_then(|value| value.as_str()) != Some(look) {
+            continue;
+        }
+        if let Some(version) = payload
+            .get("version")
+            .and_then(|value| value.as_u64())
+            .and_then(|version| u32::try_from(version).ok())
+        {
+            versions.push(version);
+        }
+    }
+    Ok(versions)
+}
+
+pub async fn pool_fingerprint(pool: &SqlitePool, look: &str, body: &str) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT fingerprint FROM look_pool_state WHERE look = ? AND body = ?")
+            .bind(look)
+            .bind(body)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+pub async fn record_pool_fingerprint(
     pool: &SqlitePool,
+    look: &str,
+    body: &str,
+    fingerprint: &str,
+    now: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO look_pool_state (look, body, fingerprint, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (look, body) DO UPDATE
+         SET fingerprint = excluded.fingerprint, updated_at = excluded.updated_at",
+    )
+    .bind(look)
+    .bind(body)
+    .bind(fingerprint)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The two stages of the hierarchical fit (docs/02 §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyStage {
+    Native,
+    Recipe,
+}
+
+impl BodyStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Recipe => "recipe",
+        }
+    }
+}
+
+pub async fn store_release_body_params(
+    pool: &SqlitePool,
+    look: &str,
+    version: u32,
+    body: &str,
+    stage: BodyStage,
+    params: &str,
+    now: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO release_body_params (look, version, body, stage, params, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (look, version, body, stage) DO UPDATE SET params = excluded.params",
+    )
+    .bind(look)
+    .bind(i64::from(version))
+    .bind(body)
+    .bind(stage.as_str())
+    .bind(params)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Whether a version manifest was already committed for these inputs.
+pub async fn manifest_exists(pool: &SqlitePool, look: &str, version: u32) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM version_manifests m
+         JOIN look_versions v ON v.id = m.look_version_id
+         WHERE v.look = ? AND v.version = ?",
+    )
+    .bind(look)
+    .bind(i64::from(version))
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
+/// Applies one credential's reputation change once per release, inside the caller's
+/// transaction. Returns false when an earlier attempt already applied it.
+pub async fn apply_reputation_once(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    look: &str,
+    version: u32,
     credential: &CredentialId,
     value: f64,
-) -> Result<()> {
+    now: i64,
+) -> Result<bool> {
+    let inserted = sqlx::query(
+        "INSERT INTO release_reputation_applied (look, version, credential_id, applied_at)
+         VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+    )
+    .bind(look)
+    .bind(i64::from(version))
+    .bind(credential.as_str())
+    .bind(now)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        return Ok(false);
+    }
     sqlx::query("UPDATE credentials SET reputation = ? WHERE id = ?")
         .bind(value)
         .bind(credential.as_str())
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
-    Ok(())
+    Ok(true)
 }

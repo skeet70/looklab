@@ -4,18 +4,23 @@
 use std::sync::Arc;
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::Path;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::HeaderMap;
+use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
-use looklab_schema::{FixtureDonation, LabeledTag, ProposalKind};
+use looklab_schema::{
+    FixtureDonation, FixtureUpload, LabeledTag, ProposalKind, Sha256Hex, split_fixture_upload,
+};
 use looklab_upload::{Challenge, POW_K, PowSolutions};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::auth;
+use crate::blob::BlobHash;
 use crate::error::{ApiError, ApiResult, ErrorCode};
 use crate::ids::ProposalId;
 use crate::proposals::{
@@ -88,7 +93,7 @@ pub async fn submit(
     let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Proposal, &bytes));
     verify_pow(&state, &credential, challenge, &payload.pow).await?;
     let submitted = crate::proposals::submit(
-        &state.db,
+        &state,
         &credential,
         Submission {
             kind,
@@ -264,6 +269,98 @@ pub async fn proposer_message(
     )
     .await?;
     Ok(Json(Value::Null).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct DonateHeader {
+    file: String,
+    sha256: Sha256Hex,
+    size: u64,
+    pow: Vec<u64>,
+    #[serde(flatten)]
+    signed: SignedRequestPayload,
+}
+
+#[derive(Serialize)]
+pub struct DonateResponse {
+    source: String,
+}
+
+pub async fn donate_fixture(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/octet-stream")
+    {
+        return Err(ApiError::new(ErrorCode::UnsupportedMediaType));
+    }
+    let (header_bytes, file_bytes) =
+        split_fixture_upload(&body).map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
+    let header: DonateHeader = serde_json::from_slice(header_bytes)
+        .map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
+    let upload = FixtureUpload {
+        file: header.file.clone(),
+        sha256: header.sha256,
+        size: header.size,
+    };
+    upload
+        .validate()
+        .map_err(|_| ApiError::new(ErrorCode::SchemaInvalid))?;
+    if file_bytes.len() as u64 != upload.size {
+        return Err(ApiError::new(ErrorCode::MalformedEnvelope));
+    }
+    let signing_bytes =
+        serde_json::to_vec(&upload).map_err(|_| ApiError::new(ErrorCode::Internal))?;
+    let credential = auth::authenticate(
+        &state,
+        &header.signed,
+        RequestDomain::FixtureUpload,
+        &signing_bytes,
+        Action::FixtureUpload,
+    )
+    .await?;
+    let (_, nonce) = header.signed.decode()?;
+    let challenge = Challenge::new(
+        &nonce,
+        &request_digest(RequestDomain::FixtureUpload, &signing_bytes),
+    );
+    verify_pow(&state, &credential, challenge, &header.pow).await?;
+
+    let hash = BlobHash::of(file_bytes);
+    if hash.as_bytes() != upload.sha256.as_bytes() {
+        return Err(ApiError::new(ErrorCode::MalformedEnvelope));
+    }
+    let offset = body.len() - file_bytes.len();
+    let payload = body.slice(offset..);
+    let store = state.blobs.clone();
+    tokio::task::spawn_blocking(move || store.put(hash, &payload))
+        .await
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+    sqlx::query(
+        "INSERT INTO fixture_uploads (sha256, credential_id, file, size, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (sha256, credential_id)
+         DO UPDATE SET file = excluded.file, size = excluded.size",
+    )
+    .bind(hash.as_bytes().as_slice())
+    .bind(credential.as_str())
+    .bind(&upload.file)
+    .bind(i64::try_from(upload.size).map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?)
+    .bind(crate::db::now_unix())
+    .execute(&state.db)
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(DonateResponse {
+            source: looklab_schema::fixture_source(upload.sha256),
+        }),
+    )
+        .into_response())
 }
 
 pub async fn fixture_manifest(State(state): State<Arc<AppState>>) -> ApiResult<Response> {

@@ -23,6 +23,7 @@ pub enum Action {
     Proposal,
     Confirmation,
     ProposalThread,
+    FixtureUpload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -84,6 +85,10 @@ impl RateKey {
                     capacity: 60.0,
                     refill_per_second: 1.0,
                 },
+                Action::FixtureUpload => Quota {
+                    capacity: 10.0,
+                    refill_per_second: 0.05,
+                },
             },
         }
     }
@@ -102,6 +107,7 @@ impl core::fmt::Display for RateKey {
             Action::Proposal => "proposal",
             Action::Confirmation => "confirmation",
             Action::ProposalThread => "proposal-thread",
+            Action::FixtureUpload => "fixture-upload",
         };
         match self {
             Self::Nonce => f.write_str("nonce"),

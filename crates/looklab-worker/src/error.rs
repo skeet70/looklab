@@ -15,10 +15,14 @@ pub enum WorkerError {
     Io(#[from] std::io::Error),
     #[error("fit: {0}")]
     Fit(#[from] looklab_fit::FitError),
+    #[error("body: {0}")]
+    Body(#[from] looklab_body::BodyError),
     #[error("samples: {0}")]
     Samples(#[from] looklab_samples::Error),
     #[error("model: {0}")]
     Model(#[from] looklab_model::ModelError),
+    #[error("realization: {0}")]
+    Realization(#[from] looklab_model::realization::RealizationError),
     #[error("trust: {0}")]
     Trust(#[from] looklab_trust::TrustError),
     #[error("publish: {0}")]

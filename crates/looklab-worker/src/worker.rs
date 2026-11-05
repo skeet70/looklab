@@ -42,9 +42,12 @@ impl Worker {
         let Some(job) = jobs::claim(&self.pool, self.config.lease_seconds, now).await? else {
             return Ok(None);
         };
-        match self.execute(&job).await {
+        let renewal = self.spawn_renewal(&job);
+        let executed = self.execute(&job).await;
+        renewal.abort();
+        match executed {
             Ok(()) => {
-                jobs::complete(&self.pool, &job.id).await?;
+                jobs::complete(&self.pool, &job.id, job.attempts).await?;
                 Ok(Some(job.id))
             }
             Err(error) => {
@@ -60,6 +63,27 @@ impl Worker {
                 Err(error)
             }
         }
+    }
+
+    fn spawn_renewal(&self, job: &ClaimedJob) -> tokio::task::JoinHandle<()> {
+        let pool = self.pool.clone();
+        let id = job.id.clone();
+        let attempts = job.attempts;
+        let lease_seconds = self.config.lease_seconds;
+        tokio::spawn(async move {
+            let period = (lease_seconds / 3).max(1);
+            loop {
+                tokio::time::sleep(Duration::from_secs(u64::try_from(period).unwrap_or(1))).await;
+                match jobs::renew(&pool, &id, attempts, lease_seconds, now_unix()).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(job = %id, "lease lost; this attempt must not commit");
+                        break;
+                    }
+                    Err(error) => tracing::warn!(%error, job = %id, "lease renewal failed"),
+                }
+            }
+        })
     }
 
     pub async fn run_until_idle(&self) -> Result<usize> {
@@ -98,7 +122,8 @@ impl Worker {
             }
             JobPayload::HonestDuplicateMerge => duplicates::run(&self.pool).await,
             JobPayload::NightlyRefit { bodies } => {
-                let outcomes = refit::run(&self.pool, &self.config, &bodies).await?;
+                let outcomes =
+                    refit::run(&self.pool, &self.config, &bodies, &job.ownership()).await?;
                 if outcomes
                     .iter()
                     .any(|(_, _, outcome)| matches!(outcome, RefitOutcome::Published(_)))

@@ -193,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/mod/{*rest}", any(forward_request))
         .route("/api/fixtures/{*rest}", any(forward_request))
         .fallback(serve)
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(65 * 1024 * 1024))
         .with_state(stub);
 
     let address = SocketAddr::from(([127, 0, 0, 1], port));

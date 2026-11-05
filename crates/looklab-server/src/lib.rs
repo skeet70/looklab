@@ -21,7 +21,7 @@ mod verify;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::MatchedPath;
+use axum::extract::{DefaultBodyLimit, MatchedPath};
 use axum::routing::{get, post};
 use axum::{Router, middleware};
 use tokio::net::TcpListener;
@@ -74,6 +74,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/mod/proposal-message",
             post(api::proposals::mod_message),
+        )
+        .route(
+            "/api/fixtures/donate",
+            post(api::proposals::donate_fixture).layer(DefaultBodyLimit::max(
+                usize::try_from(looklab_schema::MAX_FIXTURE_BYTES).unwrap_or(usize::MAX)
+                    + looklab_schema::FIXTURE_UPLOAD_HEADER_MAX
+                    + 32,
+            )),
         )
         .route(
             "/api/fixtures/manifest.toml",

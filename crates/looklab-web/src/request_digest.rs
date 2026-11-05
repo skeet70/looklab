@@ -20,6 +20,7 @@ pub enum RequestDomain {
     Proposal,
     ProposalConfirmation,
     ProposalThread,
+    FixtureUpload,
 }
 
 impl RequestDomain {
@@ -37,6 +38,7 @@ impl RequestDomain {
             Self::Proposal => "proposal",
             Self::ProposalConfirmation => "proposal-confirmation",
             Self::ProposalThread => "proposal-thread",
+            Self::FixtureUpload => "fixture-upload",
         }
     }
 }
@@ -81,6 +83,11 @@ mod tests {
         assert_eq!(
             hex(&request_digest(RequestDomain::ProposalThread, b"{}")),
             "dfbeb93192d24890d7300c847de46718b2cc0b3bcc5f472a66fe7e4a26388540"
+        );
+        // sha256("looklab-request-v1:fixture-upload:")
+        assert_eq!(
+            hex(&request_digest(RequestDomain::FixtureUpload, b"")),
+            "9246b775ae9396d771c2238d3f7bd3ca04a7ba988e5dbc63e28b5bb61da42aad"
         );
     }
 }

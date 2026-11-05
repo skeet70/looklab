@@ -7,13 +7,28 @@ use looklab_trust::{
     Violation, convert_exposure_gauge, exposure_gauge_excluded, gate_release,
 };
 
-fn probe(id: usize, jab: [f64; 3], sigma: f64, supported: bool) -> ProbeEstimate {
-    ProbeEstimate {
-        id: ProbeId::new(format!("p{id}")),
+/// The fit's default `FitOptions::support_sigma`.
+const SUPPORT_SIGMA: f64 = 1.5;
+
+fn probe(id: usize, jab: [f64; 3], sigma: f64, density_ok: bool) -> ProbeEstimate {
+    ProbeEstimate::new(
+        ProbeId::new(format!("p{id}")),
         jab,
         sigma,
-        supported,
-    }
+        density_ok,
+        SUPPORT_SIGMA,
+    )
+}
+
+/// The same probe with a different σ, re-deriving its support.
+fn with_sigma(probe: &ProbeEstimate, sigma: f64) -> ProbeEstimate {
+    ProbeEstimate::new(
+        probe.id.clone(),
+        probe.jab,
+        sigma,
+        probe.density_ok,
+        SUPPORT_SIGMA,
+    )
 }
 
 fn observation(id: usize, jab: [f64; 3]) -> RootObservation {
@@ -203,25 +218,68 @@ fn p95_ratio_above_one_fails() {
 }
 
 #[test]
-fn a_supported_probe_may_not_become_unsupported() {
+fn a_sigma_jump_that_loses_support_fails() {
     let mut input = baseline();
-    input.candidate.probes[50].supported = false;
+    input.candidate.probes[50] = with_sigma(&input.candidate.probes[50], 2.8);
+    for version in [&mut input.previous, &mut input.anchor] {
+        version.probes[50] = with_sigma(&version.probes[50], 0.7);
+    }
     let report = gate_release(&TrustParams::default(), &input);
 
     assert!(!report.passed);
     assert_eq!(report.supported_regressions, vec![ProbeId::new("p50")]);
+    assert!(report.coverage_changes.is_empty());
     assert!(report.drift_previous.pass);
     assert!(violations_contain(&report, |violation| matches!(
         violation,
+        Violation::SupportedToUnsupported { probe, .. } if probe == &ProbeId::new("p50")
+    )));
+}
+
+#[test]
+fn sigma_jitter_at_the_support_threshold_passes() {
+    let mut input = baseline();
+    input.candidate.probes[50] = with_sigma(&input.candidate.probes[50], 1.52);
+    for version in [&mut input.previous, &mut input.anchor] {
+        version.probes[50] = with_sigma(&version.probes[50], 1.47);
+    }
+    let report = gate_release(&TrustParams::default(), &input);
+
+    assert!(!input.candidate.probes[50].supported);
+    assert!(report.supported_regressions.is_empty());
+    assert!(!violations_contain(&report, |violation| matches!(
+        violation,
         Violation::SupportedToUnsupported { .. }
     )));
+    assert!(report.passed, "{:?}", report.violations);
+}
+
+#[test]
+fn a_density_only_support_loss_is_a_coverage_change() {
+    let mut input = baseline();
+    let probe = input.candidate.probes[50].clone();
+    input.candidate.probes[50] =
+        ProbeEstimate::new(probe.id, probe.jab, probe.sigma, false, SUPPORT_SIGMA);
+    let report = gate_release(&TrustParams::default(), &input);
+
+    assert!(!input.candidate.probes[50].supported);
+    assert_eq!(report.coverage_changes, vec![ProbeId::new("p50")]);
+    assert!(report.supported_regressions.is_empty());
+    assert!(!violations_contain(&report, |violation| matches!(
+        violation,
+        Violation::SupportedToUnsupported { .. }
+    )));
+    assert!(report.drift_previous.pass);
+    assert!(report.passed, "{:?}", report.violations);
 }
 
 #[test]
 fn a_probe_supported_only_in_the_reference_is_gated() {
     let mut input = baseline();
-    input.candidate.probes[60].supported = false;
-    input.candidate.probes[60].jab = [52.5, 0.0, 0.0];
+    input.candidate.probes[60] = ProbeEstimate {
+        jab: [52.5, 0.0, 0.0],
+        ..with_sigma(&input.candidate.probes[60], 2.0)
+    };
     let report = gate_release(&TrustParams::default(), &input);
 
     assert_eq!(
@@ -234,11 +292,14 @@ fn a_probe_supported_only_in_the_reference_is_gated() {
 #[test]
 fn a_probe_unsupported_in_both_versions_is_outside_the_gate() {
     let mut input = baseline();
-    for version in [&mut input.candidate, &mut input.previous, &mut input.anchor] {
-        version.probes[70].supported = false;
+    input.candidate.probes[70] = with_sigma(&input.candidate.probes[70], 2.0);
+    for version in [&mut input.previous, &mut input.anchor] {
+        version.probes[70] = with_sigma(&version.probes[70], 2.0);
     }
     let report = gate_release(&TrustParams::default(), &input);
     assert_eq!(report.drift_previous.gated, 99);
+    assert!(report.supported_regressions.is_empty());
+    assert!(report.coverage_changes.is_empty());
 }
 
 #[test]

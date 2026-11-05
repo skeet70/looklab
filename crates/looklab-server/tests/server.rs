@@ -19,7 +19,8 @@ use looklab_samples::{
     PrepVersion, PriorTransformVersion, RerenderGroupId, SampleFlags, SampleHeader, SampleSet,
 };
 use looklab_schema::{
-    Date, FixtureDonation, FixtureLicense, LabeledTag, MakernoteValue, Sha256Hex,
+    Date, FixtureDonation, FixtureLicense, FixtureUpload, LabeledTag, MakernoteValue, Sha256Hex,
+    frame_fixture_upload,
 };
 use looklab_server::{AppState, Config, PowConfig, router};
 use looklab_upload::{
@@ -1935,6 +1936,54 @@ impl TestServer {
         post_json(&self.app, "/api/proposals", &body).await
     }
 
+    async fn donate_fixture(&mut self, file: &str, bytes: &[u8]) -> (StatusCode, Value) {
+        let sha256 = Sha256Hex::parse(&hex(&Sha256::digest(bytes))).expect("sha256");
+        let upload = FixtureUpload {
+            file: file.to_owned(),
+            sha256,
+            size: bytes.len() as u64,
+        };
+        let signing = serde_json::to_vec(&upload).expect("signing body");
+        let nonce = self.nonce().await;
+        let digest = action_digest("fixture-upload", &signing);
+        let challenge = Challenge::new(&nonce, &digest);
+        let assertion = self.assertion(&challenge).await;
+        let pow = solve(&challenge, 1, &pow_params(), 0).expect("proof-of-work");
+        #[derive(serde::Serialize)]
+        struct Header<'a> {
+            file: &'a str,
+            sha256: Sha256Hex,
+            size: u64,
+            pow: Vec<u64>,
+            nonce: String,
+            credential_id: String,
+            authenticator_data: String,
+            client_data_json: String,
+            signature: String,
+        }
+        let header = serde_json::to_vec(&Header {
+            file,
+            sha256,
+            size: upload.size,
+            pow: pow.as_array().to_vec(),
+            nonce: b64(nonce.as_bytes()),
+            credential_id: b64(&assertion.credential_id),
+            authenticator_data: b64(&assertion.authenticator_data),
+            client_data_json: b64(&assertion.client_data_json),
+            signature: b64(&assertion.signature),
+        })
+        .expect("header");
+        let body = frame_fixture_upload(&header, bytes).expect("frame");
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/fixtures/donate")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(body))
+            .expect("request");
+        let (status, _, body) = send(&self.app, request).await;
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
     async fn moderator_token(&mut self) -> String {
         self.set_credential_tier_roles(&self.credential_id, "new", "[\"moderator\"]")
             .await;
@@ -2173,6 +2222,7 @@ makernote: { tag: FilmMode, value: 1792 }
         sha256: Sha256Hex::parse(&"ab".repeat(32)).expect("sha256"),
         size: 24_000_000,
         source_url: Some("https://example.com/fujifilm-x-t5-1.00.raf".to_owned()),
+        source: None,
         donator: Some("tester".to_owned()),
         donated_on: Date::parse("2026-11-04").expect("date"),
         license: FixtureLicense::Cc0_1_0,
@@ -2247,6 +2297,86 @@ makernote: { tag: FilmMode, value: 1792 }
     assert!(manifest.contains("file = \"fujifilm-x-t5-1.00.raf\""));
     assert!(manifest.contains("license = \"CC0-1.0\""));
     assert!(manifest.contains("Donated by tester on 2026-11-04"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_uploaded_fixture_is_exported_on_approval() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let bytes = b"looklab fixture bytes";
+    let (status, body) = server.donate_fixture("looklab-test.raf", bytes).await;
+    assert_eq!(status, StatusCode::CREATED, "donation: {body}");
+    let source = body["source"].as_str().expect("source").to_owned();
+    let fixture = FixtureDonation {
+        file: "looklab-test.raf".to_owned(),
+        description: "A donated test fixture".to_owned(),
+        make: "Fujifilm".to_owned(),
+        model: "X-T5".to_owned(),
+        sha256: Sha256Hex::parse(&hex(&Sha256::digest(bytes))).expect("sha256"),
+        size: bytes.len() as u64,
+        source_url: None,
+        source: Some(source),
+        donator: Some("tester".to_owned()),
+        donated_on: Date::parse("2026-11-04").expect("date"),
+        license: FixtureLicense::Cc0_1_0,
+        committed: false,
+    };
+    let body_yaml = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
+    let (status, body) = server
+        .submit_proposal("body", body_yaml, std::slice::from_ref(&fixture), true)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "submit: {body}");
+    let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+
+    let token = server.moderator_token().await;
+    let (status, body) = server
+        .decide(&token, &proposal, "the fixture is donated")
+        .await;
+    assert_eq!(status, StatusCode::OK, "decision: {body}");
+    assert_eq!(body["snapshot"]["version"], 1);
+
+    let snapshot = server.dir.path().join("community/v1");
+    assert_eq!(
+        std::fs::read(snapshot.join("fixtures/looklab-test.raf")).expect("exported fixture"),
+        bytes
+    );
+    let manifest =
+        std::fs::read_to_string(snapshot.join("fixtures/manifest.toml")).expect("manifest");
+    assert!(manifest.contains("committed = true"), "{manifest}");
+    assert!(!manifest.contains("source ="), "{manifest}");
+    let failures = looklab_schema::validate_snapshot_dir(&snapshot).expect("snapshot walk");
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fixture_source_needs_an_upload_by_the_proposer() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let bytes = b"never uploaded";
+    let sha256 = Sha256Hex::parse(&hex(&Sha256::digest(bytes))).expect("sha256");
+    let fixture = FixtureDonation {
+        file: "looklab-missing.raf".to_owned(),
+        description: "A fixture nobody uploaded".to_owned(),
+        make: "Fujifilm".to_owned(),
+        model: "X-T5".to_owned(),
+        sha256,
+        size: bytes.len() as u64,
+        source_url: None,
+        source: Some(looklab_schema::fixture_source(sha256)),
+        donator: None,
+        donated_on: Date::parse("2026-11-04").expect("date"),
+        license: FixtureLicense::Cc0_1_0,
+        committed: false,
+    };
+    let body_yaml = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
+    let (status, body) = server
+        .submit_proposal("body", body_yaml, std::slice::from_ref(&fixture), true)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "submit: {body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2360,6 +2490,7 @@ async fn a_fixture_backed_body_needs_a_fixture_donation() {
         sha256: Sha256Hex::parse(&"cd".repeat(32)).expect("sha256"),
         size: 24_000_000,
         source_url: Some("https://example.com/fujifilm-x-s10-1.00.raf".to_owned()),
+        source: None,
         donator: None,
         donated_on: Date::parse("2026-11-04").expect("date"),
         license: FixtureLicense::Cc0_1_0,

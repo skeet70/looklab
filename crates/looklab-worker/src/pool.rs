@@ -3,8 +3,11 @@
 use std::collections::{BTreeMap, HashMap};
 
 use looklab_color::Mat3;
+use looklab_fit::ExposureModeId;
 use looklab_model::LookInput;
+use looklab_model::realization::{ControlValue, Settings};
 use looklab_samples::{SampleFlags, SampleSet};
+use looklab_schema::{Affects, ControlDefault, ControlSchema, ControlType};
 use looklab_trust::{
     CredentialId as TrustCredentialId, EffectiveContributorId, Region, RegionCoverage, SerialLink,
     resolve_effective_contributors,
@@ -12,9 +15,9 @@ use looklab_trust::{
 use looklab_upload::{BodyId, LookSlug};
 use sqlx::SqlitePool;
 
-use crate::body::{BodyResources, DataDir, TransformDir, resolve_look};
+use crate::body::{BodyResources, BodyTransforms, DataDir, TransformDir, epoch_for, resolve_look};
 use crate::config::WorkerConfig;
-use crate::db::{self, ContributionRow, CredentialInfo, ImageId, ImageRow};
+use crate::db::{self, ContributionRow, CredentialInfo, ImageId, ImageOutcome, ImageRow};
 use crate::error::{Result, WorkerError};
 use crate::meta;
 
@@ -29,6 +32,10 @@ pub struct PoolImage {
     pub contributor: EffectiveContributorId,
     pub samples: SampleSet,
     pub transform: Mat3,
+    pub epoch: u32,
+    pub settings: Settings,
+    pub exposure_mode: ExposureModeId,
+    pub outcome: Option<ImageOutcome>,
     pub capture: looklab_trust::CaptureTuple,
     pub coverage: RegionCoverage,
     /// `(s, hue, √C)` per sample.
@@ -41,6 +48,7 @@ pub struct LookPool {
     pub body: BodyId,
     pub look: LookSlug,
     pub resources: BodyResources,
+    pub transforms: BodyTransforms,
     pub images: Vec<PoolImage>,
 }
 
@@ -68,7 +76,7 @@ pub async fn build(
     look: &LookSlug,
 ) -> Result<LookPool> {
     let resources = DataDir::new(&config.data).load(body)?;
-    let transform = TransformDir::new(&config.transforms).load(body)?;
+    let transforms = TransformDir::new(&config.transforms).load(body)?;
     let rows = db::body_pool(db_pool, body).await?;
 
     let mut contributions = Vec::new();
@@ -122,15 +130,19 @@ pub async fn build(
             .get(&credential.trust)
             .copied()
             .unwrap_or_else(|| EffectiveContributorId::from(credential.trust));
+        let epoch = epoch_for(&resources.schema, &contribution.firmware)?.id;
+        let exposure_mode = exposure_mode(&resources.schema, epoch, &contribution.settings)?;
         for row in rows {
             let path = db::blob_path(&config.blobs, &row.samples_hash);
             let bytes = std::fs::read(&path)
                 .map_err(|error| WorkerError::Data(format!("{}: {error}", path.display())))?;
             let samples = looklab_samples::decode(&bytes)?;
+            let transform = transforms.matrix_for(None, samples.header().wb_multipliers)?;
             let axes = axes_of(&samples, &transform);
             let coverage = coverage_of(&axes)?;
             let clip_fraction = clip_fraction(&samples);
             let capture = meta::capture_tuple(&row.meta_json)?;
+            let outcome = row.status;
             images.push(PoolImage {
                 image: row,
                 contribution: contribution.clone(),
@@ -138,6 +150,10 @@ pub async fn build(
                 contributor,
                 samples,
                 transform,
+                epoch,
+                settings: contribution.settings.clone(),
+                exposure_mode,
+                outcome,
                 capture,
                 coverage,
                 axes,
@@ -151,8 +167,49 @@ pub async fn build(
         body: body.clone(),
         look: look.clone(),
         resources,
+        transforms,
         images,
     })
+}
+
+/// The exposure mode a settings map selects: the first enum control whose value
+/// names an exposure mode key; mode 0 when none does (docs/03 §1).
+fn exposure_mode(
+    schema: &ControlSchema,
+    epoch: u32,
+    settings: &Settings,
+) -> Result<ExposureModeId> {
+    let epoch = schema
+        .epochs
+        .iter()
+        .find(|candidate| candidate.id == epoch)
+        .ok_or_else(|| WorkerError::Data(format!("body schema has no epoch {epoch}")))?;
+    for control in &epoch.controls {
+        if control.kind != ControlType::Enum || !control.affects.contains(&Affects::Exposure) {
+            continue;
+        }
+        let selected = match settings.get(&control.key) {
+            Some(ControlValue::Enum(value)) => Some(value),
+            None => match &control.default {
+                ControlDefault::Enum(value) => Some(value),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(selected) = selected else {
+            continue;
+        };
+        if let Some(index) = epoch
+            .exposure_modes
+            .iter()
+            .position(|mode| mode.key.as_str() == selected.as_str())
+        {
+            return u32::try_from(index)
+                .map(ExposureModeId)
+                .map_err(|_| WorkerError::Data("too many exposure modes".to_owned()));
+        }
+    }
+    Ok(ExposureModeId(0))
 }
 
 pub fn axes_of(samples: &SampleSet, transform: &Mat3) -> Vec<(f64, f64, f64)> {

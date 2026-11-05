@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use looklab_body::camera_to_xyz_at_wb;
 use looklab_color::Mat3;
+use looklab_color::dng::{CalibrationMatrix, DngColorSpec};
 use looklab_schema::{Body, ControlSchema, Epoch, FirmwareVersion};
 use looklab_upload::{BodyId, LookSlug};
 use serde::Deserialize;
@@ -75,10 +78,70 @@ pub struct TransformDir {
     root: PathBuf,
 }
 
-#[derive(Deserialize)]
+pub const TRANSFORM_FORMAT: &str = "looklab-transform/1";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TransformFile {
     #[serde(default)]
+    format: Option<String>,
+    version: u32,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    cct: Option<f64>,
+    #[serde(default)]
     camera_to_xyz: Option<Mat3>,
+    #[serde(default)]
+    color_matrices: Vec<XyzToCamera>,
+    #[serde(default)]
+    forward_matrices: Vec<CameraToXyz>,
+    #[serde(default)]
+    per_image: Vec<PerImageTransform>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct XyzToCamera {
+    cct: f64,
+    xyz_to_camera: Mat3,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CameraToXyz {
+    cct: f64,
+    camera_to_xyz: Mat3,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PerImageTransform {
+    file: String,
+    camera_to_xyz: Mat3,
+}
+
+/// The camera-to-XYZ matrices a body's uploads resolve against.
+#[derive(Debug, Clone)]
+pub struct BodyTransforms {
+    spec: Option<DngColorSpec>,
+    fixed: Option<Mat3>,
+    per_image: BTreeMap<String, Mat3>,
+}
+
+impl BodyTransforms {
+    /// The image's matrix, from its file override, its as-shot illuminant, or the
+    /// body's single matrix.
+    pub(crate) fn matrix_for(&self, file: Option<&str>, wb: [f32; 3]) -> Result<Mat3> {
+        if let Some(matrix) = file.and_then(|file| self.per_image.get(file)) {
+            return Ok(*matrix);
+        }
+        if let Some(spec) = &self.spec {
+            return Ok(camera_to_xyz_at_wb(spec, wb)?);
+        }
+        self.fixed
+            .ok_or_else(|| WorkerError::Data("transform file has no usable matrix".to_owned()))
+    }
 }
 
 impl TransformDir {
@@ -86,23 +149,98 @@ impl TransformDir {
         Self { root: root.into() }
     }
 
-    pub fn load(&self, body: &BodyId) -> Result<Mat3> {
+    pub fn load(&self, body: &BodyId) -> Result<BodyTransforms> {
         let path: PathBuf = self
             .root
             .join(format!("{}.yaml", body.as_str().replace('/', "-")));
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Mat3::IDENTITY);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let file: TransformFile = serde_norway::from_str(&text)?;
-        file.camera_to_xyz.ok_or_else(|| {
+        let text = std::fs::read_to_string(&path).map_err(|error| {
             WorkerError::Data(format!(
-                "{}: only a fixed `camera_to_xyz` matrix is supported",
+                "{}: {error}; a body input transform is required",
                 path.display()
             ))
+        })?;
+        Self::parse(&text, &path, body)
+    }
+
+    fn parse(text: &str, path: &std::path::Path, body: &BodyId) -> Result<BodyTransforms> {
+        let file: TransformFile = serde_norway::from_str(text)?;
+        if let Some(named) = &file.body
+            && named.as_str() != body.as_str()
+        {
+            return Err(WorkerError::Data(format!(
+                "{}: transform is for `{named}`, expected `{body}`",
+                path.display()
+            )));
+        }
+        if let Some(format) = &file.format
+            && format != TRANSFORM_FORMAT
+        {
+            return Err(WorkerError::Data(format!(
+                "{}: transform format `{format}`, expected `{TRANSFORM_FORMAT}`",
+                path.display()
+            )));
+        }
+        if file.version == 0 {
+            return Err(WorkerError::Data(format!(
+                "{}: transform version must be at least 1",
+                path.display()
+            )));
+        }
+        if let Some(cct) = file.cct
+            && !(cct.is_finite() && cct > 0.0)
+        {
+            return Err(WorkerError::Data(format!(
+                "{}: cct {cct} is not a positive temperature",
+                path.display()
+            )));
+        }
+        if file
+            .color_matrices
+            .iter()
+            .any(|entry| !(entry.cct.is_finite() && entry.cct > 0.0))
+            || file
+                .forward_matrices
+                .iter()
+                .any(|entry| !(entry.cct.is_finite() && entry.cct > 0.0))
+        {
+            return Err(WorkerError::Data(format!(
+                "{}: a calibration cct is not a positive temperature",
+                path.display()
+            )));
+        }
+        let spec = if file.color_matrices.is_empty() && file.forward_matrices.is_empty() {
+            None
+        } else {
+            let color = file
+                .color_matrices
+                .iter()
+                .filter_map(|entry| CalibrationMatrix::new(entry.cct, entry.xyz_to_camera))
+                .collect();
+            let forward = file
+                .forward_matrices
+                .iter()
+                .filter_map(|entry| CalibrationMatrix::new(entry.cct, entry.camera_to_xyz))
+                .collect();
+            Some(
+                DngColorSpec::new(color, forward)
+                    .map_err(|error| WorkerError::Data(format!("{}: {error}", path.display())))?,
+            )
+        };
+        let per_image = file
+            .per_image
+            .iter()
+            .map(|entry| (entry.file.clone(), entry.camera_to_xyz))
+            .collect();
+        if spec.is_none() && file.camera_to_xyz.is_none() && file.per_image.is_empty() {
+            return Err(WorkerError::Data(format!(
+                "{}: transform file has no matrices",
+                path.display()
+            )));
+        }
+        Ok(BodyTransforms {
+            spec,
+            fixed: file.camera_to_xyz,
+            per_image,
         })
     }
 }

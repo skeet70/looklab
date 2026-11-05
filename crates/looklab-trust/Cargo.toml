@@ -10,7 +10,7 @@ publish = false
 [features]
 default = []
 # Builds the simulator only; it needs looklab-fit and does not target wasm.
-harness = ["dep:looklab-fit", "dep:looklab-color"]
+harness = ["dep:looklab-fit", "dep:looklab-color", "dep:looklab-body"]
 
 [dependencies]
 libm.workspace = true
@@ -22,6 +22,7 @@ looklab-model.workspace = true
 looklab-upload.workspace = true
 looklab-fit = { workspace = true, features = ["synth"], optional = true }
 looklab-color = { workspace = true, optional = true }
+looklab-body = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true

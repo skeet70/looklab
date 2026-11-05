@@ -186,6 +186,34 @@ impl ClaimedJob {
     pub fn payload(&self) -> Result<JobPayload> {
         JobPayload::decode(&self.kind, &self.payload_text)
     }
+
+    pub fn ownership(&self) -> JobOwnership {
+        JobOwnership {
+            id: self.id.clone(),
+            attempts: self.attempts,
+        }
+    }
+}
+
+/// Fences one execution: `claim` increments `attempts`, so every execution has a distinct pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobOwnership {
+    pub id: JobId,
+    pub attempts: i64,
+}
+
+impl JobOwnership {
+    /// Fails when the lease expired and another attempt now owns the job.
+    pub async fn check(&self, pool: &SqlitePool) -> Result<()> {
+        if owns(pool, &self.id, self.attempts).await? {
+            Ok(())
+        } else {
+            Err(WorkerError::Job(format!(
+                "job {} is no longer owned by attempt {}",
+                self.id, self.attempts
+            )))
+        }
+    }
 }
 
 /// A job whose lease expired is reclaimable.
@@ -214,12 +242,49 @@ pub async fn claim(pool: &SqlitePool, lease_seconds: i64, now: i64) -> Result<Op
     }))
 }
 
-pub async fn complete(pool: &SqlitePool, id: &JobId) -> Result<()> {
-    sqlx::query("UPDATE jobs SET status = 'done', locked_until = NULL WHERE id = ?")
-        .bind(id.as_str())
-        .execute(pool)
-        .await?;
-    Ok(())
+/// Extends the lease of the attempt that still owns the job.
+pub async fn renew(
+    pool: &SqlitePool,
+    id: &JobId,
+    attempts: i64,
+    lease_seconds: i64,
+    now: i64,
+) -> Result<bool> {
+    let updated = sqlx::query(
+        "UPDATE jobs SET locked_until = ?
+         WHERE id = ? AND attempts = ? AND status = 'running'",
+    )
+    .bind(now + lease_seconds)
+    .bind(id.as_str())
+    .bind(attempts)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(updated == 1)
+}
+
+pub async fn owns(pool: &SqlitePool, id: &JobId, attempts: i64) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE id = ? AND attempts = ? AND status = 'running'",
+    )
+    .bind(id.as_str())
+    .bind(attempts)
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
+}
+
+pub async fn complete(pool: &SqlitePool, id: &JobId, attempts: i64) -> Result<bool> {
+    let updated = sqlx::query(
+        "UPDATE jobs SET status = 'done', locked_until = NULL
+         WHERE id = ? AND attempts = ? AND status = 'running'",
+    )
+    .bind(id.as_str())
+    .bind(attempts)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(updated == 1)
 }
 
 pub async fn fail(
@@ -229,24 +294,26 @@ pub async fn fail(
     max_attempts: i64,
     now: i64,
     permanent: bool,
-) -> Result<()> {
-    if permanent || attempts >= max_attempts {
-        sqlx::query("UPDATE jobs SET status = 'failed', locked_until = NULL WHERE id = ?")
-            .bind(id.as_str())
-            .execute(pool)
-            .await?;
-        return Ok(());
-    }
+) -> Result<bool> {
     let exponent = u32::try_from(attempts.max(1) - 1).unwrap_or(0).min(16);
     let backoff = (30_i64 << exponent).min(3_600);
-    sqlx::query(
-        "UPDATE jobs SET status = 'queued', locked_until = NULL, run_after = ? WHERE id = ?",
+    let (status, run_after) = if permanent || attempts >= max_attempts {
+        ("failed", now)
+    } else {
+        ("queued", now + backoff)
+    };
+    let updated = sqlx::query(
+        "UPDATE jobs SET status = ?, locked_until = NULL, run_after = ?
+         WHERE id = ? AND attempts = ? AND status = 'running'",
     )
-    .bind(now + backoff)
+    .bind(status)
+    .bind(run_after)
     .bind(id.as_str())
+    .bind(attempts)
     .execute(pool)
-    .await?;
-    Ok(())
+    .await?
+    .rows_affected();
+    Ok(updated == 1)
 }
 
 pub async fn enqueue(pool: &SqlitePool, payload: &JobPayload, run_after: i64) -> Result<JobId> {

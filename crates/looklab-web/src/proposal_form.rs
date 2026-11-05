@@ -115,7 +115,12 @@ pub fn parse_tag_values(text: &str, label: &str) -> Result<Vec<LabeledTag>, Stri
 
 /// # Errors
 /// Reports a donation the fixture manifest would reject.
-pub fn donation(file: &FixtureFile, make: &str, model: &str) -> Result<FixtureDonation, String> {
+pub fn donation(
+    file: &FixtureFile,
+    make: &str,
+    model: &str,
+    source: String,
+) -> Result<FixtureDonation, String> {
     let donated_on = Date::parse(&today()).map_err(|error| error.to_string())?;
     let size = u64::try_from(file.bytes.len()).map_err(|_| "file is too large".to_owned())?;
     let donation = FixtureDonation {
@@ -126,10 +131,11 @@ pub fn donation(file: &FixtureFile, make: &str, model: &str) -> Result<FixtureDo
         sha256: file.sha256,
         size,
         source_url: None,
+        source: Some(source),
         donator: None,
         donated_on,
         license: FixtureLicense::Cc0_1_0,
-        committed: true,
+        committed: false,
     };
     donation.validate().map_err(|errors| {
         errors

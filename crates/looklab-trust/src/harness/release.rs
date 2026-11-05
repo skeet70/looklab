@@ -697,12 +697,14 @@ impl Sim {
             }
             estimates.insert(
                 probe.id.clone(),
-                ProbeEstimate {
-                    id: probe.id.clone(),
-                    jab: version.look.eval(probe.xyz.scale(scale)).to_array(),
-                    sigma: version.sigma[index],
-                    supported: version.supported[index],
-                },
+                ProbeEstimate::from_fit(
+                    probe.id.clone(),
+                    version.look.eval(probe.xyz.scale(scale)).to_array(),
+                    version.sigma[index],
+                    version.density[index] >= version.density_floor,
+                    version.supported[index],
+                    self.params.fit.support_sigma,
+                ),
             );
         }
         (estimates, excluded)
@@ -883,26 +885,30 @@ impl Sim {
         stats: &[ImageFitStats],
         fit_indices: &[usize],
     ) -> HarnessResult<()> {
+        let verdicts: BTreeMap<usize, Verdict> = stats
+            .iter()
+            .zip(fit_indices)
+            .map(|(stat, &index)| (index, stat.verdict))
+            .collect();
         let mut totals: BTreeMap<CredentialId, (usize, usize, u32)> = BTreeMap::new();
         for image in &weights.images {
-            let Some(pool) = self.pool.iter().find(|candidate| candidate.id == image.id) else {
+            let Some(index) = self
+                .pool
+                .iter()
+                .position(|candidate| candidate.id == image.id)
+            else {
                 continue;
             };
-            if !matches!(pool.intent, Intent::Native) {
+            if !matches!(self.pool[index].intent, Intent::Native) {
                 continue;
             }
             let entry = totals.entry(image.credential).or_insert((0, 0, 0));
             entry.0 += 1;
-            if image.total + 1e-12 >= image.raw {
-                entry.1 += 1;
-            }
-        }
-        for (stat, &index) in stats.iter().zip(fit_indices) {
-            if stat.verdict == Verdict::Quarantine {
-                totals
-                    .entry(self.pool[index].credential)
-                    .or_insert((0, 0, 0))
-                    .2 += 1;
+            // Caps are not down-weighting (docs/05 §4); only a consistency verdict is.
+            match verdicts.get(&index).copied().unwrap_or(Verdict::Accept) {
+                Verdict::Accept => entry.1 += 1,
+                Verdict::DownWeight => {}
+                Verdict::Quarantine => entry.2 += 1,
             }
         }
         for (credential, (total, accepted, quarantines)) in totals {

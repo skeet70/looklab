@@ -119,6 +119,7 @@ pub enum RequestDomain {
     Proposal,
     ProposalConfirmation,
     ProposalThread,
+    FixtureUpload,
 }
 
 impl RequestDomain {
@@ -136,6 +137,7 @@ impl RequestDomain {
             Self::Proposal => "proposal",
             Self::ProposalConfirmation => "proposal-confirmation",
             Self::ProposalThread => "proposal-thread",
+            Self::FixtureUpload => "fixture-upload",
         }
     }
 }

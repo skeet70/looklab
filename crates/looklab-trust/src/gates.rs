@@ -21,7 +21,52 @@ pub struct ProbeEstimate {
     pub jab: [f64; 3],
     /// `σ_ΔE` of this version at the probe.
     pub sigma: f64,
+    /// `sigma <= support_sigma`.
+    pub sigma_ok: bool,
+    /// The probe's local sample density reaches the fit's density floor.
+    pub density_ok: bool,
+    /// The fit's support rule: `sigma_ok && density_ok` and outside the clip shoulder.
     pub supported: bool,
+}
+
+impl ProbeEstimate {
+    /// Derives `supported` for a caller that has no clip-shoulder verdict.
+    pub fn new(
+        id: ProbeId,
+        jab: [f64; 3],
+        sigma: f64,
+        density_ok: bool,
+        support_sigma: f64,
+    ) -> Self {
+        let sigma_ok = sigma <= support_sigma;
+        Self {
+            id,
+            jab,
+            sigma,
+            sigma_ok,
+            density_ok,
+            supported: sigma_ok && density_ok,
+        }
+    }
+
+    /// Carries the fit's `supported` flag, which also covers the clip shoulder.
+    pub fn from_fit(
+        id: ProbeId,
+        jab: [f64; 3],
+        sigma: f64,
+        density_ok: bool,
+        supported: bool,
+        support_sigma: f64,
+    ) -> Self {
+        Self {
+            id,
+            jab,
+            sigma,
+            sigma_ok: sigma <= support_sigma,
+            density_ok,
+            supported,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -142,6 +187,10 @@ pub enum Violation {
     },
     SupportedToUnsupported {
         probe: ProbeId,
+        #[serde(default)]
+        sigma: f64,
+        #[serde(default)]
+        threshold: f64,
     },
 }
 
@@ -151,6 +200,9 @@ pub struct GateReport {
     pub root_anchor: RootGateReport,
     pub drift_previous: DriftGateReport,
     pub drift_anchor: DriftGateReport,
+    /// Probes that lost support without a σ violation.
+    #[serde(default)]
+    pub coverage_changes: Vec<ProbeId>,
     pub supported_regressions: Vec<ProbeId>,
     pub violations: Vec<Violation>,
     pub passed: bool,
@@ -227,29 +279,48 @@ pub fn gate_release(params: &TrustParams, input: &GateInput) -> GateReport {
         input_valid,
     );
 
-    let mut regressions: BTreeSet<ProbeId> = BTreeSet::new();
+    let mut coverage_changes: BTreeSet<ProbeId> = BTreeSet::new();
+    let mut regressions: Vec<(ProbeId, f64, f64)> = Vec::new();
+    let threshold_scale = 1.0 + params.gate_support_margin;
     for (id, probe) in &candidate {
         if probe.supported {
             continue;
         }
-        let supported_before = previous.get(id).is_some_and(|estimate| estimate.supported)
-            || anchor.get(id).is_some_and(|estimate| estimate.supported);
-        if supported_before {
-            regressions.insert(id.clone());
+        let sigma_reference = [previous.get(id), anchor.get(id)]
+            .into_iter()
+            .flatten()
+            .filter(|estimate| estimate.supported)
+            .map(|estimate| estimate.sigma)
+            .max_by(f64::total_cmp);
+        let Some(sigma_reference) = sigma_reference else {
+            continue;
+        };
+        if !probe.sigma_ok {
+            let threshold = threshold_scale * sigma_reference;
+            if probe.sigma > threshold {
+                regressions.push((id.clone(), probe.sigma, threshold));
+                continue;
+            }
         }
+        coverage_changes.insert(id.clone());
     }
-    let supported_regressions: Vec<ProbeId> = regressions.into_iter().collect();
+    let supported_regressions: Vec<ProbeId> = regressions
+        .iter()
+        .map(|(probe, _, _)| probe.clone())
+        .collect();
+    let coverage_changes: Vec<ProbeId> = coverage_changes.into_iter().collect();
 
     collect_root_violations(&root_previous, &mut violations);
     collect_root_violations(&root_anchor, &mut violations);
     collect_drift_violations(&drift_previous, &mut violations);
     collect_drift_violations(&drift_anchor, &mut violations);
-    violations.extend(
-        supported_regressions
-            .iter()
-            .cloned()
-            .map(|probe| Violation::SupportedToUnsupported { probe }),
-    );
+    violations.extend(regressions.into_iter().map(|(probe, sigma, threshold)| {
+        Violation::SupportedToUnsupported {
+            probe,
+            sigma,
+            threshold,
+        }
+    }));
 
     let passed = input_valid
         && root_previous.pass
@@ -263,6 +334,7 @@ pub fn gate_release(params: &TrustParams, input: &GateInput) -> GateReport {
         root_anchor,
         drift_previous,
         drift_anchor,
+        coverage_changes,
         supported_regressions,
         violations,
         passed,

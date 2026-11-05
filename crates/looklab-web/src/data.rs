@@ -9,13 +9,16 @@ use looklab_publish::{
     ArtifactHash, AuditLog, BodyPage, LUT_BYTES, LookArtifact, LookPage, PreparedScene, Scene,
     SceneIndex, SceneName, SiteIndex, VersionManifest, VersionSummary, verify_artifact,
 };
-use looklab_schema::{FixtureDonation, LabeledTag, ProposalKind, ProposalRef, ProposalView};
+use looklab_schema::{
+    FixtureDonation, FixtureUpload, LabeledTag, ProposalKind, ProposalRef, ProposalView,
+};
 use looklab_wasm::prep::{ModuleFunction, default_pow};
 use looklab_wasm::{PowParamsSpec, decode_pow_reply, module_fn_id, solve_pow_request};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 
+use crate::proposal_form::FixtureFile;
 use crate::request_digest::{RequestDomain, challenge, request_digest};
 use crate::webauthn::{self, PowParameters, SignedFields};
 use crate::worker;
@@ -569,6 +572,70 @@ pub async fn proposer_message(id: &ProposalRef, body: &str) -> Result<(), String
         .map_err(|error| error.to_string())?;
     let _: serde_json::Value = api_send("/api/proposals/message", request).await?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct FixtureUploadHeader<'a> {
+    file: &'a str,
+    sha256: looklab_schema::Sha256Hex,
+    size: u64,
+    pow: Vec<u64>,
+    #[serde(flatten)]
+    signed: &'a SignedFields,
+}
+
+#[derive(Deserialize)]
+struct FixtureUploadReply {
+    source: String,
+}
+
+/// Returns the source string the uploaded file's donation cites.
+///
+/// # Errors
+/// Reports a WebAuthn, proof-of-work, size or server failure.
+pub async fn upload_fixture(file: &FixtureFile) -> Result<String, String> {
+    let credential = webauthn::ensure_credential().await?;
+    let size = u64::try_from(file.bytes.len()).map_err(|_| "file is too large".to_owned())?;
+    let upload = FixtureUpload {
+        file: file.name.clone(),
+        sha256: file.sha256,
+        size,
+    };
+    upload.validate().map_err(|errors| {
+        errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    })?;
+    let signing_bytes = serde_json::to_vec(&upload).map_err(|error| error.to_string())?;
+    let signed = webauthn::sign_request(
+        RequestDomain::FixtureUpload,
+        &signing_bytes,
+        Some(&credential),
+    )
+    .await?;
+    let digest = request_digest(RequestDomain::FixtureUpload, &signing_bytes);
+    let challenge = challenge(&signed.nonce, &digest);
+    let pow = solve_pow(challenge, signed.pow.unwrap_or_else(default_parameters)).await?;
+    let header = serde_json::to_vec(&FixtureUploadHeader {
+        file: &upload.file,
+        sha256: upload.sha256,
+        size: upload.size,
+        pow,
+        signed: &signed.fields,
+    })
+    .map_err(|error| error.to_string())?;
+    let framed = looklab_schema::frame_fixture_upload(&header, &file.bytes)
+        .map_err(|error| error.to_string())?;
+    let request = Request::post("/api/fixtures/donate")
+        .header("Content-Type", "application/octet-stream")
+        .body(Some(JsValue::from(js_sys::Uint8Array::from(
+            framed.as_slice(),
+        ))))
+        .map_err(|error| error.to_string())?;
+    let reply: FixtureUploadReply = api_send("/api/fixtures/donate", request).await?;
+    Ok(reply.source)
 }
 
 /// # Errors

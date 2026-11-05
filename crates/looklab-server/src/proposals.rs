@@ -21,6 +21,7 @@ use sqlx::{Row, SqlitePool};
 use tokio::sync::Mutex;
 
 use crate::admin::{self, AdminError, ModDecision};
+use crate::blob::BlobHash;
 use crate::db::now_unix;
 use crate::ids::{CredentialId, ProposalId, ProposalMessageId};
 use crate::state::AppState;
@@ -171,6 +172,51 @@ fn join_errors(errors: &[looklab_schema::ValidationError]) -> String {
         .join("; ")
 }
 
+async fn verify_fixture_upload(
+    state: &AppState,
+    credential: &CredentialId,
+    donation: &FixtureDonation,
+) -> Result<(), ProposalError> {
+    let Some(source) = &donation.source else {
+        return Ok(());
+    };
+    if source != &looklab_schema::fixture_source(donation.sha256) {
+        return Err(ProposalError::InvalidFixture(
+            "the source does not name this file's digest".to_owned(),
+        ));
+    }
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT file, size FROM fixture_uploads WHERE sha256 = ? AND credential_id = ?",
+    )
+    .bind(donation.sha256.as_bytes().as_slice())
+    .bind(credential.as_str())
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((file, size)) = row else {
+        return Err(ProposalError::InvalidFixture(
+            "the fixture was not uploaded by this credential".to_owned(),
+        ));
+    };
+    if file != donation.file || u64::try_from(size).ok() != Some(donation.size) {
+        return Err(ProposalError::InvalidFixture(
+            "the uploaded fixture does not match the donation".to_owned(),
+        ));
+    }
+    let present = state
+        .blobs
+        .get(BlobHash::from_bytes(*donation.sha256.as_bytes()))
+        .map_err(|_| {
+            ProposalError::InvalidFixture("the uploaded fixture is unreadable".to_owned())
+        })?
+        .is_some_and(|bytes| bytes.len() as u64 == donation.size);
+    if !present {
+        return Err(ProposalError::InvalidFixture(
+            "the uploaded fixture is missing or the wrong size".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 async fn round_trip(payload: String) -> Result<RoundTripReport, ProposalError> {
     let task = tokio::task::spawn_blocking(move || round_trip_report(&payload));
     match tokio::time::timeout(ROUND_TRIP_TIMEOUT, task).await {
@@ -180,7 +226,7 @@ async fn round_trip(payload: String) -> Result<RoundTripReport, ProposalError> {
 }
 
 pub async fn submit(
-    db: &SqlitePool,
+    state: &AppState,
     credential: &CredentialId,
     submission: Submission,
 ) -> Result<Submitted, ProposalError> {
@@ -190,6 +236,7 @@ pub async fn submit(
         donation
             .validate()
             .map_err(|errors| ProposalError::InvalidFixture(join_errors(&errors)))?;
+        verify_fixture_upload(state, credential, donation).await?;
     }
     if let ValidatedPayload::Body(body) = &validated
         && !mapping_status_supported(body, &submission.fixtures)
@@ -232,8 +279,8 @@ pub async fn submit(
     .bind(summary.text())
     .bind(&evidence_json)
     .bind(created_at)
-    .bind(&round_trip_json)
-    .execute(db)
+    .bind(round_trip_json)
+    .execute(&state.db)
     .await?;
     Ok(Submitted {
         view: ProposalView {
@@ -474,7 +521,18 @@ pub async fn moderator_view(
 }
 
 pub async fn fixture_manifest(db: &SqlitePool) -> Result<String, ProposalError> {
-    Ok(fixture_manifest_toml(&approved_donations(db).await?))
+    let donations = approved_donations(db).await?;
+    let published: Vec<FixtureDonation> = donations.iter().map(published_donation).collect();
+    Ok(fixture_manifest_toml(&published))
+}
+
+fn published_donation(donation: &FixtureDonation) -> FixtureDonation {
+    let mut published = donation.clone();
+    if published.source.is_some() {
+        published.committed = true;
+        published.source = None;
+    }
+    published
 }
 
 async fn approved_donations(db: &SqlitePool) -> Result<Vec<FixtureDonation>, ProposalError> {
@@ -650,9 +708,54 @@ async fn prepare_snapshot(
     let mut donations = approved_donations(&state.db).await?;
     donations.extend(extra.iter().cloned());
     dedupe_donations(&mut donations);
+    let mut attachments: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut published = Vec::with_capacity(donations.len());
+    for donation in &donations {
+        published.push(published_donation(donation));
+        let Some(source) = &donation.source else {
+            continue;
+        };
+        donation.validate().map_err(|errors| {
+            ProposalError::Snapshot(format!(
+                "a donated fixture is not publishable: {}",
+                join_errors(&errors)
+            ))
+        })?;
+        if source != &looklab_schema::fixture_source(donation.sha256) {
+            return Err(ProposalError::Snapshot(
+                "a donated fixture source does not name its digest".to_owned(),
+            ));
+        }
+        let bytes = state
+            .blobs
+            .get(BlobHash::from_bytes(*donation.sha256.as_bytes()))
+            .map_err(|_| ProposalError::Snapshot("a donated fixture is unreadable".to_owned()))?
+            .ok_or_else(|| {
+                ProposalError::Snapshot(format!("the fixture {} is missing", donation.file))
+            })?;
+        if bytes.len() as u64 != donation.size {
+            return Err(ProposalError::Snapshot(format!(
+                "the fixture {} does not match its recorded size",
+                donation.file
+            )));
+        }
+        let path = format!("fixtures/{}", donation.file);
+        match attachments.get(&path) {
+            Some(existing) if existing != &bytes => {
+                return Err(ProposalError::Snapshot(format!(
+                    "two donations share the file name {}",
+                    donation.file
+                )));
+            }
+            Some(_) => {}
+            None => {
+                attachments.insert(path, bytes);
+            }
+        }
+    }
     documents.insert(
         FIXTURE_MANIFEST.to_owned(),
-        fixture_manifest_toml(&donations).into_bytes(),
+        fixture_manifest_toml(&published).into_bytes(),
     );
     let version = previous_version + 1;
     let staging = dir.join(format!("v{version}.tmp"));
@@ -672,7 +775,7 @@ async fn prepare_snapshot(
     let manifest_json = serde_json::to_string(&manifest).map_err(|_| ProposalError::Corrupt)?;
     std::fs::create_dir_all(&staging)
         .map_err(|error| ProposalError::Snapshot(error.to_string()))?;
-    for (relative, bytes) in &documents {
+    for (relative, bytes) in documents.iter().chain(attachments.iter()) {
         let file = staging.join(relative);
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)
@@ -693,7 +796,7 @@ async fn prepare_snapshot(
     Ok(PreparedSnapshot {
         version,
         content_hash: manifest.content_hash,
-        files: files.len(),
+        files: files.len() + attachments.len(),
         staging,
         target,
     })

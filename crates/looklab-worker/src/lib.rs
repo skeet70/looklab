@@ -13,7 +13,9 @@ pub mod meta;
 pub mod pool;
 pub mod publish;
 pub mod refit;
-mod weights;
+mod roots;
+mod split;
+pub mod weights;
 mod worker;
 
 pub use config::WorkerConfig;

@@ -62,6 +62,8 @@ pub enum AdminError {
     NoActiveRecord(&'static str),
     #[error("the root admission is unknown")]
     UnknownRootAdmission,
+    #[error("the proposal payload is invalid: {0}")]
+    InvalidProposal(String),
     #[error("the version is unknown")]
     UnknownVersion,
     #[error("the manifest has no artifacts")]
@@ -1148,6 +1150,98 @@ pub async fn revoke_root(
     }
     .await;
     finish(&mut conn, result).await
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerProposal {
+    pub kind: looklab_schema::ProposalKind,
+    pub payload: String,
+    pub evidence: Value,
+}
+
+/// Opens a moderation proposal from the worker. An identical pending worker
+/// proposal is returned as `None` instead of being duplicated.
+pub async fn submit_worker_proposal(
+    db: &SqlitePool,
+    proposal: WorkerProposal,
+) -> Result<Option<ProposalId>, AdminError> {
+    let validated = looklab_schema::validate_proposal(proposal.kind, &proposal.payload)
+        .map_err(|errors| AdminError::InvalidProposal(format!("{errors:?}")))?;
+    let summary = validated.summary().text();
+    let evidence = serde_json::to_string(&proposal.evidence).map_err(|_| AdminError::Corrupt)?;
+    let mut conn = begin_write(db).await?;
+    let result = async {
+        let existing: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM proposals
+             WHERE origin = 'worker' AND type = ? AND payload = ? AND status = 'pending'",
+        )
+        .bind(proposal.kind.as_str())
+        .bind(&proposal.payload)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some((id,)) = existing {
+            return ProposalId::try_from(id)
+                .map_err(|_| AdminError::Corrupt)
+                .map(Some);
+        }
+        let id = ProposalId::new();
+        let now = now_unix();
+        sqlx::query(
+            "INSERT INTO proposals
+             (id, credential_id, origin, type, payload, human_summary, evidence, status, created_at)
+             VALUES (?, NULL, 'worker', ?, ?, ?, ?, 'pending', ?)",
+        )
+        .bind(id.as_str())
+        .bind(proposal.kind.as_str())
+        .bind(&proposal.payload)
+        .bind(&summary)
+        .bind(&evidence)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+        let payload = json!({
+            "event": "proposal_opened",
+            "actor": "worker",
+            "proposal": id,
+            "kind": proposal.kind.as_str(),
+            "summary": summary,
+        });
+        audit::insert(&mut conn, AuditKind::ProposalOpened, &payload).await?;
+        Ok(Some(id))
+    }
+    .await;
+    finish(&mut conn, result).await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveRootAdmission {
+    pub id: RootAdmissionId,
+    pub contribution: ContributionId,
+    pub scope: Scope,
+    pub admitted_at: i64,
+}
+
+/// Oldest first.
+pub async fn active_root_admissions(
+    db: &SqlitePool,
+) -> Result<Vec<ActiveRootAdmission>, AdminError> {
+    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT id, contribution_id, scope, admitted_at FROM root_admissions
+         WHERE revoked_at IS NULL ORDER BY admitted_at, id",
+    )
+    .fetch_all(db)
+    .await?;
+    rows.into_iter()
+        .map(|(id, contribution, scope, admitted_at)| {
+            Ok(ActiveRootAdmission {
+                id: RootAdmissionId::try_from(id).map_err(|_| AdminError::Corrupt)?,
+                contribution: ContributionId::try_from(contribution)
+                    .map_err(|_| AdminError::Corrupt)?,
+                scope: parse_scope(Some(&scope))?.ok_or(AdminError::Corrupt)?,
+                admitted_at,
+            })
+        })
+        .collect()
 }
 
 async fn next_version(

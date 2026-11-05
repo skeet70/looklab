@@ -23,6 +23,10 @@ const MAX_ATTRIBUTION_CHARS: usize = 500;
 const MAX_JUSTIFICATION_CHARS: usize = 2000;
 const MAX_TAGS_PER_CONFIRMATION: usize = 32;
 
+pub const MAX_FIXTURE_BYTES: u64 = 64 * 1024 * 1024;
+pub const FIXTURE_UPLOAD_MAGIC: &[u8] = b"looklab-fixture-1";
+pub const FIXTURE_UPLOAD_HEADER_MAX: usize = 16 * 1024;
+
 /// Makernote tags a confirmation may carry.
 pub const CONFIRMATION_TAGS: [&str; 13] = [
     "FilmMode",
@@ -515,6 +519,8 @@ pub struct FixtureDonation {
     #[serde(default)]
     pub source_url: Option<String>,
     #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
     pub donator: Option<String>,
     pub donated_on: Date,
     pub license: FixtureLicense,
@@ -525,7 +531,8 @@ pub struct FixtureDonation {
 impl FixtureDonation {
     /// # Errors
     /// A file name that could escape the fixtures directory, empty or over-long
-    /// descriptions, a zero or implausibly large size, or a non-HTTPS source URL.
+    /// descriptions, a size over the per-file upload cap, an unbound `source`,
+    /// or a non-HTTPS source URL.
     pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
         if !valid_file_name(&self.file) {
@@ -534,18 +541,36 @@ impl FixtureDonation {
         check_text(&self.description, "description", 200, &mut errors);
         check_text(&self.make, "make", MAX_NAME_CHARS, &mut errors);
         check_text(&self.model, "model", MAX_NAME_CHARS, &mut errors);
-        if self.size == 0 || self.size > 1 << 30 {
-            errors.extend(invalid("size", "a size between 1 byte and 1 GiB"));
+        if self.size == 0 || self.size > MAX_FIXTURE_BYTES {
+            errors.extend(invalid("size", "a size between 1 byte and 64 MiB"));
+        }
+        match (&self.source_url, &self.source) {
+            (Some(_), Some(_)) => {
+                errors.extend(invalid("source", "either source_url or source, not both"))
+            }
+            (None, None) if !self.committed => errors.extend(invalid(
+                "source",
+                "an uploaded source or an https URL for a fixture that is not committed",
+            )),
+            _ => {}
+        }
+        if self.committed && self.source.is_some() {
+            errors.extend(invalid(
+                "source",
+                "a blob source only before the donation is published",
+            ));
+        }
+        if let Some(source) = &self.source
+            && source != &fixture_source(self.sha256)
+        {
+            errors.extend(invalid(
+                "source",
+                "`sha256:` followed by this file's digest",
+            ));
         }
         match &self.source_url {
             Some(url) if !url.starts_with("https://") => {
                 errors.extend(invalid("source_url", "an https URL"));
-            }
-            None if !self.committed => {
-                errors.extend(invalid(
-                    "source_url",
-                    "an https URL for a fixture that is not committed",
-                ));
             }
             _ => {}
         }
@@ -576,6 +601,11 @@ impl FixtureDonation {
     }
 }
 
+/// The `source` string a donation carries before its file is published.
+pub fn fixture_source(sha256: Sha256Hex) -> String {
+    format!("sha256:{}", sha256.to_hex())
+}
+
 fn valid_file_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
@@ -584,6 +614,90 @@ fn valid_file_name(name: &str) -> bool {
         && !name.contains("..")
         && name.bytes().all(|byte| byte.is_ascii_graphic())
         && name.contains('.')
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureUpload {
+    pub file: String,
+    pub sha256: Sha256Hex,
+    pub size: u64,
+}
+
+impl FixtureUpload {
+    /// # Errors
+    /// Rejects a plain file name, or a size outside the 64 MiB cap.
+    pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
+        let mut errors = Vec::new();
+        if !valid_file_name(&self.file) {
+            errors.extend(invalid("file", "a plain file name"));
+        }
+        if self.size == 0 || self.size > MAX_FIXTURE_BYTES {
+            errors.extend(invalid("size", "a size between 1 byte and 64 MiB"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FixtureFrameError {
+    #[error("the fixture upload frame is malformed")]
+    Malformed,
+    #[error("the fixture upload header is {0} bytes, over the limit")]
+    HeaderTooLarge(usize),
+}
+
+/// `magic ‖ u32 header length ‖ header json ‖ file bytes`.
+///
+/// # Errors
+/// An empty or over-long header.
+pub fn frame_fixture_upload(header: &[u8], bytes: &[u8]) -> Result<Vec<u8>, FixtureFrameError> {
+    if header.is_empty() {
+        return Err(FixtureFrameError::Malformed);
+    }
+    if header.len() > FIXTURE_UPLOAD_HEADER_MAX {
+        return Err(FixtureFrameError::HeaderTooLarge(header.len()));
+    }
+    let length =
+        u32::try_from(header.len()).map_err(|_| FixtureFrameError::HeaderTooLarge(header.len()))?;
+    let mut out = Vec::with_capacity(FIXTURE_UPLOAD_MAGIC.len() + 4 + header.len() + bytes.len());
+    out.extend_from_slice(FIXTURE_UPLOAD_MAGIC);
+    out.extend_from_slice(&length.to_le_bytes());
+    out.extend_from_slice(header);
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
+/// # Errors
+/// A missing magic, an empty or over-long header, or a truncated frame.
+pub fn split_fixture_upload(body: &[u8]) -> Result<(&[u8], &[u8]), FixtureFrameError> {
+    let magic = FIXTURE_UPLOAD_MAGIC.len();
+    if body.len() < magic + 4 || &body[..magic] != FIXTURE_UPLOAD_MAGIC {
+        return Err(FixtureFrameError::Malformed);
+    }
+    let length = u32::from_le_bytes(
+        body[magic..magic + 4]
+            .try_into()
+            .map_err(|_| FixtureFrameError::Malformed)?,
+    ) as usize;
+    if length == 0 {
+        return Err(FixtureFrameError::Malformed);
+    }
+    if length > FIXTURE_UPLOAD_HEADER_MAX {
+        return Err(FixtureFrameError::HeaderTooLarge(length));
+    }
+    let start = magic + 4;
+    let end = start
+        .checked_add(length)
+        .ok_or(FixtureFrameError::Malformed)?;
+    if body.len() < end {
+        return Err(FixtureFrameError::Malformed);
+    }
+    Ok((&body[start..end], &body[end..]))
 }
 
 /// A lowercase SHA-256 digest.
@@ -763,6 +877,9 @@ pub fn fixture_manifest_toml(donations: &[FixtureDonation]) -> String {
         out.push_str(&format!("size = {}\n", donation.size));
         if let Some(url) = &donation.source_url {
             out.push_str(&format!("source_url = {}\n", toml_string(url)));
+        }
+        if let Some(source) = &donation.source {
+            out.push_str(&format!("source = {}\n", toml_string(source)));
         }
         out.push_str(&format!(
             "license = {}\n",

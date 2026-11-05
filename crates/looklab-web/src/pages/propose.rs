@@ -67,6 +67,13 @@ justification: new root session
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PendingDonations {
+    files: Vec<FixtureFile>,
+    make: String,
+    model: String,
+}
+
 fn body_identity(kind: ProposalKind, payload: &str) -> Option<(String, String)> {
     match validate_proposal(kind, payload).ok()? {
         looklab_schema::ValidatedPayload::Body(body) => Some((body.make, body.model)),
@@ -86,6 +93,7 @@ pub fn ProposePage() -> impl IntoView {
     let busy = RwSignal::new(false);
     let message = RwSignal::new(None::<String>);
     let submitted = RwSignal::new(None::<ProposalView>);
+    let pending = RwSignal::new(None::<PendingDonations>);
 
     let preview = move || match validate_proposal(kind.get(), &payload.get()) {
         Ok(validated) => {
@@ -212,38 +220,78 @@ pub fn ProposePage() -> impl IntoView {
             )));
             return;
         }
-        let selected = fixture_files.get();
-        let flags = consented.get();
+        let chosen: Vec<FixtureFile> = fixture_files
+            .get()
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| consented.get().get(*index).copied().unwrap_or(false))
+            .map(|(_, file)| file)
+            .collect();
         let identity = body_identity(current_kind, &current_payload);
         let fallback_make = fixture_make.get();
         let fallback_model = fixture_model.get();
-        busy.set(true);
         message.set(None);
         submitted.set(None);
-        spawn_local(async move {
-            let (make, model) = identity.unwrap_or((fallback_make, fallback_model));
-            let mut donations = Vec::new();
-            for (index, file) in selected.iter().enumerate() {
-                if !flags.get(index).copied().unwrap_or(false) {
-                    continue;
+        if chosen.is_empty() {
+            busy.set(true);
+            spawn_local(async move {
+                match data::submit_proposal(current_kind, &current_payload, &[]).await {
+                    Ok(reply) => submitted.set(Some(reply.view)),
+                    Err(error) => message.set(Some(error)),
                 }
-                match proposal_form::donation(file, &make, &model) {
-                    Ok(donation) => donations.push(donation),
+                busy.set(false);
+            });
+            return;
+        }
+        let (make, model) = identity.unwrap_or((fallback_make, fallback_model));
+        pending.set(Some(PendingDonations {
+            files: chosen,
+            make,
+            model,
+        }));
+    };
+
+    let confirm_donations = move |_| {
+        let Some(selected) = pending.get() else {
+            return;
+        };
+        let current_kind = kind.get();
+        let current_payload = payload.get();
+        busy.set(true);
+        message.set(None);
+        spawn_local(async move {
+            let mut donations = Vec::with_capacity(selected.files.len());
+            for file in &selected.files {
+                let source = match data::upload_fixture(file).await {
+                    Ok(source) => source,
                     Err(error) => {
                         message.set(Some(error));
                         busy.set(false);
                         return;
                     }
+                };
+                match proposal_form::donation(file, &selected.make, &selected.model, source) {
+                    Ok(donation) => donations.push(donation),
+                    Err(error) => {
+                        message.set(Some(error));
+                        busy.set(false);
+                        pending.set(None);
+                        return;
+                    }
                 }
             }
-            let outcome = data::submit_proposal(current_kind, &current_payload, &donations).await;
-            match outcome {
-                Ok(reply) => submitted.set(Some(reply.view)),
+            match data::submit_proposal(current_kind, &current_payload, &donations).await {
+                Ok(reply) => {
+                    submitted.set(Some(reply.view));
+                    pending.set(None);
+                }
                 Err(error) => message.set(Some(error)),
             }
             busy.set(false);
         });
     };
+
+    let cancel_donations = move |_| pending.set(None);
 
     view! {
         <h1>"Propose a change"</h1>
@@ -375,6 +423,65 @@ pub fn ProposePage() -> impl IntoView {
             <button type="button" id="submit-proposal" disabled=move || busy.get() on:click=submit>
                 {move || if busy.get() { "Signing and working…" } else { "Sign and submit" }}
             </button>
+            {move || {
+                pending
+                    .get()
+                    .map(|selected| {
+                        let rows = selected
+                            .files
+                            .iter()
+                            .map(|file| {
+                                view! {
+                                    <tr>
+                                        <th scope="row">{file.name.clone()}</th>
+                                        <td>{file.bytes.len().to_string()}</td>
+                                        <td>{file.sha256.to_hex()}</td>
+                                    </tr>
+                                }
+                            })
+                            .collect_view();
+                        let count = selected.files.len();
+                        view! {
+                            <div class="valid" id="donation-confirm">
+                                <h3>"Files that leave this device"</h3>
+                                <p>
+                                    {format!(
+                                        "These {count} file(s) are uploaded now, stored privately, and published as CC0-1.0 fixtures only if a moderator approves this proposal.",
+                                    )}
+                                </p>
+                                <table class="data-table">
+                                    <caption>"Donated files"</caption>
+                                    <thead>
+                                        <tr>
+                                            <th scope="col">"File"</th>
+                                            <th scope="col">"Bytes"</th>
+                                            <th scope="col">"sha256"</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>{rows}</tbody>
+                                </table>
+                                <div class="field-row">
+                                    <button
+                                        type="button"
+                                        id="confirm-donation"
+                                        disabled=move || busy.get()
+                                        on:click=confirm_donations
+                                    >
+                                        "Upload files and submit"
+                                    </button>
+                                    <button
+                                        type="button"
+                                        id="cancel-donation"
+                                        disabled=move || busy.get()
+                                        on:click=cancel_donations
+                                    >
+                                        "Cancel"
+                                    </button>
+                                </div>
+                            </div>
+                        }
+                    })
+            }}
             {move || {
                 message
                     .get()

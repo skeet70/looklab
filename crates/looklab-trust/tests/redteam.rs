@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use looklab_fit::{ComponentGauge, ExposureModeId, WbGaugeChange, WbModeClass, merge_gauges};
 use looklab_model::{LookInput, ProbeId, probes};
 use looklab_trust::harness::{
     Batch, CaptureSpec, HarnessParams, ModerationCause, ProbeShift, Sim, hue_band_look,
@@ -108,9 +109,11 @@ fn assert_within_bounds(sim: &Sim, shifts: &[ProbeShift], floor: f64, ceiling: f
     for shift in shifts {
         assert!(
             shift.delta <= ceiling + 1e-9,
-            "{label}: probe {:?} moved {:.3} past the ceiling {ceiling}",
+            "{label}: probe {:?} moved {:.3} past the ceiling {ceiling} (σ {:.3} -> {:.3})",
             shift.probe,
-            shift.delta
+            shift.delta,
+            shift.sigma_reference,
+            shift.sigma_new
         );
         if shift.delta > shift.bound(params, floor, ceiling) {
             over_bound += 1;
@@ -218,7 +221,7 @@ fn honest_releases_penalize_no_honest_image() {
 }
 
 #[test]
-#[ignore = "blocked: the fit's sandwich σ crosses the 1.5 support threshold when a contributor is added, so §8 rejects the honest release"]
+#[ignore = "blocked: honest releases move probes past the anchor drift ceiling with the current fit"]
 fn many_new_tier_credentials_shifting_one_hue_band() {
     let mut sim = rooted(12, 2);
     let anchor = sim.release().expect("anchor release");
@@ -245,19 +248,24 @@ fn many_new_tier_credentials_shifting_one_hue_band() {
     let published = sim.published().expect("a published version").id;
     let against_previous = sim.shifts(published, previous.version);
     let against_anchor = sim.shifts(published, anchor.version);
+    let state = if attack_release.published {
+        "attack published"
+    } else {
+        "attack held"
+    };
     assert_within_bounds(
         &sim,
         &against_previous,
         sim.params().trust.gate_previous_floor,
         sim.params().trust.gate_previous_ceiling,
-        "attack vs previous",
+        &format!("attack vs previous, {state}"),
     );
     assert_within_bounds(
         &sim,
         &against_anchor,
         sim.params().trust.gate_anchor_floor,
         sim.params().trust.gate_anchor_ceiling,
-        "attack vs anchor",
+        &format!("attack vs anchor, {state}"),
     );
     assert_small_where_measured(&against_anchor);
     assert_new_tier_capped(&sim, &attack_release.weights);
@@ -268,13 +276,14 @@ fn many_new_tier_credentials_shifting_one_hue_band() {
 }
 
 #[test]
-#[ignore = "blocked: the fit's sandwich σ crosses the 1.5 support threshold when a contributor is added, so §8 rejects the honest release"]
+#[ignore = "blocked: honest releases are held by the gate, 6 of 10 published with the current fit"]
 fn slow_drift_across_ten_releases_stays_inside_the_anchor_bound() {
     let mut sim = rooted(13, 2);
     let anchor = sim.release().expect("anchor release");
     let truth = sim.truth().clone();
     let drift = hue_band_look(&truth, 3, &[1, 2, 3], 2.0);
     let mut published = 0;
+    let mut first_failure: Option<(usize, Vec<Violation>)> = None;
     for release in 0..10 {
         let attack = Batch {
             images: 1,
@@ -292,11 +301,17 @@ fn slow_drift_across_ten_releases_stays_inside_the_anchor_bound() {
         };
         sim.add(credential(2100 + release), honest)
             .expect("honest image");
-        if sim.release().expect("release").published {
+        let outcome = sim.release().expect("release");
+        if outcome.published {
             published += 1;
+        } else if first_failure.is_none() {
+            first_failure = Some((release as usize, outcome.gate.violations));
         }
     }
-    assert!(published >= 8, "only {published} of 10 releases published");
+    assert!(
+        published >= 8,
+        "only {published} of 10 releases published; first failure: {first_failure:?}"
+    );
     let final_id = sim.published().expect("a published version").id;
     let shifts = sim.shifts(final_id, anchor.version);
     assert_within_bounds(
@@ -315,13 +330,13 @@ fn slow_drift_across_ten_releases_stays_inside_the_anchor_bound() {
 }
 
 #[test]
-#[ignore = "blocked: the fit's sandwich σ crosses the 1.5 support threshold when a contributor is added, so §8 rejects the honest release"]
+#[ignore = "blocked: fitted σ jumps past the support margin when honest data joins a thin pool"]
 fn honest_data_after_a_thin_rooted_version_needs_no_re_anchor() {
     let mut sim = rooted(14, 1);
     let anchor = sim.release().expect("anchor release");
     assert!(anchor.published, "{:?}", anchor.gate.violations);
     let mut published = 0;
-    let mut first_failure: Option<Vec<Violation>> = None;
+    let mut first_failure: Option<(usize, Vec<Violation>)> = None;
     for release in 0..10 {
         add_honest(
             &mut sim,
@@ -333,7 +348,7 @@ fn honest_data_after_a_thin_rooted_version_needs_no_re_anchor() {
         if outcome.published {
             published += 1;
         } else if first_failure.is_none() {
-            first_failure = Some(outcome.gate.violations);
+            first_failure = Some((release, outcome.gate.violations));
         }
     }
     let rate = f64::from(published) / 10.0;
@@ -350,7 +365,7 @@ fn honest_data_after_a_thin_rooted_version_needs_no_re_anchor() {
 }
 
 #[test]
-#[ignore = "blocked: the fit's sandwich σ crosses the 1.5 support threshold when a contributor is added, so §8 rejects the honest release"]
+#[ignore = "blocked: honest releases move probes past the anchor drift ceiling with the current fit"]
 fn concentrated_high_chroma_shift_is_blocked_at_the_ceiling() {
     let mut sim = rooted(15, 2);
     let anchor = sim.release().expect("anchor release");
@@ -391,7 +406,7 @@ fn concentrated_high_chroma_shift_is_blocked_at_the_ceiling() {
             &shifts,
             sim.params().trust.gate_anchor_floor,
             sim.params().trust.gate_anchor_ceiling,
-            "concentrated shift",
+            &format!("concentrated shift at release {release}"),
         );
     }
     assert!(
@@ -415,8 +430,18 @@ fn concentrated_high_chroma_shift_is_blocked_at_the_ceiling() {
     );
 }
 
+/// Shifts the mid-tone, mid-chroma coefficients of one hue by `delta` `J'`.
+fn mid_band_look(truth: &looklab_model::Look, hue: usize, delta: f64) -> looklab_model::Look {
+    let mut look = truth.clone();
+    for s in 4..8 {
+        let index =
+            (hue % looklab_model::basis::HUE_COEFS * looklab_model::basis::S_COEFS + s) * 3 + 1;
+        look.color.lambda.volume[index] += delta;
+    }
+    look
+}
+
 #[test]
-#[ignore = "blocked: the fit's sandwich σ crosses the 1.5 support threshold when a contributor is added, so §8 rejects the honest release"]
 fn conflicting_uploads_that_make_a_region_unsupported_fail_the_gate() {
     let mut sim = rooted(16, 2);
     let anchor = sim.release().expect("anchor release");
@@ -425,17 +450,18 @@ fn conflicting_uploads_that_make_a_region_unsupported_fail_the_gate() {
     let base = sim.release().expect("base release");
     assert!(base.published, "{:?}", base.gate.violations);
 
-    // Two groups pulling opposite ways in one hue band, with large per-sample noise.
+    // Two groups of new-tier contributors pull one mid-tone, mid-chroma region opposite
+    // ways, so between-image disagreement raises σ while the mean cancels.
     let truth = sim.truth().clone();
-    let up = hue_band_look(&truth, 9, &[1, 2, 3], 6.0);
-    let down = hue_band_look(&truth, 9, &[1, 2, 3], -6.0);
-    for index in 0..6 {
+    let up = mid_band_look(&truth, 9, 25.0);
+    let down = mid_band_look(&truth, 9, -25.0);
+    for index in 0..16 {
         let look = if index % 2 == 0 { &up } else { &down };
         let batch = Batch {
-            images: 2,
-            seed: 13_000 + index as u64,
+            images: 1,
+            seed: 13_000 + (index % 8) as u64,
             samples: 300,
-            noise_ucs: 4.0,
+            noise_ucs: 12.0,
             ..Batch::new(look, ContributionKind::Rerender)
         };
         sim.add(credential(5000 + index), batch)
@@ -444,7 +470,7 @@ fn conflicting_uploads_that_make_a_region_unsupported_fail_the_gate() {
     let outcome = sim.release().expect("release");
     assert!(
         !outcome.gate.supported_regressions.is_empty(),
-        "no supported probe became unsupported; σ never inflated"
+        "no supported probe lost support to σ; σ never inflated"
     );
     assert!(
         !outcome.published,
@@ -459,8 +485,49 @@ fn conflicting_uploads_that_make_a_region_unsupported_fail_the_gate() {
     );
 }
 
+/// Three new-tier credentials upload the truth Look with honest noise for three releases.
+fn farm_agreeing(sim: &mut Sim, first: u32) -> Vec<CredentialId> {
+    let truth = sim.truth().clone();
+    let farmers: Vec<CredentialId> = (0..3).map(|index| credential(first + index)).collect();
+    for round in 0..3 {
+        for (index, farmer) in farmers.iter().enumerate() {
+            let batch = Batch {
+                images: 1,
+                seed: 15_000 + round * 3 + index as u64,
+                samples: 300,
+                noise_ucs: HONEST_NOISE,
+                ..Batch::new(&truth, ContributionKind::Rerender)
+            };
+            sim.add(*farmer, batch).expect("agreeing image");
+        }
+        sim.release().expect("farming release");
+    }
+    farmers
+}
+
 #[test]
-#[ignore = "blocked: the fit's sandwich σ crosses the 1.5 support threshold when a contributor is added, so §8 rejects the honest release"]
+fn agreeing_data_raises_reputation_within_the_new_tier() {
+    let mut sim = rooted(17, 2);
+    let anchor = sim.release().expect("anchor release");
+    assert!(anchor.published, "{:?}", anchor.gate.violations);
+    add_honest(&mut sim, 700, 0, 4);
+    let base = sim.release().expect("base release");
+    assert!(base.published, "{:?}", base.gate.violations);
+
+    let farmers = farm_agreeing(&mut sim, 6000);
+    let start = TrustParams::default().reputation_new_start;
+    let farmed = sim.reputation(farmers[0]).expect("reputation");
+    assert!(
+        farmed.value() > start,
+        "agreeing data did not raise reputation: {} -> {}",
+        start,
+        farmed.value()
+    );
+    assert_eq!(sim.standing(farmers[0]), Some(Standing::New));
+}
+
+#[test]
+#[ignore = "blocked: honest drift in a rooted region exceeds 1.0 against the anchor"]
 fn reputation_farming_cannot_carry_a_shift_past_the_new_tier_cap() {
     let mut sim = rooted(17, 2);
     let anchor = sim.release().expect("anchor release");
@@ -468,20 +535,7 @@ fn reputation_farming_cannot_carry_a_shift_past_the_new_tier_cap() {
     let base = sim.release().expect("base release");
     assert!(base.published, "{:?}", base.gate.violations);
 
-    let truth = sim.truth().clone();
-    let farmers: Vec<CredentialId> = (0..3).map(|index| credential(6000 + index)).collect();
-    for round in 0..3 {
-        for (index, farmer) in farmers.iter().enumerate() {
-            let batch = Batch {
-                images: 1,
-                seed: 15_000 + round * 3 + index as u64,
-                samples: 300,
-                ..Batch::new(&truth, ContributionKind::Rerender)
-            };
-            sim.add(*farmer, batch).expect("agreeing image");
-        }
-        sim.release().expect("farming release");
-    }
+    let farmers = farm_agreeing(&mut sim, 6000);
     let start = TrustParams::default().reputation_new_start;
     let farmed = sim.reputation(farmers[0]).expect("reputation");
     assert!(
@@ -492,6 +546,7 @@ fn reputation_farming_cannot_carry_a_shift_past_the_new_tier_cap() {
     );
     assert_eq!(sim.standing(farmers[0]), Some(Standing::New));
 
+    let truth = sim.truth().clone();
     let shift = hue_band_look(&truth, 5, &[1, 2, 3], 6.0);
     for (index, farmer) in farmers.iter().enumerate() {
         for image in 0..3 {
@@ -527,9 +582,11 @@ fn reputation_farming_cannot_carry_a_shift_past_the_new_tier_cap() {
         measured += 1;
         assert!(
             probe.delta < 1.0,
-            "rooted region {region:?} moved {:.3} at {:?}",
+            "rooted region {region:?} moved {:.3} at {:?} (σ {:.3} -> {:.3})",
             probe.delta,
-            probe.probe
+            probe.probe,
+            probe.sigma_reference,
+            probe.sigma_new
         );
     }
     assert!(measured > 0, "no rooted region was gated");
@@ -537,7 +594,6 @@ fn reputation_farming_cannot_carry_a_shift_past_the_new_tier_cap() {
 }
 
 #[test]
-#[ignore = "blocked: the fit's sandwich σ crosses the 1.5 support threshold when a contributor is added, so §8 rejects the honest release"]
 fn fake_chart_claims_stay_inside_the_body_cap_and_move_no_gauge() {
     let mut sim = rooted(18, 2);
     let anchor = sim.release().expect("anchor release");
@@ -671,7 +727,6 @@ fn reusing_a_victims_serial_flags_reuse_and_spares_the_victim() {
 }
 
 #[test]
-#[ignore = "blocked: the fit's sandwich σ crosses the 1.5 support threshold when a contributor is added, so §8 rejects the honest release"]
 fn mislabeled_images_are_quarantined() {
     let mut sim = rooted(20, 2);
     let anchor = sim.release().expect("anchor release");
@@ -706,7 +761,6 @@ fn mislabeled_images_are_quarantined() {
 }
 
 #[test]
-#[ignore = "blocked: the fit's sandwich σ crosses the 1.5 support threshold when a contributor is added, so §8 rejects the honest release"]
 fn reverting_and_excluding_restores_the_pre_attack_version() {
     let mut sim = rooted(21, 2);
     let anchor = sim.release().expect("anchor release");
@@ -784,25 +838,42 @@ fn probes_at(look: &looklab_model::Look, delta_xi: f64) -> VersionProbes {
         probes: probes
             .probes
             .iter()
-            .map(|probe| ProbeEstimate {
-                id: probe.id.clone(),
-                jab: convert(probe.xyz.to_array()),
-                sigma: 0.2,
-                supported: true,
+            .map(|probe| {
+                ProbeEstimate::new(
+                    probe.id.clone(),
+                    convert(probe.xyz.to_array()),
+                    0.2,
+                    true,
+                    1.5,
+                )
             })
             .collect(),
     }
 }
 
-/// A body joining a component moves neither gauge (docs/02 §2.1): the candidate and the
-/// anchor are the same Look in the same gauge, so the gate passes with no drift.
+/// A body joining a component moves neither gauge (docs/02 §2.1): the designated body
+/// and its reference stay, so the candidate and the anchor are the same Look in the same
+/// gauge and no probe moves.
 ///
-/// Producing that candidate needs the multi-body fit that assigns the body to a
-/// component (P4.2); until then this asserts only the probe side.
+/// The candidate Look itself comes from the multi-body fit (`fit_hierarchical`); this
+/// asserts the gauge and gate half of the row.
 #[test]
 fn body_joining_a_component_keeps_the_gauge() {
+    let designated = body_of("fujifilm/x-t5");
+    let gauge = ComponentGauge {
+        designated: designated.clone(),
+        exposure_mode: ExposureModeId(0),
+        wb_mode: WbModeClass(0),
+        anchored_delta: true,
+    };
+    let before = merge_gauges(1.25, 1.25, &gauge, &gauge);
+    assert_eq!(before.wb, WbGaugeChange::Unchanged);
+    assert!(before.is_pure_exposure());
+    assert!(before.exposure.delta_xi.abs() < 1e-12);
+    assert!((before.exposure.s_ceiling() - 6.0).abs() < 1e-12);
+
     let truth = looklab_fit::synth::truth_look(4);
-    let version = probes_at(&truth, 0.0);
+    let version = probes_at(&truth, before.exposure.delta_xi);
     let report = gate_release(
         &TrustParams::default(),
         &GateInput {
@@ -815,38 +886,110 @@ fn body_joining_a_component_keeps_the_gauge() {
     assert!(report.passed, "{:?}", report.violations);
     assert!(report.drift_anchor.over_bound.is_empty());
     assert!(report.drift_previous.over_bound.is_empty());
+    assert!(report.drift_anchor.p95_ratio < 1e-9);
 }
 
-/// Two components merging needs an exact exposure conversion of the old version before
-/// gating.
+/// Two components merging converts the exposure gauge exactly, and a WB reference change
+/// takes the refit-and-re-anchor path (docs/02 §2.1).
 ///
-/// A WB reference change is not convertible this way: it needs a refit and a re-anchor.
+/// The candidate Look itself comes from the multi-body fit; this asserts the gauge and
+/// gate half of the row.
 #[test]
-#[ignore = "needs the P4.2 multi-body component fit to produce the merged candidate"]
 fn merging_components_converts_the_exposure_gauge() {
-    let truth = looklab_fit::synth::truth_look(4);
-    let delta_xi = -0.6;
-    let reference = probes_at(&truth, delta_xi);
-    let candidate = probes_at(&truth, 0.0);
+    let left = ComponentGauge {
+        designated: body_of("fujifilm/x-t5"),
+        exposure_mode: ExposureModeId(0),
+        wb_mode: WbModeClass(0),
+        anchored_delta: true,
+    };
+    let right = ComponentGauge {
+        designated: body_of("nikon/z6"),
+        exposure_mode: ExposureModeId(1),
+        wb_mode: WbModeClass(0),
+        anchored_delta: false,
+    };
+    // The designated body and WB class stay, so only the reference exposure moves.
+    let change = merge_gauges(-0.4, 0.35, &left, &left);
+    assert_eq!(change.wb, WbGaugeChange::Unchanged);
+    assert!(change.is_pure_exposure());
+    assert!((change.exposure.delta_xi - 0.75).abs() < 1e-12);
 
+    let truth = looklab_fit::synth::truth_look(4);
+    for probe in probes::v1().probes.iter().take(200) {
+        let evaluated = change.exposure.evaluate(&truth, probe.xyz);
+        let rescaled = truth.eval(change.exposure.apply(probe.xyz));
+        assert!((evaluated.j - rescaled.j).abs() < 1e-9);
+        assert!((evaluated.a - rescaled.a).abs() < 1e-9);
+        assert!((evaluated.b - rescaled.b).abs() < 1e-9);
+    }
+
+    let reference = probes_at(&truth, 0.0);
+    let converted = probes_at(&truth, change.exposure.delta_xi);
     let report = gate_release(
         &TrustParams::default(),
         &GateInput {
-            candidate: candidate.clone(),
-            previous: candidate,
-            anchor: reference,
+            candidate: converted.clone(),
+            previous: converted.clone(),
+            anchor: VersionProbes {
+                probes: reference
+                    .probes
+                    .iter()
+                    .map(|probe| {
+                        ProbeEstimate::from_fit(
+                            probe.id.clone(),
+                            change
+                                .exposure
+                                .evaluate(
+                                    &truth,
+                                    looklab_color::Xyz::from_array(probe_xyz(&probe.id)),
+                                )
+                                .to_array(),
+                            probe.sigma,
+                            probe.density_ok,
+                            probe.supported,
+                            1.5,
+                        )
+                    })
+                    .collect(),
+            },
             root_observations: Vec::new(),
         },
     );
     assert!(report.passed, "{:?}", report.violations);
-    assert!(report.drift_anchor.gated > 1000);
     assert!(report.drift_anchor.p95_ratio < 1e-9);
 
     let excluded = probes::v1()
         .probes
         .iter()
-        .filter(|probe| exposure_gauge_excluded(LookInput::new(probe.xyz).s, 0.0))
-        .map(|probe| probe.id.clone())
-        .collect::<Vec<ProbeId>>();
-    assert!(excluded.is_empty());
+        .filter(|probe| {
+            exposure_gauge_excluded(LookInput::new(probe.xyz).s, change.exposure.delta_xi)
+        })
+        .count();
+    assert_eq!(excluded, 0, "a 0.75-stop conversion leaves the s-clamp");
+
+    let wb_change = merge_gauges(
+        -0.4,
+        0.35,
+        &left,
+        &ComponentGauge {
+            wb_mode: WbModeClass(1),
+            ..right
+        },
+    );
+    assert_eq!(wb_change.wb, WbGaugeChange::RefitAndReanchor);
+    assert!(!wb_change.is_pure_exposure());
+}
+
+fn body_of(id: &str) -> looklab_body::BodyId {
+    looklab_body::BodyId::new(id).expect("body id")
+}
+
+fn probe_xyz(id: &ProbeId) -> [f64; 3] {
+    probes::v1()
+        .probes
+        .iter()
+        .find(|probe| &probe.id == id)
+        .expect("probe id is in v1")
+        .xyz
+        .to_array()
 }

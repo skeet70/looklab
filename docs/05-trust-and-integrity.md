@@ -117,7 +117,7 @@ A candidate LookVersion is published only if:
    - **no** probe exceeds the ceiling C (absolute; no allowance);
    - ≤ 2% of gated probes exceed their b_p (these may only land between b_p and C);
    - the p95 of |Δ_p|/b_p ≤ 1.0;
-   - **no** probe that was supported becomes unsupported. Raising a region's σ, for example with conflicting uploads, would otherwise take it out of the gate while it still feeds bakes and previews. Such probes count as violations and go to moderation.
+   - **no** probe that was supported leaves support because its σ rose: a probe becomes unsupported with `σ_cand > 1.5` (the support threshold) and `σ_cand > (1 + 0.1)·σ_ref`, where σ_ref is σ in the version the probe was supported in. Conflicting uploads raise σ well past that margin; honest boundary jitter around 1.5 does not. Raising a region's σ would otherwise take it out of the gate while it still feeds bakes and previews. Such probes count as violations and go to moderation. A support loss that is not a violation, whether the density floor rose, the probe entered the clip shoulder, or σ rose within the margin, is a **coverage change**: it is reported in the gate report and stays in the gated union.
 
    The floor keeps well-measured regions tight. The ceiling keeps the gate meaningful in uncertain, provisional regions, which is where a nudging attacker would aim.
 3. **Changelog:** data added (counts by tier), largest contributors by weight (internal ids), gate metrics, bodies/epochs affected, input-transform versions.
@@ -166,9 +166,9 @@ A failed gate leaves the candidate provisional and opens a moderation item.
 | Mislabeled images | ≥ 95% quarantined |
 | Rollback | Revert + exclude restores the pre-attack version within one release cycle |
 
-The two gauge rows (a body joining a component; two components merging) need the multi-body component fit ([09 P4.2](09-roadmap.md)). Their scenarios exist and are ignored until that fit lands; the exposure conversion they depend on is exercised through `convert_exposure_gauge`.
+The two gauge rows (a body joining a component; two components merging) are asserted against the component and reference gauges in `looklab-fit` ([09 P4.2](09-roadmap.md)): a join keeps the designated body and its reference, a merge converts the exposure gauge exactly through `ExposureGauge::between`, and a WB reference change takes `WbGaugeChange::RefitAndReanchor`.
 
-At CI-sized synthetic pools the fitted sandwich σ crosses the 1.5 support threshold when a contributor joins a pool, so an honest release trips the supported→unsupported rule of §8 at a handful of probes. The scenarios that need an honest release to publish are implemented and marked ignored with that reason; they run once the fit's contributor-level σ_v is stable at these sizes.
+At CI-sized synthetic pools the fitted sandwich σ crosses the 1.5 support threshold when a contributor joins a pool, so an honest release loses support at a handful of boundary probes. §8 counts that only when σ rises past the support margin, so the jitter does not block honest releases. Scenarios that still move an honest release past a drift ceiling, or whose fitted σ jumps past the margin when a thin pool gains data, remain ignored with that reason.
 
 The harness runs in CI as `cargo test -p looklab-trust --features harness --release`.
 

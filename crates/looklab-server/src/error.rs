@@ -160,7 +160,8 @@ impl From<crate::admin::AdminError> for ApiError {
             | E::ScopeTooLarge
             | E::IneligibleContribution
             | E::EmptyManifest
-            | E::InvalidArtifact(_) => ErrorCode::MalformedEnvelope,
+            | E::InvalidArtifact(_)
+            | E::InvalidProposal(_) => ErrorCode::MalformedEnvelope,
         };
         Self::new(code)
     }
