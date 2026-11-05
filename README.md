@@ -6,11 +6,9 @@ A tool, and eventually a web app, for **measuring camera "looks" (film simulatio
 - **Compare** any two looks in a perceptual appearance space (CAM16-UCS), broken down into tone, neutral tint, chroma, hue and lightness components, with uncertainty.
 - **Match** a look on another body. You get either the best in-camera settings for stock firmware, or an exact LUT/curve bundle for firmware that can load one.
 
-## Preview
+## Local site
 
-A static build with synthetic Looks, bodies, scenes and audit entries is published at <https://skeet70.github.io/looklab/>. It has no server: uploads, contribution status, proposals and moderation are disabled there, and the site says so. Pairing, local processing, the payload inspector, matching, verification and the pattern page work in the browser.
-
-The preview is a separate build: `LOOKLAB_PREVIEW=1` disables the server-backed actions. Otherwise `LOOKLAB_API_BASE` names the API origin at build time, and leaving it unset keeps the API on the page's own origin.
+`cargo run -p looklab-publish --example site_data` writes synthetic Looks, bodies, scenes and audit entries to `site/data`; `cd site && trunk serve` serves them. `LOOKLAB_API_BASE` names the API origin at build time (unset: the page's own origin), and `LOOKLAB_PREVIEW=1` builds a server-less preview with uploads, status, proposals and moderation disabled. The `Pages` workflow publishes that preview when run manually.
 
 ## Design docs
 
