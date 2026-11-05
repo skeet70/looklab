@@ -1,0 +1,88 @@
+[
+  {
+    "input": "looklab-card/1 fw=fujifilm-x-t5/1.00 look=conformance-tone@1.0.0 cid=4117568fb39de99c",
+    "result": {
+      "cid_prefix": "4117568fb39de99c",
+      "firmware_id": "fujifilm-x-t5",
+      "firmware_version": "1.00",
+      "look_slug": "conformance-tone",
+      "look_version": "1.0.0"
+    }
+  },
+  {
+    "input": "looklab-card/1 fw=a/0.1+b look=conformance-tone@1.0.0 cid=4117568fb39de99c",
+    "result": {
+      "cid_prefix": "4117568fb39de99c",
+      "firmware_id": "a",
+      "firmware_version": "0.1+b",
+      "look_slug": "conformance-tone",
+      "look_version": "1.0.0"
+    }
+  },
+  {
+    "input": "looklab-card/1 fw=Fujifilm/1.00 look=conformance-tone@1.0.0 cid=0000000000000000",
+    "result": {
+      "error": "not a well-formed render tag"
+    }
+  },
+  {
+    "input": "looklab-card/1 fw=fujifilm_x-t5/1.00 look=conformance-tone@1.0.0 cid=0000000000000000",
+    "result": {
+      "error": "not a well-formed render tag"
+    }
+  },
+  {
+    "input": "looklab-card/1 fw=fujifilm-x-t5/ look=conformance-tone@1.0.0 cid=0000000000000000",
+    "result": {
+      "error": "not a well-formed render tag"
+    }
+  },
+  {
+    "input": "looklab-card/1 fw=fujifilm-x-t5/1.00 look=Conformance@1.0.0 cid=0000000000000000",
+    "result": {
+      "error": "not a well-formed render tag"
+    }
+  },
+  {
+    "input": "looklab-card/1 fw=fujifilm-x-t5/1.00 look=conformance-tone@ cid=0000000000000000",
+    "result": {
+      "error": "not a well-formed render tag"
+    }
+  },
+  {
+    "input": "looklab-card/1 fw=fujifilm-x-t5/1.00 look=conformance-tone@1.0.0 cid=00000000000000",
+    "result": {
+      "error": "not a well-formed render tag"
+    }
+  },
+  {
+    "input": "looklab-card/1 fw=fujifilm-x-t5/1.00 look=conformance-tone@1.0.0 cid=00000000000000zz",
+    "result": {
+      "error": "not a well-formed render tag"
+    }
+  },
+  {
+    "input": "looklab-card/1 fw=fujifilm-x-t5/1.00 look=conformance-tone@1.0.0",
+    "result": {
+      "error": "not a well-formed render tag"
+    }
+  },
+  {
+    "input": "looklab-card/1 fw=fujifilm-x-t5/1.00 look=conformance-tone@1.0.0 cid=0000000000000000 extra",
+    "result": {
+      "error": "not a well-formed render tag"
+    }
+  },
+  {
+    "input": "looklab-card/2 fw=fujifilm-x-t5/1.00 look=conformance-tone@1.0.0 cid=0000000000000000",
+    "result": {
+      "error": "not a well-formed render tag"
+    }
+  },
+  {
+    "input": " looklab-card/1 fw=fujifilm-x-t5/1.00 look=conformance-tone@1.0.0 cid=0000000000000000",
+    "result": {
+      "error": "not a well-formed render tag"
+    }
+  }
+]

@@ -1,0 +1,120 @@
+{
+  "files": [
+    {
+      "outcome": "valid",
+      "path": "valid/card-33.llk",
+      "reason": ""
+    },
+    {
+      "outcome": "valid",
+      "path": "valid/card-no-grid.llk",
+      "reason": ""
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/truncated-header.llk",
+      "reason": "truncated header"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/truncated-table.llk",
+      "reason": "section table runs past the file"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/truncated-section.llk",
+      "reason": "file length disagrees with the bytes"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/bad-magic.llk",
+      "reason": "magic"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/bad-version.llk",
+      "reason": "format version"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/bad-header-length.llk",
+      "reason": "header length"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/bad-file-length.llk",
+      "reason": "file length"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/bad-header-crc.llk",
+      "reason": "header CRC"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/bad-content-id.llk",
+      "reason": "content id"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/bad-section-crc.llk",
+      "reason": "section CRC"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/missing-fit.llk",
+      "reason": "missing required section"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/duplicate-neutral.llk",
+      "reason": "duplicate section kind"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/unsorted-table.llk",
+      "reason": "section table is not sorted"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/overlapping-sections.llk",
+      "reason": "sections overlap"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/out-of-range-section.llk",
+      "reason": "section runs past the file"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/wrong-semantics.llk",
+      "reason": "semantics id"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/grid-side-34.llk",
+      "reason": "grid side not 33 or 65"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/non-finite-neutral.llk",
+      "reason": "non-finite value"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/non-finite-fit.llk",
+      "reason": "non-finite value"
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/non-finite-grid.llk",
+      "reason": "non-finite value"
+    },
+    {
+      "outcome": "valid",
+      "path": "valid/unknown-section.llk",
+      "reason": ""
+    }
+  ],
+  "format": "looklab-card-conformance/1"
+}
