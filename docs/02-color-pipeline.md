@@ -210,7 +210,7 @@ Each refit runs in **two stages**, each minimizing a single well-defined objecti
    D appears in block (a) only.
 2. **Recipe stage.** Hold every θ_L fixed. Refit the per-body parameters (Δ_c, ξ, ω, D, clip k) on native + recipe data, warm-started from stage 1. These are the published body parameters.
 
-**Recipe images contribute nothing to any θ_L**, not just to the Look they attempt. Splitting into two stages (rather than letting recipe data into block (a) of a single alternation) keeps each stage a true minimization, so it converges instead of oscillating between two objectives.
+**Recipe images contribute nothing to any θ_L**, not just to the Look they attempt. Splitting into two stages (rather than letting recipe data into block (a) of a single alternation) keeps each stage a true minimization, so it converges instead of oscillating between two objectives. Card renders (intent `card`, [07 §4](07-contribution.md)) enter neither stage.
 
 **Warm starts:** each native stage starts from the **previous native-stage solution**, never from the published recipe-stage parameters. Otherwise recipe data could still influence which local optimum the Looks land in.
 
@@ -248,7 +248,7 @@ Per Look version, per-probe 3×3 predictive covariance:
 
 Combination: `Σ_fit = Σ_boot` when available, else `Σ_sandwich`, then `Σ_total = Σ_fit + Σ_disagree + Σ_model`. Scalar `σ_ΔE = sqrt(tr Σ_total)`.
 
-**Model error:** the published path runs K-fold cross-validation over bodies (images when the pool has one body). Each held-out body's residual is binned into 12 hue × 6 exposure regions, compared with what `Σ_fit + Σ_disagree` predicts there, and the non-negative excess is smoothed and added as `Σ_model`. The interactive path reuses the last published [`ModelErrorField`](../crates/looklab-fit/src/model_error.rs) instead of recomputing it.
+**Model error:** the published path runs K-fold cross-validation over bodies (images when the pool has one body). Each held-out body's residual is binned into 12 hue × 6 exposure regions, compared with what `Σ_fit + Σ_disagree` predicted, and the mean excess plus `t_{0.95,K−1}·sd·√(1+1/K)` is smoothed and added as a radial `Σ_model` (one third per axis). The excess carries a tentative 1.3 between-body inflation. The interactive path reuses the last published [`ModelErrorField`](../crates/looklab-fit/src/model_error.rs) instead of recomputing it.
 
 **Support:** a probe is *supported* iff `σ_ΔE ≤ 1.5` **and** density ≥ the floor **and** at least `min_probe_clusters` images (tentative 3) carry non-negligible weight in its region **and** no channel of its predicted output lies in a soft-clip shoulder (`> 1 − k` or `< k`), where pre-clip values are not constrained (§3.4). This automatically excludes pre-clip values the data can't identify (§3.4). Unsupported probes are excluded from matching objectives and hatched in plots.
 

@@ -6,6 +6,12 @@ A tool, and eventually a web app, for **measuring camera "looks" (film simulatio
 - **Compare** any two looks in a perceptual appearance space (CAM16-UCS), broken down into tone, neutral tint, chroma, hue and lightness components, with uncertainty.
 - **Match** a look on another body. You get either the best in-camera settings for stock firmware, or an exact LUT/curve bundle for firmware that can load one.
 
+## Preview
+
+A static build with synthetic Looks, bodies, scenes and audit entries is published at <https://skeet70.github.io/looklab/>. It has no server: uploads, contribution status, proposals and moderation are disabled there, and the site says so. Pairing, local processing, the payload inspector, matching, verification and the pattern page work in the browser.
+
+The preview is a separate build: `LOOKLAB_PREVIEW=1` disables the server-backed actions. Otherwise `LOOKLAB_API_BASE` names the API origin at build time, and leaving it unset keeps the API on the page's own origin.
+
 ## Design docs
 
 Read in order. Each doc is self-contained enough to hand to an implementer.
@@ -16,7 +22,7 @@ Read in order. Each doc is self-contained enough to hand to an implementer.
 | 01 | [Architecture](docs/01-architecture.md) | Crates, client/server split, tech choices, licensing |
 | 02 | [Color pipeline](docs/02-color-pipeline.md) | Input transforms, the Look model, fitting, uncertainty, probes, diagnostics |
 | 03 | [Data model](docs/03-data-model.md) | Entities, firmware epochs, file formats, DB schema |
-| 04 | [Matching & export](docs/04-matching-and-export.md) | Control schemas, control-response models, optimizer, firmware interface profiles, LUT baking |
+| 04 | [Matching & export](docs/04-matching-and-export.md) | Control schemas, control-response models, optimizer, firmware card format, software interface profiles, LUT baking |
 | 05 | [Trust & integrity](docs/05-trust-and-integrity.md) | Tiers, reputation, weighting, caps, release gates, rollback (hobby scale) |
 | 06 | [Privacy & payload](docs/06-privacy-and-payload.md) | What leaves the browser, metadata sanitization, payload inspector |
 | 07 | [Contribution](docs/07-contribution.md) | The contribution ladder, capture protocols, detection |

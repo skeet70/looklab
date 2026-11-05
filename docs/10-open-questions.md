@@ -23,3 +23,5 @@ Decisions not yet made. Each has a default so work isn't blocked. Change a defau
 | Q18 | Outcome of the G1 premise spike (P1.9) | Pending; shared θ assumed | 02 §4.3, 09 |
 | Q19 | Default bake CCT for single-illuminant profiles | D65, with 5500 K / 3200 K selectable | 04 §7 |
 | Q20 | Threat level: when to restore the cut defenses (05 §13), e.g. server re-verification of kinds | Revisit if revert actions become frequent or a large coordinated attack is seen | 05 |
+| Q21 | Card `FIT` contents: the probe set only, or denser supported samples too? | Probe set v1 only; revisit with translator feedback | 04 §8.3 |
+| Q22 | Render tag location: EXIF `UserComment` only, or also `ImageDescription` for firmware that can't write `UserComment`? | `UserComment` only | 04 §8.4, 06 §1 |

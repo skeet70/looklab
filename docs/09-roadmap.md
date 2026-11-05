@@ -39,13 +39,16 @@ Phases are ordered by dependency. Each task has an ID, the docs it implements an
 
 **Milestone M2:** recommended, verified settings on the owner's body.
 
-## Phase 3: Firmware interfaces
+## Phase 3: Firmware and pipeline interfaces
 
 | ID | Task | Deps | AC |
 |---|---|---|---|
-| P3.1 | Interface profile schema; all insertion points; `illuminant_handling` single/dual; downstream inversion with perceptual clipping | P1.7 | Synthetic pipelines: round-trip p95 ≤ 1.0 ΔE where invertible, at each bake CCT |
-| P3.2 | Owner's firmware profile + reference consumer test | P3.1 | On-camera JPEG vs target p95 ≤ 2.0 ΔE *(tentative)* |
+| P3.1 | Software interface profile schema; all insertion points; `illuminant_handling` single/dual; downstream inversion with perceptual clipping | P1.7 | Synthetic pipelines: round-trip p95 ≤ 1.0 ΔE where invertible, at each bake CCT |
+| P3.2 | Card format ([04 §8](04-matching-and-export.md)): deterministic writer, strict reader and normative grid evaluator in `looklab-export` (native + wasm32); `looklab-cli card inspect \| eval`; `card.llk` in every version manifest | P1.4 | Same Look version → same bytes; reader rejects every malformed file in the conformance set; native and wasm32 evaluation bit-identical; `NEUTRAL` and `FIT` outputs equal direct Look evaluation |
 | P3.3 | Writers: HaldCLUT, `native_json` | P3.1 | Round-trip tests |
+| P3.4 | Card conformance vectors in `data/card/conformance-v1/` (valid and malformed files, grid-evaluation vectors, render-tag strings) | P3.2 | Reference reader and evaluator pass all vectors; regeneration documented |
+| P3.5 | Render tag: `looklab-meta` parses `UserComment` into typed fields; sanitizer whitelists them ([06 §1](06-privacy-and-payload.md)); client sets intent `card` and checks `cid` against the published file; worker excludes intent `card` from every fit and aggregates per-firmware verification | P1.2, P3.2 | Property test: only the parsed fields leave; a tagged synthetic render never changes any Look or body parameter; a `cid` mismatch is excluded and reported |
+| P3.6 | Example translator: portable C99, no allocator, fits a 3×3 matrix and per-channel tone curve from `FIT` and `NEUTRAL` | P3.2 | On synthetic matrix + curve looks, recovers the injected parameters; builds with `-std=c99 -Wall -Werror` and no libc allocation |
 
 ## Phase 4: Multi-body
 
@@ -80,7 +83,7 @@ Phases are ordered by dependency. Each task has an ID, the docs it implements an
 | P6.6 | Tiers and roles: `looklab-cli admin` + admin page for grants, seeder endorsement and root-admission flows, nomination queue from reputation, append-only audit log published as page + JSON, version manifests with artifact hashes | P6.3 | Grant/endorse/admit/revoke each produce a row + log entry and appear in public lists; revoking a root admission produces a new version and marks dependents; clients reject artifacts whose hash doesn't match the manifest |
 | P6.7 | Bounties + recipe scores + leaderboards | P6.3, P2.3 | Bounties on synthetic recipe-residual data point at the injected region; bounty regions not resolvable by new-tier data alone |
 
-**Launch = M1–M2 + P1.9 passed + P3.1–P3.2 + P4 + P5 + P6.1–P6.6.** P6.7 can follow shortly after.
+**Launch = M1–M2 + P1.9 passed + P3.1–P3.2 + P3.4–P3.5 + P4 + P5 + P6.1–P6.6.** P3.6 and P6.7 can follow shortly after.
 
 ## Phase 7: Post-launch
 

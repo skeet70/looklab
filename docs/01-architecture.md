@@ -51,7 +51,7 @@ crates/
   looklab-body      # input-transform priors, CCT estimation, chart anchoring
   looklab-fit       # single/hierarchical/joint fits, uncertainty, outlier scoring
   looklab-match     # control schemas, control-response models, optimizer, comparison reports
-  looklab-export    # interface profiles, LUT baking, writers
+  looklab-export    # interface profiles, LUT baking, writers, card format (writer, reader, evaluator)
   looklab-trust     # weights, tiers, reputation, caps, gates, rollback, red-team harness
   looklab-schema    # validators for data/ (bodies, interfaces, probes); also built to WASM
   looklab-report    # static HTML/SVG reports (CLI and site)
@@ -63,7 +63,8 @@ crates/
   looklab-cli       # native CLI
 data/
   bodies/           # body definitions + control schemas (snapshots exported from the server authority)
-  interfaces/       # firmware interface profiles
+  interfaces/       # software interface profiles
+  card/             # card-format conformance vectors (docs/04 §8.6)
   probes/           # probe set definitions (versioned)
   charts/           # chart reference values (with source/licensing notes)
 tools/golden/       # dev-only Python scripts producing golden test vectors from colour-science

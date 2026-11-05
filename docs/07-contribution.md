@@ -54,9 +54,11 @@ Shared tips (rung 1 and above): turn off in-camera lens corrections where possib
 - Assisted detection (click 4 corners, client refines); automatic later. Patch means from the central 50%, with glare rejected by std.
 - Reference values with source and edition in `data/charts/`.
 
-## 4. Recipe contributions
+## 4. Recipe and card contributions
 
 Intent `recipe`: settings on body B attempting target Look L. The flow is the same, with the target prefilled from a settings card. Used for body parameters, the control model, recipe scores and bounty analysis. **Never** for L's target ([05 §12](05-trust-and-integrity.md)).
+
+Intent `card`: a JPEG rendered by hacked firmware from a card file ([04 §8](04-matching-and-export.md)). The client sets it from the render tag ([04 §8.4](04-matching-and-export.md)); when the tag is missing, the user declares it by picking the firmware. Used only for per-firmware verification scores, grouped by firmware id and version. **Never** for any Look target, body parameter or control model: the makernotes name whatever stock sim the firmware borrowed, not the Look the image shows.
 
 ## 5. Contributor feedback
 

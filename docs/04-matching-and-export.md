@@ -1,8 +1,9 @@
 # 04 — Matching and export
 
-Given a user's body *B* (epoch *e*) and a target Look *L*, produce either:
-- **Settings** for stock firmware: a base native sim, control values, and exposure compensation / WB shift where useful; or
-- **An artifact** for firmware that can load one, per a declared interface profile.
+Given a user's body *B* (epoch *e*) and a target Look *L*, produce one of:
+- **Settings** for stock firmware: a base native sim, control values, and exposure compensation / WB shift where useful;
+- **A card file** (§8) for hacked firmware. It is body-agnostic; the firmware turns it into whatever its pipeline can set; or
+- **An artifact** for a software pipeline, per a declared interface profile (§6).
 
 Probes are defined in adapted scene XYZ, so the target on any body is `L(p)`. The body enters through its realization parameters (stock path) or through the bake (artifact path).
 
@@ -13,7 +14,8 @@ Probes are defined in adapted scene XYZ, so the target on any body is `L(p)`. Th
 | A | nothing / RAWs | Target renders of the user's RAWs (via `A_B` + L) |
 | B | RAW+JPEG from their current setup | Fitted realization of the current setup + diagnostic comparison vs. target |
 | C | body only (uses the crowd model); optional verification loop | Recommended settings + predicted error map + unreachable regions |
-| C+ | firmware interface profile | Baked artifact + validation report |
+| C+ | hacked firmware that implements §8 | Card file; verification through in-camera renders (§5, §8.4) |
+| C+ | software interface profile | Baked artifact + validation report |
 
 ## 2. Realization model on a body (stock firmware)
 
@@ -91,13 +93,13 @@ The canonical encoding is a single line of `key=value` fields joined by `|`, sta
 
 The first implementation updates one scale factor per non-default control with two Gauss-Newton iterations (ridge 1e-3, factor clamped to 0.05–20), then re-runs the full search. Selection ranks candidate RAW sample sets by mean `tr Cov_pred` at the recommended settings and keeps 2–4. Stored `in_rgb` is camera RGB before the body realization effects; `A_c · in_rgb` is the unmodified scene, and the realization applies WB and exposure once for prediction and target measurement. `looklab verify` reports the first suggestion's error against the observed re-renders; measuring the second suggestion needs a re-render at its settings.
 
-## 6. Firmware interface profiles
+## 6. Interface profiles (software pipelines)
 
-`data/interfaces/<id>.yaml`. Firmware authors submit profiles in the app (as YAML or through a form), together with a round-trip report generated at submission ([08 §4](08-ui.md)). Photographers just pick their firmware from a list.
+`data/interfaces/<id>.yaml`. Interface profiles describe software pipelines that apply a LUT at a known point: raw developers and editors. Their authors submit profiles in the app (as YAML or through a form), together with a round-trip report generated at submission ([08 §4](08-ui.md)). Users pick the pipeline from a list. Hacked camera firmware does not use profiles; it implements the card format (§8).
 
 ```yaml
-id: example-firmware/sim-v1
-name: "Example firmware sim slot"
+id: example-app/lut3d-v1
+name: "Example editor 3D LUT module"
 version: 1
 bodies: [vendor/model-a]                 # empty = body-agnostic
 insertion:
@@ -121,11 +123,11 @@ accepts:
 downstream:
   - output_transform: { primaries: srgb, transfer: srgb }
   - gamut_clip: hard
-formats: [cube, native_json]
-limits: { max_bytes: 262144 }
+formats: [cube, haldclut, native_json]
+limits: { max_bytes: 8388608 }
 ```
 
-**`formats` (v1):** `cube`, `haldclut` (16-bit PNG), `binary_f16` (packed half floats, layout in §7), `native_json`.
+**`formats` (v1):** `cube`, `haldclut` (16-bit PNG), `native_json`.
 
 **`insertion.point` (v1):**
 - `camera_rgb_wb_linear`: after demosaic + WB, before any color matrix.
@@ -141,19 +143,82 @@ F = Downstream⁻¹ ∘ OutputEncode ∘ CAM16UCS⁻¹ ∘ L ∘ ToSceneXYZ_{P,B
 
 - `ToSceneXYZ`: for `camera_rgb_wb_linear` it's `A_B(T)`, which is **illuminant-dependent**:
   - `illuminant_handling: single`: bake at a chosen CCT (default D65; daylight 5500 K and tungsten 3200 K are selectable). The validation report shows the error at the other two CCTs.
-  - `dual_interpolated`: bake two artifacts (StdA, D65). The firmware interpolates in 1/T using its own CCT estimate.
+  - `dual_interpolated`: bake two artifacts (StdA, D65). The pipeline interpolates in 1/T using its own CCT estimate.
   - Other insertion points use fixed matrices and are illuminant-independent.
 - Out-of-gamut targets under a hard downstream clip get perceptual clipping (reduce chroma at constant J′, h in CAM16-UCS). The affected fraction is reported.
 - If a shaper is accepted, choose it so the 3D grid is roughly uniform in `s`.
 
 **Validation (required before export):** evaluate the artifact through a software model of the declared pipeline on the probe set and report ΔE vs. target (median, p95, max, plus the per-CCT results above). Exports with p95 > 1.0 ΔE outside unsupported regions are flagged.
 
-**Writers:** `.cube` (with DOMAIN_MIN/MAX; shaper as a separate 1D file where needed, variant documented per profile), HaldCLUT (16-bit PNG), `binary_f16`, `native_json`.
-
-`binary_f16` is what a firmware with `precision: f16` loads: 16 bytes of little-endian header (magic `LLLUT`, version, flags with a shaper-present bit, grid side as `u32`, shaper length as `u32`), then the shaper as half floats when present, then `size³ × 3` half floats in `.cube` order. A 33³ grid is about 1.0 MB and a 65³ grid about 1.6 MB, against 1.0 MB and 7.9 MB as `.cube` text.
+**Writers:** `.cube` (with DOMAIN_MIN/MAX; shaper as a separate 1D file where needed, variant documented per profile), HaldCLUT (16-bit PNG), `native_json`.
 
 Later: darktable `.dtstyle` (darktable as a software body) and RawTherapee profiles.
 
-## 8. Reference implementation
+## 8. Firmware card format
 
-The project owner's firmware is the first interface profile and the reference consumer. Its profile, a bake → simulate → compare round-trip test, and a sample artifact live in `data/interfaces/` with fixtures.
+A card file carries one Look version for hacked camera firmware. looklab defines the file and its semantics; it does not model any camera's internal pipeline. The firmware translates the file into whatever its pipeline lets it set (a native film-sim stage, a LUT stage, or both), so the only information lost is what that firmware can't set. One file serves every camera that implements this section.
+
+Every published Look version includes `card.llk` as a manifest-listed artifact ([03 §5](03-data-model.md)). The writer is deterministic: the same Look version yields the same bytes.
+
+### 8.1 Semantics (fixed in v1)
+- **Look:** the family target θ_L, not any body's realization. Body parameters (Δ_c, ξ, ω, D, clip k) and control-response models are not in the file.
+- **Input:** scene-linear Rec.2020 RGB after the camera's white balance, adapted to a D65 white (`wb_policy: adaptive`). Mid gray is 0.18, which is `s = 0` ([02 §3](02-color-pipeline.md)). The firmware maps its camera RGB into this space with its own color matrix, at its own CCT estimate; the illuminant handling of §7 does not apply.
+- **Output:** the Look's appearance under the reference viewing conditions ([02 §1](02-color-pipeline.md)), converted J′a′b′ → XYZ → linear Rec.2020 RGB with Y = 1 at the reference white. Values are **pre-clip**: out-of-gamut targets keep their values, and the firmware's own output encoding and clip come after. Where the firmware can, out-of-gamut targets should be clipped perceptually (reduce M′ at constant J′ and h), as in §7.
+- **Shaped coordinate:** the log2 shaper of `preview.lut33` ([03 §5](03-data-model.md)), applied per channel: `0.5 + 0.5 · log2(1 + x / 0.18) / log2(1 + 2⁶)` for `x ≥ 0` and `0.5 − 0.5 · log2(1 − x / 0.18) / log2(1 + 2¹²)` below.
+
+### 8.2 Layout
+Little-endian throughout. 8.3 file names; the export suggests `<NAME>.LLK` from the slug, and readers take identity from the header, never from the file name.
+
+| Offset | Field |
+|---|---|
+| 0x00 | magic `LLCF` |
+| 0x04 | `u16` format version = 1 |
+| 0x06 | `u16` header length = 64 |
+| 0x08 | `u32` file length |
+| 0x0c | `u16` section count, `u16` = 0 |
+| 0x10 | `u32` CRC-32 (IEEE) over the header and the section table, with this field taken as 0 |
+| 0x14 | 32-byte content id: SHA-256 of every byte after the section table |
+| 0x34 | 12 bytes, all 0 |
+| 0x40 | section table: `count × 16` bytes |
+
+Each section-table entry is `u32` kind, `u32` offset (4-byte aligned, inside the file), `u32` length, `u32` CRC-32 of the section's bytes. Entries are sorted by kind, with no duplicates and no overlaps. Readers ignore kinds they don't know. The manifest's SHA-256 covers the whole file; the content id lets firmware name the file in the render tag (§8.4) without hashing it.
+
+### 8.3 Sections
+
+| Kind | Name | Required | Content |
+|---|---|---|---|
+| 1 | `META` | yes | TLV records `u8` key, `u16` length, bytes. Keys: 1 slug (ASCII ≤ 63), 2 version (ASCII ≤ 31), 3 name (UTF-8 ≤ 63 bytes), 4 short name (ASCII ≤ 27), 5 description (ASCII ≤ 511), 6 license and attribution (UTF-8 ≤ 255 bytes). Keys 1-4 are required; unknown keys are skipped. |
+| 2 | `SEMANTICS` | yes | `u16` fields: input space (1 = §8.1), output space (1 = §8.1), shaper (1 = §8.1), viewing conditions (1 = reference), `wb_policy` (1 = adaptive), then `u16` = 0 padding. v1 readers reject any other value. |
+| 3 | `NEUTRAL` | yes | `u32` n = 257, then n × 3 `f32`: the Look's output for a neutral input at `s = −12 + 18·i/(n − 1)`. This is the full Look on the neutral axis (T, N and the `C = 0` plane of Λ), evaluated exactly. It maps directly onto a native tone curve. |
+| 4 | `FIT` | yes | `u32` n, then n records of 40 bytes: input `f32×3`, output `f32×3`, `σ_ΔE` `f32`, weight `f32`, flags `u32` (bit 0 = supported), probe index `u32`. v1 records are the probe set of the Look version, in probe-set order. Weight is the probe's `weight` from the probe set for supported probes and 0 otherwise, normalized to sum 1. |
+| 5 | `GRID` | no | `u32` side (33 or 65), then side³ × 3 `f16`, red fastest, over the shaped input coordinate. Values are §8.1 output. A 65³ grid is about 1.6 MB; the other sections together are under 50 KB. |
+
+**Grid interpolation (normative):** clamp each shaped coordinate to [0, 1], split it into a base node and fractions. Sort the fractions descending, ties broken red before green before blue, to get `f₁ ≥ f₂ ≥ f₃` with unit steps `e₁, e₂, e₃`. Then `out = (1 − f₁)·V₀ + (f₁ − f₂)·V(e₁) + (f₂ − f₃)·V(e₁ + e₂) + f₃·V(e₁ + e₂ + e₃)`.
+
+**Reader rules:** reject the file unless the magic, version, lengths, header CRC and the CRCs of every section it reads match; every required section is present; counts match lengths; and every value it reads is finite. A rejected file changes nothing: the firmware keeps its previous state and never uses a partly read file. Sections the firmware doesn't use (typically `GRID`) need not be read.
+
+### 8.4 Render tag
+Firmware **must** write this token, in ASCII, into EXIF `UserComment` of every JPEG it renders with a card look:
+
+```
+looklab-card/1 fw=<firmware-id>/<firmware-version> look=<slug>@<version> cid=<first 8 bytes of the content id, lowercase hex>
+```
+
+`firmware-id` is `[a-z0-9-]{1,32}`; `firmware-version` is `[0-9A-Za-z.+-]{1,24}`. The sanitizer keeps only the parsed fields ([06 §1](06-privacy-and-payload.md)). A tagged image is a card render: it becomes an intent-`card` contribution ([07 §4](07-contribution.md)) and never enters a Look or body fit. Without the tag, a card render reads as a stock render of whatever sim the firmware borrowed and would contaminate that sim's fit; outlier scoring (z > 3.5) is the only backstop. Card renders are grouped by firmware id and version, so a poor translation shows up against the firmware, not the Look. When the tag is missing, the user picks the firmware from a list.
+
+The client checks `cid` against the published `card.llk` of that version. A mismatch means the card holds a different file; the image isn't counted for that version, and the user is told.
+
+### 8.5 Translation guidance (non-normative)
+looklab can't see camera internals, so this is advice, not a requirement.
+- **Translate on camera at startup.** It needs no host tool. Cache the result on the card keyed by the content id and refit only when the id changes, so only the first boot after a change pays for the fit.
+- **Fit from `FIT` and `NEUTRAL`, not the grid.** They stream in small fixed buffers, which suits firmware without an allocator.
+- **Stage the fit like looklab does** ([02 §4.1](02-color-pipeline.md)): tone and neutral parameters from `NEUTRAL` first, then color parameters on `FIT` with tone held.
+- **Loss:** weighted squared error in CIELAB or CAM16-UCS, with weight `w / (1 + σ²)`, compared after the camera's own output encoding and clip.
+- **Offline fallback:** where startup time or the FPU can't afford the fit, a host tool can read the file and write the firmware's native format.
+
+### 8.6 Conformance
+`data/card/conformance-v1/` holds valid and malformed files with the expected reader outcome, grid-evaluation vectors (shaped input → output under the normative interpolation), and render-tag strings with their parse result. Grid outputs must match the reference within 2 f16 ulp *(tentative)*.
+
+## 9. Reference implementation
+
+The reference consumer is looklab's own card reader and grid evaluator in `looklab-export`, native and wasm32, exposed as `looklab-cli card inspect | eval`, plus the conformance vectors of §8.6. An example translator in portable C99 with no allocator fits a 3×3 matrix and a per-channel tone curve from `FIT` and `NEUTRAL`, for firmware authors to start from. Software interface profiles keep their own bake → simulate → compare round-trip test in `data/interfaces/` with fixtures.

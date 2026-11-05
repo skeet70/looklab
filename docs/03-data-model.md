@@ -229,7 +229,7 @@ The model serializes as `crm.json`:
 - Every create/revoke writes an audit-log entry. The lists are public by internal id or display handle.
 
 ### Contribution and ContributionImage
-- `Contribution`: `id`, `credential_id`, `batch_manifest_hash`, `signature`, `pow`, `kind` (client-claimed: `library` | `rerender` | `pattern` | `gradient` | `chart`), `serial_hmac?` (server-computed; absent if the contributor opted out), (the effective contributor is **resolved at fit time** from current serial links, like epochs, and never stored on the contribution; [05 §2](05-trust-and-integrity.md)), `intent` (`native` | `recipe`), `target_look_id?`, `body_id`, `firmware_version`, `sim_key`, `settings`, `status` (`pending` | `accepted` | `quarantined` | `withdrawn`), `created_at`.
+- `Contribution`: `id`, `credential_id`, `batch_manifest_hash`, `signature`, `pow`, `kind` (client-claimed: `library` | `rerender` | `pattern` | `gradient` | `chart`), `serial_hmac?` (server-computed; absent if the contributor opted out), (the effective contributor is **resolved at fit time** from current serial links, like epochs, and never stored on the contribution; [05 §2](05-trust-and-integrity.md)), `intent` (`native` | `recipe` | `card`), `target_look_id?`, `card?` (for intent `card`: firmware id and version, look version, content-id prefix, and whether the tag was present or user-declared; [04 §8.4](04-matching-and-export.md)), `body_id`, `firmware_version`, `sim_key`, `settings`, `status` (`pending` | `accepted` | `quarantined` | `withdrawn`), `created_at`.
 - `ContributionImage`: `id`, `contribution_id`, `samples_hash`, `n_samples`, `meta` (sanitized), `rerender_group?` (client-assigned id, see §2.1), `duplicate_of?`, `fit_stats` (`rms_de`, `z`, `reason?`), `weight_components`.
 
 ### Proposal and ModerationDecision
@@ -400,6 +400,8 @@ data/scenes/<name>.f16                   scene-linear D65 XYZ, little-endian hal
 **Look page data** repeats the identity (`slug`, name, kind, `wb_policy`, description, aliases, license for LUT-defined looks) and lists each version's manifest, changelog, weak spots and any publication notice (a since-revoked root admission, or a revert).
 
 **Previews.** A version may publish `preview.lut33`, a 33³ grid as little-endian `f32` over a scene-linear log2 domain: each axis is Rec.2020 linear RGB, shaped as `0.5 + 0.5 · log2(1 + x / 0.18) / log2(1 + 2⁶)` above zero and `0.5 - 0.5 · log2(1 - x / 0.18) / log2(1 + 2¹²)` below, so HDR highlights and wide-gamut colours reach the Look instead of clipping at sRGB white. Grid nodes are decoded back to XYZ, evaluated through the Look with its output clip, and stored as encoded sRGB. The browser shapes each scene pixel the same way, applies the LUT with tetrahedral interpolation, and writes sRGB to a canvas. The LUT is an artifact like any other, so it is checked before use and a look switch costs only the LUT application.
+
+**Card files.** Every published version includes `card.llk`, the firmware card file of [04 §8](04-matching-and-export.md). It is body-agnostic, listed in the manifest like any artifact, and checked before use under the client rule.
 
 **Canonical scenes** are scene-linear XYZ at the D65 white point, stored as `f16` triples with dimensions in `SceneIndex`. The sample site generates a neutral and hue gradient, a hue wheel, and skin, foliage and sky patches. Real photographic scenes replace them when project-owned releases exist.
 

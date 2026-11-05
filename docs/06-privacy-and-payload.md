@@ -15,6 +15,7 @@
 | Exposure | ISO, shutter, aperture, EC, as-shot WB multipliers | Nuisance priors, CCT |
 | Capture date | **Month only** | Epoch sanity, drift analysis |
 | Software tag | String | Edited-JPEG detection |
+| Card render tag | Parsed fields only: format version, firmware id and version, look slug and version, 8-byte content-id prefix ([04 §8.4](04-matching-and-export.md)); the raw `UserComment` string is dropped | Routing card renders out of every fit; per-firmware verification |
 | Re-render group id | Random 16 bytes, client-generated per group | Server-verifiable grouping without a RAW hash |
 | Body serial (optional, opt-out) | Sent in a dedicated request field; the server HMACs it on arrival and discards it ([05 §2](05-trust-and-integrity.md)) | Effective-contributor merging for caps only |
 | Signature, nonce, proof-of-work | Per batch | Integrity, anti-flood |

@@ -50,7 +50,8 @@ Existing tools each cover part of this. darktable-lut-generator fits a LUT from 
 | **Endorsement** | Scoped, revocable, publicly logged decision by a seeder that moves a credential to the `endorsed` tier. |
 | **Reputation** | Per-credential multiplier that adjusts weight within a tier and nominates contributors for endorsement. It never changes tier. |
 | **Effective contributor** | Credentials merged by serial HMAC, for caps and diminishing returns only. |
-| **Interface profile** | Declaration of what a custom/hacked firmware can load and where in its pipeline it applies. |
+| **Interface profile** | Declaration of what a software pipeline (raw developer, editor) can load and where in its pipeline it applies it. |
+| **Card file** | The body-agnostic file (`card.llk`) that hacked camera firmware loads and translates into its own pipeline ([04 §8](04-matching-and-export.md)). |
 | **Bounty** | A public request for specific data, generated where the system's uncertainty most affects users. |
 
 ## Core principles
