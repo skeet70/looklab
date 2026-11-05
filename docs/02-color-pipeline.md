@@ -246,7 +246,9 @@ Per Look version, per-probe 3×3 predictive covariance:
 2. **Bootstrap (published versions):** B = 32 warm-started refits on image clusters resampled with replacement; a cluster is one body's images, so within-body correlation is kept (a single-body pool is the image bootstrap).
 3. **Cross-body disagreement:** covariance of leave-one-body-out predictions.
 
-Combination: `Σ_fit = Σ_boot` when available, else `Σ_sandwich`, then `Σ_total = Σ_fit + Σ_disagree`. Scalar `σ_ΔE = sqrt(tr Σ_total)`.
+Combination: `Σ_fit = Σ_boot` when available, else `Σ_sandwich`, then `Σ_total = Σ_fit + Σ_disagree + Σ_model`. Scalar `σ_ΔE = sqrt(tr Σ_total)`.
+
+**Model error:** the published path runs K-fold cross-validation over bodies (images when the pool has one body). Each held-out body's residual is binned into 12 hue × 6 exposure regions, compared with what `Σ_fit + Σ_disagree` predicts there, and the non-negative excess is smoothed and added as `Σ_model`. The interactive path reuses the last published [`ModelErrorField`](../crates/looklab-fit/src/model_error.rs) instead of recomputing it.
 
 **Support:** a probe is *supported* iff `σ_ΔE ≤ 1.5` **and** density ≥ the floor **and** at least `min_probe_clusters` images (tentative 3) carry non-negligible weight in its region **and** no channel of its predicted output lies in a soft-clip shoulder (`> 1 − k` or `< k`), where pre-clip values are not constrained (§3.4). This automatically excludes pre-clip values the data can't identify (§3.4). Unsupported probes are excluded from matching objectives and hatched in plots.
 

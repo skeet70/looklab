@@ -6,6 +6,9 @@ use looklab_model::{Look, LookInput};
 use looklab_samples::OutputSpace;
 
 use crate::hierarchical::BodyGroup;
+use crate::model_error::{
+    MODEL_HUE_BINS, MODEL_S_BINS, ModelErrorField, estimate_model_error, region,
+};
 use crate::predict::in_clip_shoulder;
 use crate::problem::Xorshift;
 use crate::types::{
@@ -45,6 +48,7 @@ pub struct PublishedUncertainty {
     pub fit_method: UncertaintyMethod,
     pub fit_covariance: Vec<Cov3>,
     pub disagreement: Vec<Cov3>,
+    pub model: ModelErrorField,
 }
 
 fn space_of(output: OutputSpace) -> RgbSpace {
@@ -172,16 +176,40 @@ pub fn published_uncertainty(
     };
 
     let probes_v1 = looklab_model::probes::v1();
+    let mut reference_sums = vec![0.0_f64; MODEL_HUE_BINS * MODEL_S_BINS];
+    let mut reference_counts = vec![0.0_f64; MODEL_HUE_BINS * MODEL_S_BINS];
+    for (index, probe) in probes_v1.probes.iter().enumerate() {
+        let fit = fit_covariance.get(index).copied().unwrap_or([[0.0; 3]; 3]);
+        let extra = disagreement.get(index).copied().unwrap_or([[0.0; 3]; 3]);
+        let variance = (0..3)
+            .map(|channel| fit[channel][channel] + extra[channel][channel])
+            .sum::<f64>();
+        let input = LookInput::new(probe.xyz);
+        let bin = region(input.s, input.h_in);
+        reference_sums[bin] += variance;
+        reference_counts[bin] += 1.0;
+    }
+    let reference_variance: Vec<f64> = reference_sums
+        .iter()
+        .zip(reference_counts.iter())
+        .map(|(sum, count)| if *count > 0.0 { sum / count } else { 0.0 })
+        .collect();
+    let model = estimate_model_error(images, groups, &reference_variance, options)?;
+
     let mut probes = Vec::with_capacity(probes_v1.probes.len());
     let mut supported = 0usize;
     for (index, probe) in probes_v1.probes.iter().enumerate() {
         let fit = fit_covariance.get(index).copied().unwrap_or([[0.0; 3]; 3]);
         let extra = disagreement.get(index).copied().unwrap_or([[0.0; 3]; 3]);
+        let model_variance = model.at(LookInput::new(probe.xyz).s, LookInput::new(probe.xyz).h_in);
         let mut covariance = [[0.0_f64; 3]; 3];
         for a in 0..3 {
             for b in 0..3 {
                 covariance[a][b] = fit[a][b] + extra[a][b];
             }
+        }
+        for (channel, row) in covariance.iter_mut().enumerate() {
+            row[channel] += model_variance;
         }
         let sigma_de = (covariance[0][0] + covariance[1][1] + covariance[2][2])
             .max(0.0)
@@ -224,5 +252,6 @@ pub fn published_uncertainty(
         fit_method,
         fit_covariance,
         disagreement,
+        model,
     })
 }

@@ -11,6 +11,7 @@ mod fit;
 pub mod gauge;
 pub mod hierarchical;
 mod layout;
+pub mod model_error;
 mod outlier;
 mod predict;
 mod problem;
@@ -42,6 +43,9 @@ pub use looklab_model::realization::{
     ControlResponseModel, ControlValue, ResponseParamId, Settings,
 };
 pub use looklab_model::{Look, LookInput, Probe, ProbeId, ProbeSet};
+pub use model_error::{
+    MODEL_HUE_BINS, MODEL_S_BINS, ModelErrorField, apply_model_error, estimate_model_error, region,
+};
 pub use types::{
     ContributorId, ControlResponseFit, Density, Diagnostics, ExcludeReason, ExcludedImage,
     ExposureModeId, ExposureOffset, FitError, FitImage, FitOptions, FitResult, ImageFitStats,
