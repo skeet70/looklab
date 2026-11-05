@@ -71,11 +71,14 @@ axum.workspace = true
 base64.workspace = true
 looklab-prep-module.workspace = true
 looklab-schema.workspace = true
+looklab-server.workspace = true
 looklab-upload.workspace = true
 getrandom.workspace = true
 p256.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
 tokio.workspace = true
+tower.workspace = true
 webauthn-rs.workspace = true
 
 [[example]]

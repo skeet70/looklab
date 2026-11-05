@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-use std::collections::BTreeMap;
+//! The proposal form ([docs/08 §4](../../../docs/08-ui.md)).
 
 use leptos::prelude::*;
-use looklab_schema::{
-    LabeledFile, MENU_QUESTION, MakernoteTag, MakernoteValue, ProposalKind, SimKey, infer_mapping,
-    validate_proposal,
-};
+use leptos::task::spawn_local;
+use looklab_schema::{MENU_QUESTION, ProposalKind, ProposalView, validate_proposal};
+use wasm_bindgen::JsCast;
+use web_sys::HtmlInputElement;
+
+use crate::proposal_form::{self, FixtureFile};
+use crate::{data, files};
 
 const EXAMPLE_FILES: &str = "\
 classic_chrome FilmMode=0x0700
@@ -65,12 +67,25 @@ justification: new root session
     }
 }
 
+fn body_identity(kind: ProposalKind, payload: &str) -> Option<(String, String)> {
+    match validate_proposal(kind, payload).ok()? {
+        looklab_schema::ValidatedPayload::Body(body) => Some((body.make, body.model)),
+        _ => None,
+    }
+}
+
 #[component]
 pub fn ProposePage() -> impl IntoView {
     let kind = RwSignal::new(ProposalKind::Mapping);
     let payload = RwSignal::new(example(ProposalKind::Mapping).to_owned());
-    let files = RwSignal::new(EXAMPLE_FILES.to_owned());
-    let donate = RwSignal::new(false);
+    let files_text = RwSignal::new(EXAMPLE_FILES.to_owned());
+    let fixture_files = RwSignal::new(Vec::<FixtureFile>::new());
+    let consented = RwSignal::new(Vec::<bool>::new());
+    let fixture_make = RwSignal::new("Fujifilm".to_owned());
+    let fixture_model = RwSignal::new("X-T5".to_owned());
+    let busy = RwSignal::new(false);
+    let message = RwSignal::new(None::<String>);
+    let submitted = RwSignal::new(None::<ProposalView>);
 
     let preview = move || match validate_proposal(kind.get(), &payload.get()) {
         Ok(validated) => {
@@ -104,7 +119,7 @@ pub fn ProposePage() -> impl IntoView {
         }
     };
 
-    let inference = move || match infer_files(&files.get()) {
+    let inference = move || match proposal_form::parse_labeled_files(&files_text.get()) {
         Ok(inference) => {
             let question = MENU_QUESTION.to_owned();
             let rows = inference
@@ -149,6 +164,85 @@ pub fn ProposePage() -> impl IntoView {
             .into_any()
         }
         Err(error) => view! { <p class="error">{error}</p> }.into_any(),
+    };
+
+    let on_fixtures = move |event: leptos::ev::Event| {
+        let Some(input) = event
+            .target()
+            .and_then(|target| target.dyn_into::<HtmlInputElement>().ok())
+        else {
+            return;
+        };
+        spawn_local(async move {
+            match files::read_input(&input).await {
+                Ok(read) => {
+                    let mut parsed = Vec::with_capacity(read.len());
+                    for file in read {
+                        match FixtureFile::new(file.name, file.bytes) {
+                            Ok(file) => parsed.push(file),
+                            Err(error) => {
+                                message.set(Some(error));
+                                return;
+                            }
+                        }
+                    }
+                    let flags = vec![false; parsed.len()];
+                    fixture_files.set(parsed);
+                    consented.set(flags);
+                }
+                Err(error) => message.set(Some(error)),
+            }
+        });
+    };
+
+    let submit = move |_| {
+        if busy.get() {
+            return;
+        }
+        let current_kind = kind.get();
+        let current_payload = payload.get();
+        if let Err(errors) = validate_proposal(current_kind, &current_payload) {
+            let text = errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            message.set(Some(format!(
+                "The browser validator rejects this payload: {text}"
+            )));
+            return;
+        }
+        let selected = fixture_files.get();
+        let flags = consented.get();
+        let identity = body_identity(current_kind, &current_payload);
+        let fallback_make = fixture_make.get();
+        let fallback_model = fixture_model.get();
+        busy.set(true);
+        message.set(None);
+        submitted.set(None);
+        spawn_local(async move {
+            let (make, model) = identity.unwrap_or((fallback_make, fallback_model));
+            let mut donations = Vec::new();
+            for (index, file) in selected.iter().enumerate() {
+                if !flags.get(index).copied().unwrap_or(false) {
+                    continue;
+                }
+                match proposal_form::donation(file, &make, &model) {
+                    Ok(donation) => donations.push(donation),
+                    Err(error) => {
+                        message.set(Some(error));
+                        busy.set(false);
+                        return;
+                    }
+                }
+            }
+            let outcome = data::submit_proposal(current_kind, &current_payload, &donations).await;
+            match outcome {
+                Ok(reply) => submitted.set(Some(reply.view)),
+                Err(error) => message.set(Some(error)),
+            }
+            busy.set(false);
+        });
     };
 
     view! {
@@ -206,69 +300,99 @@ pub fn ProposePage() -> impl IntoView {
                 id="mapping-files"
                 rows="5"
                 cols="60"
-                prop:value=move || files.get()
-                on:input=move |event| files.set(event_target_value(&event))
+                prop:value=move || files_text.get()
+                on:input=move |event| files_text.set(event_target_value(&event))
             ></textarea>
             {inference}
         </section>
         <section aria-labelledby="fixtures">
             <h2 id="fixtures">"Fixture donation"</h2>
-            <label>
-                <input
-                    type="checkbox"
-                    prop:checked=move || donate.get()
-                    on:change=move |event| donate.set(event_target_checked(&event))
-                />
-                "Donate these files as test fixtures"
-            </label>
-            <p class="muted">
+            <p>
                 "Each file is a separate opt-in. The consent record holds your handle, the date,
                 the CC0-1.0 license and the file's sha256, and exports into fixtures/manifest.toml.
                 Mappings without a donated fixture stay provisional."
             </p>
+            <label for="fixture-files">"Files you can donate"</label>
+            <input type="file" id="fixture-files" multiple on:change=on_fixtures/>
+            <div class="field-row">
+                <label for="fixture-make">"Make"</label>
+                <input
+                    type="text"
+                    id="fixture-make"
+                    prop:value=move || fixture_make.get()
+                    on:input=move |event| fixture_make.set(event_target_value(&event))
+                />
+                <label for="fixture-model">"Model"</label>
+                <input
+                    type="text"
+                    id="fixture-model"
+                    prop:value=move || fixture_model.get()
+                    on:input=move |event| fixture_model.set(event_target_value(&event))
+                />
+            </div>
+            {move || {
+                fixture_files
+                    .get()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, file)| {
+                        view! {
+                            <label class="consent">
+                                <input
+                                    type="checkbox"
+                                    id=format!("donate-{index}")
+                                    prop:checked=move || {
+                                        consented.get().get(index).copied().unwrap_or(false)
+                                    }
+                                    on:change=move |event| {
+                                        let checked = event_target_checked(&event);
+                                        consented
+                                            .update(|values| {
+                                                if let Some(slot) = values.get_mut(index) {
+                                                    *slot = checked;
+                                                }
+                                            });
+                                    }
+                                />
+                                {format!(
+                                    "Donate {} under CC0-1.0 ({} bytes, sha256 {})",
+                                    file.name,
+                                    file.bytes.len(),
+                                    &file.sha256.to_hex()[..16],
+                                )}
+                            </label>
+                        }
+                    })
+                    .collect_view()
+            }}
         </section>
         <section aria-labelledby="submit">
             <h2 id="submit">"Submit"</h2>
             <p>
                 "Submission needs your passkey's signature over the payload and a proof-of-work,
-                and is rate-limited per credential. Until the app is connected, this page only
-                validates and summarizes; nothing is uploaded."
+                and is rate-limited per credential."
             </p>
-            <button type="button" disabled=true>"Sign and submit"</button>
+            <button type="button" id="submit-proposal" disabled=move || busy.get() on:click=submit>
+                {move || if busy.get() { "Signing and working…" } else { "Sign and submit" }}
+            </button>
+            {move || {
+                message
+                    .get()
+                    .map(|text| view! { <p class="error" role="alert">{text}</p> })
+            }}
+            {move || {
+                submitted
+                    .get()
+                    .map(|proposal| {
+                        let href = format!("/proposals/{}", proposal.id.as_str());
+                        view! {
+                            <div class="valid">
+                                <p>"Submitted. It is now in the moderation queue."</p>
+                                <a id="submitted-link" href=href>"Open the proposal"</a>
+                            </div>
+                        }
+                    })
+            }}
         </section>
     }
-}
-
-fn infer_files(text: &str) -> Result<looklab_schema::MappingInference, String> {
-    let mut files = Vec::new();
-    for (index, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (label, rest) = line
-            .split_once(char::is_whitespace)
-            .ok_or_else(|| format!("line {}: expected `answer Tag=value`", index + 1))?;
-        let label =
-            SimKey::try_from(label).map_err(|error| format!("line {}: {error}", index + 1))?;
-        let mut tags = BTreeMap::new();
-        for token in rest.split_whitespace() {
-            let (tag, value) = token
-                .split_once('=')
-                .ok_or_else(|| format!("line {}: `{token}` is not `Tag=value`", index + 1))?;
-            let tag = MakernoteTag::try_from(tag)
-                .map_err(|error| format!("line {}: {error}", index + 1))?;
-            let value: u64 = match value
-                .strip_prefix("0x")
-                .or_else(|| value.strip_prefix("0X"))
-            {
-                Some(hex) => u64::from_str_radix(hex, 16),
-                None => value.parse(),
-            }
-            .map_err(|_| format!("line {}: `{value}` is not a makernote value", index + 1))?;
-            tags.insert(tag, MakernoteValue(value));
-        }
-        files.push(LabeledFile { label, tags });
-    }
-    infer_mapping(&files).map_err(|error| error.to_string())
 }

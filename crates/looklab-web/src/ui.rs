@@ -17,6 +17,12 @@ pub fn failure(message: &str) -> impl IntoView + use<> {
     }
 }
 
+pub fn timestamp(seconds: i64) -> String {
+    let millis = seconds as f64 * 1000.0;
+    let date = js_sys::Date::new(&millis.into());
+    String::from(date.to_iso_string())
+}
+
 #[component]
 pub fn StatusBadge(status: LookStatus) -> impl IntoView {
     let label = status.as_str();

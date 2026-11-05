@@ -5,17 +5,35 @@ use gloo_net::http::Request;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 use looklab_wasm::AssertionFields;
+
+use crate::request_digest::{RequestDomain, challenge, request_digest};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NonceReply {
     pub nonce: [u8; 32],
     pub expires_in_seconds: u64,
     pub pow: Option<PowParameters>,
+}
+
+/// The assertion fields the intake API expects alongside a request payload.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SignedFields {
+    pub nonce: String,
+    pub credential_id: String,
+    pub authenticator_data: String,
+    pub client_data_json: String,
+    pub signature: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignedRequest {
+    pub nonce: [u8; 32],
+    pub pow: Option<PowParameters>,
+    pub fields: SignedFields,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -154,25 +172,51 @@ pub async fn sign_batch(
     assertion_from_json(&json)
 }
 
+/// # Errors
+/// Reports a server failure while issuing the nonce, or a WebAuthn failure.
+pub async fn sign_request(
+    domain: RequestDomain,
+    payload: &[u8],
+    credential_id: Option<&[u8]>,
+) -> Result<SignedRequest, String> {
+    let nonce = fetch_nonce().await?;
+    let digest = request_digest(domain, payload);
+    let challenge = challenge(&nonce.nonce, &digest);
+    let assertion = sign_batch(&challenge, credential_id).await?;
+    Ok(SignedRequest {
+        nonce: nonce.nonce,
+        pow: nonce.pow,
+        fields: SignedFields {
+            nonce: encode_base64url(&nonce.nonce),
+            credential_id: encode_base64url(&assertion.credential_id),
+            authenticator_data: encode_base64url(&assertion.authenticator_data),
+            client_data_json: encode_base64url(&assertion.client_data_json),
+            signature: encode_base64url(&assertion.signature),
+        },
+    })
+}
+
+/// Returns the stored credential id, registering a passkey on first use.
+///
+/// # Errors
+/// Reports a WebAuthn failure or a storage failure.
+pub async fn ensure_credential() -> Result<Vec<u8>, String> {
+    if let Some(text) = crate::idb::get(crate::idb::StorageKey::CREDENTIAL).await? {
+        return decode_base64url(&text)
+            .ok_or_else(|| "the stored credential id is malformed".to_owned());
+    }
+    let id = create_passkey().await?;
+    crate::idb::put(crate::idb::StorageKey::CREDENTIAL, &encode_base64url(&id)).await?;
+    Ok(id)
+}
+
 /// Re-issues the status link from a passkey assertion ([docs/06 §4](../../../docs/06-privacy-and-payload.md)).
 ///
 /// # Errors
 /// Reports a server rejection or a WebAuthn failure.
 pub async fn reissue_status_token(credential_id: Option<&[u8]>) -> Result<String, String> {
-    let nonce = fetch_nonce().await?;
-    let digest = request_digest_status_reissue();
-    let mut hasher = Sha256::new();
-    hasher.update(nonce.nonce);
-    hasher.update(digest);
-    let challenge: [u8; 32] = hasher.finalize().into();
-    let assertion = sign_batch(&challenge, credential_id).await?;
-    let body = serde_json::json!({
-        "nonce": encode_base64url(&nonce.nonce),
-        "credential_id": encode_base64url(&assertion.credential_id),
-        "authenticator_data": encode_base64url(&assertion.authenticator_data),
-        "client_data_json": encode_base64url(&assertion.client_data_json),
-        "signature": encode_base64url(&assertion.signature),
-    });
+    let signed = sign_request(RequestDomain::StatusReissue, &[], credential_id).await?;
+    let body = serde_json::to_value(&signed.fields).map_err(|error| error.to_string())?;
     let response = Request::post("/api/status/reissue")
         .header("Content-Type", "application/json")
         .body(Some(JsValue::from_str(&body.to_string())))
@@ -220,12 +264,6 @@ pub fn rp_id() -> String {
     web_sys::window()
         .and_then(|window| window.location().hostname().ok())
         .unwrap_or_default()
-}
-
-fn request_digest_status_reissue() -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"looklab-request-v1:status-reissue:");
-    hasher.finalize().into()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

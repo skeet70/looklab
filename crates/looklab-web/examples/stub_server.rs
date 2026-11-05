@@ -9,20 +9,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Request, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use looklab_server::{AppState, Config, CredentialId, PowConfig};
 use looklab_upload::{
-    ExpectedAssertion, PowParams, SignatureAlgorithm, StructuralVerdict, check_structure,
+    ExpectedAssertion, Limits, PowParams, SignatureAlgorithm, StructuralVerdict, check_structure,
     parse_envelope_strict, verify as verify_pow,
 };
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tower::ServiceExt as _;
 use webauthn_rs::prelude::{
     CreationChallengeResponse, Passkey, PasskeyRegistration, RegisterPublicKeyCredential, Url,
     Uuid, Webauthn, WebauthnBuilder,
@@ -42,6 +44,8 @@ struct Stub {
     passkeys: Vec<Passkey>,
     tokens: HashMap<String, (String, String)>,
     next_contribution: u64,
+    server: Arc<AppState>,
+    server_routes: Router,
 }
 
 #[derive(Serialize)]
@@ -108,6 +112,7 @@ struct ImageView {
 async fn main() -> anyhow::Result<()> {
     let mut dist = PathBuf::from("site/dist");
     let mut port = 8099u16;
+    let mut state_dir = std::env::temp_dir().join("looklab-stub-state");
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -120,6 +125,10 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("--port"))?
                     .parse()?;
             }
+            "--state" => {
+                state_dir =
+                    PathBuf::from(args.next().ok_or_else(|| anyhow::anyhow!("--state path"))?);
+            }
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
@@ -128,6 +137,36 @@ async fn main() -> anyhow::Result<()> {
     let webauthn = WebauthnBuilder::new(&rp_id, &Url::parse(&origin)?)?
         .rp_name("looklab stub")
         .build()?;
+    std::fs::create_dir_all(&state_dir)?;
+    let secret_path = state_dir.join("server-secret");
+    if !secret_path.exists() {
+        std::fs::write(&secret_path, random_bytes::<32>())?;
+    }
+    let snapshot_dir = state_dir.join("community");
+    std::fs::create_dir_all(&snapshot_dir)?;
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let config = Config {
+        bind: address,
+        db_path: state_dir.join("looklab.sqlite3"),
+        blob_dir: state_dir.join("blobs"),
+        rp_id: rp_id.clone(),
+        origin: origin.clone(),
+        server_secret_path: secret_path,
+        bodies_dir: PathBuf::from("data/bodies"),
+        snapshot_dir,
+        nonce_ttl: Duration::from_secs(3600),
+        registration_ttl: Duration::from_secs(3600),
+        body_timeout: Duration::from_secs(30),
+        blob_retention_days: 30,
+        pow: PowConfig {
+            memory_kib: POW_MEMORY_KIB,
+            iterations: POW_ITERATIONS,
+            difficulty_bits_per_image: POW_DIFFICULTY,
+        },
+        limits: Limits::default(),
+    };
+    let server = Arc::new(AppState::new(config).await?);
+    let server_routes = looklab_server::router(server.clone());
     println!("stub listening on {origin}");
     let stub = Arc::new(Mutex::new(Stub {
         dist,
@@ -139,6 +178,8 @@ async fn main() -> anyhow::Result<()> {
         passkeys: Vec::new(),
         tokens: HashMap::new(),
         next_contribution: 1,
+        server,
+        server_routes,
     }));
 
     let app = Router::new()
@@ -147,6 +188,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/passkey/register/finish", post(register_finish))
         .route("/api/upload", post(upload))
         .route("/status/{token}", get(status))
+        .route("/api/proposals", any(forward_request))
+        .route("/api/proposals/{*rest}", any(forward_request))
+        .route("/api/mod/{*rest}", any(forward_request))
+        .route("/api/fixtures/{*rest}", any(forward_request))
         .fallback(serve)
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(stub);
@@ -158,12 +203,24 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn nonce(State(state): State<Arc<Mutex<Stub>>>) -> Response {
-    let mut stub = state.lock().expect("stub lock");
-    let now = Instant::now();
-    stub.nonces.retain(|_, expires| *expires > now);
-    let mut bytes = [0u8; 32];
-    fill_random(&mut bytes);
-    stub.nonces.insert(bytes, now + Duration::from_secs(300));
+    let (bytes, db, issued_at) = {
+        let mut stub = state.lock().expect("stub lock");
+        let now = Instant::now();
+        stub.nonces.retain(|_, expires| *expires > now);
+        let mut bytes = [0u8; 32];
+        fill_random(&mut bytes);
+        stub.nonces.insert(bytes, now + Duration::from_secs(300));
+        (bytes, stub.server.db.clone(), unix_now())
+    };
+    let issued = sqlx::query("INSERT INTO nonces (nonce, issued_at, expires_at) VALUES (?, ?, ?)")
+        .bind(hex(&bytes))
+        .bind(issued_at)
+        .bind(issued_at + 300)
+        .execute(&db)
+        .await;
+    if let Err(error) = issued {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
     Json(NonceResponse {
         nonce: URL_SAFE_NO_PAD.encode(bytes),
         expires_in_seconds: 300,
@@ -196,20 +253,45 @@ async fn register_finish(
     State(state): State<Arc<Mutex<Stub>>>,
     Json(payload): Json<RegisterFinishRequest>,
 ) -> Response {
-    let mut stub = state.lock().expect("stub lock");
-    let Some(registration) = stub.registrations.remove(&payload.handle) else {
-        return error_response(StatusCode::NOT_FOUND, "unknown registration");
-    };
-    match stub
-        .webauthn
-        .finish_passkey_registration(&payload.credential, &registration)
-    {
-        Ok(passkey) => {
-            stub.passkeys.push(passkey);
-            Json(serde_json::json!({ "state": "pending_upload" })).into_response()
+    let (server, passkey) = {
+        let mut stub = state.lock().expect("stub lock");
+        let Some(registration) = stub.registrations.remove(&payload.handle) else {
+            return error_response(StatusCode::NOT_FOUND, "unknown registration");
+        };
+        match stub
+            .webauthn
+            .finish_passkey_registration(&payload.credential, &registration)
+        {
+            Ok(passkey) => {
+                stub.passkeys.push(passkey.clone());
+                (stub.server.clone(), passkey)
+            }
+            Err(error) => return error_response(StatusCode::BAD_REQUEST, &error.to_string()),
         }
-        Err(error) => error_response(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    if let Err(error) = persist_credential(&server, &passkey).await {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
+    Json(serde_json::json!({ "state": "pending_upload" })).into_response()
+}
+
+async fn persist_credential(server: &AppState, passkey: &Passkey) -> Result<(), sqlx::Error> {
+    let raw_id = passkey.cred_id().as_slice().to_vec();
+    let passkey_json =
+        serde_json::to_string(passkey).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO credentials
+         (id, credential_id, webauthn_credential, display_handle, tier, roles, reputation,
+          created_at, status)
+         VALUES (?, ?, ?, 'stub', 'new', '[\"moderator\"]', 0.5, ?, 'active')",
+    )
+    .bind(CredentialId::new().as_str())
+    .bind(&raw_id)
+    .bind(passkey_json)
+    .bind(unix_now())
+    .execute(&server.db)
+    .await?;
+    Ok(())
 }
 
 async fn upload(State(state): State<Arc<Mutex<Stub>>>, body: Bytes) -> Response {
@@ -317,6 +399,16 @@ async fn status(
     .into_response()
 }
 
+async fn forward_request(State(state): State<Arc<Mutex<Stub>>>, request: Request) -> Response {
+    let routes = state.lock().expect("stub lock").server_routes.clone();
+    let (mut parts, body) = request.into_parts();
+    parts.extensions.clear();
+    match routes.oneshot(Request::from_parts(parts, body)).await {
+        Ok(response) => response,
+        Err(error) => match error {},
+    }
+}
+
 async fn serve(State(state): State<Arc<Mutex<Stub>>>, uri: Uri) -> Response {
     let dist = state.lock().expect("stub lock").dist.clone();
     let requested = uri.path().trim_start_matches('/');
@@ -363,6 +455,21 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
     fill_random(&mut bytes);
     bytes
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 fn fill_random(bytes: &mut [u8]) {

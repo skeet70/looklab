@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Fetching site data and checking every artifact against its version manifest.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use gloo_net::http::Request;
 use looklab_model::LookDocument;
@@ -9,8 +9,16 @@ use looklab_publish::{
     ArtifactHash, AuditLog, BodyPage, LUT_BYTES, LookArtifact, LookPage, PreparedScene, Scene,
     SceneIndex, SceneName, SiteIndex, VersionManifest, VersionSummary, verify_artifact,
 };
-use looklab_schema::ProposalView;
+use looklab_schema::{FixtureDonation, LabeledTag, ProposalKind, ProposalRef, ProposalView};
+use looklab_wasm::prep::{ModuleFunction, default_pow};
+use looklab_wasm::{PowParamsSpec, decode_pow_reply, module_fn_id, solve_pow_request};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use wasm_bindgen::JsValue;
+
+use crate::request_digest::{RequestDomain, challenge, request_digest};
+use crate::webauthn::{self, PowParameters, SignedFields};
+use crate::worker;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Load<T> {
@@ -71,18 +79,8 @@ pub async fn look(slug: &str) -> Result<LookPage, String> {
     get_json(&format!("/data/looks/{slug}.json")).await
 }
 
-pub async fn proposal(id: &str) -> Result<ProposalView, String> {
-    get_json(&format!("/data/proposals/{id}.json")).await
-}
-
-pub async fn proposal_queue() -> Result<Vec<ProposalView>, String> {
-    let file: ProposalQueueFile = get_json("/data/proposals/queue.json").await?;
-    Ok(file.proposals)
-}
-
-#[derive(serde::Deserialize)]
-struct ProposalQueueFile {
-    proposals: Vec<ProposalView>,
+pub async fn proposal(id: &ProposalRef) -> Result<ProposalView, String> {
+    get_json(&format!("/api/proposals/{}", id.as_str())).await
 }
 
 pub async fn audit_log() -> Result<AuditLog, String> {
@@ -244,4 +242,423 @@ pub async fn version(slug: &str, version: &str) -> Result<LoadedVersion, String>
         diagnostics,
         artifacts,
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct ProposalMessage {
+    pub author: MessageAuthor,
+    #[serde(default)]
+    pub handle: Option<String>,
+    pub body: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageAuthor {
+    Proposer,
+    Moderator,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct ModeratorProposal {
+    pub proposal: ProposalView,
+    pub payload: String,
+    #[serde(default)]
+    pub thread: Vec<ProposalMessage>,
+    #[serde(default)]
+    pub round_trip: Option<RoundTripReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct RoundTripReport {
+    pub probes: usize,
+    pub target_clipped: usize,
+    pub flagged: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct QueueProposal {
+    pub id: ProposalRef,
+    pub kind: ProposalKind,
+    pub summary: String,
+    pub created_at: i64,
+}
+
+#[derive(Deserialize)]
+struct Queue {
+    proposals: Vec<QueueProposal>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Decision {
+    Approve,
+    Reject,
+    RequestInfo,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct SnapshotRecord {
+    pub version: u64,
+    pub content_hash: String,
+    pub files: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct DecisionReceipt {
+    #[serde(default)]
+    pub snapshot: Option<SnapshotRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct Submitted {
+    pub view: ProposalView,
+}
+
+#[derive(Deserialize)]
+struct SessionReply {
+    session_token: String,
+}
+
+#[derive(Deserialize)]
+struct ThreadReply {
+    #[serde(default)]
+    messages: Vec<ProposalMessage>,
+}
+
+#[derive(Serialize)]
+struct SubmitSigningBody<'a> {
+    kind: &'a str,
+    payload: &'a str,
+    fixtures: &'a [FixtureDonation],
+}
+
+#[derive(Serialize)]
+struct SubmitRequest<'a> {
+    kind: &'a str,
+    payload: &'a str,
+    fixtures: &'a [FixtureDonation],
+    pow: Vec<u64>,
+    #[serde(flatten)]
+    signed: &'a SignedFields,
+}
+
+#[derive(Serialize)]
+struct ConfirmationSigningBody<'a> {
+    proposal_id: &'a str,
+    tags: &'a [LabeledTag],
+}
+
+#[derive(Serialize)]
+struct ConfirmRequest<'a> {
+    proposal_id: &'a str,
+    tags: &'a [LabeledTag],
+    #[serde(flatten)]
+    signed: &'a SignedFields,
+}
+
+#[derive(Serialize)]
+struct ThreadSigningBody<'a> {
+    proposal_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct ThreadRequest<'a> {
+    proposal_id: &'a str,
+    #[serde(flatten)]
+    signed: &'a SignedFields,
+}
+
+#[derive(Serialize)]
+struct ProposerMessageSigningBody<'a> {
+    proposal_id: &'a str,
+    body: &'a str,
+}
+
+#[derive(Serialize)]
+struct ProposerMessageRequest<'a> {
+    proposal_id: &'a str,
+    body: &'a str,
+    #[serde(flatten)]
+    signed: &'a SignedFields,
+}
+
+#[derive(Serialize)]
+struct ModerationDecisionRequest<'a> {
+    proposal_id: &'a str,
+    decision: Decision,
+    reason: &'a str,
+}
+
+#[derive(Serialize)]
+struct ModerationMessageRequest<'a> {
+    proposal_id: &'a str,
+    body: &'a str,
+}
+
+#[derive(Clone)]
+struct ModeratorToken(String);
+
+impl std::fmt::Debug for ModeratorToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ModeratorToken(..)")
+    }
+}
+
+static MODERATION_SESSION: Mutex<Option<ModeratorToken>> = Mutex::new(None);
+
+pub fn moderation_session_open() -> bool {
+    MODERATION_SESSION
+        .lock()
+        .map(|token| token.is_some())
+        .unwrap_or(false)
+}
+
+pub fn close_moderation_session() {
+    if let Ok(mut slot) = MODERATION_SESSION.lock() {
+        *slot = None;
+    }
+}
+
+/// # Errors
+/// Reports a WebAuthn failure or a missing moderator role.
+pub async fn open_moderation_session() -> Result<(), String> {
+    let credential = webauthn::ensure_credential().await?;
+    let signed = webauthn::sign_request(RequestDomain::ModSession, &[], Some(&credential)).await?;
+    let request = Request::post("/api/mod/session")
+        .header("Content-Type", "application/json")
+        .body(Some(json_body(&signed.fields)?))
+        .map_err(|error| error.to_string())?;
+    let reply: SessionReply = api_send("/api/mod/session", request).await?;
+    if let Ok(mut slot) = MODERATION_SESSION.lock() {
+        *slot = Some(ModeratorToken(reply.session_token));
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Reports a closed session or a server failure.
+pub async fn moderation_queue() -> Result<Vec<QueueProposal>, String> {
+    let token = moderation_token()?;
+    let request = Request::get("/api/mod/queue")
+        .header("Authorization", &format!("Bearer {}", token.0))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let queue: Queue = api_send("/api/mod/queue", request).await?;
+    Ok(queue.proposals)
+}
+
+/// # Errors
+/// Reports a closed session or a server failure.
+pub async fn moderator_proposal(id: &ProposalRef) -> Result<ModeratorProposal, String> {
+    let token = moderation_token()?;
+    let path = format!("/api/mod/proposal/{}", id.as_str());
+    let request = Request::get(&path)
+        .header("Authorization", &format!("Bearer {}", token.0))
+        .build()
+        .map_err(|error| error.to_string())?;
+    api_send(&path, request).await
+}
+
+/// # Errors
+/// Reports a closed session, a missing reason or a server failure.
+pub async fn decide(
+    id: &ProposalRef,
+    decision: Decision,
+    reason: &str,
+) -> Result<DecisionReceipt, String> {
+    let token = moderation_token()?;
+    let body = ModerationDecisionRequest {
+        proposal_id: id.as_str(),
+        decision,
+        reason,
+    };
+    let request = Request::post("/api/mod/decision")
+        .header("Content-Type", "application/json")
+        .header("Authorization", &format!("Bearer {}", token.0))
+        .body(Some(json_body(&body)?))
+        .map_err(|error| error.to_string())?;
+    api_send("/api/mod/decision", request).await
+}
+
+/// # Errors
+/// Reports a closed session or a server failure.
+pub async fn moderator_message(id: &ProposalRef, body: &str) -> Result<(), String> {
+    let token = moderation_token()?;
+    let request = Request::post("/api/mod/proposal-message")
+        .header("Content-Type", "application/json")
+        .header("Authorization", &format!("Bearer {}", token.0))
+        .body(Some(json_body(&ModerationMessageRequest {
+            proposal_id: id.as_str(),
+            body,
+        })?))
+        .map_err(|error| error.to_string())?;
+    let _: serde_json::Value = api_send("/api/mod/proposal-message", request).await?;
+    Ok(())
+}
+
+/// # Errors
+/// Reports a WebAuthn failure, an invalid tag list or a server rejection.
+pub async fn confirm_proposal(
+    id: &ProposalRef,
+    tags: &[LabeledTag],
+) -> Result<ProposalView, String> {
+    let credential = webauthn::ensure_credential().await?;
+    let bytes = serde_json::to_vec(&ConfirmationSigningBody {
+        proposal_id: id.as_str(),
+        tags,
+    })
+    .map_err(|error| error.to_string())?;
+    let signed = webauthn::sign_request(
+        RequestDomain::ProposalConfirmation,
+        &bytes,
+        Some(&credential),
+    )
+    .await?;
+    let request = Request::post("/api/proposals/confirm")
+        .header("Content-Type", "application/json")
+        .body(Some(json_body(&ConfirmRequest {
+            proposal_id: id.as_str(),
+            tags,
+            signed: &signed.fields,
+        })?))
+        .map_err(|error| error.to_string())?;
+    api_send("/api/proposals/confirm", request).await
+}
+
+/// # Errors
+/// Reports a WebAuthn failure, a closed proposal or a server rejection.
+pub async fn proposer_thread(id: &ProposalRef) -> Result<Vec<ProposalMessage>, String> {
+    let credential = webauthn::ensure_credential().await?;
+    let bytes = serde_json::to_vec(&ThreadSigningBody {
+        proposal_id: id.as_str(),
+    })
+    .map_err(|error| error.to_string())?;
+    let signed =
+        webauthn::sign_request(RequestDomain::ProposalThread, &bytes, Some(&credential)).await?;
+    let request = Request::post("/api/proposals/thread")
+        .header("Content-Type", "application/json")
+        .body(Some(json_body(&ThreadRequest {
+            proposal_id: id.as_str(),
+            signed: &signed.fields,
+        })?))
+        .map_err(|error| error.to_string())?;
+    let reply: ThreadReply = api_send("/api/proposals/thread", request).await?;
+    Ok(reply.messages)
+}
+
+/// # Errors
+/// Reports a WebAuthn failure, a closed proposal or a server rejection.
+pub async fn proposer_message(id: &ProposalRef, body: &str) -> Result<(), String> {
+    let credential = webauthn::ensure_credential().await?;
+    let bytes = serde_json::to_vec(&ProposerMessageSigningBody {
+        proposal_id: id.as_str(),
+        body,
+    })
+    .map_err(|error| error.to_string())?;
+    let signed =
+        webauthn::sign_request(RequestDomain::ProposalThread, &bytes, Some(&credential)).await?;
+    let request = Request::post("/api/proposals/message")
+        .header("Content-Type", "application/json")
+        .body(Some(json_body(&ProposerMessageRequest {
+            proposal_id: id.as_str(),
+            body,
+            signed: &signed.fields,
+        })?))
+        .map_err(|error| error.to_string())?;
+    let _: serde_json::Value = api_send("/api/proposals/message", request).await?;
+    Ok(())
+}
+
+/// # Errors
+/// Reports a WebAuthn failure, proof-of-work failure or a server rejection.
+pub async fn submit_proposal(
+    kind: ProposalKind,
+    payload: &str,
+    fixtures: &[FixtureDonation],
+) -> Result<Submitted, String> {
+    let credential = webauthn::ensure_credential().await?;
+    let bytes = serde_json::to_vec(&SubmitSigningBody {
+        kind: kind.as_str(),
+        payload,
+        fixtures,
+    })
+    .map_err(|error| error.to_string())?;
+    let signed = webauthn::sign_request(RequestDomain::Proposal, &bytes, Some(&credential)).await?;
+    let digest = request_digest(RequestDomain::Proposal, &bytes);
+    let challenge = challenge(&signed.nonce, &digest);
+    let pow = solve_pow(challenge, signed.pow.unwrap_or_else(default_parameters)).await?;
+    let request = Request::post("/api/proposals")
+        .header("Content-Type", "application/json")
+        .body(Some(json_body(&SubmitRequest {
+            kind: kind.as_str(),
+            payload,
+            fixtures,
+            pow,
+            signed: &signed.fields,
+        })?))
+        .map_err(|error| error.to_string())?;
+    api_send("/api/proposals", request).await
+}
+
+fn moderation_token() -> Result<ModeratorToken, String> {
+    MODERATION_SESSION
+        .lock()
+        .ok()
+        .and_then(|token| token.clone())
+        .ok_or_else(|| "open a moderator session first".to_owned())
+}
+
+fn default_parameters() -> PowParameters {
+    let defaults = default_pow();
+    PowParameters {
+        memory_kib: defaults.memory_kib,
+        iterations: defaults.iterations,
+        difficulty_bits_per_image: defaults.difficulty_bits_per_image,
+    }
+}
+
+async fn solve_pow(challenge: [u8; 32], params: PowParameters) -> Result<Vec<u64>, String> {
+    let request = solve_pow_request(
+        challenge,
+        1,
+        PowParamsSpec {
+            memory_kib: params.memory_kib,
+            iterations: params.iterations,
+            difficulty_bits_per_image: params.difficulty_bits_per_image,
+        },
+        0,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut worker = worker::PrepWorker::spawn()?;
+    let reply = worker
+        .call(module_fn_id(ModuleFunction::SolvePow), request)
+        .await;
+    worker.terminate();
+    let reply = reply.map_err(|error| error.message())?;
+    Ok(decode_pow_reply(&reply.bytes)
+        .map_err(|error| error.to_string())?
+        .solutions
+        .to_vec())
+}
+
+fn json_body<T: Serialize>(value: &T) -> Result<JsValue, String> {
+    serde_json::to_string(value)
+        .map(|text| JsValue::from_str(&text))
+        .map_err(|error| error.to_string())
+}
+
+async fn api_send<T: DeserializeOwned>(path: &str, request: Request) -> Result<T, String> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("{path}: {error}"))?;
+    if !response.ok() {
+        return Err(format!("{path}: HTTP {}", response.status()));
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| format!("{path}: {error}"))
 }

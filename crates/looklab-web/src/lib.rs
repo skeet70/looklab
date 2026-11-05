@@ -9,6 +9,8 @@ pub mod idb;
 pub mod match_data;
 pub mod pages;
 pub mod preview;
+pub mod proposal_form;
+pub mod request_digest;
 pub mod ui;
 pub mod webauthn;
 pub mod worker;

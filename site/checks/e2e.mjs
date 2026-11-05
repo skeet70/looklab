@@ -2,14 +2,18 @@
 // Browser checks: worker round trip, match/permalink, contribute upload with HAR, page screenshots.
 
 import { copyFile, link, mkdir, readFile, writeFile } from 'node:fs/promises';
-import { pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 
 const USAGE = `usage: node site/checks/e2e.mjs [options]
 
   --browser chromium|firefox   engine to drive (default chromium)
-  --flow all|match|contribute|pages|flatness
+  --flow all|match|contribute|pages|flatness|propose
   --origin URL                 stub server origin (default http://localhost:8099)
   --out DIR                    artifact directory (default /tmp/looklab-e2e)
+  --state DIR                  stub server state, must match --state (default /tmp/looklab-stub-state)
   --raw FILE --jpeg FILE       the contribution files
   --body ID --firmware V --sim KEY
   --controls "key=step,..."    control steps, comma separated
@@ -22,17 +26,18 @@ const USAGE = `usage: node site/checks/e2e.mjs [options]
 needs the built site behind the stub server and Playwright from nix:
 
   cd site && nix develop -c env CARGO_TARGET_DIR=target trunk build --release
-  nix develop -c cargo run -p looklab-web --features stub --example stub_server -- --port 8099
+  nix develop -c cargo run -p looklab-web --features stub --example stub_server -- --port 8099 --state /tmp/looklab-e2e/stub-state
   nix develop -c env \\
     PLAYWRIGHT_MODULE=$(nix eval --raw nixpkgs#playwright-driver)/index.js \\
     PLAYWRIGHT_BROWSERS_PATH=$(nix eval --raw nixpkgs#playwright-driver.browsers) \\
-    node site/checks/e2e.mjs --browser chromium --flow all --out /tmp/looklab-e2e`;
+    node site/checks/e2e.mjs --browser chromium --flow all --out /tmp/looklab-e2e --state /tmp/looklab-e2e/stub-state`;
 
 const options = {
   browser: 'chromium',
   flow: 'all',
   origin: 'http://localhost:8099',
   out: '/tmp/looklab-e2e',
+  state: '/tmp/looklab-stub-state',
   raw: 'fixtures/fujifilm-x-s10.raf',
   jpeg: 'fixtures/generated/fujifilm-x-s10.jpg',
   body: 'fujifilm/x-s10',
@@ -404,6 +409,60 @@ async function linkOrCopy(from, to) {
   }
 }
 
+function validateSnapshot(directory) {
+  const output = execFileSync(
+    'cargo',
+    ['run', '-q', '-p', 'looklab-cli', '--', 'validate-snapshot', directory],
+    { cwd: REPO_ROOT, encoding: 'utf8', env: process.env },
+  );
+  console.log(output.trim());
+  check(output.includes('valid snapshot'), `looklab validate-snapshot accepts ${directory}`);
+}
+
+async function propose(size) {
+  const fixture = `${options.out}/fixture-${size}.raf`;
+  await writeFile(fixture, `looklab fixture donation for ${size}\n`);
+  const session = await open(VIEWPORTS[size]);
+  const { page, problems } = session;
+  try {
+    await page.goto(`${options.origin}/propose`);
+    await page.waitForSelector('#kind', { timeout: 60_000 });
+    await page.selectOption('#kind', 'body');
+    await page.setInputFiles('#fixture-files', [fixture]);
+    await page.waitForSelector('#donate-0', { timeout: 60_000 });
+    await page.check('#donate-0');
+    await page.screenshot({ path: `${options.out}/propose-${size}.png`, fullPage: true });
+    check(await page.isChecked('#donate-0'), `${options.browser} ${size}: fixture consent is per file`);
+
+    await page.click('#submit-proposal');
+    await page.waitForSelector('#submitted-link', { timeout: 300_000 });
+    const href = await page.locator('#submitted-link').getAttribute('href');
+    check(Boolean(href), `${options.browser} ${size}: submission returned a proposal`);
+    const id = href.split('/').pop();
+    await page.click('#submitted-link');
+    await page.waitForSelector('text=Evidence', { timeout: 60_000 });
+    await page.screenshot({ path: `${options.out}/proposal-${size}.png`, fullPage: true });
+
+    await page.goto(`${options.origin}/mod`);
+    await page.waitForSelector('#mod-open-session', { timeout: 60_000 });
+    await page.click('#mod-open-session');
+    await page.waitForSelector('#mod-queue', { timeout: 60_000 });
+    await page.click(`button[data-proposal="${id}"]`);
+    await page.waitForSelector('#mod-proposal', { timeout: 60_000 });
+    await page.screenshot({ path: `${options.out}/moderate-${size}.png`, fullPage: true });
+    await page.fill('#mod-reason', 'The payload validates and the donated fixture matches it.');
+    await page.click('#mod-approve');
+    await page.waitForSelector('#mod-decision', { timeout: 300_000 });
+    const version = await page.getAttribute('#mod-decision', 'data-snapshot-version');
+    check(Boolean(version), `${options.browser} ${size}: approval wrote snapshot v${version}`);
+    await page.screenshot({ path: `${options.out}/decision-${size}.png`, fullPage: true });
+    check(problems.length === 0, `${options.browser} ${size}: no page errors during the proposal flow`);
+    return { id, version };
+  } finally {
+    await close(session);
+  }
+}
+
 const result = { browser: options.browser, out: options.out };
 if (options.flow === 'all' || options.flow === 'match') {
   result.permalink = await match('desktop');
@@ -426,6 +485,12 @@ if (options.flow === 'all' || options.flow === 'pages') {
     options.permalink = Buffer.from(result.permalink, 'utf8').toString('base64url');
   }
   await pages();
+}
+if (options.flow === 'all' || options.flow === 'propose') {
+  result.proposals = [await propose('desktop'), await propose('mobile')];
+  for (const entry of result.proposals) {
+    validateSnapshot(`${options.state}/community/v${entry.version}`);
+  }
 }
 if (options.flow === 'flatness') {
   result.flatness = await flatness();
