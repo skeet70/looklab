@@ -15,7 +15,8 @@ use crate::problem::{ActiveColumns, BlockAcc, IntentFilter, PassOutput, Problem,
 use crate::solve::{factor_in_place, select_lambda, select_lambda_diagonal, solve_in_place};
 use crate::types::{
     ControlResponseFit, Diagnostics, ExcludeReason, ExcludedImage, ExposureOffset, FitImage,
-    FitOptions, FitResult, ImageIntent, ImageNuisances, Realization, Result, StageLambdas, Verdict,
+    FitOptions, FitResult, ImageIntent, ImageNuisances, ProbeUncertainty, Realization, Result,
+    StageLambdas, Verdict,
 };
 use crate::uncertainty;
 
@@ -210,6 +211,26 @@ pub(crate) fn run_with(
     model: Option<ControlResponseModel>,
     excluded: Vec<ExcludedImage>,
 ) -> Result<FitResult> {
+    run_inner(images, options, model, excluded, None, true)
+}
+
+/// Fit without the probe/response uncertainty.
+pub(crate) fn run_quick(
+    images: &[FitImage],
+    options: &FitOptions,
+    initial: Option<&looklab_model::Look>,
+) -> Result<FitResult> {
+    run_inner(images, options, None, Vec::new(), initial, false)
+}
+
+fn run_inner(
+    images: &[FitImage],
+    options: &FitOptions,
+    model: Option<ControlResponseModel>,
+    excluded: Vec<ExcludedImage>,
+    initial: Option<&looklab_model::Look>,
+    want_uncertainty: bool,
+) -> Result<FitResult> {
     let mut native_positions: Vec<Option<usize>> = vec![None; images.len()];
     let mut native = Vec::new();
     for (index, image) in images.iter().enumerate() {
@@ -224,6 +245,9 @@ pub(crate) fn run_with(
     let mut problem = Problem::new_with(&native, model.as_ref(), options)?;
     let mut layout = problem.layout.clone();
     let mut params = initial_params(&problem);
+    if let Some(look) = initial {
+        apply_look(&problem, &mut params, look);
+    }
     let mut roles = prior_roles(&problem, &layout);
     let mut lambdas = StageLambdas::default();
     let mut evaluations = 0usize;
@@ -469,20 +493,26 @@ pub(crate) fn run_with(
     // The exposure/body gauge is a definition (docs/02 §2.1), not an estimate, so
     // the Look's covariance is conditional on the exposure nuisances.
     let uncertainty_columns = ActiveColumns::ALL;
-    let mut uncertainty_blocks = vec![
-        make_look_block(&layout, uncertainty_columns),
-        make_block(&problem, BlockKind::Residual, uncertainty_columns),
-    ];
-    let uncertainty_pass = problem.pass(
-        &params,
-        uncertainty_columns,
-        &mut uncertainty_blocks,
-        false,
-        true,
-        false,
-        IntentFilter::All,
-    );
-    evaluations += 1;
+    let mut uncertainty_blocks = want_uncertainty.then(|| {
+        vec![
+            make_look_block(&layout, uncertainty_columns),
+            make_block(&problem, BlockKind::Residual, uncertainty_columns),
+        ]
+    });
+    let uncertainty_pass = uncertainty_blocks.as_mut().map(|blocks| {
+        problem.pass(
+            &params,
+            uncertainty_columns,
+            blocks,
+            false,
+            true,
+            false,
+            IntentFilter::All,
+        )
+    });
+    if uncertainty_pass.is_some() {
+        evaluations += 1;
+    }
     let _ = &final_pass.per_image_gradient;
     let (prior_cost, dense_reg) =
         prior_and_reg(&problem, &params, &blocks, &penalties, &lambdas, options);
@@ -520,83 +550,98 @@ pub(crate) fn run_with(
 
     let density = density::build(&problem, &params, options.density_floor_fraction);
     let image_stats = outlier::score(&problem, &final_pass, options);
-    let uncertainty_penalty = double(combined_look_penalty(
-        &problem,
-        &layout,
-        &lambdas,
-        uncertainty_blocks[0].len(),
-        true,
-    ));
-    let joint = uncertainty::probe_uncertainty(
-        &problem,
-        &params,
-        &look,
-        &uncertainty_blocks[0],
-        &uncertainty_penalty,
-        uncertainty_pass.active_samples.max(1) as f64 / uncertainty_pass.hessian_rows.max(1) as f64,
-        &lambdas,
-        &uncertainty_pass.per_image_gradient,
-        &density,
-        &uncertainty_pass.residual_samples,
-        options,
-    );
-    let probe_result = match joint {
-        Ok(result) => result,
-        Err(crate::types::FitError::SingularRegularization) => {
-            let look_params: Vec<usize> = uncertainty_blocks[0]
-                .params
-                .iter()
-                .copied()
-                .filter(|index| !layout.response.contains(index))
-                .collect();
-            let mut blocks = vec![
-                BlockAcc::new(BlockKind::Tone, look_params, layout.total),
-                make_block(&problem, BlockKind::Residual, ActiveColumns::ALL),
-            ];
-            let fallback_pass = problem.pass(
-                &params,
-                ActiveColumns::ALL,
-                &mut blocks,
-                false,
-                true,
-                false,
-                IntentFilter::All,
-            );
-            let penalty = double(combined_look_penalty(
-                &problem,
-                &layout,
-                &lambdas,
-                blocks[0].len(),
-                false,
-            ));
-            uncertainty::probe_uncertainty(
-                &problem,
-                &params,
-                &look,
-                &blocks[0],
-                &penalty,
-                fallback_pass.active_samples.max(1) as f64
-                    / fallback_pass.hessian_rows.max(1) as f64,
-                &lambdas,
-                &fallback_pass.per_image_gradient,
-                &density,
-                &fallback_pass.residual_samples,
-                options,
-            )?
-        }
-        Err(error) => return Err(error),
-    };
-
-    let hessian_scale =
-        final_pass.active_samples.max(1) as f64 / final_pass.hessian_rows.max(1) as f64;
-    let (parameter_ids, covariance) = uncertainty::response_covariance(
-        &problem,
-        &blocks,
-        &penalties,
-        &lambdas,
-        hessian_scale,
-        &final_pass.per_image_gradient,
-    );
+    let (probe_result, parameter_ids, covariance) =
+        match (uncertainty_blocks.as_ref(), uncertainty_pass.as_ref()) {
+            (Some(uncertainty_blocks), Some(uncertainty_pass)) => {
+                let uncertainty_penalty = double(combined_look_penalty(
+                    &problem,
+                    &layout,
+                    &lambdas,
+                    uncertainty_blocks[0].len(),
+                    true,
+                ));
+                let joint = uncertainty::probe_uncertainty(
+                    &problem,
+                    &params,
+                    &look,
+                    &uncertainty_blocks[0],
+                    &uncertainty_penalty,
+                    uncertainty_pass.active_samples.max(1) as f64
+                        / uncertainty_pass.hessian_rows.max(1) as f64,
+                    &lambdas,
+                    &uncertainty_pass.per_image_gradient,
+                    &density,
+                    &uncertainty_pass.residual_samples,
+                    options,
+                );
+                let probes = match joint {
+                    Ok(result) => result,
+                    Err(crate::types::FitError::SingularRegularization) => {
+                        let look_params: Vec<usize> = uncertainty_blocks[0]
+                            .params
+                            .iter()
+                            .copied()
+                            .filter(|index| !layout.response.contains(index))
+                            .collect();
+                        let mut fallback = vec![
+                            BlockAcc::new(BlockKind::Tone, look_params, layout.total),
+                            make_block(&problem, BlockKind::Residual, ActiveColumns::ALL),
+                        ];
+                        let fallback_pass = problem.pass(
+                            &params,
+                            ActiveColumns::ALL,
+                            &mut fallback,
+                            false,
+                            true,
+                            false,
+                            IntentFilter::All,
+                        );
+                        let penalty = double(combined_look_penalty(
+                            &problem,
+                            &layout,
+                            &lambdas,
+                            fallback[0].len(),
+                            false,
+                        ));
+                        uncertainty::probe_uncertainty(
+                            &problem,
+                            &params,
+                            &look,
+                            &fallback[0],
+                            &penalty,
+                            fallback_pass.active_samples.max(1) as f64
+                                / fallback_pass.hessian_rows.max(1) as f64,
+                            &lambdas,
+                            &fallback_pass.per_image_gradient,
+                            &density,
+                            &fallback_pass.residual_samples,
+                            options,
+                        )?
+                    }
+                    Err(error) => return Err(error),
+                };
+                let hessian_scale =
+                    final_pass.active_samples.max(1) as f64 / final_pass.hessian_rows.max(1) as f64;
+                let (parameter_ids, covariance) = uncertainty::response_covariance(
+                    &problem,
+                    &blocks,
+                    &penalties,
+                    &lambdas,
+                    hessian_scale,
+                    &final_pass.per_image_gradient,
+                );
+                (probes, parameter_ids, covariance)
+            }
+            _ => (
+                ProbeUncertainty {
+                    probes: Vec::new(),
+                    ids: Vec::new(),
+                    supported_fraction: 0.0,
+                },
+                Vec::new(),
+                Vec::new(),
+            ),
+        };
     let control_response = model.map(|template| {
         build_control_response(template, &problem, &params, parameter_ids, covariance)
     });

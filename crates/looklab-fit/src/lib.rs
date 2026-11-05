@@ -3,10 +3,13 @@
 #![allow(clippy::needless_range_loop)]
 
 mod basis;
+pub mod bootstrap;
 mod cam;
 mod density;
 pub mod epoch;
 mod fit;
+pub mod gauge;
+pub mod hierarchical;
 mod layout;
 mod outlier;
 mod predict;
@@ -18,7 +21,22 @@ mod uncertainty;
 #[cfg(feature = "synth")]
 pub mod synth;
 
-pub use epoch::{SplitDecision, SplitOptions, SplitSample, detect_split};
+pub use bootstrap::{
+    BOOTSTRAP_RESAMPLES, BootstrapOptions, Cov3, PublishedUncertainty, UncertaintyMethod,
+    published_uncertainty,
+};
+pub use epoch::{
+    ImageProjection, PROJECTION_DIM, SampleProjection, SplitDecision, SplitOptions, SplitSample,
+    detect_split, project_images,
+};
+pub use gauge::{
+    ComponentGauge, ExposureGauge, GaugeChange, WbGaugeChange, WbModeClass, merge_gauges,
+};
+pub use hierarchical::{
+    BodyData, BodyGroup, BodyParameters, FIRMWARE_PARAMETERS, FirmwareId, HierDiagnostics,
+    HierImage, HierOptions, HierarchicalFit, LookFamilyId, LookParameters, LookProvenance,
+    firmware_images, firmware_look, fit_hierarchical,
+};
 pub use looklab_color::{Mat3, RgbSpace, Xyz};
 pub use looklab_model::realization::{
     ControlResponseModel, ControlValue, ResponseParamId, Settings,
@@ -30,6 +48,7 @@ pub use types::{
     ImageIntent, ImageNuisances, OutlierReason, ProbeEstimate, ProbeUncertainty, Realization,
     Result, StageLambdas, Verdict,
 };
+pub use uncertainty::small_cluster_factor;
 
 /// Fit one body's single Look at the reference control setting.
 pub fn fit(images: &[FitImage], options: &FitOptions) -> Result<FitResult> {

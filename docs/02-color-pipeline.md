@@ -243,12 +243,14 @@ A positive result opens a moderation proposal.
 Per Look version, per-probe 3×3 predictive covariance:
 
 1. **Fit (interactive path):** an image-clustered **sandwich estimator** `Σ_θ = H⁻¹ (Σ_i g_i g_iᵀ) H⁻¹`, where `g_i` is image *i*'s summed gradient at the optimum. It's propagated to probes through the Jacobian. Optionally cluster by contributor for an even more conservative estimate.
-2. **Bootstrap (published versions):** B = 32 warm-started refits on images resampled with replacement.
+2. **Bootstrap (published versions):** B = 32 warm-started refits on image clusters resampled with replacement; a cluster is one body's images, so within-body correlation is kept (a single-body pool is the image bootstrap).
 3. **Cross-body disagreement:** covariance of leave-one-body-out predictions.
 
 Combination: `Σ_fit = Σ_boot` when available, else `Σ_sandwich`, then `Σ_total = Σ_fit + Σ_disagree`. Scalar `σ_ΔE = sqrt(tr Σ_total)`.
 
-**Support:** a probe is *supported* iff `σ_ΔE ≤ 1.5` **and** density ≥ the floor. This automatically excludes pre-clip values the data can't identify (§3.4). Unsupported probes are excluded from matching objectives and hatched in plots.
+**Support:** a probe is *supported* iff `σ_ΔE ≤ 1.5` **and** density ≥ the floor **and** at least `min_probe_clusters` images (tentative 3) carry non-negligible weight in its region **and** no channel of its predicted output lies in a soft-clip shoulder (`> 1 − k` or `< k`), where pre-clip values are not constrained (§3.4). This automatically excludes pre-clip values the data can't identify (§3.4). Unsupported probes are excluded from matching objectives and hatched in plots.
+
+**Small clusters:** for the sandwich path the meat is scaled by `G/(G−1)` and `σ_ΔE` by `t_{0.95,G−1}/z_{0.95}`, where `G` is the number of active image clusters in the fit (Cameron & Miller 2015, *J. Hum. Resour.* 50(2), eq. 10-11; MacKinnon & White 1985). Published versions use the bootstrap when available.
 
 ## 6. Probe set (v1)
 

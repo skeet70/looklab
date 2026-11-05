@@ -16,6 +16,8 @@ use crate::layout::Layout;
 
 pub(crate) struct ImageCtx {
     pub transform: Mat3,
+    /// Prior mean `A0`; `transform = a0·(I + Δ)`.
+    pub a0: Mat3,
     pub space: RgbSpace,
     pub exposure: f64,
     pub wb_r: f64,
@@ -38,6 +40,15 @@ pub(crate) struct ColumnMap {
     pub wb_r: Option<usize>,
     pub wb_b: Option<usize>,
     pub clip: Option<usize>,
+    /// Body-level exposure `ξ`, with the same derivative as `image`.
+    pub exposure_extra: Option<usize>,
+    /// Body-level WB `ω`, with the same derivative as the per-image nuisances.
+    pub wb_r_extra: Option<usize>,
+    pub wb_b_extra: Option<usize>,
+    /// Body-level clip, with the same derivative as `clip`.
+    pub clip_extra: Option<usize>,
+    /// Six body input-transform parameters, ordered as [`looklab_body::Delta6`].
+    pub delta: Option<[usize; 6]>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -311,8 +322,7 @@ pub(crate) fn evaluate_sample(
 
     let model = reference_model();
     let xyz0 = model.jmh_to_xyz(ucs_to_jmh(pre, UcsSpace::Ucs));
-    let rgb0 = image.space.xyz_to_rgb_linear(xyz0);
-    let channels = [rgb0.r, rgb0.g, rgb0.b];
+    let channels = output_channels(pre, image.space);
     let clipped = channels.map(|value| soft_clip(value, clip_k));
     let xyz1 = image
         .space
@@ -411,9 +421,15 @@ pub(crate) fn evaluate_sample(
     if let Some(index) = columns.mode {
         jac.push(index, d_out_ds);
     }
+    if let Some(index) = columns.exposure_extra {
+        jac.push(index, d_out_ds);
+    }
 
     let needs_xyz = columns.wb_r.is_some()
         || columns.wb_b.is_some()
+        || columns.wb_r_extra.is_some()
+        || columns.wb_b_extra.is_some()
+        || columns.delta.is_some()
         || terms.iter().any(|term| {
             matches!(
                 term.component,
@@ -453,6 +469,24 @@ pub(crate) fn evaluate_sample(
     {
         jac.push(index, derivative);
     }
+    if let Some(index) = columns.wb_r_extra
+        && let Some(derivative) = wb_derivative(0)
+    {
+        jac.push(index, derivative);
+    }
+    if let Some(index) = columns.wb_b_extra
+        && let Some(derivative) = wb_derivative(2)
+    {
+        jac.push(index, derivative);
+    }
+    if let (Some(indices), Some(jacobian)) = (columns.delta, d_out_dxyz.as_ref()) {
+        for (index, slot) in indices.iter().enumerate() {
+            let column = image
+                .a0
+                .mul_vec(looklab_body::Delta6::basis(index).mul_vec(cam));
+            jac.push(*slot, jacobian.mul_vec(column));
+        }
+    }
     if !terms.is_empty() {
         push_response_columns(
             jac,
@@ -468,6 +502,9 @@ pub(crate) fn evaluate_sample(
 
     jac.apply(&clip_jacobian);
     if let Some(index) = columns.clip {
+        jac.push(index, scale(dk, clip_slope));
+    }
+    if let Some(index) = columns.clip_extra {
         jac.push(index, scale(dk, clip_slope));
     }
 
@@ -688,6 +725,22 @@ fn d_out_d_xyz(
     out
 }
 
+/// Linear `space` RGB of the pre-clip prediction.
+pub(crate) fn output_channels(pre: Ucs, space: RgbSpace) -> [f64; 3] {
+    let model = reference_model();
+    let xyz = model.jmh_to_xyz(ucs_to_jmh(pre, UcsSpace::Ucs));
+    let rgb = space.xyz_to_rgb_linear(xyz);
+    [rgb.r, rgb.g, rgb.b]
+}
+
+/// Whether any linear output channel of the pre-clip prediction lies in a
+/// soft-clip shoulder, where the data does not constrain the pre-clip value.
+pub(crate) fn in_clip_shoulder(pre: Ucs, space: RgbSpace, clip_k: f64) -> bool {
+    output_channels(pre, space)
+        .iter()
+        .any(|value| *value > 1.0 - clip_k || *value < clip_k)
+}
+
 /// Pre-clip `J'a'b'` of one probe and `dJ'a'b'/dθ`, for the sandwich estimator.
 pub(crate) fn evaluate_probe(
     look: &Look,
@@ -723,6 +776,7 @@ mod tests {
         let nuisance = params.image(0);
         ImageCtx {
             transform,
+            a0: transform,
             space,
             exposure: nuisance[0],
             wb_r: libm::exp(nuisance[1]),
@@ -789,6 +843,11 @@ mod tests {
             wb_r: Some(layout.image(0).start + 1),
             wb_b: Some(layout.image(0).start + 2),
             clip: Some(layout.clip),
+            exposure_extra: None,
+            wb_r_extra: None,
+            wb_b_extra: None,
+            clip_extra: None,
+            delta: None,
         };
         let white = Xyz::new(0.950_455_927_051_671_6, 1.0, 1.089_057_750_759_878_4);
         let cases = [

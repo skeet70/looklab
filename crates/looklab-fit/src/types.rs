@@ -34,6 +34,8 @@ pub enum FitError {
     NoNativeImages,
     #[error("control response: {0}")]
     Realization(#[from] looklab_model::realization::RealizationError),
+    #[error("hierarchical fit: {0}")]
+    Hierarchy(String),
 }
 
 pub type Result<T, E = FitError> = core::result::Result<T, E>;
@@ -102,6 +104,10 @@ pub struct FitOptions {
     pub exposure_mode_prior_sd: f64,
     pub density_floor_fraction: f64,
     pub support_sigma: f64,
+    /// Minimum images with non-negligible weight near a probe (tentative 3).
+    pub min_probe_clusters: usize,
+    /// Scale the image-clustered sandwich for few clusters (Cameron & Miller 2015).
+    pub sandwich_correction: bool,
     pub run_gcv: bool,
     pub fit_residual: bool,
     /// Sweeps of the recipe stage, which holds θ_L fixed (docs/02 §4.3).
@@ -125,6 +131,8 @@ impl Default for FitOptions {
             exposure_mode_prior_sd: 0.3,
             density_floor_fraction: 0.02,
             support_sigma: 1.5,
+            min_probe_clusters: 3,
+            sandwich_correction: true,
             run_gcv: true,
             fit_residual: true,
             recipe_sweeps: 4,
@@ -219,6 +227,8 @@ pub struct ProbeEstimate {
     pub sigma_de: f64,
     pub density: f64,
     pub supported: bool,
+    /// Images with non-negligible weight in the probe's region.
+    pub clusters: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]

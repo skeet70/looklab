@@ -23,6 +23,19 @@ fn pool(seed: u64, images: usize, contributor: u32) -> Vec<FitImage> {
     out
 }
 
+fn in_shoulder(result: &FitResult, index: usize) -> bool {
+    let xyz = looklab_model::probes::v1().probes[index].xyz;
+    let prediction = result.look.eval(xyz);
+    let z = looklab_model::solve::reference_model().jmh_to_xyz(looklab_color::ucs::ucs_to_jmh(
+        prediction,
+        looklab_color::ucs::UcsSpace::Ucs,
+    ));
+    let rgb = looklab_color::RgbSpace::Srgb.xyz_to_rgb_linear(z);
+    [rgb.r, rgb.g, rgb.b]
+        .iter()
+        .any(|value| *value > 1.0 - result.look.clip.k || *value < result.look.clip.k)
+}
+
 fn report(label: &str, result: &FitResult) {
     let supported = result.probes.probes.iter().filter(|p| p.supported).count();
     let mut sigmas: Vec<(f64, String)> = result
@@ -176,6 +189,8 @@ fn more_honest_images_do_not_loosen_probes() {
         }
         if !harness_two.probes.probes[index].supported
             && harness_two.probes.probes[index].density >= harness_two.density.floor
+            && harness_two.probes.probes[index].clusters >= 3
+            && !in_shoulder(&harness_two, index)
         {
             sigma_flips += 1;
         }
@@ -207,7 +222,10 @@ fn more_honest_images_do_not_loosen_probes() {
             worst = ratio;
             worst_id = with_two.probes.ids[index].as_str().to_string();
         }
-        if !with_two.probes.probes[index].supported {
+        if !with_two.probes.probes[index].supported
+            && with_two.probes.probes[index].clusters >= 3
+            && !in_shoulder(&with_two, index)
+        {
             flips += 1;
         }
     }

@@ -394,6 +394,7 @@ impl Problem {
         }
         ImageCtx {
             transform: image.transform,
+            a0: image.transform,
             space: image.space,
             exposure: nuisance[0]
                 + image.mode.map_or(0.0, |mode| params.mode_offset(mode))
@@ -414,6 +415,12 @@ impl Problem {
             wb_r: active.wb.then_some(range.start + 1),
             wb_b: active.wb.then_some(range.start + 2),
             clip: active.clip.then_some(params.layout.clip),
+            // Body-level columns do not exist in the single-body layout.
+            exposure_extra: None,
+            wb_r_extra: None,
+            wb_b_extra: None,
+            clip_extra: None,
+            delta: None,
         }
     }
 

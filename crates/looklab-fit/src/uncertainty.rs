@@ -10,6 +10,90 @@ use crate::problem::{BlockAcc, Problem, ResidualSample};
 use crate::solve::{factor_in_place, solve_in_place};
 use crate::types::{Density, FitOptions, ProbeEstimate, ProbeUncertainty, Result};
 
+const CLUSTER_S: f64 = 0.75;
+const CLUSTER_HUE_DEG: f64 = 20.0;
+const CLUSTER_C: f64 = 12.0;
+
+struct ClusterSample {
+    image: u32,
+    s: f64,
+    h: f64,
+    c: f64,
+    weight: f64,
+}
+
+fn cluster_samples(problem: &Problem, params: &Params) -> Vec<ClusterSample> {
+    problem
+        .samples
+        .iter()
+        .map(|sample| {
+            let image = sample.image as usize;
+            let context = problem.image_ctx(params, image);
+            let exposure = libm::pow(2.0, context.exposure);
+            let xyz = looklab_color::Xyz::from_array(context.transform.mul_vec([
+                sample.rgb[0] * context.wb_r * exposure,
+                sample.rgb[1] * exposure,
+                sample.rgb[2] * context.wb_b * exposure,
+            ]));
+            let input = LookInput::new(xyz);
+            ClusterSample {
+                image: sample.image,
+                s: input.s,
+                h: input.h_in,
+                c: input.c_in,
+                weight: sample.weight,
+            }
+        })
+        .collect()
+}
+
+fn probe_cluster_count(samples: &[ClusterSample], xyz: looklab_color::Xyz, images: usize) -> usize {
+    let input = LookInput::new(xyz);
+    let mut last = vec![usize::MAX; images];
+    let mut count = 0usize;
+    for (index, sample) in samples.iter().enumerate() {
+        if sample.weight <= 0.0 || (sample.s - input.s).abs() > CLUSTER_S {
+            continue;
+        }
+        let mut delta = (sample.h - input.h_in).abs() % 360.0;
+        if delta > 180.0 {
+            delta = 360.0 - delta;
+        }
+        if delta > CLUSTER_HUE_DEG || (sample.c - input.c_in).abs() > CLUSTER_C {
+            continue;
+        }
+        let image = sample.image as usize;
+        if last[image] != index {
+            last[image] = index;
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Small-cluster scaling of the sandwich covariance (`G/(G−1)` times the
+/// `t_{0.95,G−1}/z` band factor squared; 1 when `G < 2`).
+pub fn small_cluster_factor(clusters: usize) -> f64 {
+    if clusters < 2 {
+        return 1.0;
+    }
+    let g = clusters as f64;
+    let t = student_t_95(g - 1.0);
+    g / (g - 1.0) * t * t / (1.644_853_626_951_472_2 * 1.644_853_626_951_472_2)
+}
+
+/// Student-t 95th percentile, Cornish-Fisher expansion (Abramowitz & Stegun 26.7.5).
+fn student_t_95(dof: f64) -> f64 {
+    let z = 1.644_853_626_951_472_2;
+    let v = dof.max(1.0);
+    let z3 = z * z * z;
+    let z5 = z3 * z * z;
+    let z7 = z5 * z * z;
+    z + (z3 + z) / (4.0 * v)
+        + (5.0 * z5 + 16.0 * z3 + 3.0 * z) / (96.0 * v * v)
+        + (3.0 * z7 + 19.0 * z5 + 17.0 * z3 - 15.0 * z) / (384.0 * v * v * v)
+}
+
 fn invert(h: &[f64], n: usize) -> Option<Vec<f64>> {
     if n == 0 {
         return Some(Vec::new());
@@ -110,7 +194,12 @@ pub(crate) fn probe_uncertainty(
     let residual_start = layout.residual.start;
 
     let (_, beta_slope) = problem.look_and_slope(params);
+    let space = problem
+        .images
+        .first()
+        .map_or(looklab_color::RgbSpace::Srgb, |image| image.space);
     let probes = looklab_model::probes::v1();
+    let cluster_samples = cluster_samples(problem, params);
     let mut jac = Jac::default();
     let mut estimates = Vec::with_capacity(probes.probes.len());
     let mut supported = 0usize;
@@ -176,6 +265,17 @@ pub(crate) fn probe_uncertainty(
                 covariance[a][b] = covariance[b][a];
             }
         }
+        let clusters = probe_cluster_count(&cluster_samples, probe.xyz, problem.images.len());
+        let factor = if options.sandwich_correction {
+            small_cluster_factor(problem.active_images)
+        } else {
+            1.0
+        };
+        for row in &mut covariance {
+            for value in row {
+                *value *= factor;
+            }
+        }
         let sigma_de = (covariance[0][0] + covariance[1][1] + covariance[2][2])
             .max(0.0)
             .sqrt();
@@ -212,8 +312,10 @@ pub(crate) fn probe_uncertainty(
         }
         let input = LookInput::new(probe.xyz);
         let local_density = density.at(input.s, input.h_in, input.c_in);
-        let is_supported = sigma_de <= options.support_sigma && local_density >= density.floor;
-        let _ = &pre;
+        let is_supported = sigma_de <= options.support_sigma
+            && local_density >= density.floor
+            && clusters >= options.min_probe_clusters
+            && !crate::predict::in_clip_shoulder(pre, space, look.clip.k);
         if is_supported {
             supported += 1;
         }
@@ -224,6 +326,7 @@ pub(crate) fn probe_uncertainty(
             sigma_de,
             density: local_density,
             supported: is_supported,
+            clusters,
         });
     }
     let ids = probes

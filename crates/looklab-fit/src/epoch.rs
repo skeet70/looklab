@@ -70,6 +70,77 @@ pub fn detect_split(samples: &[SplitSample], options: &SplitOptions) -> Option<S
     }
 }
 
+/// Two firmware basis directions: a `T` offset and a `log G` offset.
+pub const PROJECTION_DIM: usize = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SampleProjection {
+    pub residual: [f64; 3],
+    /// `∂ J'a'b' / ∂δ_fw` for each firmware basis coordinate.
+    pub basis: [[f64; 3]; PROJECTION_DIM],
+    pub weight: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageProjection {
+    pub group: u32,
+    pub samples: Vec<SampleProjection>,
+}
+
+/// Least-squares projection of each image's residuals onto the firmware-offset
+/// basis, one two-vector per image.
+pub fn project_images(images: &[ImageProjection]) -> Vec<SplitSample> {
+    let mut out = Vec::with_capacity(images.len());
+    for image in images {
+        if image.samples.is_empty() {
+            continue;
+        }
+        let mut hessian = [[0.0_f64; PROJECTION_DIM]; PROJECTION_DIM];
+        let mut gradient = [0.0_f64; PROJECTION_DIM];
+        let mut norms = Vec::with_capacity(image.samples.len());
+        for sample in &image.samples {
+            norms.push(sample.residual.iter().map(|v| v * v).sum::<f64>().sqrt());
+            for a in 0..PROJECTION_DIM {
+                let mut term = 0.0;
+                for channel in 0..3 {
+                    term += sample.basis[a][channel] * sample.residual[channel];
+                }
+                gradient[a] += sample.weight * term;
+                for b in 0..PROJECTION_DIM {
+                    let mut dot = 0.0;
+                    for channel in 0..3 {
+                        dot += sample.basis[a][channel] * sample.basis[b][channel];
+                    }
+                    hessian[a][b] += sample.weight * dot;
+                }
+            }
+        }
+        let ridge = 1e-9 * (hessian[0][0] + hessian[1][1] + 1e-30);
+        hessian[0][0] += ridge;
+        hessian[1][1] += ridge;
+        let determinant = hessian[0][0] * hessian[1][1] - hessian[0][1] * hessian[1][0];
+        if determinant.abs() < 1e-18 {
+            continue;
+        }
+        let projection = [
+            (hessian[1][1] * gradient[0] - hessian[0][1] * gradient[1]) / determinant,
+            (hessian[0][0] * gradient[1] - hessian[1][0] * gradient[0]) / determinant,
+        ];
+        norms.sort_by(|a, b| a.total_cmp(b));
+        let effect_de = if norms.len() % 2 == 0 {
+            0.5 * (norms[norms.len() / 2 - 1] + norms[norms.len() / 2])
+        } else {
+            norms[norms.len() / 2]
+        };
+        out.push(SplitSample {
+            group: image.group,
+            projection,
+            effect_de,
+        });
+    }
+    out
+}
+
 fn compare(
     samples: &[SplitSample],
     left: u32,

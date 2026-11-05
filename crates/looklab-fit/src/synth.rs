@@ -15,7 +15,12 @@ use looklab_samples::{
 use rand_chacha::ChaCha12Rng;
 use rand_chacha::rand_core::{RngCore, SeedableRng};
 
-use crate::types::{ExposureModeId, FitImage};
+use crate::gauge::WbModeClass;
+use crate::hierarchical::{
+    BodyData, FIRMWARE_PARAMETERS, FirmwareId, HierImage, LookFamilyId, firmware_look,
+};
+use crate::types::{ContributorId, ExposureModeId, FitImage};
+use looklab_body::{A0Source, BodyId, BodyPrior, Delta6, InputTransform, TransformVersion};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SynthConfig {
@@ -656,4 +661,300 @@ pub fn mode_id(model: &ControlResponseModel, settings: &Settings) -> ExposureMod
         .position(|mode| settings.get(&mode.control) == Some(&mode.value))
         .map(|index| ExposureModeId(index as u32))
         .unwrap_or_default()
+}
+
+#[derive(Clone, Debug)]
+pub struct MultiBodyConfig {
+    pub seed: u64,
+    pub bodies: usize,
+    pub images_per_body: usize,
+    pub samples_per_image: usize,
+    pub noise_ucs: f64,
+    pub nu: f64,
+    pub clip_k: f64,
+    pub space: RgbSpace,
+    pub look_families: usize,
+    pub firmware: usize,
+    /// Offset of firmware 1 when `firmware > 1`.
+    pub firmware_shift: [f64; FIRMWARE_PARAMETERS],
+    pub exposure_modes: usize,
+    pub wb_modes: usize,
+    pub delta_sd: f64,
+    pub exposure_sd: f64,
+    pub wb_sd: f64,
+    pub hint_sd: f64,
+}
+
+impl Default for MultiBodyConfig {
+    fn default() -> Self {
+        Self {
+            seed: 0x3eed_0b0d_1e55,
+            bodies: 3,
+            images_per_body: 3,
+            samples_per_image: 600,
+            noise_ucs: 0.35,
+            nu: 4.0,
+            clip_k: 0.03,
+            space: RgbSpace::Srgb,
+            look_families: 2,
+            firmware: 1,
+            firmware_shift: [0.0, 0.0],
+            exposure_modes: 2,
+            wb_modes: 2,
+            delta_sd: 0.004,
+            exposure_sd: 0.09,
+            wb_sd: 0.008,
+            hint_sd: 0.03,
+        }
+    }
+}
+
+pub struct SynthBody {
+    pub id: BodyId,
+    pub a0: Mat3,
+    pub truth_delta: Delta6,
+    pub truth_exposure: Vec<(ExposureModeId, f64)>,
+    pub truth_wb: Vec<(WbModeClass, [f64; 2])>,
+    pub images: Vec<HierImage>,
+    pub points: Vec<Vec<Xyz>>,
+    /// Per image: `[x, log w_R, log w_B]`.
+    pub image_nuisances: Vec<[f64; 3]>,
+}
+
+pub struct MultiBodyDataset {
+    pub bodies: Vec<SynthBody>,
+    pub truths: Vec<(LookFamilyId, Look)>,
+    pub firmware_truth: Vec<(FirmwareId, [f64; FIRMWARE_PARAMETERS])>,
+    pub clip_k: f64,
+}
+
+impl MultiBodyDataset {
+    /// The synthetic bodies in the fit's input shape.
+    pub fn body_data(&self) -> Vec<BodyData> {
+        self.bodies
+            .iter()
+            .map(|body| {
+                let prior = BodyPrior {
+                    source: A0Source::Dng,
+                    a0_a: body.a0,
+                    a0_d65: body.a0,
+                };
+                BodyData {
+                    id: body.id.clone(),
+                    transform: InputTransform::prior(
+                        body.id.clone(),
+                        TransformVersion::new(1),
+                        prior,
+                    ),
+                    default_mode: ExposureModeId(0),
+                    default_wb_mode: WbModeClass(0),
+                    images: body.images.clone(),
+                    charts: Vec::new(),
+                }
+            })
+            .collect()
+    }
+
+    pub fn truth(&self, look: LookFamilyId) -> Option<&Look> {
+        self.truths
+            .iter()
+            .find(|(id, _)| *id == look)
+            .map(|(_, look)| look)
+    }
+}
+
+pub fn multi_body(config: &MultiBodyConfig) -> MultiBodyDataset {
+    let mut rng = ChaCha12Rng::seed_from_u64(config.seed);
+    let body_count = config.bodies.max(1);
+    let families = config.look_families.max(1);
+    let truths: Vec<(LookFamilyId, Look)> = (0..families)
+        .map(|family| {
+            (
+                LookFamilyId(family as u32),
+                truth_look(config.seed + 0x51 + family as u64),
+            )
+        })
+        .collect();
+    let firmware_truth: Vec<(FirmwareId, [f64; FIRMWARE_PARAMETERS])> = (0..config.firmware.max(1))
+        .map(|version| {
+            (
+                FirmwareId(version as u32),
+                if version == 1 {
+                    config.firmware_shift
+                } else {
+                    [0.0; FIRMWARE_PARAMETERS]
+                },
+            )
+        })
+        .collect();
+
+    let mut delta_params: Vec<[f64; 6]> = (0..body_count)
+        .map(|_| core::array::from_fn(|_| config.delta_sd * gaussian(&mut rng)))
+        .collect();
+    let mut mean = [0.0_f64; 6];
+    for params in &delta_params {
+        for (slot, value) in mean.iter_mut().zip(params.iter()) {
+            *slot += value / body_count as f64;
+        }
+    }
+    for params in &mut delta_params {
+        for (value, shift) in params.iter_mut().zip(mean.iter()) {
+            *value -= shift;
+        }
+    }
+
+    let mut bodies = Vec::with_capacity(body_count);
+    for body_index in 0..body_count {
+        let id = BodyId::new(format!("body-{body_index}")).expect("generated id is non-empty");
+        let a0 = camera_matrix(&mut rng);
+        let truth_delta = Delta6::new(delta_params[body_index]).expect("delta within range");
+        let truth_exposure: Vec<(ExposureModeId, f64)> = (0..config.exposure_modes.max(1))
+            .map(|mode| {
+                let value = if body_index == 0 && mode == 0 {
+                    0.0
+                } else {
+                    config.exposure_sd * gaussian(&mut rng)
+                };
+                (ExposureModeId(mode as u32), value)
+            })
+            .collect();
+        let truth_wb: Vec<(WbModeClass, [f64; 2])> = (0..config.wb_modes.max(1))
+            .map(|mode| {
+                let value = if body_index == 0 && mode == 0 {
+                    [0.0, 0.0]
+                } else {
+                    [
+                        config.wb_sd * gaussian(&mut rng),
+                        config.wb_sd * gaussian(&mut rng),
+                    ]
+                };
+                (WbModeClass(mode as u32), value)
+            })
+            .collect();
+        let transform = a0.mul(&truth_delta.transform());
+        let inverse = transform.inverse().unwrap_or(Mat3::IDENTITY);
+        let mut images = Vec::with_capacity(config.images_per_body);
+        let mut points = Vec::with_capacity(config.images_per_body);
+        let mut image_nuisances = Vec::with_capacity(config.images_per_body);
+        for image_index in 0..config.images_per_body {
+            let mode = ExposureModeId((image_index % config.exposure_modes.max(1)) as u32);
+            let wb_mode = WbModeClass((image_index % config.wb_modes.max(1)) as u32);
+            let family = LookFamilyId(if body_index == 0 {
+                0
+            } else if body_index + 1 == body_count {
+                (families - 1) as u32
+            } else if image_index < config.images_per_body.div_ceil(2) {
+                0
+            } else {
+                (families - 1) as u32
+            });
+            let firmware = FirmwareId((image_index % config.firmware.max(1)) as u32);
+            let xi = truth_exposure
+                .iter()
+                .find(|(candidate, _)| *candidate == mode)
+                .map_or(0.0, |(_, value)| *value);
+            let omega = truth_wb
+                .iter()
+                .find(|(candidate, _)| *candidate == wb_mode)
+                .map_or([0.0; 2], |(_, value)| *value);
+            let exposure = config.exposure_sd * 0.7 * gaussian(&mut rng);
+            let wb = [
+                config.wb_sd * 0.7 * gaussian(&mut rng),
+                config.wb_sd * 0.7 * gaussian(&mut rng),
+            ];
+            let hint = exposure + config.hint_sd * gaussian(&mut rng);
+            let gain = [
+                libm::exp(omega[0] + wb[0]) * libm::pow(2.0, xi + exposure),
+                libm::pow(2.0, xi + exposure),
+                libm::exp(omega[1] + wb[1]) * libm::pow(2.0, xi + exposure),
+            ];
+            let offset = firmware_truth
+                .iter()
+                .find(|(candidate, _)| *candidate == firmware)
+                .map_or([0.0; 2], |(_, value)| *value);
+            let truth = truths
+                .iter()
+                .find(|(candidate, _)| *candidate == family)
+                .map(|(_, look)| look);
+            let mut xyz_points = Vec::with_capacity(config.samples_per_image);
+            let mut in_rgb = Vec::with_capacity(config.samples_per_image);
+            let mut out_rgb = Vec::with_capacity(config.samples_per_image);
+            let mut density = Vec::with_capacity(config.samples_per_image);
+            let mut flags = Vec::with_capacity(config.samples_per_image);
+            for sample_index in 0..config.samples_per_image {
+                let neutral = sample_index % 4 == 0;
+                let colour = scene_color(&mut rng, neutral);
+                let camera_xyz = inverse.mul_vec([colour.x, colour.y, colour.z]);
+                let camera = [
+                    camera_xyz[0] / gain[0],
+                    camera_xyz[1] / gain[1],
+                    camera_xyz[2] / gain[2],
+                ];
+                if let Some(base) = truth {
+                    let look = firmware_look(base, offset);
+                    let clean = look.eval(colour);
+                    let jitter = [
+                        student_t(&mut rng, config.nu) * config.noise_ucs,
+                        student_t(&mut rng, config.nu) * config.noise_ucs,
+                        student_t(&mut rng, config.nu) * config.noise_ucs,
+                    ];
+                    let noisy = looklab_color::ucs::Ucs::new(
+                        clean.j + jitter[0],
+                        clean.a + jitter[1],
+                        clean.b + jitter[2],
+                    );
+                    let xyz = reference_model().jmh_to_xyz(ucs_to_jmh(noisy, UcsSpace::Ucs));
+                    let linear = config.space.xyz_to_rgb_linear(xyz);
+                    let clipped = Rgb::new(
+                        soft_clip(linear.r, config.clip_k),
+                        soft_clip(linear.g, config.clip_k),
+                        soft_clip(linear.b, config.clip_k),
+                    );
+                    out_rgb.push(clipped.to_array().map(|value| value as f32));
+                } else {
+                    out_rgb.push([0.5; 3]);
+                }
+                xyz_points.push(colour);
+                in_rgb.push(camera.map(|value| value.clamp(-0.4, 32.0) as f32));
+                density.push(1.0_f32);
+                flags.push(SampleFlags::NONE);
+            }
+            let samples = SampleSet::new(
+                header(config.samples_per_image, config.space),
+                in_rgb,
+                out_rgb,
+                density,
+                flags,
+            )
+            .unwrap_or_else(|_| unreachable!("generated samples are in range"));
+            let mut image = FitImage::new(samples, a0);
+            image.exposure_hint = hint;
+            image.exposure_mode = mode;
+            image.contributor = ContributorId(body_index as u32);
+            images.push(HierImage {
+                image,
+                look: family,
+                firmware,
+                wb_mode,
+            });
+            image_nuisances.push([exposure, wb[0], wb[1]]);
+            points.push(xyz_points);
+        }
+        bodies.push(SynthBody {
+            id,
+            a0,
+            truth_delta,
+            truth_exposure,
+            truth_wb,
+            images,
+            points,
+            image_nuisances,
+        });
+    }
+    MultiBodyDataset {
+        bodies,
+        truths,
+        firmware_truth,
+        clip_k: config.clip_k,
+    }
 }

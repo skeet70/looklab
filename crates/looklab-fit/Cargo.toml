@@ -13,6 +13,7 @@ default = []
 synth = ["dep:rand_chacha"]
 
 [dependencies]
+looklab-body.workspace = true
 looklab-color.workspace = true
 looklab-samples.workspace = true
 looklab-model.workspace = true
