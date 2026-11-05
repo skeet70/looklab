@@ -74,6 +74,28 @@ fn serialized_metadata_contains_no_dropped_values() {
 }
 
 #[test]
+fn render_tag_leaves_only_parsed_fields() {
+    const TOKEN: &str = "looklab-card/1 fw=acme-sim/2.0.1 look=provia@1.0.0 cid=0123456789abcdef";
+    let mut payload = b"ASCII\0\0\0".to_vec();
+    payload.extend_from_slice(TOKEN.as_bytes());
+    let tiff = support::build_tiff(&[], &[(0x9286, support::Value::Undefined(payload))], None);
+    let parsed = parse_tiff(&tiff).expect("synthetic TIFF");
+    let (sanitized, removed) = sanitize(&parsed);
+
+    let tag = sanitized.render_tag.as_ref().expect("render tag");
+    assert_eq!(tag.firmware_id.as_str(), "acme-sim");
+    assert_eq!(tag.firmware_version.as_str(), "2.0.1");
+    assert_eq!(tag.look_slug.as_str(), "provia");
+    assert_eq!(tag.look_version.as_str(), "1.0.0");
+    assert_eq!(tag.cid_prefix_hex(), "0123456789abcdef");
+
+    let json = serde_json::to_string(&sanitized).expect("sanitized metadata is JSON");
+    support::assert_whitelisted_keys(&json);
+    assert!(!json.contains("looklab-card/1"), "raw tag leaked in {json}");
+    assert!(removed.contains(RemovedField::UserComment));
+}
+
+#[test]
 fn removed_fields_name_every_dropped_picture_identifier() {
     let parsed = parse_tiff(&support::full_exif_tiff()).expect("synthetic TIFF");
     let (_, removed) = sanitize(&parsed);

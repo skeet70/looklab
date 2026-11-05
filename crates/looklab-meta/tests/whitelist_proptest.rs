@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 mod support;
 
-use looklab_meta::{parse, parse_tiff, sanitize};
+use looklab_meta::{RemovedField, parse, parse_tiff, sanitize};
 use proptest::prelude::*;
 
 fn value_strategy() -> impl Strategy<Value = support::Value> {
@@ -97,6 +97,24 @@ proptest! {
             let removed_json = serde_json::to_string(&removed).expect("removed fields are JSON");
             prop_assert!(!removed_json.contains("SERIAL123"));
         }
+    }
+
+    #[test]
+    fn arbitrary_user_comments_never_leave_the_device(suffix in "[ -~]{0,80}") {
+        let comment = format!("RAW:{suffix}");
+        let mut payload = b"ASCII\0\0\0".to_vec();
+        payload.extend_from_slice(comment.as_bytes());
+        let tiff = support::build_tiff(
+            &[],
+            &[(0x9286, support::Value::Undefined(payload))],
+            None,
+        );
+        let parsed = parse_tiff(&tiff).expect("synthetic TIFF");
+        let (sanitized, removed) = sanitize(&parsed);
+        let json = serde_json::to_string(&sanitized).expect("sanitized metadata is JSON");
+        support::assert_whitelisted_keys(&json);
+        prop_assert!(!json.contains(&comment), "raw UserComment leaked");
+        prop_assert!(removed.contains(RemovedField::UserComment));
     }
 
     #[test]

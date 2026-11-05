@@ -2,6 +2,7 @@
 
 use crate::error::MetaError;
 use crate::fuji::{self, FujiMakernote};
+use crate::render_tag::{RenderTag, parse_render_tag};
 use crate::serial::RawSerial;
 use crate::tiff::{Entry, Tiff};
 use crate::types::{
@@ -39,6 +40,7 @@ pub struct ParsedMetadata {
     /// Camera firmware: RAF header `FirmwareVersion` (0x3c, four digits normalized to `x.yy`),
     /// else the `Ver` token of the EXIF `Software` tag (`Ver1.00` -> `1.00`).
     pub firmware: Option<String>,
+    pub render_tag: Option<RenderTag>,
 }
 
 impl ParsedMetadata {
@@ -160,7 +162,21 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<ParsedMetadata, MetaError> {
         },
         fuji,
         firmware: None,
+        render_tag: parse_user_comment(get(TAG_USER_COMMENT)),
     })
+}
+
+fn parse_user_comment(entry: Option<&Entry<'_>>) -> Option<RenderTag> {
+    let bytes = entry.and_then(Entry::undefined)?;
+    let bytes = bytes
+        .strip_prefix(b"ASCII\0\0\0")
+        .or_else(|| bytes.strip_prefix(b"\0\0\0\0\0\0\0\0"))
+        .unwrap_or(bytes);
+    let end = bytes
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |index| index + 1);
+    parse_render_tag(core::str::from_utf8(&bytes[..end]).ok()?).ok()
 }
 
 fn parse_capture_time(datetime: &str, subsec: Option<&str>) -> Option<CaptureTime> {

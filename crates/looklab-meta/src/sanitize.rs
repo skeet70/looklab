@@ -5,6 +5,7 @@ use serde::{Serialize, Serializer};
 
 use crate::exif::ParsedMetadata;
 use crate::fuji::LookSettings;
+use crate::render_tag::RenderTag;
 use crate::types::{
     Aperture, ExposureCompensation, ExposureTime, FocalLength, Iso, WhiteBalanceMultipliers,
     YearMonth,
@@ -36,6 +37,8 @@ pub struct SanitizedMetadata {
     pub capture_month: Option<YearMonth>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub software: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub render_tag: Option<RenderTag>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub look: Option<LookSettings>,
 }
@@ -71,6 +74,7 @@ pub fn sanitize(parsed: &ParsedMetadata) -> (SanitizedMetadata, RemovedFields) {
             .as_ref()
             .and_then(|time| YearMonth::new(time.year, time.month)),
         software: exif.software.clone(),
+        render_tag: parsed.render_tag.clone(),
         look: fuji
             .map(|fuji| fuji.look.clone())
             .filter(|look| !look.is_empty()),

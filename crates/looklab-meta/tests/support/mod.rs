@@ -422,6 +422,7 @@ pub const TOP_LEVEL_KEYS: &[&str] = &[
     "as_shot_wb",
     "capture_month",
     "software",
+    "render_tag",
     "look",
 ];
 
@@ -450,6 +451,11 @@ pub const NESTED_KEYS: &[&str] = &[
     "grain_size",
     "color_chrome_effect",
     "color_chrome_fx_blue",
+    "firmware_id",
+    "firmware_version",
+    "look_slug",
+    "look_version",
+    "cid_prefix",
 ];
 
 pub fn assert_whitelisted_keys(json: &str) {
