@@ -61,7 +61,7 @@ runs:
         restore-keys: ${{ steps.key.outputs.prefix }}-
 
     - name: Save artifacts
-      if: inputs.mode == 'save' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/build-speed-validation-20261106')
+      if: inputs.mode == 'save' && github.ref == 'refs/heads/main'
       uses: actions/cache/save@v4
       with:
         path: ${{ inputs.paths }}
