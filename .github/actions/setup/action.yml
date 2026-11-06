@@ -38,10 +38,6 @@ runs:
 
     - uses: DeterminateSystems/nix-installer-action@main
 
-    - uses: DeterminateSystems/magic-nix-cache-action@main
-      with:
-        use-flakehub: false
-
     - name: Restore CC0 fixture cache
       if: inputs.fixtures == 'true'
       id: fixtures-cache
