@@ -192,6 +192,9 @@ jobs:
           salt: trunk-release-looklab-web-wasm32
           paths: |
             target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
             target/wasm32-unknown-unknown/release/deps
             target/wasm32-unknown-unknown/release/build
             target/wasm32-unknown-unknown/release/.fingerprint
@@ -215,6 +218,9 @@ jobs:
           salt: trunk-release-looklab-web-wasm32
           paths: |
             target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
             target/wasm32-unknown-unknown/release/deps
             target/wasm32-unknown-unknown/release/build
             target/wasm32-unknown-unknown/release/.fingerprint
