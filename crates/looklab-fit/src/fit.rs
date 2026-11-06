@@ -2598,8 +2598,7 @@ fn update_sigma(problem: &Problem, params: &mut Params, pass: &PassOutput, optio
     }
 }
 
-/// Nodes the data does not reach stay at zero (docs/02 §3.5).
-fn pin_residual(params: &mut Params, layout: &Layout, samples: &[ResidualSample]) {
+fn residual_support(samples: &[ResidualSample]) -> Vec<f64> {
     let mut support = vec![0.0_f64; RESIDUAL_COEFS];
     for sample in samples {
         for (m, node) in sample.nodes.iter().enumerate() {
@@ -2609,9 +2608,15 @@ fn pin_residual(params: &mut Params, layout: &Layout, samples: &[ResidualSample]
             }
         }
     }
+    support
+}
+
+/// Nodes the data does not reach stay at zero (docs/02 §3.5).
+fn pin_residual(params: &mut Params, layout: &Layout, samples: &[ResidualSample]) {
+    let support = residual_support(samples);
     let peak = support.iter().copied().fold(0.0_f64, f64::max);
-    for (index, value) in support.iter().enumerate() {
-        if *value < 1e-4 * peak {
+    for (index, &value) in support.iter().enumerate() {
+        if value < 1e-4 * peak {
             params.theta[layout.residual.start + index] = 0.0;
         }
     }

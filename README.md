@@ -60,6 +60,19 @@ The sharded run executed all 134 release trust cases: 124 passed and 10 failed. 
 
 An isolated native-only [attempt 3](https://github.com/skeet70/looklab/actions/runs/42190766989/attempts/3) restored its compiler cache, compiled in 4m 44s, then hit the same CLI failure; the job took 13m 02s. After the timed runs, removing the per-store Nix cache proxy passed a [seven-runner setup/cache smoke](https://github.com/skeet70/looklab/actions/runs/42203798464): all seven compiler caches restored and all seven project toolchains ran, with no HTTP 429 observed. That smoke did not rerun the test suites or measure full-CI latency.
 
+### Trust fitting performance
+
+Cholesky updates interleave four independent rows while retaining each row's scalar subtraction order. Residual pinning computes its support maximum once per pass. A captured in-progress fit refactor had moved that maximum scan into every coefficient check; correcting it restores linear pinning work.
+
+A same-source local comparison on 2026-11-06 used generation `a5d847973259f3f34c4fd66ac95a793c3a28271d916dccc41a37d09d2990d1c7`, release compilation, default fit options, and synthetic inputs of 3 images × 1,600 samples and 20 images × 200 samples:
+
+| Combined public fit attempts | Runtime, compilation excluded |
+|---|---:|
+| Before row interleaving and pinning correction | 66.53s |
+| After | 33.20s |
+
+Both complete `FitResult` debug outputs were identical before and after. A separate kernel comparison was bit-identical across 49 matrix sizes and three scales, including positive-definite and indefinite inputs. These fit attempts did not converge on that captured application source; they are not full trust-scenario or green-CI timing measurements. The committed application baseline already scanned the pinning maximum once, so the refactor correction is not an additional speedup over that baseline.
+
 ## Local site
 
 From the repository root, run `site/scripts/dev.sh`. It enters `nix develop`, captures source files, builds the data, stub, workers and UI, then serves the UI at <http://localhost:8081/>. A TCP proxy forwards that public origin to the stub on 8098. Passkeys use the public 8081 origin. The launcher exclusively locks its UI target root. SIGTERM, SIGINT and SIGHUP stop builds, the stub, proxy and stylesheet watcher; no TTY is required.

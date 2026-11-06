@@ -3,22 +3,46 @@
 
 /// In-place Cholesky of a row-major symmetric matrix; `false` if not positive definite.
 pub(crate) fn factor_in_place(a: &mut [f64], n: usize) -> bool {
+    let a = &mut a[..n * n];
     for j in 0..n {
-        let mut diagonal = a[j * n + j];
-        for k in 0..j {
-            diagonal -= a[j * n + k] * a[j * n + k];
+        let (_, remaining) = a.split_at_mut(j * n);
+        let (pivot, following) = remaining.split_at_mut(n);
+        let mut diagonal = pivot[j];
+        for &value in &pivot[..j] {
+            diagonal -= value * value;
         }
         if !diagonal.is_finite() || diagonal <= 0.0 {
             return false;
         }
         let root = diagonal.sqrt();
-        a[j * n + j] = root;
-        for i in j + 1..n {
-            let mut value = a[i * n + j];
-            for k in 0..j {
-                value -= a[i * n + k] * a[j * n + k];
+        pivot[j] = root;
+        let mut groups = following.chunks_exact_mut(4 * n);
+        // Each row retains increasing-k subtraction order.
+        for group in groups.by_ref() {
+            let (row0, rest) = group.split_at_mut(n);
+            let (row1, rest) = rest.split_at_mut(n);
+            let (row2, row3) = rest.split_at_mut(n);
+            let mut value0 = row0[j];
+            let mut value1 = row1[j];
+            let mut value2 = row2[j];
+            let mut value3 = row3[j];
+            for (k, &right) in pivot[..j].iter().enumerate() {
+                value0 -= row0[k] * right;
+                value1 -= row1[k] * right;
+                value2 -= row2[k] * right;
+                value3 -= row3[k] * right;
             }
-            a[i * n + j] = value / root;
+            row0[j] = value0 / root;
+            row1[j] = value1 / root;
+            row2[j] = value2 / root;
+            row3[j] = value3 / root;
+        }
+        for row in groups.into_remainder().chunks_exact_mut(n) {
+            let mut value = row[j];
+            for (&left, &right) in row[..j].iter().zip(&pivot[..j]) {
+                value -= left * right;
+            }
+            row[j] = value / root;
         }
     }
     true
@@ -239,16 +263,23 @@ mod tests {
 
     #[test]
     fn cholesky_matches_a_direct_solution() {
-        let n = 3;
-        let a = vec![4.0, 1.0, 0.0, 1.0, 3.0, 1.0, 0.0, 1.0, 2.0];
-        let rhs = vec![1.0, 2.0, 3.0];
-        let mut l = a.clone();
-        assert!(factor_in_place(&mut l, n));
-        let mut x = rhs.clone();
-        solve_in_place(&l, n, &mut x);
-        let check = dense_mat_vec(&a, n, &x);
-        for i in 0..n {
-            assert!((check[i] - rhs[i]).abs() < 1e-12);
+        for n in [1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 32, 33] {
+            let mut a = vec![0.0; n * n];
+            for i in 0..n {
+                a[i * n + i] = 4.0;
+                if i + 1 < n {
+                    a[i * n + i + 1] = 1.0;
+                    a[(i + 1) * n + i] = 1.0;
+                }
+            }
+            let mut x = vec![6.0; n];
+            x[0] -= 1.0;
+            x[n - 1] -= 1.0;
+            assert!(factor_in_place(&mut a, n));
+            solve_in_place(&a, n, &mut x);
+            for value in x {
+                assert!((value - 1.0).abs() < 1e-12, "n={n}");
+            }
         }
     }
 
