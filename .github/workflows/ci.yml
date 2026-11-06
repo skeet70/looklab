@@ -198,12 +198,12 @@ jobs:
             target/wasm32-wasip1/release/examples
 
   trust_release:
-    name: trust release (${{ matrix.shard }}/4)
+    name: trust release (${{ matrix.shard }}/12)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -219,8 +219,8 @@ jobs:
             target/release/deps
             target/release/build
             target/release/.fingerprint
-      - name: Trust red-team harness (shard ${{ matrix.shard }}/4)
-        run: nix develop -c cargo nextest run --locked -p looklab-trust --features harness --release --partition count:${{ matrix.shard }}/4 --no-fail-fast --ignore-default-filter
+      - name: Trust red-team harness (shard ${{ matrix.shard }}/12)
+        run: nix develop -c cargo nextest run --locked -p looklab-trust --features harness --release --partition count:${{ matrix.shard }}/12 --no-fail-fast --ignore-default-filter
       - name: Trust doctests
         if: ${{ !cancelled() && matrix.shard == 1 }}
         run: nix develop -c cargo test --locked -p looklab-trust --features harness --release --doc
