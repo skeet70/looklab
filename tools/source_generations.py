@@ -130,6 +130,31 @@ class SourceGeneration:
         environment.update(
             self.environment(target_dir, ui=ui, ui_target_dir=ui_target_dir)
         )
+        original = environment.get("RUSTC_WORKSPACE_WRAPPER", "")
+        if original == environment.get("LOOKLAB_CAPTURE_RUSTC_WRAPPER"):
+            original = environment.get("LOOKLAB_ORIGINAL_RUSTC_WORKSPACE_WRAPPER", "")
+        # Cargo includes the workspace-wrapper path in workspace artifact hashes.
+        identity = json.dumps([str(self.root.resolve()), original]).encode()
+        target = Path(environment["CARGO_TARGET_DIR"])
+        target.mkdir(parents=True, exist_ok=True)
+        wrapper = target / f".source-rustc-{hashlib.sha256(identity).hexdigest()}"
+        command = f"{shlex.quote(original)} " if original else ""
+        content = f'#!/bin/sh\nexec {command}"$@"\n'
+        if not wrapper.is_file() or wrapper.read_text(encoding="utf-8") != content:
+            temporary = wrapper.with_name(f"{wrapper.name}.tmp.{os.getpid()}")
+            try:
+                temporary.write_text(content, encoding="utf-8")
+                temporary.chmod(0o755)
+                os.replace(temporary, wrapper)
+            finally:
+                temporary.unlink(missing_ok=True)
+        environment.update(
+            {
+                "RUSTC_WORKSPACE_WRAPPER": str(wrapper),
+                "LOOKLAB_CAPTURE_RUSTC_WRAPPER": str(wrapper),
+                "LOOKLAB_ORIGINAL_RUSTC_WORKSPACE_WRAPPER": original,
+            }
+        )
         return environment
 
 

@@ -790,6 +790,74 @@ class CaptureTests(GenerationFixture):
         )
 
 
+class CargoReuseTests(GenerationFixture):
+    def test_captured_cargo_never_reuses_another_source_view(self) -> None:
+        write(
+            self.repo / "Cargo.toml",
+            '[workspace]\nmembers = ["app"]\nresolver = "2"\n',
+        )
+        write(
+            self.repo / "app/Cargo.toml",
+            '[package]\nname = "source-view-probe"\nversion = "0.0.0"\nedition = "2021"\n',
+        )
+        for custom_wrapper in (False, True):
+            with self.subTest(custom_wrapper=custom_wrapper):
+                base = os.environ.copy()
+                for name in (
+                    "RUSTC_WRAPPER",
+                    "RUSTC_WORKSPACE_WRAPPER",
+                    "LOOKLAB_CAPTURE_RUSTC_WRAPPER",
+                    "LOOKLAB_ORIGINAL_RUSTC_WORKSPACE_WRAPPER",
+                    "PROBE_WRAPPED",
+                ):
+                    base.pop(name, None)
+                base["CARGO_TARGET_DIR"] = str(self.root / "compiler-output")
+                base["CARGO_INCREMENTAL"] = "0"
+                suffix = "plain"
+                if custom_wrapper:
+                    wrapper = self.root / "user-wrapper.sh"
+                    write(wrapper, '#!/bin/sh\nexport PROBE_WRAPPED=custom\nexec "$@"\n')
+                    wrapper.chmod(0o755)
+                    base["RUSTC_WORKSPACE_WRAPPER"] = str(wrapper)
+                    suffix = "custom"
+
+                def program(value: str) -> None:
+                    write(
+                        self.repo / "app/src/main.rs",
+                        'fn main() { println!("'
+                        + value
+                        + '-{}", option_env!("PROBE_WRAPPED").unwrap_or("plain")); }\n',
+                    )
+
+                def run(root: Path, environment: dict[str, str]) -> str:
+                    result = subprocess.run(
+                        ["cargo", "run", "--offline", "--quiet", "-p", "source-view-probe"],
+                        cwd=root,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    return result.stdout.strip()
+
+                program("FIRST")
+                first = self.capture(self.repo / "target/first")
+                program("SECOND")
+                second = self.capture(self.repo / "target/second")
+                program("THIRD")
+                self.assertEqual(run(self.repo, base), f"THIRD-{suffix}")
+                first_environment = first.child_environment(
+                    self.root / "compiler-output", base=base
+                )
+                self.assertEqual(run(first.root, first_environment), f"FIRST-{suffix}")
+                second_environment = second.child_environment(
+                    self.root / "compiler-output", base=first_environment
+                )
+                self.assertEqual(run(second.root, second_environment), f"SECOND-{suffix}")
+                self.assertEqual(run(self.repo, base), f"THIRD-{suffix}")
+
+
 class SignatureTests(GenerationFixture):
     def test_ui_signature_excludes_css_docs_tests_benches_and_ignored_outputs(self) -> None:
         write(self.repo / "site/styles.css", "body {}\n")
