@@ -153,53 +153,39 @@ fn build_fixture_in(name: &str, render_tag: Option<&str>) -> Fixture {
 }
 
 fn module() -> PathBuf {
-    static MODULE: LazyLock<PathBuf> = LazyLock::new(build_module);
+    static MODULE: LazyLock<PathBuf> = LazyLock::new(verified_module);
     MODULE.clone()
 }
 
-fn build_module() -> PathBuf {
+fn verified_module() -> PathBuf {
+    const SCRIPT: &str = "site/scripts/wasm-assets.sh";
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("the CLI crate is under crates/");
-    let target_dir = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
-        || root.join("target"),
-        |dir| {
-            let dir = PathBuf::from(dir);
-            if dir.is_absolute() {
-                dir
-            } else {
-                root.join(dir)
-            }
-        },
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root");
+    let output = ProcessCommand::new("sh")
+        .current_dir(&root)
+        .args([SCRIPT, "--prep", "--check"])
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "run `nix develop -c sh {SCRIPT} --prep --check` in {}: {error}",
+                root.display()
+            )
+        });
+    assert!(
+        output.status.success(),
+        "the prep module is stale or missing; run `nix develop -c sh {SCRIPT} --prep` in {}:\n{}{}",
+        root.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    let target_dir = target_dir.join("verify-payload-wasm");
-    let status = ProcessCommand::new(env!("CARGO"))
-        .current_dir(root)
-        .args([
-            "build",
-            "--release",
-            "--target",
-            "wasm32-unknown-unknown",
-            "-p",
-            "looklab-prep-module",
-            "--target-dir",
-        ])
-        .arg(&target_dir)
-        .status()
-        .expect("cargo runs");
-    assert!(status.success(), "building the prep module failed");
-    let wasm = target_dir.join("wasm32-unknown-unknown/release/looklab_prep_module.wasm");
-    let optimized = wasm.with_extension("opt.wasm");
-    let status = ProcessCommand::new("wasm-opt")
-        .arg("--remove-imports")
-        .arg(&wasm)
-        .arg("-o")
-        .arg(&optimized)
-        .status()
-        .expect("wasm-opt runs");
-    assert!(status.success(), "removing wasm-bindgen imports failed");
-    std::fs::rename(&optimized, &wasm).expect("optimized module replaces the artifact");
+    let wasm = root.join("site/generated/wasm/looklab_prep_module.wasm");
+    assert!(
+        wasm.is_file(),
+        "{} is missing; run `nix develop -c sh {SCRIPT} --prep`",
+        wasm.display()
+    );
     wasm
 }
 

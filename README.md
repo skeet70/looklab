@@ -12,21 +12,67 @@ Run builds through `nix develop` from a checkout. The development shell defaults
 
 Cargo serializes competing builds with its existing locks. Wait for those locks rather than creating per-agent or per-task build directories. Unset old `CARGO_TARGET_DIR` and `LOOKLAB_UI_TARGET_DIR` overrides before re-entering the development shell.
 
+The integration owner runs the workspace-wide gates once after combining changes. Subagents run targeted crate or test checks for their slice and hand off their results. Keep one build owner per shared root; redundant Cargo commands queue behind the same locks. Use the checked-in profiles rather than per-agent profile overrides.
+
 After merging or abandoning an agent task, stop its builds and services, remove any isolated build caches it created, and remove its clean worktree with `git worktree remove <path>`. Preserve uncommitted, untracked and unmerged work. The integration owner is responsible for this cleanup.
 
 UI build directories can contain `stub-state/`, including a local database and server secret. Preserve that state before retiring a UI build directory, and never delete a build directory while another task is using it.
 
+## Build pipelines
+
+CI has independent `lint`, `native` and `wasm release` lanes plus four release trust test shards. The required `ci` check succeeds only when every lane and shard succeeds. Trust uses nextest count partitions with no fail-fast or default filter; shard 1 also runs release doctests. Native tests explicitly enable `looklab-fit/synth` in the workspace run; fit acceptance is not run a second time. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
+
+Pages generates release site data and release worker WASM in parallel. The UI job downloads both products and their receipts from the same run, verifies them, then builds the release preview. Worker optimization, UI `-Oz`, release LTO and the `/looklab/` public URL are unchanged.
+
+Cargo caches are partitioned by build family, toolchain, lock/configuration and compiler flags; incremental directories and local stub state are excluded. Cache saves are restricted to `main`. CI saves compiler artifacts after failed gates unless cancelled; generated products are saved only after their producer succeeds. One trust shard saves the shared release compiler cache. Generated-product caches are hints: source/tool/profile identities, output hashes and artifact policy are checked before reuse.
+
+Nix uses public binary substituters rather than a per-store GitHub Actions cache proxy. Synthetic trust shards skip RAW fixture downloads.
+
+`tools/build_products.py` owns worker and site-data freshness. Receipts and shared writer locks live under the main checkout's `target/build-products/`. Worker inputs include the local Cargo source closure and the explicit compile-time input trees; data also binds the fetched scene sources. CSS and UI-only source edits do not invalidate these products. New include targets or generator modules outside the supported input selection fail closed; extend the selection in that helper when adding them. Run `nix develop -c python3 -m unittest discover -s tools/tests -v` for the isolated cache-boundary tests.
+
+Single-run validation on 2026-11-06 used application commit `c10b5d2` plus the build changes, excluding concurrent uncommitted application edits. Pages times cover the build critical path, not deployment:
+
+| Pages run | Elapsed | Evidence |
+|---|---:|---|
+| Original pipeline | 22m 42s | [Baseline](https://github.com/skeet70/looklab/actions/runs/42109884751) |
+| New pipeline, first Cargo/product cache population | 16m 34s | [Cold run](https://github.com/skeet70/looklab/actions/runs/42180363234) |
+| New pipeline, warm caches before host-cache correction | 8m 13s | [Warm run](https://github.com/skeet70/looklab/actions/runs/42182424417) |
+| New pipeline, warm host and WASM UI cache | 7m 32s | [Exact-source rerun](https://github.com/skeet70/looklab/actions/runs/42192708299/attempts/2) |
+
+The corrected warm UI run restored its populated host/WASM cache and recompiled only workspace crates; no third-party dependencies recompiled.
+
+Local pipeline measurements used the same application base and retained the existing shared dependency cache. This was not an empty-cache build or an old/new pipeline comparison. Both passes included source capture, data handling, stub compilation, workers, Trunk and CSS publication.
+
+| Local pass | Elapsed |
+|---|---:|
+| First pass, generated products missing | 7m 02s |
+| Unchanged pass, verified products reused | 7.10s |
+
+Full CI measurements used the same application base and failed Clippy, the CLI E2E flow and 10 release trust red-team cases:
+
+| CI configuration | Elapsed | Evidence |
+|---|---:|---|
+| Three lanes, unsharded release trust suite | 52m 41s | [Pre-shard run](https://github.com/skeet70/looklab/actions/runs/42180330465) |
+| Four trust shards, first trust compiler-cache population | 40m 08s | [Sharded run](https://github.com/skeet70/looklab/actions/runs/42190766989/attempts/1) |
+| Four trust shards, cache-populated rerun with HTTP 429 restore failures | 38m 26s | [Same-source attempt 2](https://github.com/skeet70/looklab/actions/runs/42190766989/attempts/2), not a fully warm comparison |
+
+The sharded run executed all 134 release trust cases: 124 passed and 10 failed. Its required aggregate check stayed red. The CLI E2E failure also reproduced on unmodified `c10b5d2` with the original Wasmtime defaults. No successful same-source full-CI baseline is available; the failing native E2E binary prevents later workspace tests from running.
+
+An isolated native-only [attempt 3](https://github.com/skeet70/looklab/actions/runs/42190766989/attempts/3) restored its compiler cache, compiled in 4m 44s, then hit the same CLI failure; the job took 13m 02s. After the timed runs, removing the per-store Nix cache proxy passed a [seven-runner setup/cache smoke](https://github.com/skeet70/looklab/actions/runs/42203798464): all seven compiler caches restored and all seven project toolchains ran, with no HTTP 429 observed. That smoke did not rerun the test suites or measure full-CI latency.
+
 ## Local site
 
-From the repository root, run `site/scripts/dev.sh`. It enters `nix develop`, generates `site/data` if missing, builds the development stub once, then serves the UI with automatic reload at <http://localhost:8081/>. The stub listens on 8098; Trunk proxies `/api/*`, `/status/*`, `/log.json`, `/lists/*`, `/bounties.json` and `/manifests/*` to it. Open status pages request HTML; API fetches receive JSON. The stub uses the public 8081 origin for passkeys. Port 8080 and `site/dist` are not used. SIGTERM stops startup builds and both server processes; no TTY is required.
+From the repository root, run `site/scripts/dev.sh`. It enters `nix develop`, captures source files, builds the data, stub, workers and UI, then serves the UI at <http://localhost:8081/>. A TCP proxy forwards that public origin to the stub on 8098. Passkeys use the public 8081 origin. The launcher exclusively locks its UI target root. SIGTERM, SIGINT and SIGHUP stop builds, the stub, proxy and stylesheet watcher; no TTY is required.
 
-Artifacts, the served distribution and persistent stub state live in `target-ui/`, separate from other Cargo builds. Set `LOOKLAB_UI_TARGET_DIR` to choose another shared UI root. Trunk uses the opt-in `web-dev` Cargo profile: no debug information, incremental compilation, 256 codegen units and dependency optimization at level 1. Trunk's Cargo builds run offline after the native stub build resolves dependencies. The launcher sets `LOOKLAB_WORKER_WASM=reuse`: existing `site/generated/wasm/*.wasm` are reused, or built in release once when missing. Set `LOOKLAB_WORKER_WASM=build site/scripts/dev.sh` after changing prep or match worker code. To rebuild only the scene worker, use `LOOKLAB_WORKER_WASM=reuse LOOKLAB_SCENE_WASM=build site/scripts/dev.sh`. Ordinary Trunk, release, CI and Pages builds retain the release worker build and validation.
+The captured source view, served distribution and persistent `stub-state/` live in `target-ui/`. Set `LOOKLAB_UI_TARGET_DIR` to choose another shared UI root. The stable `target-ui/source/` view uses copied or reflinked files, not hardlinks to active sources; compiler artifacts still share `target-ui/`. Native captured builds similarly use `target/source/` and the shared `target/` cache. Lane locks serialize capture and builds without locking writers in the checkout. Trunk uses the `web-dev` profile: no debug information, incremental compilation, 256 codegen units and dependency optimization at level 1. Its Cargo build runs offline after the native stub resolves dependencies. Missing or stale workers are rebuilt in release and validated. Use `nix develop -c sh site/scripts/wasm-assets.sh --force --scene` to force only the scene worker, or omit the selector for all workers.
 
-Expected warm rebuilds are about 31 s for a page `.rs` edit and 15 s for `site/styles.css`, measured in the isolated preview checkout with the same build structure. Before: cold debug 475 s, page edit 128 s, CSS edit 107 s. Worker reuse plus disabled debug information gave a 175 s cold build; dependency optimization reduced the wasm output from 77.5 MB to 56.4 MB. The live checkout's first `web-dev` build took 343 s under concurrent build load. Other sessions changing shared crates or holding Cargo's registry lock can delay rebuilds. Missing worker assets add a one-time release build.
+Unchanged source bytes retain their view mtimes. Changed inputs receive fresh mtimes even when checkout timestamps were preserved; an older capture policy is refreshed once on cutover.
+
+Stylesheet edits publish directly to the served distribution and repaint open pages through a development-only stamp poller, without Cargo, wasm-bindgen or wasm-opt. Other source edits queue the latest generation: the current captured build finishes rather than restarting when another agent writes a file. The last successful distribution and stub remain available during builds; failed builds wait for the next edit instead of retrying unchanged inputs. Successful publication exchanges the distribution and installs the matching stub/body metadata, with rollback on failure. Tests, benches and Markdown do not queue UI builds. Restart after changing launcher/helper logic. `site/scripts/dev.sh --once` builds and serves exactly one captured generation while retaining live CSS updates.
 
 Release photo previews load the verified thumbnail before preparing the full scene. Full-size RGB16 PNG decoding and interpolation-sample construction run in an import-free scene worker using the same scalar Rust code as the reference path. The main thread validates the transferred prepared samples, renders the LUT and paints the canvas. Home, Look and Compare keep the current viewer while upgrading; a pinned match displays the target look while the settings worker runs. Browse requests omit matching covariance/model files, and prepared scenes are reused across routes. The release profile retains optimization level 3, LTO and one codegen unit; Trunk applies `wasm-opt -Oz` to the UI. Prep and match worker build settings are unchanged.
 
-To refresh the release preview served from `/tmp/looklab-release-dist` on port 8082, build from `site/` with `env CARGO_TARGET_DIR="$PWD/../target-ui" LOOKLAB_WORKER_WASM=reuse CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=6 nix develop -c trunk build --release --dist /tmp/looklab-release-dist`. The existing preview service picks up that directory without a restart.
+To refresh the release preview served from `/tmp/looklab-release-dist` on port 8082, run `nix develop -c tools/build.sh --lane ui -- sh -c 'sh site/scripts/site-data.sh --release && sh site/scripts/wasm-assets.sh && cd site && LOOKLAB_PREVIEW=1 CARGO_NET_OFFLINE=true trunk build --locked --release --dist /tmp/looklab-release-dist'` from the repository root. Data, workers and UI then use one captured generation. The existing preview service picks up that directory without a restart.
 
 Measure empty-cache Chromium navigation to the first photo and full-size upgrade from the repository root:
 
@@ -41,16 +87,17 @@ The benchmark writes timestamps, resource transfers, stage timings and screensho
 
 The photo benchmark also reports main-thread long tasks between first-photo and full-size-scene paint. With the same Playwright environment, `node site/scripts/scene-worker-check.mjs` compares the prepared sample bytes and rendered RGBA bytes against the UI-compiled main-thread Rust reference on all nine published scenes. It verifies the index, scene PNGs and LUT hashes and writes `/tmp/looklab-scene-worker-check/parity.json`.
 
-The native scene-module ABI test requires a built worker artifact. Run `LOOKLAB_SCENE_WASM=only nix develop -c sh site/scripts/wasm-assets.sh` before `cargo test --workspace` on a fresh checkout. This builds, optimizes and validates only the scene worker; CI runs this prerequisite before its workspace tests. Default Pages and development builds still produce all missing worker assets through the Trunk pre-build hook.
+For a local workspace run, use `nix develop -c tools/build.sh`. It captures one source generation, prepares prep/scene WASM, then runs `cargo test --locked --workspace --features looklab-fit/synth`. A targeted command runs exactly as supplied, for example `nix develop -c tools/build.sh -- cargo test --locked -p looklab-fit --features synth --test sample_trust`. Use `--lane ui -- <command>` when a captured command needs the shared UI build root. The prep, payload-verification and scene ABI tests require fresh worker artifacts and only verify them; raw Cargo callers must first run `nix develop -c sh site/scripts/wasm-assets.sh --prep --scene` against the same source view. `nix develop -c cargo xtask prep-module` uses that producer. To check all workers without rebuilding, run `nix develop -c sh site/scripts/wasm-assets.sh --check`.
 
-Run `site/scripts/dev.sh --regen-data` after scene-data schema changes to regenerate synthetic Looks, bodies, scenes, public camera match bundles and audit entries before serving. `site_data` includes the public match artifacts before computing release manifest hashes. The separate `publish_match_fixture` step adds only the hidden `synthetic-match` end-to-end fixture and remains required for synthetic match and verification checks. To regenerate without launching the site, run both commands:
+Each captured UI generation checks site-data freshness; `site/scripts/dev.sh --regen-data` forces its first data pass. `site/scripts/site-data.sh` runs `site_data` and then `publish_match_fixture`, including the hidden synthetic-match end-to-end fixture. The default uses the optimized test profile; `--release` preserves the production generator profile. Each profile has a distinct receipt. To generate or check data without launching the site:
 
 ```sh
-nix develop -c cargo run -p looklab-publish --example site_data -j 6 -- site
-nix develop -c cargo run -p looklab-wasm --features fixtures --example publish_match_fixture -j 6 -- site
+nix develop -c sh site/scripts/site-data.sh
+nix develop -c sh site/scripts/site-data.sh --check
+nix develop -c sh site/scripts/site-data.sh --release
 ```
 
-Both examples accept a destination directory in place of `site`, including a directory under `/tmp`; `publish_match_fixture` defaults to the workspace's `site` directory when omitted. Outside the launcher, `LOOKLAB_API_BASE` names the API origin at build time (unset: the page's own origin), and `LOOKLAB_PREVIEW=1` builds a server-less preview with uploads, status, proposals and moderation disabled. The launcher unsets both to use its local stub. The `Pages` workflow publishes that preview when run manually.
+The data wrapper accepts a destination directory in place of `site`, including a directory under `/tmp`. Generation stages on the destination filesystem and atomically exchanges the current data tree before sealing its receipt. Outside the launcher, `LOOKLAB_API_BASE` names the API origin at build time (unset: the page's own origin), and `LOOKLAB_PREVIEW=1` builds a server-less preview with uploads, status, proposals and moderation disabled. The launcher unsets both to use its local stub. The `Pages` workflow deploys only from `main`; manual runs on other branches build without deployment.
 
 New stub profiles have no roles. For local moderation checks, POST `/api/__stub/moderator/{credential}` with the base64url credential ID. POST `/api/__stub/access/{credential}` with the JSON string `"moderator"`, `"admin"` or `"seeder"` to exercise the other review roles. Reload to refresh the role menu from the server. These grant endpoints exist only in the development stub; other `/api/*` routes reach the real server handlers. `site/checks/e2e.mjs --flow account` covers profile creation and work-based activation, local sign-out, sign-in again, independent browser sessions, global revocation and role refresh.
 

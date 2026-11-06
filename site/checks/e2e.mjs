@@ -20,21 +20,25 @@ const USAGE = `usage: node site/checks/e2e.mjs [options]
   --controls "key=step,..."    control steps, comma separated
   --workers N                  worker count for the contribute run
   --verifier FILE              native looklab binary for contribution HAR checks
-  --verify-module FILE         source-built prep module for HAR checks
+  --verify-module FILE         served prep module for HAR checks
   --count N                    files for the flatness run (default 100)
   --expected FILE              canonical permalink to compare against
   --status TOKEN               status token for the /status screenshot
   --permalink BASE64URL        pinned match result for the pages flow
 
-needs the built site behind the stub server and Playwright from nix:
+needs the fixed-generation launcher and Playwright from nix:
 
-  cd site && nix develop -c env CARGO_TARGET_DIR=target-ui trunk build --release
-  CARGO_TARGET_DIR=target-ui nix develop -c cargo run -j 6 -p looklab-web --features stub --example stub_server -- --port 8099 --state /tmp/looklab-e2e/stub-state
-  CARGO_TARGET_DIR=target-ui nix develop -c cargo test -j 6 -p looklab-cli --test verify_payload reproduces_an_upload_and_passes -- --exact
+  site/scripts/dev.sh --once
+
+after it serves a generation, keep it running and use another terminal:
+
+  nix develop -c env CARGO_TARGET_DIR="$PWD/target-ui" CARGO_PROFILE_DEV_DEBUG=0 \\
+    cargo build --locked --manifest-path target-ui/source/Cargo.toml -p looklab-cli
   nix develop -c env \\
-    PLAYWRIGHT_MODULE=$(nix eval --raw nixpkgs#playwright-driver)/index.js \\
+    PLAYWRIGHT_MODULE=$(nix eval --raw nixpkgs#playwright-driver)/index.mjs \\
     PLAYWRIGHT_BROWSERS_PATH=$(nix eval --raw nixpkgs#playwright-driver.browsers) \\
-    node site/checks/e2e.mjs --browser chromium --flow all --out /tmp/looklab-e2e --state /tmp/looklab-e2e/stub-state`;
+    node site/checks/e2e.mjs --browser chromium --flow all --origin http://localhost:8081 \\
+      --out /tmp/looklab-e2e --state target-ui/stub-state`;
 
 const options = {
   browser: 'chromium',
@@ -50,9 +54,9 @@ const options = {
   controls: '',
   workers: 1,
   verifier: 'target-ui/debug/looklab',
-  'verify-module': 'target-ui/verify-payload-wasm/wasm32-unknown-unknown/release/looklab_prep_module.wasm',
+  'verify-module': 'target-ui/dist/generated/wasm/looklab_prep_module.wasm',
   count: 100,
-  expected: 'site/data/looks/synthetic-match/1.0.0/match.permalink',
+  expected: 'target-ui/dist/data/looks/synthetic-match/1.0.0/match.permalink',
   status: '',
   permalink: '',
 };

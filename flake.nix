@@ -37,6 +37,7 @@
         common = with pkgs; [
           git
           git-lfs
+          coreutils
           pkg-config
           openssl
           sqlite
@@ -47,9 +48,13 @@
           binaryen
           wabt
           nodejs_22
+          python3
+          actionlint
+          shellcheck
           cargo-nextest
           trunk
           util-linux
+          socat
         ];
         buildShellHook = ''
           if looklab_git_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then

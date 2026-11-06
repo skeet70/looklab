@@ -1,0 +1,60 @@
+name: Runner setup
+description: Install nix and restore the Git LFS and fixture caches a job needs.
+
+inputs:
+  fixtures:
+    description: Pull Git LFS objects and fetch the CC0 fixtures.
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Git LFS object list
+      if: inputs.fixtures == 'true'
+      id: lfs
+      shell: bash
+      run: echo "key=$(git lfs ls-files -l | cut -d' ' -f1 | sort | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore Git LFS objects
+      if: inputs.fixtures == 'true'
+      id: lfs-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: .git/lfs
+        key: lfs-${{ steps.lfs.outputs.key }}
+        restore-keys: lfs-
+
+    - name: Fetch Git LFS fixtures
+      if: inputs.fixtures == 'true'
+      shell: bash
+      run: git lfs pull
+
+    - name: Save Git LFS objects
+      if: inputs.fixtures == 'true' && steps.lfs-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@v4
+      with:
+        path: .git/lfs
+        key: ${{ steps.lfs-cache.outputs.cache-primary-key }}
+
+    - uses: DeterminateSystems/nix-installer-action@main
+
+    - name: Restore CC0 fixture cache
+      if: inputs.fixtures == 'true'
+      id: fixtures-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: fixtures/cache
+        key: fixtures-${{ hashFiles('fixtures/manifest.toml') }}
+        restore-keys: fixtures-
+
+    - name: Fetch CC0 fixtures
+      if: inputs.fixtures == 'true'
+      shell: bash
+      run: nix develop -c tools/fetch-fixtures.sh
+
+    - name: Save CC0 fixture cache
+      if: inputs.fixtures == 'true' && steps.fixtures-cache.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@v4
+      with:
+        path: fixtures/cache
+        key: ${{ steps.fixtures-cache.outputs.cache-primary-key }}
