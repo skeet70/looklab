@@ -1,0 +1,68 @@
+name: Build cache
+description: Restore or save a Cargo artifact or generated-product cache. The key includes RUSTFLAGS, RUSTDOCFLAGS, RUSTC and wrappers, CARGO_BUILD_*, CARGO_PROFILE_* and CARGO_TARGET_* flags, so a compiler or flag change never restores older artifacts.
+
+inputs:
+  mode:
+    description: restore before the build, save after it.
+    required: true
+  family:
+    description: Cache family; one per job and flag set so profiles and products never share artifacts.
+    required: true
+  salt:
+    description: Cargo profile, features, flags or generator set that make cached artifacts reusable.
+    required: true
+  paths:
+    description: Newline-separated artifact paths to cache. Restore and save calls for one family must pass the same list.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Validate mode
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+      run: |
+        case "$MODE" in
+          restore|save) ;;
+          *)
+            echo "::error::mode must be restore or save, got: $MODE" >&2
+            exit 1
+            ;;
+        esac
+
+    - name: Compose cache keys
+      id: key
+      shell: bash
+      env:
+        PREFIX: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ inputs.family }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('flake.nix', 'flake.lock') }}-${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml', '.cargo/config.toml') }}-${{ inputs.salt }}
+      run: |
+        flags=$(env | LC_ALL=C sort | while IFS= read -r entry; do
+          name=${entry%%=*}
+          value=${entry#*=}
+          case "$name" in
+            CARGO_BUILD_JOBS|CARGO_TARGET_DIR) ;;
+            RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|RUSTDOCFLAGS|CARGO_ENCODED_RUSTDOCFLAGS|RUSTC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER)
+              printf '%s=%s\n' "$name" "$value" ;;
+            CARGO_BUILD_*|CARGO_UNSTABLE_*|CARGO_PROFILE_*|CARGO_TARGET_*)
+              printf '%s=%s\n' "$name" "$value" ;;
+          esac
+        done)
+        env_key=$(printf '%s' "$flags" | sha256sum | cut -d' ' -f1)
+        prefix="$PREFIX-$env_key"
+        printf 'prefix=%s\nkey=%s-%s-%s\n' "$prefix" "$prefix" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+    - name: Restore artifacts
+      if: inputs.mode == 'restore'
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ inputs.paths }}
+        key: ${{ steps.key.outputs.key }}
+        restore-keys: ${{ steps.key.outputs.prefix }}-
+
+    - name: Save artifacts
+      if: inputs.mode == 'save' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/build-speed-validation-20261106')
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ inputs.paths }}
+        key: ${{ steps.key.outputs.key }}

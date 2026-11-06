@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 
 use jpeg_encoder::{ColorType, Encoder};
 use looklab_color::RgbSpace;
@@ -70,37 +71,37 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn build_module() -> PathBuf {
+fn module() -> PathBuf {
+    static MODULE: LazyLock<PathBuf> = LazyLock::new(verified_module);
+    MODULE.clone()
+}
+
+fn verified_module() -> PathBuf {
+    const SCRIPT: &str = "site/scripts/wasm-assets.sh";
     let root = workspace_root();
-    let target_dir =
-        std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from);
-    let target_dir = root.join(target_dir).join("prep-module-wasm");
-    let status = Command::new(env!("CARGO"))
+    let output = Command::new("sh")
         .current_dir(&root)
-        .args([
-            "build",
-            "--release",
-            "--target",
-            "wasm32-unknown-unknown",
-            "-p",
-            "looklab-prep-module",
-            "--target-dir",
-        ])
-        .arg(&target_dir)
-        .status()
-        .expect("cargo runs");
-    assert!(status.success(), "building the prep module failed");
-    let wasm = target_dir.join("wasm32-unknown-unknown/release/looklab_prep_module.wasm");
-    let optimized = wasm.with_extension("opt.wasm");
-    let status = Command::new("wasm-opt")
-        .arg("--remove-imports")
-        .arg(&wasm)
-        .arg("-o")
-        .arg(&optimized)
-        .status()
-        .expect("wasm-opt runs");
-    assert!(status.success(), "removing wasm-bindgen imports failed");
-    std::fs::rename(&optimized, &wasm).expect("optimized module replaces the artifact");
+        .args([SCRIPT, "--prep", "--check"])
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "run `nix develop -c sh {SCRIPT} --prep --check` in {}: {error}",
+                root.display()
+            )
+        });
+    assert!(
+        output.status.success(),
+        "the prep module is stale or missing; run `nix develop -c sh {SCRIPT} --prep` in {}:\n{}{}",
+        root.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let wasm = root.join("site/generated/wasm/looklab_prep_module.wasm");
+    assert!(
+        wasm.is_file(),
+        "{} is missing; run `nix develop -c sh {SCRIPT} --prep`",
+        wasm.display()
+    );
     wasm
 }
 
@@ -174,7 +175,7 @@ fn request(jpeg: Vec<u8>) -> PrepareRequest {
 
 #[test]
 fn wasm_prepare_is_byte_identical_across_runs() {
-    let wasm = build_module();
+    let wasm = module();
     let engine = Engine::default();
     let module = Module::from_file(&engine, &wasm).expect("module loads");
     let mut store = Store::new(&engine, ());

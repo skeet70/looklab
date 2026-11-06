@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::LazyLock;
 
 use looklab_publish::{LUT_BYTES, Scene, SceneName};
 use looklab_scene_module::dispatch;
@@ -49,18 +51,48 @@ impl Guest {
     }
 }
 
+fn module() -> PathBuf {
+    static MODULE: LazyLock<PathBuf> = LazyLock::new(verified_module);
+    MODULE.clone()
+}
+
+fn verified_module() -> PathBuf {
+    const SCRIPT: &str = "site/scripts/wasm-assets.sh";
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root");
+    let output = Command::new("sh")
+        .current_dir(&root)
+        .args([SCRIPT, "--scene", "--check"])
+        .output()
+        .unwrap_or_else(|error| {
+            panic!(
+                "run `nix develop -c sh {SCRIPT} --scene --check` in {}: {error}",
+                root.display()
+            )
+        });
+    assert!(
+        output.status.success(),
+        "the scene module is stale or missing; run `nix develop -c sh {SCRIPT} --scene` in {}:\n{}{}",
+        root.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let wasm = root.join("site/generated/wasm/looklab_scene_module.wasm");
+    assert!(
+        wasm.is_file(),
+        "{} is missing; run `nix develop -c sh {SCRIPT} --scene`",
+        wasm.display()
+    );
+    wasm
+}
+
 #[test]
 fn import_free_wasm_matches_native_and_returns_owned_errors() {
-    let path = std::env::var_os("LOOKLAB_SCENE_MODULE_WASM").map_or_else(
-        || {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../site/generated/wasm/looklab_scene_module.wasm")
-        },
-        PathBuf::from,
-    );
+    let path = module();
     let engine = Engine::default();
-    let module = Module::from_file(&engine, path)
-        .expect("build scene wasm with site/scripts/wasm-assets.sh before running this test");
+    let module = Module::from_file(&engine, path).expect("the checked scene module loads");
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).expect("instantiate without imports");
     let mut guest = Guest {

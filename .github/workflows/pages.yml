@@ -7,46 +7,199 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
   cancel-in-progress: false
 
+env:
+  CARGO_INCREMENTAL: "0"
+
 jobs:
-  build:
+  data:
+    name: site data
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Git LFS object list
-        id: lfs
-        run: echo "key=$(git lfs ls-files -l | cut -d' ' -f1 | sort | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: ./.github/actions/setup
+      - uses: ./.github/actions/cache
         with:
-          path: .git/lfs
-          key: lfs-${{ steps.lfs.outputs.key }}
-      - name: Fetch Git LFS fixtures
-        run: git lfs pull
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+          mode: restore
+          family: pages-data
+          salt: site-data-release
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+            target/release/examples
+      - uses: ./.github/actions/cache
         with:
-          use-flakehub: false
-      - uses: actions/cache@v4
-        with:
-          path: fixtures/cache
-          key: fixtures-${{ hashFiles('fixtures/manifest.toml') }}
-      - name: Fetch CC0 scene sources
-        run: nix develop -c tools/fetch-fixtures.sh
+          mode: restore
+          family: site-data
+          salt: release-site-tree
+          paths: |
+            site/data
+            site/site-root.txt
+            target/build-products/site-data
       - name: Public site data and camera match bundles
-        run: nix develop -c cargo run --release -p looklab-publish --example site_data -j 6 -- site
-      - name: Synthetic-match end-to-end fixture
-        run: nix develop -c cargo run --release -p looklab-wasm --features fixtures --example publish_match_fixture -j 6 -- site
+        run: nix develop -c sh site/scripts/site-data.sh --release
+      - name: Verify site data receipt
+        run: nix develop -c sh site/scripts/site-data.sh --check --release
+      - name: Stage site data receipt
+        run: |
+          rm -rf receipts-data
+          mkdir -p receipts-data
+          cp target/build-products/site-data/*.json receipts-data/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site-data
+          path: site/data
+          include-hidden-files: true
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site-root
+          path: site/site-root.txt
+          include-hidden-files: true
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site-data-receipt
+          path: receipts-data
+          include-hidden-files: true
+          retention-days: 1
+      - uses: ./.github/actions/cache
+        with:
+          mode: save
+          family: site-data
+          salt: release-site-tree
+          paths: |
+            site/data
+            site/site-root.txt
+            target/build-products/site-data
+      - uses: ./.github/actions/cache
+        with:
+          mode: save
+          family: pages-data
+          salt: site-data-release
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+            target/release/examples
+
+  workers:
+    name: worker wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          fixtures: "false"
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: wasm-assets
+          salt: wasm-assets-release-worker-scene-prep
+          paths: |
+            target/wasm32-unknown-unknown/release/deps
+            target/wasm32-unknown-unknown/release/build
+            target/wasm32-unknown-unknown/release/.fingerprint
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: wasm-products
+          salt: site-generated
+          paths: |
+            site/generated/wasm
+            target/build-products/wasm
+      - name: Worker wasm artifacts
+        run: nix develop -c sh site/scripts/wasm-assets.sh
+      - name: Worker wasm import policy
+        run: nix develop -c sh site/scripts/wasm-assets.sh --check
+      - name: Stage worker receipts
+        run: |
+          rm -rf receipts
+          mkdir -p receipts
+          cp target/build-products/wasm/*.json receipts/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site-wasm
+          path: site/generated/wasm
+          include-hidden-files: true
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-receipts
+          path: receipts
+          include-hidden-files: true
+          retention-days: 1
+      - uses: ./.github/actions/cache
+        with:
+          mode: save
+          family: wasm-products
+          salt: site-generated
+          paths: |
+            site/generated/wasm
+            target/build-products/wasm
+      - uses: ./.github/actions/cache
+        with:
+          mode: save
+          family: wasm-assets
+          salt: wasm-assets-release-worker-scene-prep
+          paths: |
+            target/wasm32-unknown-unknown/release/deps
+            target/wasm32-unknown-unknown/release/build
+            target/wasm32-unknown-unknown/release/.fingerprint
+
+  build:
+    name: build
+    needs: [data, workers]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@v4
+        with:
+          name: site-data
+          path: site/data
+      - uses: actions/download-artifact@v4
+        with:
+          name: site-root
+          path: site
+      - uses: actions/download-artifact@v4
+        with:
+          name: site-wasm
+          path: site/generated/wasm
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-receipts
+          path: target/build-products/wasm
+      - uses: actions/download-artifact@v4
+        with:
+          name: site-data-receipt
+          path: target/build-products/site-data
+      - name: Verify handed-off site data
+        run: nix develop -c sh site/scripts/site-data.sh --check --release
+      - name: Verify handed-off worker wasm
+        run: nix develop -c sh site/scripts/wasm-assets.sh --check
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: pages-ui
+          salt: trunk-release-looklab-web-wasm32
+          paths: |
+            target/.rustc_info.json
+            target/wasm32-unknown-unknown/release/deps
+            target/wasm32-unknown-unknown/release/build
+            target/wasm32-unknown-unknown/release/.fingerprint
       - name: Trunk build
         working-directory: site
         env:
           LOOKLAB_PREVIEW: "1"
-        run: nix develop -c trunk build --release --public-url /looklab/
+        run: nix develop -c trunk build --locked --release --public-url /looklab/
       - name: SPA deep-link fallback and fixture pattern page
         run: |
           cp site/dist/index.html site/dist/404.html
@@ -55,10 +208,26 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site/dist
+      - uses: ./.github/actions/cache
+        with:
+          mode: save
+          family: pages-ui
+          salt: trunk-release-looklab-web-wasm32
+          paths: |
+            target/.rustc_info.json
+            target/wasm32-unknown-unknown/release/deps
+            target/wasm32-unknown-unknown/release/build
+            target/wasm32-unknown-unknown/release/.fingerprint
 
   deploy:
+    name: deploy
     needs: build
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

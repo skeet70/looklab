@@ -4,52 +4,101 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+
 jobs:
-  ci:
+  lint:
+    name: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Git LFS object list
-        id: lfs
-        run: echo "key=$(git lfs ls-files -l | cut -d' ' -f1 | sort | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: ./.github/actions/setup
         with:
-          path: .git/lfs
-          key: lfs-${{ steps.lfs.outputs.key }}
-      - name: Fetch Git LFS fixtures
-        run: git lfs pull
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+          fixtures: "false"
+      - uses: ./.github/actions/cache
         with:
-          use-flakehub: false
-      - uses: actions/cache@v4
-        with:
-          path: fixtures/cache
-          key: fixtures-${{ hashFiles('fixtures/manifest.toml') }}
-      - name: Fetch CC0 fixtures
-        run: nix develop -c tools/fetch-fixtures.sh
+          mode: restore
+          family: lint
+          salt: fmt-clippy-all-targets-check-web-wasm32
+          paths: |
+            target/.rustc_info.json
+            target/debug/deps
+            target/debug/build
+            target/debug/.fingerprint
+            target/wasm32-unknown-unknown/debug/deps
+            target/wasm32-unknown-unknown/debug/build
+            target/wasm32-unknown-unknown/debug/.fingerprint
       - name: Format
         run: nix develop -c cargo fmt --all --check
+      - name: Build cache boundaries
+        run: nix develop -c python3 -m unittest discover -s tools/tests -v
       - name: Clippy
         run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
       - name: Web client clippy (wasm32)
         run: nix develop -c cargo clippy -p looklab-web --target wasm32-unknown-unknown -- -D warnings
-      - name: Scene worker test artifact
-        run: LOOKLAB_SCENE_WASM=only nix develop -c sh site/scripts/wasm-assets.sh
-      - name: Test
-        run: nix develop -c cargo test --workspace
-      - name: Fit acceptance tests
-        run: nix develop -c cargo test -p looklab-fit --features synth
-      - name: Trust red-team harness
-        run: nix develop -c cargo test -p looklab-trust --features harness --release
-      - name: RAW decode under Node
-        run: nix develop -c cargo test -p looklab-raw --target wasm32-unknown-unknown --test wasm_node
       - name: Float method allow-list
         run: nix develop -c cargo xtask float-methods
       - name: SPDX headers
         run: nix develop -c cargo xtask spdx
-      - name: Core crates build for wasm32
-        run: nix develop -c cargo xtask wasm-core
+      - uses: ./.github/actions/cache
+        with:
+          mode: save
+          family: lint
+          salt: fmt-clippy-all-targets-check-web-wasm32
+          paths: |
+            target/.rustc_info.json
+            target/debug/deps
+            target/debug/build
+            target/debug/.fingerprint
+            target/wasm32-unknown-unknown/debug/deps
+            target/wasm32-unknown-unknown/debug/build
+            target/wasm32-unknown-unknown/debug/.fingerprint
+
+  native:
+    name: native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: native-test
+          salt: test-workspace-fit-synth
+          paths: |
+            target/.rustc_info.json
+            target/debug/deps
+            target/debug/build
+            target/debug/.fingerprint
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: wasm-assets
+          salt: wasm-assets-release-worker-scene-prep
+          paths: |
+            target/wasm32-unknown-unknown/release/deps
+            target/wasm32-unknown-unknown/release/build
+            target/wasm32-unknown-unknown/release/.fingerprint
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: wasm-products
+          salt: site-generated
+          paths: |
+            site/generated/wasm
+            target/build-products/wasm
+      - name: Prep and scene wasm artifacts
+        run: nix develop -c sh site/scripts/wasm-assets.sh --prep --scene
+      - name: Prep and scene import policy
+        run: nix develop -c sh site/scripts/wasm-assets.sh --check --prep --scene
+      - name: Build product receipts
+        run: nix develop -c python3 -m unittest discover -s tools/tests -v
+      - name: Test
+        run: nix develop -c cargo test --workspace --features looklab-fit/synth
       - name: Community data snapshots
         run: |
           if compgen -G "data/community/v*" > /dev/null; then
@@ -59,7 +108,109 @@ jobs:
           else
             echo "no community data snapshots present"
           fi
-      - name: Prep module
-        run: nix develop -c cargo xtask prep-module
+      - uses: ./.github/actions/cache
+        with:
+          mode: save
+          family: native-test
+          salt: test-workspace-fit-synth
+          paths: |
+            target/.rustc_info.json
+            target/debug/deps
+            target/debug/build
+            target/debug/.fingerprint
+      - uses: ./.github/actions/cache
+        with:
+          mode: save
+          family: wasm-assets
+          salt: wasm-assets-release-worker-scene-prep
+          paths: |
+            target/wasm32-unknown-unknown/release/deps
+            target/wasm32-unknown-unknown/release/build
+            target/wasm32-unknown-unknown/release/.fingerprint
+      - uses: ./.github/actions/cache
+        with:
+          mode: save
+          family: wasm-products
+          salt: site-generated
+          paths: |
+            site/generated/wasm
+            target/build-products/wasm
+
+  wasm_release:
+    name: wasm release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: wasm-gates
+          salt: node-wasm-core-bitid-release-trust
+          paths: |
+            target/.rustc_info.json
+            target/debug/deps
+            target/debug/build
+            target/debug/.fingerprint
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+            target/release/examples
+            target/wasm32-unknown-unknown/debug/deps
+            target/wasm32-unknown-unknown/debug/build
+            target/wasm32-unknown-unknown/debug/.fingerprint
+            target/wasm32-wasip1/release/deps
+            target/wasm32-wasip1/release/build
+            target/wasm32-wasip1/release/.fingerprint
+            target/wasm32-wasip1/release/examples
+      - name: Node RAW decode
+        run: nix develop -c cargo test -p looklab-raw --target wasm32-unknown-unknown --test wasm_node
+      - name: Core crates build for wasm32
+        run: nix develop -c cargo xtask wasm-core
       - name: Native/wasm bit identity
         run: nix develop -c cargo xtask bitid
+      - name: Trust red-team harness
+        run: nix develop -c cargo test -p looklab-trust --features harness --release
+      - uses: ./.github/actions/cache
+        with:
+          mode: save
+          family: wasm-gates
+          salt: node-wasm-core-bitid-release-trust
+          paths: |
+            target/.rustc_info.json
+            target/debug/deps
+            target/debug/build
+            target/debug/.fingerprint
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+            target/release/examples
+            target/wasm32-unknown-unknown/debug/deps
+            target/wasm32-unknown-unknown/debug/build
+            target/wasm32-unknown-unknown/debug/.fingerprint
+            target/wasm32-wasip1/release/deps
+            target/wasm32-wasip1/release/build
+            target/wasm32-wasip1/release/.fingerprint
+            target/wasm32-wasip1/release/examples
+
+  ci:
+    name: ci
+    if: always()
+    needs: [lint, native, wasm_release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every lane to succeed
+        env:
+          LINT: ${{ needs.lint.result }}
+          NATIVE: ${{ needs.native.result }}
+          WASM_RELEASE: ${{ needs.wasm_release.result }}
+        run: |
+          failed=0
+          for lane in "lint=$LINT" "native=$NATIVE" "wasm release=$WASM_RELEASE"; do
+            result=${lane#*=}
+            if [ "$result" != success ]; then
+              echo "::error::${lane%%=*} lane result: $result"
+              failed=1
+            fi
+          done
+          exit "$failed"
