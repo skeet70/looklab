@@ -45,6 +45,7 @@ jobs:
       - name: SPDX headers
         run: nix develop -c cargo xtask spdx
       - uses: ./.github/actions/cache
+        if: ${{ !cancelled() }}
         with:
           mode: save
           family: lint
@@ -92,6 +93,7 @@ jobs:
             site/generated/wasm
             target/build-products/wasm
       - name: Prep and scene wasm artifacts
+        id: wasm-assets
         run: nix develop -c sh site/scripts/wasm-assets.sh --prep --scene
       - name: Prep and scene import policy
         run: nix develop -c sh site/scripts/wasm-assets.sh --check --prep --scene
@@ -109,6 +111,7 @@ jobs:
             echo "no community data snapshots present"
           fi
       - uses: ./.github/actions/cache
+        if: ${{ !cancelled() }}
         with:
           mode: save
           family: native-test
@@ -119,6 +122,7 @@ jobs:
             target/debug/build
             target/debug/.fingerprint
       - uses: ./.github/actions/cache
+        if: ${{ !cancelled() }}
         with:
           mode: save
           family: wasm-assets
@@ -128,6 +132,7 @@ jobs:
             target/wasm32-unknown-unknown/release/build
             target/wasm32-unknown-unknown/release/.fingerprint
       - uses: ./.github/actions/cache
+        if: ${{ !cancelled() && steps.wasm-assets.outcome == 'success' }}
         with:
           mode: save
           family: wasm-products
@@ -146,7 +151,7 @@ jobs:
         with:
           mode: restore
           family: wasm-gates
-          salt: node-wasm-core-bitid-release-trust
+          salt: node-wasm-core-bitid
           paths: |
             target/.rustc_info.json
             target/debug/deps
@@ -169,13 +174,12 @@ jobs:
         run: nix develop -c cargo xtask wasm-core
       - name: Native/wasm bit identity
         run: nix develop -c cargo xtask bitid
-      - name: Trust red-team harness
-        run: nix develop -c cargo test -p looklab-trust --features harness --release
       - uses: ./.github/actions/cache
+        if: ${{ !cancelled() }}
         with:
           mode: save
           family: wasm-gates
-          salt: node-wasm-core-bitid-release-trust
+          salt: node-wasm-core-bitid
           paths: |
             target/.rustc_info.json
             target/debug/deps
@@ -193,10 +197,47 @@ jobs:
             target/wasm32-wasip1/release/.fingerprint
             target/wasm32-wasip1/release/examples
 
+  trust_release:
+    name: trust release (${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: trust-release
+          salt: release-harness
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+      - name: Trust red-team harness (shard ${{ matrix.shard }}/4)
+        run: nix develop -c cargo nextest run --locked -p looklab-trust --features harness --release --partition count:${{ matrix.shard }}/4 --no-fail-fast --ignore-default-filter
+      - name: Trust doctests
+        if: ${{ !cancelled() && matrix.shard == 1 }}
+        run: nix develop -c cargo test --locked -p looklab-trust --features harness --release --doc
+      - uses: ./.github/actions/cache
+        if: ${{ !cancelled() && matrix.shard == 1 }}
+        with:
+          mode: save
+          family: trust-release
+          salt: release-harness
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+
   ci:
     name: ci
     if: always()
-    needs: [lint, native, wasm_release]
+    needs: [lint, native, wasm_release, trust_release]
     runs-on: ubuntu-latest
     steps:
       - name: Require every lane to succeed
@@ -204,9 +245,10 @@ jobs:
           LINT: ${{ needs.lint.result }}
           NATIVE: ${{ needs.native.result }}
           WASM_RELEASE: ${{ needs.wasm_release.result }}
+          TRUST_RELEASE: ${{ needs.trust_release.result }}
         run: |
           failed=0
-          for lane in "lint=$LINT" "native=$NATIVE" "wasm release=$WASM_RELEASE"; do
+          for lane in "lint=$LINT" "native=$NATIVE" "wasm release=$WASM_RELEASE" "trust release=$TRUST_RELEASE"; do
             result=${lane#*=}
             if [ "$result" != success ]; then
               echo "::error::${lane%%=*} lane result: $result"

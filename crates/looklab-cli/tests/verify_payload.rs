@@ -160,9 +160,9 @@ fn module() -> PathBuf {
 fn verified_module() -> PathBuf {
     const SCRIPT: &str = "site/scripts/wasm-assets.sh";
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("the CLI crate is under crates/");
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root");
     let output = ProcessCommand::new("sh")
         .current_dir(&root)
         .args([SCRIPT, "--prep", "--check"])
