@@ -88,7 +88,7 @@ fn cluster_samples(problem: &Problem, params: &Params) -> Vec<ClusterSample> {
         .map(|sample| {
             let image = sample.image as usize;
             let context = problem.image_ctx(params, image);
-            let exposure = libm::pow(2.0, context.exposure);
+            let exposure = context.exposure_scale;
             let xyz = looklab_color::Xyz::from_array(context.transform.mul_vec([
                 sample.rgb[0] * context.wb_r * exposure,
                 sample.rgb[1] * exposure,
@@ -230,8 +230,7 @@ fn prior_diagonal(options: &FitOptions, problem: &Problem, params: &Params) -> V
     diagonal
 }
 
-/// Half-open column span covering the nonzeros of each row of a row-major square matrix;
-/// columns inside a span can still be zero.
+/// Spans can contain zero-valued interior columns.
 struct PenaltySpans {
     /// `(first, end)` per row; `first == end` for an all-zero row.
     rows: Vec<(u32, u32)>,
@@ -388,7 +387,6 @@ pub(crate) fn probe_uncertainty(
 
     for probe in &probes.probes {
         let pre = evaluate_probe(look, layout, probe.xyz, &beta_slope, &mut jac);
-        // Only residual slots persist across probes.
         for index in residual_written.drain(..) {
             for z in z_columns.iter_mut() {
                 z[index] = 0.0;

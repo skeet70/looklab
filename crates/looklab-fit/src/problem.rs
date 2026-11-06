@@ -128,6 +128,86 @@ impl BlockAcc {
     }
 }
 
+#[derive(Default, PartialEq, Eq)]
+enum MirrorState {
+    #[default]
+    Unchecked,
+    /// Upper-triangle updates followed by mirroring.
+    Canonical,
+    Asymmetric,
+}
+
+#[derive(Default)]
+struct HessianBuffer {
+    columns: Vec<(u32, [f64; 3])>,
+    mirror: MirrorState,
+}
+
+impl MirrorState {
+    fn resolve(&mut self, hessian: &[f64], n: usize) -> bool {
+        if *self == Self::Unchecked {
+            *self = if bitwise_symmetric(hessian, n) {
+                Self::Canonical
+            } else {
+                Self::Asymmetric
+            };
+        }
+        *self == Self::Canonical
+    }
+}
+
+fn bitwise_symmetric(hessian: &[f64], n: usize) -> bool {
+    (0..n).all(|row| {
+        (row + 1..n).all(|column| {
+            hessian[row * n + column].to_bits() == hessian[column * n + row].to_bits()
+        })
+    })
+}
+
+/// Each entry receives contributions in the original pair order.
+fn accumulate_block<const CANONICAL: bool>(
+    hessian: &mut [f64],
+    gradient: &mut [f64],
+    n: usize,
+    buffer: &[(u32, [f64; 3])],
+    contribution: f64,
+    residual: [f64; 3],
+) {
+    for (a, (left, left_derivative)) in buffer.iter().enumerate() {
+        for (right, right_derivative) in buffer.iter().skip(a) {
+            let dot = left_derivative[0] * right_derivative[0]
+                + left_derivative[1] * right_derivative[1]
+                + left_derivative[2] * right_derivative[2];
+            let weighted = contribution * dot;
+            if CANONICAL {
+                let (row, column) = if left <= right {
+                    (*left, *right)
+                } else {
+                    (*right, *left)
+                };
+                hessian[row as usize * n + column as usize] += weighted;
+            } else {
+                hessian[*left as usize * n + *right as usize] += weighted;
+                if right != left {
+                    hessian[*right as usize * n + *left as usize] += weighted;
+                }
+            }
+        }
+        let term = left_derivative[0] * residual[0]
+            + left_derivative[1] * residual[1]
+            + left_derivative[2] * residual[2];
+        gradient[*left as usize] += contribution * term;
+    }
+}
+
+fn mirror_triangle(hessian: &mut [f64], n: usize) {
+    for row in 0..n {
+        for column in row + 1..n {
+            hessian[column * n + row] = hessian[row * n + column];
+        }
+    }
+}
+
 /// Per-sample data for the matrix-free residual block.
 pub(crate) struct ResidualSample {
     pub nodes: [u32; 8],
@@ -151,6 +231,11 @@ pub(crate) struct PassOutput {
     pub residual_samples: Vec<ResidualSample>,
     pub active_samples: usize,
     pub hessian_rows: usize,
+}
+
+struct LikelihoodScale {
+    nu_variance: f64,
+    log_scale: f64,
 }
 
 fn space_of(output: OutputSpace) -> RgbSpace {
@@ -400,13 +485,14 @@ impl Problem {
                 _ => {}
             }
         }
+        let exposure = nuisance[0]
+            + image.mode.map_or(0.0, |mode| params.mode_offset(mode))
+            + image.known_exposure;
         ImageCtx {
             transform: image.transform,
             a0: image.transform,
             space: image.space,
-            exposure: nuisance[0]
-                + image.mode.map_or(0.0, |mode| params.mode_offset(mode))
-                + image.known_exposure,
+            exposure_scale: libm::pow(2.0, exposure),
             wb_r: libm::exp(log_r),
             wb_b: libm::exp(log_b),
         }
@@ -500,16 +586,20 @@ impl Problem {
                 )
             })
             .collect();
-        let sigma: Vec<f64> = (0..self.contributors.len())
-            .map(|index| params.sigma(index) * params.sigma(index))
-            .collect();
         let nu = self.nu;
         let nu_plus_three = nu + 3.0;
-        let nu_sigma: Vec<f64> = sigma.iter().map(|value| nu * *value).collect();
-        let log_scale: Vec<f64> = sigma.iter().map(|value| 1.5 * libm::log(*value)).collect();
+        let likelihood: Vec<LikelihoodScale> = (0..self.contributors.len())
+            .map(|index| {
+                let variance = params.sigma(index) * params.sigma(index);
+                LikelihoodScale {
+                    nu_variance: nu * variance,
+                    log_scale: 1.5 * libm::log(variance),
+                }
+            })
+            .collect();
         let hessian_set = &self.hessian_set;
-        let mut block_buffers: Vec<Vec<(u32, [f64; 3])>> =
-            blocks.iter().map(|_| Vec::new()).collect();
+        let mut block_buffers: Vec<HessianBuffer> =
+            blocks.iter().map(|_| HessianBuffer::default()).collect();
 
         for (index, sample) in self.samples.iter().enumerate() {
             if neutral_only && !sample.neutral {
@@ -557,13 +647,14 @@ impl Problem {
             let squared =
                 residual[0] * residual[0] + residual[1] * residual[1] + residual[2] * residual[2];
             let contributor = image_entry.contributor;
-            let (log_likelihood, alpha) = Self::irls(squared, nu_sigma[contributor], nu_plus_three);
+            let scale = &likelihood[contributor];
+            let (log_likelihood, alpha) = Self::irls(squared, scale.nu_variance, nu_plus_three);
             let weight = sample.weight;
             output.active_samples += 1;
             if is_hessian {
                 output.hessian_rows += 1;
             }
-            output.cost += weight * (log_likelihood + log_scale[contributor]);
+            output.cost += weight * (log_likelihood + scale.log_scale);
             output.image_rss[image] += weight * squared;
             output.image_weight[image] += weight;
             output.contributor_rss[contributor] += weight * squared;
@@ -575,11 +666,6 @@ impl Problem {
             let contribution = weight * alpha;
             output.rss += contribution * squared;
             if evaluated.is_some() {
-                if is_hessian {
-                    for buffer in &mut block_buffers {
-                        buffer.clear();
-                    }
-                }
                 for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
                     let term = derivative[0] * residual[0]
                         + derivative[1] * residual[1]
@@ -587,17 +673,6 @@ impl Problem {
                     output.gradient[*column as usize] += contribution * term;
                     if want_per_image {
                         output.per_image_gradient[image][*column as usize] += contribution * term;
-                    }
-                    if is_hessian {
-                        for (slot, block) in blocks.iter_mut().enumerate() {
-                            if block.image.is_some_and(|other| other != image) {
-                                continue;
-                            }
-                            let local = block.local[*column as usize];
-                            if local != u32::MAX {
-                                block_buffers[slot].push((local, *derivative));
-                            }
-                        }
                     }
                 }
             }
@@ -609,24 +684,36 @@ impl Problem {
                 if block.image.is_some_and(|other| other != image) {
                     continue;
                 }
-                let buffer = &block_buffers[slot];
                 let n = block.len();
-                for (a, (left, left_derivative)) in buffer.iter().enumerate() {
-                    let base = *left as usize * n;
-                    for (right, right_derivative) in buffer.iter().skip(a) {
-                        let dot = left_derivative[0] * right_derivative[0]
-                            + left_derivative[1] * right_derivative[1]
-                            + left_derivative[2] * right_derivative[2];
-                        let weighted = contribution * dot;
-                        block.hessian[base + *right as usize] += weighted;
-                        if right != left {
-                            block.hessian[*right as usize * n + *left as usize] += weighted;
-                        }
+                let entry = &mut block_buffers[slot];
+                entry.columns.clear();
+                for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
+                    let local = block.local[*column as usize];
+                    if local != u32::MAX {
+                        entry.columns.push((local, *derivative));
                     }
-                    let term = left_derivative[0] * residual[0]
-                        + left_derivative[1] * residual[1]
-                        + left_derivative[2] * residual[2];
-                    block.gradient[*left as usize] += contribution * term;
+                }
+                if entry.columns.is_empty() {
+                    continue;
+                }
+                if entry.mirror.resolve(&block.hessian, n) {
+                    accumulate_block::<true>(
+                        &mut block.hessian,
+                        &mut block.gradient,
+                        n,
+                        &entry.columns,
+                        contribution,
+                        residual,
+                    );
+                } else {
+                    accumulate_block::<false>(
+                        &mut block.hessian,
+                        &mut block.gradient,
+                        n,
+                        &entry.columns,
+                        contribution,
+                        residual,
+                    );
                 }
             }
             if wants_residual_block {
@@ -640,6 +727,12 @@ impl Problem {
                     alpha: contribution,
                     residual,
                 });
+            }
+        }
+        for (slot, block) in blocks.iter_mut().enumerate() {
+            if block_buffers[slot].mirror == MirrorState::Canonical {
+                let n = block.len();
+                mirror_triangle(&mut block.hessian, n);
             }
         }
         output
@@ -704,5 +797,90 @@ impl Xorshift {
     /// Uniform in `[0, 1)`.
     pub fn unit(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+#[cfg(all(test, feature = "synth"))]
+mod tests {
+    use super::*;
+    use crate::synth::{SynthConfig, dataset};
+
+    /// Every fixture contribution is smaller than this value's ULP.
+    const ABSORBING: f64 = 1e300;
+
+    fn mixed_block(problem: &Problem) -> BlockAcc {
+        let mut params: Vec<usize> = problem.layout.tone_beta.clone().rev().collect();
+        params.push(problem.layout.tone_c0);
+        params.push(problem.layout.tint_a.start);
+        BlockAcc::new(BlockKind::Tone, params, problem.layout.total)
+    }
+
+    #[test]
+    fn prefilled_hessians_keep_their_triangles_and_mirror_the_rest() {
+        let data = dataset(&SynthConfig {
+            images: 1,
+            samples_per_image: 32,
+            ..SynthConfig::default()
+        });
+        let options = FitOptions::default();
+        let problem = Problem::new_with(&data.images, None, &options).expect("problem");
+        let params = Params::initial(problem.layout.clone(), problem.contributors.len());
+        let image = problem.layout.image(0);
+        let mut untouched = BlockAcc::new(
+            BlockKind::Nuisance,
+            vec![image.start, image.start + 1],
+            problem.layout.total,
+        );
+        untouched.image = Some(7);
+        untouched.hessian[1] = 3.0;
+        untouched.hessian[2] = -4.0;
+        let mut blocks = vec![mixed_block(&problem), untouched];
+        let n = blocks[0].len();
+        let _ = problem.pass(
+            &params,
+            ActiveColumns::ALL,
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::NativeOnly,
+        );
+        let canonical = blocks[0].hessian.clone();
+        let mut probe = None;
+        for row in 0..n {
+            for column in row + 1..n {
+                assert_eq!(
+                    canonical[row * n + column].to_bits(),
+                    canonical[column * n + row].to_bits(),
+                    "entries ({row}, {column}) and ({column}, {row}) differ"
+                );
+                if probe.is_none() && canonical[row * n + column] != 0.0 {
+                    probe = Some((row, column));
+                }
+            }
+        }
+        let (row, column) = probe.expect("no off-diagonal entry carries a contribution");
+        assert_eq!(blocks[1].hessian[1].to_bits(), 3.0_f64.to_bits());
+        assert_eq!(blocks[1].hessian[2].to_bits(), (-4.0_f64).to_bits());
+
+        blocks[0].reset();
+        blocks[0].hessian[row * n + column] = ABSORBING;
+        let _ = problem.pass(
+            &params,
+            ActiveColumns::ALL,
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::NativeOnly,
+        );
+        assert_eq!(
+            blocks[0].hessian[row * n + column].to_bits(),
+            ABSORBING.to_bits()
+        );
+        assert_eq!(
+            blocks[0].hessian[column * n + row].to_bits(),
+            canonical[column * n + row].to_bits()
+        );
     }
 }

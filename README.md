@@ -30,7 +30,7 @@ Nix uses public binary substituters rather than a per-store GitHub Actions cache
 
 `tools/build_products.py` owns worker and site-data freshness. Receipts and shared writer locks live under the main checkout's `target/build-products/`. Worker inputs include the local Cargo source closure and the explicit compile-time input trees; data also binds the fetched scene sources. CSS and UI-only source edits do not invalidate these products. New include targets or generator modules outside the supported input selection fail closed; extend the selection in that helper when adding them. Run `nix develop -c python3 -m unittest discover -s tools/tests -v` for the isolated cache-boundary tests.
 
-Single-run validation on 2026-11-06 used application commit `c10b5d2` plus the build changes, excluding concurrent uncommitted application edits. Pages times cover the build critical path, not deployment:
+Single-run validation on 2026-11-06 used application commit `c10b5d2` plus build and fitting-performance changes, excluding concurrent uncommitted application edits. Pages times cover the build critical path, not deployment:
 
 | Pages run | Elapsed | Evidence |
 |---|---:|---|
@@ -38,6 +38,8 @@ Single-run validation on 2026-11-06 used application commit `c10b5d2` plus the b
 | New pipeline, first Cargo/product cache population | 16m 34s | [Cold run](https://github.com/skeet70/looklab/actions/runs/42180363234) |
 | New pipeline, warm caches before host-cache correction | 8m 13s | [Warm run](https://github.com/skeet70/looklab/actions/runs/42182424417) |
 | New pipeline, warm host and WASM UI cache | 7m 32s | [Exact-source rerun](https://github.com/skeet70/looklab/actions/runs/42192708299/attempts/2) |
+| Main, unchanged Rust source | 6m 48s | [Successful deployment](https://github.com/skeet70/looklab/actions/runs/42262170856) |
+| Main, changed fitting Rust source | 12m 25s | [Successful deployment](https://github.com/skeet70/looklab/actions/runs/42271818181), not an unchanged-source warm run |
 
 The corrected warm UI run restored its populated host/WASM cache and recompiled only workspace crates; no third-party dependencies recompiled.
 
@@ -55,6 +57,7 @@ Full CI measurements used the same application base and failed Clippy, the CLI E
 | Three lanes, unsharded release trust suite | 52m 41s | [Pre-shard run](https://github.com/skeet70/looklab/actions/runs/42180330465) |
 | Four trust shards, first trust compiler-cache population | 40m 08s | [Sharded run](https://github.com/skeet70/looklab/actions/runs/42190766989/attempts/1) |
 | Four trust shards, cache-populated rerun with HTTP 429 restore failures | 38m 26s | [Same-source attempt 2](https://github.com/skeet70/looklab/actions/runs/42190766989/attempts/2), not a fully warm comparison |
+| Four trust shards with exact-order covariance/pass reuse | 25m 26s | [Pushed-main run](https://github.com/skeet70/looklab/actions/runs/42271818190), same 124 passed and 10 failed |
 
 The sharded run executed all 134 release trust cases: 124 passed and 10 failed. Its required aggregate check stayed red. The CLI E2E failure also reproduced on unmodified `c10b5d2` with the original Wasmtime defaults. No successful same-source full-CI baseline is available; the failing native E2E binary prevents later workspace tests from running.
 
@@ -62,29 +65,22 @@ An isolated native-only [attempt 3](https://github.com/skeet70/looklab/actions/r
 
 ### Trust fitting performance
 
-Cholesky updates interleave four independent rows while retaining each row's scalar subtraction order. Residual pinning computes its support maximum once per pass. A captured in-progress fit refactor had moved that maximum scan into every coefficient check; correcting it restores linear pinning work.
+Cholesky updates and triangular solves interleave independent accumulators without changing their scalar reduction order. Hessian accumulation uses one triangle only when the initial matrix is bitwise symmetric; asymmetric matrices retain independent updates. The completed triangle is mirrored after the pass.
 
-A same-source local comparison on 2026-11-06 used generation `a5d847973259f3f34c4fd66ac95a793c3a28271d916dccc41a37d09d2990d1c7`, release compilation, default fit options, and synthetic inputs of 3 images × 1,600 samples and 20 images × 200 samples:
+Image contexts store `2^exposure` once, and prediction-only evaluation constructs one `LookInput` per sample. Model-error held-out scoring computes predictions without unused Jacobians. Fit options, sample counts, seeds, stopping criteria and acceptance thresholds are unchanged.
 
-| Combined public fit attempts | Runtime, compilation excluded |
-|---|---:|
-| Before row interleaving and pinning correction | 66.53s |
-| After | 33.20s |
+The complete thin-root scenario ran all ten releases on the same workstation:
 
-Both complete `FitResult` debug outputs were identical before and after. A separate kernel comparison was bit-identical across 49 matrix sizes and three scales, including positive-definite and indefinite inputs. These fit attempts did not converge on that captured application source; they are not full trust-scenario or green-CI timing measurements. The committed application baseline already scanned the pinning maximum once, so the refactor correction is not an additional speedup over that baseline.
+| Application/performance revision | Elapsed, compilation excluded | Peak RSS |
+|---|---:|---:|
+| `c10b5d2` | 22m 31s | 424 MiB |
+| `35f282a` | 17m 26s | 428 MiB |
+| `3a9c6c8` | 17m 41s | 395 MiB |
+| Guarded Hessian and input/scoring reuse | 15m 01s | 465 MiB |
 
-The full thin-root scenario on committed application `c10b5d2` took 22m 31s before and 17m 26s with `35f282a`, on the same workstation in separate runs. Both completed all ten releases and failed with the same 2/10 publication count and first over-ceiling value. Concurrent unrelated work limits the timing comparison; this does not establish green-CI latency.
+Every run retained the same 2/10 publication outcome and first over-ceiling shift `2.102994928935835`. These are separate runs with concurrent workstation activity; scheduling, clock frequency and allocator residency were not controlled. They do not establish green-CI latency.
 
-The next optimization batch interleaves four independent triangular-solve right-hand sides, reuses pass-invariant likelihood terms, and projects all three probe channels together. Prior covariance scans each penalty row's nonzero bounding span, retaining the original interior-zero checks and accumulation order.
-
-A committed-source comparison used the same two synthetic inputs and default fit options above. Both fits converged, and their complete `FitResult` debug outputs, including probe uncertainties, matched byte for byte:
-
-| Combined converged fits | Runtime, compilation excluded |
-|---|---:|
-| `35f282a` | 48.76s |
-| Four-RHS solves, pass reuse and covariance projection reuse | 29.91s |
-
-These are separate single runs on the same workstation, not full-suite or CI timings.
+Three alternating baseline/candidate pairs also exercised converged public fits with default options on 3 images × 1,600 samples and 20 images × 200 samples, using seeds 14 and 71. All six executions returned byte-identical full `FitResult` debug outputs, including probe uncertainties. The new mathematical boundary tests cover inverse batch tails and prefilled asymmetric Hessians.
 
 ## Local site
 

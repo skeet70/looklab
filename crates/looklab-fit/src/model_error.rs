@@ -137,8 +137,6 @@ pub fn estimate_model_error(
         let Ok(problem) = Problem::new_with(&held_images, None, options) else {
             continue;
         };
-        let slopes = tone_slopes(&result.look);
-        let mut jac = crate::predict::Jac::default();
         let mut squared = vec![0.0_f64; field.variance.len()];
         let mut counts = vec![0.0_f64; field.variance.len()];
         for sample in &problem.samples {
@@ -155,23 +153,13 @@ pub fn estimate_model_error(
                 transform: image.transform,
                 a0: image.transform,
                 space: problem.images[index].space,
-                exposure: image.exposure_hint,
+                exposure_scale: scale,
                 wb_r: 1.0,
                 wb_b: 1.0,
             };
-            let evaluated = crate::predict::evaluate_sample(
-                &result.look,
-                &problem.layout,
-                &context,
-                &crate::predict::ColumnMap::default(),
-                sample.rgb,
-                clip_k,
-                1.0,
-                &slopes,
-                &[],
-                &mut jac,
-            );
-            let error = delta_e_ucs(evaluated.prediction, sample.target);
+            let prediction =
+                crate::predict::predict_only(&result.look, &context, sample.rgb, clip_k);
+            let error = delta_e_ucs(prediction, sample.target);
             let bin = region(input.s, input.h_in);
             let weight = sample.weight.max(0.0);
             squared[bin] += weight * error * error;
@@ -208,17 +196,6 @@ pub fn estimate_model_error(
     }
     field.variance = smooth(&raw);
     Ok(field)
-}
-
-fn tone_slopes(look: &Look) -> [f64; looklab_model::basis::TONE_COEFS] {
-    use crate::layout::{softplus_inverse, softplus_slope};
-    let mut slopes = [1.0_f64; looklab_model::basis::TONE_COEFS];
-    if let looklab_model::Tone::Spline { beta, .. } = &look.tone {
-        for (slope, value) in slopes.iter_mut().zip(beta.iter()) {
-            *slope = softplus_slope(softplus_inverse(*value));
-        }
-    }
-    slopes
 }
 
 /// Add the stored model variance to an interactive probe set and re-mark support.

@@ -19,7 +19,8 @@ pub(crate) struct ImageCtx {
     /// Prior mean `A0`; `transform = a0·(I + Δ)`.
     pub a0: Mat3,
     pub space: RgbSpace,
-    pub exposure: f64,
+    /// `2^exposure`.
+    pub exposure_scale: f64,
     pub wb_r: f64,
     pub wb_b: f64,
 }
@@ -308,7 +309,7 @@ pub(crate) fn evaluate_sample(
     jac: &mut Jac,
 ) -> EvalOutput {
     jac.clear();
-    let exposure_scale = libm::pow(2.0, image.exposure);
+    let exposure_scale = image.exposure_scale;
     let cam = [
         rgb[0] * image.wb_r * exposure_scale,
         rgb[1] * exposure_scale,
@@ -742,15 +743,16 @@ pub fn post_clip(look: &Look, xyz: Xyz, space: RgbSpace, clip_k: f64) -> Ucs {
 
 /// Post-clip prediction without the Jacobian, for samples outside the Hessian set.
 pub(crate) fn predict_only(look: &Look, image: &ImageCtx, rgb: [f64; 3], clip_k: f64) -> Ucs {
-    let exposure_scale = libm::pow(2.0, image.exposure);
+    let exposure_scale = image.exposure_scale;
     let cam = [
         rgb[0] * image.wb_r * exposure_scale,
         rgb[1] * exposure_scale,
         rgb[2] * image.wb_b * exposure_scale,
     ];
     let xyz = Xyz::from_array(image.transform.mul_vec(cam));
-    let values = look.layer_values(&LookInput::new(xyz));
-    let pre = look.eval_from_layer_values(&LookInput::new(xyz), &values);
+    let input = LookInput::new(xyz);
+    let values = look.layer_values(&input);
+    let pre = look.eval_from_layer_values(&input, &values);
     let channels = output_channels(pre, image.space);
     let clipped = channels.map(|value| soft_clip(value, clip_k));
     ucs_of_xyz(
@@ -854,7 +856,7 @@ mod tests {
             transform,
             a0: transform,
             space,
-            exposure: nuisance[0],
+            exposure_scale: libm::pow(2.0, nuisance[0]),
             wb_r: libm::exp(nuisance[1]),
             wb_b: libm::exp(nuisance[2]),
         }

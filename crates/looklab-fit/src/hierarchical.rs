@@ -448,7 +448,7 @@ fn body_pass(
             transform,
             a0,
             space: spaces[position],
-            exposure: xi + nuisance[0],
+            exposure_scale: libm::pow(2.0, xi + nuisance[0]),
             wb_r: libm::exp(log_r),
             wb_b: libm::exp(log_b),
         };
@@ -946,7 +946,7 @@ pub fn firmware_images(
             transform: images[index].transform,
             a0: images[index].transform,
             space,
-            exposure: nuisance.exposure,
+            exposure_scale: libm::pow(2.0, nuisance.exposure),
             wb_r: libm::exp(nuisance.wb_log_r),
             wb_b: libm::exp(nuisance.wb_log_b),
         };
@@ -1098,7 +1098,7 @@ fn estimate_firmware(
             transform: pool[index].transform,
             a0: pool[index].transform,
             space: problem.images[index].space,
-            exposure: pool[index].exposure_hint,
+            exposure_scale: libm::pow(2.0, pool[index].exposure_hint),
             wb_r: 1.0,
             wb_b: 1.0,
         };

@@ -77,9 +77,9 @@ pub(crate) fn build(problem: &Problem, params: &Params, floor: f64) -> Density {
                 let image = sample.image as usize;
                 let context = problem.image_ctx(params, image);
                 let xyz = context.transform.mul_vec([
-                    sample.rgb[0] * context.wb_r * libm::pow(2.0, context.exposure),
-                    sample.rgb[1] * libm::pow(2.0, context.exposure),
-                    sample.rgb[2] * context.wb_b * libm::pow(2.0, context.exposure),
+                    sample.rgb[0] * context.wb_r * context.exposure_scale,
+                    sample.rgb[1] * context.exposure_scale,
+                    sample.rgb[2] * context.wb_b * context.exposure_scale,
                 ]);
                 (looklab_color::Xyz::from_array(xyz), sample.weight)
             }),
