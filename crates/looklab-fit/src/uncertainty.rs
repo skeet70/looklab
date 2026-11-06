@@ -7,7 +7,7 @@ use looklab_model::{Look, LookInput};
 use crate::layout::Params;
 use crate::predict::{Jac, evaluate_probe};
 use crate::problem::{BlockAcc, Problem, ResidualSample};
-use crate::solve::{factor_in_place, solve_in_place};
+use crate::solve::{factor_in_place, solve_four_in_place, solve_in_place};
 use crate::types::{Density, FitOptions, PreviousSupport, ProbeEstimate, ProbeUncertainty, Result};
 
 /// Keep post-clip variance at least `(0.25)²` times the pre-clip trace, the clip
@@ -178,11 +178,28 @@ fn invert(h: &[f64], n: usize) -> Option<Vec<f64>> {
         return None;
     }
     let mut inverse = vec![0.0_f64; n * n];
-    let mut column = vec![0.0_f64; n];
-    for j in 0..n {
-        column.iter_mut().for_each(|value| *value = 0.0);
+    let full = n - n % 4;
+    let mut columns = vec![0.0_f64; if full == 0 { n } else { 4 * n }];
+    for j in (0..full).step_by(4) {
+        columns.fill(0.0);
+        for offset in 0..4 {
+            columns[offset * n + j + offset] = 1.0;
+        }
+        let (a, rest) = columns.split_at_mut(n);
+        let (b, rest) = rest.split_at_mut(n);
+        let (c, d) = rest.split_at_mut(n);
+        solve_four_in_place(&l, [a, b, c, d]);
+        for i in 0..n {
+            for offset in 0..4 {
+                inverse[i * n + j + offset] = columns[offset * n + i];
+            }
+        }
+    }
+    let column = &mut columns[..n];
+    for j in full..n {
+        column.fill(0.0);
         column[j] = 1.0;
-        solve_in_place(&l, n, &mut column);
+        solve_in_place(&l, n, column);
         for (i, value) in column.iter().enumerate() {
             inverse[i * n + j] = *value;
         }
@@ -211,6 +228,29 @@ fn prior_diagonal(options: &FitOptions, problem: &Problem, params: &Params) -> V
         diagonal[index] = RESPONSE_PRIOR_PRECISION;
     }
     diagonal
+}
+
+/// Half-open column span covering the nonzeros of each row of a row-major square matrix;
+/// columns inside a span can still be zero.
+struct PenaltySpans {
+    /// `(first, end)` per row; `first == end` for an all-zero row.
+    rows: Vec<(u32, u32)>,
+}
+
+impl PenaltySpans {
+    fn new(matrix: &[f64], n: usize) -> Self {
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            let row = &matrix[i * n..(i + 1) * n];
+            let first = row.iter().position(|value| *value != 0.0);
+            let last = row.iter().rposition(|value| *value != 0.0);
+            rows.push(match (first, last) {
+                (Some(first), Some(last)) => (first as u32, last as u32 + 1),
+                _ => (0, 0),
+            });
+        }
+        Self { rows }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -306,7 +346,8 @@ pub(crate) fn probe_uncertainty(
         }
         out
     };
-    let apply_prior_many = |z: [&[f64]; 3]| -> [Vec<f64>; 3] {
+    let penalty_spans = options.prior_floor.then(|| PenaltySpans::new(penalty, n));
+    let apply_prior_many = |spans: &PenaltySpans, z: [&[f64]; 3]| -> [Vec<f64>; 3] {
         let mut out: [Vec<f64>; 3] =
             core::array::from_fn(|channel| crate::fit::identity_apply(layout, block, z[channel]));
         for i in 0..n {
@@ -314,11 +355,13 @@ pub(crate) fn probe_uncertainty(
             for channel in 0..3 {
                 out[channel][i] += priors[global] * z[channel][global];
             }
-            for j in 0..n {
+            let (first, end) = spans.rows[i];
+            for j in first as usize..end as usize {
                 let weight = penalty[i * n + j];
                 if weight != 0.0 {
+                    let source = block.params[j];
                     for channel in 0..3 {
-                        out[channel][i] += weight * z[channel][block.params[j]];
+                        out[channel][i] += weight * z[channel][source];
                     }
                 }
             }
@@ -338,40 +381,55 @@ pub(crate) fn probe_uncertainty(
     let mut jac = Jac::default();
     let mut estimates = Vec::with_capacity(probes.probes.len());
     let mut supported = 0usize;
-    let mut z_dense = vec![0.0_f64; layout.total];
     let mut z_columns: [Vec<f64>; 3] = core::array::from_fn(|_| vec![0.0_f64; layout.total]);
-    let mut entries: Vec<(usize, f64)> = Vec::with_capacity(320);
+    let mut entries: Vec<(usize, usize)> = Vec::with_capacity(320);
+    let mut residual_written: Vec<usize> = Vec::new();
+    let mut support: Vec<usize> = Vec::with_capacity(n);
 
     for probe in &probes.probes {
         let pre = evaluate_probe(look, layout, probe.xyz, &beta_slope, &mut jac);
-        for channel in 0..3 {
-            z_dense.fill(0.0);
-            entries.clear();
-            for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
-                let local = block.local[*column as usize];
-                if local != u32::MAX {
-                    entries.push((local as usize, derivative[channel]));
+        // Only residual slots persist across probes.
+        for index in residual_written.drain(..) {
+            for z in z_columns.iter_mut() {
+                z[index] = 0.0;
+            }
+        }
+        entries.clear();
+        for (deriv, column) in jac.cols.iter().enumerate() {
+            let local = block.local[*column as usize];
+            if local != u32::MAX {
+                entries.push((local as usize, deriv));
+            }
+        }
+        for i in 0..n {
+            let row = &inverse[i * n..i * n + n];
+            let mut sums = [0.0_f64; 3];
+            for &(local, deriv) in &entries {
+                let inverse_value = row[local];
+                let derivative = jac.derivs[deriv];
+                for channel in 0..3 {
+                    sums[channel] += inverse_value * derivative[channel];
                 }
             }
-            for i in 0..n {
-                let mut sum = 0.0;
-                for (local, value) in &entries {
-                    sum += inverse[i * n + local] * value;
-                }
-                z_dense[block.params[i]] = sum;
+            let global = block.params[i];
+            for channel in 0..3 {
+                z_columns[channel][global] = sums[channel];
             }
-            for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
-                let index = *column as usize;
-                if layout.residual.contains(&index) {
-                    z_dense[index] =
-                        derivative[channel] * residual_diagonal[index - residual_start];
+        }
+        for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
+            let index = *column as usize;
+            if layout.residual.contains(&index) {
+                let scale = residual_diagonal[index - residual_start];
+                for channel in 0..3 {
+                    z_columns[channel][index] = derivative[channel] * scale;
                 }
+                residual_written.push(index);
             }
-            z_columns[channel].copy_from_slice(&z_dense);
         }
         // `z = H^-1 J_probe` is dense, so the contraction must cover every fitted coordinate.
-        let mut support: Vec<usize> = block.params.clone();
-        for index in residual_start..residual_start + RESIDUAL_COEFS {
+        support.clear();
+        support.extend_from_slice(&block.params);
+        for &index in &residual_written {
             if z_columns.iter().any(|z| z[index] != 0.0) {
                 support.push(index);
             }
@@ -403,8 +461,8 @@ pub(crate) fn probe_uncertainty(
 
         // `H^-1 (factor * M + L_prior) H^-1`: the meat uses z, the prior term is z' L z.
         let mut prior_cov = [[0.0_f64; 3]; 3];
-        if options.prior_floor {
-            let applied = apply_prior_many([&z_columns[0], &z_columns[1], &z_columns[2]]);
+        if let Some(spans) = &penalty_spans {
+            let applied = apply_prior_many(spans, [&z_columns[0], &z_columns[1], &z_columns[2]]);
             for c in 0..3 {
                 for d in 0..3 {
                     for (local, global) in block.params.iter().enumerate() {
@@ -739,6 +797,30 @@ fn residual_inverse_diagonal(samples: &[ResidualSample], lambda: f64) -> Vec<f64
 #[cfg(test)]
 mod review_tests {
     use super::*;
+
+    #[test]
+    fn inverse_recovers_identity_across_batch_boundaries() {
+        assert_eq!(invert(&[], 0), Some(Vec::new()));
+        assert_eq!(invert(&[0.0], 1), None);
+        for n in [1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 32, 33] {
+            let mut matrix = vec![0.0; n * n];
+            for i in 0..n {
+                matrix[i * n + i] = 4.0;
+                if i + 1 < n {
+                    matrix[i * n + i + 1] = 0.5;
+                    matrix[(i + 1) * n + i] = 0.5;
+                }
+            }
+            let inverse = invert(&matrix, n).expect("positive-definite matrix");
+            for i in 0..n {
+                for j in 0..n {
+                    let product: f64 = (0..n).map(|k| matrix[i * n + k] * inverse[k * n + j]).sum();
+                    let expected = if i == j { 1.0 } else { 0.0 };
+                    assert!((product - expected).abs() < 1e-12, "n={n}, ({i}, {j})");
+                }
+            }
+        }
+    }
 
     #[test]
     fn clusters_count_images_not_samples() {

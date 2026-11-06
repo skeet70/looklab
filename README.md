@@ -75,6 +75,17 @@ Both complete `FitResult` debug outputs were identical before and after. A separ
 
 The full thin-root scenario on committed application `c10b5d2` took 22m 31s before and 17m 26s with `35f282a`, on the same workstation in separate runs. Both completed all ten releases and failed with the same 2/10 publication count and first over-ceiling value. Concurrent unrelated work limits the timing comparison; this does not establish green-CI latency.
 
+The next optimization batch interleaves four independent triangular-solve right-hand sides, reuses pass-invariant likelihood terms, and projects all three probe channels together. Prior covariance scans each penalty row's nonzero bounding span, retaining the original interior-zero checks and accumulation order.
+
+A committed-source comparison used the same two synthetic inputs and default fit options above. Both fits converged, and their complete `FitResult` debug outputs, including probe uncertainties, matched byte for byte:
+
+| Combined converged fits | Runtime, compilation excluded |
+|---|---:|
+| `35f282a` | 48.76s |
+| Four-RHS solves, pass reuse and covariance projection reuse | 29.91s |
+
+These are separate single runs on the same workstation, not full-suite or CI timings.
+
 ## Local site
 
 From the repository root, run `site/scripts/dev.sh`. It enters `nix develop`, captures source files, builds the data, stub, workers and UI, then serves the UI at <http://localhost:8081/>. A TCP proxy forwards that public origin to the stub on 8098. Passkeys use the public 8081 origin. The launcher exclusively locks its UI target root. SIGTERM, SIGINT and SIGHUP stop builds, the stub, proxy and stylesheet watcher; no TTY is required.

@@ -62,6 +62,7 @@ pub(crate) struct Problem {
     pub contributors: Vec<ContributorId>,
     pub samples: Vec<Sample>,
     pub hessian: Vec<u32>,
+    hessian_set: Vec<bool>,
     pub nu: f64,
     /// Images that carry non-zero weight and therefore count towards the effective sample size.
     pub active_images: usize,
@@ -309,6 +310,10 @@ impl Problem {
             return Err(FitError::NoSamples);
         }
         let hessian = hessian_subset(samples.len(), options.hessian_samples, options.seed);
+        let mut hessian_set = vec![false; samples.len()];
+        for index in &hessian {
+            hessian_set[*index as usize] = true;
+        }
         let active_images = entries
             .iter()
             .filter(|entry| {
@@ -347,6 +352,7 @@ impl Problem {
             contributors,
             samples,
             hessian,
+            hessian_set,
             nu: options.nu,
             active_images,
             parameter_ids,
@@ -427,11 +433,10 @@ impl Problem {
     }
 
     /// Student-t log-likelihood increase and IRLS weight for one residual.
-    fn irls(&self, residual_squared: f64, sigma_squared: f64) -> (f64, f64) {
-        let nu = self.nu;
-        let ratio = residual_squared / (nu * sigma_squared);
-        let weight = (nu + 3.0) / (nu * sigma_squared + residual_squared);
-        (0.5 * (nu + 3.0) * libm::log1p(ratio), weight)
+    fn irls(residual_squared: f64, nu_sigma: f64, nu_plus_three: f64) -> (f64, f64) {
+        let ratio = residual_squared / nu_sigma;
+        let weight = nu_plus_three / (nu_sigma + residual_squared);
+        (0.5 * nu_plus_three * libm::log1p(ratio), weight)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -452,6 +457,7 @@ impl Problem {
         let clip_k = params.clip_k();
         let clip_slope = params.clip_slope();
         let total = self.layout.total;
+        let wants_residual_block = blocks.iter().any(|block| block.kind == BlockKind::Residual);
         let mut output = PassOutput {
             cost: 0.0,
             rss: 0.0,
@@ -474,7 +480,11 @@ impl Problem {
             } else {
                 Vec::new()
             },
-            residual_samples: Vec::new(),
+            residual_samples: if wants_residual_block {
+                Vec::with_capacity(self.hessian.len())
+            } else {
+                Vec::new()
+            },
             active_samples: 0,
             hessian_rows: 0,
         };
@@ -493,29 +503,31 @@ impl Problem {
         let sigma: Vec<f64> = (0..self.contributors.len())
             .map(|index| params.sigma(index) * params.sigma(index))
             .collect();
-        let mut hessian_set = vec![false; self.samples.len()];
-        for index in &self.hessian {
-            hessian_set[*index as usize] = true;
-        }
+        let nu = self.nu;
+        let nu_plus_three = nu + 3.0;
+        let nu_sigma: Vec<f64> = sigma.iter().map(|value| nu * *value).collect();
+        let log_scale: Vec<f64> = sigma.iter().map(|value| 1.5 * libm::log(*value)).collect();
+        let hessian_set = &self.hessian_set;
         let mut block_buffers: Vec<Vec<(u32, [f64; 3])>> =
             blocks.iter().map(|_| Vec::new()).collect();
-        let wants_residual_block = blocks.iter().any(|block| block.kind == BlockKind::Residual);
 
         for (index, sample) in self.samples.iter().enumerate() {
             if neutral_only && !sample.neutral {
                 continue;
             }
             let image = sample.image as usize;
-            if !intents.includes(self.images[image].intent) {
+            let image_entry = &self.images[image];
+            if !intents.includes(image_entry.intent) {
                 continue;
             }
+            let is_hessian = hessian_set[index];
             let (context, columns) = &contexts[image];
             let terms: &[ResponseTerm] = if active.response {
                 &self.terms[image]
             } else {
                 &[]
             };
-            let needs_jacobian = hessian_set[index] || want_per_image;
+            let needs_jacobian = is_hessian || want_per_image;
             let (prediction, evaluated) = if needs_jacobian {
                 let evaluated = evaluate_sample(
                     &looks[image],
@@ -544,17 +556,16 @@ impl Problem {
             ];
             let squared =
                 residual[0] * residual[0] + residual[1] * residual[1] + residual[2] * residual[2];
-            let variance = sigma[self.images[image].contributor];
-            let (log_likelihood, alpha) = self.irls(squared, variance);
+            let contributor = image_entry.contributor;
+            let (log_likelihood, alpha) = Self::irls(squared, nu_sigma[contributor], nu_plus_three);
             let weight = sample.weight;
             output.active_samples += 1;
-            if hessian_set[index] {
+            if is_hessian {
                 output.hessian_rows += 1;
             }
-            output.cost += weight * (log_likelihood + 1.5 * libm::log(variance));
+            output.cost += weight * (log_likelihood + log_scale[contributor]);
             output.image_rss[image] += weight * squared;
             output.image_weight[image] += weight;
-            let contributor = self.images[image].contributor;
             output.contributor_rss[contributor] += weight * squared;
             output.contributor_weight[contributor] += weight;
             output.contributor_pairs[contributor].push((weight, squared));
@@ -564,6 +575,11 @@ impl Problem {
             let contribution = weight * alpha;
             output.rss += contribution * squared;
             if evaluated.is_some() {
+                if is_hessian {
+                    for buffer in &mut block_buffers {
+                        buffer.clear();
+                    }
+                }
                 for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
                     let term = derivative[0] * residual[0]
                         + derivative[1] * residual[1]
@@ -572,24 +588,28 @@ impl Problem {
                     if want_per_image {
                         output.per_image_gradient[image][*column as usize] += contribution * term;
                     }
+                    if is_hessian {
+                        for (slot, block) in blocks.iter_mut().enumerate() {
+                            if block.image.is_some_and(|other| other != image) {
+                                continue;
+                            }
+                            let local = block.local[*column as usize];
+                            if local != u32::MAX {
+                                block_buffers[slot].push((local, *derivative));
+                            }
+                        }
+                    }
                 }
             }
 
-            if !hessian_set[index] {
+            if !is_hessian {
                 continue;
             }
             for (slot, block) in blocks.iter_mut().enumerate() {
                 if block.image.is_some_and(|other| other != image) {
                     continue;
                 }
-                let buffer = &mut block_buffers[slot];
-                buffer.clear();
-                for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
-                    let local = block.local[*column as usize];
-                    if local != u32::MAX {
-                        buffer.push((local, *derivative));
-                    }
-                }
+                let buffer = &block_buffers[slot];
                 let n = block.len();
                 for (a, (left, left_derivative)) in buffer.iter().enumerate() {
                     let base = *left as usize * n;
@@ -597,10 +617,10 @@ impl Problem {
                         let dot = left_derivative[0] * right_derivative[0]
                             + left_derivative[1] * right_derivative[1]
                             + left_derivative[2] * right_derivative[2];
-                        block.hessian[base + *right as usize] += contribution * dot;
+                        let weighted = contribution * dot;
+                        block.hessian[base + *right as usize] += weighted;
                         if right != left {
-                            block.hessian[*right as usize * n + *left as usize] +=
-                                contribution * dot;
+                            block.hessian[*right as usize * n + *left as usize] += weighted;
                         }
                     }
                     let term = left_derivative[0] * residual[0]

@@ -65,6 +65,42 @@ pub(crate) fn solve_in_place(l: &[f64], n: usize, b: &mut [f64]) {
     }
 }
 
+/// Each column retains [`solve_in_place`]'s arithmetic order.
+pub(crate) fn solve_four_in_place(l: &[f64], columns: [&mut [f64]; 4]) {
+    let [a, b, c, d] = columns;
+    let n = a.len();
+    for i in 0..n {
+        let (mut va, mut vb, mut vc, mut vd) = (a[i], b[i], c[i], d[i]);
+        for k in 0..i {
+            let factor = l[i * n + k];
+            va -= factor * a[k];
+            vb -= factor * b[k];
+            vc -= factor * c[k];
+            vd -= factor * d[k];
+        }
+        let diagonal = l[i * n + i];
+        a[i] = va / diagonal;
+        b[i] = vb / diagonal;
+        c[i] = vc / diagonal;
+        d[i] = vd / diagonal;
+    }
+    for i in (0..n).rev() {
+        let (mut va, mut vb, mut vc, mut vd) = (a[i], b[i], c[i], d[i]);
+        for k in i + 1..n {
+            let factor = l[k * n + i];
+            va -= factor * a[k];
+            vb -= factor * b[k];
+            vc -= factor * c[k];
+            vd -= factor * d[k];
+        }
+        let diagonal = l[i * n + i];
+        a[i] = va / diagonal;
+        b[i] = vb / diagonal;
+        c[i] = vc / diagonal;
+        d[i] = vd / diagonal;
+    }
+}
+
 pub(crate) fn dense_mat_vec(a: &[f64], n: usize, v: &[f64]) -> Vec<f64> {
     let mut out = vec![0.0_f64; n];
     for i in 0..n {
