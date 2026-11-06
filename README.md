@@ -20,7 +20,7 @@ UI build directories can contain `stub-state/`, including a local database and s
 
 ## Build pipelines
 
-CI has independent `lint`, `native` and `wasm release` lanes plus twelve release trust test shards. The required `ci` check succeeds only when every lane and shard succeeds. Trust uses nextest count partitions with no fail-fast or default filter; shard 1 also runs release doctests. Native tests explicitly enable `looklab-fit/synth` in the workspace run; fit acceptance is not run a second time. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
+CI has independent `lint`, `native` and `wasm release` lanes plus four release trust test shards. The required `ci` check succeeds only when every lane and shard succeeds. Trust uses nextest count partitions with no fail-fast or default filter; shard 1 also runs release doctests. Native tests explicitly enable `looklab-fit/synth` in the workspace run; fit acceptance is not run a second time. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
 
 Pages generates release site data and release worker WASM in parallel. The UI job downloads both products and their receipts from the same run, verifies them, then builds the release preview. Worker optimization, UI `-Oz`, release LTO and the `/looklab/` public URL are unchanged.
 
@@ -41,6 +41,7 @@ Single-run validation on 2026-11-06 used application commit `c10b5d2` plus build
 | Main, unchanged Rust source | 6m 48s | [Successful deployment](https://github.com/skeet70/looklab/actions/runs/42262170856) |
 | Main, changed fitting Rust source | 12m 25s | [Successful deployment](https://github.com/skeet70/looklab/actions/runs/42271818181), not an unchanged-source warm run |
 | Main, guarded Hessian and input/scoring reuse | 12m 28s | [Successful deployment](https://github.com/skeet70/looklab/actions/runs/42286293145), changed Rust source |
+| Main, unchanged Rust source after scheduling-only change | 7m 25s | [Successful deployment](https://github.com/skeet70/looklab/actions/runs/42293118758), warm generated products |
 
 The corrected warm UI run restored its populated host/WASM cache and recompiled only workspace crates; no third-party dependencies recompiled.
 
@@ -60,10 +61,11 @@ Full CI measurements used the same application base and failed Clippy, the CLI E
 | Four trust shards, cache-populated rerun with HTTP 429 restore failures | 38m 26s | [Same-source attempt 2](https://github.com/skeet70/looklab/actions/runs/42190766989/attempts/2), not a fully warm comparison |
 | Four trust shards with exact-order covariance/pass reuse | 25m 26s | [Pushed-main run](https://github.com/skeet70/looklab/actions/runs/42271818190), same 124 passed and 10 failed |
 | Four trust shards with guarded Hessian and input/scoring reuse | 27m 05s | [Pushed-main run](https://github.com/skeet70/looklab/actions/runs/42286293272), same 124 passed and 10 failed |
+| Twelve trust shards, scheduling trial not retained | 25m 22s | [Measured trial](https://github.com/skeet70/looklab/actions/runs/42293118552), same 124 passed and 10 failed |
 
 The sharded run executed all 134 release trust cases: 124 passed and 10 failed. Its required aggregate check stayed red. The CLI E2E failure also reproduced on unmodified `c10b5d2` with the original Wasmtime defaults. No successful same-source full-CI baseline is available; the failing native E2E binary prevents later workspace tests from running.
 
-The partition inventory at `ed383e9` selected all 134 trust cases exactly once with twelve count partitions. Four and eight partitions co-located the two longest cases; twelve put them in separate jobs. Fit settings, test filters and gates are unchanged. The twelve-shard full-CI critical path has not yet been measured.
+Eight count partitions still co-located the two longest cases. Twelve selected all 134 cases exactly once and separated those cases, but the measured critical path remained within the observed four-way range. Four shards are retained rather than tripling trust runner fan-out without a demonstrated latency gain. The trial restored all twelve compiler caches with no HTTP 429 observed. CI remains above twenty minutes; no sub-twenty-minute or green-CI result is established.
 
 An isolated native-only [attempt 3](https://github.com/skeet70/looklab/actions/runs/42190766989/attempts/3) restored its compiler cache, compiled in 4m 44s, then hit the same CLI failure; the job took 13m 02s. After the timed runs, removing the per-store Nix cache proxy passed a [seven-runner setup/cache smoke](https://github.com/skeet70/looklab/actions/runs/42203798464): all seven compiler caches restored and all seven project toolchains ran, with no HTTP 429 observed. That smoke did not rerun the test suites or measure full-CI latency.
 
