@@ -20,6 +20,9 @@ pub struct PublishArgs {
     /// Body and control-schema snapshots.
     #[arg(long, default_value = "data")]
     pub data: PathBuf,
+    /// Body input transforms, one `<make>-<model>.yaml` per body.
+    #[arg(long, default_value = "data/transforms")]
+    pub transforms: PathBuf,
 }
 
 pub fn run(args: &PublishArgs) -> Result<()> {
@@ -31,6 +34,7 @@ pub fn run(args: &PublishArgs) -> Result<()> {
         db: args.db.clone(),
         blobs: args.blobs.clone(),
         data: args.data.clone(),
+        transforms: args.transforms.clone(),
         out: args.out.clone(),
     }))?;
     println!(

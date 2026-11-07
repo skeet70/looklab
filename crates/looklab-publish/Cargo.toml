@@ -7,30 +7,44 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Reading and writing a prepared scene-source directory. Native only.
+scene-sources = []
+# Preparing the CC0 photo scenes from fetched RAW fixtures. Native only.
+photo-scenes = ["scene-sources", "dep:looklab-body", "dep:looklab-raw", "dep:toml"]
+
+[[example]]
+name = "site_data"
+required-features = ["photo-scenes"]
+
+[[example]]
+name = "prepare_scenes"
+required-features = ["photo-scenes"]
+
 [dependencies]
 libm.workspace = true
+looklab-body = { workspace = true, optional = true }
 looklab-color.workspace = true
 looklab-export.workspace = true
 looklab-model.workspace = true
+looklab-raw = { workspace = true, optional = true }
 looklab-schema.workspace = true
 png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+toml = { workspace = true, optional = true }
+zip.workspace = true
 
 [dev-dependencies]
 libm.workspace = true
 looklab-fit = { workspace = true, features = ["synth"] }
 looklab-match.workspace = true
-looklab-raw.workspace = true
-looklab-body.workspace = true
 looklab-samples.workspace = true
 looklab-report.workspace = true
 serde_norway.workspace = true
-toml.workspace = true
 proptest.workspace = true
-zip.workspace = true
 
 [lints]
 workspace = true

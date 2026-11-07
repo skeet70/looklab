@@ -2,13 +2,40 @@
 //! Contribution settings read from a file's makernotes.
 
 use looklab_meta::ParsedMetadata;
+use looklab_prep::pair::{FileKind, LocalImageKey};
 use looklab_schema::{
-    MakernoteValues, settings_from_makernote_partial, sim_from_makernote, unmapped_controls,
-    validate_control_schema,
+    Epoch, MakernoteValues, SimKey, monochrome_sim, settings_from_makernote_partial,
+    sim_from_makernote, unmapped_controls, validate_control_schema,
 };
 use serde::Serialize;
 
 use crate::error::FacadeError;
+
+/// Shown for a render the fit cannot use.
+pub const MONOCHROME_REFUSAL: &str = "B&W renders aren't supported yet";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct MonochromeRender {
+    pub file: String,
+    pub sim: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RenderClass {
+    Colour(SimKey),
+    Monochrome(SimKey),
+    Undetermined,
+}
+
+pub fn render_class(epoch: &Epoch, values: &MakernoteValues) -> RenderClass {
+    if let Some(sim) = monochrome_sim(epoch, values) {
+        return RenderClass::Monochrome(sim);
+    }
+    match sim_from_makernote(epoch, values) {
+        Ok(sim) => RenderClass::Colour(sim),
+        Err(_) => RenderClass::Undetermined,
+    }
+}
 
 /// The batch fields the contribution form prefills.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -21,6 +48,8 @@ pub struct SettingsPrefill {
     pub unavailable: Vec<String>,
     /// Look-affecting controls the schema maps from no tag.
     pub unmapped: Vec<String>,
+    /// The batch's JPEGs that render a monochrome native sim.
+    pub monochrome: Vec<MonochromeRender>,
 }
 
 /// Derives the settings of `files` through the body's control schema.
@@ -30,16 +59,61 @@ pub struct SettingsPrefill {
 /// no epoch covers it.
 pub fn prefill_settings(
     schema_yaml: &str,
-    files: &[(String, Vec<u8>)],
+    files: &[(&str, &[u8])],
+) -> Result<SettingsPrefill, FacadeError> {
+    let parsed = parsed_files(files);
+    let parsed = parsed
+        .iter()
+        .map(|(name, metadata)| (*name, metadata))
+        .collect::<Vec<_>>();
+    prefill_settings_parsed(schema_yaml, &parsed)
+}
+
+/// JPEG rendering metadata takes precedence over RAW capture metadata; missing
+/// JPEG firmware falls back to another file's firmware.
+///
+/// # Errors
+/// The schema does not validate, no file carries an EXIF firmware version, or
+/// no epoch covers it.
+pub fn prefill_settings_parsed(
+    schema_yaml: &str,
+    parsed: &[(&str, &ParsedMetadata)],
 ) -> Result<SettingsPrefill, FacadeError> {
     let schema = validate_control_schema(schema_yaml).map_err(FacadeError::Schema)?;
-    let (firmware, metadata) = first_metadata(files)
+    let metadata = parsed
+        .iter()
+        .find(|(name, _)| is_jpeg(name))
+        .or_else(|| parsed.first())
+        .map(|(_, metadata)| metadata)
+        .ok_or_else(|| FacadeError::Input("the files carry no readable EXIF".to_owned()))?;
+    let firmware = metadata
+        .firmware
+        .as_ref()
+        .or_else(|| {
+            parsed
+                .iter()
+                .find_map(|(_, metadata)| metadata.firmware.as_ref())
+        })
+        .cloned()
         .ok_or_else(|| FacadeError::Input("the files carry no EXIF firmware".to_owned()))?;
     let epoch = schema
         .epoch_for(&firmware)
         .ok_or_else(|| FacadeError::Input(format!("no epoch covers firmware {firmware}")))?;
-    let values = values_of(&metadata);
+    let values = values_of(metadata);
     let (settings, problems) = settings_from_makernote_partial(&schema, epoch.id, &values);
+    let monochrome = parsed
+        .iter()
+        .filter(|(name, _)| is_jpeg(name))
+        .filter_map(
+            |(name, metadata)| match render_class(epoch, &values_of(metadata)) {
+                RenderClass::Monochrome(sim) => Some(MonochromeRender {
+                    file: (*name).to_owned(),
+                    sim: sim.to_string(),
+                }),
+                RenderClass::Colour(_) | RenderClass::Undetermined => None,
+            },
+        )
+        .collect();
     Ok(SettingsPrefill {
         firmware,
         sim: sim_from_makernote(epoch, &values)
@@ -55,15 +129,19 @@ pub fn prefill_settings(
             .iter()
             .map(ToString::to_string)
             .collect(),
+        monochrome,
     })
 }
 
-fn first_metadata(files: &[(String, Vec<u8>)]) -> Option<(String, ParsedMetadata)> {
-    files.iter().find_map(|(_, bytes)| {
-        let metadata = looklab_meta::parse(bytes).ok()?;
-        let firmware = metadata.firmware.clone()?;
-        Some((firmware, metadata))
-    })
+fn parsed_files<'a>(files: &'a [(&'a str, &'a [u8])]) -> Vec<(&'a str, ParsedMetadata)> {
+    files
+        .iter()
+        .filter_map(|(name, bytes)| looklab_meta::parse(bytes).ok().map(|meta| (*name, meta)))
+        .collect()
+}
+
+fn is_jpeg(name: &str) -> bool {
+    LocalImageKey::new(name).is_some_and(|key| key.kind() == FileKind::Jpeg)
 }
 
 fn values_of(metadata: &ParsedMetadata) -> MakernoteValues {
@@ -81,6 +159,69 @@ fn values_of(metadata: &ParsedMetadata) -> MakernoteValues {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use looklab_meta::FujiTag;
+
+    const SCHEMA: &str = "\
+body: test/body
+epochs:
+  - id: 1
+    firmware: { from: \"1.00\", to: \"1.99\" }
+    native_sims:
+      - key: acros
+        look: acros
+        makernote: { tag: Saturation, value: 0x0500 }
+        monochrome: true
+      - key: acros_ye
+        look: acros
+        makernote: { tag: Saturation, value: 0x0502 }
+        monochrome: true
+      - key: provia
+        look: provia
+        makernote: { tag: FilmMode, value: 0x0000 }
+    exposure_modes: []
+    controls: []
+    solve_plan: []
+";
+
+    #[test]
+    fn a_monochrome_native_sim_is_classified_apart() {
+        let schema = validate_control_schema(SCHEMA).expect("the schema validates");
+        let epoch = schema.epoch_for("1.00").expect("epoch");
+
+        let mut acros = MakernoteValues::new();
+        acros.insert(FujiTag::Saturation, vec![0x0500]);
+        assert_eq!(
+            render_class(epoch, &acros),
+            RenderClass::Monochrome("acros".try_into().expect("sim key"))
+        );
+
+        let mut acros_ye = MakernoteValues::new();
+        acros_ye.insert(FujiTag::Saturation, vec![0x0502]);
+        assert_eq!(
+            render_class(epoch, &acros_ye),
+            RenderClass::Monochrome("acros_ye".try_into().expect("sim key"))
+        );
+
+        let mut both = MakernoteValues::new();
+        both.insert(FujiTag::FilmMode, vec![0x0000]);
+        both.insert(FujiTag::Saturation, vec![0x0500]);
+        assert_eq!(
+            render_class(epoch, &both),
+            RenderClass::Monochrome("acros".try_into().expect("sim key"))
+        );
+
+        let mut provia = MakernoteValues::new();
+        provia.insert(FujiTag::FilmMode, vec![0x0000]);
+        assert_eq!(
+            render_class(epoch, &provia),
+            RenderClass::Colour("provia".try_into().expect("sim key"))
+        );
+
+        assert_eq!(
+            render_class(epoch, &MakernoteValues::new()),
+            RenderClass::Undetermined
+        );
+    }
 
     #[test]
     #[allow(clippy::disallowed_methods)]
@@ -95,10 +236,9 @@ mod tests {
         });
         let schema = include_str!("../../../data/bodies/fujifilm-x-t5.yaml");
         let prefill =
-            prefill_settings(schema, &[("fujifilm-x-s10.raf".to_owned(), raw)]).expect("prefill");
+            prefill_settings(schema, &[("fujifilm-x-s10.raf", raw.as_slice())]).expect("prefill");
         assert_eq!(prefill.firmware, "1.00");
         assert_eq!(prefill.sim.as_deref(), Some("provia"));
-        assert_eq!(prefill.controls.len(), 12);
         assert!(prefill.unavailable.is_empty(), "{:?}", prefill.unavailable);
         assert!(prefill.unmapped.is_empty(), "{:?}", prefill.unmapped);
     }

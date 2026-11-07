@@ -13,6 +13,8 @@ pub enum WorkerError {
     Yaml(#[from] serde_norway::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("task: {0}")]
+    Task(#[from] tokio::task::JoinError),
     #[error("fit: {0}")]
     Fit(#[from] looklab_fit::FitError),
     #[error("body: {0}")]
@@ -29,10 +31,16 @@ pub enum WorkerError {
     Publish(#[from] looklab_publish::PublishError),
     #[error("card: {0}")]
     Card(#[from] looklab_export::card::CardError),
+    #[error("lut: {0}")]
+    Lut(#[from] looklab_export::LutLookError),
     #[error("manifest: {0}")]
     Admin(#[from] looklab_server::admin::AdminError),
     #[error("data: {0}")]
     Data(String),
+    #[error(
+        "release {version} predates the relative exposure gauge; a moderator-approved audited re-anchor and refit is required"
+    )]
+    MigrationRequired { version: u32 },
     #[error("job: {0}")]
     Job(String),
 }
@@ -41,7 +49,7 @@ impl WorkerError {
     /// True when retrying cannot change the outcome.
     pub fn permanent(&self) -> bool {
         match self {
-            Self::Data(_) | Self::Job(_) => true,
+            Self::Data(_) | Self::Job(_) | Self::MigrationRequired { .. } | Self::Lut(_) => true,
             Self::Admin(error) => !matches!(error, looklab_server::admin::AdminError::Database(_)),
             _ => false,
         }

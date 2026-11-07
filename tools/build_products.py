@@ -785,12 +785,76 @@ def wasm_imports(path: Path) -> list[str]:
     ]
 
 
+def read_leb_u32(data: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while True:
+        if offset >= len(data):
+            raise ValueError("truncated LEB128 value")
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, offset
+        shift += 7
+        if shift > 35:
+            raise ValueError("LEB128 value is too long")
+
+
+def wasm_target_features(module: bytes) -> list[tuple[str, str]]:
+    """`(prefix, name)` for each `target_features` custom-section entry; `[]` when absent."""
+    offset = 8
+    while offset < len(module):
+        section_id = module[offset]
+        size, offset = read_leb_u32(module, offset + 1)
+        end = offset + size
+        if end > len(module):
+            raise ValueError("truncated wasm section")
+        if section_id == 0:
+            name_length, name_start = read_leb_u32(module, offset)
+            name_end = name_start + name_length
+            if name_end > end:
+                raise ValueError("truncated custom-section name")
+            if module[name_start:name_end] == b"target_features":
+                return parse_target_features(module[name_end:end])
+        offset = end
+    return []
+
+
+def parse_target_features(payload: bytes) -> list[tuple[str, str]]:
+    count, offset = read_leb_u32(payload, 0)
+    features = []
+    for _ in range(count):
+        prefix = payload[offset : offset + 1].decode("ascii", "replace")
+        offset += 1
+        length, offset = read_leb_u32(payload, offset)
+        features.append((prefix, payload[offset : offset + length].decode("utf-8")))
+        offset += length
+    return features
+
+
+def relaxed_simd_features(features: list[tuple[str, str]]) -> list[str]:
+    return [
+        prefix + name
+        for prefix, name in features
+        if name == "relaxed-simd" and prefix in {"+", "="}
+    ]
+
+
 def wasm_policy_errors(path: Path) -> list[str]:
     errors = []
     result = run_capture(["wasm-tools", "validate", "--features=-relaxed-simd", str(path)])
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip().splitlines()
         errors.append("wasm-tools validate failed" + (f": {detail[-1]}" if detail else ""))
+    try:
+        features = wasm_target_features(path.read_bytes())
+    except ValueError as error:
+        errors.append(f"unreadable target_features section: {error}")
+    else:
+        relaxed = relaxed_simd_features(features)
+        if relaxed:
+            errors.append("module enables relaxed-simd in target_features: " + ", ".join(relaxed))
     imports = wasm_imports(path)
     if imports:
         errors.append("module still imports after wasm-opt --remove-imports: " + imports[0])
@@ -1299,6 +1363,8 @@ def build_site_data(dest: Path, profile: CargoProfile, identity: dict) -> None:
                     *profile_arguments,
                     "-p",
                     "looklab-publish",
+                    "--features",
+                    "photo-scenes",
                     "--example",
                     "site_data",
                     "-j",

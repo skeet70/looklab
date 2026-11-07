@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Local RAW/JPEG pairing for the contribution walkthrough ([docs/07 §2](../../../docs/07-contribution.md)).
 
-use looklab_meta::ParsedMetadata;
+use looklab_meta::{MetaError, ParsedMetadata};
 use looklab_prep::pair::{self, FileKind, JpegRole, LocalImageKey, PairingFile, UnpairedReason};
 use serde::Serialize;
 
@@ -26,6 +26,8 @@ pub enum UnpairedReasonView {
     NoCounterpart,
     BodyMismatch,
     AmbiguousCounterpart,
+    /// Same base name as a RAW, but a different shot.
+    SeparateShot,
     Unreadable(String),
 }
 
@@ -56,27 +58,57 @@ pub struct PairingPlan {
     pub facts: Vec<FileFacts>,
 }
 
+/// One file's metadata, or why the browser could not read it.
+pub struct MetadataFile {
+    name: String,
+    metadata: Result<ParsedMetadata, MetaError>,
+}
+
+impl MetadataFile {
+    pub fn new(name: String, bytes: &[u8]) -> Self {
+        Self {
+            name,
+            metadata: looklab_meta::parse(bytes),
+        }
+    }
+
+    pub fn into_parsed(self) -> Option<(String, ParsedMetadata)> {
+        let Self { name, metadata } = self;
+        metadata.ok().map(|metadata| (name, metadata))
+    }
+}
+
 /// Pairs files by name, then by capture time.
 ///
 /// # Errors
 /// Only a file name that cannot be a seed key fails the whole plan; unreadable
 /// metadata is reported per file.
 pub fn inspect_files(files: &[(String, Vec<u8>)]) -> Result<PairingPlan, FacadeError> {
+    let parsed = files
+        .iter()
+        .map(|(name, bytes)| MetadataFile::new(name.clone(), bytes))
+        .collect::<Vec<_>>();
+    inspect_metadata(&parsed)
+}
+
+/// Pairs parsed files; see [`inspect_files`] for the failure rules.
+pub fn inspect_metadata(files: &[MetadataFile]) -> Result<PairingPlan, FacadeError> {
     let mut pairing_files = Vec::with_capacity(files.len());
     let mut facts = Vec::with_capacity(files.len());
     let mut unpaired = Vec::new();
-    for (name, bytes) in files {
-        let key = LocalImageKey::new(name)
-            .ok_or_else(|| FacadeError::Input(format!("{name} is not a usable file name")))?;
+    for file in files {
+        let key = LocalImageKey::new(&file.name).ok_or_else(|| {
+            FacadeError::Input(format!("{} is not a usable file name", file.name))
+        })?;
         let kind = kind_view(key.kind());
-        match looklab_meta::parse(bytes) {
+        match &file.metadata {
             Ok(metadata) => {
-                facts.push(facts_of(name, kind, &metadata));
-                pairing_files.push(PairingFile::new(key, &metadata));
+                facts.push(facts_of(&file.name, kind, metadata));
+                pairing_files.push(PairingFile::new(key, metadata));
             }
             Err(error) => {
                 facts.push(FileFacts {
-                    name: name.clone(),
+                    name: file.name.clone(),
                     kind,
                     make: None,
                     model: None,
@@ -86,7 +118,7 @@ pub fn inspect_files(files: &[(String, Vec<u8>)]) -> Result<PairingPlan, FacadeE
                     render_tag_malformed: false,
                 });
                 unpaired.push(UnpairedEntry {
-                    name: name.clone(),
+                    name: file.name.clone(),
                     reason: UnpairedReasonView::Unreadable(error.to_string()),
                 });
             }
@@ -94,19 +126,31 @@ pub fn inspect_files(files: &[(String, Vec<u8>)]) -> Result<PairingPlan, FacadeE
     }
 
     let outcome = pair::pair(&pairing_files);
-    let groups = outcome
-        .pairs
-        .iter()
-        .map(|pair| PairGroup {
-            raw: pair.raw.as_str().to_owned(),
-            jpegs: pair
-                .jpegs
-                .iter()
-                .filter(|member| !matches!(member.role, JpegRole::Duplicate { .. }))
-                .map(|member| member.key.as_str().to_owned())
-                .collect(),
-        })
-        .collect();
+    let mut groups = Vec::new();
+    for pair in &outcome.pairs {
+        let mut jpegs = Vec::new();
+        for member in &pair.jpegs {
+            match member.role {
+                JpegRole::Rerender => jpegs.push(member.key.as_str().to_owned()),
+                JpegRole::Duplicate { .. } => {}
+                JpegRole::SeparateShot => unpaired.push(UnpairedEntry {
+                    name: member.key.as_str().to_owned(),
+                    reason: UnpairedReasonView::SeparateShot,
+                }),
+            }
+        }
+        if jpegs.is_empty() {
+            unpaired.push(UnpairedEntry {
+                name: pair.raw.as_str().to_owned(),
+                reason: UnpairedReasonView::NoCounterpart,
+            });
+        } else {
+            groups.push(PairGroup {
+                raw: pair.raw.as_str().to_owned(),
+                jpegs,
+            });
+        }
+    }
     unpaired.extend(outcome.unpaired.iter().map(|entry| UnpairedEntry {
         name: entry.key.as_str().to_owned(),
         reason: reason_view(entry.reason),

@@ -41,6 +41,34 @@ fn an_empty_image_has_no_gain() {
 }
 
 #[test]
+fn subtracting_an_image_restores_the_leave_one_out_grid() {
+    let image = [(0.0, 10.0, 1.0), (1.0, 40.0, 2.0), (1.0, 40.0, 2.0)];
+    let rest = [(2.0, 90.0, 4.0), (3.0, 200.0, 6.0)];
+    let mut union = grid_with(&image);
+    for &(s, hue, chroma) in &rest {
+        union.add(s, hue, chroma, 1.0).expect("finite sample");
+    }
+    let expected = grid_with(&rest);
+
+    union
+        .subtract(&grid_with(&image))
+        .expect("image counts are present");
+    assert_eq!(union, expected);
+    assert!((union.total() - 2.0).abs() < 1e-12);
+}
+
+#[test]
+fn subtracting_a_larger_or_mismatched_grid_is_rejected() {
+    let mut grid = grid_with(&[(0.0, 10.0, 1.0)]);
+    let larger = grid_with(&[(0.0, 10.0, 1.0), (0.0, 10.0, 1.0)]);
+    assert!(grid.subtract(&larger).is_err());
+    assert_eq!(grid, grid_with(&[(0.0, 10.0, 1.0)]));
+
+    let coarse = EvidenceGrid::new(4, 4, 4).expect("non-zero bins");
+    assert!(grid.subtract(&coarse).is_err());
+}
+
+#[test]
 fn mismatched_grids_are_rejected() {
     let coarse = EvidenceGrid::new(4, 4, 4).expect("non-zero bins");
     let fine = EvidenceGrid::default();

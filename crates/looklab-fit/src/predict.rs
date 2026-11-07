@@ -19,7 +19,7 @@ pub(crate) struct ImageCtx {
     /// Prior mean `A0`; `transform = a0·(I + Δ)`.
     pub a0: Mat3,
     pub space: RgbSpace,
-    /// `2^exposure`.
+    /// `2^exposure`, shared by every sample of the image.
     pub exposure_scale: f64,
     pub wb_r: f64,
     pub wb_b: f64,
@@ -163,7 +163,7 @@ fn tone_slope(look: &Look, s: f64) -> f64 {
     }
 }
 
-/// `(d/ds, d/dh, d/dC)` of one chroma/hue/lightness component at `input`.
+/// `(∂F/∂s, ∂F/∂a, ∂F/∂b)` of one chroma/hue/lightness component at `input`.
 fn grl_terms(
     component: &GrlComponent,
     input: &LookInput,
@@ -172,6 +172,8 @@ fn grl_terms(
     c_derivative: &[f64; 4],
 ) -> (f64, f64, f64) {
     let weights = &input.grl;
+    let mut plane = 0.0;
+    let mut plane_s = 0.0;
     let mut ds = weights.c_w[0]
         * weights
             .s_idx
@@ -185,19 +187,72 @@ fn grl_terms(
         .zip(weights.s_w.iter())
         .map(|(index, weight)| c_derivative[0] * weight * component.plane[*index])
         .sum::<f64>();
+    for (position, index) in weights.s_idx.iter().enumerate() {
+        plane += weights.s_w[position] * component.plane[*index];
+        plane_s += s_derivative[position] * component.plane[*index];
+    }
+    let mut volume = 0.0;
     let mut dh = 0.0;
     for h in 0..4 {
         for s in 0..4 {
             let base = (weights.hue_idx[h] * S_COEFS + weights.s_idx[s]) * 3;
+            let spatial = weights.hue_w[h] * weights.s_w[s];
             for c in 1..4 {
                 let node = base + (c - 1);
-                ds += weights.hue_w[h] * s_derivative[s] * weights.c_w[c] * component.volume[node];
-                dh += hue_derivative[h] * weights.s_w[s] * weights.c_w[c] * component.volume[node];
-                dc += weights.hue_w[h] * weights.s_w[s] * c_derivative[c] * component.volume[node];
+                let value = component.volume[node];
+                volume += spatial * weights.c_w[c] * value;
+                ds += spatial * s_derivative[s] * weights.c_w[c] * value;
+                dh += hue_derivative[h] * weights.s_w[s] * weights.c_w[c] * value;
+                dc += weights.hue_w[h] * weights.s_w[s] * c_derivative[c] * value;
             }
         }
     }
-    (ds, dh, dc)
+    let outer = weights.c_w[0] * plane + volume;
+
+    let basis = looklab_model::basis::core_weights(input.a_in, input.b_in);
+    let inv_join = 1.0 / looklab_model::basis::NEUTRAL_JOIN_C;
+    let x = input.a_in * inv_join;
+    let y = input.b_in * inv_join;
+    let basis_a = [inv_join, 0.0, 2.0 * x * inv_join, y * inv_join, 0.0];
+    let basis_b = [0.0, inv_join, 0.0, x * inv_join, 2.0 * y * inv_join];
+    let mut core = 0.0;
+    let mut core_s = 0.0;
+    let mut core_a = 0.0;
+    let mut core_b = 0.0;
+    for (position, index) in weights.s_idx.iter().enumerate() {
+        let base = *index * looklab_model::basis::CORE_TERMS;
+        let spatial = weights.s_w[position];
+        for term in 0..looklab_model::basis::CORE_TERMS {
+            let value = component.core[base + term];
+            core += spatial * basis[term] * value;
+            core_s += s_derivative[position] * basis[term] * value;
+            core_a += spatial * basis_a[term] * value;
+            core_b += spatial * basis_b[term] * value;
+        }
+    }
+
+    let w = input.blend.w;
+    let near = input.blend.core();
+    let slope = input.blend.dw_dc;
+    let c = input.c_in;
+    let (outer_a, outer_b, w_a, w_b) = if c > 0.0 {
+        let inv_c = 1.0 / c;
+        let inv_c2 = inv_c * inv_c;
+        (
+            dc * (input.a_in * inv_c) - dh * (input.b_in * inv_c2),
+            dc * (input.b_in * inv_c) + dh * (input.a_in * inv_c2),
+            slope * input.a_in * inv_c,
+            slope * input.b_in * inv_c,
+        )
+    } else {
+        (0.0, 0.0, 0.0, 0.0)
+    };
+    let base = outer - plane - core;
+    (
+        w * ds + near * (plane_s + core_s),
+        w * outer_a + w_a * base + near * core_a,
+        w * outer_b + w_b * base + near * core_b,
+    )
 }
 
 fn residual_terms(
@@ -224,19 +279,36 @@ fn residual_terms(
 
 fn push_grl(jac: &mut Jac, start: usize, input: &LookInput, d: [f64; 3]) {
     let weights = &input.grl;
+    let outer = input.blend.w;
+    let near = input.blend.core();
+    let plane_weight = outer * weights.c_w[0] + near;
     for s in 0..4 {
         jac.push(
             start + weights.s_idx[s],
-            scale(d, weights.c_w[0] * weights.s_w[s]),
+            scale(d, plane_weight * weights.s_w[s]),
         );
     }
     for h in 0..4 {
         for s in 0..4 {
             let base = (weights.hue_idx[h] * S_COEFS + weights.s_idx[s]) * 3;
             for c in 1..4 {
-                let weight = weights.hue_w[h] * weights.s_w[s] * weights.c_w[c];
+                let weight = outer * weights.hue_w[h] * weights.s_w[s] * weights.c_w[c];
                 jac.push(start + S_COEFS + base + c - 1, scale(d, weight));
             }
+        }
+    }
+    let basis = looklab_model::basis::core_weights(input.a_in, input.b_in);
+    for s in 0..4 {
+        for (term, basis_weight) in basis.iter().enumerate() {
+            let weight = near * weights.s_w[s] * basis_weight;
+            jac.push(
+                start
+                    + S_COEFS
+                    + looklab_model::basis::VOLUME_COEFS
+                    + weights.s_idx[s] * looklab_model::basis::CORE_TERMS
+                    + term,
+                scale(d, weight),
+            );
         }
     }
 }
@@ -323,7 +395,8 @@ pub(crate) fn evaluate_sample(
 
     let model = reference_model();
     let xyz0 = model.jmh_to_xyz(ucs_to_jmh(pre, UcsSpace::Ucs));
-    let channels = output_channels(pre, image.space);
+    let rgb0 = image.space.xyz_to_rgb_linear(xyz0);
+    let channels = [rgb0.r, rgb0.g, rgb0.b];
     let clipped = channels.map(|value| soft_clip(value, clip_k));
     let xyz1 = image
         .space
@@ -595,7 +668,10 @@ fn push_response_columns(
 
 fn grl_response_weight(input: &LookInput, layer: LayerKind, feature: u32) -> f64 {
     let weights = &input.grl;
-    let mut sum = weights.c_w[0]
+    let outer = input.blend.w;
+    let near = input.blend.core();
+    let plane_weight = outer * weights.c_w[0] + near;
+    let mut sum = plane_weight
         * weights
             .s_w
             .iter()
@@ -607,7 +683,8 @@ fn grl_response_weight(input: &LookInput, layer: LayerKind, feature: u32) -> f64
             let base = (weights.hue_idx[h] * S_COEFS + weights.s_idx[s]) * 3;
             for c in 1..4 {
                 let node = S_COEFS + base + (weights.c_idx[c] - 1);
-                sum += weights.hue_w[h]
+                sum += outer
+                    * weights.hue_w[h]
                     * weights.s_w[s]
                     * weights.c_w[c]
                     * feature_coefficient(layer, feature, node);
@@ -639,7 +716,7 @@ fn d_out_d_xyz(
     let d_unit = Mat3([
         [inv_y, -xyz.x / (input.y * input.y), 0.0],
         [0.0, 0.0, 0.0],
-        [0.0, 0.0, inv_y],
+        [0.0, -xyz.z / (input.y * input.y), inv_y],
     ]);
     let d_reference = scale_mat(&Mat3(reference_jacobian).mul(&d_unit), y_ref);
 
@@ -662,21 +739,6 @@ fn d_out_d_xyz(
         [chromaticity[2][0], chromaticity[2][1], chromaticity[2][2]],
         0.18,
     );
-    let denominator = input.a_in * input.a_in + input.b_in * input.b_in;
-    let dh_du = if denominator == 0.0 {
-        [0.0; 3]
-    } else {
-        let k = (180.0 / PI) / denominator;
-        add(scale(da_du, -input.b_in * k), scale(db_du, input.a_in * k))
-    };
-    let dc_du = if input.c_in == 0.0 {
-        [0.0; 3]
-    } else {
-        let k = 1.0 / input.c_in;
-        add(scale(da_du, input.a_in * k), scale(db_du, input.b_in * k))
-    };
-    let dh_dxyz = row_mat(dh_du, &d_unit);
-    let dc_dxyz = row_mat(dc_du, &d_unit);
     let da_dxyz = row_mat(da_du, &d_unit);
     let db_dxyz = row_mat(db_du, &d_unit);
     let ds_dxyz = [
@@ -701,12 +763,12 @@ fn d_out_d_xyz(
     accumulate(1, scale(ds_dxyz, dt_ds * na_slope));
     accumulate(2, scale(ds_dxyz, dt_ds * nb_slope));
     for (component, index) in [(0usize, 3usize), (1, 4), (2, 5)] {
-        let (ds, dh, dc) = grl[component];
+        let (ds, da, db) = grl[component];
         accumulate(
             index,
             add(
                 scale(ds_dxyz, ds),
-                add(scale(dh_dxyz, dh), scale(dc_dxyz, dc)),
+                add(scale(da_dxyz, da), scale(db_dxyz, db)),
             ),
         );
     }
@@ -895,6 +957,134 @@ mod tests {
     }
 
     #[test]
+    fn wb_paths_crossing_neutral_have_smooth_jacobians() {
+        let layout = Layout::new(1, 0, 1);
+        let mut params = Params::initial(layout.clone(), 1);
+        for range in [
+            layout.g.clone(),
+            layout.r.clone(),
+            layout.lambda.clone(),
+        ] {
+            for value in &mut params.theta[range.start + S_COEFS..range.end] {
+                *value = 0.02;
+            }
+        }
+        let white = looklab_model::solve::reference_white();
+        let image = layout.image(0);
+        params.theta[image.start] = 0.0;
+        params.theta[image.start + 1] = libm::log(white.x / 0.18);
+        params.theta[image.start + 2] = libm::log(white.z / 0.18);
+        let columns = ColumnMap {
+            image: None,
+            mode: None,
+            wb_r: Some(image.start + 1),
+            wb_b: Some(image.start + 2),
+            clip: None,
+            exposure_extra: None,
+            wb_r_extra: None,
+            wb_b_extra: None,
+            clip_extra: None,
+            delta: None,
+        };
+        let rgb = [0.18, 0.18, 0.18];
+        let mut jac = Jac::default();
+        let _ = evaluate_sample(
+            &params.look(),
+            &layout,
+            &context(&params, Mat3::IDENTITY, RgbSpace::Srgb),
+            &columns,
+            rgb,
+            params.clip_k(),
+            params.clip_slope(),
+            &slopes(&params),
+            &[],
+            &mut jac,
+        );
+        let derivative = |index: usize| {
+            let position = jac
+                .cols
+                .iter()
+                .position(|column| *column as usize == index)
+                .expect("column");
+            jac.derivs[position]
+        };
+        let d_r = derivative(image.start + 1);
+        let d_b = derivative(image.start + 2);
+        for direction in 0..8 {
+            let angle = 2.0 * core::f64::consts::PI * direction as f64 / 8.0;
+            let (cos, sin) = (libm::cos(angle), libm::sin(angle));
+            let analytic = [
+                d_r[0] * cos + d_b[0] * sin,
+                d_r[1] * cos + d_b[1] * sin,
+                d_r[2] * cos + d_b[2] * sin,
+            ];
+            let mut fine = [0.0_f64; 3];
+            for step in [1e-3, 1e-4] {
+                let mut plus = params.clone();
+                let mut minus = params.clone();
+                plus.theta[image.start + 1] += step * cos;
+                plus.theta[image.start + 2] += step * sin;
+                minus.theta[image.start + 1] -= step * cos;
+                minus.theta[image.start + 2] -= step * sin;
+                let mut scratch = Jac::default();
+                let a = evaluate_sample(
+                    &plus.look(),
+                    &layout,
+                    &context(&plus, Mat3::IDENTITY, RgbSpace::Srgb),
+                    &ColumnMap::default(),
+                    rgb,
+                    plus.clip_k(),
+                    plus.clip_slope(),
+                    &slopes(&plus),
+                    &[],
+                    &mut scratch,
+                )
+                .prediction;
+                let b = evaluate_sample(
+                    &minus.look(),
+                    &layout,
+                    &context(&minus, Mat3::IDENTITY, RgbSpace::Srgb),
+                    &ColumnMap::default(),
+                    rgb,
+                    minus.clip_k(),
+                    minus.clip_slope(),
+                    &slopes(&minus),
+                    &[],
+                    &mut scratch,
+                )
+                .prediction;
+                let numerical = [
+                    (a.j - b.j) / (2.0 * step),
+                    (a.a - b.a) / (2.0 * step),
+                    (a.b - b.b) / (2.0 * step),
+                ];
+                for channel in 0..3 {
+                    assert!(analytic[channel].is_finite());
+                    assert!(numerical[channel].is_finite());
+                    let scale = analytic[channel].abs().max(numerical[channel].abs()).max(1e-2);
+                    assert!(
+                        (analytic[channel] - numerical[channel]).abs() / scale < 2e-2,
+                        "direction {direction} step {step} channel {channel}: {} vs {}",
+                        analytic[channel],
+                        numerical[channel]
+                    );
+                    if step == 1e-3 {
+                        fine[channel] = numerical[channel];
+                    } else {
+                        let scale = fine[channel].abs().max(numerical[channel].abs()).max(1e-2);
+                        assert!(
+                            (fine[channel] - numerical[channel]).abs() / scale < 5e-2,
+                            "direction {direction} step dependence channel {channel}: {} vs {}",
+                            fine[channel],
+                            numerical[channel]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn analytic_columns_match_central_differences() {
         let layout = Layout::new(2, 0, 1);
         let mut params = Params::initial(layout.clone(), 1);
@@ -933,6 +1123,7 @@ mod tests {
             ([0.2, 0.1, 0.6], Mat3::IDENTITY),
             ([0.9, 0.9, 0.9], Mat3::IDENTITY),
             ([0.02, 0.02, 0.02], Mat3::IDENTITY),
+            ([0.2, 0.1, 0.6], RgbSpace::Srgb.to_xyz_matrix()),
         ];
         let mut checked = 0usize;
         for (rgb, transform) in cases {
@@ -974,6 +1165,12 @@ mod tests {
                         .abs()
                         .max(derivative[channel].abs())
                         .max(1e-3);
+                    if index == 17124 {
+                        eprintln!(
+                            "index {index} step {step:e} channel {channel}: analytic {} numerical {}",
+                            derivative[channel], numerical[channel]
+                        );
+                    }
                     assert!(
                         (derivative[channel] - numerical[channel]).abs() / scale < 2e-3,
                         "rgb {rgb:?} index {index} channel {channel}: {} vs {}",

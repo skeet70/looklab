@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use looklab_fit::{FitOptions, OutlierReason, Verdict, fit_controlled};
+use looklab_fit::{FitOptions, OutlierReason, Verdict, score_controlled};
 use looklab_schema::SimKey;
 use looklab_trust::TrustParams;
 use looklab_upload::LookSlug;
@@ -46,7 +46,7 @@ pub async fn run(
         contribution.intent,
         contribution.target_look.as_ref(),
     )?;
-    let target_epoch = epoch_for(&resources.schema, &contribution.firmware)?.id;
+    let epoch = epoch_for(&resources.schema, &contribution.firmware)?;
 
     crate::duplicates::run(db_pool).await?;
     let pool = pool::build(db_pool, config, &contribution.body, &look).await?;
@@ -56,13 +56,13 @@ pub async fn run(
     let contributors = weights::contributor_index(&pool);
     let entries = weighted.fit_entries(&pool);
     let images = weights::fit_images(&pool, &weighted, &contributors);
-    let selected: Vec<(usize, looklab_fit::FitImage)> = entries
+    let (indices, fit_images): (Vec<usize>, Vec<looklab_fit::FitImage>) = entries
         .iter()
         .map(|(index, _)| *index)
         .zip(images)
-        .filter(|(index, _)| pool.images[*index].epoch == target_epoch)
-        .collect();
-    if selected.is_empty() {
+        .filter(|(index, _)| pool.images[*index].epoch == epoch.id)
+        .unzip();
+    if indices.is_empty() {
         return Ok(());
     }
     let sim = SimKey::new(&contribution.sim_key)
@@ -72,15 +72,13 @@ pub async fn run(
         max_samples_per_image: config.max_samples_per_image,
         ..FitOptions::default()
     };
-    let fit_images: Vec<looklab_fit::FitImage> =
-        selected.iter().map(|(_, image)| image.clone()).collect();
-    let result = fit_controlled(&fit_images, &resources.schema, target_epoch, &sim, &options)?;
+    let result = score_controlled(&fit_images, &resources.schema, epoch, &sim, &options)?;
 
     let excluded: BTreeSet<usize> = result.excluded.iter().map(|image| image.index).collect();
     let mut written: HashSet<ImageId> = HashSet::new();
-    for ((index, stats), position) in selected
+    for ((index, stats), position) in indices
         .iter()
-        .map(|(index, _)| *index)
+        .copied()
         .zip(&result.image_stats)
         .zip(0_usize..)
     {
@@ -137,7 +135,7 @@ pub async fn run(
         }
         if epochs
             .get(&image.id)
-            .is_some_and(|epoch| *epoch != target_epoch)
+            .is_some_and(|image_epoch| *image_epoch != epoch.id)
         {
             continue;
         }

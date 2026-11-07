@@ -11,8 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::PrepError;
-use crate::image::Image3;
-use crate::jpeg::DecodedJpeg;
+use crate::image::{AreaDownsample, LinearPixels};
 
 const LUMINANCE: [f64; 3] = [0.2126, 0.7152, 0.0722];
 const TONE_KNOTS: usize = 12;
@@ -181,20 +180,20 @@ fn to_pixels(u: f64, v: f64, width: u32, height: u32) -> (f64, f64) {
     (cx + u * cx, cy + v * cy)
 }
 
-pub fn align(
-    raw_wb_linear: &Image3,
-    jpeg: &DecodedJpeg,
+pub fn align<R: LinearPixels + ?Sized, J: LinearPixels + ?Sized>(
+    raw_wb_linear: &R,
+    jpeg: &J,
     params: &AlignParams,
 ) -> Result<Alignment, PrepError> {
-    if raw_wb_linear.data.is_empty() || jpeg.image.data.is_empty() {
+    if raw_wb_linear.is_empty() || jpeg.is_empty() {
         return Err(PrepError::ImageEmpty);
     }
     let estimate_size = 512.min(next_power_of_two(
-        raw_wb_linear.width.max(raw_wb_linear.height) as usize,
+        raw_wb_linear.width().max(raw_wb_linear.height()) as usize,
     ));
     let estimate_size = estimate_size.max(64);
     let raw_grid = normalized_luma(raw_wb_linear, estimate_size, estimate_size);
-    let jpeg_grid = normalized_luma(&jpeg.image, estimate_size, estimate_size);
+    let jpeg_grid = normalized_luma(jpeg, estimate_size, estimate_size);
     if variance(&raw_grid) < 1e-12 || variance(&jpeg_grid) < 1e-12 {
         return Err(PrepError::AlignNoOverlap);
     }
@@ -202,7 +201,7 @@ pub fn align(
     let initial = seed_alignment(raw_wb_linear, jpeg, &raw_grid, &jpeg_grid, estimate_size);
 
     let grid = 192;
-    let jpeg_luma = normalized_luma(&jpeg.image, grid, grid);
+    let jpeg_luma = normalized_luma(jpeg, grid, grid);
     let mut alignment = initial;
     alignment.gain = fit_gain(&gain_samples(raw_wb_linear, jpeg, &alignment));
     for _ in 0..1 {
@@ -215,13 +214,16 @@ pub fn align(
     let (u, v) = normalized_coords(grid, grid);
     // The reduced decode integrates a CFA tile per pixel, so JPEG detail finer
     // than a raw pixel has no counterpart and aliases the correlation score.
-    let score_jpeg = jpeg.image.downsample_area(
-        raw_wb_linear
-            .width
-            .saturating_mul(raw_wb_linear.height)
-            .max(1),
-    );
-    let score_luma = normalized_luma(&score_jpeg, grid, grid);
+    let score_luma = {
+        let score_jpeg = AreaDownsample::new(
+            jpeg,
+            raw_wb_linear
+                .width()
+                .saturating_mul(raw_wb_linear.height())
+                .max(1),
+        );
+        normalized_luma(&score_jpeg, grid, grid)
+    };
     let (central_correlation, central_count, central_eligible) =
         correlation_at(raw_wb_linear, &score_luma, &alignment, &u, &v)
             .ok_or(PrepError::AlignNoOverlap)?;
@@ -240,12 +242,12 @@ pub fn align(
     let samples = gain_samples(raw_wb_linear, jpeg, &alignment);
     alignment.gain = fit_gain(&samples);
     alignment.central_correlation = central_correlation;
-    alignment.residual_px = block_residual(raw_wb_linear, &jpeg.image, &alignment);
+    alignment.residual_px = block_residual(raw_wb_linear, jpeg, &alignment);
     Ok(alignment)
 }
 
-fn refine_geometry(
-    raw: &Image3,
+fn refine_geometry<R: LinearPixels + ?Sized>(
+    raw: &R,
     jpeg_luma: &[f64],
     alignment: &mut Alignment,
     params: &AlignParams,
@@ -332,13 +334,13 @@ fn next_power_of_two(value: usize) -> usize {
     value.max(1).next_power_of_two()
 }
 
-fn normalized_luma(image: &Image3, width: usize, height: usize) -> Vec<f64> {
+fn normalized_luma<I: LinearPixels + ?Sized>(image: &I, width: usize, height: usize) -> Vec<f64> {
     let (u, v) = normalized_coords(width, height);
     let mut out = Vec::with_capacity(u.len());
-    let (cx, cy) = centre(image.width, image.height);
+    let (cx, cy) = centre(image.width(), image.height());
     for (u, v) in u.into_iter().zip(v) {
-        let x = (cx + u * cx).clamp(0.0, f64::from(image.width - 1));
-        let y = (cy + v * cy).clamp(0.0, f64::from(image.height - 1));
+        let x = (cx + u * cx).clamp(0.0, f64::from(image.width() - 1));
+        let y = (cy + v * cy).clamp(0.0, f64::from(image.height() - 1));
         out.push(image.sample_bilinear(x, y).map(luminance).unwrap_or(0.0));
     }
     out
@@ -393,9 +395,9 @@ fn mean(values: &[f64]) -> f64 {
     }
 }
 
-fn seed_alignment(
-    raw: &Image3,
-    jpeg: &DecodedJpeg,
+fn seed_alignment<R: LinearPixels + ?Sized, J: LinearPixels + ?Sized>(
+    raw: &R,
+    jpeg: &J,
     raw_grid: &[f64],
     jpeg_grid: &[f64],
     size: usize,
@@ -423,7 +425,7 @@ fn seed_alignment(
     ];
     let coarse = 64;
     let (u, v) = normalized_coords(coarse, coarse);
-    let jpeg_coarse = normalized_luma(&jpeg.image, coarse, coarse);
+    let jpeg_coarse = normalized_luma(jpeg, coarse, coarse);
     let raw_gray = normalized_luma(raw, coarse, coarse);
     let mut best = Alignment {
         scale: 1.0,
@@ -437,7 +439,7 @@ fn seed_alignment(
         residual_px: 0.0,
     };
     for (candidate_scale, candidate_rotation) in candidates {
-        let warped = warped_grid(&jpeg.image, candidate_scale, candidate_rotation, coarse);
+        let warped = warped_grid(jpeg, candidate_scale, candidate_rotation, coarse);
         let (dx, dy, _) = phase_translation_multiscale(&raw_gray, &warped, coarse);
         let mut candidate = Alignment {
             scale: candidate_scale,
@@ -461,7 +463,12 @@ fn seed_alignment(
     best
 }
 
-fn warped_grid(jpeg: &Image3, scale: f64, rotation: f64, size: usize) -> Vec<f64> {
+fn warped_grid<J: LinearPixels + ?Sized>(
+    jpeg: &J,
+    scale: f64,
+    rotation: f64,
+    size: usize,
+) -> Vec<f64> {
     let (u, v) = normalized_coords(size, size);
     let (sin, cos) = (libm::sin(rotation), libm::cos(rotation));
     let inverse_scale = if scale.abs() > 1e-12 {
@@ -469,7 +476,7 @@ fn warped_grid(jpeg: &Image3, scale: f64, rotation: f64, size: usize) -> Vec<f64
     } else {
         0.0
     };
-    let (cx, cy) = centre(jpeg.width, jpeg.height);
+    let (cx, cy) = centre(jpeg.width(), jpeg.height());
     let mut out = Vec::with_capacity(u.len());
     for (u, v) in u.into_iter().zip(v) {
         let uj = inverse_scale * (cos * u + sin * v);
@@ -481,8 +488,13 @@ fn warped_grid(jpeg: &Image3, scale: f64, rotation: f64, size: usize) -> Vec<f64
     out
 }
 
-fn base_mask(raw: &Image3, alignment: &Alignment, u: &[f64], v: &[f64]) -> Vec<bool> {
-    let (max_x, max_y) = (f64::from(raw.width - 1), f64::from(raw.height - 1));
+fn base_mask<R: LinearPixels + ?Sized>(
+    raw: &R,
+    alignment: &Alignment,
+    u: &[f64],
+    v: &[f64],
+) -> Vec<bool> {
+    let (max_x, max_y) = (f64::from(raw.width() - 1), f64::from(raw.height() - 1));
     let (sin, cos) = (
         libm::sin(alignment.rotation_rad),
         libm::cos(alignment.rotation_rad),
@@ -492,14 +504,14 @@ fn base_mask(raw: &Image3, alignment: &Alignment, u: &[f64], v: &[f64]) -> Vec<b
         .map(|(u, v)| {
             let (a, b) = alignment.linear_with(*u, *v, sin, cos);
             let (ad, bd) = alignment.distort(a, b);
-            let (x, y) = to_pixels(ad, bd, raw.width, raw.height);
+            let (x, y) = to_pixels(ad, bd, raw.width(), raw.height());
             x > 2.0 && y > 2.0 && x < max_x - 2.0 && y < max_y - 2.0
         })
         .collect()
 }
 
-fn evaluate_cost(
-    raw: &Image3,
+fn evaluate_cost<R: LinearPixels + ?Sized>(
+    raw: &R,
     jpeg_luma: &[f64],
     alignment: &Alignment,
     u: &[f64],
@@ -515,16 +527,16 @@ fn evaluate_cost(
     Some((cost, count as f64))
 }
 
-fn evaluate_residual(
-    raw: &Image3,
+fn evaluate_residual<R: LinearPixels + ?Sized>(
+    raw: &R,
     jpeg_luma: &[f64],
     alignment: &Alignment,
     u: &[f64],
     v: &[f64],
     mask: &[bool],
 ) -> Option<Vec<f64>> {
-    let (cx, cy) = centre(raw.width, raw.height);
-    let (max_x, max_y) = (f64::from(raw.width - 1), f64::from(raw.height - 1));
+    let (cx, cy) = centre(raw.width(), raw.height());
+    let (max_x, max_y) = (f64::from(raw.width() - 1), f64::from(raw.height() - 1));
     let mut raw_values = Vec::with_capacity(mask.len());
     let mut jpeg_values = Vec::with_capacity(mask.len());
     let mut indices = Vec::with_capacity(mask.len());
@@ -579,15 +591,15 @@ fn evaluate_residual(
     Some(residual)
 }
 
-fn correlation_at(
-    raw: &Image3,
+fn correlation_at<R: LinearPixels + ?Sized>(
+    raw: &R,
     jpeg_luma: &[f64],
     alignment: &Alignment,
     u: &[f64],
     v: &[f64],
 ) -> Option<(f64, usize, usize)> {
-    let (cx, cy) = centre(raw.width, raw.height);
-    let (max_x, max_y) = (f64::from(raw.width - 1), f64::from(raw.height - 1));
+    let (cx, cy) = centre(raw.width(), raw.height());
+    let (max_x, max_y) = (f64::from(raw.width() - 1), f64::from(raw.height() - 1));
     let mut raw_values = Vec::new();
     let mut jpeg_values = Vec::new();
     let mut eligible = 0usize;
@@ -1040,10 +1052,14 @@ struct GainSample {
     jpeg: f64,
 }
 
-fn gain_samples(raw: &Image3, jpeg: &DecodedJpeg, alignment: &Alignment) -> Vec<GainSample> {
+fn gain_samples<R: LinearPixels + ?Sized, J: LinearPixels + ?Sized>(
+    raw: &R,
+    jpeg: &J,
+    alignment: &Alignment,
+) -> Vec<GainSample> {
     let size = 96;
     let (u, v) = normalized_coords(size, size);
-    let (cx, cy) = centre(raw.width, raw.height);
+    let (cx, cy) = centre(raw.width(), raw.height());
     let (sin, cos) = (
         libm::sin(alignment.rotation_rad),
         libm::cos(alignment.rotation_rad),
@@ -1061,15 +1077,9 @@ fn gain_samples(raw: &Image3, jpeg: &DecodedJpeg, alignment: &Alignment) -> Vec<
         if !raw_luma.is_finite() || raw_luma <= 1e-7 {
             continue;
         }
-        let (jpeg_x, jpeg_y) = alignment.raw_to_jpeg(
-            x,
-            y,
-            raw.width,
-            raw.height,
-            jpeg.image.width,
-            jpeg.image.height,
-        );
-        let Some(jpeg_pixel) = jpeg.image.sample_bilinear(jpeg_x, jpeg_y) else {
+        let (jpeg_x, jpeg_y) =
+            alignment.raw_to_jpeg(x, y, raw.width(), raw.height(), jpeg.width(), jpeg.height());
+        let Some(jpeg_pixel) = jpeg.sample_bilinear(jpeg_x, jpeg_y) else {
             continue;
         };
         let jpeg_luma = luminance(jpeg_pixel);
@@ -1278,13 +1288,19 @@ fn solve3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
     Some(out)
 }
 
-fn block_residual(raw: &Image3, jpeg: &Image3, alignment: &Alignment) -> f64 {
+fn block_residual<R: LinearPixels + ?Sized, J: LinearPixels + ?Sized>(
+    raw: &R,
+    jpeg: &J,
+    alignment: &Alignment,
+) -> f64 {
     const BLOCK: usize = 64;
     const STEP: usize = 64;
     const SAMPLE: usize = 3;
     const SIZE: usize = BLOCK / SAMPLE;
-    let width = raw.width as usize;
-    let height = raw.height as usize;
+    let raw_width = raw.width();
+    let raw_height = raw.height();
+    let width = raw_width as usize;
+    let height = raw_height as usize;
     let mut shifts: Vec<f64> = Vec::new();
     let (sin, cos) = (
         libm::sin(alignment.rotation_rad),
@@ -1307,10 +1323,10 @@ fn block_residual(raw: &Image3, jpeg: &Image3, alignment: &Alignment) -> f64 {
                     let (jx, jy) = alignment.raw_to_jpeg_with(
                         sx,
                         sy,
-                        raw.width,
-                        raw.height,
-                        jpeg.width,
-                        jpeg.height,
+                        raw_width,
+                        raw_height,
+                        jpeg.width(),
+                        jpeg.height(),
                         sin,
                         cos,
                     );
@@ -1319,8 +1335,8 @@ fn block_residual(raw: &Image3, jpeg: &Image3, alignment: &Alignment) -> f64 {
                         break;
                     };
                     let radius = libm::hypot(
-                        (sx - f64::from(raw.width - 1) * 0.5) / (f64::from(raw.width - 1) * 0.5),
-                        (sy - f64::from(raw.height - 1) * 0.5) / (f64::from(raw.height - 1) * 0.5),
+                        (sx - f64::from(raw_width - 1) * 0.5) / (f64::from(raw_width - 1) * 0.5),
+                        (sy - f64::from(raw_height - 1) * 0.5) / (f64::from(raw_height - 1) * 0.5),
                     );
                     a.push(luminance(raw_pixel) * alignment.gain_at(radius));
                     b.push(luminance(jpeg_pixel));
@@ -1381,7 +1397,8 @@ mod tests {
     use looklab_color::RgbSpace;
     use looklab_samples::OutputSpace;
 
-    use crate::jpeg::decode_jpeg;
+    use crate::image::Image3;
+    use crate::jpeg::{DecodedJpeg, decode_jpeg};
 
     const RAW_WIDTH: u32 = 900;
     const RAW_HEIGHT: u32 = 600;

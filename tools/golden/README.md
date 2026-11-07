@@ -28,7 +28,7 @@ Commit the regenerated JSON with the code change that requires it. Never hand-ed
 
 | Script | Writes |
 |---|---|
-| `gen_basics.py` | `crates/looklab-color/tests/golden/basics.json`, `data/charts/colorchecker24_2014.json` |
+| `gen_basics.py` | `crates/looklab-color/tests/golden/xyy.json`, `transfer_functions.json`, `lab.json`, `difference.json`, `illuminants.json`, `spaces.json`, `cats.json`, `data/charts/colorchecker24_2014.json` |
 | `gen_body.py` | `crates/looklab-body/tests/golden/fixtures_cct.json` |
 | `gen_cam16.py` | `crates/looklab-color/tests/golden/cam16_forward.json`, `cam16_inverse.json`, `cam16_ucs.json` |
 | `gen_dng.py` | `crates/looklab-color/tests/golden/dng.json` |

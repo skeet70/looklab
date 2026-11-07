@@ -41,7 +41,7 @@ fn sanitized() -> SanitizedMetadata {
         look: Some(LookSettings {
             film_mode: Some(ParsedTag {
                 tag: FujiTag::FilmMode,
-                raw: 0x0700,
+                raw: 0x0600,
                 value: Some(FilmMode::ClassicChrome),
             }),
             white_balance_fine_tune: Some(ParsedPair {
@@ -84,7 +84,7 @@ fn mirror_carries_every_sanitized_field() {
 
     let look = mirror.look.expect("look settings survive the mirror");
     let film = look.film_mode.expect("film mode survives");
-    assert_eq!(film.raw, 0x0700);
+    assert_eq!(film.raw, 0x0600);
     assert_eq!(film.value, Some(WireFilmMode::ClassicChrome));
     let fine_tune = look.white_balance_fine_tune.expect("fine tune survives");
     assert_eq!(fine_tune.raw, [20, -10]);

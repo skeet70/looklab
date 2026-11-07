@@ -191,6 +191,7 @@ pub struct MatchReply {
     pub results: Vec<SuggestionDto>,
     pub stats: StatsDto,
     pub realization_lut: Vec<u8>,
+    pub excluded: Vec<looklab_publish::ExcludedSim>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -67,6 +67,7 @@ fn random_look(rng: &mut SplitMix64) -> Look {
             .plane
             .iter_mut()
             .chain(component.volume.iter_mut())
+            .chain(component.core.iter_mut())
         {
             *coefficient = rng.range(-0.3, 0.3);
         }
@@ -85,9 +86,20 @@ fn main() {
     let mut eval = Fnv::new();
     let mut encoded = Fnv::new();
 
-    for _ in 0..SAMPLES {
+    for sample in 0..SAMPLES {
         let y = rng.range(0.005, 4.0);
-        let xyz = Xyz::new(y * rng.range(0.4, 1.6), y, y * rng.range(0.3, 1.8));
+        let xyz = if sample % 4 == 0 {
+            let white = looklab_model::solve::reference_white();
+            let angle = 2.0 * core::f64::consts::PI * rng.unit();
+            let radius = rng.range(0.0, 0.05);
+            Xyz::new(
+                y * (white.x + radius * libm::cos(angle)),
+                y,
+                y * (white.z + radius * libm::sin(angle)),
+            )
+        } else {
+            Xyz::new(y * rng.range(0.4, 1.6), y, y * rng.range(0.3, 1.8))
+        };
         let ucs = look.eval(xyz);
         eval.mix(ucs.j);
         eval.mix(ucs.a);

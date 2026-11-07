@@ -6,6 +6,7 @@ use looklab_model::LookInput;
 use looklab_model::realization::{ControlResponseModel, Settings};
 use looklab_model::solve::ucs_of_xyz;
 use looklab_samples::{OutputSpace, SampleSet};
+use looklab_schema::ControlKey;
 
 use crate::error::{MatchError, Result};
 use crate::model::MatchModel;
@@ -85,16 +86,19 @@ impl TruthRenderer for MatchModel {
 /// A few Gauss-Newton iterations on one scale factor per non-default control.
 pub struct ScaleFitter;
 
-impl ObservedFitter for ScaleFitter {
-    fn fit(
+impl ScaleFitter {
+    /// # Errors
+    /// Reports a failed solve or an invalid control-response model.
+    pub fn fit_with_scales(
         &self,
         model: &MatchModel,
         plan: &Plan,
         settings: &Settings,
         observed: &[ObservedRender],
         options: &FitObservedOptions,
-    ) -> Result<ControlResponseModel> {
+    ) -> Result<(ControlResponseModel, Vec<(ControlKey, f64)>)> {
         let mut crm = model.crm.clone();
+        let mut scales: Vec<(ControlKey, f64)> = Vec::new();
         for _ in 0..options.iterations {
             let candidate = MatchModel {
                 crm: crm.clone(),
@@ -160,10 +164,34 @@ impl ObservedFitter for ScaleFitter {
             let correction = solve(&mut hessian, &mut gradient)?;
             for (slot, &control) in active.iter().enumerate() {
                 let factor = (1.0 + correction[slot]).clamp(options.min_factor, options.max_factor);
-                scale_response(&mut crm, plan.key(control), factor);
+                let key = plan.key(control);
+                scale_response(&mut crm, key, factor);
+                match scales
+                    .iter_mut()
+                    .find(|(known, _)| known.as_str() == key.as_str())
+                {
+                    Some((_, total)) => *total *= factor,
+                    None => scales.push((key.clone(), factor)),
+                }
             }
         }
-        Ok(crm)
+        scales.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok((crm, scales))
+    }
+}
+
+impl ObservedFitter for ScaleFitter {
+    fn fit(
+        &self,
+        model: &MatchModel,
+        plan: &Plan,
+        settings: &Settings,
+        observed: &[ObservedRender],
+        options: &FitObservedOptions,
+    ) -> Result<ControlResponseModel> {
+        Ok(self
+            .fit_with_scales(model, plan, settings, observed, options)?
+            .0)
     }
 }
 
@@ -172,7 +200,7 @@ fn has_response(crm: &ControlResponseModel, key: &looklab_schema::ControlKey) ->
         || crm.wb.controls.iter().any(|control| &control.key == key)
 }
 
-fn scale_response(crm: &mut ControlResponseModel, key: &looklab_schema::ControlKey, factor: f64) {
+pub(crate) fn scale_response(crm: &mut ControlResponseModel, key: &ControlKey, factor: f64) {
     for control in &mut crm.controls {
         if &control.key != key {
             continue;

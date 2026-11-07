@@ -119,26 +119,10 @@ pub fn optimize(
         ..RunStats::default()
     };
 
-    let mut pruned: Vec<(f64, usize, LinearCache, Settings)> = Vec::with_capacity(models.len());
+    let mut pruned: Vec<(f64, usize)> = Vec::with_capacity(models.len());
     for (index, model) in models.iter().enumerate() {
-        let cache = LinearCache::new(model, plan, target, &plan.default, &subset, options.beta)?;
-        let mut settings = plan.default.clone();
-        for control in plan.stage_controls() {
-            if affects(plan, control, Affects::Exposure) || affects(plan, control, Affects::Wb) {
-                sweep(
-                    &cache,
-                    plan,
-                    &mut settings,
-                    control,
-                    &mut stats.linear_evaluations,
-                );
-            }
-        }
-        let score = {
-            stats.linear_evaluations += 1;
-            cache.score(plan, &settings)
-        };
-        pruned.push((score, index, cache, settings));
+        let score = prune_sim(model, plan, target, &subset, &coarse, &mut stats)?;
+        pruned.push((score, index));
     }
     pruned.sort_by(|left, right| left.0.total_cmp(&right.0));
     pruned.truncate(options.top_sims.max(1));
@@ -148,7 +132,27 @@ pub fn optimize(
     let mut seeds: Vec<(usize, Settings)> = Vec::new();
     let best_sim = pruned.first().map(|entry| entry.1);
     let mut caches: Vec<Option<LinearCache>> = (0..models.len()).map(|_| None).collect();
-    for (position, (_score, index, cache, start)) in pruned.into_iter().enumerate() {
+    for (position, (_score, index)) in pruned.into_iter().enumerate() {
+        let cache = LinearCache::new(
+            &models[index],
+            plan,
+            target,
+            &plan.default,
+            &subset,
+            options.beta,
+        )?;
+        let mut start = plan.default.clone();
+        for control in plan.stage_controls() {
+            if affects(plan, control, Affects::Exposure) || affects(plan, control, Affects::Wb) {
+                sweep(
+                    &cache,
+                    plan,
+                    &mut start,
+                    control,
+                    &mut stats.linear_evaluations,
+                );
+            }
+        }
         for start_point in [plan.default.clone(), start.clone()] {
             let greedy = greedy_residual(&cache, plan, &start_point);
             seeds.push((index, greedy.clone()));
@@ -363,6 +367,66 @@ pub fn optimize(
 
 fn affects(plan: &Plan, control: usize, affect: Affects) -> bool {
     plan.controls[control].affects.contains(&affect)
+}
+
+fn exact_probe_score(
+    model: &MatchModel,
+    target: &PreparedTarget<'_>,
+    settings: &Settings,
+    subset: &ProbeSubset,
+) -> Result<f64> {
+    let realization = model.realize(settings)?;
+    let mut total = 0.0_f64;
+    for (index, weight) in subset.indices.iter().zip(&subset.weights) {
+        let probe = &target.probes.probes[*index];
+        let prediction = model
+            .input_ucs(&realization, probe.xyz, [0.0, 0.0], 0.0)
+            .to_array();
+        let expected = target.target[*index].to_array();
+        let delta = [
+            prediction[0] - expected[0],
+            prediction[1] - expected[1],
+            prediction[2] - expected[2],
+        ];
+        total += weight * (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]);
+    }
+    Ok(total)
+}
+
+/// The prune stage of docs/04 §3 step 1: every sim at its defaults, with the
+/// best exposure and white-balance values found by 1-D sweeps on a coarse subset.
+fn prune_sim(
+    model: &MatchModel,
+    plan: &Plan,
+    target: &PreparedTarget<'_>,
+    subset: &ProbeSubset,
+    coarse: &ProbeSubset,
+    stats: &mut RunStats,
+) -> Result<f64> {
+    let mut settings = plan.default.clone();
+    for control in plan.stage_controls() {
+        if !(affects(plan, control, Affects::Exposure) || affects(plan, control, Affects::Wb)) {
+            continue;
+        }
+        let mut best_value = plan.value_index(control, &settings);
+        stats.exact_evaluations += 1;
+        let mut best_score = exact_probe_score(model, target, &settings, coarse)?;
+        for value in 0..plan.domains[control].values.len() {
+            if value == best_value {
+                continue;
+            }
+            let candidate = plan.candidate(&settings, control, value);
+            stats.exact_evaluations += 1;
+            let score = exact_probe_score(model, target, &candidate, coarse)?;
+            if score < best_score {
+                best_score = score;
+                best_value = value;
+            }
+        }
+        plan.set(control, best_value, &mut settings);
+    }
+    stats.exact_evaluations += 1;
+    exact_probe_score(model, target, &settings, subset)
 }
 
 fn sweep(

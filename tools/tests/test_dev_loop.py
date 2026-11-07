@@ -48,7 +48,12 @@ def failing_stub(path: Path) -> None:
     path.chmod(0o755)
 
 
-def make_layout(root: Path) -> dev_loop.Layout:
+def make_layout(
+    root: Path,
+    *,
+    public_port: int = dev_loop.DEFAULT_PUBLIC_PORT,
+    stub_port: int = dev_loop.DEFAULT_STUB_PORT,
+) -> dev_loop.Layout:
     target = root / "target-ui"
     runtime = target / "runtime"
     return dev_loop.Layout(
@@ -66,7 +71,46 @@ def make_layout(root: Path) -> dev_loop.Layout:
         runtime_record=runtime / "generation.json",
         css_script=target / "source" / "site" / "scripts" / "dev-css.mjs",
         css_watch_script=root / "site" / "scripts" / "dev-css.mjs",
+        public_port=public_port,
+        stub_port=stub_port,
     )
+
+
+class PortEnvironmentTests(unittest.TestCase):
+    def layout_for(self, values: dict[str, str]) -> dev_loop.Layout:
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = {"LOOKLAB_UI_TARGET_DIR": temporary, **values}
+            with mock.patch.dict(os.environ, environment, clear=False):
+                return dev_loop.Layout.from_environment()
+
+    def test_ports_come_from_the_environment(self) -> None:
+        layout = self.layout_for(
+            {"LOOKLAB_DEV_PORT": "8099", "LOOKLAB_DEV_API_PORT": "8100"}
+        )
+        self.assertEqual(layout.public_port, 8099)
+        self.assertEqual(layout.stub_port, 8100)
+
+    def test_defaults_are_used_without_overrides(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LOOKLAB_DEV_PORT", None)
+            os.environ.pop("LOOKLAB_DEV_API_PORT", None)
+            layout = self.layout_for({})
+        self.assertEqual(layout.public_port, dev_loop.DEFAULT_PUBLIC_PORT)
+        self.assertEqual(layout.stub_port, dev_loop.DEFAULT_STUB_PORT)
+
+    def test_equal_ports_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.layout_for({"LOOKLAB_DEV_PORT": "8099", "LOOKLAB_DEV_API_PORT": "8099"})
+
+    def test_invalid_port_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.layout_for({"LOOKLAB_DEV_PORT": "http"})
+
+
+class ArgumentsTests(unittest.TestCase):
+    def test_reuse_data_is_opt_in(self) -> None:
+        self.assertFalse(dev_loop.parse_arguments([]).reuse_data)
+        self.assertTrue(dev_loop.parse_arguments(["--reuse-data"]).reuse_data)
 
 
 class ExchangeTests(unittest.TestCase):
@@ -101,17 +145,14 @@ class PublishTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        self.layout = make_layout(self.root)
+        self.port = free_port()
+        self.layout = make_layout(self.root, stub_port=self.port)
         for directory in (
             self.layout.dist,
             self.layout.runtime / "data",
             self.layout.stub_bin,
         ):
             directory.mkdir(parents=True, exist_ok=True)
-        self.port = free_port()
-        self.port_patch = mock.patch.object(dev_loop, "STUB_PORT", self.port)
-        self.port_patch.start()
-        self.addCleanup(self.port_patch.stop)
         for name, value in (("GRACE_SECONDS", 2.0), ("READY_SECONDS", 5.0)):
             patcher = mock.patch.object(dev_loop, name, value)
             patcher.start()

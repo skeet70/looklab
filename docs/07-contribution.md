@@ -23,14 +23,16 @@ After each step, show the impact (server-computed, via the status link) and offe
 
 ## 2. Pairing, attestation and usability
 
-- **Pair** RAW↔JPEG by base filename, then capture time (subsecond where available) and the same body. Show unpaired files with a reason.
+- **Pair** RAW↔JPEG by base filename, then capture time (subsecond where available) and the same body. Show unpaired files with a reason. Keep re-renders with different sims, settings or rendering firmware. Suppress a duplicate only when its sim/settings and known rendering firmware match; unknown firmware is retained for review.
 - **Attestation signals** (consistency inputs, not proof):
   - The makernote sim tag matches the declared sim (the makernote is the default; the user confirms).
-  - The `Software` tag equals the body's firmware string; anything else means "edited" and the image is excluded.
+  - The JPEG's native-renderer `Software` metadata identifies its rendering firmware when available. An older firmware version in the source RAW does not make a later camera re-render edited. Software identifying an external editor remains an exclusion signal.
   - Makernotes are present in the JPEG.
   - C2PA content credentials, where present and valid, are post-launch evidence. Treat them as a server-verifiable signal only once verification runs server-side on the embedded manifest.
 - **Usable settings** ([03 §1](03-data-model.md)): any values of `look_affecting` controls are usable. Default-setting images are target-defining, and non-default images inform the Look through the joint fit. Spatial controls must be at a `tolerated` value.
 - **In-camera re-renders:** the client recognizes JPEGs rendered from the same RAW (same capture time/image number with different settings, or the conversion's own markers; verify per make). It assigns a `rerender_group` and **samples one shared pixel set** for the group, which gives the control-response fit exactly matched inputs ([03 §2.1](03-data-model.md)).
+
+The browser retains File/Blob handles and scans metadata one file at a time. It reads bytes for active worker groups, decodes each shared RAW once, and decodes and samples the group's JPEGs sequentially. Each JPEG keeps its own rendering metadata.
 
 ## 3. Capture protocols (shown only when a rung needs them)
 

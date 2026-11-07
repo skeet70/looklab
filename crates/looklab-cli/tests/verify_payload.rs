@@ -64,6 +64,42 @@ fn card_fixture() -> &'static Fixture {
     &FIXTURE
 }
 
+/// Two colour renders of one RAW: identical EXIF apart from the film simulation.
+fn simulation_fixture() -> &'static Fixture {
+    static FIXTURE: LazyLock<Fixture> = LazyLock::new(|| {
+        build_fixture("verify-payload-simulations", None, |renders| {
+            renders[1] = with_fuji_tag(&renders[1], 0x1401, 0x0600);
+        })
+    });
+    &FIXTURE
+}
+
+/// A fixture whose second render reports firmware 1.10 while the RAW reports 1.00.
+fn render_firmware_fixture() -> &'static Fixture {
+    static FIXTURE: LazyLock<Fixture> = LazyLock::new(|| {
+        build_fixture("verify-payload-render-firmware", None, |renders| {
+            renders[1] = with_software_firmware(&renders[1], "1.10");
+        })
+    });
+    &FIXTURE
+}
+
+fn simulation_batches(fixture: &Fixture) -> (Site, Site) {
+    (
+        Site::from_fixture(fixture).only(&[0]),
+        Site::from_fixture(fixture)
+            .only(&[1])
+            .with_sim("classic_chrome"),
+    )
+}
+
+fn assert_upload_passes(fixture: &Fixture, site: &Site, name: &str) {
+    let har = har_path(&format!("{name}-control"), &default_har(site).json());
+    let state = state_path(&format!("{name}-control"));
+    let (success, output) = run(fixture, &[har.as_path()], &state);
+    assert!(success, "the control upload does not verify: {output}");
+}
+
 /// A fixture whose schema maps no makernote tag for `color_chrome_effect`.
 fn declared_fixture() -> &'static Fixture {
     static FIXTURE: LazyLock<Fixture> = LazyLock::new(|| {
@@ -81,13 +117,25 @@ fn declared_fixture() -> &'static Fixture {
     &FIXTURE
 }
 
-fn build_fixture_in(name: &str, render_tag: Option<&str>) -> Fixture {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    std::fs::create_dir_all(&dir).expect("fixture directory");
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
-        .expect("workspace root");
+        .expect("workspace root")
+}
+
+fn build_fixture_in(name: &str, render_tag: Option<&str>) -> Fixture {
+    build_fixture(name, render_tag, |_| {})
+}
+
+fn build_fixture(
+    name: &str,
+    render_tag: Option<&str>,
+    adjust: impl FnOnce(&mut Vec<Vec<u8>>),
+) -> Fixture {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    std::fs::create_dir_all(&dir).expect("fixture directory");
+    let workspace = workspace_root();
     let fixture = workspace.join("fixtures/cache/fujifilm-x-s10.raf");
     let raw = std::fs::read(&fixture).unwrap_or_else(|error| {
         panic!(
@@ -104,13 +152,14 @@ fn build_fixture_in(name: &str, render_tag: Option<&str>) -> Fixture {
         embedded.clone(),
         splice_exif(&embedded, &jpeg_from_image(&decoded.image, 0.7)),
     ];
-    let renders: Vec<Vec<u8>> = match render_tag {
+    let mut renders: Vec<Vec<u8>> = match render_tag {
         Some(token) => untagged
             .iter()
             .map(|jpeg| with_render_tag(jpeg, token))
             .collect(),
         None => untagged,
     };
+    adjust(&mut renders);
     let jpegs: Vec<PathBuf> = ["render-a.jpg", "render-b.jpg"]
         .iter()
         .map(|name| dir.join(name))
@@ -159,10 +208,7 @@ fn module() -> PathBuf {
 
 fn verified_module() -> PathBuf {
     const SCRIPT: &str = "site/scripts/wasm-assets.sh";
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("workspace root");
+    let root = workspace_root();
     let output = ProcessCommand::new("sh")
         .current_dir(&root)
         .args([SCRIPT, "--prep", "--check"])
@@ -301,6 +347,98 @@ fn with_render_tag(jpeg: &[u8], token: &str) -> Vec<u8> {
     tagged[base + entry + 4..base + entry + 8].copy_from_slice(&length);
     tagged[base + offset..base + offset + payload.len()].copy_from_slice(&payload);
     tagged
+}
+
+/// Sets a Fujifilm makernote `u16` tag in a JPEG's EXIF.
+fn with_fuji_tag(jpeg: &[u8], tag: u16, value: u16) -> Vec<u8> {
+    let segment = exif_segment(jpeg).expect("EXIF segment");
+    let start = segment.as_ptr() as usize - jpeg.as_ptr() as usize;
+    let tiff = &segment[10..];
+    let little = match &tiff[..2] {
+        b"II" => true,
+        b"MM" => false,
+        other => panic!("unknown TIFF byte order {other:?}"),
+    };
+    let read_u16 = |at: usize| {
+        let bytes: [u8; 2] = tiff[at..at + 2].try_into().expect("two bytes");
+        if little {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        }
+    };
+    let read_u32 = |at: usize| {
+        let bytes: [u8; 4] = tiff[at..at + 4].try_into().expect("four bytes");
+        if little {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        }
+    };
+
+    let ifd0 = read_u32(4) as usize;
+    let count0 = read_u16(ifd0) as usize;
+    let mut directories = vec![ifd0];
+    for index in 0..count0 {
+        let at = ifd0 + 2 + index * 12;
+        if read_u16(at) == 0x8769 {
+            directories.push(read_u32(at + 8) as usize);
+        }
+    }
+    for directory in directories {
+        let count = read_u16(directory) as usize;
+        for index in 0..count {
+            let at = directory + 2 + index * 12;
+            if read_u16(at) != 0x927c || read_u16(at + 2) != 7 {
+                continue;
+            }
+            let length = read_u32(at + 4) as usize;
+            let offset = read_u32(at + 8) as usize;
+            let note = &tiff[offset..offset + length];
+            assert!(note.starts_with(b"FUJIFILM"), "the MakerNote is Fujifilm's");
+            let start_of = u32::from_le_bytes(note[8..12].try_into().expect("four bytes"));
+            let start_of = start_of as usize;
+            let entries = u16::from_le_bytes(note[start_of..start_of + 2].try_into().expect("two"));
+            for entry in 0..usize::from(entries) {
+                let at = start_of + 2 + entry * 12;
+                if u16::from_le_bytes(note[at..at + 2].try_into().expect("two bytes")) != tag {
+                    continue;
+                }
+                assert_eq!(
+                    u16::from_le_bytes(note[at + 2..at + 4].try_into().expect("two bytes")),
+                    3,
+                    "a u16 tag"
+                );
+                assert_eq!(
+                    u32::from_le_bytes(note[at + 4..at + 8].try_into().expect("four bytes")),
+                    1,
+                    "a single value"
+                );
+                let mut patched = jpeg.to_vec();
+                let base = start + 10 + offset;
+                patched[base + at + 8..base + at + 10].copy_from_slice(&value.to_le_bytes());
+                return patched;
+            }
+            panic!("the Fujifilm makernote has no tag {tag:#06x}");
+        }
+    }
+    panic!("EXIF has no MakerNote");
+}
+
+/// Rewrites the `Ver1.00` token of the fixture JPEG's EXIF `Software` tag.
+fn with_software_firmware(jpeg: &[u8], firmware: &str) -> Vec<u8> {
+    let segment = exif_segment(jpeg).expect("EXIF segment");
+    let start = segment.as_ptr() as usize - jpeg.as_ptr() as usize;
+    let token = b"Ver1.00";
+    let at = segment
+        .windows(token.len())
+        .position(|window| window == token)
+        .expect("the Software tag's Ver token");
+    let replacement = format!("Ver{firmware}");
+    assert_eq!(replacement.len(), token.len(), "the token keeps its length");
+    let mut patched = jpeg.to_vec();
+    patched[start + at..start + at + token.len()].copy_from_slice(replacement.as_bytes());
+    patched
 }
 
 fn jpeg_from_image(image: &Image3, exposure: f64) -> Vec<u8> {
@@ -471,6 +609,25 @@ impl Site {
 
     fn with_intent(mut self, intent: Intent) -> Self {
         self.manifest.intent = intent;
+        self
+    }
+
+    fn only(mut self, indices: &[usize]) -> Self {
+        let images = indices
+            .iter()
+            .map(|&index| self.manifest.images[index].clone())
+            .collect();
+        let blobs = indices
+            .iter()
+            .map(|&index| self.blobs[index].clone())
+            .collect();
+        self.manifest.images = images;
+        self.blobs = blobs;
+        self
+    }
+
+    fn with_sim(mut self, sim: &str) -> Self {
+        self.manifest.sim_key = SimKey::new(sim).expect("sim key");
         self
     }
 
@@ -882,6 +1039,37 @@ fn reproduces_an_upload_and_passes() {
 }
 
 #[test]
+fn multiple_native_batches_from_one_raw_verify() {
+    let fixture = simulation_fixture();
+    let (provia, chrome) = simulation_batches(fixture);
+    let har = har_path(
+        "simulations",
+        &default_har(&provia).upload(chrome.body()).json(),
+    );
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("simulations"));
+
+    assert!(success, "{output}");
+    assert!(output.contains("PASS"), "{output}");
+}
+
+#[test]
+fn each_render_verifies_its_own_firmware() {
+    let fixture = render_firmware_fixture();
+    let raw_version = Site::from_fixture(fixture).only(&[0]);
+    let render_version = Site::from_fixture(fixture).only(&[1]).with_firmware("1.10");
+    let har = har_path(
+        "render-firmware",
+        &default_har(&raw_version)
+            .upload(render_version.body())
+            .json(),
+    );
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("render-firmware"));
+
+    assert!(success, "{output}");
+    assert!(output.contains("PASS"), "{output}");
+}
+
+#[test]
 fn a_matching_declare_setting_passes() {
     let fixture = declared_fixture();
     let site = Site::from_fixture(fixture).with_declared_color_chrome_effect(2);
@@ -896,32 +1084,42 @@ fn a_matching_declare_setting_passes() {
 
     assert!(success, "{output}");
     assert!(output.contains("PASS"), "{output}");
-    assert!(
-        output.contains("color_chrome_effect = 2 (declared)"),
-        "{output}"
-    );
-    assert!(output.contains("11 reproduced, 1 declared"), "{output}");
 }
 
 #[test]
 fn a_missing_declare_setting_fails() {
     let fixture = declared_fixture();
     let site = Site::from_fixture(fixture).with_declared_color_chrome_effect(2);
+    let control = har_path("declared-missing-control", &default_har(&site).json());
+    let (success, output) = run_extra(
+        fixture,
+        &[control.as_path()],
+        &state_path("declared-missing-control"),
+        &["--intent", "native"],
+        &["--declare-setting", "color_chrome_effect=2"],
+    );
+    assert!(success, "the control upload does not verify: {output}");
+
     let har = har_path("declared-missing", &default_har(&site).json());
     let (success, output) = run(fixture, &[har.as_path()], &state_path("declared-missing"));
 
     assert!(!success, "{output}");
-    assert!(
-        output.contains("color_chrome_effect has no value"),
-        "{output}"
-    );
-    assert!(output.contains("--declare-setting"), "{output}");
 }
 
 #[test]
 fn a_different_declare_setting_fails() {
     let fixture = declared_fixture();
     let site = Site::from_fixture(fixture).with_declared_color_chrome_effect(2);
+    let control = har_path("declared-wrong-control", &default_har(&site).json());
+    let (success, output) = run_extra(
+        fixture,
+        &[control.as_path()],
+        &state_path("declared-wrong-control"),
+        &["--intent", "native"],
+        &["--declare-setting", "color_chrome_effect=2"],
+    );
+    assert!(success, "the control upload does not verify: {output}");
+
     let har = har_path("declared-wrong", &default_har(&site).json());
     let (success, output) = run_extra(
         fixture,
@@ -932,19 +1130,18 @@ fn a_different_declare_setting_fails() {
     );
 
     assert!(!success, "{output}");
-    assert!(output.contains("color_chrome_effect"), "{output}");
 }
 
 #[test]
 fn fails_on_a_fabricated_batch_field() {
     let fixture = fixture();
+    assert_upload_passes(fixture, &Site::new(), "firmware");
+
     let site = Site::new().with_firmware("1.01");
     let har = har_path("firmware", &default_har(&site).json());
     let (success, output) = run(fixture, &[har.as_path()], &state_path("firmware"));
 
     assert!(!success, "{output}");
-    assert!(output.contains("firmware version is 1.01"), "{output}");
-    assert!(output.contains("reproduced 1.00"), "{output}");
 }
 
 #[test]
@@ -969,26 +1166,27 @@ fn reproduces_a_tagged_card_upload_and_passes() {
 
     assert!(success, "{output}");
     assert!(output.contains("PASS"), "{output}");
-    assert!(
-        output.contains("card firmware: acme-sim/2.0.1 (reproduced from the render tag)"),
-        "{output}"
-    );
-    assert!(
-        output.contains("card look: provia@1.0.0 (reproduced from the render tag)"),
-        "{output}"
-    );
-    assert!(
-        output.contains("card cid: 0123456789abcdef (reproduced from the render tag)"),
-        "{output}"
-    );
 }
 
 #[test]
 fn fails_on_a_fabricated_render_tag() {
     let fixture = card_fixture();
-    let mut tag = parse_render_tag(CARD_TAG).expect("render tag");
-    tag.cid_prefix[0] ^= 0xff;
-    let site = Site::from_fixture(fixture).with_intent(Intent::Card(CardDeclaration::tagged(tag)));
+    let tag = parse_render_tag(CARD_TAG).expect("render tag");
+    let control =
+        Site::from_fixture(fixture).with_intent(Intent::Card(CardDeclaration::tagged(tag.clone())));
+    let control_har = har_path("card-fabricated-control", &default_har(&control).json());
+    let (success, output) = run_with(
+        fixture,
+        &[control_har.as_path()],
+        &state_path("card-fabricated-control"),
+        &["--intent", "card"],
+    );
+    assert!(success, "the control upload does not verify: {output}");
+
+    let mut forged = tag;
+    forged.cid_prefix[0] ^= 0xff;
+    let site =
+        Site::from_fixture(fixture).with_intent(Intent::Card(CardDeclaration::tagged(forged)));
     let har = har_path("card-fabricated", &default_har(&site).json());
     let (success, output) = run_with(
         fixture,
@@ -998,10 +1196,6 @@ fn fails_on_a_fabricated_render_tag() {
     );
 
     assert!(!success, "{output}");
-    assert!(
-        output.contains("render tag does not match the batch card declaration"),
-        "{output}"
-    );
 }
 
 #[test]
@@ -1017,16 +1211,22 @@ fn accepts_a_user_declared_card_with_matching_firmware() {
     );
 
     assert!(success, "{output}");
-    assert!(
-        output.contains("card firmware: acme-sim/2.0.1 (declared)"),
-        "{output}"
-    );
+    assert!(output.contains("PASS"), "{output}");
 }
 
 #[test]
 fn fails_on_a_user_declared_card_firmware_mismatch() {
     let fixture = fixture();
     let site = Site::from_fixture(fixture).with_intent(user_declared_card("acme-sim", "2.0.1"));
+    let control = har_path("card-mismatch-control", &default_har(&site).json());
+    let (success, output) = run_with(
+        fixture,
+        &[control.as_path()],
+        &state_path("card-mismatch-control"),
+        &["--intent", "card", "--firmware", "acme-sim/2.0.1"],
+    );
+    assert!(success, "the control upload does not verify: {output}");
+
     let har = har_path("card-mismatch", &default_har(&site).json());
     let (success, output) = run_with(
         fixture,
@@ -1036,11 +1236,6 @@ fn fails_on_a_user_declared_card_firmware_mismatch() {
     );
 
     assert!(!success, "{output}");
-    assert!(output.contains("intent is"), "{output}");
-    assert!(
-        output.contains("card firmware: acme-sim/9.9.9 (declared)"),
-        "{output}"
-    );
 }
 
 fn user_declared_card(firmware: &str, version: &str) -> Intent {
@@ -1053,30 +1248,25 @@ fn user_declared_card(firmware: &str, version: &str) -> Intent {
 #[test]
 fn fails_on_a_setting_outside_the_schema() {
     let fixture = fixture();
+    assert_upload_passes(fixture, &Site::new(), "hidden-setting");
+
     let site = Site::new().with_hidden_setting();
     let har = har_path("hidden-setting", &default_har(&site).json());
     let (success, output) = run(fixture, &[har.as_path()], &state_path("hidden-setting"));
 
     assert!(!success, "{output}");
-    assert!(output.contains("hidden"), "{output}");
-    assert!(
-        output.contains("neither reproduced nor declared"),
-        "{output}"
-    );
 }
 
 #[test]
 fn fails_on_signed_zero_manifest_bytes() {
     let fixture = fixture();
+    assert_upload_passes(fixture, &Site::new(), "signed-zero");
+
     let site = Site::new().with_positive_zero_tone();
     let har = har_path("signed-zero", &default_har(&site).json());
     let (success, output) = run(fixture, &[har.as_path()], &state_path("signed-zero"));
 
     assert!(!success, "{output}");
-    assert!(
-        output.contains("the manifest does not match the reproduced and declared manifest"),
-        "{output}"
-    );
 }
 
 #[test]
@@ -1114,12 +1304,97 @@ fn fails_on_an_extra_manifest_field() {
 #[test]
 fn fails_on_a_reordered_field() {
     let fixture = fixture();
+    assert_upload_passes(fixture, &Site::new(), "reordered");
+
     let site = Site::new().reversed();
     let har = har_path("reordered", &default_har(&site).json());
     let (success, output) = run(fixture, &[har.as_path()], &state_path("reordered"));
 
     assert!(!success, "{output}");
-    assert!(output.contains("image 0"), "{output}");
+}
+
+#[test]
+fn fails_on_altered_samples_with_a_matching_manifest_hash() {
+    let fixture = fixture();
+    assert_upload_passes(fixture, &Site::new(), "altered-samples");
+
+    let mut site = Site::new();
+    let samples = looklab_samples::decode(&site.blobs[0]).expect("the samples decode");
+    let mut out_rgb = samples.out_rgb().to_vec();
+    out_rgb[0][0] = if out_rgb[0][0] == 0.0 {
+        0.5
+    } else {
+        out_rgb[0][0] / 2.0
+    };
+    let altered = looklab_samples::SampleSet::new(
+        samples.header().clone(),
+        samples.in_rgb().to_vec(),
+        out_rgb,
+        samples.density_w().to_vec(),
+        samples.flags().to_vec(),
+    )
+    .expect("the altered samples validate");
+    site.blobs[0] = looklab_samples::encode(&altered).expect("the altered samples encode");
+    site.manifest.images[0].blob_sha256 = sha256(&site.blobs[0]);
+    let har = har_path("altered-samples", &default_har(&site).json());
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("altered-samples"));
+
+    assert!(!success, "{output}");
+}
+
+#[test]
+fn fails_on_a_batch_declaring_another_render_of_the_same_raw() {
+    let fixture = simulation_fixture();
+    let (provia, chrome) = simulation_batches(fixture);
+    let control = har_path(
+        "mislabelled-control",
+        &default_har(&provia).upload(chrome.body()).json(),
+    );
+    let (success, output) = run(
+        fixture,
+        &[control.as_path()],
+        &state_path("mislabelled-control"),
+    );
+    assert!(success, "the control upload does not verify: {output}");
+
+    let mislabelled = Site::from_fixture(fixture)
+        .only(&[0])
+        .with_sim("classic_chrome");
+    let har = har_path(
+        "mislabelled",
+        &default_har(&provia).upload(mislabelled.body()).json(),
+    );
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("mislabelled"));
+
+    assert!(!success, "{output}");
+}
+
+#[test]
+fn fails_on_the_same_image_twice_in_one_upload() {
+    let fixture = fixture();
+    assert_upload_passes(fixture, &Site::new(), "repeated-image");
+
+    let mut site = Site::new();
+    let image = site.manifest.images[0].clone();
+    let blob = site.blobs[0].clone();
+    site.manifest.images.push(image);
+    site.blobs.push(blob);
+    let har = har_path("repeated-image", &default_har(&site).json());
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("repeated-image"));
+
+    assert!(!success, "{output}");
+}
+
+#[test]
+fn a_har_that_omits_a_prepared_image_fails() {
+    let fixture = fixture();
+    assert_upload_passes(fixture, &Site::new(), "omitted-image");
+
+    let site = Site::new().only(&[0]);
+    let har = har_path("omitted-image", &default_har(&site).json());
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("omitted-image"));
+
+    assert!(!success, "{output}");
 }
 
 #[test]

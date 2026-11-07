@@ -121,6 +121,8 @@ impl TestServer {
             registration_ttl: Duration::from_secs(300),
             body_timeout: Duration::from_secs(30),
             blob_retention_days: 30,
+            cors_origins: Vec::new(),
+            site: Default::default(),
             pow: PowConfig {
                 memory_kib: 8,
                 iterations: 1,
@@ -351,6 +353,51 @@ impl TestServer {
     }
 }
 
+#[tokio::test]
+async fn nonce_advertises_the_configured_parent_rp_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let secret = dir.path().join("server-secret");
+    std::fs::write(&secret, [3u8; 32]).expect("write secret");
+    let config = Config {
+        bind: "127.0.0.1:0".parse().expect("bind"),
+        db_path: dir.path().join("looklab.sqlite3"),
+        blob_dir: dir.path().join("blobs"),
+        rp_id: "looklab.example".to_owned(),
+        origin: "https://photos.looklab.example".to_owned(),
+        server_secret_path: secret,
+        bodies_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies"),
+        snapshot_dir: dir.path().join("community"),
+        nonce_ttl: Duration::from_secs(300),
+        registration_ttl: Duration::from_secs(300),
+        body_timeout: Duration::from_secs(30),
+        blob_retention_days: 30,
+        cors_origins: Vec::new(),
+        site: Default::default(),
+        pow: PowConfig {
+            memory_kib: 8,
+            iterations: 1,
+            difficulty_bits_per_image: 5.0,
+        },
+        limits: Limits {
+            max_body_bytes: 1 << 20,
+            max_manifest_bytes: 1 << 16,
+            max_images: 8,
+            max_blob_bytes: 1 << 16,
+        },
+    };
+    let state = Arc::new(AppState::new(config).await.expect("state"));
+    let app = router(state);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/nonce")
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, body) = send(&app, request).await;
+    assert_eq!(status, StatusCode::CREATED, "nonce: {body:?}");
+    let value: Value = serde_json::from_slice(&body).expect("nonce json");
+    assert_eq!(value["rp_id"], "looklab.example");
+}
+
 async fn tcp_nonce(addr: SocketAddr) -> (u16, Vec<u8>) {
     tcp_request(addr, "POST", "/api/nonce", None, &[]).await
 }
@@ -578,6 +625,20 @@ fn declared(key: &str, step: i64) -> ControlEntry {
     entry(key, step, SettingSource::Declared)
 }
 
+fn monochrome_look() -> looklab_upload::LookSettings {
+    looklab_upload::LookSettings {
+        film_mode: Some(looklab_upload::Tagged {
+            raw: 0x0000,
+            value: None,
+        }),
+        saturation: Some(looklab_upload::Tagged {
+            raw: 0x0500,
+            value: None,
+        }),
+        ..looklab_upload::LookSettings::default()
+    }
+}
+
 fn valid_settings() -> ControlSettings {
     settings_at(&[
         ("color", 0),
@@ -630,7 +691,7 @@ fn snapshot_schema(color: &str) -> String {
     let mut text = String::from(
         "body: fujifilm/x-t5\nepochs:\n  - id: 1\n    firmware: { from: \"1.00\", to: \"9.99\" }\n    \
          native_sims:\n      - key: classic_chrome\n        look: classic-chrome\n        \
-         makernote: { tag: FilmMode, value: 0x0700 }\n    exposure_modes:\n      - key: dr100\n    \
+         makernote: { tag: FilmMode, value: 0x0600 }\n    exposure_modes:\n      - key: dr100\n    \
          controls:\n      - key: dynamic_range\n        type: enum\n        \
          values: [dr100, dr200, dr400]\n        default: dr100\n        look_affecting: true\n        \
          affects: [tone, exposure]\n        makernote:\n          tag: DevelopmentDynamicRange\n          \
@@ -950,6 +1011,33 @@ async fn schema_invalid_settings_are_rejected() {
     let (status, body) = server.upload_bytes(bytes).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "SCHEMA_INVALID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_monochrome_sim_is_rejected() {
+    let mut server = TestServer::start().await;
+    let (mut manifest, blobs) = manifest(valid_settings());
+    manifest.body = BodyId::new("fujifilm/x-t4").expect("body id");
+    manifest.firmware_version = FirmwareVersionString::new("1.00").expect("firmware");
+    manifest.sim_key = SimKey::new("acros_ye").expect("sim key");
+    let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upload: {body}");
+    assert_eq!(body["error"], "MONOCHROME_UNSUPPORTED");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_monochrome_image_rejects_a_colour_sim_declaration() {
+    let mut server = TestServer::start().await;
+    let (mut manifest, blobs) = manifest(valid_settings());
+    manifest.body = BodyId::new("fujifilm/x-t4").expect("body id");
+    manifest.firmware_version = FirmwareVersionString::new("1.00").expect("firmware");
+    manifest.sim_key = SimKey::new("provia").expect("sim key");
+    for image in &mut manifest.images {
+        image.meta.look = Some(monochrome_look());
+    }
+    let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upload: {body}");
+    assert_eq!(body["error"], "MONOCHROME_UNSUPPORTED");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2244,6 +2332,108 @@ async fn moderator_session_serves_the_queue_and_records_decisions() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn moderator_revert_route_republishes_and_requests_a_refit() {
+    use looklab_model::file::{LookIdentity, LookKind, WbPolicy};
+    use looklab_model::{Look, LookDocument};
+    use looklab_server::admin::{self, ManifestArtifact};
+
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let token = server.moderator_token().await;
+    let look = looklab_upload::LookSlug::try_from("classic-chrome".to_owned()).expect("look");
+    let identity = LookIdentity::new(
+        "classic-chrome",
+        "1.0.0",
+        LookKind::NativeFamily,
+        WbPolicy::Adaptive,
+    )
+    .expect("identity");
+    let document = LookDocument::from_look(identity, Look::colorimetric()).expect("document");
+    let look_bytes = document.encode().expect("look bytes");
+    let look_hash = hex(&Sha256::digest(&look_bytes));
+    std::fs::write(server.blob_dir.join(&look_hash), &look_bytes).expect("look blob");
+    let release = json!({
+        "version": 1,
+        "gauge": 0.0,
+        "anchor": 1,
+        "clip_k": 1.0,
+        "probes": [],
+        "gated_since_anchor": {"probes": []},
+        "converged": true,
+        "gate": {},
+        "provenance": {"anchor_version": "1.0.0"},
+        "created_at": 0,
+    });
+    let release_bytes = serde_json::to_vec(&release).expect("release");
+    let release_hash = hex(&Sha256::digest(&release_bytes));
+    std::fs::write(server.blob_dir.join(&release_hash), &release_bytes).expect("release blob");
+    let artifacts = vec![
+        ManifestArtifact {
+            name: looklab_publish::DOCUMENT_ARTIFACT.to_owned(),
+            sha256: look_hash,
+        },
+        ManifestArtifact {
+            name: "release.json".to_owned(),
+            sha256: release_hash,
+        },
+    ];
+    admin::write_version_manifest(
+        &server.db,
+        &look,
+        looklab_trust::VersionId::new(1),
+        &artifacts,
+        &[],
+    )
+    .await
+    .expect("version 1");
+
+    let (status, reply) = server
+        .revert_look(
+            &token,
+            json!({
+                "look": "classic-chrome",
+                "target_version": 1,
+                "excluded_credentials": [],
+                "reason": "restore the released fit",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "revert: {reply}");
+    assert_eq!(reply["target_version"], 1);
+    assert_eq!(reply["new_version"], 2);
+    let manifests: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM version_manifests m
+         JOIN look_versions v ON v.id = m.look_version_id
+         WHERE v.look = 'classic-chrome' AND v.version = 2",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("new manifest");
+    assert_eq!(manifests, 1);
+
+    let audit: String =
+        sqlx::query_scalar("SELECT type FROM audit_log ORDER BY seq DESC LIMIT 1")
+            .fetch_one(&server.db)
+            .await
+            .expect("audit");
+    assert_eq!(audit, "revert");
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'revert_refit' AND status = 'queued'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("refit job");
+    assert_eq!(queued, 1);
+    let requested: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM look_refit_requests WHERE look = 'classic-chrome'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("refit request");
+    assert_eq!(requested, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn admin_and_public_endpoints_publish_no_secrets() {
     use looklab_server::RootAdmissionId;
     use looklab_server::admin::{ManifestArtifact, write_version_manifest};
@@ -2537,6 +2727,21 @@ impl TestServer {
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::from(
                 serde_json::to_vec(&decision).expect("decision json"),
+            ))
+            .expect("request");
+        let (status, _, body) = send(&self.app, request).await;
+        let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        (status, value)
+    }
+
+    async fn revert_look(&self, token: &str, payload: Value) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/mod/look/revert")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::to_vec(&payload).expect("revert json"),
             ))
             .expect("request");
         let (status, _, body) = send(&self.app, request).await;
@@ -2866,14 +3071,16 @@ async fn an_uploaded_fixture_is_exported_on_approval() {
     assert_eq!(body["snapshot"]["version"], 1);
 
     let snapshot = server.dir.path().join("community/v1");
+    let exported = snapshot.join("fixtures/donated/looklab-test.raf");
     assert_eq!(
-        std::fs::read(snapshot.join("fixtures/looklab-test.raf")).expect("exported fixture"),
-        bytes
+        std::fs::read(&exported).expect("exported fixture"),
+        bytes,
+        "a published donation is exported under its LFS path"
     );
-    let manifest =
-        std::fs::read_to_string(snapshot.join("fixtures/manifest.toml")).expect("manifest");
-    assert!(manifest.contains("committed = \"lfs\""), "{manifest}");
-    assert!(!manifest.contains("source ="), "{manifest}");
+    assert!(
+        !snapshot.join("fixtures/looklab-test.raf").exists(),
+        "a donated RAW must not be exported into plain git"
+    );
     let failures = looklab_schema::validate_snapshot_dir(&snapshot).expect("snapshot walk");
     assert!(failures.is_empty(), "{failures:?}");
 }

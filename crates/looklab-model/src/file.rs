@@ -11,15 +11,15 @@ use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 
 use crate::basis::{
-    C_COEFS, C_MAX, HUE_COEFS, RESIDUAL_COEFS, RESIDUAL_GRID, S_COEFS, S_KNOTS, TINT_COEFS,
-    TINT_KNOTS, TONE_COEFS, TONE_KNOTS,
+    C_COEFS, C_MAX, CORE_TERMS, HUE_COEFS, NEUTRAL_JOIN_C, RESIDUAL_COEFS, RESIDUAL_GRID, S_COEFS,
+    S_KNOTS, TINT_COEFS, TINT_KNOTS, TONE_COEFS, TONE_KNOTS, VOLUME_COEFS,
 };
 use crate::clip::ClipSettings;
 use crate::error::{ModelError, Result};
 use crate::look::{ColorLayer, GRL_COEFS, GrlComponent, Look, RESIDUAL_DOMAIN, Residual, Tint};
 use crate::tone::Tone;
 
-pub const FORMAT_ID: &str = "looklab-look/1";
+pub const FORMAT_ID: &str = "looklab-look/2";
 
 const BIN_MAGIC: &[u8; 4] = b"LKBN";
 const JSON_NAME: &str = "look.json";
@@ -36,6 +36,8 @@ const MAX_ARRAY_VALUES: usize = 1_000_000;
 pub enum FormatId {
     #[serde(rename = "looklab-look/1")]
     LookV1,
+    #[serde(rename = "looklab-look/2")]
+    LookV2,
 }
 
 macro_rules! string_newtype {
@@ -340,6 +342,25 @@ pub enum BaseStatus {
     BaseInconsistent { field: BaseField },
 }
 
+/// Why a Look document cannot be matched or baked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchRefusal {
+    DisplayBaseUnpinned,
+    /// The stored support mask admits no probe.
+    Unsupported,
+    NotNativeFamily,
+}
+
+impl core::fmt::Display for MatchRefusal {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::DisplayBaseUnpinned => "the display base is not pinned",
+            Self::Unsupported => "no probe is supported",
+            Self::NotNativeFamily => "the Look is not native-family",
+        })
+    }
+}
+
 impl BaseStatus {
     fn validate(&self) -> Result<()> {
         Ok(())
@@ -376,9 +397,15 @@ impl DeclaredEncoding {
     }
 
     pub fn is_matchable(&self) -> bool {
+        self.match_refusal().is_none()
+    }
+
+    pub fn match_refusal(&self) -> Option<MatchRefusal> {
         match self {
-            Self::SceneReferred { .. } => true,
-            Self::DisplayReferred { status, .. } => status.is_pinned(),
+            Self::SceneReferred { .. } => None,
+            Self::DisplayReferred { status, .. } => {
+                (!status.is_pinned()).then_some(MatchRefusal::DisplayBaseUnpinned)
+            }
         }
     }
 }
@@ -614,7 +641,11 @@ impl LutDefinition {
     }
 
     pub fn is_matchable(&self) -> bool {
-        self.encoding.is_matchable()
+        self.match_refusal().is_none()
+    }
+
+    pub fn match_refusal(&self) -> Option<MatchRefusal> {
+        self.encoding.match_refusal()
     }
 
     pub fn base(&self) -> Option<&BaseReference> {
@@ -733,6 +764,8 @@ pub struct ChromaRecord {
     pub s_knots: Vec<f64>,
     pub c_knots: usize,
     pub c_max: f64,
+    pub core_terms: usize,
+    pub core_radius: f64,
     pub coef_ref: BinRef,
     pub reference: ChromaReference,
 }
@@ -919,7 +952,7 @@ pub struct LookFile {
 impl LookFile {
     pub fn from_look(identity: LookIdentity, look: &Look) -> Result<Self> {
         Ok(Self {
-            format: FormatId::LookV1,
+            format: FormatId::LookV2,
             look: identity,
             definition: None,
             rendering: None,
@@ -934,8 +967,14 @@ impl LookFile {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.format != FormatId::LookV1 {
-            return Err(ModelError::Format(format!("{:?}", self.format)));
+        match self.format {
+            FormatId::LookV2 => {}
+            FormatId::LookV1 => {
+                return Err(ModelError::Format(
+                    "looklab-look/1 is superseded by looklab-look/2; refit and republish"
+                        .to_string(),
+                ));
+            }
         }
         match (self.look.kind, &self.definition) {
             (LookKind::LutDefined, Some(definition)) => definition.validate()?,
@@ -969,6 +1008,8 @@ impl LookFile {
             || self.layers.chroma.s_knots != S_KNOTS[4..S_COEFS]
             || self.layers.chroma.c_knots != C_COEFS
             || self.layers.chroma.c_max != C_MAX
+            || self.layers.chroma.core_terms != CORE_TERMS
+            || self.layers.chroma.core_radius != NEUTRAL_JOIN_C
         {
             return Err(ModelError::Knots);
         }
@@ -1063,6 +1104,8 @@ impl LayersRecord {
                 s_knots: S_KNOTS[4..S_COEFS].to_vec(),
                 c_knots: C_COEFS,
                 c_max: C_MAX,
+                core_terms: CORE_TERMS,
+                core_radius: NEUTRAL_JOIN_C,
                 coef_ref: BinRef::new("bin:G").expect("static bin reference"),
                 reference: ChromaReference::ColorimetricAtNeutralMatchedLuminance,
             },
@@ -1258,11 +1301,24 @@ impl LookDocument {
         self.validated()
     }
 
+    /// The reason this document cannot be matched or baked.
+    pub fn match_refusal(&self) -> Option<MatchRefusal> {
+        let encoding = match &self.file.definition {
+            Some(definition) => definition.match_refusal(),
+            None if self.file.look.kind == LookKind::NativeFamily => None,
+            None => Some(MatchRefusal::NotNativeFamily),
+        };
+        encoding.or_else(|| {
+            self.uncertainty
+                .support
+                .as_ref()
+                .filter(|mask| !mask.values.iter().any(|value| *value > 0.5))
+                .map(|_| MatchRefusal::Unsupported)
+        })
+    }
+
     pub fn is_matchable(&self) -> bool {
-        match &self.file.definition {
-            Some(definition) => definition.is_matchable(),
-            None => self.file.look.kind == LookKind::NativeFamily,
-        }
+        self.match_refusal().is_none()
     }
 
     pub fn base(&self) -> Option<&BaseReference> {
@@ -1551,6 +1607,7 @@ fn grl_coefficients(component: &GrlComponent) -> Vec<f64> {
     let mut out = Vec::with_capacity(GRL_COEFS);
     out.extend_from_slice(&component.plane);
     out.extend_from_slice(&component.volume);
+    out.extend_from_slice(&component.core);
     out
 }
 
@@ -1787,7 +1844,12 @@ fn look_from_arrays(file: &LookFile, mut arrays: BTreeMap<BinArray, Vec<f64>>) -
     ] {
         let values = take(&mut arrays, array, GRL_COEFS)?;
         component.plane.copy_from_slice(&values[..S_COEFS]);
-        component.volume.copy_from_slice(&values[S_COEFS..]);
+        component
+            .volume
+            .copy_from_slice(&values[S_COEFS..S_COEFS + VOLUME_COEFS]);
+        component
+            .core
+            .copy_from_slice(&values[S_COEFS + VOLUME_COEFS..]);
     }
     let residual = Residual {
         values: take(&mut arrays, BinArray::Residual, RESIDUAL_COEFS)?,

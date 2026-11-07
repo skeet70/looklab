@@ -2,11 +2,12 @@
 
 use looklab_match::synth;
 use looklab_match::{
-    ControlCovariance, Emphasis, MatchOptions, Permalink, PermalinkSources, PreparedTarget,
-    TargetSpec, optimize, predicted_trace, settings_card,
+    Calibration, ControlCovariance, Emphasis, MatchOptions, Permalink, PermalinkSources,
+    PreparedTarget, TargetSpec, optimize, predicted_trace, settings_card,
 };
 use looklab_model::ProbeSetVersion;
 use looklab_model::file::{ProbeCovariance, UncertaintyData};
+use looklab_schema::{ControlKey, SimKey};
 
 #[test]
 fn permalink_round_trips_through_its_canonical_form() {
@@ -34,6 +35,7 @@ fn permalink_round_trips_through_its_canonical_form() {
             transform: Some("models/transform.yaml".to_string()),
             covariance: Some("models/classic-chrome.cov.json".to_string()),
         },
+        calibration: Calibration::default(),
     };
     let text = permalink.canonical();
     assert!(text.starts_with("looklab-match/1|"));
@@ -41,6 +43,82 @@ fn permalink_round_trips_through_its_canonical_form() {
     assert_eq!(parsed, permalink);
     assert!(Permalink::parse("looklab-match/1|look=x").is_err());
     assert!(Permalink::parse("other/1").is_err());
+}
+
+#[test]
+fn calibrated_permalink_round_trips_and_rejects_bad_overlays() {
+    let plan = synth::plan();
+    let sim = SimKey::new("classic_chrome").expect("sim");
+    let control = plan.controls[0].key.clone();
+    let calibration = Calibration::default()
+        .merged(&sim, &[(control.clone(), 1.25)])
+        .expect("calibration");
+    let permalink = Permalink {
+        target_slug: "classic-chrome".to_string(),
+        target_version: "3.0.0".to_string(),
+        base_slug: "provia".to_string(),
+        base_version: "1.2.0".to_string(),
+        body: "fujifilm/x-t5".to_string(),
+        epoch: 1,
+        sim: sim.to_string(),
+        crm_version: 4,
+        input_transform_version: 2,
+        realization_params_version: 5,
+        epoch_map_version: 3,
+        probe_set: ProbeSetVersion::V1,
+        optimizer: "looklab-match/1".to_string(),
+        emphasis: Emphasis::Skin,
+        seed: 42,
+        sources: PermalinkSources::default(),
+        calibration: calibration.clone(),
+    };
+    let text = permalink.canonical();
+    assert!(text.starts_with("looklab-match/2|"));
+    assert_eq!(Permalink::parse(&text).expect("parse"), permalink);
+    calibration
+        .validate(std::slice::from_ref(&sim), &plan)
+        .expect("known sim and control");
+
+    let unknown_sim = Calibration::default()
+        .merged(
+            &SimKey::new("other").expect("sim"),
+            &[(control.clone(), 1.1)],
+        )
+        .expect("calibration");
+    assert!(
+        unknown_sim
+            .validate(std::slice::from_ref(&sim), &plan)
+            .is_err()
+    );
+    let unknown_control = Calibration::default()
+        .merged(
+            &sim,
+            &[(ControlKey::new("other_control").expect("control"), 1.1)],
+        )
+        .expect("calibration");
+    assert!(
+        unknown_control
+            .validate(std::slice::from_ref(&sim), &plan)
+            .is_err()
+    );
+    assert!(
+        Calibration::default()
+            .merged(&sim, &[(control.clone(), 1e9)])
+            .is_err()
+    );
+    assert!(
+        Calibration::default()
+            .merged(&sim, &[(control.clone(), f64::NAN)])
+            .is_err()
+    );
+
+    let v1 = text.replacen("looklab-match/2", "looklab-match/1", 1);
+    assert!(Permalink::parse(&v1).is_err());
+    let base = text.split("|calibration=").next().expect("base");
+    let duplicate = format!("{base}|calibration={sim}@{control}=1.2;{sim}@{control}=1.3");
+    assert!(Permalink::parse(&duplicate).is_err());
+    let unknown_field = format!("{base}|calibration={sim}@{control}=1.2|bogus=1");
+    assert!(Permalink::parse(&unknown_field).is_err());
 }
 
 #[test]

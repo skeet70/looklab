@@ -28,18 +28,24 @@ pub use looklab_prep_module::{
     AlignmentSummary, AssertionFields, PowParamsSpec, PreparedImageView,
 };
 pub use match_api::{
-    MatchInputs, MatchRequest, VerifyRequestMessage, decode_match_reply, decode_verify_reply,
-    run_match, run_verify,
+    MatchInputs, MatchRequest, SimInputs, SimSources, VerifyRequestMessage, decode_match_reply,
+    decode_verify_reply, run_match, run_verify,
 };
 pub use match_api::{encode_match_request, encode_verify_request};
-pub use pairing::{PairGroup, PairingPlan, UnpairedEntry, inspect_files};
+pub use pairing::{
+    MetadataFile, PairGroup, PairingPlan, UnpairedEntry, inspect_files, inspect_metadata,
+};
 pub use pattern::{PatternImage, render_pattern};
-pub use prefill::{SettingsPrefill, prefill_settings};
+pub use prefill::{
+    MONOCHROME_REFUSAL, MonochromeRender, RenderClass, SettingsPrefill, prefill_settings,
+    prefill_settings_parsed, render_class,
+};
 pub use prep::{
     ControlSetting, GroupSettings, IntentChoice, PrepSummary, build_manifest_request,
     decode_build_manifest_reply, decode_encode_reply, decode_parse_reply, decode_pow_reply,
     decode_prepare_reply, encode_envelope_request, module_fn_id, parse_envelope_request,
-    prepare_request, serial_ascii, serial_ascii_for_file, solve_pow_request, version_request,
+    prepare_request, serial_ascii, serial_ascii_for_file, serial_ascii_from_metadata,
+    solve_pow_request, version_request,
 };
 pub use seedfile::build_seed_file;
 

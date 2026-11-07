@@ -65,6 +65,16 @@ fn header_length_past_the_input_is_rejected() {
 }
 
 #[test]
+fn a_header_length_of_u32_max_is_rejected_before_the_offset_arithmetic() {
+    let mut bytes = encode(&common::set(2)).expect("valid set encodes");
+    patch_prefix(&mut bytes, 8, &u32::MAX.to_le_bytes());
+    assert!(matches!(
+        decode(&bytes),
+        Err(Error::HeaderTooLong { len: u32::MAX, .. })
+    ));
+}
+
+#[test]
 fn trailing_bytes_inside_the_header_are_rejected() {
     let mut header = header_bytes_with(1);
     header.push(0);

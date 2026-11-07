@@ -41,12 +41,16 @@ pub struct FitArgs {
     pub seed: u64,
     #[arg(long)]
     pub out: PathBuf,
+    /// Directory of body YAML files used to resolve the Look's film simulation.
+    #[arg(long, default_value = "data/bodies")]
+    pub bodies_dir: PathBuf,
 }
 
 pub fn run(args: &FitArgs) -> Result<()> {
     let transform_path = util::transform_path(&args.transform, &args.samples)
         .unwrap_or_else(|| PathBuf::from(&args.transform));
     let transform = TransformFile::load(&transform_path)?;
+    refuse_monochrome(args, &transform)?;
 
     let files = util::samples_in(&args.samples)?;
     let mut images = Vec::with_capacity(files.len());
@@ -59,9 +63,10 @@ pub fn run(args: &FitArgs) -> Result<()> {
             let samples = looklab_samples::decode(&bytes)
                 .with_context(|| format!("decoding {}", file.display()))?;
             let matrix = transform.image_matrix(&name, samples.header().wb_multipliers)?;
-            let exposure_hint = f64::from(samples.header().exposure_hint_ev);
+            // `exposure_hint_ev` is an absolute EV at ISO 100, not the fit's
+            // relative prior mean `x_meta` (docs/02 §2).
             let mut image = FitImage::new(samples, matrix);
-            image.exposure_hint = exposure_hint;
+            image.exposure_hint = 0.0;
             image.exposure_mode = ExposureModeId(0);
             Ok((name.clone(), image))
         });
@@ -128,6 +133,31 @@ pub fn run(args: &FitArgs) -> Result<()> {
 
     if !held_out.is_empty() {
         print_held_out(&document, &result, held_out);
+    }
+    Ok(())
+}
+
+/// # Errors
+/// A monochrome sim matches the Look slug, or the body's schema is invalid.
+fn refuse_monochrome(args: &FitArgs, transform: &TransformFile) -> Result<()> {
+    let body = transform.body.as_deref().unwrap_or(args.body.as_str());
+    let path = args
+        .bodies_dir
+        .join(format!("{}.yaml", body.replace('/', "-")));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let schema = looklab_schema::validate_control_schema(&text)
+        .map_err(|errors| anyhow::anyhow!("{}: {errors:?}", path.display()))?;
+    for sim in schema.epochs.iter().flat_map(|epoch| &epoch.native_sims) {
+        if sim.monochrome
+            && (sim.key.as_str() == args.look_slug || sim.look.as_str() == args.look_slug)
+        {
+            bail!(
+                "{} is a monochrome film simulation: B&W renders aren't supported yet",
+                sim.key
+            );
+        }
     }
     Ok(())
 }

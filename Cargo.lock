@@ -3068,6 +3068,7 @@ dependencies = [
  "looklab-model",
  "looklab-prep",
  "looklab-prep-module",
+ "looklab-publish",
  "looklab-raw",
  "looklab-report",
  "looklab-samples",
@@ -3075,9 +3076,11 @@ dependencies = [
  "looklab-server",
  "looklab-trust",
  "looklab-upload",
+ "looklab-wasm",
  "looklab-worker",
  "p256",
  "postcard",
+ "same-file",
  "serde",
  "serde_json",
  "serde_norway",
@@ -3106,6 +3109,7 @@ dependencies = [
  "libm",
  "looklab-color",
  "looklab-fit",
+ "looklab-match",
  "looklab-model",
  "looklab-samples",
  "looklab-schema",
@@ -3254,6 +3258,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "toml 0.8.23",
  "uuid",
  "wasm-bindgen-test",
 ]
@@ -3316,6 +3321,7 @@ dependencies = [
  "looklab-color",
  "looklab-export",
  "looklab-model",
+ "looklab-publish",
  "looklab-samples",
  "looklab-schema",
  "looklab-trust",
@@ -3457,10 +3463,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libm",
  "looklab-body",
  "looklab-color",
  "looklab-export",
  "looklab-fit",
+ "looklab-match",
  "looklab-meta",
  "looklab-model",
  "looklab-publish",
@@ -5187,6 +5195,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "signature"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5758,6 +5776,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
@@ -6608,7 +6627,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

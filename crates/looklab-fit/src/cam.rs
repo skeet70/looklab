@@ -81,16 +81,6 @@ fn post_adaptation_scalar(response: f64, f_l: f64) -> f64 {
     400.0 * response.signum() * f / (27.13 + f) + 0.1
 }
 
-fn post_adaptation_derivative(response: f64, f_l: f64) -> f64 {
-    if response == 0.0 {
-        return 0.0;
-    }
-    let u = f_l * response.abs() / 100.0;
-    let f = libm::pow(u, 0.42);
-    let denom = 27.13 + f;
-    400.0 * 27.13 / (denom * denom) * 0.42 * (f / u) * (f_l / 100.0)
-}
-
 /// Value and three partial derivatives.
 #[derive(Clone, Copy, Debug)]
 struct Jet {
@@ -211,8 +201,15 @@ impl core::ops::Div for Jet {
 }
 
 fn post_adaptation(response: Jet, f_l: f64) -> Jet {
-    let value = post_adaptation_scalar(response.v, f_l);
-    let slope = post_adaptation_derivative(response.v, f_l);
+    let u = f_l * response.v.abs() / 100.0;
+    let f = libm::pow(u, 0.42);
+    let denom = 27.13 + f;
+    let value = 400.0 * response.v.signum() * f / denom + 0.1;
+    let slope = if response.v == 0.0 {
+        0.0
+    } else {
+        400.0 * 27.13 / (denom * denom) * 0.42 * (f / u) * (f_l / 100.0)
+    };
     Jet {
         v: value,
         d: [

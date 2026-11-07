@@ -99,14 +99,16 @@ pub enum JobKind {
     ConsistencyScore,
     HardDeleteBlobs,
     PublishSite,
+    RevertRefit,
 }
 
 impl JobKind {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::ConsistencyScore => "consistency_score",
             Self::HardDeleteBlobs => "hard_delete_blobs",
             Self::PublishSite => "publish_site",
+            Self::RevertRefit => "revert_refit",
         }
     }
 }
@@ -304,7 +306,7 @@ pub async fn enqueue_consistency_score(
     }
     let payload = serde_json::to_string(&Payload { contribution_id })
         .map_err(|_| sqlx::Error::Protocol("job payload does not serialize".to_owned()))?;
-    enqueue_job(&mut **tx, JobKind::ConsistencyScore, &payload, now_unix()).await
+    enqueue_job(tx, JobKind::ConsistencyScore, &payload, now_unix()).await
 }
 
 pub async fn insert_credential(
@@ -466,21 +468,23 @@ pub async fn enqueue_job(
     Ok(id)
 }
 
-pub async fn enqueue_publish_if_idle(
-    conn: &mut SqliteConnection,
-) -> Result<Option<JobId>, sqlx::Error> {
+/// Persists the request while a publisher is queued or running; a running one
+/// enqueues its successor when it completes.
+pub async fn request_publication(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+    let now = now_unix();
+    sqlx::query("UPDATE publication SET generation = generation + 1 WHERE id = 1")
+        .execute(&mut *conn)
+        .await?;
     let pending: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM jobs WHERE kind = ? AND status IN ('queued', 'running')",
     )
     .bind(JobKind::PublishSite.as_str())
     .fetch_one(&mut *conn)
     .await?;
-    if pending > 0 {
-        return Ok(None);
+    if pending == 0 {
+        enqueue_job(conn, JobKind::PublishSite, "{}", now).await?;
     }
-    Ok(Some(
-        enqueue_job(conn, JobKind::PublishSite, "{}", now_unix()).await?,
-    ))
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -606,7 +610,7 @@ pub async fn withdraw(
     .await?;
     let payload = serde_json::to_string(&BlobDeletionPayload { contribution_id })
         .map_err(|_| sqlx::Error::Protocol("job payload does not serialize".to_owned()))?;
-    enqueue_job(&mut *tx, JobKind::HardDeleteBlobs, &payload, delete_after).await?;
+    enqueue_job(&mut tx, JobKind::HardDeleteBlobs, &payload, delete_after).await?;
     tx.commit().await?;
     Ok(Some(delete_after))
 }

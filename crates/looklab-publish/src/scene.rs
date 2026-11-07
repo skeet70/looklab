@@ -251,6 +251,132 @@ impl Scene {
     }
 }
 
+/// Neutral/hue gradient, hue wheel and memory-colour patches in scene-linear
+/// D65 XYZ.
+///
+/// # Errors
+/// Rejects a size outside `3..=1600` and scenes with non-finite values.
+pub fn test_chart_scenes(size: u32) -> Result<Vec<Scene>, PublishError> {
+    if !(3..=1600).contains(&size) {
+        return Err(PublishError::ChartSize(size));
+    }
+    Ok(vec![
+        gradient_scene(size)?,
+        hue_wheel_scene(size)?,
+        patches_scene(size)?,
+    ])
+}
+
+fn gradient_scene(size: u32) -> Result<Scene, PublishError> {
+    let colours = [
+        [0.82, 0.18, 0.16],
+        [0.88, 0.55, 0.18],
+        [0.86, 0.82, 0.24],
+        [0.28, 0.62, 0.30],
+        [0.22, 0.44, 0.78],
+        [0.48, 0.28, 0.66],
+    ];
+    let mut xyz = Vec::with_capacity((size * size) as usize);
+    for y in 0..size {
+        let v = f64::from(y) / f64::from(size - 1);
+        for x in 0..size {
+            let u = f64::from(x) / f64::from(size - 1);
+            let encoded = if u < 0.5 {
+                let level = 0.002 + (u / 0.5);
+                [level, level, level]
+            } else {
+                let band =
+                    (((u - 0.5) * colours.len() as f64).floor() as usize).min(colours.len() - 1);
+                let shade = 0.10 + 0.90 * (1.0 - v);
+                [
+                    colours[band][0] * shade,
+                    colours[band][1] * shade,
+                    colours[band][2] * shade,
+                ]
+            };
+            xyz.push(encoded_xyz(encoded));
+        }
+    }
+    Scene::new(SceneName::new("gradient")?, size, size, xyz)
+}
+
+fn hue_wheel_scene(size: u32) -> Result<Scene, PublishError> {
+    let mut xyz = Vec::with_capacity((size * size) as usize);
+    let centre = f64::from(size - 1) / 2.0;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = f64::from(x) - centre;
+            let dy = f64::from(y) - centre;
+            let distance = (dx * dx + dy * dy).sqrt() / centre;
+            let angle = libm::atan2(dy, dx);
+            let turns = angle / (2.0 * core::f64::consts::PI);
+            let hue = turns - turns.floor();
+            let saturation = distance.clamp(0.0, 1.0);
+            let value = 1.0 - 0.55 * saturation;
+            xyz.push(encoded_xyz(hsv(hue, saturation, value)));
+        }
+    }
+    Scene::new(SceneName::new("hue-wheel")?, size, size, xyz)
+}
+
+fn patches_scene(size: u32) -> Result<Scene, PublishError> {
+    let patches = [
+        [0.91, 0.76, 0.66],
+        [0.55, 0.36, 0.26],
+        [0.22, 0.42, 0.16],
+        [0.44, 0.66, 0.92],
+        [0.18, 0.18, 0.18],
+        [0.92, 0.92, 0.92],
+        [0.04, 0.04, 0.04],
+        [0.78, 0.12, 0.10],
+        [0.16, 0.60, 0.22],
+        [0.12, 0.32, 0.78],
+        [0.96, 0.72, 0.28],
+        [0.10, 0.09, 0.12],
+    ];
+    let cols = 4_u32;
+    let rows = 3_u32;
+    let mut xyz = Vec::with_capacity((size * size) as usize);
+    for y in 0..size {
+        let row = (y * rows / size).min(rows - 1) as usize;
+        let v = f64::from(y % (size / rows)) / f64::from(size / rows);
+        for x in 0..size {
+            let col = (x * cols / size).min(cols - 1) as usize;
+            let patch = patches[(row * cols as usize + col).min(patches.len() - 1)];
+            let shade = 0.72 + 0.28 * v;
+            xyz.push(encoded_xyz([
+                patch[0] * shade,
+                patch[1] * shade,
+                patch[2] * shade,
+            ]));
+        }
+    }
+    Scene::new(SceneName::new("patches")?, size, size, xyz)
+}
+
+fn encoded_xyz(encoded: [f64; 3]) -> [f32; 3] {
+    let xyz = looklab_color::RgbSpace::Srgb
+        .rgb_encoded_to_xyz(looklab_color::Rgb::new(encoded[0], encoded[1], encoded[2]));
+    [xyz.x as f32, xyz.y as f32, xyz.z as f32]
+}
+
+fn hsv(h: f64, s: f64, v: f64) -> [f64; 3] {
+    let h6 = h * 6.0;
+    let i = h6.floor();
+    let f = h6 - i;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    match (i as i64).rem_euclid(6) {
+        0 => [v, t, p],
+        1 => [q, v, p],
+        2 => [p, v, t],
+        3 => [p, q, v],
+        4 => [t, p, v],
+        _ => [v, p, q],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

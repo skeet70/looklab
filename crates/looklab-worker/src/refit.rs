@@ -60,10 +60,24 @@ pub struct StoredProbe {
     pub support: ProbeSupport,
 }
 
+/// The frame of [`ReleaseRecord::gauge`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GaugeConvention {
+    /// `median(x_i - exposure_hint_ev)`; no exact relative conversion exists.
+    #[default]
+    LegacyAbsoluteHeader,
+    /// `median(x_i)`.
+    Relative,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseRecord {
     pub version: u32,
     pub gauge: f64,
+    /// The frame of [`Self::gauge`]; records without it are legacy.
+    #[serde(default)]
+    pub gauge_convention: GaugeConvention,
     pub anchor: u32,
     /// Soft clip of the published realization, for re-evaluating the Look.
     #[serde(default)]
@@ -87,6 +101,16 @@ fn default_output_space() -> RgbSpace {
     RgbSpace::Srgb
 }
 
+impl ReleaseRecord {
+    /// `None` for the legacy absolute-header frame, which has no exact conversion.
+    fn relative_gauge(&self) -> Option<f64> {
+        match self.gauge_convention {
+            GaugeConvention::Relative => Some(self.gauge),
+            GaugeConvention::LegacyAbsoluteHeader => None,
+        }
+    }
+}
+
 /// Body parameters published for the recipe stage (docs/02 §4.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RecipeStageParams {
@@ -101,6 +125,8 @@ struct RecipeStageParams {
 pub enum RefitOutcome {
     Published(u32),
     Held(u32),
+    /// A reference release predates the relative exposure gauge; nothing was published.
+    MigrationRequired(u32),
     /// The native fit exhausted its budget; nothing was published.
     NotConverged(u32),
     Skipped,
@@ -124,11 +150,54 @@ pub async fn run(
     let mut outcomes = Vec::new();
     for body in targets {
         for look in pool::looks_for_body(db_pool, config, &body).await? {
-            let outcome = refit_look(db_pool, config, &body, &look, ownership).await?;
+            let outcome = refit_look(db_pool, config, &body, &look, ownership, false).await?;
             if outcome != RefitOutcome::Skipped {
                 outcomes.push((body.clone(), look, outcome));
             }
         }
+    }
+    Ok(outcomes)
+}
+
+/// Bypasses dirty discovery and the unchanged-fingerprint shortcut for a revert.
+pub async fn run_forced(
+    db_pool: &SqlitePool,
+    config: &WorkerConfig,
+    ownership: &JobOwnership,
+) -> Result<Vec<(BodyId, LookSlug, RefitOutcome)>> {
+    let requests = db::pending_refit_requests(db_pool).await?;
+    let bodies: Vec<BodyId> = db::all_contributions(db_pool)
+        .await?
+        .into_iter()
+        .map(|contribution| contribution.body)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut outcomes = Vec::new();
+    for request in requests {
+        for body in &bodies {
+            if !pool::looks_for_body(db_pool, config, body)
+                .await?
+                .contains(&request.look)
+            {
+                continue;
+            }
+            if db::body_refitted_after(
+                db_pool,
+                &request.look,
+                body.as_str(),
+                request.reverted_version,
+            )
+            .await?
+            {
+                continue;
+            }
+            let outcome = refit_look(db_pool, config, body, &request.look, ownership, true).await?;
+            if outcome != RefitOutcome::Skipped {
+                outcomes.push((body.clone(), request.look.clone(), outcome));
+            }
+        }
+        db::clear_refit_request(db_pool, &request.look, request.generation).await?;
     }
     Ok(outcomes)
 }
@@ -231,6 +300,7 @@ async fn refit_look(
     body: &BodyId,
     look: &LookSlug,
     ownership: &JobOwnership,
+    force: bool,
 ) -> Result<RefitOutcome> {
     let mut at = std::time::Instant::now();
     let pool = pool::build(db_pool, config, body, look).await?;
@@ -239,14 +309,12 @@ async fn refit_look(
     }
     lap(&mut at, "pool");
     let roots = roots::load(db_pool, config, &pool).await?;
-    let mut options = FitOptions {
+    let options = FitOptions {
         seed: config.seed,
         max_samples_per_image: config.max_samples_per_image,
+        sweep_budget: config.sweep_budget.unwrap_or(f64::MAX),
         ..FitOptions::default()
     };
-    if let Some(budget) = config.sweep_budget {
-        options.sweep_budget = budget;
-    }
     let params = TrustParams {
         support_sigma_exit: options.support_sigma_exit,
         ..TrustParams::default()
@@ -277,13 +345,15 @@ async fn refit_look(
     let stored = db::pool_fingerprint(db_pool, look.as_str(), body.as_str()).await?;
     let prior_attempt = db::fit_attempt(db_pool, look.as_str()).await?;
     lap(&mut at, "fingerprint");
-    if stored.as_deref() == Some(fingerprint.as_str())
+    if !force
+        && stored.as_deref() == Some(fingerprint.as_str())
         && previous_version.is_some()
         && prior_attempt.is_none()
     {
         return Ok(RefitOutcome::Skipped);
     }
-    if stored.is_none()
+    if !force
+        && stored.is_none()
         && prior_attempt.is_none()
         && let Some(latest) = previous_version
     {
@@ -337,6 +407,21 @@ async fn refit_look(
             body,
         )
         .await;
+    }
+    let anchor_version = select_anchor(db_pool, look, &versions).await?;
+    let anchor = match &anchor_version {
+        Some(version) => Some(load_snapshot(db_pool, config, look, *version).await?),
+        None => None,
+    };
+    if let Some(snapshot) = &previous
+        && snapshot.record.relative_gauge().is_none()
+    {
+        return hold_for_migration(db_pool, look, next_version, snapshot.record.version).await;
+    }
+    if let Some(snapshot) = &anchor
+        && snapshot.record.relative_gauge().is_none()
+    {
+        return hold_for_migration(db_pool, look, next_version, snapshot.record.version).await;
     }
     let (epoch, sim) = roots::base_sim(&pool)?;
     let support_history = previous_support(&previous);
@@ -456,15 +541,10 @@ async fn refit_look(
 
     crate::split::detect_and_propose(db_pool, config, &pool, &native_result).await?;
     lap(&mut at, "split");
-    let gauge = gauge(&pool, &weighted, &native_result);
+    let gauge = pool_gauge(&pool, &weighted, &native_result);
     let candidate_probes = stored_probes(&native_result);
     let candidate_versions = candidate_estimates(&native_result);
 
-    let anchor_version = select_anchor(db_pool, look, &versions).await?;
-    let anchor = match &anchor_version {
-        Some(version) => Some(load_snapshot(db_pool, config, look, *version).await?),
-        None => None,
-    };
     let anchor_id = anchor_version.unwrap_or(next_version);
 
     let previous_probes = match &previous {
@@ -527,10 +607,12 @@ async fn refit_look(
     ownership.check(db_pool).await?;
     let (document, document_bytes) =
         look_document(look, next_version, &native_result, pool.body.make())?;
+    crate::lut_rebase::record_lut_pin(db_pool, look, next_version, &document).await?;
     lap(&mut at, "document");
     let release = ReleaseRecord {
         version: next_version,
         gauge,
+        gauge_convention: GaugeConvention::Relative,
         anchor: anchor_id,
         clip_k: native_result.realization.clip_k,
         output_space: native_result.output_space,
@@ -541,17 +623,38 @@ async fn refit_look(
         provenance: provenance.clone(),
         created_at: now,
     };
-    let artifacts = vec![
-        store_artifact(config, LOOK_ARTIFACT, &document_bytes)?,
-        store_artifact(
+    let crm_bytes = encode_crm(&recipe_model)?;
+    let matchable = document.is_matchable();
+    let bundles = if matchable {
+        let candidate = crate::bundle::Candidate {
+            body,
+            epoch,
+            sim: &sim,
+            look,
+            base: &document_bytes,
+            crm: &crm_bytes,
+        };
+        crate::bundle::for_release(db_pool, config, &release.provenance, &candidate).await?
+    } else {
+        Vec::new()
+    };
+    let mut artifacts = Vec::with_capacity(4 + usize::from(matchable) + bundles.len());
+    artifacts.push(store_artifact(config, LOOK_ARTIFACT, &document_bytes)?);
+    if matchable {
+        artifacts.push(store_artifact(
             config,
             CARD_ARTIFACT,
             &write_card(&document, &card_meta(look), &CardOptions::default())?,
-        )?,
+        )?);
+    }
+    artifacts.extend([
         store_artifact(config, PREVIEW_LUT_ARTIFACT, &bake_preview_lut(&document))?,
-        store_artifact(config, CRM_ARTIFACT, &encode_crm(&recipe_model)?)?,
+        store_artifact(config, CRM_ARTIFACT, &crm_bytes)?,
         store_artifact(config, RELEASE_ARTIFACT, &serde_json::to_vec(&release)?)?,
-    ];
+    ]);
+    for blob in &bundles {
+        artifacts.push(store_artifact(config, blob.name.as_str(), &blob.bytes)?);
+    }
     lap(&mut at, "artifacts");
     store_stage_params(
         db_pool,
@@ -678,6 +781,27 @@ async fn select_anchor(
     }
     candidates.extend(db::re_anchor_versions(db_pool, look.as_str()).await?);
     Ok(candidates.into_iter().max())
+}
+
+async fn hold_for_migration(
+    db_pool: &SqlitePool,
+    look: &LookSlug,
+    pending: u32,
+    required: u32,
+) -> Result<RefitOutcome> {
+    let now = now_unix();
+    let diagnostics = serde_json::json!({
+        "reason": "legacy_release_exposure_frame_unknown",
+        "message": format!(
+            "Release {required} predates the relative exposure gauge. A moderator-approved audited re-anchor and refit is required before version {pending} can be published."
+        ),
+        "pending_version": pending,
+        "required_release": required,
+        "action": "moderator-approved audited re-anchor and refit",
+    })
+    .to_string();
+    db::open_fit_hold(db_pool, look.as_str(), 1, now, now, &diagnostics).await?;
+    Ok(RefitOutcome::MigrationRequired(pending))
 }
 
 struct Snapshot {
@@ -849,7 +973,12 @@ fn stored_estimates(look: &Look, record: &ReleaseRecord, gauge: f64) -> Result<V
         .iter()
         .map(|probe| (&probe.id, probe))
         .collect();
-    let exposure = ExposureGauge::between(record.gauge, gauge);
+    let reference = record
+        .relative_gauge()
+        .ok_or(WorkerError::MigrationRequired {
+            version: record.version,
+        })?;
+    let exposure = ExposureGauge::between(reference, gauge);
     let mut probes = Vec::with_capacity(by_id.len());
     for probe in looklab_model::probes::v1().probes {
         let stored = by_id.get(&probe.id).ok_or_else(|| {
@@ -918,27 +1047,25 @@ fn previous_support(previous: &Option<Snapshot>) -> Option<PreviousSupport> {
     })
 }
 
-fn gauge(pool: &LookPool, weighted: &WeightedPool, result: &FitResult) -> f64 {
+fn pool_gauge(pool: &LookPool, weighted: &WeightedPool, result: &FitResult) -> f64 {
     let excluded: BTreeSet<usize> = result.excluded.iter().map(|image| image.index).collect();
-    let entries: Vec<(usize, f64)> = weighted
+    let mut relative: Vec<f64> = weighted
         .fit_entries(pool)
         .into_iter()
         .enumerate()
         .filter(|(index, _)| !excluded.contains(index))
-        .map(|(_, entry)| entry)
-        .collect();
-    let mut offsets: Vec<f64> = entries
-        .into_iter()
         .zip(&result.images)
-        .map(|((index, _weight), nuisances)| {
-            nuisances.exposure - f64::from(pool.images[index].samples.header().exposure_hint_ev)
-        })
+        .map(|(_, nuisances)| nuisances.exposure)
         .collect();
-    if offsets.is_empty() {
+    if relative.is_empty() {
         return 0.0;
     }
-    offsets.sort_by(f64::total_cmp);
-    offsets[offsets.len() / 2]
+    median(&mut relative)
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
 }
 
 fn provenance(
@@ -1195,4 +1322,97 @@ async fn update_reputation(
         tx.commit().await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use looklab_fit::synth::{self, SynthConfig};
+    use looklab_fit::{FitOptions, fit};
+
+    fn record(result: &FitResult, gauge: f64, convention: GaugeConvention) -> ReleaseRecord {
+        ReleaseRecord {
+            version: 1,
+            gauge,
+            gauge_convention: convention,
+            anchor: 1,
+            clip_k: result.realization.clip_k,
+            output_space: result.output_space,
+            probes: stored_probes(result),
+            gated_since_anchor: GatedUnion::default(),
+            converged: true,
+            gate: gate_release(&TrustParams::default(), &GateInput::default()),
+            provenance: ProvenanceSummary::default(),
+            created_at: 0,
+        }
+    }
+
+    fn gate_against(candidate: &VersionProbes, previous: VersionProbes) -> GateReport {
+        gate_release(
+            &TrustParams::default(),
+            &GateInput {
+                candidate: candidate.clone(),
+                anchor: previous.clone(),
+                previous,
+                root_observations: Vec::new(),
+                gated_since_anchor: GatedUnion::default(),
+            },
+        )
+    }
+
+    fn fitted() -> FitResult {
+        let dataset = synth::dataset(&SynthConfig {
+            seed: 7,
+            images: 3,
+            samples_per_image: 64,
+            ..SynthConfig::default()
+        });
+        let options = FitOptions {
+            max_sweeps: 8,
+            run_gcv: false,
+            ..FitOptions::default()
+        };
+        fit(&dataset.images, &options).expect("fit")
+    }
+
+    #[test]
+    fn a_relative_reference_gauge_is_converted_before_gating() {
+        let result = fitted();
+        let candidate = candidate_estimates(&result);
+        let previous = stored_estimates(
+            &result.look,
+            &record(&result, 0.0, GaugeConvention::Relative),
+            0.0,
+        )
+        .expect("relative probes");
+        let gate = gate_against(&candidate, previous);
+        assert!(gate.passed, "{:?}", gate.violations);
+    }
+
+    #[test]
+    fn a_legacy_reference_frame_fails_closed() {
+        let result = fitted();
+        let relative = record(&result, 0.0, GaugeConvention::Relative);
+        assert!(stored_estimates(&result.look, &relative, 0.0).is_ok());
+
+        let legacy = record(&result, 0.0, GaugeConvention::LegacyAbsoluteHeader);
+        assert!(matches!(
+            stored_estimates(&result.look, &legacy, 0.0),
+            Err(WorkerError::MigrationRequired { version: 1 })
+        ));
+    }
+
+    #[test]
+    fn a_persisted_header_median_does_not_convert_a_legacy_frame() {
+        let result = fitted();
+        let mut value =
+            serde_json::to_value(record(&result, 4.0, GaugeConvention::LegacyAbsoluteHeader))
+                .expect("release json");
+        value["gauge_median_header_ev"] = serde_json::json!(10.0);
+        let legacy: ReleaseRecord = serde_json::from_value(value).expect("legacy release");
+        assert!(matches!(
+            stored_estimates(&result.look, &legacy, 0.0),
+            Err(WorkerError::MigrationRequired { version: 1 })
+        ));
+    }
 }

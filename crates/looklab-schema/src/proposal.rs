@@ -226,6 +226,9 @@ pub struct MappingProposal {
     #[serde(default)]
     pub firmware_to: Option<FirmwareVersion>,
     pub makernote: Makernote,
+    /// The sim renders a monochrome image; the fit has no B&W Look kind.
+    #[serde(default)]
+    pub monochrome: bool,
 }
 
 impl MappingProposal {
@@ -256,6 +259,7 @@ impl MappingProposal {
             key: self.sim_key.clone(),
             look: self.look.clone(),
             makernote: self.makernote.clone(),
+            monochrome: self.monochrome,
         }
     }
 }
@@ -526,6 +530,15 @@ impl Placement {
             Self::Lfs => "\"lfs\"",
         }
     }
+
+    /// Relative path of a published fixture's bytes inside a snapshot.
+    pub fn snapshot_path(self, file: FixtureFileName<'_>) -> Option<String> {
+        match self {
+            Self::Git => Some(format!("fixtures/{}", file.as_str())),
+            Self::Lfs => Some(format!("fixtures/donated/{}", file.as_str())),
+            Self::Fetch => None,
+        }
+    }
 }
 
 impl Serialize for Placement {
@@ -597,7 +610,7 @@ impl FixtureDonation {
     /// or a non-HTTPS source URL.
     pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
-        if !valid_file_name(&self.file) {
+        if FixtureFileName::parse(&self.file).is_err() {
             errors.extend(invalid("file", "a plain file name"));
         }
         check_text(&self.description, "description", 200, &mut errors);
@@ -668,15 +681,35 @@ pub fn fixture_source(sha256: Sha256Hex) -> String {
     format!("sha256:{}", sha256.to_hex())
 }
 
-fn valid_file_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 128
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains("..")
-        && name.bytes().all(|byte| byte.is_ascii_graphic())
-        && name.contains('.')
+/// A fixture file name: one path-free ASCII name with an extension, at most 128 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FixtureFileName<'a>(&'a str);
+
+impl<'a> FixtureFileName<'a> {
+    /// # Errors
+    /// Empty, over 128 bytes, a path separator, `..`, a non-graphic byte, or no extension.
+    pub fn parse(value: &'a str) -> Result<Self, FixtureNameError> {
+        if value.is_empty()
+            || value.len() > 128
+            || value.contains('/')
+            || value.contains('\\')
+            || value.contains("..")
+            || !value.bytes().all(|byte| byte.is_ascii_graphic())
+            || !value.contains('.')
+        {
+            return Err(FixtureNameError);
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn as_str(self) -> &'a str {
+        self.0
+    }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("expected a plain fixture file name")]
+pub struct FixtureNameError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -691,7 +724,7 @@ impl FixtureUpload {
     /// Rejects a plain file name, or a size outside the 64 MiB cap.
     pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
-        if !valid_file_name(&self.file) {
+        if FixtureFileName::parse(&self.file).is_err() {
             errors.extend(invalid("file", "a plain file name"));
         }
         if self.size == 0 || self.size > MAX_FIXTURE_BYTES {

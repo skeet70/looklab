@@ -205,6 +205,33 @@ fn donation() -> FixtureDonation {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct ParsedManifest {
+    #[serde(default)]
+    fixture: Vec<ParsedFixture>,
+}
+
+#[derive(serde::Deserialize)]
+struct ParsedFixture {
+    file: String,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    consent: Option<String>,
+    #[serde(default)]
+    source_url: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default, rename = "committed")]
+    placement: Placement,
+}
+
+fn parse_manifest(text: &str) -> ParsedFixture {
+    let mut manifest: ParsedManifest = toml::from_str(text).expect("manifest parses");
+    assert_eq!(manifest.fixture.len(), 1, "{text}");
+    manifest.fixture.remove(0)
+}
+
 #[test]
 fn a_download_only_fixture_needs_a_source() {
     let published = FixtureDonation {
@@ -215,7 +242,8 @@ fn a_download_only_fixture_needs_a_source() {
     published
         .validate()
         .expect("a committed fixture needs no URL");
-    assert!(!fixture_manifest_toml(std::slice::from_ref(&published)).contains("source_url"));
+    let manifest = fixture_manifest_toml(std::slice::from_ref(&published));
+    assert!(parse_manifest(&manifest).source_url.is_none());
 
     let download_only = FixtureDonation {
         source_url: None,
@@ -233,12 +261,9 @@ fn an_uploaded_source_is_bound_to_the_file_digest() {
         ..donation()
     };
     uploaded.validate().expect("an uploaded source is valid");
-    let manifest = fixture_manifest_toml(std::slice::from_ref(&uploaded));
-    assert!(manifest.contains(&format!(
-        "source = \"{}\"",
-        fixture_source(donation().sha256)
-    )));
-    assert!(!manifest.contains("source_url"));
+    let parsed = parse_manifest(&fixture_manifest_toml(std::slice::from_ref(&uploaded)));
+    assert_eq!(parsed.source, Some(fixture_source(donation().sha256)));
+    assert!(parsed.source_url.is_none());
 
     let mismatched = FixtureDonation {
         source: Some(fixture_source(
@@ -292,12 +317,14 @@ fn a_fixture_backed_body_needs_a_matching_donation() {
 fn a_fixture_donation_validates_and_renders_a_manifest_table() {
     let donation = donation();
     donation.validate().expect("valid donation");
-    let toml = fixture_manifest_toml(std::slice::from_ref(&donation));
-    assert!(toml.contains("[[fixture]]"));
-    assert!(toml.contains("file = \"fujifilm-x-t5-2.00.raf\""));
-    assert!(toml.contains("license = \"CC0-1.0\""));
-    assert!(toml.contains("consent = \"Donated by a_handle on 2026-11-04 under CC0-1.0\""));
-    assert!(toml.contains("committed = false"));
+    let parsed = parse_manifest(&fixture_manifest_toml(std::slice::from_ref(&donation)));
+    assert_eq!(parsed.file, "fujifilm-x-t5-2.00.raf");
+    assert_eq!(parsed.license.as_deref(), Some("CC0-1.0"));
+    assert_eq!(
+        parsed.consent.as_deref(),
+        Some("Donated by a_handle on 2026-11-04 under CC0-1.0")
+    );
+    assert_eq!(parsed.placement, Placement::Fetch);
 
     let mut unsafe_name = donation.clone();
     unsafe_name.file = "../secret.raf".to_owned();
@@ -306,18 +333,10 @@ fn a_fixture_donation_validates_and_renders_a_manifest_table() {
 
 #[test]
 fn fixture_placement_round_trips_as_json_and_in_the_manifest() {
-    for (placement, json, rendered) in [
-        (Placement::Git, serde_json::json!(true), "committed = true"),
-        (
-            Placement::Fetch,
-            serde_json::json!(false),
-            "committed = false",
-        ),
-        (
-            Placement::Lfs,
-            serde_json::json!("lfs"),
-            "committed = \"lfs\"",
-        ),
+    for (placement, json) in [
+        (Placement::Git, serde_json::json!(true)),
+        (Placement::Fetch, serde_json::json!(false)),
+        (Placement::Lfs, serde_json::json!("lfs")),
     ] {
         let encoded = serde_json::to_value(placement).expect("json");
         assert_eq!(encoded, json);
@@ -333,8 +352,9 @@ fn fixture_placement_round_trips_as_json_and_in_the_manifest() {
         let parsed: FixtureDonation = serde_json::from_value(value).expect("donation");
         assert_eq!(parsed, donation);
 
-        let manifest = fixture_manifest_toml(std::slice::from_ref(&donation));
-        assert!(manifest.contains(rendered), "{manifest}");
+        let manifest = parse_manifest(&fixture_manifest_toml(std::slice::from_ref(&donation)));
+        assert_eq!(manifest.file, donation.file);
+        assert_eq!(manifest.placement, placement);
     }
 }
 

@@ -121,6 +121,11 @@ pub async fn detect_and_propose(
                 continue;
             };
             let effect = predicted_effect(&basis, *left_offset, *right_offset);
+            if std::env::var_os("LOOKLAB_TIMING").is_some() {
+                eprintln!(
+                    "split pair {left_group}-{right_group}: effect={effect:.3} offsets={left_offset:?}/{right_offset:?}",
+                );
+            }
             if effect < options.min_effect_de {
                 continue;
             }

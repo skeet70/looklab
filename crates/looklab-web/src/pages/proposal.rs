@@ -55,7 +55,7 @@ pub fn ProposalDetail() -> impl IntoView {
                     <h1>"Proposal"</h1>
                     {ui::preview_notice()}
                     <p class="muted">
-                        "Proposals live in the server's moderation queue, not in the static site data."
+                        "Proposals live in the server's review queue, not in the static site data."
                     </p>
                 }
                 .into_any();
@@ -66,7 +66,7 @@ pub fn ProposalDetail() -> impl IntoView {
                     view! {
                         <h1>"Proposal"</h1>
                         <p class="muted">
-                            "Proposals live in the server's moderation queue, not in the static site data."
+                            "Proposals live in the server's review queue, not in the static site data."
                         </p>
                         {ui::failure(&error)}
                     }
@@ -124,11 +124,11 @@ fn ProposalViewDetail(
     let read_confirmation = Callback::new(move |selected| {
         spawn_local(async move {
             let result = async {
-                let files = crate::files::read_files(selected).await?;
+                let files = crate::files::selected_files(selected);
                 let file = files
                     .first()
                     .ok_or_else(|| "Choose a camera JPEG.".to_owned())?;
-                proposal_form::file_menu_value(&file.bytes)
+                proposal_form::file_menu_value(&file.bytes().await?)
             }
             .await;
             match result {

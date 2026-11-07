@@ -97,6 +97,11 @@ pub fn ModQueuePage() -> impl IntoView {
     let pending_decision = RwSignal::new(Decision::Approve);
     let look_slug = RwSignal::new(String::new());
     let listing_notice = RwSignal::new(None::<String>);
+    let revert_slug = RwSignal::new(String::new());
+    let revert_version = RwSignal::new(String::new());
+    let revert_excluded = RwSignal::new(String::new());
+    let revert_reason = RwSignal::new(String::new());
+    let revert_notice = RwSignal::new(None::<String>);
     let filter = RwSignal::new(QueueFilter::All);
     let expiry_timer = StoredValue::new(None::<leptos::leptos_dom::helpers::TimeoutHandle>);
     on_cleanup(move || {
@@ -288,6 +293,47 @@ pub fn ModQueuePage() -> impl IntoView {
         });
     };
 
+    let revert_look = move |_| {
+        let look = revert_slug.get_untracked().trim().to_owned();
+        if look.is_empty() {
+            revert_notice.set(Some("Enter the Look slug.".to_owned()));
+            return;
+        }
+        let version = match revert_version.get_untracked().trim().parse::<u32>() {
+            Ok(version) if version > 0 => version,
+            _ => {
+                revert_notice.set(Some(
+                    "Enter the published version number to restore.".to_owned(),
+                ));
+                return;
+            }
+        };
+        let reason = revert_reason.get_untracked().trim().to_owned();
+        if reason.is_empty() {
+            revert_notice.set(Some("A reason is required.".to_owned()));
+            return;
+        }
+        let excluded: Vec<String> = revert_excluded
+            .get_untracked()
+            .split(|character: char| character == ',' || character.is_whitespace())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .collect();
+        busy.set(true);
+        revert_notice.set(None);
+        spawn_local(async move {
+            let outcome = data::revert_look(&look, version, &excluded, &reason).await;
+            busy.set(false);
+            revert_notice.set(Some(match outcome {
+                Ok(receipt) => format!(
+                    "Reverted {look} to version {} and published version {}.",
+                    receipt.target_version, receipt.new_version
+                ),
+                Err(error) => error,
+            }));
+        });
+    };
+
     let send_message = move |_| {
         let Some(id) = selected_id.get() else {
             return;
@@ -366,6 +412,22 @@ pub fn ModQueuePage() -> impl IntoView {
                 <button type="button" id="mod-look-relist" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Relist)>"Relist"</button>
             </div>
             {move || listing_notice.get().map(|text| view! { <p class="muted" role="status">{text}</p> })}
+        </section>
+        <section aria-labelledby="look-revert" hidden=move || !available || !can_moderate() || !session.get()>
+            <h2 id="look-revert">"Revert a Look"</h2>
+            <p class="muted">"Publish a released version's content as a new version, then refit without the excluded profiles."</p>
+            <label for="mod-revert-slug">"Look slug"</label>
+            <input id="mod-revert-slug" type="text" on:input=move |event| revert_slug.set(event_target_value(&event))/>
+            <label for="mod-revert-version">"Version to restore"</label>
+            <input id="mod-revert-version" type="number" min="1" on:input=move |event| revert_version.set(event_target_value(&event))/>
+            <label for="mod-revert-excluded">"Exclude profiles (comma separated internal IDs)"</label>
+            <input id="mod-revert-excluded" type="text" on:input=move |event| revert_excluded.set(event_target_value(&event))/>
+            <label for="mod-revert-reason">"Reason"</label>
+            <input id="mod-revert-reason" type="text" on:input=move |event| revert_reason.set(event_target_value(&event))/>
+            <div class="field-row">
+                <button type="button" id="mod-revert-submit" disabled=move || busy.get() on:click=revert_look>"Revert and exclude"</button>
+            </div>
+            {move || revert_notice.get().map(|text| view! { <p class="muted" role="status">{text}</p> })}
         </section>
         <ui::Tabs tabs=tabs() selected=tab_ui>
         <div tabindex="0" aria-label="Proposal queue, use j and k to navigate" hidden=move || tab.get() != ReviewTab::Queue on:keydown=move |event| {

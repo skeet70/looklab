@@ -20,7 +20,7 @@ looklab-fit.workspace = true
 looklab-meta.workspace = true
 looklab-model.workspace = true
 looklab-export.workspace = true
-looklab-publish.workspace = true
+looklab-publish = { workspace = true, features = ["scene-sources"] }
 looklab-samples.workspace = true
 looklab-schema = { workspace = true, features = ["fs"] }
 looklab-server.workspace = true
@@ -32,13 +32,15 @@ serde_norway.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
+libm.workspace = true
 looklab-fit = { workspace = true, features = ["synth"] }
+looklab-match.workspace = true
 tempfile.workspace = true
 
 [lints]

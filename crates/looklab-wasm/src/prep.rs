@@ -312,5 +312,10 @@ pub fn manifest_hash(bytes: &[u8]) -> Option<ManifestHash> {
 /// The EXIF serial of `bytes`, for the envelope only.
 pub fn serial_ascii_for_file(bytes: &[u8]) -> Option<Vec<u8>> {
     let metadata = looklab_meta::parse(bytes).ok()?;
+    serial_ascii_from_metadata(&metadata)
+}
+
+/// For the envelope only.
+pub fn serial_ascii_from_metadata(metadata: &looklab_meta::ParsedMetadata) -> Option<Vec<u8>> {
     metadata.body_serial().map(serial_ascii)
 }

@@ -6,6 +6,7 @@
 //! E(k,u) = Σ_p w_p c_p ΔE_UCS(L(p), Real_{k,u}(p))² + β Σ_p w_p tr Cov_pred(k,u,p)
 //! ```
 
+mod calibration;
 mod card;
 mod covariance;
 mod emphasis;
@@ -20,6 +21,7 @@ mod verify;
 
 pub mod synth;
 
+pub use calibration::Calibration;
 pub use card::{
     Confidence, ConfidenceLevel, ControlEntry, SettingsCard, UnreachableRegion, settings_card,
 };
@@ -33,7 +35,7 @@ pub use model::MatchModel;
 pub use optimizer::{
     MatchOptions, MatchOutcome, OPTIMIZER_VERSION, RunStats, Suggestion, optimize,
 };
-pub use permalink::{PERMALINK_FORMAT, Permalink, PermalinkSources};
+pub use permalink::{CALIBRATED_PERMALINK_FORMAT, PERMALINK_FORMAT, Permalink, PermalinkSources};
 pub use settings::{ControlDomain, Plan};
 pub use target::{PreparedTarget, TargetFunction, TargetSpec};
 pub use verify::{

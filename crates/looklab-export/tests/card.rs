@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use looklab_color::cam16::{Cam16Model, ViewingConditions};
 use looklab_color::ucs::{UcsSpace, ucs_to_jmh};
-use looklab_color::{Illuminant, RgbSpace};
+use looklab_color::{Illuminant, Rgb, RgbSpace};
 use looklab_export::card::{
     Card, CardError, CardMeta, CardOptions, GridSide, read_card, write_card,
 };
@@ -156,6 +156,63 @@ fn grid_vectors_match_the_normative_interpolation() {
         let actual = card.eval_grid_shaped(input).expect("the card has a grid");
         for channel in 0..3 {
             assert_within_f16_ulp(actual[channel], expected[channel], 2.0);
+        }
+    }
+}
+
+#[test]
+fn grid_nodes_are_the_direct_evaluation_at_the_shaped_coordinate() {
+    // docs/04 §8.1 shaper inverse, with the constants it fixes.
+    fn unshape(coordinate: f64) -> f64 {
+        const PIVOT: f64 = 0.18;
+        const HIGH_EV: f64 = 6.0;
+        const LOW_EV: f64 = 12.0;
+        let coordinate = coordinate.clamp(0.0, 1.0);
+        if coordinate >= 0.5 {
+            PIVOT
+                * (libm::pow(
+                    2.0,
+                    (coordinate - 0.5) * 2.0 * libm::log2(1.0 + libm::pow(2.0, HIGH_EV)),
+                ) - 1.0)
+        } else {
+            -PIVOT
+                * (libm::pow(
+                    2.0,
+                    (0.5 - coordinate) * 2.0 * libm::log2(1.0 + libm::pow(2.0, LOW_EV)),
+                ) - 1.0)
+        }
+    }
+
+    let document = LookDocument::decode(&load("valid/look.looklab")).expect("document");
+    let card = card();
+    let grid = card.grid().expect("grid");
+    assert_eq!(grid.side(), GridSide::S33);
+    let side = grid.side().side() as usize;
+    let scale = 1.0 / (side - 1) as f64;
+    let coordinates = [0, 1, 4, 8, 12, 16, 20, 24, 28, 31, 32];
+    for r in coordinates {
+        for g in coordinates {
+            for b in coordinates {
+                let linear = Rgb::new(
+                    unshape(r as f64 * scale),
+                    unshape(g as f64 * scale),
+                    unshape(b as f64 * scale),
+                );
+                let expected = output_rgb(&document, RgbSpace::Rec2020.rgb_linear_to_xyz(linear));
+                let stored = grid.values()[r + side * (g + side * b)];
+                for channel in 0..3 {
+                    let value = if expected[channel].is_finite() {
+                        expected[channel].clamp(-65504.0, 65504.0)
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(
+                        f16_bits(value),
+                        f16_bits(stored[channel]),
+                        "node ({r}, {g}, {b}) channel {channel}"
+                    );
+                }
+            }
         }
     }
 }

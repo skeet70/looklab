@@ -33,8 +33,8 @@ try:
 except ImportError as error:  # pragma: no cover - configuration error
     sys.exit(f"dev_loop: cannot import source_generations: {error}")
 
-PUBLIC_PORT = 8081
-STUB_PORT = 8098
+DEFAULT_PUBLIC_PORT = 8081
+DEFAULT_STUB_PORT = 8098
 BUILD_STAMP = "dev-build-stamp.txt"
 RECORD = "dev-generation.json"
 RUNTIME_RECORD = "generation.json"
@@ -69,6 +69,8 @@ class Layout:
     runtime_record: Path
     css_script: Path
     css_watch_script: Path
+    public_port: int
+    stub_port: int
 
     @classmethod
     def from_environment(cls) -> "Layout":
@@ -83,6 +85,10 @@ class Layout:
             target = origin / target
         target = target.resolve()
         runtime = target / "runtime"
+        public_port = port_from_environment("LOOKLAB_DEV_PORT", DEFAULT_PUBLIC_PORT)
+        stub_port = port_from_environment("LOOKLAB_DEV_API_PORT", DEFAULT_STUB_PORT)
+        if public_port == stub_port:
+            raise ValueError("LOOKLAB_DEV_PORT and LOOKLAB_DEV_API_PORT must differ")
         return cls(
             origin=origin,
             target=target,
@@ -98,7 +104,22 @@ class Layout:
             runtime_record=runtime / RUNTIME_RECORD,
             css_script=target / "source" / "site" / "scripts" / "dev-css.mjs",
             css_watch_script=origin / "site" / "scripts" / "dev-css.mjs",
+            public_port=public_port,
+            stub_port=stub_port,
         )
+
+
+def port_from_environment(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        port = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a port number, got {raw!r}") from None
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{name} must be between 1 and 65535, got {port}")
+    return port
 
 
 def toml_string(value: object) -> str:
@@ -324,9 +345,12 @@ def build_environment(layout: Layout, generation) -> dict[str, str]:
 
 
 class Supervisor:
-    def __init__(self, layout: Layout, *, regen_data: bool) -> None:
+    def __init__(
+        self, layout: Layout, *, regen_data: bool, reuse_data: bool = False
+    ) -> None:
         self.layout = layout
         self.regen_data = regen_data
+        self.reuse_data = reuse_data
         self.children = Children()
         self.active_binary: Path | None = None
         self.active_binary_digest: str | None = None
@@ -351,6 +375,18 @@ class Supervisor:
         shutil.rmtree(staging, ignore_errors=True)
         shutil.copytree(source, staging)
         return staging, tree_digest(staging)
+
+    def stage_site_data(self) -> None:
+        source = self.layout.origin / "site" / "data"
+        if not source.is_dir():
+            raise BuildError("--reuse-data needs site/data in the source checkout")
+        destination = self.layout.view / "site" / "data"
+        index = source / "index.json"
+        if destination.is_dir() and (destination / "index.json").is_file():
+            if (destination / "index.json").read_bytes() == index.read_bytes():
+                return
+        shutil.rmtree(destination, ignore_errors=True)
+        shutil.copytree(source, destination)
 
     def replace_bodies(self, staging: Path) -> None:
         data = self.layout.runtime / "data"
@@ -407,9 +443,9 @@ class Supervisor:
                 "--dist",
                 self.layout.dist,
                 "--port",
-                str(STUB_PORT),
+                str(self.layout.stub_port),
                 "--origin",
-                f"http://localhost:{PUBLIC_PORT}",
+                f"http://localhost:{self.layout.public_port}",
                 "--state",
                 self.layout.stub_state,
             ],
@@ -426,7 +462,9 @@ class Supervisor:
             if process.poll() is not None:
                 raise BuildError(f"stub exited with status {process.returncode}")
             try:
-                with socket.create_connection(("127.0.0.1", STUB_PORT), timeout=0.2):
+                with socket.create_connection(
+                    ("127.0.0.1", self.layout.stub_port), timeout=0.2
+                ):
                     return
             except OSError:
                 time.sleep(0.05)
@@ -489,8 +527,8 @@ class Supervisor:
             "proxy",
             [
                 "socat",
-                f"TCP4-LISTEN:{PUBLIC_PORT},bind=127.0.0.1,reuseaddr,fork",
-                f"TCP4:127.0.0.1:{STUB_PORT}",
+                f"TCP4-LISTEN:{self.layout.public_port},bind=127.0.0.1,reuseaddr,fork",
+                f"TCP4:127.0.0.1:{self.layout.stub_port}",
             ],
             env=self.environment,
         )
@@ -515,14 +553,17 @@ class Supervisor:
         layout = self.layout
         view = layout.view
         staged_bodies = self.stage_bodies()
-        run_step(
-            f"site data ({generation.digest[:12]})",
-            ["sh", view / "site" / "scripts" / "site-data.sh"]
-            + (["--force"] if self.regen_data else []),
-            cwd=view,
-            env=environment,
-        )
-        self.regen_data = False
+        if not self.reuse_data:
+            run_step(
+                f"site data ({generation.digest[:12]})",
+                ["sh", view / "site" / "scripts" / "site-data.sh"]
+                + (["--force"] if self.regen_data else []),
+                cwd=view,
+                env=environment,
+            )
+            self.regen_data = False
+        else:
+            self.stage_site_data()
         run_step(
             f"stub server ({generation.digest[:12]})",
             [
@@ -768,7 +809,7 @@ def loop(layout: Layout, supervisor: Supervisor, *, once: bool) -> int:
         built = None
     failed: str | None = None
     print(
-        f"[dev] UI http://localhost:{PUBLIC_PORT}/ (api 127.0.0.1:{STUB_PORT}); "
+        f"[dev] UI http://localhost:{layout.public_port}/ (api 127.0.0.1:{layout.stub_port}); "
         f"view {layout.view}; styles hot, generations serial"
         + ("; fixed generation" if once else ""),
         flush=True,
@@ -803,7 +844,7 @@ def loop(layout: Layout, supervisor: Supervisor, *, once: bool) -> int:
             if once:
                 print(
                     f"[dev] fixed generation {generation.digest} serving at "
-                    f"http://localhost:{PUBLIC_PORT}/",
+                    f"http://localhost:{layout.public_port}/",
                     flush=True,
                 )
                 while not stopping:
@@ -835,6 +876,11 @@ def parse_arguments(argv: list[str]) -> argparse.Namespace:
         "--regen-data", action="store_true", help="regenerate the static site data"
     )
     parser.add_argument(
+        "--reuse-data",
+        action="store_true",
+        help="copy site/data from the checkout instead of regenerating it",
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         help="build and serve exactly one captured generation, then stop watching sources",
@@ -844,20 +890,29 @@ def parse_arguments(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     arguments = parse_arguments(argv)
-    layout = Layout.from_environment()
-    supervisor = Supervisor(layout, regen_data=arguments.regen_data)
+    if arguments.regen_data and arguments.reuse_data:
+        print("[dev] --regen-data and --reuse-data cannot be combined", file=sys.stderr)
+        return 1
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGHUP, request_stop)
+    supervisor = None
     try:
+        layout = Layout.from_environment()
+        supervisor = Supervisor(
+            layout,
+            regen_data=arguments.regen_data,
+            reuse_data=arguments.reuse_data,
+        )
         return loop(layout, supervisor, once=arguments.once)
     except Stopped:
         return 0
-    except (RuntimeError, OSError) as error:
+    except (RuntimeError, OSError, ValueError) as error:
         print(f"[dev] {error}", file=sys.stderr, flush=True)
         return 1
     finally:
-        supervisor.shutdown()
+        if supervisor is not None:
+            supervisor.shutdown()
 
 
 if __name__ == "__main__":

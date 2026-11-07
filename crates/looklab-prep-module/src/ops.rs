@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use looklab_meta::{RawSerial, parse_jpeg};
+use looklab_meta::RawSerial;
 use looklab_prep::{
-    Image3, PrepParams, PriorTransform, SamplingSeed, SeedFile, align, decode_jpeg, prepare_group,
+    PrepParams, PriorTransform, SamplingSeed, SeedFile, prepare_group_with_decoded_raw,
 };
-use looklab_raw::{DecodedRaw, Orientation, RawDecoder, RawlerDecoder};
+use looklab_raw::{DecodedRaw, RawDecoder, RawlerDecoder};
 use looklab_samples::{PriorTransformVersion, encode};
 use looklab_upload::webauthn::{
     MAX_AUTHENTICATOR_DATA, MAX_CLIENT_DATA_JSON, MAX_CREDENTIAL_ID, MAX_SIGNATURE,
@@ -15,32 +15,51 @@ use looklab_upload::{
     canonical_manifest_bytes, encode_envelope as encode_upload_envelope, manifest_hash,
     parse_envelope_strict, solve,
 };
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::ModuleError;
 use crate::types::{
     AlignmentSummary, AssertionFields, BlobSummary, BuildManifestRequest, BuildManifestResponse,
     EncodeEnvelopeRequest, EncodeEnvelopeResponse, ParseEnvelopeRequest, ParseEnvelopeResponse,
-    PrepareRequest, PrepareResponse, PreparedImageView, PriorTransformSpec, SolvePowRequest,
-    SolvePowResponse,
+    PrepareResponse, PreparedImageView, PriorTransformSpec, SolvePowRequest, SolvePowResponse,
 };
 
 const SEED_KEY: &str = "module-input";
 
-pub(crate) fn prepare(request: PrepareRequest) -> Result<PrepareResponse, ModuleError> {
-    let first_jpeg = request
-        .jpegs
-        .first()
-        .ok_or_else(|| ModuleError::prep("a group needs at least one JPEG"))?;
+#[derive(Deserialize)]
+pub(crate) struct PrepareInput<'a> {
+    #[serde(borrow)]
+    raw: &'a [u8],
+    #[serde(borrow)]
+    jpegs: Vec<&'a [u8]>,
+    prior: PriorTransformSpec,
+    seed: [u8; 32],
+    params: PrepParams,
+}
+
+pub(crate) fn prepare(request: PrepareInput<'_>) -> Result<PrepareResponse, ModuleError> {
+    if request.jpegs.is_empty() {
+        return Err(ModuleError::prep("a group needs at least one JPEG"));
+    }
     let decoded = RawlerDecoder
-        .decode(&request.raw)
+        .decode(request.raw)
         .map_err(ModuleError::prep)?;
     let prior = prior_transform(&request.prior, &decoded)?;
     let seed = sampling_seed(request.seed, prior.version())?;
-    let alignment = alignment_summary(&decoded, first_jpeg, &request.params)?;
-    let jpegs: Vec<&[u8]> = request.jpegs.iter().map(Vec::as_slice).collect();
-    let prepared = prepare_group(&request.raw, &jpegs, &prior, seed, &request.params)
-        .map_err(ModuleError::prep)?;
+    let (prepared, alignment) = prepare_group_with_decoded_raw(
+        request.raw,
+        decoded,
+        &request.jpegs,
+        &prior,
+        seed,
+        &request.params,
+    )
+    .map_err(ModuleError::prep)?;
+    let alignment = AlignmentSummary {
+        correlation: alignment.central_correlation,
+        residual_px: alignment.residual_px,
+    };
 
     let mut images = Vec::with_capacity(prepared.len());
     for image in prepared {
@@ -117,65 +136,6 @@ fn to_hex(bytes: &[u8; 32]) -> String {
         out.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     out
-}
-
-fn alignment_summary(
-    decoded: &DecodedRaw,
-    jpeg_bytes: &[u8],
-    params: &PrepParams,
-) -> Result<AlignmentSummary, ModuleError> {
-    let raw = raw_linear_image(decoded)?.apply_orientation(meta_orientation(decoded.orientation));
-    let mut jpeg = decode_jpeg(jpeg_bytes).map_err(ModuleError::prep)?;
-    if let Ok(metadata) = parse_jpeg(jpeg_bytes)
-        && let Some(orientation) = metadata.exif.orientation
-    {
-        jpeg = jpeg.apply_orientation(orientation);
-    }
-    let alignment = align(&raw, &jpeg, &params.align).map_err(ModuleError::prep)?;
-    Ok(AlignmentSummary {
-        correlation: alignment.central_correlation,
-        residual_px: alignment.residual_px,
-    })
-}
-
-fn raw_linear_image(raw: &DecodedRaw) -> Result<Image3, ModuleError> {
-    let width =
-        u32::try_from(raw.width).map_err(|_| ModuleError::prep("RAW width does not fit u32"))?;
-    let height =
-        u32::try_from(raw.height).map_err(|_| ModuleError::prep("RAW height does not fit u32"))?;
-    let pixels = raw
-        .width
-        .checked_mul(raw.height)
-        .ok_or_else(|| ModuleError::prep("RAW dimensions overflow"))?;
-    let channels = pixels
-        .checked_mul(3)
-        .ok_or_else(|| ModuleError::prep("RAW channel count overflows"))?;
-    if raw.rgb.len() < channels {
-        return Err(ModuleError::prep("RAW pixel buffer is too short"));
-    }
-    let mut data = Vec::with_capacity(pixels);
-    for index in 0..pixels {
-        let base = index * 3;
-        data.push([
-            (f64::from(raw.rgb[base]) * raw.as_shot_wb[0]) as f32,
-            (f64::from(raw.rgb[base + 1]) * raw.as_shot_wb[1]) as f32,
-            (f64::from(raw.rgb[base + 2]) * raw.as_shot_wb[2]) as f32,
-        ]);
-    }
-    Image3::new(width, height, data).map_err(ModuleError::prep)
-}
-
-fn meta_orientation(orientation: Orientation) -> looklab_meta::Orientation {
-    match orientation {
-        Orientation::Normal => looklab_meta::Orientation::Normal,
-        Orientation::HorizontalFlip => looklab_meta::Orientation::FlipHorizontal,
-        Orientation::Rotate180 => looklab_meta::Orientation::Rotate180,
-        Orientation::VerticalFlip => looklab_meta::Orientation::FlipVertical,
-        Orientation::Transpose => looklab_meta::Orientation::Transpose,
-        Orientation::Rotate90 => looklab_meta::Orientation::Rotate90Clockwise,
-        Orientation::Transverse => looklab_meta::Orientation::Transverse,
-        Orientation::Rotate270 => looklab_meta::Orientation::Rotate270Clockwise,
-    }
 }
 
 pub(crate) fn build_manifest(

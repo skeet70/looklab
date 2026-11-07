@@ -61,6 +61,14 @@ pub struct Epoch {
     pub solve_plan: Vec<SolvePlanStep>,
 }
 
+impl Epoch {
+    pub fn native_sim(&self, key: &SimKey) -> Option<&NativeSim> {
+        self.native_sims
+            .iter()
+            .find(|sim| sim.key.as_str() == key.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FirmwareRange {
@@ -74,6 +82,9 @@ pub struct NativeSim {
     pub key: SimKey,
     pub look: LookId,
     pub makernote: Makernote,
+    /// The sim renders a monochrome image; the fit has no B&W Look kind.
+    #[serde(default)]
+    pub monochrome: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]

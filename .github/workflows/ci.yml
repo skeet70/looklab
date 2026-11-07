@@ -92,11 +92,11 @@ jobs:
           paths: |
             site/generated/wasm
             target/build-products/wasm
-      - name: Prep and scene wasm artifacts
+      - name: Prep, scene and match wasm artifacts
         id: wasm-assets
-        run: nix develop -c sh site/scripts/wasm-assets.sh --prep --scene
-      - name: Prep and scene import policy
-        run: nix develop -c sh site/scripts/wasm-assets.sh --check --prep --scene
+        run: nix develop -c sh site/scripts/wasm-assets.sh --prep --scene --match
+      - name: Prep, scene and match import policy
+        run: nix develop -c sh site/scripts/wasm-assets.sh --check --prep --scene --match
       - name: Build product receipts
         run: nix develop -c python3 -m unittest discover -s tools/tests -v
       - name: Test

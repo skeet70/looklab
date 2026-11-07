@@ -21,6 +21,7 @@ fn decorated() -> Look {
             .plane
             .iter_mut()
             .chain(component.volume.iter_mut())
+            .chain(component.core.iter_mut())
             .enumerate()
         {
             *coefficient = libm::sin(index as f64 * 0.001);

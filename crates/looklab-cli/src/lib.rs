@@ -52,7 +52,7 @@ pub enum Command {
     /// Inspect or evaluate a firmware card file.
     Card(card::CardArgs),
     /// Import a community LUT.
-    LutLook(lut_look::LutLookArgs),
+    LutLook(Box<lut_look::LutLookArgs>),
     /// Validate a data directory and its probe set files.
     Validate(validate::ValidateArgs),
     /// Validate a community data snapshot directory and its content hash.

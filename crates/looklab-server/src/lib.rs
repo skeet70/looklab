@@ -10,9 +10,11 @@ mod config;
 mod db;
 mod error;
 mod ids;
+pub mod operator;
 mod preparse;
 mod proposals;
 mod rate_limit;
+mod serve;
 mod state;
 mod store;
 mod trust;
@@ -27,13 +29,14 @@ use axum::{Router, middleware};
 use tokio::net::TcpListener;
 use tracing::Instrument as _;
 
-pub use config::{Config, PowConfig};
+pub use config::{Config, CorsOrigin, PowConfig, SiteConfig};
 pub use db::{DbError, open as open_database};
 pub use ids::{
     ContributionId, CredentialId, EndorsementId, GrantId, LookVersionId, ModerationDecisionId,
     ProposalId, RootAdmissionId, StatusToken,
 };
 pub use state::{AppState, ModSessions};
+pub use store::request_publication;
 pub use trust::{CredentialStanding, DefaultTrustPolicy, Tier, TrustPolicy};
 pub use verify::{RequestDomain, request_digest};
 
@@ -135,9 +138,37 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     if let Err(error) = proposals::publish_pending(&state).await {
         tracing::warn!(%error, "a pending snapshot publication did not complete");
     }
-    let app = router(state);
+    let app = serve::production_router(state.clone())?;
     let listener = TcpListener::bind(bind).await?;
     tracing::info!("listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    state.db.close().await;
+    tracing::info!("stopped");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "SIGINT handler failed");
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => tracing::error!(%error, "SIGTERM handler failed"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+    tracing::info!("server shutting down");
 }

@@ -10,6 +10,7 @@ use crate::file::ProbeSetVersion;
 
 const POINTER_JSON: &str = include_str!("../../../data/probes/pointer_gamut.json");
 
+/// `data/probes/v1.yaml`, written by `cargo run -p looklab-model --example gen_probes`.
 pub const PROBES_V1_YAML: &str = include_str!("../../../data/probes/v1.yaml");
 
 /// Probe count of v1; fixed by the generator and checked by the file format.

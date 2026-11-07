@@ -20,9 +20,9 @@ pub use file::{
     BaseField, BaseReference, BaseStatus, BinRef, CameraRendering, ChromaReference,
     DeclaredEncoding, Density, DynamicRange, FormatId, Gamut, LayersRecord, LicenseRecord,
     LogTransfer, LookDocument, LookFile, LookIdentity, LookKind, LookPin, LutData, LutDefinition,
-    LutEmulation, LutRecord, MAX_LUT_SIDE, NEUTRAL_BASELINE_SLUG, NEUTRAL_BASELINE_VERSION,
-    OutputEncoding, ProbeCovariance, ProbeScalars, ProbeSetVersion, Renderer, UncertaintyData,
-    WbPolicy, emulation_matches_camera_rendering, lut_value_count,
+    LutEmulation, LutRecord, MAX_LUT_SIDE, MatchRefusal, NEUTRAL_BASELINE_SLUG,
+    NEUTRAL_BASELINE_VERSION, OutputEncoding, ProbeCovariance, ProbeScalars, ProbeSetVersion,
+    Renderer, UncertaintyData, WbPolicy, emulation_matches_camera_rendering, lut_value_count,
 };
 pub use look::{
     CoefTerm, ColorLayer, GrlComponent, GrlWeights, LayerValues, Look, LookInput, ParamLayout,

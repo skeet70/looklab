@@ -60,11 +60,15 @@ pub async fn load(
         .collect();
 
     let rows = db::body_pool(db_pool, &pool.body).await?;
+    let exclusions = db::look_credential_exclusions(db_pool, pool.look.as_str()).await?;
     let mut sessions = Vec::new();
     let mut admissions = Vec::new();
     let mut measured: BTreeMap<_, Vec<[f64; 3]>> = BTreeMap::new();
 
     for (contribution, images) in rows {
+        if exclusions.contains(&contribution.credential) {
+            continue;
+        }
         let Some(admission) = by_contribution.get(&contribution.id) else {
             continue;
         };

@@ -10,9 +10,10 @@ use looklab_model::LookDocument;
 use looklab_model::file::{LookKind, LookVersion, Slug, WbPolicy, identity};
 use looklab_model::realization::encode_crm;
 use looklab_publish::{
-    ArtifactHash, ArtifactName, LookStatus, LookSummary, LookVisibility, SiteIndex, SitePath,
-    VersionSummary,
+    ArtifactHash, ArtifactName, LookStatus, LookSummary, LookVisibility, MatchBundle, MatchSim,
+    SiteIndex, SitePath, VersionSummary, body_artifact, bundle_artifact, transform_artifact,
 };
+use looklab_schema::SimKey;
 use serde::Serialize;
 
 const SLUG: &str = "synthetic-match";
@@ -33,38 +34,104 @@ fn main() -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("site"));
     let version_dir = site.join("data/looks").join(SLUG).join(VERSION);
+    if version_dir.exists() {
+        std::fs::remove_dir_all(&version_dir).map_err(|error| error.to_string())?;
+    }
     std::fs::create_dir_all(&version_dir).map_err(|error| error.to_string())?;
 
-    let body = synth::body(9).map_err(|error| error.to_string())?;
+    let classic_sim = SimKey::new(synth::SYNTH_SIM).map_err(|error| error.to_string())?;
+    let provia_sim = SimKey::new("provia").map_err(|error| error.to_string())?;
+    let classic = synth::body(9).map_err(|error| error.to_string())?;
+    let provia = synth::body_for_sim(10, &provia_sim).map_err(|error| error.to_string())?;
     let document = LookDocument::from_look(
         identity(SLUG, VERSION).map_err(|error| error.to_string())?,
-        body.model.base_look.clone(),
+        classic.model.base_look.clone(),
     )
     .map_err(|error| error.to_string())?;
     let look_bytes = document.encode().map_err(|error| error.to_string())?;
     let lut = looklab_publish::bake_preview_lut(&document);
     let body_yaml = std::fs::read_to_string(root.join("data/bodies/fujifilm-x-t5.yaml"))
         .map_err(|error| error.to_string())?;
-    let crm = encode_crm(&body.model.crm).map_err(|error| error.to_string())?;
-    let covariance_json = diagonal_covariance(&body.model.crm)
-        .to_json()
-        .map_err(|error| error.to_string())?;
+    let schema = looklab_schema::validate_control_schema(&body_yaml)
+        .map_err(|errors| format!("{errors:?}"))?;
+    let body_id = schema.body.clone();
     let transform = transform_yaml();
 
-    let artifacts: [(&str, &[u8]); 7] = [
+    let classic_names =
+        looklab_publish::sim_artifacts(&body_id, 1, &classic_sim).map_err(|e| e.to_string())?;
+    let provia_names =
+        looklab_publish::sim_artifacts(&body_id, 1, &provia_sim).map_err(|e| e.to_string())?;
+    let classic_base = look_bytes.clone();
+    let classic_crm = encode_crm(&classic.model.crm).map_err(|error| error.to_string())?;
+    let classic_covariance = diagonal_covariance(&classic.model.crm)
+        .to_json()
+        .map_err(|error| error.to_string())?;
+    let provia_base = LookDocument::from_look(
+        identity(&format!("{SLUG}-provia"), VERSION).map_err(|error| error.to_string())?,
+        provia.model.base_look.clone(),
+    )
+    .map_err(|error| error.to_string())?
+    .encode()
+    .map_err(|error| error.to_string())?;
+    let provia_crm = encode_crm(&provia.model.crm).map_err(|error| error.to_string())?;
+    let provia_covariance = diagonal_covariance(&provia.model.crm)
+        .to_json()
+        .map_err(|error| error.to_string())?;
+
+    let bundle = MatchBundle::new(
+        body_id.clone(),
+        1,
+        vec![
+            MatchSim {
+                sim: classic_sim,
+                base: classic_names.base.clone(),
+                crm: classic_names.crm.clone(),
+                covariance: Some(classic_names.covariance.clone()),
+            },
+            MatchSim {
+                sim: provia_sim,
+                base: provia_names.base.clone(),
+                crm: provia_names.crm.clone(),
+                covariance: Some(provia_names.covariance.clone()),
+            },
+        ],
+        Vec::new(),
+    )
+    .map_err(|error| error.to_string())?;
+    let bundle_bytes = bundle.to_json().map_err(|error| error.to_string())?;
+    let bundle_name = bundle_artifact(&body_id, 1).map_err(|error| error.to_string())?;
+    let body_name = body_artifact(&body_id, 1).map_err(|error| error.to_string())?;
+    let transform_name = transform_artifact(&body_id, 1).map_err(|error| error.to_string())?;
+
+    let artifacts: [(&str, &[u8]); 10] = [
         ("look.looklab", look_bytes.as_slice()),
         ("preview.lut33", lut.as_slice()),
-        ("base.looklab", look_bytes.as_slice()),
-        ("body.yaml", body_yaml.as_bytes()),
-        ("crm.json", crm.as_slice()),
-        ("covariance.json", covariance_json.as_slice()),
-        ("transform.yaml", transform.as_bytes()),
+        (body_name.as_str(), body_yaml.as_bytes()),
+        (transform_name.as_str(), transform.as_bytes()),
+        (classic_names.base.as_str(), classic_base.as_slice()),
+        (classic_names.crm.as_str(), classic_crm.as_slice()),
+        (
+            classic_names.covariance.as_str(),
+            classic_covariance.as_slice(),
+        ),
+        (provia_names.base.as_str(), provia_base.as_slice()),
+        (provia_names.crm.as_str(), provia_crm.as_slice()),
+        (
+            provia_names.covariance.as_str(),
+            provia_covariance.as_slice(),
+        ),
     ];
     for (name, bytes) in artifacts {
         std::fs::write(version_dir.join(name), bytes).map_err(|error| error.to_string())?;
     }
-
-    let entries = artifact_entries(&artifacts);
+    std::fs::write(version_dir.join(bundle_name.as_str()), &bundle_bytes)
+        .map_err(|error| error.to_string())?;
+    let mut entries = artifact_entries(&artifacts);
+    entries.push(serde_json::json!({
+        "name": bundle_name.as_str(),
+        "sha256": ArtifactHash::of(&bundle_bytes).as_str(),
+        "bytes": bundle_bytes.len(),
+    }));
     let manifest = manifest_value(&entries);
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
     std::fs::write(version_dir.join("manifest.json"), &manifest_bytes)

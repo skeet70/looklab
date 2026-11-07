@@ -36,6 +36,7 @@ impl RawDecoder for RawlerDecoder {
                 },
                 rawler::RawlerError::DecoderFailed(detail) => RawError::DecodeFailed { detail },
             })?;
+        drop(source);
 
         if image.cpp != 1 {
             return Err(RawError::MultiComponent { cpp: image.cpp });

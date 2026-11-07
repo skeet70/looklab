@@ -471,10 +471,19 @@ fn non_default_images_reduce_theta_uncertainty() {
     let library = library_settings();
     let defaults = &dataset.images[..6];
     let with_non_default = &dataset.images[..library.len()];
+    let production = FitOptions {
+        max_sweeps: FitOptions::default().max_sweeps,
+        ..options()
+    };
     let base =
-        fit_controlled(defaults, &dataset.schema, 1, &sim(), &options()).expect("default fit");
-    let extended = fit_controlled(with_non_default, &dataset.schema, 1, &sim(), &options())
+        fit_controlled(defaults, &dataset.schema, 1, &sim(), &production).expect("default fit");
+    let extended = fit_controlled(with_non_default, &dataset.schema, 1, &sim(), &production)
         .expect("joint fit");
+    assert!(base.diagnostics.converged, "default fit did not converge");
+    assert!(
+        extended.diagnostics.converged,
+        "joint fit did not converge"
+    );
     let base_trace = trace(&base.probes);
     let extended_trace = trace(&extended.probes);
     println!("theta probe covariance trace: {base_trace:.4} -> {extended_trace:.4}");
@@ -540,6 +549,171 @@ fn rerender_groups_share_input_pixels_and_support_inflates() {
     assert_eq!(support.inflation(&observed), 1.0);
     assert!(support.inflation(&far) > 1.0);
     let _ = model;
+}
+
+#[test]
+fn exposure_mode_prior_resolves_the_gauge() {
+    let dataset = controlled_dataset(&config());
+    let library = library_settings();
+    let train = &dataset.images[..library.len()];
+    let tight = FitOptions {
+        exposure_mode_prior_sd: 0.01,
+        max_sweeps: 16,
+        ..options()
+    };
+    let loose = FitOptions {
+        exposure_mode_prior_sd: 3.0,
+        max_sweeps: 16,
+        ..options()
+    };
+    let tight_fit =
+        fit_controlled(train, &dataset.schema, 1, &sim(), &tight).expect("tight mode fit");
+    let loose_fit =
+        fit_controlled(train, &dataset.schema, 1, &sim(), &loose).expect("loose mode fit");
+    let mode_offset = |fit: &looklab_fit::FitResult, mode: looklab_fit::ExposureModeId| {
+        fit.realization
+            .exposure_offsets
+            .iter()
+            .find(|entry| entry.mode == mode)
+            .map_or(0.0, |entry| entry.offset)
+    };
+    let mut tight_largest = 0.0_f64;
+    let mut loose_largest = 0.0_f64;
+    let mut total_gap = 0.0_f64;
+    let mut non_default = 0usize;
+    for (index, image) in train.iter().enumerate() {
+        if image.exposure_mode == looklab_fit::ExposureModeId(0) {
+            continue;
+        }
+        non_default += 1;
+        let tight_mode = mode_offset(&tight_fit, image.exposure_mode);
+        let loose_mode = mode_offset(&loose_fit, image.exposure_mode);
+        tight_largest = tight_largest.max(tight_mode.abs());
+        loose_largest = loose_largest.max(loose_mode.abs());
+        let tight_total = tight_fit.images[index].exposure + tight_mode;
+        let loose_total = loose_fit.images[index].exposure + loose_mode;
+        total_gap = total_gap.max((tight_total - loose_total).abs());
+    }
+    assert!(
+        non_default >= 2,
+        "fixture must carry non-default exposure modes"
+    );
+    assert!(loose_largest > 0.001, "loose mode offsets {loose_largest}");
+    assert!(
+        tight_largest < loose_largest,
+        "{tight_largest} vs {loose_largest}"
+    );
+    assert!(
+        total_gap < 0.15,
+        "data-identified exposure totals differ by {total_gap}"
+    );
+}
+
+#[test]
+fn capped_hessian_rows_converge_on_a_noisy_fit() {
+    let dataset = controlled_dataset(&config());
+    let library = library_settings();
+    let train = &dataset.images[..library.len()];
+    let capped = FitOptions {
+        hessian_samples: 997,
+        max_sweeps: FitOptions::default().max_sweeps,
+        ..options()
+    };
+    let result =
+        fit_controlled(train, &dataset.schema, 1, &sim(), &capped).expect("capped-row fit");
+    assert_eq!(result.diagnostics.hessian_samples, capped.hessian_samples);
+    assert!(
+        result.diagnostics.converged,
+        "capped noisy fit did not converge after {} evaluations",
+        result.diagnostics.evaluations
+    );
+    let lambdas = result.lambdas;
+    for value in [
+        lambdas.tone,
+        lambdas.tint,
+        lambdas.grl,
+        lambdas.residual,
+        lambdas.response_tone,
+        lambdas.response_tint,
+        lambdas.response_chroma,
+        lambdas.response_hue,
+        lambdas.response_lightness,
+        lambdas.response_wb,
+    ] {
+        assert!(value.is_finite() && value >= 0.0, "lambda {value}");
+    }
+    assert!(result.realization.clip_k.is_finite());
+    for image in &result.images {
+        assert!(image.exposure.is_finite());
+        assert!(image.wb_log_r.is_finite());
+        assert!(image.wb_log_b.is_finite());
+    }
+    let model = result
+        .control_response
+        .as_ref()
+        .expect("control model")
+        .model
+        .clone();
+    let mut errors = Vec::new();
+    for (index, settings) in library.iter().enumerate() {
+        let image = &dataset.images[index];
+        errors.extend(prediction_error(
+            &result.look,
+            &model,
+            image,
+            settings,
+            image.exposure_hint,
+            [0.0, 0.0],
+        ));
+    }
+    assert!(median(errors) <= 2.5);
+}
+
+#[test]
+fn resumed_controlled_fit_keeps_checkpoint_theta() {
+    let dataset = controlled_dataset(&config());
+    let library = library_settings();
+    let train = &dataset.images[..library.len()];
+    let first_options = FitOptions {
+        max_sweeps: 1,
+        ..options()
+    };
+    let (first, mut state) = looklab_fit::fit_controlled_with_history_resumable(
+        train,
+        &dataset.schema,
+        1,
+        &sim(),
+        &first_options,
+        None,
+        None,
+    )
+    .expect("first attempt");
+    assert!(!first.diagnostics.converged);
+    let terminal = state.take().expect("non-converged state");
+    let revised = FitOptions {
+        seed: first_options.seed ^ 0x1234,
+        sweep_budget: 0.0,
+        ..options()
+    };
+    let (resumed, _) = looklab_fit::fit_controlled_with_history_resumable(
+        train,
+        &dataset.schema,
+        1,
+        &sim(),
+        &revised,
+        None,
+        Some(&terminal),
+    )
+    .expect("resume");
+    assert!(
+        first
+            .look
+            .coef_vector()
+            .iter()
+            .zip(resumed.look.coef_vector().iter())
+            .all(|(before, after)| before.to_bits() == after.to_bits()),
+        "resume ran fresh initialization over the restored checkpoint"
+    );
 }
 
 #[test]

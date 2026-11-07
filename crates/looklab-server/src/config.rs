@@ -38,6 +38,48 @@ impl PowConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SiteConfig {
+    /// Built browser distribution served at `/`, with an HTML fallback.
+    pub dist_dir: Option<PathBuf>,
+    /// Directory `looklab-worker` publishes into, served at `/data/`.
+    pub data_dir: Option<PathBuf>,
+}
+
+/// A browser origin allowed to call a backend on another origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorsOrigin(String);
+
+impl CorsOrigin {
+    /// # Errors
+    /// Rejects anything but a bare `http`/`https` origin.
+    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+        let url = webauthn_rs::prelude::Url::parse(value).map_err(|_| ConfigError::Value {
+            name: "cors_origins",
+            value: value.to_owned(),
+        })?;
+        let origin = url.origin().ascii_serialization();
+        if origin != value.trim_end_matches('/') {
+            return Err(ConfigError::Value {
+                name: "cors_origins",
+                value: value.to_owned(),
+            });
+        }
+        Ok(Self(origin))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::fmt::Display for CorsOrigin {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
@@ -53,6 +95,9 @@ struct FileConfig {
     registration_ttl_seconds: u64,
     body_timeout_seconds: u64,
     blob_retention_days: u32,
+    /// Browser origins allowed to call the API.
+    cors_origins: Vec<String>,
+    site: SiteConfig,
     pow: PowConfig,
     limits: LimitsFile,
 }
@@ -104,6 +149,8 @@ impl Default for FileConfig {
             registration_ttl_seconds: 0,
             body_timeout_seconds: 30,
             blob_retention_days: 30,
+            cors_origins: Vec::new(),
+            site: SiteConfig::default(),
             pow: PowConfig::default(),
             limits: LimitsFile::default(),
         }
@@ -124,6 +171,8 @@ pub struct Config {
     pub registration_ttl: Duration,
     pub body_timeout: Duration,
     pub blob_retention_days: u32,
+    pub cors_origins: Vec<CorsOrigin>,
+    pub site: SiteConfig,
     pub pow: PowConfig,
     pub limits: Limits,
 }
@@ -138,6 +187,8 @@ pub enum ConfigError {
     Value { name: &'static str, value: String },
     #[error("{name} is out of range: {value}")]
     Range { name: &'static str, value: String },
+    #[error("the operating system did not provide random bytes")]
+    Random,
 }
 
 impl Config {
@@ -203,6 +254,15 @@ impl Config {
         if let Some(value) = env("LOOKLAB_BLOB_RETENTION_DAYS") {
             self.blob_retention_days = parse_value("LOOKLAB_BLOB_RETENTION_DAYS", &value)?;
         }
+        if let Some(value) = env("LOOKLAB_SITE_DIST") {
+            self.site.dist_dir = Some(PathBuf::from(value));
+        }
+        if let Some(value) = env("LOOKLAB_SITE_DATA") {
+            self.site.data_dir = Some(PathBuf::from(value));
+        }
+        if let Some(value) = env("LOOKLAB_CORS_ORIGINS") {
+            self.cors_origins = parse_cors_origins(&value)?;
+        }
         if let Some(value) = env("LOOKLAB_POW_MEMORY_KIB") {
             self.pow.memory_kib = parse_value("LOOKLAB_POW_MEMORY_KIB", &value)?;
         }
@@ -217,14 +277,28 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        webauthn_rs::prelude::Url::parse(&self.origin).map_err(|_| ConfigError::Value {
-            name: "origin",
-            value: self.origin.clone(),
-        })?;
+        let url =
+            webauthn_rs::prelude::Url::parse(&self.origin).map_err(|_| ConfigError::Value {
+                name: "origin",
+                value: self.origin.clone(),
+            })?;
         if self.rp_id.is_empty() {
             return Err(ConfigError::Value {
                 name: "rp_id",
                 value: self.rp_id.clone(),
+            });
+        }
+        let host = url.host_str().unwrap_or_default();
+        if host != self.rp_id && !host.ends_with(&format!(".{}", self.rp_id)) {
+            return Err(ConfigError::Value {
+                name: "rp_id",
+                value: self.rp_id.clone(),
+            });
+        }
+        if url.scheme() != "https" && host != "localhost" && host != "127.0.0.1" {
+            return Err(ConfigError::Value {
+                name: "origin",
+                value: self.origin.clone(),
             });
         }
         if self.nonce_ttl < Duration::from_secs(60) {
@@ -302,6 +376,8 @@ impl FileConfig {
             registration_ttl: Duration::from_secs(registration_ttl),
             body_timeout: Duration::from_secs(self.body_timeout_seconds),
             blob_retention_days: self.blob_retention_days,
+            cors_origins: parse_cors_origins_list(&self.cors_origins)?,
+            site: self.site,
             pow: self.pow,
             limits,
         })
@@ -322,10 +398,69 @@ where
     })
 }
 
+fn parse_cors_origins(value: &str) -> Result<Vec<CorsOrigin>, ConfigError> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .map(CorsOrigin::parse)
+        .collect()
+}
+
+fn parse_cors_origins_list(values: &[String]) -> Result<Vec<CorsOrigin>, ConfigError> {
+    values
+        .iter()
+        .map(|value| CorsOrigin::parse(value.trim()))
+        .collect()
+}
+
 /// The serial HMAC key: 32 raw bytes or 64 hex characters in a file.
 pub struct ServerSecret([u8; 32]);
 
 impl ServerSecret {
+    /// A created secret is 32 bytes of OS randomness.
+    pub fn load_or_create(path: &Path) -> Result<Self, ConfigError> {
+        match Self::load(path) {
+            Ok(secret) => Ok(secret),
+            Err(ConfigError::File(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                match Self::create(path) {
+                    Ok(secret) => Ok(secret),
+                    Err(ConfigError::File(error))
+                        if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                    {
+                        Self::load(path)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn create(path: &Path) -> Result<Self, ConfigError> {
+        use std::io::Write as _;
+
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).map_err(|_| ConfigError::Random)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        tracing::info!(path = %path.display(), "generated server secret");
+        Ok(Self(bytes))
+    }
+
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let raw = std::fs::read(path)?;
         let bytes = if raw.len() == 32 {
@@ -383,6 +518,15 @@ impl core::fmt::Debug for ServerSecret {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cors_origins_are_bare_http_origins() {
+        let origin = CorsOrigin::parse("https://looklab.example").expect("origin");
+        assert_eq!(origin.as_str(), "https://looklab.example");
+        assert!(CorsOrigin::parse("*").is_err());
+        assert!(CorsOrigin::parse("https://looklab.example/path").is_err());
+        assert!(CorsOrigin::parse("looklab.example").is_err());
+    }
 
     #[test]
     fn secret_reads_hex_and_raw() {

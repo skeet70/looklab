@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 
-use crate::base::{api_url, site_url};
+use crate::base::{api_url, publication_url};
 use crate::proposal_form::FixtureFile;
 use crate::request_digest::{RequestDomain, challenge, request_digest};
 use crate::webauthn::{self, PowParameters, SignedFields};
@@ -98,20 +98,17 @@ async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
     serde_json::from_slice(&bytes).map_err(|error| format!("{path}: {error}"))
 }
 
-/// The site index, verified against the digest embedded in this build.
+/// Verifies the index against the deployment's advertised root.
 pub async fn index() -> Result<SiteIndex, String> {
     if let Some(index) = SITE_INDEX.with(|cache| cache.get().cloned()) {
         return Ok(index);
     }
-    let bytes = get(&site_url("/data/index.json")).await?;
-    let expected = crate::site_root();
-    if expected.is_empty() {
-        return Err("this build has no embedded site root digest".to_owned());
-    }
+    let bytes = get(&publication_url("/data/index.json")).await?;
+    let expected = expected_site_root().await?;
     let actual = ArtifactHash::of(&bytes);
-    if actual.as_str() != expected {
+    if actual.as_str() != expected.as_str() {
         return Err(format!(
-            "site index does not match the embedded root: expected {expected}, got {actual}"
+            "site index does not match the advertised root: expected {expected}, got {actual}"
         ));
     }
     let index: SiteIndex =
@@ -122,12 +119,30 @@ pub async fn index() -> Result<SiteIndex, String> {
     Ok(index)
 }
 
+#[derive(Deserialize)]
+struct SiteRootReply {
+    root: String,
+}
+
+async fn expected_site_root() -> Result<String, String> {
+    if crate::base::server() == crate::base::Server::Preview {
+        let root = crate::site_root();
+        if root.is_empty() {
+            return Err("this build has no embedded site root digest".to_owned());
+        }
+        return Ok(root.to_owned());
+    }
+    get_json::<SiteRootReply>(&crate::base::site_root_url())
+        .await
+        .map(|reply| reply.root)
+}
+
 pub async fn body(make: &str, model: &str) -> Result<BodyPage, String> {
-    get_json(&site_url(&format!("/data/bodies/{make}/{model}.json"))).await
+    get_json(&publication_url(&format!("/data/bodies/{make}/{model}.json"))).await
 }
 
 pub async fn look(slug: &str) -> Result<LookPage, String> {
-    get_json(&site_url(&format!("/data/looks/{slug}.json"))).await
+    get_json(&publication_url(&format!("/data/looks/{slug}.json"))).await
 }
 
 pub async fn proposal(id: &ProposalRef) -> Result<ProposalView, String> {
@@ -135,7 +150,7 @@ pub async fn proposal(id: &ProposalRef) -> Result<ProposalView, String> {
 }
 
 pub async fn audit_log() -> Result<AuditLog, String> {
-    get_json(&site_url("/data/audit-log.json")).await
+    get_json(&publication_url("/data/audit-log.json")).await
 }
 
 pub async fn scenes() -> Result<SceneIndex, String> {
@@ -214,7 +229,7 @@ async fn load_scene(name: &str, thumbnail: bool) -> Result<PreparedScene, String
             summary.height,
         )
     };
-    let bytes = get(&site_url(&format!("/{}", path.as_str()))).await?;
+    let bytes = get(&publication_url(&format!("/{}", path.as_str()))).await?;
     let digest = ArtifactHash::of(&bytes);
     if &digest != hash || bytes.len() as u64 != size {
         return Err(format!(
@@ -293,7 +308,7 @@ async fn verified_manifest(
     version: &str,
     summary: &VersionSummary,
 ) -> Result<VersionManifest, String> {
-    let bytes = get(&site_url(&format!(
+    let bytes = get(&publication_url(&format!(
         "/data/looks/{slug}/{version}/manifest.json"
     )))
     .await?;
@@ -320,7 +335,7 @@ pub async fn preview(slug: &str, version: &str) -> Result<Arc<Vec<u8>>, String> 
         .iter()
         .find(|entry| matches!(LookArtifact::of(&entry.name), LookArtifact::PreviewLut))
         .ok_or_else(|| format!("{slug} {version}: no preview LUT in the manifest"))?;
-    let bytes = get(&site_url(&format!(
+    let bytes = get(&publication_url(&format!(
         "/data/looks/{slug}/{version}/{}",
         entry.name.as_str()
     )))
@@ -344,7 +359,7 @@ pub async fn reference_preview() -> Result<Option<Arc<Vec<u8>>>, String> {
     let Some(preview) = index.reference_preview else {
         return Ok(None);
     };
-    let bytes = get(&site_url(&format!("/{}", preview.path.as_str()))).await?;
+    let bytes = get(&publication_url(&format!("/{}", preview.path.as_str()))).await?;
     if bytes.len() != LUT_BYTES
         || bytes.len() as u64 != preview.bytes
         || ArtifactHash::of(&bytes) != preview.sha256
@@ -367,7 +382,7 @@ pub async fn card(slug: &str, version: &str) -> Result<Vec<u8>, String> {
         .iter()
         .find(|entry| matches!(LookArtifact::of(&entry.name), LookArtifact::Card))
         .ok_or_else(|| format!("{slug} {version}: no card file in the manifest"))?;
-    let bytes = get(&site_url(&format!(
+    let bytes = get(&publication_url(&format!(
         "/data/looks/{slug}/{version}/{}",
         entry.name.as_str()
     )))
@@ -422,7 +437,7 @@ async fn load_version(
         {
             continue;
         }
-        let bytes = get(&site_url(&format!(
+        let bytes = get(&publication_url(&format!(
             "/data/looks/{slug}/{version}/{}",
             entry.name.as_str()
         )))
@@ -686,6 +701,30 @@ struct LookListingRequest<'a> {
     reason: &'a str,
 }
 
+#[derive(Serialize)]
+struct RevertLookRequest<'a> {
+    look: &'a str,
+    target_version: u32,
+    excluded_credentials: &'a [String],
+    reason: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct RevertReceipt {
+    pub look: looklab_upload::LookSlug,
+    pub target_version: u32,
+    pub new_version: u32,
+    pub lut_dependents: Vec<RevertVersionRef>,
+    pub refit_queued: bool,
+    pub reverted_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct RevertVersionRef {
+    pub look: looklab_upload::LookSlug,
+    pub version: u32,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LookListingAction {
     Hide,
@@ -832,6 +871,29 @@ pub async fn set_look_listing(
         .map_err(|error| error.to_string())?;
     let _: EmptyReply = moderation_send(&path, request).await?;
     Ok(())
+}
+
+/// # Errors
+/// Reports a closed session, an unpublished target, or a server rejection.
+pub async fn revert_look(
+    look: &str,
+    target_version: u32,
+    excluded_credentials: &[String],
+    reason: &str,
+) -> Result<RevertReceipt, String> {
+    let token = moderation_token()?;
+    let path = api_url("/api/mod/look/revert");
+    let request = Request::post(&path)
+        .header("Content-Type", "application/json")
+        .header("Authorization", &format!("Bearer {}", token.0))
+        .body(Some(json_body(&RevertLookRequest {
+            look,
+            target_version,
+            excluded_credentials,
+            reason,
+        })?))
+        .map_err(|error| error.to_string())?;
+    moderation_send(&path, request).await
 }
 
 /// # Errors

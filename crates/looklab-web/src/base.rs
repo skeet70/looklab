@@ -56,6 +56,22 @@ pub fn api_url(path: &str) -> String {
     }
 }
 
+/// Where the running deployment advertises its current publication root.
+pub fn site_root_url() -> String {
+    match server() {
+        Server::Remote(origin) => format!("{origin}/data/site-root.json"),
+        Server::Preview | Server::SameOrigin => "/data/site-root.json".to_owned(),
+    }
+}
+
+/// An absolute URL for published catalog data, from the API when one is configured.
+pub fn publication_url(path: &str) -> String {
+    match server() {
+        Server::Preview => site_url(path),
+        Server::SameOrigin | Server::Remote(_) => api_url(path),
+    }
+}
+
 /// The router path for a full `window.location.pathname`.
 pub fn page_path(pathname: &str) -> String {
     path_after_prefix(pathname, public_prefix()).into_owned()

@@ -240,7 +240,7 @@ pub fn MatchPage() -> impl IntoView {
                 })).collect::<Vec<_>>();
                 let items = StoredValue::new(items);
                 view! {
-                    <fieldset class="match-wizard" aria-label="Recipe choices" disabled=move || running.get()>
+                    <fieldset class="match-wizard" aria-label="Look choices" disabled=move || running.get()>
                     <ui::Stepper
                         steps=vec![
                             ui::WizardStep { title: "Your camera".into(), summary: None },
@@ -440,6 +440,7 @@ fn MatchResult(
     let card = reply.card.clone();
     let export_slug = reply.target_slug.to_string();
     let export_version = reply.target_version.to_string();
+    let excluded = excluded_note(&reply.excluded);
     let session = crate::session::use_session();
     let copy = move |_| {
         let text = recipe_text(&copy_card, body.get_untracked().as_ref(), &copy_settings);
@@ -488,6 +489,7 @@ fn MatchResult(
     view! {
         <section class="match-result">
             <h2>{move || heading.get()}</h2>
+            {excluded.map(|note| view! { <p class="muted">{note}</p> })}
             <ui::Notice message="Sample data: these settings use a simulated camera model, not measured camera response. Do not treat this demonstration as a tested recipe.".to_owned()/>
             {move || match preview.get() {
                 Load::Loading => ui::loading().into_any(),
@@ -806,14 +808,10 @@ fn InlineVerification(permalink: String) -> impl IntoView {
         error.set(None);
         spawn_local(async move {
             let result = async {
-                let mut local = Vec::new();
-                for file in files {
-                    let buffer = JsFuture::from(file.array_buffer()).await.map_err(|_| "Could not read this file.")?;
-                    let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
-                    local.push(crate::files::LocalFile { name: file.name(), bytes });
-                }
-                if !local.iter().any(|file| file.bytes.starts_with(&[0xff, 0xd8])) { return Err("Choose JPEGs shot at these settings, together with their original RAW files.".to_owned()); }
-                let pairing = looklab_wasm::inspect_files(&local.iter().map(|file| (file.name.clone(), file.bytes.clone())).collect::<Vec<_>>()).map_err(|error| error.to_string())?;
+                let local = crate::files::selected_files(files);
+                if !local.iter().any(crate::files::LocalFile::is_jpeg) { return Err("Choose JPEGs shot at these settings, together with their original RAW files.".to_owned()); }
+                let scanned = crate::files::scan_metadata(&local).await?;
+                let pairing = looklab_wasm::inspect_metadata(&scanned).map_err(|error| error.to_string())?;
                 if pairing.groups.is_empty() { return Err("Add the original RAW files alongside these JPEGs so their colors can be measured.".into()); }
                 let (groups, _, failures) = crate::pages::contribute::run_files(&pairing, &local, crate::worker::default_worker_count()).await?;
                 if groups.is_empty() { return Err(failures.first().map(|failure| failure.message.clone()).unwrap_or_else(|| "Add the original RAW files alongside these JPEGs so their colors can be measured.".into())); }
@@ -980,6 +978,23 @@ fn preview_cube(bytes: &[u8]) -> Result<String, String> {
         "looklab shaped scene Rec2020 to encoded sRGB",
         [0.0, 1.0],
     ))
+}
+
+fn excluded_note(excluded: &[looklab_publish::ExcludedSim]) -> Option<String> {
+    if excluded.is_empty() {
+        return None;
+    }
+    let items: Vec<String> = excluded
+        .iter()
+        .map(|entry| {
+            let reason = match entry.reason {
+                looklab_publish::SimExclusion::NoPublishedLook => "no published look",
+                looklab_publish::SimExclusion::NoResponse => "no published response",
+            };
+            format!("{} ({reason})", sim_name(&entry.sim))
+        })
+        .collect();
+    Some(format!("Not considered: {}.", items.join(", ")))
 }
 
 fn sim_name(sim: &looklab_schema::SimKey) -> String {

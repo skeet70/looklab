@@ -21,6 +21,7 @@ pub enum ErrorCode {
     PowInvalid,
     BodyUnknown,
     SchemaInvalid,
+    MonochromeUnsupported,
     SnapshotUnknown,
     SnapshotTooOld,
     CredentialUnknown,
@@ -50,6 +51,7 @@ impl ErrorCode {
             Self::PowInvalid => StatusCode::BAD_REQUEST,
             Self::BodyUnknown
             | Self::SchemaInvalid
+            | Self::MonochromeUnsupported
             | Self::SnapshotUnknown
             | Self::SnapshotTooOld => StatusCode::BAD_REQUEST,
             Self::CredentialUnknown => StatusCode::UNAUTHORIZED,
@@ -80,6 +82,7 @@ impl ErrorCode {
             Self::PowInvalid => "POW_INVALID",
             Self::BodyUnknown => "BODY_UNKNOWN",
             Self::SchemaInvalid => "SCHEMA_INVALID",
+            Self::MonochromeUnsupported => "MONOCHROME_UNSUPPORTED",
             Self::SnapshotUnknown => "SNAPSHOT_UNKNOWN",
             Self::SnapshotTooOld => "SNAPSHOT_TOO_OLD",
             Self::CredentialUnknown => "CREDENTIAL_UNKNOWN",
@@ -161,7 +164,12 @@ impl From<crate::admin::AdminError> for ApiError {
             E::Trust(T::UnknownCredential(_)) => ErrorCode::NotFound,
             E::Trust(T::CannotEndorseSeeder(_)) => ErrorCode::Conflict,
             E::Trust(_) => ErrorCode::MalformedEnvelope,
-            E::ProposalDecided | E::ManifestExists | E::LookState(_) => ErrorCode::Conflict,
+            E::ProposalDecided
+            | E::ManifestExists
+            | E::LookState(_)
+            | E::VersionNotPublished
+            | E::CredentialInactive
+            | E::TooManyExclusions => ErrorCode::Conflict,
             E::InvalidReason
             | E::InvalidEvidence
             | E::EmptyScope
@@ -169,7 +177,8 @@ impl From<crate::admin::AdminError> for ApiError {
             | E::IneligibleContribution
             | E::EmptyManifest
             | E::InvalidArtifact(_)
-            | E::InvalidProposal(_) => ErrorCode::MalformedEnvelope,
+            | E::InvalidProposal(_)
+            | E::CyclicBaseDependency => ErrorCode::MalformedEnvelope,
         };
         Self::new(code)
     }

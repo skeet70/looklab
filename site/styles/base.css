@@ -13,6 +13,7 @@ button:disabled { color: var(--muted); cursor: not-allowed; }
 input[type=search], textarea { width: min(34rem, 100%); }
 label { display: block; font-weight: 600; margin-block: .8rem .3rem; }
 main { width: min(78rem, 100%); margin-inline: auto; padding: clamp(1rem, 3vw, 2.5rem); flex: 1; min-width: 0; }
+main:focus { outline: none; }
 h1, h2, h3 { line-height: 1.2; text-wrap: balance; }
 h1 { font-size: var(--text-title); margin-top: 0; letter-spacing: -.035em; }
 h2 { font-size: clamp(1.3rem, 2.5vw, 1.8rem); }

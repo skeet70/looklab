@@ -314,7 +314,8 @@ pub(crate) fn probe_uncertainty(
         }
         fallback
     });
-    let residual_diagonal = residual_inverse_diagonal(residual_samples, lambdas.residual);
+    let residual_diagonal =
+        residual_inverse_diagonal(residual_samples, lambdas.residual, hessian_scale);
     let residual_start = layout.residual.start;
     let residual_prior: Vec<f64> = crate::fit::residual_penalty_diagonal()
         .into_iter()
@@ -653,6 +654,7 @@ pub(crate) fn probe_uncertainty(
             supported_density: flags.density,
             supported_clusters: flags.clusters,
             supported_bias: flags.bias,
+            supported_evidence: false,
             supported: flags.all(),
             clusters,
         });
@@ -762,7 +764,11 @@ fn response_lambda(
     }
 }
 
-fn residual_inverse_diagonal(samples: &[ResidualSample], lambda: f64) -> Vec<f64> {
+fn residual_inverse_diagonal(
+    samples: &[ResidualSample],
+    lambda: f64,
+    hessian_scale: f64,
+) -> Vec<f64> {
     let mut diagonal = vec![0.0_f64; RESIDUAL_COEFS];
     for sample in samples {
         for (m, node) in sample.nodes.iter().enumerate() {
@@ -772,19 +778,21 @@ fn residual_inverse_diagonal(samples: &[ResidualSample], lambda: f64) -> Vec<f64
                 for row in 0..3 {
                     sum += sample.clip.0[row][channel] * sample.clip.0[row][channel];
                 }
-                diagonal[*node as usize * 3 + channel] += sample.alpha * weight * weight * sum;
+                diagonal[*node as usize * 3 + channel] +=
+                    sample.alpha * weight * weight * sum * hessian_scale;
             }
         }
     }
     let identity = crate::fit::identity_weight(crate::layout::BlockKind::Residual);
-    for value in &mut diagonal {
-        *value += identity;
+    let penalty = crate::fit::residual_penalty_diagonal();
+    for (index, value) in diagonal.iter_mut().enumerate() {
+        *value += identity + 2.0 * lambda * penalty[index];
     }
     let peak = diagonal.iter().copied().fold(0.0_f64, f64::max);
     for value in &mut diagonal {
         // Nodes without data stay pinned at zero, so their posterior is degenerate.
-        *value = if *value > 1e-6 * peak && *value + lambda > 0.0 {
-            1.0 / (*value + lambda)
+        *value = if *value > 1e-6 * peak {
+            1.0 / *value
         } else {
             0.0
         };

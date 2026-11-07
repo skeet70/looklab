@@ -5,7 +5,6 @@
 
 use std::error::Error;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use looklab_export::card::{CardMeta, CardOptions, write_card};
@@ -24,11 +23,13 @@ use looklab_model::{
 };
 use looklab_publish::{
     ArtifactBlob, ArtifactHash, ArtifactName, AuditEntry, AuditEvent, AuditLog, BodyExtras,
-    BodyPage, BodyUse, CARD_ARTIFACT, CredentialRef, CredentialTier, DOCUMENT_ARTIFACT, Decision,
-    GateCheck, GateSummary, InputTransformPage, LicensePage, LookListing, LookPage, LookRef,
-    LookStatus, LookVersionPage, PREVIEW_LUT_ARTIFACT, ProposalRef, ProvenanceSummary,
-    RealizationNote, Role, Scene, SceneName, SiteData, SitePath, Timestamp, TransformSource,
-    VersionNotes, VersionRef, WeakSpot, bake_lut, bake_preview_lut, write_site,
+    BodyPage, BodyUse, CARD_ARTIFACT, ConformanceEntry, CredentialRef, CredentialTier,
+    DOCUMENT_ARTIFACT, Decision, ExcludedSim, GateCheck, GateSummary, InputTransformPage,
+    LicensePage, LookListing, LookPage, LookRef, LookStatus, LookVersionPage, MatchBundle,
+    MatchSim, PREVIEW_LUT_ARTIFACT, ProposalRef, ProvenanceSummary, RealizationNote, Role, Scene,
+    SimExclusion, SiteData, SitePath, Timestamp, TransformSource, VersionNotes, VersionRef,
+    WeakSpot, bake_lut, bake_preview_lut, body_artifact, bundle_artifact, sim_artifacts,
+    transform_artifact, write_conformance_pack, write_site,
 };
 use looklab_report::compare::{ComparisonInput, FunctionName, compare};
 use looklab_schema::{BodyId, SimKey, validate_body, validate_control_schema};
@@ -158,7 +159,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let root = write_site(&mut sink, &site)?;
     fs::write(out.join("site-root.txt"), root.as_str())?;
-    publish_conformance_archive(&out)?;
+    publish_conformance_archive(&mut sink)?;
     println!(
         "wrote {}/data ({} bytes of index)",
         out.display(),
@@ -169,55 +170,38 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[derive(serde::Serialize)]
-struct ConformanceArchive {
-    archive: SitePath,
-    sha256: ArtifactHash,
-}
-
-fn publish_conformance_archive(out: &Path) -> Result<(), Box<dyn Error>> {
+fn publish_conformance_archive(
+    sink: &mut impl looklab_publish::SiteSink,
+) -> Result<(), Box<dyn Error>> {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/card/conformance-v1");
-    let archive = SitePath::new("data/developers/conformance-v1.zip")?;
-    let destination = out.join(archive.as_str());
-    fs::create_dir_all(out.join("data/developers"))?;
-    let mut writer = zip::ZipWriter::new(fs::File::create(&destination)?);
-    archive_conformance_directory(&mut writer, &source, &source)?;
-    writer.finish()?;
-    let metadata = ConformanceArchive {
-        archive,
-        sha256: ArtifactHash::of(&fs::read(&destination)?),
-    };
-    fs::write(
-        out.join("data/developers/conformance-v1.json"),
-        serde_json::to_vec_pretty(&metadata)?,
-    )?;
+    let mut entries = Vec::new();
+    collect_conformance_entries(&source, &source, &mut entries)?;
+    write_conformance_pack(sink, &entries)?;
     Ok(())
 }
 
-fn archive_conformance_directory(
-    writer: &mut zip::ZipWriter<fs::File>,
+fn collect_conformance_entries(
     root: &Path,
     directory: &Path,
+    entries: &mut Vec<ConformanceEntry>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut entries = fs::read_dir(directory)?
+    let mut paths = fs::read_dir(directory)?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<Result<Vec<_>, _>>()?;
-    entries.sort();
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored)
-        .last_modified_time(zip::DateTime::default())
-        .unix_permissions(0o644);
-    for path in entries {
+    paths.sort();
+    for path in paths {
         let kind = fs::symlink_metadata(&path)?.file_type();
         if kind.is_dir() {
-            archive_conformance_directory(writer, root, &path)?;
+            collect_conformance_entries(root, &path, entries)?;
         } else if kind.is_file() {
             let relative = path.strip_prefix(root)?;
             let name = relative
                 .to_str()
                 .ok_or("conformance file name is not UTF-8")?;
-            writer.start_file(format!("conformance-v1/{name}"), options)?;
-            writer.write_all(&fs::read(path)?)?;
+            entries.push(ConformanceEntry {
+                path: SitePath::new(name)?,
+                bytes: fs::read(path)?,
+            });
         } else {
             return Err(format!("unsupported conformance entry: {}", path.display()).into());
         }
@@ -287,7 +271,7 @@ fn community_looks() -> Result<Vec<LookPage>, Box<dyn Error>> {
                     maker: "ricoh".to_owned(),
                     rendering: "Cinema (Green)".to_owned(),
                 }),
-                provenance_note: "AI-tool approximation of Ricoh GR stock Cinema (Green) image control, sRGB variant; not graded by a person.",
+                provenance_note: "AI-tool approximation of Ricoh GR stock Cinema (Green) image control, sRGB variant; not graded by a person. Donor revision v3 lowers the brightest near-neutral tones by 1/3 stop.",
                 base_note: Some("base incomplete: film simulation not declared"),
             },
         )?,
@@ -316,13 +300,10 @@ fn community_looks() -> Result<Vec<LookPage>, Box<dyn Error>> {
                 slug: "leica-classic-gold-200",
                 name: "Leica Classic Gold 200",
                 short_name: "Gold 200",
-                description: "Classic Gold 200 from a Leica Classic. The intended base is Fujifilm Eterna at DR200, declared by the donor but not applied (their X-E3 lacks the sim); the preview uses the neutral baseline and the Look is not matchable until the base Look is published.",
+                description: "Unofficial donor-defined Classic Gold 200 grade, not an official Leica rendering or a confirmed emulation of one. The theoretical intended base is Fujifilm Eterna at DR200, declared by the donor but not applied (their X-E3 lacks the sim). The preview uses the neutral baseline and the Look is not matchable until the intended base is measured.",
                 encoding: family_base("Eterna", DynamicRange::Dr200),
-                emulation: Some(LutEmulation::CameraRendering {
-                    maker: "leica".to_owned(),
-                    rendering: "Classic".to_owned(),
-                }),
-                provenance_note: "Intended base declared by the donor; the LUT was authored for this base and not applied on it (donor body X-E3 lacks the sim).",
+                emulation: None,
+                provenance_note: "Unofficial donor-defined grade with no official Leica equivalent. The donor declared Eterna DR200 as the theoretical intended base but did not apply the LUT on it; their X-E3 lacks Eterna.",
                 base_note: Some("base identified, unmeasured: fujifilm / Eterna at DR200"),
             },
         )?,
@@ -563,10 +544,10 @@ fn synthetic_looks(bodies: &[BodyPage]) -> Result<Vec<LookPage>, Box<dyn Error>>
             &data.images,
             &FitOptions {
                 seed,
-                max_sweeps: 12,
                 max_samples_per_image: 2_000,
                 hessian_samples: 8_000,
-                sweep_budget: 3_000_000.0,
+                // Leave room for the full `max_sweeps`; the convergence check is the gate.
+                sweep_budget: 8_000_000.0,
                 run_gcv: true,
                 fit_residual: false,
                 // These captures have calibrated exposure, WB and output clipping.
@@ -577,11 +558,20 @@ fn synthetic_looks(bodies: &[BodyPage]) -> Result<Vec<LookPage>, Box<dyn Error>>
                 ..FitOptions::default()
             },
         )?;
+        if !result.diagnostics.converged {
+            return Err(format!(
+                "{slug}: fit did not converge after {} evaluations",
+                result.diagnostics.evaluations
+            )
+            .into());
+        }
         report_recovery(slug, &data, &result, region);
         let probes = &result.probes.probes;
         let supported = probes.iter().filter(|probe| probe.supported).count();
         println!(
-            "{slug}: supported {}/{}; sigma {}, density {}, clusters {}, bias {}",
+            "{slug}: converged {} in {} evaluations; supported {}/{}; sigma {}, density {}, clusters {}, bias {}",
+            result.diagnostics.converged,
+            result.diagnostics.evaluations,
             supported,
             probes.len(),
             probes.iter().filter(|p| p.supported_sigma).count(),
@@ -670,10 +660,10 @@ fn sample_match_artifacts(
     target: &LookDocument,
     bodies: &[BodyPage],
 ) -> Result<Vec<ArtifactBlob>, Box<dyn Error>> {
-    let synthetic = synth::body(9)?;
-    let base =
-        LookDocument::from_look(target.file.look.clone(), synthetic.model.base_look.clone())?;
-    let base_bytes = base.encode()?;
+    let classic = synth::body(9)?;
+    let classic_key = SimKey::new(synth::SYNTH_SIM)?;
+    let provia_key = SimKey::new("provia")?;
+    let provia = synth::body_for_sim(10, &provia_key)?;
     let transform = serde_norway::to_string(&TransformOut {
         format: "looklab-transform/1",
         version: 1,
@@ -687,43 +677,69 @@ fn sample_match_artifacts(
         let schema =
             validate_control_schema(&camera.schema).map_err(|error| format!("{error:?}"))?;
         for epoch in &camera.epochs {
-            let sim = epoch
-                .native_sims
-                .first()
-                .ok_or("Sample camera has no built-in look.")?;
-            let mut crm = ControlResponseModel::zeroed(&schema, epoch.id, &sim.key, 1)?;
-            if crm.body == synthetic.model.crm.body && epoch.id == synthetic.model.crm.epoch {
-                crm = synthetic.model.crm.clone();
+            let body = schema.body.clone();
+            artifacts.push(ArtifactBlob::new(
+                body_artifact(&body, epoch.id)?,
+                camera.schema.as_bytes().to_vec(),
+            ));
+            artifacts.push(ArtifactBlob::new(
+                transform_artifact(&body, epoch.id)?,
+                transform.as_bytes().to_vec(),
+            ));
+            let mut sims = Vec::new();
+            let mut excluded = Vec::new();
+            for sim in &epoch.native_sims {
+                let model = if sim.key == classic_key {
+                    Some(&classic)
+                } else if sim.key == provia_key {
+                    Some(&provia)
+                } else {
+                    None
+                };
+                let Some(model) = model else {
+                    excluded.push(ExcludedSim {
+                        sim: sim.key.clone(),
+                        reason: SimExclusion::NoPublishedLook,
+                    });
+                    continue;
+                };
+                let base = LookDocument::from_look(
+                    target.file.look.clone(),
+                    model.model.base_look.clone(),
+                )?
+                .encode()?;
+                let crm = if model.model.crm.body == body && model.model.crm.epoch == epoch.id {
+                    model.model.crm.clone()
+                } else {
+                    ControlResponseModel::zeroed(&schema, epoch.id, &sim.key, 1)?
+                };
+                let units = crm.parameter_ids();
+                let count = units.len();
+                let mut covariance = vec![0.0_f64; count * count];
+                for index in 0..count {
+                    covariance[index * count + index] = 1.0e-4;
+                }
+                let covariance = ControlCovariance {
+                    parameter_ids: units,
+                    covariance,
+                }
+                .to_json()?;
+                let names = sim_artifacts(&body, epoch.id, &sim.key)?;
+                artifacts.push(ArtifactBlob::new(names.base.clone(), base));
+                artifacts.push(ArtifactBlob::new(names.crm.clone(), encode_crm(&crm)?));
+                artifacts.push(ArtifactBlob::new(names.covariance.clone(), covariance));
+                sims.push(MatchSim {
+                    sim: sim.key.clone(),
+                    base: names.base,
+                    crm: names.crm,
+                    covariance: Some(names.covariance),
+                });
             }
-            let ids = crm.parameter_ids();
-            let n = ids.len();
-            let mut covariance = vec![0.0_f64; n * n];
-            for index in 0..n {
-                covariance[index * n + index] = 1.0e-4;
-            }
-            let covariance = ControlCovariance {
-                parameter_ids: ids,
-                covariance,
-            }
-            .to_json()?;
-            let crm = encode_crm(&crm)?;
-            let prefix = format!(
-                "match-{}-{}-",
-                camera.id.as_str().replace('/', "-"),
-                epoch.id
-            );
-            for (suffix, bytes) in [
-                ("base.looklab", base_bytes.clone()),
-                ("body.yaml", camera.schema.as_bytes().to_vec()),
-                ("crm.json", crm),
-                ("covariance.json", covariance),
-                ("transform.yaml", transform.as_bytes().to_vec()),
-            ] {
-                artifacts.push(ArtifactBlob::new(
-                    ArtifactName::new(format!("{prefix}{suffix}"))?,
-                    bytes,
-                ));
-            }
+            let bundle = MatchBundle::new(body.clone(), epoch.id, sims, excluded)?;
+            artifacts.push(ArtifactBlob::new(
+                bundle_artifact(&body, epoch.id)?,
+                bundle.to_json()?,
+            ));
         }
     }
     Ok(artifacts)
@@ -1099,271 +1115,16 @@ fn gates() -> Result<GateSummary, Box<dyn Error>> {
     })
 }
 
-#[derive(serde::Deserialize)]
-struct FixtureSources {
-    fixture: Vec<FixtureSource>,
-}
-
-#[derive(serde::Deserialize)]
-struct FixtureSource {
-    file: String,
-    make: String,
-    model: String,
-    source_url: String,
-    license: String,
-    sha256: ArtifactHash,
-    size: u64,
-}
-
-impl FixtureSource {
-    fn credit(&self) -> String {
-        let normalize = |value: &str| {
-            let mut normalized = String::with_capacity(value.len());
-            for word in value.split_whitespace() {
-                if !normalized.is_empty() {
-                    normalized.push(' ');
-                }
-                normalized.push_str(word);
-            }
-            normalized
-        };
-        let make = normalize(&self.make);
-        let model = normalize(&self.model);
-        let camera = if model
-            .get(..make.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&make))
-        {
-            model
-        } else {
-            format!("{make} {model}")
-        };
-        format!("{camera} · raw.pixls.us · CC0")
-    }
-}
-
 fn canonical_scenes() -> Result<Vec<Scene>, Box<dyn Error>> {
-    use looklab_raw::{RawDecoder, RawlerDecoder};
-    let sources: FixtureSources = toml::from_str(include_str!("../../../fixtures/manifest.toml"))?;
     let mut scenes = Vec::new();
     if !std::env::args().any(|arg| arg == "--charts-only") {
-        for (id, title) in [
-            ("3115", "Coastal dunes"),
-            ("1955", "Riverside light"),
-            ("1824", "Autumn canopy"),
-            ("1797", "Blue boat on a green waterway"),
-            ("3094", "Frog among lily pads"),
-            ("1603", "Sunlit brickwork"),
-        ] {
-            let path = format!("fixtures/cache/scene-{id}.dng");
-            let bytes = fs::read(&path).map_err(|e| format!("{path}: {e}. Run tools/fetch-fixtures.sh, or pass --charts-only to omit photos explicitly."))?;
-            let filename = format!("scene-{id}.dng");
-            let source = sources
-                .fixture
-                .iter()
-                .find(|entry| entry.file == filename)
-                .ok_or_else(|| format!("{filename} is missing from fixtures/manifest.toml"))?;
-            if source.sha256 != ArtifactHash::of(&bytes) || source.size != bytes.len() as u64 {
-                return Err(format!(
-                    "{path}: source checksum mismatch. Run tools/fetch-fixtures.sh."
-                )
-                .into());
-            }
-            let raw = RawlerDecoder.decode(&bytes)?;
-            let profile = looklab_body::CameraProfile::from_raw(
-                raw.color_matrices
-                    .as_ref()
-                    .ok_or("RAW has no color matrix")?,
-            )?;
-            let matrix = looklab_body::camera_to_xyz_at_wb(
-                profile.spec(),
-                raw.as_shot_wb.map(|v| v as f32),
-            )?;
-            let mut xyz: Vec<[f32; 3]> = raw
-                .apply_wb()
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .map(|rgb| {
-                    matrix
-                        .mul_vec([rgb[0] as f64, rgb[1] as f64, rgb[2] as f64])
-                        .map(|v| v as f32)
-                })
-                .collect();
-            let mut luminance: Vec<f32> = xyz
-                .iter()
-                .map(|p| p[1])
-                .filter(|y| y.is_finite() && *y > 0.00001)
-                .collect();
-            if luminance.is_empty() {
-                return Err(format!("{path}: no usable luminance").into());
-            }
-            let middle = luminance.len() / 2;
-            luminance.select_nth_unstable_by(middle, f32::total_cmp);
-            let exposure = 0.18 / luminance[middle];
-            for pixel in &mut xyz {
-                for value in pixel {
-                    *value *= exposure;
-                }
-            }
-            let mut scene = Scene::new(
-                SceneName::new(format!("photo-{id}"))?,
-                raw.width as u32,
-                raw.height as u32,
-                xyz,
-            )?
-            .downscale(1000);
-            while scene.to_png()?.len() > 2_500_000 {
-                scene = scene.downscale(scene.width.max(scene.height) * 9 / 10);
-            }
-            scene.kind = looklab_publish::SceneKind::Photo;
-            scene.title = title.to_owned();
-            scene.credit = Some(looklab_publish::SceneCredit {
-                text: source.credit(),
-                source_url: source.source_url.clone(),
-                license: source.license.clone(),
-                source_sha256: source.sha256.clone(),
-            });
-            println!(
-                "photo {id}: {}x{}, orientation {:?}, {} PNG bytes",
-                scene.width,
-                scene.height,
-                raw.orientation,
-                scene.to_png()?.len()
-            );
-            scenes.push(scene);
-        }
+        scenes.extend(looklab_publish::photo::prepare_photo_scenes(
+            include_str!("../../../fixtures/manifest.toml"),
+            Path::new("fixtures/cache"),
+        )?);
     }
-    scenes.extend([gradient_scene(), hue_wheel_scene(), patches_scene()]);
+    scenes.extend(looklab_publish::test_chart_scenes(SIZE)?);
     Ok(scenes)
-}
-
-fn gradient_scene() -> Scene {
-    let colors = [
-        [0.82, 0.18, 0.16],
-        [0.88, 0.55, 0.18],
-        [0.86, 0.82, 0.24],
-        [0.28, 0.62, 0.30],
-        [0.22, 0.44, 0.78],
-        [0.48, 0.28, 0.66],
-    ];
-    let mut xyz = Vec::with_capacity((SIZE * SIZE) as usize);
-    for y in 0..SIZE {
-        let v = y as f64 / (SIZE - 1) as f64;
-        for x in 0..SIZE {
-            let u = x as f64 / (SIZE - 1) as f64;
-            let encoded = if u < 0.5 {
-                let level = 0.002 + 1.0 * (u / 0.5);
-                [level, level, level]
-            } else {
-                let band =
-                    (((u - 0.5) * colors.len() as f64).floor() as usize).min(colors.len() - 1);
-                let shade = 0.10 + 0.90 * (1.0 - v);
-                [
-                    colors[band][0] * shade,
-                    colors[band][1] * shade,
-                    colors[band][2] * shade,
-                ]
-            };
-            xyz.push(encoded_xyz(encoded));
-        }
-    }
-    Scene::new(
-        SceneName::new("gradient").expect("scene name"),
-        SIZE,
-        SIZE,
-        xyz,
-    )
-    .expect("scene")
-}
-
-fn hue_wheel_scene() -> Scene {
-    let mut xyz = Vec::with_capacity((SIZE * SIZE) as usize);
-    let center = (SIZE - 1) as f64 / 2.0;
-    let radius = center;
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let dx = x as f64 - center;
-            let dy = y as f64 - center;
-            let distance = (dx * dx + dy * dy).sqrt() / radius;
-            let angle = libm::atan2(dy, dx);
-            let hue = (angle / (2.0 * core::f64::consts::PI)).rem_euclid(1.0);
-            let saturation = distance.clamp(0.0, 1.0);
-            let value = 1.0 - 0.55 * distance.clamp(0.0, 1.0);
-            let encoded = hsv(hue, saturation, value);
-            xyz.push(encoded_xyz(encoded));
-        }
-    }
-    Scene::new(
-        SceneName::new("hue-wheel").expect("scene name"),
-        SIZE,
-        SIZE,
-        xyz,
-    )
-    .expect("scene")
-}
-
-fn patches_scene() -> Scene {
-    let patches = [
-        ([0.91, 0.76, 0.66], "light skin"),
-        ([0.55, 0.36, 0.26], "deep skin"),
-        ([0.22, 0.42, 0.16], "foliage"),
-        ([0.44, 0.66, 0.92], "sky"),
-        ([0.18, 0.18, 0.18], "neutral 18%"),
-        ([0.92, 0.92, 0.92], "white"),
-        ([0.04, 0.04, 0.04], "black"),
-        ([0.78, 0.12, 0.10], "red"),
-        ([0.16, 0.60, 0.22], "green"),
-        ([0.12, 0.32, 0.78], "blue"),
-        ([0.96, 0.72, 0.28], "highlight"),
-        ([0.10, 0.09, 0.12], "shadow"),
-    ];
-    let cols = 4_u32;
-    let rows = 3_u32;
-    let mut xyz = Vec::with_capacity((SIZE * SIZE) as usize);
-    for y in 0..SIZE {
-        let row = (y * rows / SIZE).min(rows - 1) as usize;
-        let v = (y % (SIZE / rows)) as f64 / (SIZE / rows) as f64;
-        for x in 0..SIZE {
-            let col = (x * cols / SIZE).min(cols - 1) as usize;
-            let patch = patches[(row * cols as usize + col).min(patches.len() - 1)].0;
-            let shade = 0.72 + 0.28 * v;
-            xyz.push(encoded_xyz([
-                patch[0] * shade,
-                patch[1] * shade,
-                patch[2] * shade,
-            ]));
-        }
-    }
-    Scene::new(
-        SceneName::new("patches").expect("scene name"),
-        SIZE,
-        SIZE,
-        xyz,
-    )
-    .expect("scene")
-}
-
-fn encoded_xyz(encoded: [f64; 3]) -> [f32; 3] {
-    let xyz = looklab_color::RgbSpace::Srgb
-        .rgb_encoded_to_xyz(looklab_color::Rgb::new(encoded[0], encoded[1], encoded[2]));
-    [xyz.x as f32, xyz.y as f32, xyz.z as f32]
-}
-
-fn hsv(h: f64, s: f64, v: f64) -> [f64; 3] {
-    let h6 = h * 6.0;
-    let i = h6.floor();
-    let f = h6 - i;
-    let p = v * (1.0 - s);
-    let q = v * (1.0 - s * f);
-    let t = v * (1.0 - s * (1.0 - f));
-    match (i as i64).rem_euclid(6) {
-        0 => [v, t, p],
-        1 => [q, v, p],
-        2 => [p, v, t],
-        3 => [p, q, v],
-        4 => [t, p, v],
-        _ => [v, p, q],
-    }
 }
 
 trait SecondBody {

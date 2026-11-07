@@ -2,6 +2,7 @@
 
 pub mod body;
 pub mod bounties;
+pub mod bundle;
 pub mod cards;
 pub mod clock;
 pub mod config;
@@ -11,6 +12,7 @@ pub mod duplicates;
 pub mod error;
 pub mod gc;
 pub mod jobs;
+pub mod lut_rebase;
 pub mod meta;
 pub mod pool;
 pub mod publish;

@@ -3,14 +3,19 @@
 //! shared by the HTTP API and `looklab-cli admin` ([docs/05 §3 §7 §11], [docs/08 §6]).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::Path;
 use std::str::FromStr;
 
-use looklab_model::file::LookPin;
+use looklab_export::card::{CardMeta, CardOptions, write_card};
+use looklab_model::LookDocument;
+use looklab_model::file::{
+    BaseReference, BaseStatus, CameraRendering, LookPin, LookVersion, LutEmulation,
+};
 use looklab_trust::{
     Actor, ArtifactHash, CredentialId as TrustCredentialId, CredentialState, Endorsement,
-    EvidenceRef, Grant, Reputation, Role, RootAdmission as TrustRootAdmission, RootDataKind,
-    RootSession, RootTarget, Scope, ScopeRule, Tier as TrustTier, TrustError, TrustParams,
-    TrustState, VersionId, admission_eligible,
+    EvidenceRef, Grant, Reputation, RevertPlan, Role, RootAdmission as TrustRootAdmission,
+    RootDataKind, RootSession, RootTarget, Scope, ScopeRule, Tier as TrustTier, TrustError,
+    TrustParams, TrustState, VersionId, admission_eligible,
 };
 use looklab_upload::{ContributionKind as UploadKind, Intent, LookSlug};
 use serde::{Deserialize, Serialize};
@@ -21,6 +26,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::audit::{self, AuditKind};
+use crate::blob::{BlobHash, BlobStore, FsBlobStore};
 use crate::db::now_unix;
 use crate::ids::{
     ContributionId, CredentialId, EndorsementId, GrantId, LookVersionId, ModerationDecisionId,
@@ -37,6 +43,7 @@ const MAX_ARTIFACTS: usize = 256;
 const MAX_ARTIFACT_NAME: usize = 128;
 const MAX_AUDIT_PAGE: i64 = 500;
 const MAX_LIST_PAGE: i64 = 100;
+const MAX_REVERT_EXCLUSIONS: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
@@ -68,6 +75,12 @@ pub enum AdminError {
     InvalidProposal(String),
     #[error("the version is unknown")]
     UnknownVersion,
+    #[error("the version is not a published release")]
+    VersionNotPublished,
+    #[error("the credential is not active")]
+    CredentialInactive,
+    #[error("too many credential exclusions")]
+    TooManyExclusions,
     #[error("the manifest has no artifacts")]
     EmptyManifest,
     #[error("an artifact is invalid: {0}")]
@@ -80,6 +93,8 @@ pub enum AdminError {
     ProposalDecided,
     #[error("the Look is unknown")]
     UnknownLook,
+    #[error("the base would make the LUT depend on itself")]
+    CyclicBaseDependency,
     #[error("the Look is {0}")]
     LookState(&'static str),
     #[error("the stored record is not readable")]
@@ -1023,6 +1038,7 @@ pub struct RootRevocation {
     pub root_admission: RootAdmissionId,
     pub new_versions: Vec<VersionRef>,
     pub regating: Vec<LookVersionId>,
+    pub lut_dependents: Vec<VersionRef>,
 }
 
 pub async fn revoke_root(
@@ -1077,14 +1093,6 @@ pub async fn revoke_root(
             .bind(root_admission.as_str())
             .execute(&mut *conn)
             .await?;
-        let payload = json!({
-            "event": "root_revoked",
-            "actor": actor_text(actor)?,
-            "root_admission": root_admission,
-            "scope": scope,
-            "reason": reason,
-        });
-        audit::insert(&mut conn, AuditKind::RootRevoked, &payload).await?;
 
         let mut looks: BTreeSet<LookSlug> = scope
             .rules
@@ -1156,10 +1164,541 @@ pub async fn revoke_root(
             .into_iter()
             .map(|(id,)| LookVersionId::try_from(id).map_err(|_| AdminError::Corrupt))
             .collect::<Result<Vec<_>, _>>()?;
+        let lut_dependents = affected_lut_dependents_conn(&mut conn, root_admission).await?;
+        mark_lut_dependents_conn(&mut conn, now).await?;
+        enqueue_lut_rebase(&mut conn, now).await?;
+        let payload = json!({
+            "event": "root_revoked",
+            "actor": actor_text(actor)?,
+            "root_admission": root_admission,
+            "scope": scope,
+            "reason": reason,
+            "lut_dependents": &lut_dependents,
+        });
+        audit::insert(&mut conn, AuditKind::RootRevoked, &payload).await?;
         Ok(RootRevocation {
             root_admission: root_admission.clone(),
             new_versions,
             regating,
+            lut_dependents,
+        })
+    }
+    .await;
+    finish(&mut conn, result).await
+}
+
+/// One moderator action: publish the content of `target_version` as a new version,
+/// exclude credentials from later fits, and request an immediate refit (docs/05 §8).
+#[derive(Debug, Clone, Serialize)]
+pub struct RevertRecord {
+    pub look: LookSlug,
+    pub target_version: u32,
+    pub new_version: u32,
+    pub excluded: Vec<CredentialId>,
+    pub lut_dependents: Vec<VersionRef>,
+    pub refit_queued: bool,
+    pub reverted_at: i64,
+}
+
+async fn authorize_moderator(
+    conn: &mut SqliteConnection,
+    actor: Actor,
+) -> Result<(), AdminError> {
+    let Actor::Credential(actor_trust) = actor else {
+        return Ok(());
+    };
+    let state = trust_state(conn).await?;
+    let record = state
+        .credential(actor_trust)
+        .ok_or(AdminError::UnknownCredential)?;
+    if !record.roles.contains(&Role::Moderator) && !record.roles.contains(&Role::Admin) {
+        return Err(AdminError::NotAuthorized);
+    }
+    Ok(())
+}
+
+fn manifest_hash(
+    look: &LookSlug,
+    version: u32,
+    artifacts: &[ManifestArtifact],
+) -> Result<String, AdminError> {
+    let canonical = json!({
+        "look": look,
+        "version": version,
+        "artifacts": artifacts,
+    });
+    let canonical = serde_json::to_vec(&canonical).map_err(|_| AdminError::Corrupt)?;
+    Ok(hex(&Sha256::digest(&canonical)))
+}
+
+const RELEASE_ARTIFACT: &str = "release.json";
+
+const BASE_LOOK_SUFFIX: &str = "-base.looklab";
+
+fn read_artifact_blob(
+    store: &FsBlobStore,
+    artifact: &ManifestArtifact,
+) -> Result<Vec<u8>, AdminError> {
+    let hash = BlobHash::from_hex(&artifact.sha256).ok_or(AdminError::Corrupt)?;
+    let bytes = store
+        .get(hash)
+        .map_err(|_| AdminError::Corrupt)?
+        .ok_or(AdminError::Corrupt)?;
+    if BlobHash::of(&bytes) != hash {
+        return Err(AdminError::Corrupt);
+    }
+    Ok(bytes)
+}
+
+fn put_artifact(
+    store: &FsBlobStore,
+    artifacts: &mut [ManifestArtifact],
+    name: &str,
+    bytes: &[u8],
+) -> Result<bool, AdminError> {
+    let Some(artifact) = artifacts.iter_mut().find(|artifact| artifact.name == name) else {
+        return Ok(false);
+    };
+    let hash = BlobHash::of(bytes);
+    store.put(hash, bytes).map_err(|_| AdminError::Corrupt)?;
+    artifact.sha256 = hash.to_hex();
+    Ok(true)
+}
+
+fn card_meta(look: &LookSlug) -> CardMeta {
+    let short: String = look.as_str().chars().take(27).collect();
+    CardMeta::new(look.as_str(), short)
+}
+
+/// Re-encodes the artifacts that carry a Look identity for the new version.
+fn republish_artifacts(
+    blob_dir: &Path,
+    look: &LookSlug,
+    new_version: u32,
+    anchor: u32,
+    latest_release: Option<&Value>,
+    artifacts: &[ManifestArtifact],
+    now: i64,
+) -> Result<Vec<ManifestArtifact>, AdminError> {
+    let store = FsBlobStore::new(blob_dir).map_err(|_| AdminError::Corrupt)?;
+    let mut artifacts = artifacts.to_vec();
+    let identity = format!("{new_version}.0.0");
+    let anchor_text = format!("{anchor}.0.0");
+    let look_artifact = artifacts
+        .iter()
+        .find(|artifact| artifact.name == looklab_publish::DOCUMENT_ARTIFACT)
+        .cloned()
+        .ok_or(AdminError::Corrupt)?;
+    let bytes = read_artifact_blob(&store, &look_artifact)?;
+    let mut document = LookDocument::decode(&bytes).map_err(|_| AdminError::Corrupt)?;
+    document.file.look.version =
+        LookVersion::new(identity.clone()).map_err(|_| AdminError::Corrupt)?;
+    document.file.provenance.root.anchor_version = anchor_text.clone();
+    let document_bytes = document.encode().map_err(|_| AdminError::Corrupt)?;
+    put_artifact(
+        &store,
+        &mut artifacts,
+        looklab_publish::DOCUMENT_ARTIFACT,
+        &document_bytes,
+    )?;
+    if artifacts
+        .iter()
+        .any(|artifact| artifact.name == looklab_publish::CARD_ARTIFACT)
+    {
+        let card = write_card(&document, &card_meta(look), &CardOptions::default())
+            .map_err(|_| AdminError::Corrupt)?;
+        put_artifact(
+            &store,
+            &mut artifacts,
+            looklab_publish::CARD_ARTIFACT,
+            &card,
+        )?;
+    }
+    if let Some(release_artifact) = artifacts
+        .iter()
+        .find(|artifact| artifact.name == RELEASE_ARTIFACT)
+        .cloned()
+    {
+        let bytes = read_artifact_blob(&store, &release_artifact)?;
+        let mut release: Value =
+            serde_json::from_slice(&bytes).map_err(|_| AdminError::Corrupt)?;
+        let Value::Object(fields) = &mut release else {
+            return Err(AdminError::Corrupt);
+        };
+        fields.insert("version".to_owned(), json!(new_version));
+        fields.insert("anchor".to_owned(), json!(anchor));
+        fields.insert("created_at".to_owned(), json!(now));
+        if let Some(gated) = latest_release.and_then(|value| value.get("gated_since_anchor")) {
+            fields.insert("gated_since_anchor".to_owned(), gated.clone());
+        }
+        if let Some(provenance) = fields.get_mut("provenance").and_then(Value::as_object_mut) {
+            provenance.insert("anchor_version".to_owned(), json!(anchor_text.as_str()));
+        }
+        let bytes = serde_json::to_vec(&release).map_err(|_| AdminError::Corrupt)?;
+        put_artifact(&store, &mut artifacts, RELEASE_ARTIFACT, &bytes)?;
+    }
+    let base_names: Vec<String> = artifacts
+        .iter()
+        .filter(|artifact| artifact.name.ends_with(BASE_LOOK_SUFFIX))
+        .map(|artifact| artifact.name.clone())
+        .collect();
+    for name in base_names {
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.name == name)
+            .cloned()
+            .ok_or(AdminError::Corrupt)?;
+        let bytes = read_artifact_blob(&store, &artifact)?;
+        let mut base = LookDocument::decode(&bytes).map_err(|_| AdminError::Corrupt)?;
+        if base.file.look.slug.as_str() != look.as_str() {
+            continue;
+        }
+        base.file.look.version =
+            LookVersion::new(identity.clone()).map_err(|_| AdminError::Corrupt)?;
+        base.file.provenance.root.anchor_version = anchor_text.clone();
+        let bytes = base.encode().map_err(|_| AdminError::Corrupt)?;
+        put_artifact(&store, &mut artifacts, &name, &bytes)?;
+    }
+    Ok(artifacts)
+}
+
+async fn current_anchor(
+    conn: &mut SqliteConnection,
+    look: &LookSlug,
+) -> Result<Option<u32>, AdminError> {
+    let mut candidates = Vec::new();
+    let first_rooted: Option<i64> = sqlx::query_scalar(
+        "SELECT MIN(version) FROM look_versions WHERE look = ? AND status = 'rooted'",
+    )
+    .bind(look.as_str())
+    .fetch_one(&mut *conn)
+    .await?;
+    if let Some(version) = first_rooted.and_then(|version| u32::try_from(version).ok()) {
+        candidates.push(version);
+    }
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT payload FROM audit_log WHERE type = 're_anchor'")
+            .fetch_all(&mut *conn)
+            .await?;
+    for (payload,) in rows {
+        let value: Value = serde_json::from_str(&payload).map_err(|_| AdminError::Corrupt)?;
+        if value.get("look").and_then(Value::as_str) != Some(look.as_str()) {
+            continue;
+        }
+        if let Some(version) = value
+            .get("version")
+            .and_then(Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+        {
+            candidates.push(version);
+        }
+    }
+    Ok(candidates.into_iter().max())
+}
+
+async fn latest_release_value(
+    conn: &mut SqliteConnection,
+    blob_dir: &Path,
+    look: &LookSlug,
+) -> Result<Option<Value>, AdminError> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT m.artifacts FROM look_versions v
+         JOIN version_manifests m ON m.look_version_id = v.id
+         WHERE v.look = ? AND v.status IN ('published', 'rooted')
+         ORDER BY v.version DESC LIMIT 1",
+    )
+    .bind(look.as_str())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((artifacts,)) = row else {
+        return Ok(None);
+    };
+    let artifacts: Vec<ManifestArtifact> =
+        serde_json::from_str(&artifacts).map_err(|_| AdminError::Corrupt)?;
+    let Some(release) = artifacts
+        .iter()
+        .find(|artifact| artifact.name == RELEASE_ARTIFACT)
+    else {
+        return Ok(None);
+    };
+    let store = FsBlobStore::new(blob_dir).map_err(|_| AdminError::Corrupt)?;
+    let bytes = read_artifact_blob(&store, release)?;
+    Ok(Some(
+        serde_json::from_slice(&bytes).map_err(|_| AdminError::Corrupt)?,
+    ))
+}
+
+async fn enqueue_revert_refit(
+    conn: &mut SqliteConnection,
+    now: i64,
+) -> Result<bool, AdminError> {
+    let queued: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = ? AND status = 'queued'")
+            .bind(crate::store::JobKind::RevertRefit.as_str())
+            .fetch_one(&mut *conn)
+            .await?;
+    if queued > 0 {
+        return Ok(false);
+    }
+    crate::store::enqueue_job(conn, crate::store::JobKind::RevertRefit, "{}", now).await?;
+    Ok(true)
+}
+
+pub async fn revert(
+    db: &SqlitePool,
+    blob_dir: &Path,
+    actor: Actor,
+    look: &LookSlug,
+    target_version: u32,
+    excluded: &[CredentialId],
+    reason: &str,
+) -> Result<RevertRecord, AdminError> {
+    let reason = normalize_reason(reason)?;
+    let mut excluded = excluded.to_vec();
+    excluded.sort();
+    excluded.dedup();
+    if excluded.len() > MAX_REVERT_EXCLUSIONS {
+        return Err(AdminError::TooManyExclusions);
+    }
+    let mut conn = begin_write(db).await?;
+    let result = async {
+        authorize_moderator(&mut conn, actor).await?;
+
+        let source: Option<(String, String)> = sqlx::query_as(
+            "SELECT v.id, m.artifacts FROM look_versions v
+             JOIN version_manifests m ON m.look_version_id = v.id
+             WHERE v.look = ? AND v.version = ? AND v.status IN ('published', 'rooted')",
+        )
+        .bind(look.as_str())
+        .bind(i64::from(target_version))
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some((source_id, artifacts_text)) = source else {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM look_versions WHERE look = ? AND version = ?",
+            )
+            .bind(look.as_str())
+            .bind(i64::from(target_version))
+            .fetch_one(&mut *conn)
+            .await?;
+            if exists == 0 {
+                return Err(AdminError::UnknownVersion);
+            }
+            return Err(AdminError::VersionNotPublished);
+        };
+        let source_id = LookVersionId::try_from(source_id).map_err(|_| AdminError::Corrupt)?;
+        let artifacts: Vec<ManifestArtifact> =
+            serde_json::from_str(&artifacts_text).map_err(|_| AdminError::Corrupt)?;
+        let artifacts = normalize_artifacts(&artifacts)?;
+
+        for credential in &excluded {
+            let verified: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM credentials WHERE id = ? AND status = 'active'",
+            )
+            .bind(credential.as_str())
+            .fetch_one(&mut *conn)
+            .await?;
+            if verified == 0 {
+                let exists: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM credentials WHERE id = ?")
+                        .bind(credential.as_str())
+                        .fetch_one(&mut *conn)
+                        .await?;
+                if exists == 0 {
+                    return Err(AdminError::UnknownCredential);
+                }
+                return Err(AdminError::CredentialInactive);
+            }
+        }
+
+        let now = now_unix();
+        let version = next_version(&mut conn, look).await?;
+        let target_artifacts = artifacts;
+        let latest_release = latest_release_value(&mut *conn, blob_dir, look).await?;
+        let anchor = current_anchor(&mut *conn, look)
+            .await?
+            .or_else(|| {
+                latest_release
+                    .as_ref()
+                    .and_then(|value| value.get("anchor"))
+                    .and_then(Value::as_u64)
+                    .and_then(|anchor| u32::try_from(anchor).ok())
+            })
+            .unwrap_or_else(|| version.get());
+        let artifacts = normalize_artifacts(&republish_artifacts(
+            blob_dir,
+            look,
+            version.get(),
+            anchor,
+            latest_release.as_ref(),
+            &target_artifacts,
+            now,
+        )?)?;
+        let version_id = LookVersionId::new();
+        let changelog = if excluded.is_empty() {
+            format!("Reverted to version {target_version}.")
+        } else {
+            format!(
+                "Reverted to version {target_version} and excluded {} contributor(s) from the refit.",
+                excluded.len()
+            )
+        };
+        sqlx::query(
+            "INSERT INTO look_versions (id, look, version, status, changelog, created_at)
+             VALUES (?, ?, ?, 'published', ?, ?)",
+        )
+        .bind(version_id.as_str())
+        .bind(look.as_str())
+        .bind(i64::from(version.get()))
+        .bind(&changelog)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+        let artifact_json = serde_json::to_string(&artifacts).map_err(|_| AdminError::Corrupt)?;
+        sqlx::query(
+            "INSERT INTO version_manifests (look_version_id, artifacts, created_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(version_id.as_str())
+        .bind(&artifact_json)
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+        let new_manifest_sha256 = manifest_hash(look, version.get(), &artifacts)?;
+        let manifest_payload = json!({
+            "event": "release_manifest",
+            "look": look,
+            "version": version.get(),
+            "manifest_sha256": new_manifest_sha256,
+        });
+        audit::insert(&mut *conn, AuditKind::ReleaseManifest, &manifest_payload).await?;
+        sqlx::query(
+            "INSERT INTO version_depends_on_root (look_version_id, root_admission_id)
+             SELECT ?, root_admission_id FROM version_depends_on_root
+             WHERE look_version_id = ?",
+        )
+        .bind(version_id.as_str())
+        .bind(source_id.as_str())
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "INSERT INTO lut_base_pins
+             (look, version, base, base_status, base_look, base_version, recorded_at)
+             SELECT look, ?, base, base_status, base_look, base_version, ?
+             FROM lut_base_pins WHERE look = ? AND version = ?",
+        )
+        .bind(i64::from(version.get()))
+        .bind(now)
+        .bind(look.as_str())
+        .bind(i64::from(target_version))
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "INSERT INTO lut_native_renderings (look, version, maker, rendering, published_at)
+             SELECT look, ?, maker, rendering, ? FROM lut_native_renderings
+             WHERE look = ? AND version = ?",
+        )
+        .bind(i64::from(version.get()))
+        .bind(now)
+        .bind(look.as_str())
+        .bind(i64::from(target_version))
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "INSERT INTO release_body_params (look, version, body, stage, params, created_at)
+             SELECT look, ?, body, stage, params, ? FROM release_body_params
+             WHERE look = ? AND version = ?",
+        )
+        .bind(i64::from(version.get()))
+        .bind(now)
+        .bind(look.as_str())
+        .bind(i64::from(target_version))
+        .execute(&mut *conn)
+        .await?;
+
+        for credential in &excluded {
+            sqlx::query(
+                "INSERT INTO look_credential_exclusions
+                 (look, credential_id, target_version, reverted_version, reason, excluded_at)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT (look, credential_id) DO UPDATE SET
+                   target_version = excluded.target_version,
+                   reverted_version = excluded.reverted_version,
+                   reason = excluded.reason,
+                   excluded_at = excluded.excluded_at",
+            )
+            .bind(look.as_str())
+            .bind(credential.as_str())
+            .bind(i64::from(target_version))
+            .bind(i64::from(version.get()))
+            .bind(&reason)
+            .bind(now)
+            .execute(&mut *conn)
+            .await?;
+        }
+
+        let lut_dependents = mark_lut_dependents_conn(&mut *conn, now).await?;
+        enqueue_lut_rebase(&mut *conn, now).await?;
+
+        let target_contributors: Vec<(String,)> = sqlx::query_as(
+            "SELECT credential_id FROM release_reputation_applied
+             WHERE look = ? AND version = ?",
+        )
+        .bind(look.as_str())
+        .bind(i64::from(target_version))
+        .fetch_all(&mut *conn)
+        .await?;
+        let target: HashSet<String> = target_contributors.into_iter().map(|(id,)| id).collect();
+        let excluded_contributors_of_target = excluded
+            .iter()
+            .filter(|credential| target.contains(credential.as_str()))
+            .map(trust_id)
+            .collect::<Result<Vec<_>, _>>()?;
+        let plan = RevertPlan {
+            target_version: VersionId::new(target_version),
+            publish_as_new: ArtifactHash::from_str(&manifest_hash(
+                look,
+                target_version,
+                &target_artifacts,
+            )?)
+            .map_err(|_| AdminError::Corrupt)?,
+            refit_excluding: excluded.iter().map(trust_id).collect::<Result<Vec<_>, _>>()?,
+            excluded_contributors_of_target,
+        };
+        let payload = json!({
+            "event": "revert",
+            "actor": actor_text(actor)?,
+            "look": look,
+            "reason": reason,
+            "plan": plan,
+        });
+        audit::insert(&mut conn, AuditKind::Revert, &payload).await?;
+
+        sqlx::query(
+            "INSERT INTO look_refit_requests (look, generation, reverted_version, requested_at)
+             VALUES (?, 1, ?, ?)
+             ON CONFLICT (look) DO UPDATE SET
+               generation = look_refit_requests.generation + 1,
+               reverted_version = excluded.reverted_version,
+               requested_at = excluded.requested_at",
+        )
+        .bind(look.as_str())
+        .bind(i64::from(version.get()))
+        .bind(now)
+        .execute(&mut *conn)
+        .await?;
+
+        crate::store::request_publication(&mut *conn).await?;
+        let refit_queued = enqueue_revert_refit(&mut *conn, now).await?;
+
+        Ok(RevertRecord {
+            look: look.clone(),
+            target_version,
+            new_version: version.get(),
+            excluded,
+            lut_dependents,
+            refit_queued,
+            reverted_at: now,
         })
     }
     .await;
@@ -1351,97 +1890,100 @@ pub async fn write_version_manifest(
     artifacts: &[ManifestArtifact],
     depends_on_root: &[RootAdmissionId],
 ) -> Result<ManifestRecord, AdminError> {
+    let mut conn = begin_write(db).await?;
+    let result =
+        write_version_manifest_conn(&mut conn, look, version, artifacts, depends_on_root).await;
+    finish(&mut conn, result).await
+}
+
+pub async fn write_version_manifest_conn(
+    conn: &mut SqliteConnection,
+    look: &LookSlug,
+    version: VersionId,
+    artifacts: &[ManifestArtifact],
+    depends_on_root: &[RootAdmissionId],
+) -> Result<ManifestRecord, AdminError> {
     let artifacts = normalize_artifacts(artifacts)?;
     let mut depends_on_root = depends_on_root.to_vec();
     depends_on_root.sort();
     depends_on_root.dedup();
 
-    let mut conn = begin_write(db).await?;
-    let result = async {
-        for root in &depends_on_root {
-            let exists: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM root_admissions WHERE id = ?")
-                    .bind(root.as_str())
-                    .fetch_one(&mut *conn)
-                    .await?;
-            if exists == 0 {
-                return Err(AdminError::UnknownRootAdmission);
-            }
+    for root in &depends_on_root {
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM root_admissions WHERE id = ?")
+            .bind(root.as_str())
+            .fetch_one(&mut *conn)
+            .await?;
+        if exists == 0 {
+            return Err(AdminError::UnknownRootAdmission);
         }
-        let now = now_unix();
+    }
+    let now = now_unix();
+    sqlx::query(
+        "INSERT INTO look_versions (id, look, version, status, changelog, created_at)
+         VALUES (?, ?, ?, 'published', NULL, ?)
+         ON CONFLICT (look, version) DO NOTHING",
+    )
+    .bind(LookVersionId::new().as_str())
+    .bind(look.as_str())
+    .bind(version.get())
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+    let row: (String, String, i64) = sqlx::query_as(
+        "SELECT id, status, created_at FROM look_versions WHERE look = ? AND version = ?",
+    )
+    .bind(look.as_str())
+    .bind(version.get())
+    .fetch_one(&mut *conn)
+    .await?;
+    let (version_id, status, created_at) = row;
+    let status = parse_version_status(&status)?;
+    let version_id = LookVersionId::try_from(version_id).map_err(|_| AdminError::Corrupt)?;
+    let existing: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM version_manifests WHERE look_version_id = ?")
+            .bind(version_id.as_str())
+            .fetch_one(&mut *conn)
+            .await?;
+    if existing > 0 {
+        return Err(AdminError::ManifestExists);
+    }
+    let artifact_json = serde_json::to_string(&artifacts).map_err(|_| AdminError::Corrupt)?;
+    sqlx::query(
+        "INSERT INTO version_manifests (look_version_id, artifacts, created_at)
+         VALUES (?, ?, ?)",
+    )
+    .bind(version_id.as_str())
+    .bind(&artifact_json)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+    for root in &depends_on_root {
         sqlx::query(
-            "INSERT INTO look_versions (id, look, version, status, changelog, created_at)
-             VALUES (?, ?, ?, 'published', NULL, ?)
-             ON CONFLICT (look, version) DO NOTHING",
-        )
-        .bind(LookVersionId::new().as_str())
-        .bind(look.as_str())
-        .bind(version.get())
-        .bind(now)
-        .execute(&mut *conn)
-        .await?;
-        let row: (String, String, i64) = sqlx::query_as(
-            "SELECT id, status, created_at FROM look_versions WHERE look = ? AND version = ?",
-        )
-        .bind(look.as_str())
-        .bind(version.get())
-        .fetch_one(&mut *conn)
-        .await?;
-        let (version_id, status, created_at) = row;
-        let status = parse_version_status(&status)?;
-        let version_id = LookVersionId::try_from(version_id).map_err(|_| AdminError::Corrupt)?;
-        let existing: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM version_manifests WHERE look_version_id = ?")
-                .bind(version_id.as_str())
-                .fetch_one(&mut *conn)
-                .await?;
-        if existing > 0 {
-            return Err(AdminError::ManifestExists);
-        }
-        let artifact_json = serde_json::to_string(&artifacts).map_err(|_| AdminError::Corrupt)?;
-        sqlx::query(
-            "INSERT INTO version_manifests (look_version_id, artifacts, created_at)
-             VALUES (?, ?, ?)",
+            "INSERT INTO version_depends_on_root (look_version_id, root_admission_id)
+             VALUES (?, ?) ON CONFLICT DO NOTHING",
         )
         .bind(version_id.as_str())
-        .bind(&artifact_json)
-        .bind(now)
+        .bind(root.as_str())
         .execute(&mut *conn)
         .await?;
-        for root in &depends_on_root {
-            sqlx::query(
-                "INSERT INTO version_depends_on_root (look_version_id, root_admission_id)
-                 VALUES (?, ?) ON CONFLICT DO NOTHING",
-            )
-            .bind(version_id.as_str())
-            .bind(root.as_str())
-            .execute(&mut *conn)
-            .await?;
-        }
-        let canonical = json!({
-            "look": look,
-            "version": version.get(),
-            "artifacts": artifacts,
-        });
-        let canonical = serde_json::to_vec(&canonical).map_err(|_| AdminError::Corrupt)?;
-        let manifest_sha256 = hex(&Sha256::digest(&canonical));
-        let payload = json!({
-            "event": "release_manifest",
-            "look": look,
-            "version": version.get(),
-            "manifest_sha256": manifest_sha256,
-        });
-        audit::insert(&mut conn, AuditKind::ReleaseManifest, &payload).await?;
-        Ok(ManifestRecord {
-            look: look.clone(),
-            version: version.get(),
-            status,
-            artifacts: artifacts.clone(),
-            created_at,
-        })
     }
-    .await;
-    finish(&mut conn, result).await
+    mark_lut_dependents_conn(&mut *conn, now).await?;
+    enqueue_lut_rebase(&mut *conn, now).await?;
+    let manifest_sha256 = manifest_hash(look, version.get(), &artifacts)?;
+    let payload = json!({
+        "event": "release_manifest",
+        "look": look,
+        "version": version.get(),
+        "manifest_sha256": manifest_sha256,
+    });
+    audit::insert(&mut *conn, AuditKind::ReleaseManifest, &payload).await?;
+    Ok(ManifestRecord {
+        look: look.clone(),
+        version: version.get(),
+        status,
+        artifacts: artifacts.clone(),
+        created_at,
+    })
 }
 
 pub async fn manifest_record(
@@ -1470,6 +2012,530 @@ pub async fn manifest_record(
         artifacts,
         created_at,
     })
+}
+
+/// The display base a published `lut_defined` version was fitted against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LutBasePin {
+    pub look: LookSlug,
+    pub version: u32,
+    pub base: BaseReference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LutRebaseReason {
+    BasePublished,
+    BaseRevoked,
+    FamilyResolved,
+}
+
+impl LutRebaseReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BasePublished => "base_published",
+            Self::BaseRevoked => "base_revoked",
+            Self::FamilyResolved => "family_resolved",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, AdminError> {
+        match value {
+            "base_published" => Ok(Self::BasePublished),
+            "base_revoked" => Ok(Self::BaseRevoked),
+            "family_resolved" => Ok(Self::FamilyResolved),
+            _ => Err(AdminError::Corrupt),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LutRebaseWork {
+    pub look: LookSlug,
+    pub version: u32,
+    pub reason: LutRebaseReason,
+}
+
+/// The major component of a Look version, matching `look_versions.version`.
+fn version_number(version: &LookVersion) -> Result<u32, AdminError> {
+    version
+        .as_str()
+        .split('.')
+        .next()
+        .and_then(|major| major.parse().ok())
+        .ok_or(AdminError::Corrupt)
+}
+
+pub async fn record_lut_base(
+    db: &SqlitePool,
+    look: &LookSlug,
+    version: u32,
+    base: &BaseReference,
+    status: &BaseStatus,
+) -> Result<(), AdminError> {
+    let mut conn = begin_write(db).await?;
+    let result = record_lut_base_conn(&mut conn, look, version, base, status).await;
+    finish(&mut conn, result).await
+}
+
+pub async fn record_lut_base_conn(
+    conn: &mut SqliteConnection,
+    look: &LookSlug,
+    version: u32,
+    base: &BaseReference,
+    status: &BaseStatus,
+) -> Result<(), AdminError> {
+    let (base_look, base_version) = match base {
+        BaseReference::Look { slug, version } => (
+            Some(slug.as_str().to_owned()),
+            version_number(version).ok().map(i64::from),
+        ),
+        _ => (None, None),
+    };
+    if let BaseReference::Look { slug, version } = base
+        && base_reaches_look(
+            conn,
+            slug.as_str(),
+            version_number(version).ok(),
+            look.as_str(),
+        )
+        .await?
+    {
+        return Err(AdminError::CyclicBaseDependency);
+    }
+    sqlx::query(
+        "INSERT INTO lut_base_pins
+         (look, version, base, base_status, base_look, base_version, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (look, version) DO UPDATE SET
+           base = excluded.base,
+           base_status = excluded.base_status,
+           base_look = excluded.base_look,
+           base_version = excluded.base_version",
+    )
+    .bind(look.as_str())
+    .bind(i64::from(version))
+    .bind(serde_json::to_string(base).map_err(|_| AdminError::Corrupt)?)
+    .bind(serde_json::to_string(status).map_err(|_| AdminError::Corrupt)?)
+    .bind(base_look)
+    .bind(base_version)
+    .bind(now_unix())
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+async fn base_reaches_look(
+    conn: &mut SqliteConnection,
+    base_look: &str,
+    base_version: Option<u32>,
+    target: &str,
+) -> Result<bool, AdminError> {
+    let mut current = Some((base_look.to_owned(), base_version));
+    let mut seen = HashSet::new();
+    while let Some((look, version)) = current {
+        if look == target {
+            return Ok(true);
+        }
+        let Some(version) = version else {
+            return Ok(false);
+        };
+        if !seen.insert((look.clone(), version)) {
+            return Ok(true);
+        }
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT base FROM lut_base_pins WHERE look = ? AND version = ?")
+                .bind(&look)
+                .bind(i64::from(version))
+                .fetch_optional(&mut *conn)
+                .await?;
+        let Some((base,)) = row else {
+            return Ok(false);
+        };
+        let base: BaseReference = serde_json::from_str(&base).map_err(|_| AdminError::Corrupt)?;
+        current = match base {
+            BaseReference::Look { slug, version } => {
+                Some((slug.as_str().to_owned(), version_number(&version).ok()))
+            }
+            _ => None,
+        };
+    }
+    Ok(false)
+}
+
+pub async fn record_native_rendering(
+    db: &SqlitePool,
+    look: &LookSlug,
+    version: u32,
+    rendering: &CameraRendering,
+) -> Result<(), AdminError> {
+    sqlx::query(
+        "INSERT INTO lut_native_renderings (look, version, maker, rendering, published_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (look, version) DO UPDATE SET
+           maker = excluded.maker,
+           rendering = excluded.rendering",
+    )
+    .bind(look.as_str())
+    .bind(i64::from(version))
+    .bind(&rendering.maker)
+    .bind(&rendering.name)
+    .bind(now_unix())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+pub async fn lut_base_pin(
+    db: &SqlitePool,
+    look: &LookSlug,
+    version: u32,
+) -> Result<Option<LutBasePin>, AdminError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT base FROM lut_base_pins WHERE look = ? AND version = ?")
+            .bind(look.as_str())
+            .bind(i64::from(version))
+            .fetch_optional(db)
+            .await?;
+    let Some((base,)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(LutBasePin {
+        look: look.clone(),
+        version,
+        base: serde_json::from_str(&base).map_err(|_| AdminError::Corrupt)?,
+    }))
+}
+
+pub async fn pending_lut_rebases(db: &SqlitePool) -> Result<Vec<LutRebaseWork>, AdminError> {
+    let rows: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT look, version, reason FROM lut_rebase_pending ORDER BY look, version",
+    )
+    .fetch_all(db)
+    .await?;
+    rows.into_iter()
+        .map(|(look, version, reason)| {
+            Ok(LutRebaseWork {
+                look: LookSlug::try_from(look).map_err(|_| AdminError::Corrupt)?,
+                version: u32::try_from(version).map_err(|_| AdminError::Corrupt)?,
+                reason: LutRebaseReason::parse(&reason)?,
+            })
+        })
+        .collect()
+}
+
+pub async fn clear_lut_rebase_pending(
+    db: &SqlitePool,
+    look: &LookSlug,
+    version: u32,
+) -> Result<(), AdminError> {
+    let mut conn = db.acquire().await?;
+    clear_lut_rebase_pending_conn(&mut conn, look, version).await
+}
+
+pub async fn clear_lut_rebase_pending_conn(
+    conn: &mut SqliteConnection,
+    look: &LookSlug,
+    version: u32,
+) -> Result<(), AdminError> {
+    sqlx::query("DELETE FROM lut_rebase_pending WHERE look = ? AND version = ?")
+        .bind(look.as_str())
+        .bind(i64::from(version))
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Published versions whose root was revoked, plus their transitive LUT dependents.
+pub async fn invalidated_versions(db: &SqlitePool) -> Result<Vec<VersionRef>, AdminError> {
+    let mut conn = db.acquire().await?;
+    invalidated_versions_conn(&mut conn).await
+}
+
+pub async fn invalidated_versions_conn(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<VersionRef>, AdminError> {
+    invalidated_set_conn(&mut *conn)
+        .await?
+        .into_iter()
+        .map(|(look, version)| {
+            Ok(VersionRef {
+                look: LookSlug::try_from(look).map_err(|_| AdminError::Corrupt)?,
+                version,
+            })
+        })
+        .collect()
+}
+
+async fn invalidated_set_conn(
+    conn: &mut SqliteConnection,
+) -> Result<BTreeSet<(String, u32)>, AdminError> {
+    let pins = pins_conn(&mut *conn).await?;
+    let revoked: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT DISTINCT v.look, v.version FROM version_depends_on_root d
+         JOIN look_versions v ON v.id = d.look_version_id
+         JOIN root_admissions r ON r.id = d.root_admission_id
+         WHERE r.revoked_at IS NOT NULL",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut invalid: BTreeSet<(String, u32)> = BTreeSet::new();
+    for (look, version) in revoked {
+        invalid.insert((
+            look,
+            u32::try_from(version).map_err(|_| AdminError::Corrupt)?,
+        ));
+    }
+    loop {
+        let mut changed = false;
+        for (look, version, base) in &pins {
+            if let BaseReference::Look {
+                slug,
+                version: pinned,
+            } = base
+            {
+                let Ok(pinned) = version_number(pinned) else {
+                    continue;
+                };
+                if invalid.contains(&(slug.as_str().to_owned(), pinned)) {
+                    changed |= invalid.insert((look.as_str().to_owned(), *version));
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(invalid)
+}
+
+type Pins = Vec<(LookSlug, u32, BaseReference)>;
+
+async fn pins_conn(conn: &mut SqliteConnection) -> Result<Pins, AdminError> {
+    let rows: Vec<(String, i64, String)> =
+        sqlx::query_as("SELECT look, version, base FROM lut_base_pins ORDER BY look, version")
+            .fetch_all(&mut *conn)
+            .await?;
+    let mut pins = Vec::with_capacity(rows.len());
+    for (look, version, base) in rows {
+        pins.push((
+            LookSlug::try_from(look).map_err(|_| AdminError::Corrupt)?,
+            u32::try_from(version).map_err(|_| AdminError::Corrupt)?,
+            serde_json::from_str::<BaseReference>(&base).map_err(|_| AdminError::Corrupt)?,
+        ));
+    }
+    Ok(pins)
+}
+
+/// Every pinned LUT version beneath the versions rooted in one admission.
+pub async fn affected_lut_dependents_conn(
+    conn: &mut SqliteConnection,
+    root_admission: &RootAdmissionId,
+) -> Result<Vec<VersionRef>, AdminError> {
+    let pins = pins_conn(&mut *conn).await?;
+    let seeds: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT DISTINCT v.look, v.version FROM version_depends_on_root d
+         JOIN look_versions v ON v.id = d.look_version_id
+         WHERE d.root_admission_id = ?",
+    )
+    .bind(root_admission.as_str())
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut closure: BTreeSet<(String, u32)> = BTreeSet::new();
+    for (look, version) in seeds {
+        closure.insert((
+            look,
+            u32::try_from(version).map_err(|_| AdminError::Corrupt)?,
+        ));
+    }
+    loop {
+        let mut changed = false;
+        for (look, version, base) in &pins {
+            if let BaseReference::Look {
+                slug,
+                version: pinned,
+            } = base
+            {
+                let Ok(pinned) = version_number(pinned) else {
+                    continue;
+                };
+                if closure.contains(&(slug.as_str().to_owned(), pinned)) {
+                    changed |= closure.insert((look.as_str().to_owned(), *version));
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    closure
+        .into_iter()
+        .filter(|(look, version)| {
+            pins.iter().any(|(pin_look, pin_version, _)| {
+                pin_look.as_str() == look.as_str() && pin_version == version
+            })
+        })
+        .map(|(look, version)| {
+            Ok(VersionRef {
+                look: LookSlug::try_from(look).map_err(|_| AdminError::Corrupt)?,
+                version,
+            })
+        })
+        .collect()
+}
+
+pub async fn is_version_invalidated_conn(
+    conn: &mut SqliteConnection,
+    look: &LookSlug,
+    version: u32,
+) -> Result<bool, AdminError> {
+    Ok(invalidated_set_conn(&mut *conn)
+        .await?
+        .contains(&(look.as_str().to_owned(), version)))
+}
+
+pub async fn insert_gate_failure_conn(
+    conn: &mut SqliteConnection,
+    look: &LookSlug,
+    version: u32,
+    report: &str,
+    now: i64,
+) -> Result<(), AdminError> {
+    sqlx::query(
+        "INSERT INTO gate_failures (id, look, version, report, status, created_at)
+         VALUES (?, ?, ?, ?, 'pending', ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(look.as_str())
+    .bind(i64::from(version))
+    .bind(report)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+const LUT_REBASE_JOB: &str = "lut_rebase";
+
+async fn enqueue_lut_rebase(conn: &mut SqliteConnection, now: i64) -> Result<(), AdminError> {
+    let queued: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = ? AND status = 'queued'")
+            .bind(LUT_REBASE_JOB)
+            .fetch_one(&mut *conn)
+            .await?;
+    if queued > 0 {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, payload, status, attempts, run_after, created_at)
+         VALUES (?, ?, '{}', 'queued', 0, ?, ?)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(LUT_REBASE_JOB)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Marks the latest published version of each affected LUT Look.
+pub async fn mark_lut_dependents(db: &SqlitePool, now: i64) -> Result<Vec<VersionRef>, AdminError> {
+    let mut conn = db.acquire().await?;
+    mark_lut_dependents_conn(&mut conn, now).await
+}
+
+async fn mark_lut_dependents_conn(
+    conn: &mut SqliteConnection,
+    now: i64,
+) -> Result<Vec<VersionRef>, AdminError> {
+    let pins = pins_conn(&mut *conn).await?;
+    let invalid: HashSet<(String, u32)> = invalidated_versions_conn(&mut *conn)
+        .await?
+        .into_iter()
+        .map(|version| (version.look.as_str().to_owned(), version.version))
+        .collect();
+    let latest_rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT look, MAX(version) FROM look_versions
+         WHERE status IN ('published', 'rooted') GROUP BY look",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let latest: HashMap<String, u32> = latest_rows
+        .into_iter()
+        .filter_map(|(look, version)| u32::try_from(version).ok().map(|version| (look, version)))
+        .collect();
+    let renderings: Vec<(String, String)> =
+        sqlx::query_as("SELECT maker, rendering FROM lut_native_renderings")
+            .fetch_all(&mut *conn)
+            .await?;
+
+    let mut marks = Vec::new();
+    for (look, version, base) in &pins {
+        if latest.get(look.as_str()) != Some(version) {
+            continue;
+        }
+        if invalid.contains(&(look.as_str().to_owned(), *version)) {
+            marks.push((look.clone(), *version, LutRebaseReason::BaseRevoked));
+            continue;
+        }
+        match base {
+            BaseReference::Look {
+                slug,
+                version: pinned,
+            } => {
+                if latest
+                    .get(slug.as_str())
+                    .is_some_and(|newest| *newest > version_number(pinned).unwrap_or(u32::MAX))
+                {
+                    marks.push((look.clone(), *version, LutRebaseReason::BasePublished));
+                }
+            }
+            BaseReference::FamilyRendering {
+                maker,
+                rendering,
+                dynamic_range,
+                ..
+            } => {
+                if dynamic_range.is_some() {
+                    continue;
+                }
+                let family = LutEmulation::CameraRendering {
+                    maker: maker.clone(),
+                    rendering: rendering.clone(),
+                };
+                if renderings.iter().any(|(native_maker, native_rendering)| {
+                    looklab_model::file::emulation_matches_camera_rendering(
+                        &family,
+                        native_maker,
+                        native_rendering,
+                    )
+                }) {
+                    marks.push((look.clone(), *version, LutRebaseReason::FamilyResolved));
+                }
+            }
+            BaseReference::BodyRealization { .. } => {}
+        }
+    }
+
+    let mut marked = Vec::new();
+    for (look, version, reason) in marks {
+        let inserted = sqlx::query(
+            "INSERT INTO lut_rebase_pending (look, version, reason, marked_at)
+             VALUES (?, ?, ?, ?) ON CONFLICT (look, version) DO NOTHING",
+        )
+        .bind(look.as_str())
+        .bind(i64::from(version))
+        .bind(reason.as_str())
+        .bind(now)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            marked.push(VersionRef { look, version });
+        }
+    }
+    Ok(marked)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1642,7 +2708,7 @@ async fn set_listing(
             "reason": reason,
         });
         audit::insert(&mut conn, kind, &payload).await?;
-        crate::store::enqueue_publish_if_idle(&mut conn).await?;
+        crate::store::request_publication(&mut conn).await?;
         let (listing, superseded_by): (String, Option<String>) =
             sqlx::query_as("SELECT listing, superseded_by FROM look_listings WHERE look = ?")
                 .bind(look.as_str())

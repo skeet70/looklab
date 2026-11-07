@@ -16,7 +16,7 @@ use crate::basis::{HUE_COEFS, S_COEFS, TINT_COEFS, TONE_COEFS};
 use crate::error::{ModelError, Result};
 use crate::look::{GRL_COEFS, Look};
 
-pub const CRM_FORMAT: &str = "looklab-crm/1";
+pub const CRM_FORMAT: &str = "looklab-crm/2";
 const MAX_CRM_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTROLS: usize = 256;
 const MAX_VALUES: usize = 1024;

@@ -9,12 +9,14 @@ if [[ ${1:-} != --in-shell ]]; then
 fi
 shift
 regen_data=false
+reuse_data=false
 once=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --regen-data) regen_data=true ;;
+    --reuse-data) reuse_data=true ;;
     --once) once=true ;;
-    *) printf 'Usage: %s [--once] [--regen-data]\n' "$0" >&2; exit 1 ;;
+    *) printf 'Usage: %s [--once] [--regen-data|--reuse-data]\n' "$0" >&2; exit 1 ;;
   esac
   shift
 done
@@ -38,5 +40,6 @@ export CARGO_TARGET_DIR="$target_root"
 
 args=()
 [[ $regen_data = false ]] || args+=(--regen-data)
+[[ $reuse_data = false ]] || args+=(--reuse-data)
 [[ $once = false ]] || args+=(--once)
 exec python3 "$root/tools/dev_loop.py" "${args[@]}"

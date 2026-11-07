@@ -10,8 +10,8 @@ use looklab_export::{BakeIlluminant, Baker, CctK, InputTransform, ValidationRepo
 use looklab_model::Look;
 use looklab_model::probes;
 use looklab_schema::{
-    AcceptedArtifact, Evidence, FIXTURE_MANIFEST, FixtureDonation, LabeledTag, Placement,
-    ProposalKind, ProposalStatus, ProposalView, SNAPSHOT_MANIFEST, SnapshotManifest,
+    AcceptedArtifact, Evidence, FIXTURE_MANIFEST, FixtureDonation, FixtureFileName, LabeledTag,
+    Placement, ProposalKind, ProposalStatus, ProposalView, SNAPSHOT_MANIFEST, SnapshotManifest,
     ValidatedPayload, apply_sim_mapping, body_export_path, content_hash, fixture_manifest_toml,
     interface_export_path, mapping_status_supported, schema_export_path, validate_confirmation,
     validate_proposal,
@@ -711,7 +711,8 @@ async fn prepare_snapshot(
     let mut attachments: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut published = Vec::with_capacity(donations.len());
     for donation in &donations {
-        published.push(published_donation(donation));
+        let entry = published_donation(donation);
+        published.push(entry.clone());
         let Some(source) = &donation.source else {
             continue;
         };
@@ -739,7 +740,18 @@ async fn prepare_snapshot(
                 donation.file
             )));
         }
-        let path = format!("fixtures/{}", donation.file);
+        let file = FixtureFileName::parse(&donation.file).map_err(|_| {
+            ProposalError::Snapshot(format!(
+                "the fixture {} is not a plain file name",
+                donation.file
+            ))
+        })?;
+        let Some(path) = entry.placement.snapshot_path(file) else {
+            return Err(ProposalError::Snapshot(format!(
+                "the fixture {} has no published placement",
+                donation.file
+            )));
+        };
         match attachments.get(&path) {
             Some(existing) if existing != &bytes => {
                 return Err(ProposalError::Snapshot(format!(

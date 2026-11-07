@@ -88,7 +88,7 @@ fn the_sim_comes_from_the_declared_native_sims() {
     let schema = shipped();
     let epoch = &schema.epochs[0];
     let mut values = MakernoteValues::new();
-    values.insert(FujiTag::FilmMode, vec![0x0700]);
+    values.insert(FujiTag::FilmMode, vec![0x0600]);
     assert_eq!(
         sim_from_makernote(epoch, &values).unwrap().as_str(),
         "classic_chrome"

@@ -4,17 +4,19 @@ RAW samples for `looklab-raw` and the CLI. `fixtures/manifest.toml` is the autho
 
 ## Licensing
 
-Every sample here is CC0 1.0. raw.pixls.us marks each file's license column with the CC0 public-domain dedication (`https://creativecommons.org/publicdomain/zero/1.0/`), and the manifest records `consent = "CC0 public sample (raw.pixls.us)"`. The files are unmodified downloads; only the local file names are shortened.
+Every redistributable RAW in `fixtures/manifest.toml` is CC0 1.0. raw.pixls.us marks each file's license column with the CC0 public-domain dedication (`https://creativecommons.org/publicdomain/zero/1.0/`), and the manifest records `consent = "CC0 public sample (raw.pixls.us)"`. The files are unmodified downloads; only the local file names are shortened.
+
+Measurement-only sources stay in an ignored local cache, outside the redistributable fixture manifest and Git LFS. Permission to use their measurements does not license the source images for redistribution. Their private samples, fits and comparisons follow [the measurement/publication boundary](../docs/06-privacy-and-payload.md#6-publication).
 
 ## Storage
 
-`fixtures/manifest.toml` records `committed` per file. `true` files live in this directory in plain git: only vectors small enough to embed, such as `canon-eos-60d.dng` (471,476 bytes, 480×270 reduced RGGB crop) and the fuzz seed prefixes under `fuzz/corpus/`. `false` files are fetch-only and land in `fixtures/cache/` (gitignored). `"lfs"` files are donated RAWs stored in Git LFS under `fixtures/donated/`, which holds its own note on the consent rule.
+`fixtures/manifest.toml` records `committed` per file. `true` files live in this directory in plain git: only vectors small enough to embed, such as `canon-eos-60d.dng` (471,476 bytes, 480×270 reduced RGGB crop) and the fuzz seed prefixes under `fuzz/corpus/`. `false` files are fetch-only and land in `fixtures/cache/` (gitignored). `"lfs"` files are donated RAWs stored in Git LFS under `fixtures/donated/`, which holds its own note on the consent rule; an approval exports each donated file to that same path inside the community snapshot.
 
 `fujifilm-x-s10.raf` (18,675,216 bytes, 1042×696 reduced) is fetch-only. Its X-Trans IV sensor exercises the 6×6 tile path; the Canon DNG exercises the 2×2 path and the DNG ColorMatrix1/2 path. `sigma-fp-8bit.dng` is an 8-bit Sigma fp DNG used as a smoke test when present.
 
 ## Preview photographs
 
-The six `scene-*.dng` files are fetch-only CC0 sources for `site_data`. The filename suffix is the raw.pixls.us record number. They contain no identifiable people.
+The six `scene-*.dng` files are fetch-only CC0 sources for `site_data` and for the prepared scene directory the worker publishes. The filename suffix is the raw.pixls.us record number. They contain no identifiable people.
 
 | File | Camera | Scene |
 |---|---|---|
@@ -25,9 +27,11 @@ The six `scene-*.dng` files are fetch-only CC0 sources for `site_data`. The file
 | `scene-3094.dng` | Pentax K-30 | Frog, lily pads and water reflections |
 | `scene-1603.dng` | Leica M10 | Warm brickwork, neutral windows and sunlit grass |
 
-Source URLs, original byte sizes, SHA-256 digests, license and consent are recorded in the manifest. Each generated scene repeats its source URL, license and source digest in both site scene indexes. All six DNGs expose color matrices through `looklab-raw`; `looklab-body` solves the as-shot white and adapts the transform to D65.
+Source URLs, original byte sizes, SHA-256 digests, license and consent are recorded in the manifest. Each generated scene repeats its source URL, license and source digest in the published site indexes and in the prepared worker index. All six DNGs expose color matrices through `looklab-raw`; `looklab-body` solves the as-shot white and adapts the transform to D65.
 
-Run `nix develop -c tools/fetch-fixtures.sh` before `CARGO_TARGET_DIR=target-ui nix develop -c cargo run -p looklab-publish --example site_data -j 6`. Missing or corrupt sources fail generation and name the fetch command. `site_data --charts-only` explicitly omits photographs. Photo scenes are area-averaged in linear light to a 1000 px long edge, reduced further when needed to fit 2.5 MB; thumbnails have a 220 px long edge. Scene PNGs store 12-bit-quantized LUT coordinates in 16-bit RGB, not display-ready sRGB pixels.
+Run `nix develop -c tools/fetch-fixtures.sh` before `CARGO_TARGET_DIR=target-ui nix develop -c cargo run -p looklab-publish --features photo-scenes --example site_data -j 6`. Missing or corrupt sources fail generation and name the fetch command. `site_data --charts-only` explicitly omits photographs. Photo scenes are area-averaged in linear light to a 1000 px long edge, reduced further when needed to fit 2.5 MB; thumbnails have a 220 px long edge. Scene PNGs store 12-bit-quantized LUT coordinates in 16-bit RGB, not display-ready sRGB pixels.
+
+`nix develop -c cargo run -p looklab-publish --features photo-scenes --example prepare_scenes -- --out <data>/scenes` writes the prepared directory the production worker reads, using the same scene preparation code.
 
 
 ## Pattern fixture

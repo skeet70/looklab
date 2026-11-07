@@ -51,6 +51,53 @@ fn gauge(result: &looklab_fit::FitResult, data: &synth::SyntheticDataset) -> f64
     shifts[shifts.len() / 2]
 }
 
+/// Held-out ΔE between the fitted and true latent Look at noise-free scene colours.
+fn held_out_latent_errors(
+    result: &looklab_fit::FitResult,
+    training: &synth::SyntheticDataset,
+    held: &synth::SyntheticDataset,
+) -> Vec<f64> {
+    // The absolute exposure gauge is a definition.
+    let shift = libm::pow(2.0, gauge(result, training));
+    held.points
+        .iter()
+        .flatten()
+        .map(|xyz| delta_e_ucs(result.look.eval(xyz.scale(shift)), held.truth.eval(*xyz)))
+        .collect()
+}
+
+/// Supported probes whose latent error lies inside twice the published post-clip σ.
+fn supported_coverage(
+    result: &looklab_fit::FitResult,
+    data: &synth::SyntheticDataset,
+) -> (usize, f64) {
+    let shift = libm::pow(2.0, gauge(result, data));
+    let mut count = 0usize;
+    let mut inside = 0usize;
+    for (probe, estimate) in probes_v1().probes.iter().zip(result.probes.probes.iter()) {
+        if !estimate.supported {
+            continue;
+        }
+        count += 1;
+        let truth = looklab_fit::post_clip(
+            &data.truth,
+            probe.xyz,
+            result.output_space,
+            data.truth.clip.k,
+        );
+        let predicted = looklab_fit::post_clip(
+            &result.look,
+            probe.xyz.scale(shift),
+            result.output_space,
+            result.realization.clip_k,
+        );
+        if delta_e_ucs(predicted, truth) <= 2.0 * estimate.post_sigma_de {
+            inside += 1;
+        }
+    }
+    (count, inside as f64 / count.max(1) as f64)
+}
+
 fn training(seed: u64) -> SynthConfig {
     SynthConfig {
         seed,
@@ -75,15 +122,7 @@ fn held_out_scenes_are_close() {
         &data.truth,
         &LookSelector::Single(&data.truth),
     );
-    // The absolute exposure gauge is a definition (docs/02 §2.1); compare after the exact conversion.
-    let shift = libm::pow(2.0, gauge(&result, &data));
-    let errors: Vec<f64> = held
-        .points
-        .iter()
-        .flatten()
-        .map(|xyz| delta_e_ucs(result.look.eval(xyz.scale(shift)), data.truth.eval(*xyz)))
-        .collect();
-    let (median, p95) = percentiles(errors);
+    let (median, p95) = percentiles(held_out_latent_errors(&result, &data, &held));
     println!("held-out median {median:.3} p95 {p95:.3}");
     assert!(median <= 1.5, "median {median}, p95 {p95}");
     assert!(p95 <= 4.0, "median {median}, p95 {p95}");
@@ -169,6 +208,7 @@ fn tone_only_difference_leaves_the_colour_layers_alone() {
         seed: 31,
         images: 20,
         samples_per_image: 10_000,
+        noise_ucs: 0.0,
         ..SynthConfig::default()
     };
     let truth = synth::truth_look(config.seed);
@@ -177,6 +217,11 @@ fn tone_only_difference_leaves_the_colour_layers_alone() {
     let shifted = synth::dataset_with(&config, &variant, &LookSelector::Single(&variant));
     let a = fit(&baseline.images, &layered_options(7)).expect("fit a");
     let b = fit(&shifted.images, &layered_options(7)).expect("fit b");
+    assert!(
+        a.diagnostics.converged,
+        "tone-free baseline did not converge"
+    );
+    assert!(b.diagnostics.converged, "tone-shifted fit did not converge");
     let mut worst_gain: f64 = 0.0;
     let mut worst_rotation: f64 = 0.0;
     let mut worst_lightness: f64 = 0.0;
@@ -235,8 +280,6 @@ fn tone_only_difference_leaves_the_colour_layers_alone() {
         a.lambdas,
         b.lambdas
     );
-    // The identity prior is what holds G fixed under a tone-only change; with it
-    // ablated the same fixture leaks 0.38 (see tone_leak_identity_ablation).
     assert!(worst_gain < 0.02, "log G difference {worst_gain}");
     assert!(
         worst_rotation < 1.8,
@@ -246,6 +289,60 @@ fn tone_only_difference_leaves_the_colour_layers_alone() {
         worst_lightness < 2.0,
         "lightness difference {worst_lightness}"
     );
+}
+
+#[test]
+fn noisy_tone_fixtures_recover_their_latent_looks() {
+    let config = SynthConfig {
+        seed: 31,
+        images: 20,
+        samples_per_image: 10_000,
+        noise_ucs: 1.0,
+        nu: 4.0,
+        ..SynthConfig::default()
+    };
+    let truth = synth::truth_look(config.seed);
+    let variant = synth::tone_only_variant(&truth);
+    let baseline = synth::dataset_with(&config, &truth, &LookSelector::Single(&truth));
+    let shifted = synth::dataset_with(&config, &variant, &LookSelector::Single(&variant));
+    let a = fit(&baseline.images, &layered_options(7)).expect("fit a");
+    let b = fit(&shifted.images, &layered_options(7)).expect("fit b");
+    let held_config = SynthConfig {
+        seed: 99,
+        images: 3,
+        samples_per_image: 900,
+        ..config
+    };
+    let held_baseline = synth::dataset_with(&held_config, &truth, &LookSelector::Single(&truth));
+    let held_shifted = synth::dataset_with(&held_config, &variant, &LookSelector::Single(&variant));
+    for (label, result, training, held) in [
+        ("baseline", &a, &baseline, &held_baseline),
+        ("tone-shifted", &b, &shifted, &held_shifted),
+    ] {
+        assert!(result.diagnostics.converged, "{label} did not converge");
+        let (median, p95) = percentiles(held_out_latent_errors(result, training, held));
+        let (covered, coverage) = supported_coverage(result, training);
+        let mut biases: Vec<f64> = result
+            .probes
+            .probes
+            .iter()
+            .filter(|probe| probe.supported)
+            .map(|probe| probe.bias_de)
+            .collect();
+        biases.sort_by(f64::total_cmp);
+        println!(
+            "{label}: held latent median {median:.3} p95 {p95:.3}; supported {covered} coverage {coverage:.3}; bias median {:.3} p90 {:.3}",
+            biases.get(biases.len() / 2).copied().unwrap_or(0.0),
+            biases.get(biases.len() * 9 / 10).copied().unwrap_or(0.0),
+        );
+        assert!(median <= 1.5, "{label} latent median {median}, p95 {p95}");
+        assert!(p95 <= 4.0, "{label} latent median {median}, p95 {p95}");
+        assert!(covered >= 20, "{label} supported probes {covered}");
+        assert!(
+            coverage >= 0.90,
+            "{label} coverage {coverage} over {covered} supported probes"
+        );
+    }
 }
 
 #[test]

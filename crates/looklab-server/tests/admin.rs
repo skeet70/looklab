@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use looklab_server::admin::{self, AdminError};
+use std::path::{Path, PathBuf};
+
+use looklab_model::file::{LookIdentity, LookKind, WbPolicy};
+use looklab_model::{Look, LookDocument};
+use looklab_server::admin::{self, AdminError, ManifestArtifact};
 use looklab_server::{ContributionId, CredentialId, EndorsementId, GrantId, LookVersionId, Tier};
 use looklab_trust::{Actor, Grant, Scope, ScopeRule, TrustError, VersionId};
 use looklab_upload::{BodyId, LookSlug};
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tempfile::TempDir;
 
 struct Fixture {
     _dir: TempDir,
     db: SqlitePool,
+    blobs: PathBuf,
 }
 
 async fn fixture() -> Fixture {
@@ -17,7 +23,60 @@ async fn fixture() -> Fixture {
     let db = looklab_server::open_database(&dir.path().join("looklab.sqlite3"))
         .await
         .expect("database");
-    Fixture { _dir: dir, db }
+    let blobs = dir.path().join("blobs");
+    std::fs::create_dir_all(&blobs).expect("blob dir");
+    Fixture {
+        _dir: dir,
+        db,
+        blobs,
+    }
+}
+
+fn store_blob(blobs: &Path, bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    std::fs::write(blobs.join(&hex), bytes).expect("blob");
+    hex
+}
+
+fn version_artifacts(
+    blobs: &Path,
+    look: &str,
+    version: u32,
+    anchor: u32,
+    union: serde_json::Value,
+) -> Vec<ManifestArtifact> {
+    let identity = LookIdentity::new(
+        look,
+        &format!("{version}.0.0"),
+        LookKind::NativeFamily,
+        WbPolicy::Adaptive,
+    )
+    .expect("identity");
+    let document = LookDocument::from_look(identity, Look::colorimetric()).expect("document");
+    let look_bytes = document.encode().expect("look bytes");
+    let release = serde_json::json!({
+        "version": version,
+        "gauge": 0.0,
+        "anchor": anchor,
+        "clip_k": 1.0,
+        "probes": [],
+        "gated_since_anchor": union,
+        "converged": true,
+        "gate": {},
+        "provenance": {"anchor_version": format!("{anchor}.0.0")},
+        "created_at": 0,
+    });
+    vec![
+        ManifestArtifact {
+            name: looklab_publish::DOCUMENT_ARTIFACT.to_owned(),
+            sha256: store_blob(blobs, &look_bytes),
+        },
+        ManifestArtifact {
+            name: "release.json".to_owned(),
+            sha256: store_blob(blobs, &serde_json::to_vec(&release).expect("release json")),
+        },
+    ]
 }
 
 async fn credential(db: &SqlitePool, tier: &str, roles: &str, reputation: f64) -> CredentialId {
@@ -587,6 +646,362 @@ async fn public_lists_page_with_a_hard_cap() {
         .expect("page");
     assert_eq!(second.endorsements.len(), 1);
     assert!(second.next_after.is_none());
+}
+
+#[tokio::test]
+async fn revert_republishes_the_target_with_current_gates_and_excludes_credentials() {
+    use looklab_server::admin::VersionStatus;
+
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    let attacker = credential(db, "endorsed", "[]", 1.0).await;
+
+    let first = version_artifacts(
+        &fixture.blobs,
+        LOOK_1,
+        1,
+        1,
+        serde_json::json!({"probes": ["v1"]}),
+    );
+    let second = version_artifacts(
+        &fixture.blobs,
+        LOOK_1,
+        2,
+        2,
+        serde_json::json!({"probes": ["current"]}),
+    );
+    admin::write_version_manifest(db, &look(LOOK_1), VersionId::new(1), &first, &[])
+        .await
+        .expect("version 1");
+    admin::write_version_manifest(db, &look(LOOK_1), VersionId::new(2), &second, &[])
+        .await
+        .expect("version 2");
+
+    let reverted = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        std::slice::from_ref(&attacker),
+        "contributor introduced a hue shift",
+    )
+    .await
+    .expect("revert");
+
+    assert_eq!(reverted.target_version, 1);
+    assert_eq!(reverted.new_version, 3);
+    assert_eq!(reverted.excluded, vec![attacker.clone()]);
+
+    let target = admin::manifest_record(db, &look(LOOK_1), VersionId::new(1))
+        .await
+        .expect("target manifest");
+    let published = admin::manifest_record(db, &look(LOOK_1), VersionId::new(3))
+        .await
+        .expect("new manifest");
+    assert_eq!(published.status, VersionStatus::Published);
+    assert_eq!(
+        published
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str())
+            .collect::<Vec<_>>(),
+        target
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(published.artifacts, target.artifacts);
+    let look_hash = published
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.name == looklab_publish::DOCUMENT_ARTIFACT)
+        .expect("look artifact")
+        .sha256
+        .clone();
+    let look_bytes = std::fs::read(fixture.blobs.join(look_hash)).expect("republished look");
+    let document = LookDocument::decode(&look_bytes).expect("republished document");
+    assert_eq!(document.file.look.version.as_str(), "3.0.0");
+    assert_eq!(document.file.provenance.root.anchor_version, "2.0.0");
+    let release_hash = published
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.name == "release.json")
+        .expect("release artifact")
+        .sha256
+        .clone();
+    let release: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.blobs.join(release_hash)).expect("release"))
+            .expect("release json");
+    assert_eq!(release["version"], 3);
+    assert_eq!(release["anchor"], 2);
+    assert_eq!(
+        release["gated_since_anchor"],
+        serde_json::json!({"probes": ["current"]})
+    );
+    let old = admin::manifest_record(db, &look(LOOK_1), VersionId::new(2))
+        .await
+        .expect("old manifest");
+    assert_eq!(old.artifacts, second);
+    let original = admin::manifest_record(db, &look(LOOK_1), VersionId::new(1))
+        .await
+        .expect("original manifest");
+    assert_eq!(original.artifacts, first);
+
+    let exclusions: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT credential_id, target_version, reverted_version
+         FROM look_credential_exclusions WHERE look = ?",
+    )
+    .bind(LOOK_1)
+    .fetch_all(db)
+    .await
+    .expect("exclusions");
+    assert_eq!(exclusions, vec![(attacker.as_str().to_owned(), 1, 3)]);
+    let request: (i64, i64) = sqlx::query_as(
+        "SELECT generation, reverted_version FROM look_refit_requests WHERE look = ?",
+    )
+    .bind(LOOK_1)
+    .fetch_one(db)
+    .await
+    .expect("refit request");
+    assert_eq!(request, (1, 3));
+
+    let audit: String = sqlx::query_scalar(
+        "SELECT payload FROM audit_log WHERE type = 'revert' ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(db)
+    .await
+    .expect("revert audit");
+    let audit: serde_json::Value = serde_json::from_str(&audit).expect("audit payload");
+    assert_eq!(audit["reason"], "contributor introduced a hue shift");
+    assert_eq!(audit["plan"]["target_version"], 1);
+    let attacker_trust = admin::trust_id(&attacker).expect("trust id").to_string();
+    assert_eq!(
+        audit["plan"]["refit_excluding"][0].as_str(),
+        Some(attacker_trust.as_str())
+    );
+
+    let queued: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT kind, COUNT(*) FROM jobs
+         WHERE kind IN ('publish_site', 'revert_refit') AND status = 'queued'
+         GROUP BY kind ORDER BY kind",
+    )
+    .fetch_all(db)
+    .await
+    .expect("queued jobs");
+    assert_eq!(
+        queued,
+        vec![
+            ("publish_site".to_owned(), 1),
+            ("revert_refit".to_owned(), 1),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn revert_validates_permission_reason_version_and_credentials_before_mutation() {
+    use looklab_server::admin::ManifestArtifact;
+
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    let outsider = credential(db, "new", "[]", 0.5).await;
+    let revoked = credential(db, "new", "[]", 0.5).await;
+    sqlx::query("UPDATE credentials SET status = 'revoked' WHERE id = ?")
+        .bind(revoked.as_str())
+        .execute(db)
+        .await
+        .expect("revoke credential");
+    let artifact = ManifestArtifact {
+        name: "look.looklab".to_owned(),
+        sha256: "ab".repeat(32),
+    };
+    admin::write_version_manifest(
+        db,
+        &look(LOOK_1),
+        VersionId::new(1),
+        std::slice::from_ref(&artifact),
+        &[],
+    )
+    .await
+    .expect("version 1");
+    sqlx::query(
+        "INSERT INTO look_versions (id, look, version, status, changelog, created_at)
+         VALUES (?, ?, 2, 'provisional', NULL, 0)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(LOOK_1)
+    .execute(db)
+    .await
+    .expect("provisional version");
+
+    let error = admin::revert(db, &fixture.blobs, actor(&moderator), &look(LOOK_1), 2, &[], "not published")
+        .await
+        .expect_err("unpublished target");
+    assert!(matches!(error, AdminError::VersionNotPublished));
+    let error = admin::revert(db, &fixture.blobs, actor(&moderator), &look(LOOK_1), 9, &[], "missing")
+        .await
+        .expect_err("unknown target");
+    assert!(matches!(error, AdminError::UnknownVersion));
+    let error = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        std::slice::from_ref(&revoked),
+        "inactive credential",
+    )
+    .await
+    .expect_err("inactive credential");
+    assert!(matches!(error, AdminError::CredentialInactive));
+    let error = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        std::slice::from_ref(&CredentialId::new()),
+        "unknown credential",
+    )
+    .await
+    .expect_err("unknown credential");
+    assert!(matches!(error, AdminError::UnknownCredential));
+    let error = admin::revert(db, &fixture.blobs, actor(&moderator), &look(LOOK_1), 1, &[], "   ")
+        .await
+        .expect_err("empty reason");
+    assert!(matches!(error, AdminError::InvalidReason));
+    let error = admin::revert(db, &fixture.blobs, actor(&outsider), &look(LOOK_1), 1, &[], "not a moderator")
+        .await
+        .expect_err("insufficient role");
+    assert!(matches!(error, AdminError::NotAuthorized));
+
+    let versions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM look_versions WHERE look = ?")
+            .bind(LOOK_1)
+            .fetch_one(db)
+            .await
+            .expect("versions");
+    assert_eq!(versions, 2);
+    let exclusions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM look_credential_exclusions")
+            .fetch_one(db)
+            .await
+            .expect("exclusions");
+    assert_eq!(exclusions, 0);
+    let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE type = 'revert'")
+        .fetch_one(db)
+        .await
+        .expect("audit");
+    assert_eq!(audit, 0);
+    let refit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'revert_refit' AND status = 'queued'",
+    )
+    .fetch_one(db)
+    .await
+    .expect("refit job");
+    assert_eq!(refit, 0);
+    let requested: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM look_refit_requests")
+        .fetch_one(db)
+        .await
+        .expect("refit request");
+    assert_eq!(requested, 0);
+}
+
+#[tokio::test]
+async fn revert_marks_pinned_lut_dependents_for_rebase() {
+    use looklab_model::file::{BaseReference, BaseStatus, LookVersion, Slug};
+    use looklab_server::admin::LutRebaseReason;
+
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    let artifact = version_artifacts(
+        &fixture.blobs,
+        LOOK_1,
+        1,
+        1,
+        serde_json::json!({"probes": []}),
+    );
+    admin::write_version_manifest(
+        db,
+        &look(LOOK_1),
+        VersionId::new(1),
+        &artifact,
+        &[],
+    )
+    .await
+    .expect("base version");
+    let dependent = look("donor-lut");
+    let dependent_artifacts = version_artifacts(
+        &fixture.blobs,
+        "donor-lut",
+        1,
+        1,
+        serde_json::json!({"probes": []}),
+    );
+    admin::record_lut_base(
+        db,
+        &dependent,
+        1,
+        &BaseReference::Look {
+            slug: Slug::new(LOOK_1).expect("slug"),
+            version: LookVersion::new("1.0.0").expect("version"),
+        },
+        &BaseStatus::Pinned,
+    )
+    .await
+    .expect("base pin");
+    admin::write_version_manifest(
+        db,
+        &dependent,
+        VersionId::new(1),
+        &dependent_artifacts,
+        &[],
+    )
+    .await
+    .expect("dependent version");
+    sqlx::query("DELETE FROM jobs")
+        .execute(db)
+        .await
+        .expect("clear jobs");
+    assert!(
+        admin::pending_lut_rebases(db)
+            .await
+            .expect("pending")
+            .is_empty()
+    );
+
+    let reverted = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        &[],
+        "restore the fit",
+    )
+    .await
+    .expect("revert");
+
+    assert!(
+        reverted
+            .lut_dependents
+            .iter()
+            .any(|version| version.look == dependent && version.version == 1)
+    );
+    let pending = admin::pending_lut_rebases(db).await.expect("pending");
+    assert!(pending.iter().any(|work| {
+        work.look == dependent && work.version == 1 && work.reason == LutRebaseReason::BasePublished
+    }));
+    let queued: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'lut_rebase' AND status = 'queued'")
+            .fetch_one(db)
+            .await
+            .expect("lut rebase job");
+    assert_eq!(queued, 1);
 }
 
 #[tokio::test]

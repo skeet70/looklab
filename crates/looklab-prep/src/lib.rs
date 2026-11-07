@@ -18,7 +18,7 @@ pub mod preselect;
 pub mod sample;
 pub mod seed;
 
-pub use align::{AlignParams, Alignment, align};
+pub use align::{AlignParams, Alignment};
 pub use chart::{
     ChartError, ChartExtraction, ChartLayout, ChartLayoutId, ChartParams, ChartRegion,
 };
@@ -34,8 +34,8 @@ pub use pair::{
 pub use pattern::{PatternDetection, PatternError, PatternParams, PatternSeed};
 pub use pipeline::{
     AlignedRaw, PREP_VERSION, PrepParams, PreparedImage, PriorTransform, prepare_aligned_raw,
-    prepare_decoded, prepare_decoded_with_chart, prepare_group, prepare_pair, prepare_pair_decoded,
-    prepare_pair_with_chart,
+    prepare_decoded, prepare_decoded_with_chart, prepare_group, prepare_group_with_decoded_raw,
+    prepare_pair, prepare_pair_decoded, prepare_pair_with_chart,
 };
 pub use preselect::{CoveragePool, PreselectOptions, preselect};
 pub use sample::{MAX_DENSITY_SAMPLES, PixelSelection, SampleParams, select_pixels};

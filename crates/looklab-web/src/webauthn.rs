@@ -23,10 +23,41 @@ impl core::ops::Deref for CredentialId {
     }
 }
 
+/// The WebAuthn relying-party ID the server signs challenges for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RpId(String);
+
+impl RpId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for RpId {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let valid = !value.is_empty()
+            && value.len() <= 253
+            && !value.starts_with('.')
+            && !value.ends_with('.')
+            && !value.contains("..")
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'));
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err("invalid relying-party id".to_owned())
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NonceReply {
     pub nonce: [u8; 32],
     pub expires_in_seconds: u64,
+    pub rp_id: RpId,
     pub pow: Option<PowParameters>,
 }
 
@@ -64,6 +95,7 @@ pub struct UploadReply {
 struct NonceWire {
     nonce: String,
     expires_in_seconds: u64,
+    rp_id: String,
     #[serde(default)]
     pow: Option<PowWire>,
 }
@@ -94,6 +126,7 @@ pub async fn fetch_nonce() -> Result<NonceReply, String> {
     Ok(NonceReply {
         nonce,
         expires_in_seconds: wire.expires_in_seconds,
+        rp_id: RpId::try_from(wire.rp_id).map_err(|_| "nonce: invalid relying-party id")?,
         pow: wire.pow.map(|pow| PowParameters {
             memory_kib: pow.memory_kib,
             iterations: pow.iterations,
@@ -165,10 +198,11 @@ pub async fn create_profile(
 pub async fn sign_batch(
     challenge: &[u8],
     credential_id: Option<&[u8]>,
+    rp_id: &RpId,
 ) -> Result<AssertionFields, String> {
     let public_key = Object::new();
     set(&public_key, "challenge", &Uint8Array::from(challenge))?;
-    set(&public_key, "rpId", &JsValue::from_str(&rp_id()))?;
+    set(&public_key, "rpId", &JsValue::from_str(rp_id.as_str()))?;
     set(
         &public_key,
         "userVerification",
@@ -218,7 +252,7 @@ async fn sign_request_classified(
     let nonce = fetch_nonce().await.map_err(SigningFailure::Nonce)?;
     let digest = request_digest(domain, payload);
     let challenge = challenge(&nonce.nonce, &digest);
-    let assertion = sign_batch(&challenge, credential_id)
+    let assertion = sign_batch(&challenge, credential_id, &nonce.rp_id)
         .await
         .map_err(SigningFailure::Prompt)?;
     Ok(SignedRequest {
@@ -519,12 +553,6 @@ pub async fn upload_envelope(envelope: Vec<u8>) -> Result<UploadReply, String> {
         status_token: wire.status_token,
         contribution_id: wire.contribution_id,
     })
-}
-
-pub fn rp_id() -> String {
-    web_sys::window()
-        .and_then(|window| window.location().hostname().ok())
-        .unwrap_or_default()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

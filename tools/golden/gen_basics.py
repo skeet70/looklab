@@ -6,7 +6,8 @@ Run from the repo root:
 
     nix develop .#golden -c python3 tools/golden/gen_basics.py
 
-Writes ``crates/looklab-color/tests/golden/basics.json`` and
+Writes one JSON file per test group under
+``crates/looklab-color/tests/golden/`` and
 ``data/charts/colorchecker24_2014.json``. Deterministic: fixed seed, sorted
 keys, ``repr``-precision floats.
 """
@@ -111,6 +112,17 @@ TRANSFER_FUNCTIONS = {
 # Adobe RGB is a pure power law in colour-science, so negative input is NaN and
 # cannot appear in a finite golden vector.
 NON_NEGATIVE = {"adobe_rgb_encode", "adobe_rgb_decode"}
+
+GOLDEN_DIR = "crates/looklab-color/tests/golden"
+
+# One file per test group, each under the 1 MB plain-git limit.
+VECTOR_GROUPS = {
+    "xyy.json": ("xyz_to_xyy", "xyy_to_xyz", "xy_to_xyz"),
+    "transfer_functions.json": tuple(TRANSFER_FUNCTIONS),
+    "lab.json": ("xyz_to_lab", "lab_to_xyz", "lab_to_lchab", "lchab_to_lab"),
+    "difference.json": ("delta_e_ciede2000",),
+    "illuminants.json": ("illuminant_xyz",),
+}
 
 
 def derived_colourspace(spec: dict) -> RGB_Colourspace:
@@ -292,12 +304,19 @@ def main() -> None:
             "stored_xyz_to_rgb": common.floats(stored.matrix_XYZ_to_RGB),
         }
 
-    payload = common.meta("tools/golden/gen_basics.py")
-    payload["vectors"] = vectors
-    payload["spaces"] = spaces
-    payload["cats"] = cats
-    payload["space_matrices"] = matrices
-    common.write_json(common.ROOT / "crates/looklab-color/tests/golden/basics.json", payload)
+    meta = common.meta("tools/golden/gen_basics.py")
+    for filename, names in VECTOR_GROUPS.items():
+        payload = dict(meta)
+        payload["vectors"] = {name: vectors[name] for name in names}
+        common.write_json(common.ROOT / GOLDEN_DIR / filename, payload)
+    common.write_json(
+        common.ROOT / GOLDEN_DIR / "spaces.json",
+        dict(meta, spaces=spaces, space_matrices=matrices),
+    )
+    common.write_json(
+        common.ROOT / GOLDEN_DIR / "cats.json",
+        dict(meta, cats=cats),
+    )
 
     checker = colour.CCS_COLOURCHECKERS["ColorChecker24 - After November 2014"]
     chart = {

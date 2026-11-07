@@ -231,6 +231,72 @@ fn a_non_finite_jpeg_sample_is_an_error() {
 }
 
 #[test]
+fn random_pixels_never_store_a_non_finite_sample() {
+    use rand_chacha::ChaCha20Rng;
+    use rand_chacha::rand_core::{RngCore, SeedableRng};
+
+    let mut rng = ChaCha20Rng::from_seed([0x5a; 32]);
+    for _ in 0..8 {
+        let width = 24 + rng.next_u32() % 17;
+        let height = 24 + rng.next_u32() % 17;
+        let pixels = |rng: &mut ChaCha20Rng| -> Vec<[f32; 3]> {
+            (0..(width * height))
+                .map(|_| {
+                    [
+                        f32::from_bits(rng.next_u32()),
+                        f32::from_bits(rng.next_u32()),
+                        f32::from_bits(rng.next_u32()),
+                    ]
+                })
+                .collect()
+        };
+        let raw = DecodedRaw {
+            width: width as usize,
+            height: height as usize,
+            rgb: pixels(&mut rng).into_iter().flatten().collect(),
+            as_shot_wb: [2.0, 1.0, 1.5],
+            orientation: Orientation::Normal,
+            make: "FUJIFILM".to_owned(),
+            model: "X-S10".to_owned(),
+            color_matrices: None,
+        };
+        let jpegs: Vec<DecodedJpeg> = (0..2)
+            .map(|_| {
+                jpeg_from(Image3::new(width, height, pixels(&mut rng)).expect("dimensions match"))
+            })
+            .collect();
+        let members: Vec<&DecodedJpeg> = jpegs.iter().collect();
+        if let Ok(sets) = prepare_decoded(&raw, &members, &prior(), fixed_seed(0x06), &params()) {
+            for set in &sets {
+                all_samples_in_limits(set);
+            }
+        }
+    }
+
+    let mut data = scene().data;
+    for _ in 0..(data.len() / 20) {
+        let index = (rng.next_u32() as usize) % data.len();
+        let channel = (rng.next_u32() % 3) as usize;
+        data[index][channel] = f32::from_bits(rng.next_u32());
+    }
+    let raw = DecodedRaw {
+        width: WIDTH as usize,
+        height: HEIGHT as usize,
+        rgb: data.iter().flatten().copied().collect(),
+        as_shot_wb: [2.0, 1.0, 1.5],
+        orientation: Orientation::Normal,
+        make: "FUJIFILM".to_owned(),
+        model: "X-S10".to_owned(),
+        color_matrices: None,
+    };
+    let jpeg = jpeg_from(scene());
+    let samples = prepare_pair_decoded(&raw, &jpeg, &prior(), fixed_seed(0x07), &params())
+        .expect("prepares around the corrupted pixels");
+    assert!(samples.n() > 0);
+    all_samples_in_limits(&samples);
+}
+
+#[test]
 fn the_params_hash_covers_the_params() {
     let a = params();
     let b = params();
@@ -286,6 +352,14 @@ fn meta_orientation(orientation: Orientation) -> looklab_meta::Orientation {
         Orientation::Rotate90 => looklab_meta::Orientation::Rotate90Clockwise,
         Orientation::Transverse => looklab_meta::Orientation::Transverse,
         Orientation::Rotate270 => looklab_meta::Orientation::Rotate270Clockwise,
+    }
+}
+
+fn inverse_orientation(orientation: Orientation) -> Orientation {
+    match orientation {
+        Orientation::Rotate90 => Orientation::Rotate270,
+        Orientation::Rotate270 => Orientation::Rotate90,
+        other => other,
     }
 }
 
@@ -402,6 +476,44 @@ fn samples_average_the_jpeg_over_the_raw_footprint() {
         for (a, b) in in_rgb.iter().zip(out_rgb) {
             assert!((a - b).abs() < 0.08, "{in_rgb:?} vs {out_rgb:?}");
         }
+    }
+}
+
+#[test]
+fn every_raw_orientation_samples_as_the_oriented_image() {
+    let mut base = scene();
+    for y in 8..12 {
+        for x in 16..20 {
+            base.data[y * base.width as usize + x] = [2.0, 1.0, 1.5];
+        }
+    }
+    let params = PrepParams {
+        downsample_max_pixels: 2_000,
+        ..params()
+    };
+    let prepare = |orientation: Orientation| {
+        let sensor = base.apply_orientation(meta_orientation(inverse_orientation(orientation)));
+        let mut raw = raw_from(&sensor, [2.0, 1.0, 1.5]);
+        raw.orientation = orientation;
+        let jpeg = jpeg_from(base.clone());
+        encode(
+            &prepare_pair_decoded(&raw, &jpeg, &prior(), fixed_seed(0x30), &params)
+                .expect("prepares"),
+        )
+        .expect("encodes")
+    };
+    let reference = prepare(Orientation::Normal);
+    for orientation in [
+        Orientation::Normal,
+        Orientation::HorizontalFlip,
+        Orientation::Rotate180,
+        Orientation::VerticalFlip,
+        Orientation::Transpose,
+        Orientation::Rotate90,
+        Orientation::Transverse,
+        Orientation::Rotate270,
+    ] {
+        assert_eq!(prepare(orientation), reference, "{orientation:?}");
     }
 }
 

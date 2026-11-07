@@ -18,8 +18,8 @@ use looklab_prep_module::{
     PrepareRequest, PrepareResponse, PriorTransformSpec, Response, VersionResponse,
 };
 use looklab_schema::{
-    MakernoteValues, MappingError, SettingSource, SimKey, settings_from_makernote_partial,
-    sim_from_makernote,
+    Epoch, MakernoteValues, MappingError, SettingSource, SimKey, monochrome_sim,
+    settings_from_makernote_partial, sim_from_makernote,
 };
 use looklab_server::body_schema::{Bodies, BodyRecord, resolve_epoch, validate_settings};
 use looklab_server::{RequestDomain, StatusToken, request_digest};
@@ -28,9 +28,8 @@ use looklab_upload::{
     ContributionKind, ControlEntry, ControlKey, ControlSettings, Envelope, EnvelopeParts,
     ExpectedAssertion, FirmwareId, FirmwareVersion, FirmwareVersionString, Intent, Limits,
     LookSlug, ManifestImage, ManifestMetadata, Nonce, PowParams, RawSerial as UploadSerial,
-    RenderTag, SignatureAlgorithm, StepIndex, StructuralVerdict, TopOriginReview,
-    WebAuthnAssertion, check_structure, encode_envelope, parse_envelope_strict,
-    verify as verify_pow,
+    SignatureAlgorithm, StepIndex, StructuralVerdict, TopOriginReview, WebAuthnAssertion,
+    check_structure, encode_envelope, parse_envelope_strict, verify as verify_pow,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -275,29 +274,13 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         .filter_map(|file| file.serial().map(|serial| (file.name.as_str(), serial)))
         .collect();
 
-    let reproduced = reproduce(&groups, &seeds, &module, &mut findings);
-    let intent = match intent {
-        Some(intent) => intent,
-        None => resolve_card_intent(args, &reproduced, &mut findings)?,
-    };
-    let card = args.intent == DeclaredIntent::Card;
     let snapshot = manifest_snapshot_version(&hars, &origin, &mut findings);
-    let derived = derive_batch(
-        &reproduced,
-        &bodies,
-        snapshot,
-        &declarations,
-        card,
-        &mut findings,
-    );
-    let declared = DeclaredFields {
-        kind: args.kind.into(),
-        intent: intent.clone(),
-    };
-    print_batch_fields(derived.as_ref(), &declared, &bodies, &mut findings);
-    let expected = derived
-        .as_ref()
-        .map(|fields| expected_manifest(fields, &declared, &reproduced));
+    let reproduced = reproduce(&groups, &seeds, &module, &bodies, snapshot, &mut findings);
+    let card_firmware = args
+        .firmware
+        .as_deref()
+        .map(parse_card_firmware)
+        .transpose()?;
 
     let service = Service {
         origin: &origin,
@@ -306,11 +289,16 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         reproduced: &reproduced,
         serials: &serials,
         pow: pow_params(args),
-        expected: expected.as_ref(),
         bodies: &bodies,
+        snapshot,
+        kind: args.kind.into(),
+        intent,
+        card_firmware,
+        declarations: &declarations,
     };
 
     let mut credentials: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut covered = vec![false; reproduced.len()];
     for (path, har) in &hars {
         findings.note("");
         findings.note(format!(
@@ -356,8 +344,22 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
             let label = format!("upload {} of {}", index + 1, file_name(path));
             findings.note("");
             findings.note(label.clone());
-            if let Some(credential) = verify_upload(&entry.request, &service, &mut findings) {
-                credentials.push((label, credential));
+            if let Some(upload) = verify_upload(&entry.request, &service, &mut findings) {
+                for image in upload.images {
+                    covered[image] = true;
+                }
+                credentials.push((label, upload.credential));
+            }
+        }
+    }
+
+    if findings.failures.is_empty() {
+        for (index, named) in covered.iter().enumerate() {
+            if !named {
+                findings.fail(format!(
+                    "no upload names the reproduced image {index} (blob {}); the HAR does not cover every prepared image",
+                    hex(&reproduced[index].blob_sha256)
+                ));
             }
         }
     }
@@ -447,50 +449,59 @@ fn manifest_snapshot_version(
     named.unwrap_or(CommunitySnapshotVersion::SHIPPED)
 }
 
-fn resolve_card_intent(
-    args: &VerifyPayloadArgs,
-    reproduced: &[ReproducedImage],
+/// The declared fields one upload names: the kind, the declared intent, and
+/// for intent `card` the declaration its images carry.
+fn upload_declared(
+    service: &Service<'_>,
+    images: &[&ReproducedImage],
     findings: &mut Findings,
-) -> Result<Intent> {
-    let tag = reproduced_tag(reproduced, findings);
-    let declared = args
-        .firmware
-        .as_deref()
-        .map(parse_card_firmware)
-        .transpose()?;
-    match (tag, declared) {
+) -> Option<DeclaredFields> {
+    let intent = match &service.intent {
+        Some(intent) => intent.clone(),
+        None => card_intent(images, service.card_firmware.as_ref(), findings)?,
+    };
+    Some(DeclaredFields {
+        kind: service.kind,
+        intent,
+    })
+}
+
+fn card_intent(
+    images: &[&ReproducedImage],
+    declared: Option<&(FirmwareId, FirmwareVersion)>,
+    findings: &mut Findings,
+) -> Option<Intent> {
+    let mut tags = images
+        .iter()
+        .filter_map(|image| image.metadata.render_tag.clone());
+    let first = tags.next();
+    if tags.any(|tag| Some(&tag) != first.as_ref()) {
+        findings.fail("the upload's images disagree on the render tag; one batch carries one tag");
+        return None;
+    }
+    match (first, declared) {
         (Some(tag), declared) => {
             if let Some((id, version)) = declared
-                && (tag.firmware_id != id || tag.firmware_version != version)
+                && (&tag.firmware_id != id || &tag.firmware_version != version)
             {
                 findings.fail(format!(
                     "--firmware {id}/{version} disagrees with the render tag {}/{}",
                     tag.firmware_id, tag.firmware_version
                 ));
             }
-            Ok(Intent::Card(CardDeclaration::Tagged(tag)))
+            Some(Intent::Card(CardDeclaration::Tagged(tag)))
         }
-        (None, Some((id, version))) => {
-            Ok(Intent::Card(CardDeclaration::user_declared(id, version)))
-        }
-        (None, None) => bail!(
-            "--intent card needs --firmware <id>/<version> when no image carries a render tag"
-        ),
-    }
-}
-
-fn reproduced_tag(reproduced: &[ReproducedImage], findings: &mut Findings) -> Option<RenderTag> {
-    let mut tags = reproduced
-        .iter()
-        .filter_map(|image| image.metadata.render_tag.clone());
-    let first = tags.next()?;
-    for tag in tags {
-        if tag != first {
-            findings.fail("the images disagree on the render tag; one batch carries one tag");
-            return None;
+        (None, Some((id, version))) => Some(Intent::Card(CardDeclaration::user_declared(
+            id.clone(),
+            version.clone(),
+        ))),
+        (None, None) => {
+            findings.fail(
+                "the upload's intent is undetermined: --intent card needs --firmware <id>/<version> when no image carries a render tag",
+            );
+            None
         }
     }
-    Some(first)
 }
 
 fn parse_card_firmware(text: &str) -> Result<(FirmwareId, FirmwareVersion)> {
@@ -552,7 +563,7 @@ struct BatchFields {
 }
 
 fn derive_batch(
-    reproduced: &[ReproducedImage],
+    images: &[&ReproducedImage],
     bodies: &Bodies,
     version: CommunitySnapshotVersion,
     declarations: &BTreeMap<ControlKey, StepIndex>,
@@ -569,7 +580,7 @@ fn derive_batch(
             return None;
         }
     };
-    let first = reproduced.first()?;
+    let first = images.first()?;
     let fields = match derive_one(&first.metadata, records, version, declarations, card) {
         Ok(fields) => fields,
         Err(reason) => {
@@ -579,7 +590,7 @@ fn derive_batch(
             return None;
         }
     };
-    for image in &reproduced[1..] {
+    for image in &images[1..] {
         match derive_one(&image.metadata, records, version, declarations, card) {
             Ok(other) if other == fields => {}
             Ok(_) => {
@@ -831,7 +842,7 @@ fn print_batch_fields(
 fn expected_manifest(
     fields: &BatchFields,
     declared: &DeclaredFields,
-    reproduced: &[ReproducedImage],
+    images: &[&ReproducedImage],
 ) -> BatchManifest {
     BatchManifest {
         kind: declared.kind,
@@ -841,14 +852,14 @@ fn expected_manifest(
         sim_key: fields.sim.clone(),
         community_snapshot_version: fields.version,
         settings: fields.settings.clone(),
-        images: reproduced
+        images: images
             .iter()
             .map(|image| ManifestImage {
                 meta: image.metadata.clone(),
                 rerender_group: image
                     .rerender_group
                     .map(looklab_upload::RerenderGroupId::new),
-                blob_sha256: sha256(&image.blob),
+                blob_sha256: image.blob_sha256,
                 blob_kind: BlobKind::Samples,
             })
             .collect(),
@@ -862,8 +873,13 @@ struct Service<'a> {
     reproduced: &'a [ReproducedImage],
     serials: &'a [(&'a str, &'a UploadSerial)],
     pow: PowParams,
-    expected: Option<&'a BatchManifest>,
     bodies: &'a Bodies,
+    snapshot: CommunitySnapshotVersion,
+    kind: ContributionKind,
+    /// The declared intent, absent when `--intent card` resolves it per upload.
+    intent: Option<Intent>,
+    card_firmware: Option<(FirmwareId, FirmwareVersion)>,
+    declarations: &'a BTreeMap<ControlKey, StepIndex>,
 }
 
 #[derive(Debug)]
@@ -871,13 +887,19 @@ struct ReproducedImage {
     metadata: ManifestMetadata,
     rerender_group: Option<[u8; 16]>,
     blob: Vec<u8>,
+    blob_sha256: [u8; 32],
+}
+
+struct VerifiedUpload {
+    credential: Vec<u8>,
+    images: Vec<usize>,
 }
 
 fn verify_upload(
     request: &HarRequest,
     service: &Service<'_>,
     findings: &mut Findings,
-) -> Option<Vec<u8>> {
+) -> Option<VerifiedUpload> {
     if let Some(mime_type) = request
         .post_data
         .as_ref()
@@ -913,19 +935,124 @@ fn verify_upload(
         envelope.nonce.as_bytes().len()
     ));
 
-    check_images(&envelope, service, findings);
+    let selected = select_images(&envelope, service.reproduced, findings);
+    let images = selected.as_ref().map(|indices| {
+        indices
+            .iter()
+            .map(|&index| &service.reproduced[index])
+            .collect::<Vec<_>>()
+    });
+    if let Some(images) = &images {
+        findings.note(format!(
+            "  images: {} of {} reproduced, in the manifest's order",
+            images.len(),
+            service.reproduced.len()
+        ));
+        match upload_declared(service, images, findings) {
+            Some(declared) => {
+                let derived = derive_batch(
+                    images,
+                    service.bodies,
+                    service.snapshot,
+                    service.declarations,
+                    matches!(declared.intent, Intent::Card(_)),
+                    findings,
+                );
+                print_batch_fields(derived.as_ref(), &declared, service.bodies, findings);
+                if let Some(fields) = &derived {
+                    let expected = expected_manifest(fields, &declared, images);
+                    check_images(&envelope, &expected, images, service, findings);
+                } else {
+                    findings.fail(
+                        "the manifest cannot be reproduced: the batch fields are not determined",
+                    );
+                }
+            }
+            None => findings.fail(
+                "the manifest cannot be reproduced: the upload's declared intent is not determined",
+            ),
+        }
+    } else {
+        findings.fail("the manifest cannot be reproduced: the upload's images are not reproduced");
+    }
+
     check_webauthn(&envelope, service, findings);
     check_pow(&envelope, service, findings);
     check_serial(&envelope, service, &body, findings);
 
-    Some(envelope.assertion.credential_id)
+    Some(VerifiedUpload {
+        credential: envelope.assertion.credential_id,
+        images: selected.unwrap_or_default(),
+    })
 }
 
-fn check_images(envelope: &Envelope, service: &Service<'_>, findings: &mut Findings) {
-    let Some(expected) = service.expected else {
-        findings.fail("the manifest cannot be reproduced: the batch fields are not determined");
-        return;
-    };
+/// The reproduced images one upload names, in its manifest's order.
+fn select_images(
+    envelope: &Envelope,
+    reproduced: &[ReproducedImage],
+    findings: &mut Findings,
+) -> Option<Vec<usize>> {
+    if envelope.manifest.images.is_empty() {
+        findings.fail("the upload names no image");
+        return None;
+    }
+    let mut used = vec![false; reproduced.len()];
+    let mut selected = Vec::with_capacity(envelope.manifest.images.len());
+    let mut last: Option<usize> = None;
+    for (position, recorded) in envelope.manifest.images.iter().enumerate() {
+        let matching: Vec<usize> = reproduced
+            .iter()
+            .enumerate()
+            .filter(|(index, image)| !used[*index] && image.matches(recorded))
+            .map(|(index, _)| index)
+            .collect();
+        let Some(&chosen) = matching
+            .iter()
+            .find(|&&index| last.is_none_or(|last| index > last))
+        else {
+            if matching.is_empty() {
+                if reproduced.iter().any(|image| image.matches(recorded)) {
+                    findings.fail(format!(
+                        "image {position} repeats a reproduced image; one upload carries each prepared image once"
+                    ));
+                } else {
+                    findings.fail(format!(
+                        "image {position} does not match any reproduced image; its blob, metadata or re-render group differs"
+                    ));
+                }
+            } else {
+                findings.fail(format!(
+                    "image {position} is out of the reproduced order: the files put it before image {}",
+                    last.unwrap_or_default()
+                ));
+            }
+            return None;
+        };
+        used[chosen] = true;
+        last = Some(chosen);
+        selected.push(chosen);
+    }
+    Some(selected)
+}
+
+impl ReproducedImage {
+    fn matches(&self, recorded: &ManifestImage) -> bool {
+        self.blob_sha256 == recorded.blob_sha256
+            && self.metadata == recorded.meta
+            && self
+                .rerender_group
+                .map(looklab_upload::RerenderGroupId::new)
+                == recorded.rerender_group
+    }
+}
+
+fn check_images(
+    envelope: &Envelope,
+    expected: &BatchManifest,
+    images: &[&ReproducedImage],
+    service: &Service<'_>,
+    findings: &mut Findings,
+) {
     if let Err(error) = service
         .bodies
         .at(envelope.manifest.community_snapshot_version)
@@ -945,8 +1072,7 @@ fn check_images(envelope: &Envelope, service: &Service<'_>, findings: &mut Findi
         sim: expected.sim_key.clone(),
         community_snapshot_version: expected.community_snapshot_version,
         settings: expected.settings.clone(),
-        images: service
-            .reproduced
+        images: images
             .iter()
             .map(|image| ManifestImageInput {
                 metadata: image.metadata.clone(),
@@ -981,8 +1107,8 @@ fn check_images(envelope: &Envelope, service: &Service<'_>, findings: &mut Findi
         }
     }
 
-    let mut blobs_match = envelope.blobs.len() == service.reproduced.len();
-    for (index, (site_blob, ours)) in envelope.blobs.iter().zip(service.reproduced).enumerate() {
+    let mut blobs_match = envelope.blobs.len() == images.len();
+    for (index, (site_blob, ours)) in envelope.blobs.iter().zip(images).enumerate() {
         if site_blob != &ours.blob {
             blobs_match = false;
             findings.fail(format!(
@@ -994,7 +1120,7 @@ fn check_images(envelope: &Envelope, service: &Service<'_>, findings: &mut Findi
         findings.note(format!(
             "  blobs: {} of {} reproduced byte for byte",
             envelope.blobs.len(),
-            service.reproduced.len()
+            images.len()
         ));
     }
 }
@@ -1271,6 +1397,8 @@ fn reproduce(
     groups: &[Group],
     seeds: &SeedFile,
     module: &ModuleHost,
+    bodies: &Bodies,
+    snapshot: CommunitySnapshotVersion,
     findings: &mut Findings,
 ) -> Vec<ReproducedImage> {
     let version = seeds.prior_transform_version().get();
@@ -1286,9 +1414,34 @@ fn reproduce(
             findings.fail(format!("the seed file has no entry for {}", group.raw.name));
             continue;
         };
+        let monochrome = monochrome_renders(group, bodies, snapshot);
+        let refused: Vec<&str> = group
+            .jpegs
+            .iter()
+            .zip(&monochrome)
+            .filter(|(_, refused)| **refused)
+            .map(|(file, _)| file.name.as_str())
+            .collect();
+        if !refused.is_empty() {
+            findings.note(format!(
+                "  excluded known monochrome render(s): {}",
+                refused.join(", ")
+            ));
+        }
+        let jpegs: Vec<Vec<u8>> = group
+            .jpegs
+            .iter()
+            .zip(&monochrome)
+            .filter(|(_, refused)| !**refused)
+            .map(|(file, _)| file.bytes.clone())
+            .collect();
+        if jpegs.is_empty() {
+            findings.note("  no colour render to prepare");
+            continue;
+        }
         let request = PrepareRequest {
             raw: group.raw.bytes.clone(),
-            jpegs: group.jpegs.iter().map(|file| file.bytes.clone()).collect(),
+            jpegs,
             prior: PriorTransformSpec::CameraMatrices { version },
             seed: *seed.as_bytes(),
             params: PrepParams::default(),
@@ -1298,6 +1451,7 @@ fn reproduce(
                 findings.note(format!("  prepared {} image(s)", response.images.len()));
                 for image in response.images {
                     images.push(ReproducedImage {
+                        blob_sha256: sha256(&image.blob),
                         metadata: image.metadata,
                         rerender_group: image.rerender_group,
                         blob: image.blob,
@@ -1308,6 +1462,55 @@ fn reproduce(
         }
     }
     images
+}
+
+/// One flag per JPEG, in file order: whether the published schema calls its
+/// render a monochrome sim.
+fn monochrome_renders(
+    group: &Group,
+    bodies: &Bodies,
+    snapshot: CommunitySnapshotVersion,
+) -> Vec<bool> {
+    let none = vec![false; group.jpegs.len()];
+    let Ok(records) = bodies.at(snapshot) else {
+        return none;
+    };
+    let Some(epoch) = group_epoch(group, records) else {
+        return none;
+    };
+    group
+        .jpegs
+        .iter()
+        .map(|jpeg| {
+            jpeg.manifest_metadata().is_some_and(|metadata| {
+                monochrome_sim(epoch, &MakernoteValues::from(&metadata)).is_some()
+            })
+        })
+        .collect()
+}
+
+/// The epoch the contribution form classifies the group under: the first
+/// JPEG's body and firmware, else another file's.
+fn group_epoch<'a>(group: &Group, records: &'a BTreeMap<String, BodyRecord>) -> Option<&'a Epoch> {
+    let jpegs: Vec<ManifestMetadata> = group
+        .jpegs
+        .iter()
+        .filter_map(InputFile::manifest_metadata)
+        .collect();
+    let primary = jpegs
+        .first()
+        .cloned()
+        .or_else(|| group.files().find_map(InputFile::manifest_metadata))?;
+    let firmware = jpegs
+        .iter()
+        .find_map(|metadata| metadata.firmware.clone())
+        .or_else(|| {
+            group
+                .files()
+                .find_map(|file| file.manifest_metadata()?.firmware)
+        })?;
+    let body = match_body(records, primary.make.as_deref()?, primary.model.as_deref()?).ok()?;
+    resolve_epoch(&records.get(body.as_str())?.schema, &firmware)
 }
 
 fn undecodable(name: &str, failure: &ModuleFailure) -> String {
@@ -1588,6 +1791,12 @@ impl InputFile {
 
     fn serial(&self) -> Option<&RawSerial> {
         self.parsed.as_ref().and_then(ParsedMetadata::body_serial)
+    }
+
+    fn manifest_metadata(&self) -> Option<ManifestMetadata> {
+        self.parsed
+            .as_ref()
+            .map(|parsed| ManifestMetadata::from(&looklab_meta::sanitize(parsed).0))
     }
 }
 

@@ -14,7 +14,9 @@ use tokio::task;
 
 use crate::api::consume_nonce;
 use crate::blob::{BlobHash, BlobStore};
-use crate::body_schema::{SnapshotVersionError, validate_settings};
+use crate::body_schema::{
+    SettingsProblem, SnapshotVersionError, validate_render_sims, validate_settings,
+};
 use crate::error::{ApiError, ApiResult, ErrorCode};
 use crate::ids::{ContributionId, CredentialId, RawCredentialId, StatusToken};
 use crate::preparse::parse_header;
@@ -154,7 +156,13 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         &envelope.manifest.settings,
         matches!(envelope.manifest.intent, looklab_upload::Intent::Card(_)),
     )
-    .map_err(|_| ApiError::new(ErrorCode::SchemaInvalid))?;
+    .map_err(settings_error)?;
+    validate_render_sims(
+        body_record,
+        envelope.manifest.firmware_version.as_str(),
+        envelope.manifest.images.iter().map(|image| &image.meta),
+    )
+    .map_err(settings_error)?;
 
     let serial_hmac = match envelope.serial.take() {
         Some(serial) => {
@@ -318,6 +326,13 @@ fn store_blobs(store: &Arc<dyn BlobStore>, envelope: &Envelope) -> Result<Vec<i6
         counts.push(i64::try_from(n).unwrap_or(i64::MAX));
     }
     Ok(counts)
+}
+
+fn settings_error(problem: SettingsProblem) -> ApiError {
+    match problem {
+        SettingsProblem::MonochromeSim(_) => ApiError::new(ErrorCode::MonochromeUnsupported),
+        _ => ApiError::new(ErrorCode::SchemaInvalid),
+    }
 }
 
 pub(super) fn database_error(error: sqlx::Error) -> ApiError {

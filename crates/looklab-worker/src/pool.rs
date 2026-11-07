@@ -81,6 +81,7 @@ pub async fn build(
     let resources = DataDir::new(&config.data).load(body)?;
     let transforms = TransformDir::new(&config.transforms).load(body)?;
     let rows = db::body_pool(db_pool, body).await?;
+    let exclusions = db::look_credential_exclusions(db_pool, look.as_str()).await?;
 
     let mut contributions = Vec::new();
     for (contribution, images) in rows {
@@ -94,7 +95,7 @@ pub async fn build(
             contribution.intent,
             contribution.target_look.as_ref(),
         )?;
-        if &resolved == look {
+        if &resolved == look && !exclusions.contains(&contribution.credential) {
             contributions.push((contribution, images));
         }
     }
@@ -133,8 +134,9 @@ pub async fn build(
             .get(&credential.trust)
             .copied()
             .unwrap_or_else(|| EffectiveContributorId::from(credential.trust));
-        let epoch = epoch_for(&resources.schema, &contribution.firmware)?.id;
-        let settings = model_settings(&contribution.settings);
+        let epoch_schema = epoch_for(&resources.schema, &contribution.firmware)?;
+        let settings = model_settings(&contribution.settings, epoch_schema)?;
+        let epoch = epoch_schema.id;
         let setting_source: BTreeMap<ControlKey, SettingSource> = contribution
             .settings
             .entries()
@@ -183,12 +185,48 @@ pub async fn build(
     })
 }
 
-fn model_settings(wire: &ControlSettings) -> Settings {
+fn model_settings(wire: &ControlSettings, epoch: &looklab_schema::Epoch) -> Result<Settings> {
     let mut settings = Settings::new();
     for entry in wire.entries() {
-        settings.set(entry.key.clone(), ControlValue::Step(entry.step.get()));
+        let control = epoch
+            .controls
+            .iter()
+            .find(|control| control.key == entry.key)
+            .ok_or_else(|| {
+                WorkerError::Data(format!(
+                    "control {} is not in epoch {}",
+                    entry.key, epoch.id
+                ))
+            })?;
+        let step = entry.step.get();
+        let value = match control.kind {
+            ControlType::Int | ControlType::Decimal => ControlValue::Step(step),
+            ControlType::Enum => {
+                let value = usize::try_from(step)
+                    .ok()
+                    .and_then(|index| control.values.as_ref()?.get(index))
+                    .ok_or_else(|| {
+                        WorkerError::Data(format!(
+                            "control {} has no value at step {step}",
+                            entry.key
+                        ))
+                    })?;
+                ControlValue::Enum(value.clone())
+            }
+            ControlType::Bool => match step {
+                0 => ControlValue::Bool(false),
+                1 => ControlValue::Bool(true),
+                _ => {
+                    return Err(WorkerError::Data(format!(
+                        "control {} has no boolean value at step {step}",
+                        entry.key
+                    )));
+                }
+            },
+        };
+        settings.set(entry.key.clone(), value);
     }
-    settings
+    Ok(settings)
 }
 
 /// The exposure mode a settings map selects: the first enum control whose value

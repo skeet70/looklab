@@ -28,3 +28,4 @@ Decisions not yet made. Each has a default so work isn't blocked. Change a defau
 | Q23 | ΔE₍UCS₎ boundaries for the five closeness labels of 08 §0.4 | < 1, 1 to 2, 2 to 4, 4 to 7, ≥ 7; set by the color pipeline from perceptual evidence | 02 §7, 08 §0.4 |
 | Q24 | Status token lifetime | No expiry; a token ends at sign-out or sign out everywhere | 06 §4, 08 §4.1 |
 | Q25 | Neutral display-baseline standard for display-referred LUTs | Plain ITU-R BT.709 OETF after a hard clip; ACES SDR output transform is the alternative | 02 §3.8, 03 §3 |
+| Q26 | A B&W Look kind: achromatic tone and filter response (Acros, Monochrome, Sepia and their filter variants) | Open: model and roadmap placement undecided. The current colour fitter refuses sims marked `monochrome: true` rather than fitting them as colour Looks | 02 §3, 03 §1, 08 §4.2 |

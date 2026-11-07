@@ -70,7 +70,7 @@ data/
 tools/golden/       # dev-only Python scripts producing golden test vectors from colour-science
 fixtures/           # manifest + fetched/LFS/plain-git fixture policy (see AGENTS.md)
 xtask/              # cargo xtask: float-method allow-list, SPDX headers, wasm32 core build, native/wasm bit identity
-fuzz/               # cargo-fuzz project (its own workspace, excluded from the crate workspace); runs the sample reader
+fuzz/               # cargo-fuzz project (its own workspace, excluded from the crate workspace); runs the sample, patch-table, upload-envelope and RAW readers
 ```
 
 **Dependency DAG:**
@@ -111,7 +111,7 @@ Nothing in the core depends on `server`/`web`. Core crates (everything except `s
 
 **WASM threading:** shared-memory WASM threads need nightly Rust plus `build-std`, so v1 uses **N single-threaded workers**. Each worker processes one file at a time. No COOP/COEP headers are needed.
 
-**Memory budget:** each worker stays ≤ 1 GB *(tentative)*: half-size demosaic, downsampling immediately after decode. N is sized from a **total** budget, not the thread count:
+**Memory budget:** each worker stays ≤ 1 GB *(tentative)*: half-size CFA decode, bounded alignment grids and downsampling after the fitted radial gain. The full reduced RAW stays live until gain correction; averaging before that correction changes sample bytes. The module borrows RAW and JPEG bytes from its ABI request, and releases rawler's source copy before CFA reduction. Alignment reads the area-averaged scoring JPEG lazily rather than allocating another reduced RGB image. The RAW is decoded and aligned once per group; group members are decoded one at a time and sampled through oriented RGB8 codes, so one member's pixels are live. N is sized from a **total** budget, not the thread count:
 ```
 total_budget = navigator.deviceMemory ? min(2 GB, deviceMemory / 4) : 1 GB
 N = clamp(floor(total_budget / 1 GB), 1, 2)

@@ -1,7 +1,7 @@
 id: example-app/lut3d-v1
 name: "Example editor 3D LUT module"
 version: 1
-bodies: [vendor/model-a]
+bodies: [vendor/model-a, synthetic/looklab]
 insertion:
   point: camera_rgb_wb_linear
   encoding:

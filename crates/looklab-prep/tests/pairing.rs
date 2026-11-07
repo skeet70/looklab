@@ -62,7 +62,7 @@ fn metadata(
             lens_serial_present: false,
         },
         fuji,
-        firmware: None,
+        firmware: Some("1.00".to_owned()),
         render_tag: looklab_meta::RenderTagOutcome::Absent,
     }
 }
@@ -214,6 +214,170 @@ fn classifies_in_camera_renders_and_duplicates() {
         }
     );
     assert_eq!(outcome.rerender_groups().len(), 1);
+}
+
+fn with_saturation(
+    mut metadata: ParsedMetadata,
+    saturation: looklab_meta::ColorSaturation,
+) -> ParsedMetadata {
+    metadata
+        .fuji
+        .as_mut()
+        .expect("the fixture has makernotes")
+        .look
+        .saturation = Some(ParsedTag {
+        tag: looklab_meta::FujiTag::Saturation,
+        raw: 0,
+        value: Some(saturation),
+    });
+    metadata
+}
+
+#[test]
+fn same_raw_keeps_provia_velvia_and_acros_as_separate_renders() {
+    let render = |name: &str, film: looklab_meta::FilmMode| {
+        file(
+            name,
+            &metadata(
+                "FUJIFILM",
+                "X-S10",
+                Some(capture(9, None)),
+                Some(16),
+                Some(film),
+            ),
+        )
+    };
+    let raw = file(
+        "DSCF0106.RAF",
+        &metadata(
+            "FUJIFILM",
+            "X-S10",
+            Some(capture(9, None)),
+            Some(16),
+            Some(looklab_meta::FilmMode::Provia),
+        ),
+    );
+    let provia = render("RENDER-1.JPG", looklab_meta::FilmMode::Provia);
+    let velvia = render("RENDER-2.JPG", looklab_meta::FilmMode::Velvia);
+    let acros = file(
+        "RENDER-3.JPG",
+        &with_saturation(
+            metadata(
+                "FUJIFILM",
+                "X-S10",
+                Some(capture(9, None)),
+                Some(16),
+                Some(looklab_meta::FilmMode::Provia),
+            ),
+            looklab_meta::ColorSaturation::Acros(looklab_meta::MonochromeFilter::NoFilter),
+        ),
+    );
+    let outcome = pair(&[raw, provia, velvia, acros]);
+
+    assert_eq!(outcome.pairs.len(), 1);
+    assert_eq!(
+        outcome.pairs[0]
+            .rerender_members()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            key("RENDER-1.JPG"),
+            key("RENDER-2.JPG"),
+            key("RENDER-3.JPG")
+        ]
+    );
+    let groups = outcome.rerender_groups();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].jpegs.len(), 3);
+}
+
+#[test]
+fn same_raw_keeps_two_settings_of_one_sim_as_separate_renders() {
+    let raw = file(
+        "DSCF0107.RAF",
+        &metadata(
+            "FUJIFILM",
+            "X-S10",
+            Some(capture(10, None)),
+            Some(17),
+            Some(looklab_meta::FilmMode::Provia),
+        ),
+    );
+    let neutral = file(
+        "RENDER-1.JPG",
+        &metadata(
+            "FUJIFILM",
+            "X-S10",
+            Some(capture(10, None)),
+            Some(17),
+            Some(looklab_meta::FilmMode::Provia),
+        ),
+    );
+    let punchy = file(
+        "RENDER-2.JPG",
+        &with_saturation(
+            metadata(
+                "FUJIFILM",
+                "X-S10",
+                Some(capture(10, None)),
+                Some(17),
+                Some(looklab_meta::FilmMode::Provia),
+            ),
+            looklab_meta::ColorSaturation::Step(2),
+        ),
+    );
+    let outcome = pair(&[raw, neutral, punchy]);
+
+    assert_eq!(
+        outcome.pairs[0]
+            .rerender_members()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![key("RENDER-1.JPG"), key("RENDER-2.JPG")]
+    );
+    assert!(
+        outcome.pairs[0]
+            .jpegs
+            .iter()
+            .all(|member| member.role == JpegRole::Rerender)
+    );
+}
+
+#[test]
+fn different_or_unknown_rendering_firmware_does_not_discard_a_jpeg() {
+    for (left_firmware, right_firmware) in [
+        (Some("1.00"), Some("1.10")),
+        (None, Some("1.00")),
+        (None, None),
+    ] {
+        let make_metadata = || {
+            metadata(
+                "FUJIFILM",
+                "X-S10",
+                Some(capture(8, None)),
+                Some(15),
+                Some(looklab_meta::FilmMode::Provia),
+            )
+        };
+        let raw = file("DSCF0105.RAF", &make_metadata());
+        let mut left = make_metadata();
+        left.firmware = left_firmware.map(str::to_owned);
+        let mut right = make_metadata();
+        right.firmware = right_firmware.map(str::to_owned);
+        let outcome = pair(&[
+            raw,
+            file("DSCF0105-1.JPG", &left),
+            file("DSCF0105-2.JPG", &right),
+        ]);
+        assert_eq!(
+            outcome.pairs[0]
+                .rerender_members()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![key("DSCF0105-1.JPG"), key("DSCF0105-2.JPG")],
+            "rendering firmware {left_firmware:?} / {right_firmware:?}",
+        );
+    }
 }
 
 #[test]

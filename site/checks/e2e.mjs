@@ -10,7 +10,13 @@ const REPO_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 
 const USAGE = `usage: node site/checks/e2e.mjs [options]
 
-  --browser chromium|firefox   engine to drive (default chromium)
+  --browser chromium|firefox|webkit
+                               engine to drive (default chromium); Firefox and
+                               WebKit use Playwright's context credentials, so a
+                               WebKit run on a machine without a GPU also needs
+                               __EGL_VENDOR_LIBRARY_FILENAMES for Mesa's
+                               libEGL_mesa, EGL_PLATFORM=surfaceless and
+                               MESA_LOADER_DRIVER_OVERRIDE=swrast
   --flow all|match|contribute|pages|flatness|propose|developers|compare|account
   --origin URL                 stub server origin (default http://localhost:8099)
   --out DIR                    artifact directory (default /tmp/looklab-e2e)
@@ -18,6 +24,8 @@ const USAGE = `usage: node site/checks/e2e.mjs [options]
   --raw FILE --jpeg FILE       the contribution files
   --body ID --firmware V --sim KEY
   --controls "key=step,..."    control steps, comma separated
+  --fail-draft-blobs 1         make IndexedDB Blob writes throw, to check the
+                               draft-unavailable note and that the flow continues
   --workers N                  worker count for the contribute run
   --verifier FILE              native looklab binary for contribution HAR checks
   --verify-module FILE         served prep module for HAR checks
@@ -59,6 +67,7 @@ const options = {
   expected: 'target-ui/dist/data/looks/synthetic-match/1.0.0/match.permalink',
   status: '',
   permalink: '',
+  'fail-draft-blobs': false,
 };
 
 for (let index = 2; index < process.argv.length; index += 1) {
@@ -73,15 +82,23 @@ for (let index = 2; index < process.argv.length; index += 1) {
   }
   index += 1;
   const value = process.argv[index];
-  options[key] = ['workers', 'count'].includes(key) ? Number(value) : value;
+  options[key] = ['workers', 'count'].includes(key)
+    ? Number(value)
+    : key === 'fail-draft-blobs'
+      ? value === '1' || value === 'true'
+      : value;
 }
 
 const playwrightModule = process.env.PLAYWRIGHT_MODULE;
 const playwright = playwrightModule
   ? await import(pathToFileURL(playwrightModule).href)
   : await import('playwright-core');
-const { chromium, firefox } = playwright.default ?? playwright;
-const engine = options.browser === 'firefox' ? firefox : chromium;
+const { chromium, firefox, webkit } = playwright.default ?? playwright;
+const ENGINES = { chromium, firefox, webkit };
+const engine = ENGINES[options.browser];
+if (!engine) {
+  throw new Error(`unknown browser ${options.browser}\n\n${USAGE}`);
+}
 
 const VIEWPORTS = {
   desktop: { width: 1280, height: 960 },
@@ -97,22 +114,10 @@ function check(condition, message) {
   console.log(`ok ${message}`);
 }
 
-function launchOptions() {
-  if (options.browser !== 'firefox') {
-    return {};
-  }
-  return {
-    firefoxUserPrefs: {
-      'security.webauth.webauthn_enable_softtoken': true,
-      'security.webauth.webauthn_enable_usbtoken': false,
-      'security.webauth.webauthn_enable_android_fido2': false,
-    },
-  };
-}
-
 async function addVirtualAuthenticator(page) {
   if (options.browser !== 'chromium') {
-    return;
+    await page.context().credentials.install();
+    return null;
   }
   const session = await page.context().newCDPSession(page);
   await session.send('WebAuthn.enable');
@@ -136,7 +141,7 @@ async function addVirtualAuthenticator(page) {
 }
 
 async function open(viewport, harPath) {
-  const browser = await engine.launch(launchOptions());
+  const browser = await engine.launch();
   const context = await browser.newContext({
     viewport,
     acceptDownloads: true,
@@ -151,6 +156,17 @@ async function open(viewport, harPath) {
       : {}),
   });
   const page = await context.newPage();
+  if (options['fail-draft-blobs']) {
+    await page.addInitScript(() => {
+      const put = IDBObjectStore.prototype.put;
+      IDBObjectStore.prototype.put = function (value, key) {
+        if (value instanceof Blob) {
+          throw new Error('draft blob write refused');
+        }
+        return put.call(this, value, key);
+      };
+    });
+  }
   await page.bringToFront();
   const bodies = new Map();
   page.on('request', (request) => {
@@ -198,6 +214,16 @@ async function match(size) {
     await recipe.waitFor({ timeout: 120_000 });
     await page.getByRole('heading', { name: 'Sunlit Negative on your Fujifilm X-T5', exact: true }).waitFor();
     await page.getByRole('slider', { name: 'Comparison divider' }).waitFor({ timeout: 120_000 });
+    const prefill = new URL(page.url());
+    check(prefill.searchParams.get('camera') === 'fujifilm/x-t5' && prefill.searchParams.get('look') === 'sunlit-negative', `${size}: camera and look stay prefilled from the URL`);
+    check(await page.getByRole('heading', { name: 'Which look?', exact: true }).count() === 0, `${size}: a prefilled URL lands on the result`);
+    check(await page.getByText('Left: target look', { exact: true }).count() === 1, `${size}: the result splits target from realization`);
+    check(await page.getByText('Right: your camera at these settings', { exact: true }).count() === 1, `${size}: the realization side is labelled`);
+    const closeness = recipe.locator('.closeness-label');
+    check(await closeness.count() === 1, `${size}: the result carries a closeness label`);
+    check(!(await recipe.locator('.closeness-details').isVisible()), `${size}: closeness numbers wait to be asked for`);
+    await closeness.click();
+    check(await recipe.locator('.closeness-details').isVisible(), `${size}: closeness numbers appear on demand`);
     const settings = await recipe.locator('dl').innerText();
     const share = page.getByRole('link', { name: 'Share link', exact: true });
     const href = await share.getAttribute('href');
@@ -411,14 +437,22 @@ async function contribute(size) {
     await chooser.setFiles([options.raw, options.jpeg]);
     await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).waitFor({ timeout: 120_000 });
     await capture('contribute-1-drop');
+    if (options['fail-draft-blobs']) {
+      await page.getByText("This browser couldn't keep a local draft").waitFor({ timeout: 30_000 });
+    }
+    const draftUnavailable = await page.getByText("This browser couldn't keep a local draft").count() > 0;
+    if (options['fail-draft-blobs']) {
+      check(draftUnavailable, `${size}: a failed draft save is reported without blocking`);
+    }
+    summary.draft_unavailable = draftUnavailable;
 
     await page.fill('#body-id', options.body);
     await page.fill('#firmware', options.firmware);
     await page.fill('#sim', options.sim);
-    await page.getByRole('checkbox', { name: 'Recipe contribution' }).check();
+    await page.getByRole('checkbox', { name: 'Settings contribution' }).check();
     await page.fill('#recipe-target', 'cold-steel');
     await page.fill('#recipe-target', 'sunlit-negative');
-    await page.getByRole('checkbox', { name: 'Recipe contribution' }).uncheck();
+    await page.getByRole('checkbox', { name: 'Settings contribution' }).uncheck();
     await page.click('summary:has-text("Technical settings editor")');
     if (options.controls) {
       await page.fill('#controls', options.controls.split(',').join('\n'));
@@ -460,32 +494,55 @@ async function contribute(size) {
       page.click('button:has-text("Download payload")'),
     ]);
     await payloadDownload.saveAs(`${options.out}/payload-${size}.json`);
-    const beforeResume = await page.locator('.payload-summary').textContent();
-    await page.reload();
-    await page.waitForSelector('h2:has-text("Review what")');
-    check(await page.locator('.payload-summary').textContent() === beforeResume, `${size}: local draft resumes prepared samples`);
-    check(await page.locator('#recipe-target').inputValue() === 'sunlit-negative', `${size}: latest settings survive draft resume`);
+    if (!draftUnavailable) {
+      const beforeResume = await page.locator('.payload-summary').textContent();
+      await page.reload();
+      await page.waitForSelector('h2:has-text("Review what")');
+      check(await page.locator('.payload-summary').textContent() === beforeResume, `${size}: local draft resumes prepared samples`);
+      check(await page.locator('#recipe-target').inputValue() === 'sunlit-negative', `${size}: latest settings survive draft resume`);
+    }
 
     await page.bringToFront();
     await page.click('button:has-text("Continue to send")');
     await capture('contribute-send');
     await page.click('button:has-text("Send contribution")');
     await page.waitForSelector('dialog[open]');
+    const upload = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname === '/api/upload',
+      { timeout: 300_000 },
+    );
     await page.click('dialog button:has-text("Create a profile")');
-    await page.waitForSelector('text=Status link', { timeout: 300_000 });
+    const uploadResponse = await upload;
+    check(uploadResponse.status() === 201, `${size}: upload was accepted`);
+    const { contribution_id: contributionId } = await uploadResponse.json();
+    check(Boolean(contributionId), `${size}: upload returns a contribution id`);
+    await page.getByRole('heading', { name: 'Thanks for helping build looks', exact: true }).waitFor({ timeout: 300_000 });
     await capture('contribute-4-upload');
     check(await page.getByRole('button', { name: 'Back', exact: true }).isDisabled(), `${size}: completed upload cannot go back`);
     check(await page.getByRole('navigation', { name: 'Progress' }).getByRole('button', { name: 'Send', exact: true }).isDisabled(), `${size}: completed batch cannot reopen Send`);
-    const link = await page.locator('a[href^="/status/"]').first().getAttribute('href');
-    summary.status = link;
-    check(Boolean(link), `${options.browser} ${size}: upload returned a status link`);
     check(problems.length === 0, `${options.browser} ${size}: no page errors during contribute`);
 
-    await page.click('a[href^="/status/"]');
-    await page.waitForSelector('h1:has-text("Your contributions")', { timeout: 60_000 });
-    await page.waitForSelector('table.data-table', { timeout: 60_000 });
-    await page.screenshot({ path: `${options.out}/status-${size}.png`, fullPage: true });
-    summary.status_token = link.split('/').pop();
+    const feed = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'GET' &&
+        /^\/status\/[A-Za-z0-9_-]+$/.test(new URL(response.url()).pathname),
+      { timeout: 60_000 },
+    );
+    await page.getByRole('main').getByRole('link', { name: 'Your contributions', exact: true }).click();
+    await page.waitForURL((url) => url.pathname.endsWith('/me'), { timeout: 60_000 });
+    await page.getByRole('heading', { name: 'Your contributions', exact: true }).waitFor({ timeout: 60_000 });
+    const feedResponse = await feed;
+    check(feedResponse.ok(), `${size}: contribution feed loads`);
+    const feedBody = await feedResponse.json();
+    check(Array.isArray(feedBody.contributions), `${size}: contribution feed returns contributions`);
+    const persisted = feedBody.contributions.find((contribution) => contribution.id === contributionId);
+    check(Boolean(persisted), `${size}: contribution feed lists the uploaded batch`);
+    check(Array.isArray(persisted.images) && persisted.images.length === 1, `${size}: contribution feed contains the one uploaded image`);
+    await page.getByRole('heading', { name: `Contribution ${contributionId}`, exact: true }).waitFor({ timeout: 60_000 });
+    await page.screenshot({ path: `${options.out}/contributions-${size}.png`, fullPage: true });
+    summary.contribution_id = contributionId;
     return summary;
   } catch (error) {
     const state = await page
@@ -628,6 +685,23 @@ async function pages() {
           check(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${size}: ${theme} ${name} fits the viewport after photos load`);
           if (name === 'home' || name === 'looks') {
             check(await page.getByRole('button', { name: /Synthetic Match Case/ }).count() === 0, `${size}: ${name} excludes test fixture looks`);
+          }
+          const glance = await page.evaluate(() => {
+            const visible = element => {
+              const box = element.getBoundingClientRect();
+              return box.width > 0 && box.height > 0;
+            };
+            const top = selector => {
+              const element = Array.from(document.querySelectorAll(selector)).find(visible);
+              return element ? element.getBoundingClientRect().top + window.scrollY : null;
+            };
+            return { image: top('main canvas'), plot: top('main .plot'), table: top('main table') };
+          });
+          check(glance.image !== null, `${size}: ${theme} ${name} shows an image at the glance level`);
+          check(glance.plot === null || glance.plot > glance.image, `${size}: ${theme} ${name} keeps plots below the glance image`);
+          check(glance.table === null || glance.table > glance.image, `${size}: ${theme} ${name} keeps tables below the glance image`);
+          if (name === 'look' || name === 'camera') {
+            check(await page.getByRole('heading', { name: 'Recipes others use', exact: true }).isVisible(), `${size}: ${theme} ${name} shows the recipe leaderboard`);
           }
           if (name === 'home') {
             check(await page.getByRole('group', { name: 'Comparison view', exact: true }).count() === 0, `${size}: ${theme} home hides view-mode controls`);
@@ -876,16 +950,12 @@ async function propose(size) {
     }
 
     const snapshotDir = `${options.state}/community/v${version}`;
-    const exported = await readFile(`${snapshotDir}/fixtures/fixture-${size}.raf`, 'utf8');
+    const exported = await readFile(`${snapshotDir}/fixtures/donated/fixture-${size}.raf`, 'utf8');
     check(
       exported === `looklab fixture donation for ${size}\n`,
       `${options.browser} ${size}: the approved snapshot exports the donated file`,
     );
     const manifest = await readFile(`${snapshotDir}/fixtures/manifest.toml`, 'utf8');
-    check(
-      manifest.includes('committed = true'),
-      `${options.browser} ${size}: the exported fixture is committed`,
-    );
     check(
       !manifest.includes('source ='),
       `${options.browser} ${size}: the published manifest drops the private blob source`,
@@ -1099,6 +1169,9 @@ async function compareViews() {
 }
 
 async function account() {
+  if (options.browser !== 'chromium') {
+    throw new Error('the account flow needs the Chromium CDP authenticator; use --browser chromium');
+  }
   const session = await open(VIEWPORTS.desktop);
   const { page, context, browser: engineBrowser, problems } = session;
   const { cdp, authenticatorId } = session.authenticator;

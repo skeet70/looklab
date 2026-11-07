@@ -6,9 +6,9 @@ use looklab_color::RgbSpace;
 use looklab_color::cam16::{Cam16Model, ViewingConditions};
 use looklab_color::ucs::{UcsSpace, ucs_to_jmh};
 use looklab_color::{Illuminant, Rgb, Xyz};
-use looklab_model::LookDocument;
 use looklab_model::file::{LookIdentity, LookVersion, Slug, WbPolicy as LookWbPolicy};
 use looklab_model::probes;
+use looklab_model::{LookDocument, MatchRefusal};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -69,8 +69,8 @@ pub enum CardError {
     NonFinite,
     #[error("card metadata: {0}")]
     Meta(&'static str),
-    #[error("Look is not matchable: its display base is not pinned")]
-    NotMatchable,
+    #[error("Look is not matchable: {0}")]
+    NotMatchable(MatchRefusal),
 }
 
 /// Input space id 1: scene-linear Rec.2020 adapted to D65 (docs/04 §8.1).
@@ -402,8 +402,8 @@ pub fn write_card(
     meta: &CardMeta,
     options: &CardOptions,
 ) -> Result<Vec<u8>, CardError> {
-    if !document.is_matchable() {
-        return Err(CardError::NotMatchable);
+    if let Some(refusal) = document.match_refusal() {
+        return Err(CardError::NotMatchable(refusal));
     }
     if document.file.look.wb_policy != LookWbPolicy::Adaptive {
         return Err(CardError::Meta("wb_policy is not adaptive"));

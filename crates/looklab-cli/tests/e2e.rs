@@ -5,39 +5,17 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use looklab_color::trc::srgb_encode;
+use looklab_export::{
+    Artifact, ArtifactAtCct, BakeIlluminant, BakeOutput, Baker, CctK, DownstreamModel,
+    InsertionSpec, Interpolation, Lut3d, Precision, read_cube, read_cube_1d, validate,
+};
+use looklab_model::{Look, LookDocument};
 use looklab_raw::{DecodedRaw, RawDecoder, RawlerDecoder};
 use serde_json::Value;
 
 fn looklab() -> Command {
     Command::cargo_bin("looklab").expect("built binary")
 }
-
-/// A 17^3 grid is too coarse to represent a fitted Look within 1.0 ΔE p95.
-const COARSE_PROFILE: &str = "\
-id: example-app/lut3d-coarse
-name: \"Coarse 3D LUT module\"
-version: 1
-bodies: [vendor/model-a]
-insertion:
-  point: camera_rgb_wb_linear
-  encoding:
-    transfer: log2_shaper
-    shaper: { min_ev: -12, max_ev: 6, mid_gray: 0.18 }
-    primaries: camera_native
-    range: [0.0, 1.0]
-  illuminant_handling: single
-accepts:
-  - type: lut3d
-    sizes: [17]
-    interpolation: tetrahedral
-    precision: f16
-    with_shaper: true
-downstream:
-  - output_transform: { primaries: srgb, transfer: srgb }
-  - gamut_clip: hard
-formats: [cube]
-limits: { max_bytes: 8388608 }
-";
 
 fn ok(mut command: Command) -> (String, String) {
     let output = command.output().expect("run");
@@ -88,7 +66,7 @@ fn fit(dir: &Path, slug: &str, out: &Path) {
 }
 
 #[test]
-fn synthetic_flow_fits_reports_compares_exports_and_validates() {
+fn synthetic_flow_fits_reports_compares_and_attempts_export() {
     let temp = tempfile::tempdir().expect("tempdir");
     let a = temp.path().join("a");
     let b = temp.path().join("b");
@@ -157,52 +135,274 @@ fn synthetic_flow_fits_reports_compares_exports_and_validates() {
         }
         command.output().expect("run export")
     };
-    let clean = export(&profile, &cube, false);
-    let clean_stdout = String::from_utf8_lossy(&clean.stdout);
-    assert!(clean_stdout.contains("median"), "{clean_stdout}");
-    assert!(clean_stdout.contains("flagged: no"), "{clean_stdout}");
-    assert!(
-        clean.status.success(),
-        "an unflagged export failed: {}",
-        String::from_utf8_lossy(&clean.stderr)
-    );
-    assert!(cube.exists(), "an unflagged export wrote no cube");
 
-    // A 17^3 grid cannot represent this Look, so the export is flagged.
-    let coarse = temp.path().join("coarse.yaml");
-    std::fs::write(&coarse, COARSE_PROFILE).expect("coarse profile");
-    let coarse_cube = temp.path().join("look-a-coarse.cube");
-    let refused = export(&coarse, &coarse_cube, false);
-    let refused_stdout = String::from_utf8_lossy(&refused.stdout);
-    assert!(refused_stdout.contains("flagged: yes"), "{refused_stdout}");
-    assert!(
-        !refused.status.success(),
-        "a flagged export wrote {} anyway",
-        coarse_cube.display()
-    );
-    let stderr = String::from_utf8_lossy(&refused.stderr);
-    assert!(stderr.contains("flagged"), "{stderr}");
-    assert!(
-        !coarse_cube.exists(),
-        "a flagged export wrote {}",
-        coarse_cube.display()
-    );
+    let document = LookDocument::decode(&std::fs::read(&look_a).expect("look")).expect("decode");
+    if document.match_refusal().is_some() {
+        for force in [false, true] {
+            let output = export(&profile, &cube, force);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "a non-matchable Look exported with force={force}\n{stderr}"
+            );
+            assert!(
+                !cube.exists(),
+                "a non-matchable Look wrote {}\n{stderr}",
+                cube.display()
+            );
+        }
+    } else {
+        let profile_text = std::fs::read_to_string(&profile).expect("profile");
+        let profile_schema =
+            looklab_schema::validate_interface_profile(&profile_text).expect("profile");
+        let transform =
+            looklab_cli::TransformFile::load(&a.join("transform.yaml")).expect("transform");
+        let body = transform.input_transform().expect("input transform");
+        let probes = looklab_model::probes::v1();
+        let support: Option<Vec<bool>> = document
+            .uncertainty
+            .support
+            .as_ref()
+            .filter(|mask| mask.values.len() == probes.probes.len())
+            .map(|mask| mask.values.iter().map(|value| *value > 0.5).collect());
+        let baked = Baker::new(&profile_schema, &document.look, &body)
+            .bake(BakeIlluminant::Single { cct: CctK::D65 })
+            .expect("bake");
+        let report = validate(&baked, &document.look, &body, &probes, support.as_deref())
+            .expect("validation");
 
-    let forced = export(&coarse, &coarse_cube, true);
-    assert!(
-        forced.status.success(),
-        "forced export failed: {}",
-        String::from_utf8_lossy(&forced.stderr)
-    );
-    let text = std::fs::read_to_string(&coarse_cube).expect("cube");
-    assert!(text.contains("LUT_3D_SIZE"));
-    assert!(text.contains("TITLE"));
+        let first = export(&profile, &cube, false);
+        let first_stderr = String::from_utf8_lossy(&first.stderr);
+        if report.flagged() {
+            assert!(
+                !first.status.success(),
+                "a flagged export wrote {} anyway\n{first_stderr}",
+                cube.display()
+            );
+            assert!(
+                !cube.exists(),
+                "a flagged export wrote {}\n{first_stderr}",
+                cube.display()
+            );
+            let forced = export(&profile, &cube, true);
+            assert!(
+                forced.status.success(),
+                "forced export failed: {}",
+                String::from_utf8_lossy(&forced.stderr)
+            );
+        } else {
+            assert!(
+                first.status.success(),
+                "an unflagged export failed: {first_stderr}"
+            );
+        }
+        let text = std::fs::read_to_string(&cube).expect("cube");
+        assert!(text.contains("LUT_3D_SIZE 33"), "{text}");
+        assert!(text.contains("TITLE"));
+    }
 
     ok({
         let mut command = looklab();
         command.arg("validate").arg(workspace().join("data"));
         command
     });
+}
+
+/// A colourimetric tone with a 6% lift, a warm shift, 4% chroma gain and a 1.5°
+/// hue rotation.
+fn analytic_look() -> Look {
+    let mut look = Look::colorimetric_spline().expect("tone spline");
+    if let looklab_model::Tone::Spline { c0, beta } = &mut look.tone {
+        *c0 *= 1.06;
+        for coefficient in beta.iter_mut() {
+            *coefficient *= 1.03;
+        }
+    }
+    look.tint.a.fill(1.0);
+    look.tint.b.fill(-0.6);
+    look.color.g.plane.fill(0.04);
+    look.color.g.volume.fill(0.01);
+    look.color.r.plane.fill(1.5);
+    look.color.lambda.plane.fill(0.3);
+    look
+}
+
+/// The X-S10 calibration matrices, as the body transform the analytic Look bakes through.
+const ANALYTIC_TRANSFORM: &str = "\
+format: looklab-transform/1
+version: 1
+body: synthetic/looklab
+color_matrices:
+  - cct: 2850
+    xyz_to_camera: [[1.6064, -0.9942, 0.112], [-0.376, 1.2096, 0.1853], [-0.0007, 0.0545, 0.6654]]
+  - cct: 6500
+    xyz_to_camera: [[1.3426, -0.6334, -0.1177], [-0.4244, 1.2136, 0.2371], [-0.058, 0.1303, 0.598]]
+";
+
+/// A body-agnostic linear insertion that accepts one 3D LUT side.
+fn analytic_profile(side: u32) -> String {
+    format!(
+        r#"id: test/analytic-lut3d
+name: "Analytic 3D LUT module"
+version: 1
+insertion:
+  point: camera_rgb_wb_linear
+  encoding:
+    transfer: linear
+    primaries: camera_native
+    range: [0.0, 8.0]
+  illuminant_handling: single
+accepts:
+  - type: lut3d
+    sizes: [{side}]
+    interpolation: tetrahedral
+    precision: f16
+    with_shaper: true
+downstream:
+  - output_transform: {{ primaries: srgb, transfer: srgb }}
+  - gamut_clip: hard
+formats: [cube]
+limits: {{ max_bytes: 16777216 }}
+"#
+    )
+}
+
+fn write_look(path: &Path, slug: &str, look: &Look) {
+    let identity = looklab_model::file::identity(slug, "1.0.0").expect("identity");
+    let document = LookDocument::from_look(identity, look.clone()).expect("document");
+    std::fs::write(path, document.encode().expect("encode")).expect("write look");
+}
+
+#[test]
+fn analytic_look_exports_cleanly_and_refuses_a_coarse_grid() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let look = analytic_look();
+    let look_path = temp.path().join("analytic.looklab");
+    write_look(&look_path, "analytic-tone", &look);
+    let transform_path = temp.path().join("transform.yaml");
+    std::fs::write(&transform_path, ANALYTIC_TRANSFORM).expect("transform");
+
+    let export = |profile: &Path, out: &Path, force: bool| {
+        let mut command = looklab();
+        command
+            .args(["export"])
+            .arg(&look_path)
+            .arg("--profile")
+            .arg(profile)
+            .arg("--body-transform")
+            .arg(&transform_path)
+            .args(["--format", "cube", "--out"])
+            .arg(out);
+        if force {
+            command.arg("--force");
+        }
+        command.output().expect("run export")
+    };
+
+    let profile_text = analytic_profile(65);
+    let profile_path = temp.path().join("analytic-65.yaml");
+    std::fs::write(&profile_path, &profile_text).expect("profile");
+    let cube_path = temp.path().join("analytic.cube");
+    let output = export(&profile_path, &cube_path, false);
+    assert!(
+        output.status.success(),
+        "clean export failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(cube_path.exists(), "an unflagged export wrote no cube");
+
+    let grid_text = std::fs::read_to_string(&cube_path).expect("cube");
+    let grid = read_cube(&grid_text).expect("grid cube");
+    assert_eq!(grid.lut.size, 65);
+    assert_eq!(grid.domain, [0.0, 1.0]);
+    let shaper_text =
+        std::fs::read_to_string(temp.path().join("analytic-shaper.cube")).expect("shaper cube");
+    let shaper = read_cube_1d(&shaper_text).expect("shaper");
+    assert_eq!(shaper.domain, [0.0, 8.0]);
+    let serialized = Lut3d {
+        size: grid.lut.size,
+        data: grid.lut.data,
+        shaper: Some(shaper.shaper),
+    };
+
+    let profile = looklab_schema::validate_interface_profile(&profile_text).expect("profile");
+    let transform = looklab_cli::TransformFile::parse(ANALYTIC_TRANSFORM).expect("transform");
+    let body = transform.input_transform().expect("input transform");
+    let document = LookDocument::decode(&std::fs::read(&look_path).expect("look")).expect("decode");
+    assert_eq!(document.look, look, "the document round-trips the Look");
+    let artifact = BakeOutput {
+        profile_id: profile.id.clone(),
+        profile_version: profile.version,
+        bake: BakeIlluminant::Single { cct: CctK::D65 },
+        insertion: InsertionSpec::from_profile(&profile, None).expect("insertion"),
+        downstream: DownstreamModel::from_profile(&profile).expect("downstream"),
+        interpolation: Some(Interpolation::Tetrahedral),
+        precision: Some(Precision::F16),
+        artifacts: vec![ArtifactAtCct {
+            cct: CctK::D65,
+            artifact: Artifact::Lut3d(serialized),
+        }],
+    };
+    let probes = looklab_model::probes::v1();
+    let report = validate(&artifact, &document.look, &body, &probes, None).expect("validation");
+    assert!(
+        report.primary.stats.p95 <= 1.0,
+        "serialized artifact p95 {} over {} probes",
+        report.primary.stats.p95,
+        report.primary.stats.count
+    );
+    assert!(
+        report.primary.unsupported < probes.probes.len(),
+        "{} of {} probes unsupported",
+        report.primary.unsupported,
+        probes.probes.len()
+    );
+    let eligible = probes.probes.len() - report.primary.unsupported;
+    assert!(
+        report.primary.stats.count * 10 >= eligible * 9,
+        "evaluated {} of {eligible} supported probes",
+        report.primary.stats.count
+    );
+    assert!(report.primary.clipped > 0, "no clipped targets counted");
+
+    let coarse_text = analytic_profile(17);
+    let coarse_path = temp.path().join("analytic-17.yaml");
+    std::fs::write(&coarse_path, &coarse_text).expect("profile");
+    let coarse_profile =
+        looklab_schema::validate_interface_profile(&coarse_text).expect("coarse profile");
+    let coarse_baked = Baker::new(&coarse_profile, &look, &body)
+        .bake(BakeIlluminant::Single { cct: CctK::D65 })
+        .expect("coarse bake");
+    let coarse_report =
+        validate(&coarse_baked, &look, &body, &probes, None).expect("coarse validation");
+    assert!(
+        coarse_report.flagged(),
+        "17^3 p95 {} is not flagged",
+        coarse_report.primary.stats.p95
+    );
+
+    let coarse_cube = temp.path().join("analytic-coarse.cube");
+    let refused = export(&coarse_path, &coarse_cube, false);
+    assert!(
+        !refused.status.success(),
+        "a flagged export wrote {} anyway: {}",
+        coarse_cube.display(),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !coarse_cube.exists(),
+        "a flagged export wrote {}",
+        coarse_cube.display()
+    );
+
+    let forced = export(&coarse_path, &coarse_cube, true);
+    assert!(
+        forced.status.success(),
+        "forced export failed: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    let text = std::fs::read_to_string(&coarse_cube).expect("cube");
+    assert!(text.contains("LUT_3D_SIZE 17"), "{text}");
 }
 
 #[test]
@@ -418,6 +618,59 @@ fn fit_skips_an_undecodable_sample_and_keeps_going() {
     );
     assert!(out.exists());
 }
+
+#[test]
+fn fit_refuses_a_monochrome_look_slug() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let samples = temp.path().join("samples");
+    synth(&samples, "42", "3", "200");
+    let bodies = temp.path().join("bodies");
+    std::fs::create_dir(&bodies).expect("bodies dir");
+    std::fs::write(bodies.join("synthetic-looklab.yaml"), MONOCHROME_BODY).expect("schema");
+    let out = temp.path().join("acros.looklab");
+    let output = looklab()
+        .args(["fit", "--samples"])
+        .arg(&samples)
+        .args([
+            "--transform",
+            "from-metadata",
+            "--look-slug",
+            "acros",
+            "--bodies-dir",
+        ])
+        .arg(&bodies)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .expect("run fit");
+    assert!(!output.status.success(), "fit wrote {}", out.display());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("acros_ye"), "{stderr}");
+    assert!(
+        stderr.contains("B&W renders aren't supported yet"),
+        "{stderr}"
+    );
+    assert!(!out.exists());
+}
+
+/// One body whose `acros` renders are monochrome, under the synthetic body id.
+const MONOCHROME_BODY: &str = "\
+body: synthetic/looklab
+epochs:
+  - id: 1
+    firmware: { from: \"1.00\", to: \"9.99\" }
+    native_sims:
+      - key: acros_ye
+        look: acros
+        makernote: { tag: Saturation, value: 0x0502 }
+        monochrome: true
+      - key: provia
+        look: provia
+        makernote: { tag: FilmMode, value: 0x0000 }
+    exposure_modes: []
+    controls: []
+    solve_plan: []
+";
 
 #[test]
 fn card_inspect_and_eval_read_the_conformance_card() {

@@ -72,6 +72,7 @@ webauthn-rs = "0.6"
 webauthn-rs-core = "0.6"
 webauthn-authenticator-rs = { version = "0.6", features = ["softpasskey"] }
 tempfile = "3"
+same-file = "1"
 wasmtime = { version = "50", default-features = false, features = [
     "cranelift",
     "parallel-compilation",

@@ -261,20 +261,13 @@ fn evidence_values(pool: &LookPool, params: &TrustParams) -> Result<Vec<f64>> {
 
     let mut representative_values: HashMap<usize, f64> = HashMap::new();
     for representative in &representatives {
-        let mut rest = EvidenceGrid::default();
-        for other in &representatives {
-            if other == representative {
-                continue;
-            }
-            for (s, hue, chroma) in &pool.images[*other].axes {
-                rest.add(*s, *hue, *chroma, 1.0)?;
-            }
-        }
-        let gain = coverage_gain(&rest, &grids[*representative])?;
-        representative_values.insert(
-            *representative,
-            evidence(gain, pool.images[*representative].clip_fraction, params),
-        );
+        let value = representative_evidence(
+            &native_union,
+            &grids[*representative],
+            pool.images[*representative].clip_fraction,
+            params,
+        )?;
+        representative_values.insert(*representative, value);
     }
 
     let mut values = Vec::with_capacity(pool.images.len());
@@ -292,6 +285,18 @@ fn evidence_values(pool: &LookPool, params: &TrustParams) -> Result<Vec<f64>> {
         values.push(value);
     }
     Ok(values)
+}
+
+/// Evidence of one representative against the union without itself.
+fn representative_evidence(
+    union: &EvidenceGrid,
+    own: &EvidenceGrid,
+    clip_fraction: f64,
+    params: &TrustParams,
+) -> Result<f64> {
+    let mut rest = union.clone();
+    rest.subtract(own)?;
+    Ok(evidence(coverage_gain(&rest, own)?, clip_fraction, params))
 }
 
 /// Native contributors take the first ids in sorted order, so adding a recipe
@@ -377,8 +382,9 @@ fn base_image(
     contributors: &HashMap<EffectiveContributorId, u32>,
 ) -> FitImage {
     let image = &pool.images[index];
+    // `exposure_hint` is the relative prior mean `x_meta` (docs/02 §2); the
+    // header's absolute EV at ISO 100 is not one.
     let mut fit = FitImage::new(image.samples.clone(), image.transform);
-    fit.exposure_hint = f64::from(image.samples.header().exposure_hint_ev);
     fit.exposure_mode = image.exposure_mode;
     fit.contributor = ContributorId(
         contributors
@@ -434,4 +440,51 @@ fn region_shares(image: &PoolImage, entry: &WeightedImage) -> Vec<f32> {
             (per_region * n as f64 / (total * count as f64)) as f32
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid(samples: &[(f64, f64, f64)]) -> EvidenceGrid {
+        let mut grid = EvidenceGrid::default();
+        grid.add_samples(samples.iter().copied())
+            .expect("samples in range");
+        grid
+    }
+
+    #[test]
+    fn leave_one_out_matches_rebuilding_the_rest() {
+        let params = TrustParams::default();
+        let pool: Vec<Vec<(f64, f64, f64)>> = vec![
+            vec![(0.0, 10.0, 0.2), (0.5, 20.0, 0.4), (1.0, 30.0, 0.6)],
+            vec![(0.5, 20.0, 0.4), (1.5, 40.0, 0.8)],
+            vec![(-1.0, 200.0, 0.3), (0.0, 210.0, 0.3), (2.0, 300.0, 0.9)],
+        ];
+        let grids: Vec<EvidenceGrid> = pool.iter().map(|samples| grid(samples)).collect();
+        let union = grid(
+            &pool
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<(f64, f64, f64)>>(),
+        );
+        for (index, own) in grids.iter().enumerate() {
+            let rebuilt = grid(
+                &pool
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != index)
+                    .flat_map(|(_, samples)| samples.iter().copied())
+                    .collect::<Vec<(f64, f64, f64)>>(),
+            );
+            let mut rest = union.clone();
+            rest.subtract(own).expect("union contains the image");
+            assert_eq!(rest, rebuilt);
+            assert_eq!(
+                representative_evidence(&union, own, 0.2, &params).expect("subtracted evidence"),
+                evidence(coverage_gain(&rebuilt, own).expect("gain"), 0.2, &params),
+            );
+        }
+    }
 }

@@ -5,7 +5,7 @@ use core::fmt;
 use looklab_server::ContributionId;
 use looklab_upload::BodyId;
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::clock::now_unix;
 use crate::error::{Result, WorkerError};
@@ -45,6 +45,8 @@ pub enum JobKind {
     Bounties,
     CardVerification,
     PublishSite,
+    LutRebase,
+    RevertRefit,
     Other(String),
 }
 
@@ -59,6 +61,8 @@ impl JobKind {
             "bounties" => Self::Bounties,
             "card_verification" => Self::CardVerification,
             "publish_site" => Self::PublishSite,
+            "lut_rebase" => Self::LutRebase,
+            "revert_refit" => Self::RevertRefit,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -72,6 +76,8 @@ impl JobKind {
             Self::Bounties => "bounties",
             Self::CardVerification => "card_verification",
             Self::PublishSite => "publish_site",
+            Self::LutRebase => "lut_rebase",
+            Self::RevertRefit => "revert_refit",
             Self::Other(value) => value,
         }
     }
@@ -92,6 +98,8 @@ pub enum JobPayload {
     Bounties,
     CardVerification,
     PublishSite,
+    LutRebase,
+    RevertRefit,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -121,11 +129,13 @@ impl JobPayload {
             Self::Bounties => JobKind::Bounties,
             Self::CardVerification => JobKind::CardVerification,
             Self::PublishSite => JobKind::PublishSite,
+            Self::LutRebase => JobKind::LutRebase,
+            Self::RevertRefit => JobKind::RevertRefit,
         }
     }
 
     /// The `kind` column and the JSON `payload` column.
-    pub fn encode(&self) -> Result<(String, String)> {
+    pub fn encode(&self) -> Result<(JobKind, String)> {
         let payload = match self {
             Self::ConsistencyScore { contribution_id } => {
                 serde_json::to_string(&ConsistencyWire {
@@ -135,7 +145,9 @@ impl JobPayload {
             Self::HonestDuplicateMerge
             | Self::Bounties
             | Self::CardVerification
-            | Self::PublishSite => "{}".to_owned(),
+            | Self::PublishSite
+            | Self::LutRebase
+            | Self::RevertRefit => "{}".to_owned(),
             Self::NightlyRefit { bodies } => serde_json::to_string(&NightlyWire {
                 bodies: bodies.iter().map(|body| body.as_str().to_owned()).collect(),
             })?,
@@ -143,7 +155,7 @@ impl JobPayload {
                 contribution_id: contribution_id.as_ref().map(|id| id.as_str().to_owned()),
             })?,
         };
-        Ok((self.kind().as_str().to_owned(), payload))
+        Ok((self.kind(), payload))
     }
 
     pub fn decode(kind: &JobKind, payload: &str) -> Result<Self> {
@@ -181,6 +193,8 @@ impl JobPayload {
             JobKind::Bounties => Self::Bounties,
             JobKind::CardVerification => Self::CardVerification,
             JobKind::PublishSite => Self::PublishSite,
+            JobKind::LutRebase => Self::LutRebase,
+            JobKind::RevertRefit => Self::RevertRefit,
             JobKind::Other(kind) => {
                 return Err(WorkerError::Job(format!("unknown job kind `{kind}`")));
             }
@@ -231,20 +245,33 @@ impl JobOwnership {
     }
 }
 
-/// A job whose lease expired is reclaimable.
+/// The publication generation a publisher read before taking its snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicationGeneration(i64);
+
+/// A job whose lease expired is reclaimable. A live publisher blocks another
+/// `publish_site` claim, so output writers never overlap.
 pub async fn claim(pool: &SqlitePool, lease_seconds: i64, now: i64) -> Result<Option<ClaimedJob>> {
     let row: Option<(String, String, String, i64)> = sqlx::query_as(
         "UPDATE jobs SET status = 'running', locked_until = ?, attempts = attempts + 1
          WHERE id = (
-             SELECT id FROM jobs
-             WHERE (status = 'queued' AND run_after <= ?)
-                OR (status = 'running' AND locked_until IS NOT NULL AND locked_until <= ?)
-             ORDER BY run_after, created_at, id
+             SELECT candidate.id FROM jobs candidate
+             WHERE ((candidate.status = 'queued' AND candidate.run_after <= ?)
+                 OR (candidate.status = 'running' AND candidate.locked_until IS NOT NULL
+                     AND candidate.locked_until <= ?))
+               AND (candidate.kind <> 'publish_site'
+                 OR NOT EXISTS (
+                     SELECT 1 FROM jobs writer
+                     WHERE writer.kind = 'publish_site' AND writer.status = 'running'
+                       AND writer.id <> candidate.id
+                       AND (writer.locked_until IS NULL OR writer.locked_until > ?)))
+             ORDER BY candidate.run_after, candidate.created_at, candidate.id
              LIMIT 1
          )
          RETURNING id, kind, payload, attempts",
     )
     .bind(now + lease_seconds)
+    .bind(now)
     .bind(now)
     .bind(now)
     .fetch_optional(pool)
@@ -310,6 +337,40 @@ pub async fn fail(
     now: i64,
     permanent: bool,
 ) -> Result<bool> {
+    let mut conn = pool.acquire().await?;
+    mark_failed(&mut conn, id, attempts, max_attempts, now, permanent).await
+}
+
+/// Marks a publisher failed and records a terminal attempt, so only a new request retries it.
+pub async fn fail_publish(
+    pool: &SqlitePool,
+    id: &JobId,
+    attempts: i64,
+    observed: PublicationGeneration,
+    max_attempts: i64,
+    now: i64,
+    permanent: bool,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let updated = mark_failed(&mut tx, id, attempts, max_attempts, now, permanent).await?;
+    if updated && (permanent || attempts >= max_attempts) {
+        sqlx::query("UPDATE publication SET attempted = MAX(attempted, ?) WHERE id = 1")
+            .bind(observed.0)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(updated)
+}
+
+async fn mark_failed(
+    conn: &mut SqliteConnection,
+    id: &JobId,
+    attempts: i64,
+    max_attempts: i64,
+    now: i64,
+    permanent: bool,
+) -> Result<bool> {
     let exponent = u32::try_from(attempts.max(1) - 1).unwrap_or(0).min(16);
     let backoff = (30_i64 << exponent).min(3_600);
     let (status, run_after) = if permanent || attempts >= max_attempts {
@@ -325,7 +386,7 @@ pub async fn fail(
     .bind(run_after)
     .bind(id.as_str())
     .bind(attempts)
-    .execute(pool)
+    .execute(conn)
     .await?
     .rows_affected();
     Ok(updated == 1)
@@ -333,7 +394,8 @@ pub async fn fail(
 
 pub async fn enqueue(pool: &SqlitePool, payload: &JobPayload, run_after: i64) -> Result<JobId> {
     let (kind, encoded) = payload.encode()?;
-    insert(pool, &kind, &encoded, run_after).await
+    let mut conn = pool.acquire().await?;
+    insert(&mut conn, &kind, &encoded, run_after).await
 }
 
 /// Enqueues unless one is already queued or running.
@@ -346,29 +408,120 @@ pub async fn enqueue_if_idle(
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM jobs WHERE kind = ? AND status IN ('queued', 'running')",
     )
-    .bind(&kind)
+    .bind(kind.as_str())
     .fetch_one(pool)
     .await?;
     if count > 0 {
         return Ok(None);
     }
-    Ok(Some(insert(pool, &kind, &encoded, run_after).await?))
+    let mut conn = pool.acquire().await?;
+    Ok(Some(insert(&mut conn, &kind, &encoded, run_after).await?))
 }
 
-async fn insert(pool: &SqlitePool, kind: &str, payload: &str, run_after: i64) -> Result<JobId> {
+async fn insert(
+    conn: &mut SqliteConnection,
+    kind: &JobKind,
+    payload: &str,
+    run_after: i64,
+) -> Result<JobId> {
     let id = JobId::new();
     sqlx::query(
         "INSERT INTO jobs (id, kind, payload, status, attempts, run_after, created_at)
          VALUES (?, ?, ?, 'queued', 0, ?, ?)",
     )
     .bind(id.as_str())
-    .bind(kind)
+    .bind(kind.as_str())
     .bind(payload)
     .bind(run_after)
     .bind(now_unix())
-    .execute(pool)
+    .execute(conn)
     .await?;
     Ok(id)
+}
+
+pub async fn publication_generation(pool: &SqlitePool) -> Result<PublicationGeneration> {
+    let generation: i64 = sqlx::query_scalar("SELECT generation FROM publication WHERE id = 1")
+        .fetch_one(pool)
+        .await?;
+    Ok(PublicationGeneration(generation))
+}
+
+/// Persists the request even when a publisher is queued or running, so a
+/// listing change committed after that publisher's snapshot is not lost.
+pub async fn request_publish(pool: &SqlitePool, now: i64) -> Result<Option<JobId>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE publication SET generation = generation + 1 WHERE id = 1")
+        .execute(&mut *tx)
+        .await?;
+    let id = enqueue_if_no_publication(&mut tx, now).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Enqueues the successor a later request needs in the transaction that releases the job.
+pub async fn complete_publish(
+    pool: &SqlitePool,
+    id: &JobId,
+    attempts: i64,
+    observed: PublicationGeneration,
+    now: i64,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE jobs SET status = 'done', locked_until = NULL
+         WHERE id = ? AND attempts = ? AND status = 'running'",
+    )
+    .bind(id.as_str())
+    .bind(attempts)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        return Ok(false);
+    }
+    sqlx::query("UPDATE publication SET published = MAX(published, ?) WHERE id = 1")
+        .bind(observed.0)
+        .execute(&mut *tx)
+        .await?;
+    let generation: i64 = sqlx::query_scalar("SELECT generation FROM publication WHERE id = 1")
+        .fetch_one(&mut *tx)
+        .await?;
+    if generation > observed.0 {
+        enqueue_if_no_publication(&mut tx, now).await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Enqueues a publisher for a request that advanced past every settled attempt.
+pub async fn enqueue_pending_publication(pool: &SqlitePool, now: i64) -> Result<Option<JobId>> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM publication
+         WHERE generation > published AND generation > attempted",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if pending == 0 {
+        return Ok(None);
+    }
+    let id = enqueue_if_no_publication(&mut tx, now).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+async fn enqueue_if_no_publication(conn: &mut SqliteConnection, now: i64) -> Result<Option<JobId>> {
+    let (kind, payload) = JobPayload::PublishSite.encode()?;
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = ? AND status IN ('queued', 'running')",
+    )
+    .bind(kind.as_str())
+    .fetch_one(&mut *conn)
+    .await?;
+    if pending > 0 {
+        return Ok(None);
+    }
+    Ok(Some(insert(conn, &kind, &payload, now).await?))
 }
 
 /// Whether no refit is queued or running and the last one is older than `interval`.

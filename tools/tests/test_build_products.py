@@ -14,6 +14,8 @@ import unittest
 from pathlib import Path
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(SOURCE_ROOT / "tools"))
+import build_products  # noqa: E402  (path set above)
 SCENE_FIXTURES = ("3115", "1955", "1824", "1797", "3094", "1603")
 SCENES_INDEX = b'{"scenes":[]}'
 
@@ -682,6 +684,61 @@ class BuildProductBoundaries(unittest.TestCase):
             stale_build = run_cli(fresh, "wasm", "--prep", env=gated)
             self.assertEqual(stale_build.returncode, 1)
             self.assertEqual(fresh_output.read_bytes(), payload)
+
+
+class WasmTargetFeatures(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        if shutil.which("wasm-tools") is None:
+            raise RuntimeError("wasm-tools is required; run tests inside nix develop")
+
+    def module(self, features: list[tuple[str, str]]) -> bytes:
+        def leb(value: int) -> bytes:
+            out = bytearray()
+            while True:
+                byte = value & 0x7F
+                value >>= 7
+                out.append(byte | (0x80 if value else 0))
+                if not value:
+                    return bytes(out)
+
+        def name(text: str) -> bytes:
+            encoded = text.encode("utf-8")
+            return leb(len(encoded)) + encoded
+
+        payload = leb(len(features))
+        for prefix, feature in features:
+            payload += prefix.encode("ascii") + name(feature)
+        section_name = name("target_features")
+        section = b"\0" + leb(len(section_name) + len(payload)) + section_name + payload
+        return b"\0asm\x01\0\0\0" + section
+
+    def policy_errors(self, module: bytes) -> list[str]:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "module.wasm"
+            path.write_bytes(module)
+            return build_products.wasm_policy_errors(path)
+
+    def test_target_features_are_read_in_order(self) -> None:
+        features = [("+", "multivalue"), ("+", "relaxed-simd"), ("-", "simd128")]
+        self.assertEqual(
+            build_products.wasm_target_features(self.module(features)),
+            features,
+        )
+
+    def test_a_module_without_the_section_has_no_features(self) -> None:
+        self.assertEqual(build_products.wasm_target_features(clean_wasm_module()), [])
+
+    def test_enabling_relaxed_simd_is_a_policy_error(self) -> None:
+        for prefix in ("+", "="):
+            errors = self.policy_errors(self.module([(prefix, "relaxed-simd")]))
+            self.assertTrue(
+                any("relaxed-simd" in error for error in errors),
+                f"{prefix}relaxed-simd was accepted: {errors}",
+            )
+
+    def test_disabling_relaxed_simd_is_accepted(self) -> None:
+        self.assertEqual(self.policy_errors(self.module([("-", "relaxed-simd")])), [])
 
 
 if __name__ == "__main__":

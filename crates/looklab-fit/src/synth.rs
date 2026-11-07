@@ -229,8 +229,10 @@ fn camera_matrix(rng: &mut ChaCha12Rng) -> Mat3 {
 }
 
 fn scene_color(rng: &mut ChaCha12Rng, neutral: bool) -> Xyz {
+    static NO_NEUTRAL: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("LOOKLAB_SYNTH_NO_NEUTRAL").is_some());
     let white = d65();
-    if neutral {
+    if neutral && !*NO_NEUTRAL {
         let lift = 1.0 + 0.02 * gaussian(rng);
         let y = 0.18 * libm::pow(2.0, -4.0 + 6.0 * rng.next_u32() as f64 / u32::MAX as f64);
         return Xyz::new(white.x * lift, 1.0, white.z * lift).scale(y);

@@ -46,7 +46,7 @@ epochs:
     native_sims:
       - key: classic_chrome
         look: classic-chrome
-        makernote: { tag: FilmMode, value: 0x0700 }     # placeholder
+        makernote: { tag: FilmMode, value: 0x0600 }     # placeholder
       - key: provia
         look: provia
         makernote: { tag: FilmMode, value: 0x0000 }     # placeholder
@@ -175,6 +175,7 @@ epochs:
   | `exposure` | effective exposure (ξ/mode or EC) |
 
 - `solve_plan` may only name declared controls.
+- A `native_sims` entry may set `monochrome: true` when the sim renders a monochrome image (Acros, Monochrome, Sepia and their filter variants). There is no B&W Look kind yet ([10 Q26](10-open-questions.md)), so a contribution that resolves to such a sim is refused at every entry point: the contribution client lists the file as "B&W renders aren't supported yet" and omits it from the batch; `looklab prep --raw` and `looklab fit` fail with an error naming the sim, and `looklab prep --dir` lists the file as refused; server intake answers `MONOCHROME_UNSUPPORTED`, checking the declared sim and every image's own makernotes. The makernotes are ambiguous when two sims match, and an ambiguous set that includes a monochrome sim counts as monochrome. `looklab fit` resolves the sim from the body schema the transform names and the Look slug, so the refusal applies to comparing a monochrome family.
 - `look_affecting: true` controls at `default` define the **reference setting** ([02 §4.2](02-color-pipeline.md)).
 - `spatial: true` controls must be in `tolerated` for an image to be used.
 - Validated by `looklab-schema` (native in CI, WASM in the browser form).
@@ -183,9 +184,9 @@ epochs:
 - `Look`: `id`, `slug`, `name`, `kind` (`native_family` | `lut_defined`), `wb_policy`, `description`, `aliases[]`, `license` (for `lut_defined`: the submitter's declaration + attribution).
 - A `lut_defined` Look's identity is the LUT bytes, its declared encoding and its base. It also stores the grid, license and attribution, and a layered approximation fitted to the composition (§3, [02 §3.8](02-color-pipeline.md)).
 - `encoding` is `scene_referred { transfer, gamut }` for a LUT that consumes scene-referred log (v1: `transfer = flog2`, `gamut = fgamut`), or `display_referred { base, status }` for a LUT that expects an already-rendered image. `output` is `srgb` in v1.
-- A display-referred `base` is `look@version` (a published Look; the neutral baseline `looklab-neutral-srgb-v1@1.0.0` is itself a fixed Look), `body_realization { body, renderer, film_simulation, dynamic_range, notes }` for an in-camera or software rendering, or `family_rendering { maker, rendering, dynamic_range, notes }` for an intended family Look that is not published yet. A family base resolves to a `look@version` pin when that family Look is published; until then it is `base_identified_unmeasured`.
+- A display-referred `base` is `look@version` (a published Look; the neutral baseline `looklab-neutral-srgb-v1@1.0.0` is itself a fixed Look), `body_realization { body, renderer, film_simulation, dynamic_range, notes }` for an in-camera or software rendering, or `family_rendering { maker, rendering, dynamic_range, notes }` for an intended family Look that is not published yet. A family base resolves to a `look@version` pin when that family Look is published; until then it is `base_identified_unmeasured`. A family declaration that names a setting the native release does not carry, such as `dynamic_range`, stays `base_identified_unmeasured` rather than pinning a settings-losing base.
 - `status` is `pinned` (published and fitted), `base_identified_unmeasured` (fully declared and consistent, not yet measured or published), `base_incomplete { missing }` (a declared field is absent), or `base_inconsistent { field }` (the declared setting does not exist on the declared body; `field` names it). Only `pinned` is matchable and gets a card file; the other three are stored and listed with an approximate preview at most.
-- `LookVersion`: `version`, `status` (`provisional` | `rooted` | `published` | `deprecated`), `artifact_hash`, `probe_predictions_hash`, `metrics`, `provenance` (§3), `gate_results`, `changelog`. Provenance records the pinned base and `needs_rebase`; a new base version creates a candidate rebased version gated against the Look's anchor, and a base revert marks every pinned dependent ([05 §8](05-trust-and-integrity.md)).
+- `LookVersion`: `version`, `status` (`provisional` | `rooted` | `published` | `deprecated`), `artifact_hash`, `probe_predictions_hash`, `metrics`, `provenance` (§3), `gate_results`, `changelog`. Provenance records the pinned base; a new base version creates a candidate rebased version gated against the Look's anchor, and a base revert marks every pinned dependent ([05 §8](05-trust-and-integrity.md)). Each published `lut_defined` version stores its declared base in `lut_base_pins`; a pin that names its own Look or closes a Look dependency cycle is rejected. Publishing a newer version of a base Look, resolving a pending family base to a native `look@version`, or revoking a root admission the base used writes a `lut_rebase_pending` row, and the worker consumes those rows in a `lut_rebase` job independently of image pools. A candidate publishes only after its gate passes; a held candidate leaves the previous version's bytes and matchability unchanged, and a pin is never re-anchored automatically.
 - Same name ≠ same Look. Cross-body disagreement can propose a split.
 
 ### InputTransform
@@ -197,7 +198,7 @@ epochs:
 ### ControlResponseModel
 `body_id`, `epoch`, `base_sim`, `version`, `D` coefficients, `support` (controls/ranges with data), `metrics`.
 
-`D` is stored per control and non-default value as a delta over the layers named in `affects`. Tone and tint deltas are coefficient offsets on their spline coefficients. Chroma, hue and lightness deltas use a ten-term unit-norm expansion over the layer's coefficients: the `C = 0` plane, a uniform shift over the `C > 0` volume, hue cosine and sine, an `s`-linear term, a `C`-linear term, and four Gaussian hue bumps centered at 45°, 135°, 225° and 315° (σ = 40°). The bumps let a control act on a localized hue region, such as blue-only chroma. Numeric controls interpolate piecewise-linearly between stored steps, with the default fixed at zero; enums and booleans select one stored value exactly.
+`D` is stored per control and non-default value as a delta over the layers named in `affects`. Tone and tint deltas are coefficient offsets on their spline coefficients. Chroma, hue and lightness deltas use a ten-term unit-norm expansion over the layer's plane and `C > 0` volume: the `C = 0` plane, a uniform shift over the `C > 0` volume, hue cosine and sine, an `s`-linear term, a `C`-linear term, and four Gaussian hue bumps centered at 45°, 135°, 225° and 315° (σ = 40°). The bumps let a control act on a localized hue region, such as blue-only chroma. The near-neutral core stays with the base Look; control deltas do not move it. A `looklab-crm/1` file is refused: its layer coefficient vectors predate the core. Numeric controls interpolate piecewise-linearly between stored steps, with the default fixed at zero; enums and booleans select one stored value exactly.
 
 WB controls store a 2-DOF camera-space log gain (R/B vs G) per value. Exposure stores `ξ` per exposure mode selected by an exposure-affecting enum value, and exact EV per EC step. Interactions are an optional sparse list of `(control, value)` pairs with an extra delta, empty in v1.
 
@@ -207,7 +208,7 @@ The model serializes as `crm.json`:
 
 ```jsonc
 {
-  "format": "looklab-crm/1",
+  "format": "looklab-crm/2",
   "model": {
     "body": "fujifilm/x-t5", "epoch": 1, "base_sim": "classic_chrome", "version": 3,
     "controls": [
@@ -250,8 +251,8 @@ The model serializes as `crm.json`:
 - `AuditLogEntry`: `seq` (autoincrement), `type`, `payload` (JSON text), `ts`. Append-only (no UPDATE/DELETE in application code). Published as a page and JSON ([05 §11](05-trust-and-integrity.md)).
 - `Job`: `id`, `kind`, `payload`, `status`, `attempts`, `run_after`, `locked_until`. The worker polls this table.
 - `CommunityDataSnapshot`: `version`, `content_hash`, export of approved bodies/schemas/interfaces plus the fixture consent list.
-  A snapshot lives in `data/community/v<version>/` with `bodies/`, `interfaces/`, `fixtures/manifest.toml` and `snapshot.json` (`{version, content_hash}`);
-  the hash covers each file's relative path and bytes in path order, and `looklab validate-snapshot <dir>` checks the files, the hash, each document's id against its path, and that every `fixture_backed` body has a manifest entry.
+  A snapshot lives in `data/community/v<version>/` with `bodies/`, `interfaces/`, `fixtures/manifest.toml`, published fixture bytes under `fixtures/` or `fixtures/donated/` and `snapshot.json` (`{version, content_hash}`);
+  the hash covers each file's relative path and bytes in path order, and `looklab validate-snapshot <dir>` checks the files, the hash, each document's id against its path, each manifest entry's sha256, each published fixture's bytes at the path its `committed` value names, and that every `fixture_backed` body has a manifest entry.
 - An approval records the version it publishes before the directory rename; a failed rename leaves a `pending` publication that the server retries rather than an approval without its export.
 
 ## 2. Samples: preparation and format
@@ -290,7 +291,7 @@ SampleHeader {
   output_space: OutputSpace,      // enum: Srgb | AdobeRgb
   wb_multipliers: [f32; 3],
   cct_hint_k: f32,                // server recomputes
-  exposure_hint_ev: f32,
+  exposure_hint_ev: f32,          // absolute EV at ISO 100; not the fit's x_meta (02 §2)
   rerender_group: Option<[u8;16]>,
   prep_version: u32,              // registered prep version id
   prior_transform_version: u32,   // body input-transform version used for density sampling
@@ -302,6 +303,8 @@ columns:
   density_w f32 × n
   flags     u8 × n     // bit0 chart, bit1 pattern, bit2 near-clip output
 ```
+
+`exposure_hint_ev` is the capture's absolute EV at ISO 100, from the ISO 2720:1974 exposure equation on ISO, shutter and aperture. It is reported, not consumed: the fit's per-image exposure prior mean `x_meta` is a relative offset against the body's exposure gauge ([02 §2](02-color-pipeline.md)), which an absolute EV is not, and `in_rgb` is already image-referred. Prep writes it; the CLI `fit` and the worker's `weights` and `refit` set `x_meta = 0` rather than converting it.
 
 The reader rejects: unknown enum values, n out of range, a header over the limit, decompressed size ≠ expected, NaN/Inf, and out-of-range values. Chart and pattern patch tables are separate small blobs with the same limits.
 
@@ -337,7 +340,7 @@ The challenge signed by WebAuthn is `H(nonce ‖ sha256(manifest))`. The server 
 
 ```jsonc
 {
-  "format": "looklab-look/1",
+  "format": "looklab-look/2",
   "look": { "slug": "classic-chrome", "version": "3.0.0", "kind": "native_family", "wb_policy": "adaptive" },
   "rendering": { "maker": "Fujifilm", "name": "Classic Chrome" },
   "viewing_conditions": { "white": "D65", "L_A": 4.074, "Y_b": 20, "surround": "average", "discount_illuminant": true },
@@ -345,7 +348,7 @@ The challenge signed by WebAuthn is `H(nonce ‖ sha256(manifest))`. The server 
   "layers": {
     "tone":      { "kind": "spline", "knots": [], "coef_ref": "bin:T" },
     "tint":      { "knots": [], "coef_ref": "bin:N" },
-    "chroma":    { "hue_knots": 24, "s_knots": [], "c_knots": 4, "c_max": 120, "coef_ref": "bin:G", "reference": "colorimetric_at_neutral_matched_luminance" },
+    "chroma":    { "hue_knots": 24, "s_knots": [], "c_knots": 4, "c_max": 120, "core_terms": 5, "core_radius": 2, "coef_ref": "bin:G", "reference": "colorimetric_at_neutral_matched_luminance" },
     "hue":       { "coef_ref": "bin:R" },
     "lightness": { "coef_ref": "bin:Lambda" },
     "residual":  { "grid": [17,17,17], "domain": {}, "coef_ref": "bin:res" }
@@ -386,9 +389,9 @@ A `lut_defined` Look stores the uploaded LUT, its declared encodings, base and l
 
 A `lut_defined` Look may declare what it reproduces: `emulates = camera_rendering { maker, rendering }` or `film_stock { name }`; absent means an original grade. A native-family Look declares the rendering it reproduces in `rendering = { maker, name }`; a camera-rendering emulation matches when both labels agree after case folding and ignoring spaces and punctuation. A LUT that reproduces a rendering a released camera already produces officially is interim. When a native-family Look for that rendering is published, the LUT Look gets `superseded_by` pointing at it (`slug@version`) and stays listed with that pointer until a moderator hides or removes it; both actions write an audit-log row. A film-stock emulation or an original grade is first-class and is never superseded by a camera rendering. A Look's listing state is `listed`, `hidden` or `removed`; hidden and removed Looks keep their versions and artifacts in the database but are left out of the published index, and their published pages and downloadable artifacts are removed from the site.
 
-A display-referred LUT replaces `encoding` with `{ "kind": "display_referred", "base": { "kind": "body_realization", "body": "fujifilm/x-e3", "renderer": "x_raw_studio", "film_simulation": "classic_negative", "dynamic_range": "dr400", "notes": "..." }, "status": { "kind": "base_inconsistent", "field": "film_simulation" } }`. `status.kind` is `pinned`, `base_identified_unmeasured`, `base_incomplete` or `base_inconsistent`; the last three are stored and listed but not matchable and have no card file. Provenance repeats the pinned base as `base` and carries `needs_rebase` when a base revert marks the version ([05 §8](05-trust-and-integrity.md)).
+A display-referred LUT replaces `encoding` with `{ "kind": "display_referred", "base": { "kind": "body_realization", "body": "fujifilm/x-e3", "renderer": "x_raw_studio", "film_simulation": "classic_negative", "dynamic_range": "dr400", "notes": "..." }, "status": { "kind": "base_inconsistent", "field": "film_simulation" } }`. `status.kind` is `pinned`, `base_identified_unmeasured`, `base_incomplete` or `base_inconsistent`; the last three are stored and listed but not matchable and have no card file. A `base_identified_unmeasured` family base becomes `pinned` in a new version when a native Look for that rendering is published, unless the declaration names a setting the native release does not carry; the rebased approximation is refitted against that `look@version` rather than the neutral preview. Provenance repeats the pinned base as `base`; a base publish or root revocation marks the version in `lut_rebase_pending` without rewriting its immutable file ([05 §8](05-trust-and-integrity.md)).
 
-`look.bin` is a named-array container: `LKBN`, a little-endian `u32` array count, then per array a `u8` name length, the ASCII name, a little-endian `u32` element count and that many little-endian `f64`, arrays sorted by name. v1 names are `T` (absent for a colorimetric tone), `N`, `G`, `R`, `Lambda`, `res`, and optionally `probe_cov` and `probe_cov_post` (9 `f64` per probe, row-major 3×3), `probe_sigma`, `probe_sigma_post`, `probe_bias`, `probe_pre_reliable` and `support` (one `f64` per probe), `kde` (one `f64` per probe) and `lut` (`size³ × 3` `f64`, red fastest, for a `lut_defined` Look); `res` is channel-minor, `((s·17 + a)·17 + b)·3 + channel`. v1 fixes the knot vectors and residual domain, repeated in `look.json` for validation; a stored LUT side is at most 64, checked before allocation; the zip is stored, fixed-order and fixed-timestamp.
+`look.bin` is a named-array container: `LKBN`, a little-endian `u32` array count, then per array a `u8` name length, the ASCII name, a little-endian `u32` element count and that many little-endian `f64`, arrays sorted by name. v2 names are `T` (absent for a colorimetric tone), `N`, `G`, `R`, `Lambda`, `res`, and optionally `probe_cov` and `probe_cov_post` (9 `f64` per probe, row-major 3×3), `probe_sigma`, `probe_sigma_post`, `probe_bias`, `probe_pre_reliable` and `support` (one `f64` per probe), `kde` (one `f64` per probe) and `lut` (`size³ × 3` `f64`, red fastest, for a `lut_defined` Look); `res` is channel-minor, `((s·17 + a)·17 + b)·3 + channel`. Each `G`/`R`/`Lambda` array is 780 `f64`: 10 plane, 720 volume, then 50 near-neutral core coefficients indexed `[s][term]` for the five normalized Cartesian monomials of docs/02 §3.3. v2 fixes the knot vectors, residual domain and core join radius, repeated in `look.json` for validation; a stored LUT side is at most 64, checked before allocation; the zip is stored, fixed-order and fixed-timestamp. A `looklab-look/1` file is refused with a format error: its coefficient meaning has no exact v2 representation, so it must be refitted and republished under v2.
 
 A body's control-response model is a separate `crm.json` (§1), versioned and referenced from provenance by `control_response_version`.
 
@@ -419,9 +422,13 @@ data/scenes/<name>-thumb.png             thumbnail in the same coordinate format
 
 **Client rule.** A page downloads an artifact only through its manifest and verifies it before parsing. A mismatch is an error and nothing is rendered from the bytes. The Look page shows each artifact's digest and a "matches version manifest" indicator after a successful check.
 
-**Authenticated index.** `data/index.json` is the single publication root. It lists every version's `manifest_sha256` and byte count, and every scene's `sha256` and byte count. The generator writes the index digest to `site/site-root.txt`, the site build embeds it in the wasm at publish time, and the client refuses to use an index whose digest differs. It then verifies each manifest and scene against the index before trusting anything those files contain. This protects against tampered or partially rewritten CDN data: replacing an artifact, a manifest, a scene or the index itself fails the check. It does not protect against a malicious origin that serves a different application with a matching embedded digest, which is the limit described in [06 §5](06-privacy-and-payload.md); the CLI and reproducible builds are the defence there.
+**Authenticated index.** `data/index.json` is the single publication root. It lists every version's `manifest_sha256` and byte count, and every scene's `sha256` and byte count. A serverless preview embeds the digest from `site/site-root.txt` in its wasm. An online build fetches the current digest from `/data/site-root.json` at its configured API origin and fetches the catalog and publication artifacts from that same authority. The client rejects an index whose SHA-256 differs, then verifies each manifest and scene against the index before parsing their contents. These checks detect corruption and partial publication. The live root endpoint is trusted authority, not protection against a malicious API; a malicious application origin can also replace the client and its embedded pin. The CLI and reproducible builds provide the independent verification described in [06 §5](06-privacy-and-payload.md).
 
 **Body page data** is derived from the body and control-schema YAML snapshots: make/model, epochs and firmware ranges, capabilities, mapping status, the control schema per epoch with control differences, native sims, plus page-only facts the schema does not hold: input-transform confidence (source, anchor count, tier) and plain-language realization notes. The writer joins native sims to the latest published look version.
+
+**Match bundles.** A matchable version carries one bundle per `(body, epoch)`. The descriptor `match-<body>-<epoch>-sims.json` (`looklab-match-bundle/1`) names, for each ranked sim, the base realization Look (`match-<body>-<epoch>-<sim>-base.looklab`), its control-response model (`...-<sim>-crm.json`) and optional predicted covariance (`...-<sim>-covariance.json`), and lists every native sim the bundle leaves out with `no_published_look` or `no_response`. The schema snapshot (`...-body.yaml`) and input transform (`...-transform.yaml`) are shared. Consumers verify every artifact through the version manifest before parsing it, so a bundle is only usable as a whole. The consumer reads `manifest.json` from the version directory, verifies the descriptor against it before decoding, then verifies and parses the schema snapshot, transform, base Looks, response models and covariances from the same directory. Each descriptor artifact name must be the canonical `match-<body>-<epoch>-<sim>-...` name derived from the descriptor's body, epoch and sim, so a descriptor cannot name files outside its version directory. Each response model must name the descriptor's body, epoch and sim.
+
+The worker assembles a bundle for every active camera body epoch in the version's release provenance before writing the version manifest, from the realizations published at that moment plus the release's own in-memory candidate sim. The bundle artifacts are stored with the version and listed in its manifest; a later source-sim release, schema update or input-transform update does not change the version's bytes or manifest. A version published before bundles were bound this way has no bundle and does not gain one retroactively. A sim whose Look has no published realization on the body, or whose realization has no response model for the epoch, is listed in the descriptor with the matching reason. A hidden or removed Look contributes neither a target version nor a ranked sim. Clients verify the bundle artifacts through the manifest like any other artifact. The fit stores no control-response covariance yet, so bundles omit `covariance.json`.
 
 **Look page data** repeats the identity (`slug`, name, kind, `wb_policy`, description, aliases, license for LUT-defined looks) and lists each version's manifest, changelog, weak spots and any publication notice (a since-revoked root admission, or a revert).
 
@@ -433,6 +440,6 @@ data/scenes/<name>-thumb.png             thumbnail in the same coordinate format
 
 `SceneIndex` and the authenticated `SiteIndex` list each scene's `name`, typed `kind` (`photo | test_chart`), display `title`, optional `credit` (`text`, `source_url`, `license`, `source_sha256`), dimensions, `path`, `sha256` and `bytes`. The nested `thumbnail` records its own dimensions, path, digest and byte count. Clients verify full scenes and thumbnails against the authenticated index before decoding.
 
-**Sample data.** `cargo run -p looklab-publish --example site_data` fits three synthetic Looks, builds their manifested sample camera match bundles, then computes Release audit entries from the final manifests. It publishes bodies, photographic scenes, test charts and the audit log, writing the tree above plus `site/site-root.txt` to `site/`. `publish_match_fixture` in `looklab-wasm` adds the separate `synthetic-match` test fixture without rewriting public look manifests. `trunk build --release` in `site/` embeds the root digest and produces a site that renders with no server.
+**Sample data.** `cargo run -p looklab-publish --features photo-scenes --example site_data` fits three synthetic Looks, builds their manifested sample camera match bundles, then computes Release audit entries from the final manifests. It publishes bodies, photographic scenes, test charts and the audit log, writing the tree above plus `site/site-root.txt` to `site/`. `publish_match_fixture` in `looklab-wasm` adds the separate `synthetic-match` test fixture without rewriting public look manifests. `trunk build --release` in `site/` embeds the root digest and produces a site that renders with no server.
 
-`looklab publish --db <sqlite> --blobs <dir> --out site/data` writes the same tree from the server database: published Look versions and their manifested artifacts, body pages from `data/bodies/`, the release entries of the audit log, and `site/site-root.txt`.
+`looklab publish --db <sqlite> --blobs <dir> --data data --transforms data/transforms --out site` writes the same tree from the server database: published Look versions and their manifested artifacts, the match bundles of every published body epoch, body pages from `data/bodies/`, and the release entries of the audit log under `site/data/`, with the index digest at `site/site-root.txt`. It publishes the photo scenes prepared under `data/scenes/` (one PNG per scene plus a provenance index; see [ops/deployment](ops/deployment.md)), verifying each PNG's SHA-256 first. Without that directory it publishes the test charts only.

@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use looklab_export::card::read_card;
-use looklab_fit::FitImage;
 use looklab_fit::synth::{LookSelector, SynthConfig, SyntheticDataset};
+use looklab_model::LookDocument;
 use looklab_publish::{ArtifactName, CARD_ARTIFACT, SiteIndex, VersionManifest, verify_artifact};
 use looklab_samples::{SampleSet, encode};
 use looklab_server::{ContributionId, CredentialId};
@@ -20,7 +20,7 @@ const FIRMWARE: &str = "1.50";
 const SIM: &str = "classic_chrome";
 
 struct Fixture {
-    _dir: TempDir,
+    _dir: Option<TempDir>,
     worker: Worker,
     site: PathBuf,
 }
@@ -58,8 +58,17 @@ async fn fixture_with(write_transform: bool, configure: impl FnOnce(&mut WorkerC
     config.transforms = transforms;
     configure(&mut config);
     let worker = Worker::open(config).await.expect("worker");
+    if std::env::var_os("LOOKLAB_KEEP_FIXTURE").is_some() {
+        eprintln!("fixture kept at {}", dir.path().display());
+        std::mem::forget(dir);
+        return Fixture {
+            _dir: None,
+            worker,
+            site,
+        };
+    }
     Fixture {
-        _dir: dir,
+        _dir: Some(dir),
         worker,
         site,
     }
@@ -102,14 +111,23 @@ fn metadata(index: usize) -> ManifestMetadata {
     }
 }
 
-fn blob_for(image: &FitImage) -> Vec<u8> {
-    let samples = &image.samples;
-    let in_rgb: Vec<[f32; 3]> = samples
-        .in_rgb()
+fn blob_for(dataset: &SyntheticDataset, index: usize) -> Vec<u8> {
+    let samples = &dataset.images[index].samples;
+    let nuisance = dataset.nuisances[index];
+    let gain = libm::exp2(nuisance.exposure);
+    let inverse_gains = [
+        libm::exp(-nuisance.wb_log_r) / gain,
+        1.0 / gain,
+        libm::exp(-nuisance.wb_log_b) / gain,
+    ];
+    let in_rgb: Vec<[f32; 3]> = dataset.points[index]
         .iter()
-        .map(|rgb| {
-            let xyz = image.transform.mul_vec(rgb.map(f64::from));
-            [xyz[0] as f32, xyz[1] as f32, xyz[2] as f32]
+        .map(|xyz| {
+            [
+                (xyz.x * inverse_gains[0]) as f32,
+                (xyz.y * inverse_gains[1]) as f32,
+                (xyz.z * inverse_gains[2]) as f32,
+            ]
         })
         .collect();
     let set = SampleSet::new(
@@ -248,7 +266,7 @@ async fn insert_contribution(
 
     let mut images = Vec::new();
     for &index in indices {
-        let bytes = blob_for(&dataset.images[index]);
+        let bytes = blob_for(dataset, index);
         let digest = Sha256::digest(&bytes);
         let hash: [u8; 32] = digest.into();
         std::fs::write(worker.config().blobs.join(hex(&hash)), &bytes).expect("blob file");
@@ -313,10 +331,156 @@ async fn image_field(worker: &Worker, id: &str, column: &str) -> Option<String> 
 }
 
 async fn count(worker: &Worker, sql: &str) -> i64 {
-    sqlx::query_scalar(sql)
+    let value = sqlx::query_scalar(sql)
         .fetch_one(worker.pool())
         .await
-        .expect("count")
+        .expect("count");
+    if std::env::var_os("LOOKLAB_DUMP_STATE").is_some() {
+        dump_state(worker, sql).await;
+    }
+    value
+}
+
+#[derive(serde::Deserialize)]
+struct PersistedArtifact {
+    name: String,
+    sha256: String,
+}
+
+/// Prints the persisted state a missing release can hinge on.
+async fn dump_state(worker: &Worker, at: &str) {
+    let versions: Vec<(i64, String)> =
+        sqlx::query_as("SELECT version, status FROM look_versions WHERE look = ? ORDER BY version")
+            .bind(LOOK)
+            .fetch_all(worker.pool())
+            .await
+            .unwrap_or_default();
+    let manifests: Vec<i64> = sqlx::query_scalar(
+        "SELECT v.version FROM look_versions v
+         JOIN version_manifests m ON m.look_version_id = v.id
+         WHERE v.look = ? ORDER BY v.version",
+    )
+    .bind(LOOK)
+    .fetch_all(worker.pool())
+    .await
+    .unwrap_or_default();
+    let attempts: Vec<(String, i64, i64)> =
+        sqlx::query_as("SELECT states, consecutive, updated_at FROM fit_attempts WHERE look = ?")
+            .bind(LOOK)
+            .fetch_all(worker.pool())
+            .await
+            .unwrap_or_default();
+    let holds: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT consecutive, status, diagnostics FROM fit_holds WHERE look = ?")
+            .bind(LOOK)
+            .fetch_all(worker.pool())
+            .await
+            .unwrap_or_default();
+    let gates: Vec<(i64, String)> =
+        sqlx::query_as("SELECT version, status FROM gate_failures WHERE look = ? ORDER BY version")
+            .bind(LOOK)
+            .fetch_all(worker.pool())
+            .await
+            .unwrap_or_default();
+    let jobs: Vec<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT kind, status, attempts, run_after FROM jobs ORDER BY created_at, id",
+    )
+    .fetch_all(worker.pool())
+    .await
+    .unwrap_or_default();
+    let publication: Option<(i64, i64, i64)> =
+        sqlx::query_as("SELECT generation, published, attempted FROM publication WHERE id = 1")
+            .fetch_optional(worker.pool())
+            .await
+            .unwrap_or_default();
+    let applied: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM release_reputation_applied WHERE look = ?")
+            .bind(LOOK)
+            .fetch_one(worker.pool())
+            .await
+            .unwrap_or_default();
+    let scores: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM recipe_scores")
+        .fetch_one(worker.pool())
+        .await
+        .unwrap_or_default();
+    let params: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT version, body, stage FROM release_body_params WHERE look = ? ORDER BY version",
+    )
+    .bind(LOOK)
+    .fetch_all(worker.pool())
+    .await
+    .unwrap_or_default();
+    let pool_state: Vec<(String, String)> =
+        sqlx::query_as("SELECT body, fingerprint FROM look_pool_state WHERE look = ?")
+            .bind(LOOK)
+            .fetch_all(worker.pool())
+            .await
+            .unwrap_or_default();
+    let statuses: Vec<(String, i64)> =
+        sqlx::query_as("SELECT status, COUNT(*) FROM contribution_images GROUP BY status")
+            .fetch_all(worker.pool())
+            .await
+            .unwrap_or_default();
+    eprintln!("--- worker state at {at}");
+    eprintln!("look_versions {versions:?}");
+    eprintln!("manifests {manifests:?}");
+    for (states, consecutive, updated_at) in &attempts {
+        let parsed: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(states).unwrap_or_default();
+        for (body, state) in parsed {
+            let state = match state {
+                serde_json::Value::String(text) => {
+                    serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
+                }
+                other => other,
+            };
+            eprintln!(
+                "main fit {body}: stage {:?}, sweep {:?}, converged {:?} (attempt {consecutive}, updated {updated_at})",
+                state.get("stage").and_then(serde_json::Value::as_u64),
+                state.get("sweep").and_then(serde_json::Value::as_u64),
+                state.get("converged").and_then(serde_json::Value::as_bool),
+            );
+        }
+    }
+    if attempts.is_empty() {
+        eprintln!("main fit: no pending attempt (the last native fit converged, or none ran)");
+    }
+    eprintln!("fit_holds {holds:?}");
+    eprintln!("gate_failures {gates:?}");
+    eprintln!("jobs {jobs:?}");
+    eprintln!("publication {publication:?}");
+    let release_rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT v.version, m.artifacts FROM look_versions v
+         JOIN version_manifests m ON m.look_version_id = v.id
+         WHERE v.look = ? ORDER BY v.version",
+    )
+    .bind(LOOK)
+    .fetch_all(worker.pool())
+    .await
+    .unwrap_or_default();
+    for (version, artifacts) in release_rows {
+        let Ok(refs) = serde_json::from_str::<Vec<PersistedArtifact>>(&artifacts) else {
+            continue;
+        };
+        let Some(artifact) = refs
+            .iter()
+            .find(|artifact| artifact.name == looklab_worker::refit::RELEASE_ARTIFACT)
+        else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(worker.config().blobs.join(&artifact.sha256)) else {
+            continue;
+        };
+        let Ok(release) = serde_json::from_slice::<looklab_worker::ReleaseRecord>(&bytes) else {
+            continue;
+        };
+        eprintln!(
+            "reference {version}: converged {}, gate passed {}, anchor {}, gauge {:.3}",
+            release.converged, release.gate.passed, release.anchor, release.gauge
+        );
+    }
+    eprintln!("reputation rows {applied}; recipe scores {scores}; body params {params:?}");
+    eprintln!("pool state {pool_state:?}; image statuses {statuses:?}");
 }
 
 #[tokio::test]
@@ -462,8 +626,7 @@ async fn nightly_refit_publishes_a_manifest_and_a_verifiable_site() {
     assert_eq!(releases, 1);
 
     let index_bytes = std::fs::read(fixture.site.join("data/index.json")).expect("index");
-    let root = std::fs::read_to_string(fixture.site.parent().expect("site").join("site-root.txt"))
-        .expect("site root");
+    let root = std::fs::read_to_string(fixture.site.join("site-root.txt")).expect("site root");
     let digest = hex(&Sha256::digest(&index_bytes));
     assert_eq!(root.trim(), digest);
     let index: SiteIndex = serde_json::from_slice(&index_bytes).expect("site index");
@@ -507,6 +670,212 @@ async fn nightly_refit_publishes_a_manifest_and_a_verifiable_site() {
     )
     .expect("artifact hash");
     assert_eq!(artifact.bytes, bytes.len() as u64);
+}
+
+#[tokio::test]
+async fn a_revert_republishes_the_target_and_the_refit_drops_the_excluded_credential() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 8,
+        samples_per_image: 500,
+        ..SynthConfig::default()
+    });
+    let honest = add_credential(worker, "seeder", 1.2).await;
+    let attacker = add_credential(worker, "new", 0.5).await;
+    add_contribution(worker, &honest, &dataset, &[0, 1, 2, 3, 4, 5, 6, 7], 100).await;
+
+    worker
+        .enqueue(
+            &JobPayload::NightlyRefit {
+                bodies: vec![looklab_upload::BodyId::new(BODY).expect("body")],
+            },
+            0,
+        )
+        .await
+        .expect("enqueue");
+    worker.run_until_idle().await.expect("initial refit");
+    add_contribution(worker, &attacker, &dataset, &[4, 5, 6, 7], 200).await;
+
+    let body = looklab_upload::BodyId::new(BODY).expect("body");
+    let look = looklab_upload::LookSlug::try_from(LOOK.to_owned()).expect("look");
+    let before = looklab_worker::pool::build(worker.pool(), worker.config(), &body, &look)
+        .await
+        .expect("pool");
+    assert!(
+        before
+            .images
+            .iter()
+            .any(|image| image.credential.id == attacker)
+    );
+
+    let reverted = looklab_server::admin::revert(
+        worker.pool(),
+        &worker.config().blobs,
+        looklab_trust::Actor::Cli,
+        &look,
+        1,
+        std::slice::from_ref(&attacker),
+        "attacker contribution",
+    )
+    .await
+    .expect("revert");
+    assert_eq!(reverted.new_version, 2);
+
+    let target: String = sqlx::query_scalar(
+        "SELECT m.artifacts FROM version_manifests m
+         JOIN look_versions v ON v.id = m.look_version_id
+         WHERE v.look = ? AND v.version = 1",
+    )
+    .bind(LOOK)
+    .fetch_one(worker.pool())
+    .await
+    .expect("target manifest");
+    let republished: String = sqlx::query_scalar(
+        "SELECT m.artifacts FROM version_manifests m
+         JOIN look_versions v ON v.id = m.look_version_id
+         WHERE v.look = ? AND v.version = 2",
+    )
+    .bind(LOOK)
+    .fetch_one(worker.pool())
+    .await
+    .expect("republished manifest");
+    let target_artifacts: Vec<PersistedArtifact> =
+        serde_json::from_str(&target).expect("target artifacts");
+    let republished_artifacts: Vec<PersistedArtifact> =
+        serde_json::from_str(&republished).expect("republished artifacts");
+    assert_eq!(
+        target_artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str())
+            .collect::<Vec<_>>(),
+        republished_artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(republished, target);
+    let v2_look = republished_artifacts
+        .iter()
+        .find(|artifact| artifact.name == looklab_publish::DOCUMENT_ARTIFACT)
+        .expect("look artifact");
+    let document = LookDocument::decode(
+        &std::fs::read(worker.config().blobs.join(&v2_look.sha256)).expect("look bytes"),
+    )
+    .expect("document");
+    assert_eq!(document.file.look.version.as_str(), "2.0.0");
+    let v2_card = republished_artifacts
+        .iter()
+        .find(|artifact| artifact.name == CARD_ARTIFACT)
+        .expect("card artifact");
+    let card =
+        read_card(&std::fs::read(worker.config().blobs.join(&v2_card.sha256)).expect("card bytes"))
+            .expect("card");
+    assert_eq!(card.meta().version.as_str(), "2.0.0");
+    let v2_release = republished_artifacts
+        .iter()
+        .find(|artifact| artifact.name == "release.json")
+        .expect("release artifact");
+    let v2_release: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(worker.config().blobs.join(&v2_release.sha256)).expect("release bytes"),
+    )
+    .expect("release json");
+    let v1_release = target_artifacts
+        .iter()
+        .find(|artifact| artifact.name == "release.json")
+        .expect("target release");
+    let v1_release: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(worker.config().blobs.join(&v1_release.sha256)).expect("target release"),
+    )
+    .expect("target release json");
+    assert_eq!(v2_release["version"], 2);
+    assert_eq!(v2_release["anchor"], 1);
+    assert_eq!(
+        v2_release["gated_since_anchor"],
+        v1_release["gated_since_anchor"]
+    );
+
+    let after = looklab_worker::pool::build(worker.pool(), worker.config(), &body, &look)
+        .await
+        .expect("pool");
+    assert!(
+        after
+            .images
+            .iter()
+            .all(|image| image.credential.id != attacker)
+    );
+    assert!(
+        after
+            .images
+            .iter()
+            .any(|image| image.credential.id == honest)
+    );
+
+    worker.run_until_idle().await.expect("revert refit");
+    let refit_status: String = sqlx::query_scalar(
+        "SELECT status FROM jobs WHERE kind = 'revert_refit' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(worker.pool())
+    .await
+    .expect("revert refit job");
+    assert_eq!(refit_status, "done");
+    let released: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM look_versions
+         WHERE look = ? AND version = 3 AND status = 'published'",
+    )
+    .bind(LOOK)
+    .fetch_one(worker.pool())
+    .await
+    .expect("forced release");
+    let held: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM gate_failures WHERE look = ? AND version = 3")
+            .bind(LOOK)
+            .fetch_one(worker.pool())
+            .await
+            .expect("forced gate");
+    assert_eq!(
+        released + held,
+        1,
+        "the forced refit must produce a release or a gate result"
+    );
+    if released == 1 {
+        let refitted: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM release_body_params
+             WHERE look = ? AND version = 3 AND body = ?",
+        )
+        .bind(LOOK)
+        .bind(BODY)
+        .fetch_one(worker.pool())
+        .await
+        .expect("refit params");
+        assert_eq!(refitted, 2);
+    }
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM look_refit_requests")
+        .fetch_one(worker.pool())
+        .await
+        .expect("refit request");
+    assert_eq!(pending, 0);
+
+    let target_after: String = sqlx::query_scalar(
+        "SELECT m.artifacts FROM version_manifests m
+         JOIN look_versions v ON v.id = m.look_version_id
+         WHERE v.look = ? AND v.version = 1",
+    )
+    .bind(LOOK)
+    .fetch_one(worker.pool())
+    .await
+    .expect("target manifest after refit");
+    assert_eq!(target_after, target);
+    let exclusions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM look_credential_exclusions WHERE look = ? AND credential_id = ?",
+    )
+    .bind(LOOK)
+    .bind(attacker.as_str())
+    .fetch_one(worker.pool())
+    .await
+    .expect("exclusion row");
+    assert_eq!(exclusions, 1);
 }
 
 #[tokio::test]
@@ -684,7 +1053,11 @@ async fn refit(worker: &Worker) {
         )
         .await
         .expect("enqueue");
-    worker.run_until_idle().await.expect("refit");
+    let drained = worker.run_until_idle().await;
+    if std::env::var_os("LOOKLAB_DUMP_STATE").is_some() {
+        dump_state(worker, "refit").await;
+    }
+    drained.expect("refit");
 }
 
 #[tokio::test]
@@ -1539,6 +1912,54 @@ async fn non_tolerated_spatial_settings_exclude_every_image() {
         ),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn pool_conversion_keeps_enum_settings_typed() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 1,
+        samples_per_image: 200,
+        ..SynthConfig::default()
+    });
+    let credential = add_credential(worker, "seeder", 1.2).await;
+    add_contribution_with(
+        worker,
+        &credential,
+        &dataset,
+        &[0],
+        100,
+        ContributionKind::Library,
+        ContributionIntent::Native,
+        None,
+        r#"[{"key":"dynamic_range","step":1,"source":"reproduced"},
+            {"key":"grain","step":0,"source":"reproduced"},
+            {"key":"highlight_tone","step":4,"source":"reproduced"}]"#,
+    )
+    .await;
+
+    let body = looklab_upload::BodyId::new(BODY).expect("body");
+    let look = looklab_upload::LookSlug::new(LOOK).expect("look");
+    let pool = looklab_worker::pool::build(worker.pool(), worker.config(), &body, &look)
+        .await
+        .expect("pool");
+    let image = pool.images.first().expect("pooled image");
+    let grain = looklab_schema::ControlKey::new("grain").expect("grain");
+    assert_eq!(
+        image.settings.get(&grain),
+        Some(&looklab_model::realization::ControlValue::Enum(
+            looklab_schema::EnumValue::new("off").expect("off")
+        )),
+        "the default grain setting must stay the enum value the tolerance check reads"
+    );
+    let tone = looklab_schema::ControlKey::new("highlight_tone").expect("highlight tone");
+    assert_eq!(
+        image.settings.get(&tone),
+        Some(&looklab_model::realization::ControlValue::Step(4)),
+    );
+    assert_eq!(image.exposure_mode.0, 1, "DR200 is exposure mode 1");
 }
 
 #[tokio::test]

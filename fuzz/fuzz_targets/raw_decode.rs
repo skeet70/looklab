@@ -3,7 +3,8 @@
 //!
 //! rawler catches unwinds inside `RawLoader::decode`, so caught panics never reach libFuzzer,
 //! while on wasm32 they abort. The hook records each panic location and saves the first input.
-//! `OMP_FUZZ_ABORT_ON_PANIC=1` aborts instead, which `cargo fuzz tmin` needs.
+//! `OMP_FUZZ_ABORT_ON_PANIC=1` aborts instead, which `cargo fuzz tmin` needs;
+//! `OMP_FUZZ_ABORT_LOCATION` limits the abort to locations containing it.
 
 #![no_main]
 
@@ -34,12 +35,23 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
 
 static HOOK: Once = Once::new();
 
-fn abort_on_panic() -> bool {
-    std::env::var_os("OMP_FUZZ_ABORT_ON_PANIC").is_some()
+/// Without a location filter, `-minimize_crash` reduces every input to the
+/// easiest panic in the target.
+fn abort_on_panic(info: &std::panic::PanicHookInfo<'_>) -> bool {
+    if std::env::var_os("OMP_FUZZ_ABORT_ON_PANIC").is_none() {
+        return false;
+    }
+    match std::env::var("OMP_FUZZ_ABORT_LOCATION") {
+        Ok(narrow) => info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()).contains(&narrow))
+            .unwrap_or(false),
+        Err(_) => true,
+    }
 }
 
 fn panic_hook(info: &std::panic::PanicHookInfo<'_>) {
-    if abort_on_panic() {
+    if abort_on_panic(info) {
         eprintln!("panic: {info}");
         eprintln!("{}", std::backtrace::Backtrace::force_capture());
         std::process::abort();

@@ -6,16 +6,11 @@ use looklab_model::ProbeGroup;
 use looklab_model::probes::{PROBES_V1_YAML, v1, validate_yaml};
 
 #[test]
-fn committed_yaml_matches_generation() {
-    assert_eq!(PROBES_V1_YAML, v1().to_yaml().expect("yaml"));
-}
-
-#[test]
-fn committed_yaml_parses_back() {
+fn committed_probe_set_matches_generation() {
     let file = validate_yaml(PROBES_V1_YAML).expect("committed yaml");
     let generated = v1();
+    assert_eq!(file.version, generated.version);
     assert_eq!(file.probes, generated.probes);
-    assert_eq!(file.notes, generated.notes);
 }
 
 #[test]

@@ -29,6 +29,18 @@ pub const C_COEFS: usize = 4;
 /// Maximum `M'` the `sqrt(C)` axis covers; larger inputs clamp to the last knot.
 pub const C_MAX: f64 = 120.0;
 
+/// Number of Cartesian monomials in the near-neutral core.
+pub const CORE_TERMS: usize = 5;
+
+/// Coefficients of the near-neutral core, indexed `[s][term]`.
+pub const CORE_COEFS: usize = S_COEFS * CORE_TERMS;
+
+/// Coefficients on the `C > 0` hue/s volume.
+pub const VOLUME_COEFS: usize = HUE_COEFS * S_COEFS * 3;
+
+/// Radius in CAM16-UCS `M'` at which the outer representation is rejoined.
+pub const NEUTRAL_JOIN_C: f64 = 2.0;
+
 /// Coefficients of each tint spline `(a', b')`, over `J'_base`.
 pub const TINT_COEFS: usize = 12;
 
@@ -237,6 +249,35 @@ pub(crate) fn c_weights(c: f64) -> ([usize; 4], [f64; 4]) {
     ([0, 1, 2, 3], weights)
 }
 
+/// Normalized Cartesian monomials `[a, b, a², ab, b²]` over [`NEUTRAL_JOIN_C`].
+pub fn core_weights(a: f64, b: f64) -> [f64; CORE_TERMS] {
+    let x = a / NEUTRAL_JOIN_C;
+    let y = b / NEUTRAL_JOIN_C;
+    [x, y, x * x, x * y, y * y]
+}
+
+/// Outer weight `w(C)` and `dw/dC`; the C^∞ step
+/// `e^(-1/x)/(e^(-1/x)+e^(-1/(1-x)))` (Lee, *Introduction to Smooth Manifolds*, §2).
+pub fn outer_weight(c: f64) -> (f64, f64) {
+    if !(c > 0.0) {
+        return (0.0, 0.0);
+    }
+    if c >= NEUTRAL_JOIN_C {
+        return (1.0, 0.0);
+    }
+    let p = 1.0 / c;
+    let q = 1.0 / (NEUTRAL_JOIN_C - c);
+    let a = libm::exp(-p);
+    let b = libm::exp(-q);
+    let sum = a + b;
+    if sum == 0.0 {
+        return (0.0, 0.0);
+    }
+    let w = a / sum;
+    let slope = w * (1.0 - w) * (p * p + q * q);
+    (w, slope)
+}
+
 /// Cubic B-spline weights on the `s` axis.
 pub(crate) fn s_weights(s: f64) -> ([usize; 4], [f64; 4]) {
     let mut values = [0.0_f64; 4];
@@ -389,5 +430,33 @@ mod tests {
     fn neutral_chroma_uses_only_the_plane() {
         let (_, weights) = c_weights(0.0);
         assert_eq!(weights, [1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn outer_weight_derivative_matches_finite_difference() {
+        for step in 1..=190 {
+            let c = 2.0 * step as f64 / 200.0;
+            let (_, derivative) = outer_weight(c);
+            let h = 1e-6;
+            let (plus, _) = outer_weight(c + h);
+            let (minus, _) = outer_weight(c - h);
+            let numerical = (plus - minus) / (2.0 * h);
+            assert!(
+                (derivative - numerical).abs() < 1e-5,
+                "c={c} analytical={derivative} numerical={numerical}"
+            );
+        }
+    }
+
+    #[test]
+    fn core_weights_are_bounded_on_the_join_disk() {
+        for a in [-2.0, -1.0, 0.0, 1.0, 2.0] {
+            for b in [-2.0, -1.0, 0.0, 1.0, 2.0] {
+                for weight in core_weights(a, b) {
+                    assert!(weight.is_finite());
+                    assert!(weight.abs() <= 1.0, "a={a} b={b} weight={weight}");
+                }
+            }
+        }
     }
 }

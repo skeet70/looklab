@@ -73,12 +73,13 @@ mod dir {
     use std::path::{Path, PathBuf};
 
     use serde::Deserialize;
+    use sha2::{Digest, Sha256};
 
     use crate::body::{MappingStatus, validate_body};
     use crate::error::{ErrorKind, ValidationError};
     use crate::fs::{FileErrors, Kind, classified_yaml_files, classify, validate_dir};
     use crate::interface::validate_interface_profile;
-    use crate::proposal::Placement;
+    use crate::proposal::{FixtureFileName, Placement, Sha256Hex};
     use crate::schema::validate_control_schema;
 
     use super::{
@@ -94,8 +95,11 @@ mod dir {
 
     #[derive(Deserialize)]
     struct FixtureEntry {
+        file: String,
         make: String,
         model: String,
+        #[serde(default)]
+        sha256: Option<Sha256Hex>,
         #[serde(default)]
         source_url: Option<String>,
         #[serde(default, rename = "committed")]
@@ -200,7 +204,8 @@ mod dir {
         let entries = match fs::read_to_string(&manifest_path) {
             Ok(text) => match toml::from_str::<FixtureManifest>(&text) {
                 Ok(manifest) => {
-                    let errors = fixture_entry_errors(&manifest);
+                    let mut errors = fixture_entry_errors(&manifest);
+                    errors.extend(fixture_storage_errors(root, &manifest));
                     if !errors.is_empty() {
                         failures.push(FileErrors {
                             file: PathBuf::from(FIXTURE_MANIFEST),
@@ -255,6 +260,12 @@ mod dir {
     fn fixture_entry_errors(manifest: &FixtureManifest) -> Vec<ValidationError> {
         let mut errors = Vec::new();
         for (index, entry) in manifest.fixture.iter().enumerate() {
+            if FixtureFileName::parse(&entry.file).is_err() {
+                errors.push(fixture_entry_error(index, "a plain file name"));
+            }
+            if entry.sha256.is_none() {
+                errors.push(fixture_entry_error(index, "a sha256 digest"));
+            }
             if entry.make.trim().is_empty() || entry.model.trim().is_empty() {
                 errors.push(fixture_entry_error(
                     index,
@@ -278,11 +289,39 @@ mod dir {
         errors
     }
 
-    fn fixture_entry_error(index: usize, detail: &'static str) -> ValidationError {
+    fn fixture_entry_error(index: usize, detail: &str) -> ValidationError {
         ValidationError::new(
             format!("fixture[{index}]"),
             ErrorKind::FixtureManifest(detail.to_owned()),
         )
+    }
+
+    fn fixture_storage_errors(root: &Path, manifest: &FixtureManifest) -> Vec<ValidationError> {
+        let mut errors = Vec::new();
+        for (index, entry) in manifest.fixture.iter().enumerate() {
+            let Ok(file) = FixtureFileName::parse(&entry.file) else {
+                continue;
+            };
+            let Some(relative) = entry.placement.snapshot_path(file) else {
+                continue;
+            };
+            let Ok(bytes) = fs::read(root.join(&relative)) else {
+                errors.push(fixture_entry_error(
+                    index,
+                    &format!("fixture bytes at {relative}"),
+                ));
+                continue;
+            };
+            if let Some(expected) = entry.sha256
+                && Sha256::digest(&bytes).as_slice() != expected.as_bytes()
+            {
+                errors.push(fixture_entry_error(
+                    index,
+                    &format!("fixture bytes at {relative} matching the recorded sha256"),
+                ));
+            }
+        }
+        errors
     }
 
     fn fixture_error(message: String) -> FileErrors {

@@ -74,12 +74,16 @@ pub fn transform() -> Mat3 {
 }
 
 pub fn body(seed: u64) -> Result<SyntheticBody> {
+    let sim = SimKey::new(SYNTH_SIM).map_err(|error| MatchError::Schema(error.to_string()))?;
+    body_for_sim(seed, &sim)
+}
+
+pub fn body_for_sim(seed: u64, sim: &SimKey) -> Result<SyntheticBody> {
     let schema = schema();
     let plan = plan();
     let mut rng = ChaCha12Rng::seed_from_u64(seed);
     let base_look = looklab_fit::synth::truth_look(seed);
-    let sim = SimKey::new(SYNTH_SIM).map_err(|error| MatchError::Schema(error.to_string()))?;
-    let mut crm = ControlResponseModel::zeroed(&schema, 1, &sim, 1)
+    let mut crm = ControlResponseModel::zeroed(&schema, 1, sim, 1)
         .map_err(|error| MatchError::Schema(error.to_string()))?;
     let mut settings = plan.default.clone();
 

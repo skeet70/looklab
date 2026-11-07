@@ -1,0 +1,23 @@
+# Litestream 0.5 replication for the looklab SQLite database.
+# Copy to /etc/looklab/litestream.yml. See docs/ops/litestream.md.
+#
+# Credentials are read from AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, or from
+# LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY.
+dbs:
+  - path: /var/lib/looklab/looklab.sqlite3
+    replica:
+      url: s3://looklab-sqlite/looklab
+      region: eu-central-1
+      sync-interval: 1s
+
+# A snapshot a day, kept for 30 days. l0-retention bounds how long the
+# per-sync files that give the finest restore points are kept.
+snapshot:
+  interval: 24h
+  retention: 720h
+l0-retention: 24h
+
+# Runtime control for `litestream sync`, `status` and `stop`.
+socket:
+  enabled: true
+  path: /var/lib/looklab/litestream.sock

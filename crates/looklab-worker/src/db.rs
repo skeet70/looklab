@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Row access for uploads, credentials, blobs, versions and moderation items.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use looklab_server::admin::{self, ManifestArtifact};
@@ -250,6 +250,84 @@ async fn credential_scope(pool: &SqlitePool, id: &CredentialId) -> Result<Option
         rules.extend(scope.rules);
     }
     Ok(Some(Scope::new(rules)))
+}
+
+/// Credentials a moderator excluded from later fits of one Look.
+pub async fn look_credential_exclusions(
+    pool: &SqlitePool,
+    look: &str,
+) -> Result<BTreeSet<CredentialId>> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT credential_id FROM look_credential_exclusions WHERE look = ?")
+            .bind(look)
+            .fetch_all(pool)
+            .await?;
+    rows.into_iter()
+        .map(|(id,)| {
+            CredentialId::try_from(id)
+                .map_err(|_| WorkerError::Data("excluded credential id is not a UUID".to_owned()))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefitRequest {
+    pub look: LookSlug,
+    pub generation: i64,
+    pub reverted_version: u32,
+}
+
+pub async fn pending_refit_requests(pool: &SqlitePool) -> Result<Vec<RefitRequest>> {
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT look, generation, reverted_version FROM look_refit_requests
+         ORDER BY requested_at, look",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|(look, generation, reverted_version)| {
+            Ok(RefitRequest {
+                look: LookSlug::try_from(look)
+                    .map_err(|_| WorkerError::Data("refit look is not a slug".to_owned()))?,
+                generation,
+                reverted_version: u32::try_from(reverted_version)
+                    .map_err(|_| WorkerError::Data("reverted version is not a u32".to_owned()))?,
+            })
+        })
+        .collect()
+}
+
+pub async fn clear_refit_request(
+    pool: &SqlitePool,
+    look: &LookSlug,
+    generation: i64,
+) -> Result<()> {
+    sqlx::query("DELETE FROM look_refit_requests WHERE look = ? AND generation = ?")
+        .bind(look.as_str())
+        .bind(generation)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn body_refitted_after(
+    pool: &SqlitePool,
+    look: &LookSlug,
+    body: &str,
+    version: u32,
+) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM release_body_params p
+         JOIN look_versions v ON v.look = p.look AND v.version = p.version
+         WHERE p.look = ? AND p.body = ? AND p.version > ?
+           AND v.status IN ('published', 'rooted')",
+    )
+    .bind(look.as_str())
+    .bind(body)
+    .bind(i64::from(version))
+    .fetch_one(pool)
+    .await?;
+    Ok(count > 0)
 }
 
 fn parse_tier(value: &str) -> Result<Tier> {

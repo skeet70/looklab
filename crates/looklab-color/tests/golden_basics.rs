@@ -20,11 +20,19 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
-struct Golden {
+struct VectorFile {
     vectors: BTreeMap<String, Vectors>,
+}
+
+#[derive(Deserialize)]
+struct SpacesFile {
     spaces: BTreeMap<String, SpaceVectors>,
-    cats: BTreeMap<String, CatVectors>,
     space_matrices: BTreeMap<String, SpaceGolden>,
+}
+
+#[derive(Deserialize)]
+struct CatsFile {
+    cats: BTreeMap<String, CatVectors>,
 }
 
 #[derive(Deserialize)]
@@ -54,13 +62,36 @@ struct SpaceGolden {
     stored_xyz_to_rgb: Vec<f64>,
 }
 
-static GOLDEN: LazyLock<Golden> = LazyLock::new(|| {
-    serde_json::from_str(include_str!("golden/basics.json")).expect("golden vectors parse")
+static VECTORS: LazyLock<BTreeMap<String, Vectors>> = LazyLock::new(|| {
+    let mut merged = BTreeMap::new();
+    for text in [
+        include_str!("golden/xyy.json"),
+        include_str!("golden/transfer_functions.json"),
+        include_str!("golden/lab.json"),
+        include_str!("golden/difference.json"),
+        include_str!("golden/illuminants.json"),
+    ] {
+        let file: VectorFile = serde_json::from_str(text).expect("golden vectors parse");
+        for (name, set) in file.vectors {
+            assert!(
+                merged.insert(name.clone(), set).is_none(),
+                "duplicate golden vector set {name}"
+            );
+        }
+    }
+    merged
+});
+
+static SPACES: LazyLock<SpacesFile> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("golden/spaces.json")).expect("golden space vectors parse")
+});
+
+static CATS: LazyLock<CatsFile> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("golden/cats.json")).expect("golden cat vectors parse")
 });
 
 fn vectors(name: &str) -> &'static Vectors {
-    GOLDEN
-        .vectors
+    VECTORS
         .get(name)
         .unwrap_or_else(|| panic!("missing golden vector set {name}"))
 }
@@ -146,7 +177,7 @@ fn transfer_functions_match_colour_science() {
 
 #[test]
 fn rgb_space_conversions_match_colour_science() {
-    for (key, set) in &GOLDEN.spaces {
+    for (key, set) in &SPACES.spaces {
         let space: RgbSpace = from_key(key);
         check_vectors(&set.rgb_to_xyz, |v| {
             space
@@ -165,7 +196,7 @@ fn rgb_space_conversions_match_colour_science() {
 
 #[test]
 fn space_matrices_match_derivation_and_stored_values() {
-    for (key, golden) in &GOLDEN.space_matrices {
+    for (key, golden) in &SPACES.space_matrices {
         let space: RgbSpace = from_key(key);
         assert_eq!(space.name(), golden.name);
         let to_xyz = flatten(space.to_xyz_matrix());
@@ -185,7 +216,7 @@ fn space_matrices_match_derivation_and_stored_values() {
 
 #[test]
 fn chromatic_adaptation_matches_colour_science() {
-    for (key, set) in &GOLDEN.cats {
+    for (key, set) in &CATS.cats {
         let cat: Cat = from_key(key);
         check_vectors(&set.matrix, |v| {
             flatten(adaptation_matrix(
@@ -288,8 +319,8 @@ fn chart_matches_colour_science() {
 
 #[test]
 fn every_space_has_a_golden_derivation() {
-    assert_eq!(GOLDEN.space_matrices.len(), RgbSpace::ALL.len());
+    assert_eq!(SPACES.space_matrices.len(), RgbSpace::ALL.len());
     for space in RgbSpace::ALL {
-        assert!(GOLDEN.space_matrices.contains_key(&key_of(space)));
+        assert!(SPACES.space_matrices.contains_key(&key_of(space)));
     }
 }

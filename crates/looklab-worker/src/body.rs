@@ -149,10 +149,13 @@ impl TransformDir {
         Self { root: root.into() }
     }
 
+    fn path(&self, body: &BodyId) -> PathBuf {
+        self.root
+            .join(format!("{}.yaml", body.as_str().replace('/', "-")))
+    }
+
     pub fn load(&self, body: &BodyId) -> Result<BodyTransforms> {
-        let path: PathBuf = self
-            .root
-            .join(format!("{}.yaml", body.as_str().replace('/', "-")));
+        let path = self.path(body);
         let text = std::fs::read_to_string(&path).map_err(|error| {
             WorkerError::Data(format!(
                 "{}: {error}; a body input transform is required",
@@ -160,6 +163,14 @@ impl TransformDir {
             ))
         })?;
         Self::parse(&text, &path, body)
+    }
+
+    /// The body's transform file, validated for publication with its match bundles.
+    pub fn snapshot(&self, body: &BodyId) -> Result<Vec<u8>> {
+        self.load(body)?;
+        let path = self.path(body);
+        std::fs::read(&path)
+            .map_err(|error| WorkerError::Data(format!("{}: {error}", path.display())))
     }
 
     fn parse(text: &str, path: &std::path::Path, body: &BodyId) -> Result<BodyTransforms> {

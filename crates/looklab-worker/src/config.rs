@@ -8,7 +8,7 @@ pub struct WorkerConfig {
     pub blobs: PathBuf,
     /// Body and control-schema snapshots (`data/bodies`).
     pub data: PathBuf,
-    /// Directory passed to [`looklab_publish::write_site`].
+    /// Publication root passed to [`looklab_publish::write_site`]; receives `data/`.
     pub site: PathBuf,
     /// Fixed camera-to-XYZ matrices, one `<make>-<model>.yaml` per body.
     pub transforms: PathBuf,
@@ -20,7 +20,7 @@ pub struct WorkerConfig {
     pub max_samples_per_image: usize,
     /// Consecutive non-converged batches before a Look opens a moderation item.
     pub max_consecutive_nonconverged: u32,
-    /// Sample-evaluation budget override; `None` keeps the fit's default.
+    /// Sample-evaluation budget; `None` uses the fitter's sweep limit.
     pub sweep_budget: Option<f64>,
 }
 
@@ -30,7 +30,7 @@ impl WorkerConfig {
             db: db.into(),
             blobs: blobs.into(),
             data: PathBuf::from("data"),
-            site: PathBuf::from("site/data"),
+            site: PathBuf::from("site"),
             transforms: PathBuf::from("data/transforms"),
             seed: 0x5eed_1a5e,
             lease_seconds: 3_600,

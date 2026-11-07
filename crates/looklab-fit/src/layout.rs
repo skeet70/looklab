@@ -2,10 +2,11 @@
 //! Fit parameter layout and the constrained-to-unconstrained coordinate maps.
 
 use core::ops::Range;
-use looklab_model::basis::{HUE_COEFS, RESIDUAL_COEFS, S_COEFS, TINT_COEFS, TONE_COEFS};
+use looklab_model::basis::{RESIDUAL_COEFS, S_COEFS, TINT_COEFS, TONE_COEFS};
 use looklab_model::{ClipSettings, ColorLayer, GrlComponent, Look, Residual, Tint, Tone};
 
-pub const GRL_COEFS: usize = S_COEFS + HUE_COEFS * S_COEFS * 3;
+pub const GRL_COEFS: usize = looklab_model::look::GRL_COEFS;
+const VOLUME_COEFS: usize = looklab_model::basis::VOLUME_COEFS;
 
 /// Three nuisances per image: exposure, `log w_R`, `log w_B`.
 pub const NUISANCE_PER_IMAGE: usize = 3;
@@ -97,7 +98,8 @@ impl Layout {
         let tone = Tone::spline(theta[self.tone_c0], beta).unwrap_or(Tone::Colorimetric);
         let component = |range: Range<usize>| GrlComponent {
             plane: theta[range.start..range.start + S_COEFS].to_vec(),
-            volume: theta[range.start + S_COEFS..range.end].to_vec(),
+            volume: theta[range.start + S_COEFS..range.start + S_COEFS + VOLUME_COEFS].to_vec(),
+            core: theta[range.start + S_COEFS + VOLUME_COEFS..range.end].to_vec(),
         };
         Look {
             tone,

@@ -1,0 +1,24 @@
+# /etc/looklab/looklab.toml
+# One server process, one worker process, one local state directory.
+
+bind = "127.0.0.1:8080"
+db_path = "/var/lib/looklab/looklab.sqlite3"
+blob_dir = "/var/lib/looklab/blobs"
+server_secret_path = "/var/lib/looklab/server-secret"
+bodies_dir = "/var/lib/looklab/data/bodies"
+snapshot_dir = "/var/lib/looklab/community"
+
+# The browser origin and its registrable RP ID. Both are pinned for the life of
+# every credential registered on this host.
+origin = "https://looklab.example"
+rp_id = "looklab.example"
+
+# Add the public site origin when the API is on a different hostname.
+# Never a wildcard; cookies are not used, sessions travel as Bearer tokens.
+cors_origins = []
+
+[site]
+# Built Trunk output. Omit to run API-only.
+dist_dir = "/var/lib/looklab/site/dist"
+# The data/ directory under the worker's --site root. Omit to withhold /data and the root endpoint.
+data_dir = "/var/lib/looklab/site/data"

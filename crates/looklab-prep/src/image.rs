@@ -5,12 +5,57 @@ use looklab_meta::Orientation;
 
 use crate::error::PrepError;
 
+/// Row-major linear RGB read pixel by pixel.
+pub(crate) trait LinearPixels {
+    fn width(&self) -> u32;
+    fn height(&self) -> u32;
+    fn pixel(&self, x: u32, y: u32) -> Option<[f32; 3]>;
+
+    fn is_empty(&self) -> bool {
+        self.width() == 0 || self.height() == 0
+    }
+
+    fn sample_bilinear(&self, x: f64, y: f64) -> Option<[f32; 3]> {
+        bilinear(self, x, y)
+    }
+
+    fn downsample_area(&self, max_pixels: u32) -> Image3 {
+        area_downsample(self, max_pixels)
+    }
+}
+
 /// Linear RGB, row-major, `width * height` entries.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Image3 {
     pub width: u32,
     pub height: u32,
     pub data: Vec<[f32; 3]>,
+}
+
+impl LinearPixels for Image3 {
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn pixel(&self, x: u32, y: u32) -> Option<[f32; 3]> {
+        Image3::pixel(self, x, y)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    fn sample_bilinear(&self, x: f64, y: f64) -> Option<[f32; 3]> {
+        Image3::sample_bilinear(self, x, y)
+    }
+
+    fn downsample_area(&self, max_pixels: u32) -> Image3 {
+        Image3::downsample_area(self, max_pixels)
+    }
 }
 
 impl Image3 {
@@ -46,19 +91,7 @@ impl Image3 {
         if total <= u64::from(max_pixels) {
             return self.clone();
         }
-        let max_pixels = max_pixels.max(1);
-        let scale = (f64::from(max_pixels) / total as f64).sqrt();
-        let mut out_width = ((f64::from(self.width) * scale).floor() as u32).max(1);
-        let mut out_height = ((f64::from(self.height) * scale).floor() as u32).max(1);
-        while u64::from(out_width) * u64::from(out_height) > u64::from(max_pixels) {
-            if out_width >= out_height && out_width > 1 {
-                out_width -= 1;
-            } else if out_height > 1 {
-                out_height -= 1;
-            } else {
-                break;
-            }
-        }
+        let (out_width, out_height) = downsample_dimensions(self.width, self.height, max_pixels);
 
         let x_taps = axis_taps(self.width, out_width);
         let y_taps = axis_taps(self.height, out_height);
@@ -160,6 +193,189 @@ impl Image3 {
             data,
         }
     }
+}
+
+/// Same arithmetic as [`Image3::sample_bilinear`].
+fn bilinear<P: LinearPixels + ?Sized>(pixels: &P, x: f64, y: f64) -> Option<[f32; 3]> {
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    let max_x = f64::from(pixels.width() - 1);
+    let max_y = f64::from(pixels.height() - 1);
+    if x < 0.0 || y < 0.0 || x > max_x || y > max_y {
+        return None;
+    }
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(pixels.width() - 1);
+    let y1 = (y0 + 1).min(pixels.height() - 1);
+    let fx = x - f64::from(x0);
+    let fy = y - f64::from(y0);
+    let p00 = pixels.pixel(x0, y0)?;
+    let p10 = pixels.pixel(x1, y0)?;
+    let p01 = pixels.pixel(x0, y1)?;
+    let p11 = pixels.pixel(x1, y1)?;
+    let mut out = [0.0_f32; 3];
+    for channel in 0..3 {
+        let top =
+            f64::from(p00[channel]) + fx * (f64::from(p10[channel]) - f64::from(p00[channel]));
+        let bottom =
+            f64::from(p01[channel]) + fx * (f64::from(p11[channel]) - f64::from(p01[channel]));
+        out[channel] = (top + fy * (bottom - top)) as f32;
+    }
+    Some(out)
+}
+
+/// Same arithmetic as [`Image3::downsample_area`].
+fn area_downsample<P: LinearPixels + ?Sized>(pixels: &P, max_pixels: u32) -> Image3 {
+    let width = pixels.width();
+    let height = pixels.height();
+    let total = u64::from(width) * u64::from(height);
+    if total <= u64::from(max_pixels) {
+        let mut data = Vec::with_capacity(usize::try_from(total).expect("pixels fit usize"));
+        for y in 0..height {
+            for x in 0..width {
+                data.push(pixels.pixel(x, y).expect("pixels stay in bounds"));
+            }
+        }
+        return Image3 {
+            width,
+            height,
+            data,
+        };
+    }
+    let (out_width, out_height) = downsample_dimensions(width, height, max_pixels);
+
+    let x_taps = axis_taps(width, out_width);
+    let y_taps = axis_taps(height, out_height);
+    let mut row_sum = vec![[0.0_f64; 3]; usize::try_from(width).expect("width fits usize")];
+    let mut data = Vec::with_capacity(
+        usize::try_from(out_width).expect("width fits usize")
+            * usize::try_from(out_height).expect("height fits usize"),
+    );
+
+    for taps_y in &y_taps {
+        row_sum.iter_mut().for_each(|cell| *cell = [0.0; 3]);
+        let mut weight_y = 0.0_f64;
+        for &(sy, wy) in taps_y {
+            weight_y += wy;
+            for (x, sum) in row_sum.iter_mut().enumerate() {
+                let value = pixels
+                    .pixel(u32::try_from(x).expect("column fits u32"), sy)
+                    .expect("tap stays in bounds");
+                sum[0] += wy * f64::from(value[0]);
+                sum[1] += wy * f64::from(value[1]);
+                sum[2] += wy * f64::from(value[2]);
+            }
+        }
+        for taps_x in &x_taps {
+            let mut sum = [0.0_f64; 3];
+            let mut weight_x = 0.0_f64;
+            for &(sx, wx) in taps_x {
+                weight_x += wx;
+                let value = row_sum[usize::try_from(sx).expect("column fits usize")];
+                sum[0] += wx * value[0];
+                sum[1] += wx * value[1];
+                sum[2] += wx * value[2];
+            }
+            let norm = weight_x * weight_y;
+            data.push([
+                (sum[0] / norm) as f32,
+                (sum[1] / norm) as f32,
+                (sum[2] / norm) as f32,
+            ]);
+        }
+    }
+
+    Image3 {
+        width: out_width,
+        height: out_height,
+        data,
+    }
+}
+
+pub(crate) struct AreaDownsample<'a, P: ?Sized> {
+    pixels: &'a P,
+    width: u32,
+    height: u32,
+    x_taps: Vec<Vec<(u32, f64)>>,
+    y_taps: Vec<Vec<(u32, f64)>>,
+}
+
+impl<'a, P: LinearPixels + ?Sized> AreaDownsample<'a, P> {
+    pub(crate) fn new(pixels: &'a P, max_pixels: u32) -> Self {
+        let (width, height) = downsample_dimensions(pixels.width(), pixels.height(), max_pixels);
+        Self {
+            pixels,
+            width,
+            height,
+            x_taps: axis_taps(pixels.width(), width),
+            y_taps: axis_taps(pixels.height(), height),
+        }
+    }
+}
+
+impl<P: LinearPixels + ?Sized> LinearPixels for AreaDownsample<'_, P> {
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn pixel(&self, x: u32, y: u32) -> Option<[f32; 3]> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        if self.width == self.pixels.width() && self.height == self.pixels.height() {
+            return self.pixels.pixel(x, y);
+        }
+        let taps_y = &self.y_taps[y as usize];
+        let weight_y: f64 = taps_y.iter().map(|(_, weight)| weight).sum();
+        let mut sum = [0.0_f64; 3];
+        let mut weight_x = 0.0_f64;
+        for &(sx, wx) in &self.x_taps[x as usize] {
+            weight_x += wx;
+            let mut row_sum = [0.0_f64; 3];
+            for &(sy, wy) in taps_y {
+                let value = self.pixels.pixel(sx, sy)?;
+                row_sum[0] += wy * f64::from(value[0]);
+                row_sum[1] += wy * f64::from(value[1]);
+                row_sum[2] += wy * f64::from(value[2]);
+            }
+            sum[0] += wx * row_sum[0];
+            sum[1] += wx * row_sum[1];
+            sum[2] += wx * row_sum[2];
+        }
+        let norm = weight_x * weight_y;
+        Some([
+            (sum[0] / norm) as f32,
+            (sum[1] / norm) as f32,
+            (sum[2] / norm) as f32,
+        ])
+    }
+}
+
+fn downsample_dimensions(width: u32, height: u32, max_pixels: u32) -> (u32, u32) {
+    let total = u64::from(width) * u64::from(height);
+    if total <= u64::from(max_pixels) {
+        return (width, height);
+    }
+    let max_pixels = max_pixels.max(1);
+    let scale = (f64::from(max_pixels) / total as f64).sqrt();
+    let mut out_width = ((f64::from(width) * scale).floor() as u32).max(1);
+    let mut out_height = ((f64::from(height) * scale).floor() as u32).max(1);
+    while u64::from(out_width) * u64::from(out_height) > u64::from(max_pixels) {
+        if out_width >= out_height && out_width > 1 {
+            out_width -= 1;
+        } else if out_height > 1 {
+            out_height -= 1;
+        } else {
+            break;
+        }
+    }
+    (out_width, out_height)
 }
 
 pub(crate) fn orientation_size(width: u32, height: u32, orientation: Orientation) -> (u32, u32) {

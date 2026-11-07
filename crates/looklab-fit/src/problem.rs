@@ -2,10 +2,12 @@
 //! The fit's sample set, block structure and one objective/Jacobian pass.
 
 use core::ops::Range;
+use std::borrow::Cow;
+
 use looklab_color::ucs::Ucs;
 use looklab_color::{Mat3, Rgb, RgbSpace};
 use looklab_model::Look;
-use looklab_model::basis::TONE_COEFS;
+use looklab_model::basis::{RESIDUAL_COEFS, TONE_COEFS};
 use looklab_model::realization::{
     ControlResponseModel, ControlValue, Delta, ResponseComponent, ResponseParamId, Settings,
 };
@@ -98,7 +100,12 @@ pub(crate) struct BlockAcc {
     /// `Some(index)` for a block whose columns belong to image `index` alone.
     pub image: Option<usize>,
     pub hessian: Vec<f64>,
+    /// Full-data gradient.
     pub gradient: Vec<f64>,
+    /// Gradient over the Hessian rows.
+    pub hessian_gradient: Vec<f64>,
+    /// Exact diagonal of the data Hessian over all active samples.
+    pub full_diagonal: Vec<f64>,
 }
 
 impl BlockAcc {
@@ -115,6 +122,8 @@ impl BlockAcc {
             image: None,
             hessian: vec![0.0; n * n],
             gradient: vec![0.0; n],
+            hessian_gradient: vec![0.0; n],
+            full_diagonal: vec![0.0; n],
         }
     }
 
@@ -125,6 +134,8 @@ impl BlockAcc {
     pub fn reset(&mut self) {
         self.hessian.fill(0.0);
         self.gradient.fill(0.0);
+        self.hessian_gradient.fill(0.0);
+        self.full_diagonal.fill(0.0);
     }
 }
 
@@ -217,10 +228,16 @@ pub(crate) struct ResidualSample {
     pub residual: [f64; 3],
 }
 
+pub(crate) struct HessianRow {
+    pub columns: Vec<(u32, [f64; 3])>,
+    pub weight: f64,
+}
+
 pub(crate) struct PassOutput {
     pub cost: f64,
     pub rss: f64,
-    pub gradient: Vec<f64>,
+    /// RSS over the rows that contribute to the block Hessians.
+    pub hessian_rss: f64,
     pub contributor_rss: Vec<f64>,
     pub contributor_weight: Vec<f64>,
     pub contributor_pairs: Vec<Vec<(f64, f64)>>,
@@ -229,8 +246,11 @@ pub(crate) struct PassOutput {
     pub image_weight: Vec<f64>,
     pub per_image_gradient: Vec<Vec<f64>>,
     pub residual_samples: Vec<ResidualSample>,
+    /// Full-data residual gradient.
+    pub residual_gradient: Vec<f64>,
     pub active_samples: usize,
     pub hessian_rows: usize,
+    pub coupled_rows: Vec<HessianRow>,
 }
 
 struct LikelihoodScale {
@@ -337,10 +357,11 @@ impl Problem {
                         out_rgb[index].map(|value| value as f64),
                     )));
                 // Neutrality is an input property (docs/02 §4.1 stage 1), taken at the prior nuisance.
+                let hint_scale = libm::pow(2.0, image.exposure_hint.clamp(-8.0, 8.0));
                 let scene = image.transform.mul_vec([
-                    in_rgb[index][0] as f64 * libm::pow(2.0, image.exposure_hint.clamp(-8.0, 8.0)),
-                    in_rgb[index][1] as f64 * libm::pow(2.0, image.exposure_hint.clamp(-8.0, 8.0)),
-                    in_rgb[index][2] as f64 * libm::pow(2.0, image.exposure_hint.clamp(-8.0, 8.0)),
+                    in_rgb[index][0] as f64 * hint_scale,
+                    in_rgb[index][1] as f64 * hint_scale,
+                    in_rgb[index][2] as f64 * hint_scale,
                 ]);
                 let neutral = looklab_model::LookInput::new(looklab_color::Xyz::from_array(scene))
                     .c_in
@@ -448,19 +469,26 @@ impl Problem {
     }
 
     pub fn look_and_slope(&self, params: &Params) -> (Look, [f64; TONE_COEFS]) {
-        let look = params.look();
+        (params.look(), self.tone_slope(params))
+    }
+
+    pub(crate) fn realized_look(&self, params: &Params, index: usize) -> Look {
+        let base = params.look();
+        self.effective_look(params, &base, index).into_owned()
+    }
+
+    fn tone_slope(&self, params: &Params) -> [f64; TONE_COEFS] {
         let mut slope = [0.0_f64; TONE_COEFS];
         for (k, value) in slope.iter_mut().enumerate() {
             *value = softplus_slope(params.theta[self.layout.tone_beta.start + k]);
         }
-        (look, slope)
+        slope
     }
 
-    pub fn effective_look(&self, params: &Params, index: usize) -> Look {
-        let base = params.look();
+    fn effective_look<'a>(&self, params: &Params, base: &'a Look, index: usize) -> Cow<'a, Look> {
         let terms = &self.terms[index];
         if terms.is_empty() {
-            return base;
+            return Cow::Borrowed(base);
         }
         let mut delta = Delta::default();
         for term in terms {
@@ -469,7 +497,10 @@ impl Problem {
                 delta.add(layer, term.feature, value * term.phi);
             }
         }
-        delta.apply(&base).unwrap_or(base)
+        match delta.apply(base) {
+            Ok(realized) => Cow::Owned(realized),
+            Err(_) => Cow::Borrowed(base),
+        }
     }
 
     pub fn image_ctx(&self, params: &Params, index: usize) -> ImageCtx {
@@ -536,18 +567,46 @@ impl Problem {
         neutral_only: bool,
         intents: IntentFilter,
     ) -> PassOutput {
-        let (_, slope) = self.look_and_slope(params);
-        let looks: Vec<Look> = (0..self.images.len())
-            .map(|index| self.effective_look(params, index))
+        self.pass_with_rows(
+            params, active, blocks, want_residuals, want_per_image, neutral_only, intents, false, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn pass_with_rows(
+        &self,
+        params: &Params,
+        active: ActiveColumns,
+        blocks: &mut [BlockAcc],
+        want_residuals: bool,
+        want_per_image: bool,
+        neutral_only: bool,
+        intents: IntentFilter,
+        retain_rows: bool,
+        all_rows: bool,
+    ) -> PassOutput {
+        let base = params.look();
+        let slope = self.tone_slope(params);
+        let looks: Vec<Cow<'_, Look>> = (0..self.images.len())
+            .map(|index| self.effective_look(params, &base, index))
             .collect();
         let clip_k = params.clip_k();
         let clip_slope = params.clip_slope();
         let total = self.layout.total;
+        let mut retained_columns = vec![false; if retain_rows { total } else { 0 }];
+        if retain_rows {
+            for block in blocks.iter().filter(|block| block.kind != BlockKind::Residual) {
+                for &global in &block.params {
+                    retained_columns[global] = true;
+                }
+            }
+        }
         let wants_residual_block = blocks.iter().any(|block| block.kind == BlockKind::Residual);
+        let needs_jacobian = !blocks.is_empty() || want_per_image;
         let mut output = PassOutput {
             cost: 0.0,
             rss: 0.0,
-            gradient: vec![0.0_f64; total],
+            hessian_rss: 0.0,
             contributor_rss: vec![0.0_f64; self.contributors.len()],
             contributor_weight: vec![0.0_f64; self.contributors.len()],
             contributor_pairs: vec![Vec::new(); self.contributors.len()],
@@ -571,6 +630,12 @@ impl Problem {
             } else {
                 Vec::new()
             },
+            residual_gradient: if wants_residual_block {
+                vec![0.0_f64; RESIDUAL_COEFS]
+            } else {
+                Vec::new()
+            },
+            coupled_rows: if retain_rows { Vec::with_capacity(self.hessian.len()) } else { Vec::new() },
             active_samples: 0,
             hessian_rows: 0,
         };
@@ -600,6 +665,8 @@ impl Problem {
         let hessian_set = &self.hessian_set;
         let mut block_buffers: Vec<HessianBuffer> =
             blocks.iter().map(|_| HessianBuffer::default()).collect();
+        let mut column_terms: Vec<f64> = Vec::new();
+        let mut column_norms: Vec<f64> = Vec::new();
 
         for (index, sample) in self.samples.iter().enumerate() {
             if neutral_only && !sample.neutral {
@@ -610,17 +677,17 @@ impl Problem {
             if !intents.includes(image_entry.intent) {
                 continue;
             }
-            let is_hessian = hessian_set[index];
+            let is_hessian = all_rows || hessian_set[index];
             let (context, columns) = &contexts[image];
+            let look: &Look = &looks[image];
             let terms: &[ResponseTerm] = if active.response {
                 &self.terms[image]
             } else {
                 &[]
             };
-            let needs_jacobian = is_hessian || want_per_image;
             let (prediction, evaluated) = if needs_jacobian {
                 let evaluated = evaluate_sample(
-                    &looks[image],
+                    look,
                     &self.layout,
                     context,
                     columns,
@@ -634,7 +701,7 @@ impl Problem {
                 (evaluated.prediction, Some(evaluated))
             } else {
                 (
-                    crate::predict::predict_only(&looks[image], context, sample.rgb, clip_k),
+                    crate::predict::predict_only(look, context, sample.rgb, clip_k),
                     None,
                 )
             };
@@ -664,15 +731,83 @@ impl Problem {
                 output.residuals[index] = residual;
             }
             let contribution = weight * alpha;
+            if retain_rows && is_hessian {
+                output.coupled_rows.push(HessianRow {
+                    columns: jac.cols.iter().zip(&jac.derivs)
+                        .filter(|(column, _)| retained_columns[**column as usize])
+                        .map(|(column, derivative)| (*column, *derivative))
+                        .collect(),
+                    weight: contribution,
+                });
+            }
             output.rss += contribution * squared;
+            if is_hessian {
+                output.hessian_rss += contribution * squared;
+            }
             if evaluated.is_some() {
-                for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
-                    let term = derivative[0] * residual[0]
-                        + derivative[1] * residual[1]
-                        + derivative[2] * residual[2];
-                    output.gradient[*column as usize] += contribution * term;
-                    if want_per_image {
+                column_terms.clear();
+                column_norms.clear();
+                for derivative in &jac.derivs {
+                    column_terms.push(
+                        derivative[0] * residual[0]
+                            + derivative[1] * residual[1]
+                            + derivative[2] * residual[2],
+                    );
+                    column_norms.push(
+                        derivative[0] * derivative[0]
+                            + derivative[1] * derivative[1]
+                            + derivative[2] * derivative[2],
+                    );
+                }
+                if want_per_image {
+                    for (column, term) in jac.cols.iter().zip(column_terms.iter()) {
                         output.per_image_gradient[image][*column as usize] += contribution * term;
+                    }
+                }
+                if is_hessian {
+                    for buffer in &mut block_buffers {
+                        buffer.columns.clear();
+                    }
+                }
+                for (slot, block) in blocks.iter_mut().enumerate() {
+                    if block.image.is_some_and(|other| other != image) {
+                        continue;
+                    }
+                    let buffer = &mut block_buffers[slot];
+                    for (column_index, (column, derivative)) in
+                        jac.cols.iter().zip(jac.derivs.iter()).enumerate()
+                    {
+                        let local = block.local[*column as usize];
+                        if local == u32::MAX {
+                            continue;
+                        }
+                        block.gradient[local as usize] += contribution * column_terms[column_index];
+                        block.full_diagonal[local as usize] +=
+                            contribution * column_norms[column_index];
+                        if is_hessian {
+                            buffer.columns.push((local, *derivative));
+                        }
+                    }
+                }
+            }
+
+            if wants_residual_block {
+                let evaluated = evaluated
+                    .as_ref()
+                    .expect("every active sample carries the Jacobian");
+                let mut clip_residual = [0.0_f64; 3];
+                for (channel, value) in clip_residual.iter_mut().enumerate() {
+                    let mut gradient = 0.0;
+                    for row in 0..3 {
+                        gradient += evaluated.clip_jacobian.0[row][channel] * residual[row];
+                    }
+                    *value = gradient;
+                }
+                for (m, node) in evaluated.residual_indices.iter().enumerate() {
+                    let weight = evaluated.residual_weights[m];
+                    for channel in 0..3 {
+                        output.residual_gradient[*node * 3 + channel] -=
+                            contribution * weight * clip_residual[channel];
                     }
                 }
             }
@@ -686,20 +821,13 @@ impl Problem {
                 }
                 let n = block.len();
                 let entry = &mut block_buffers[slot];
-                entry.columns.clear();
-                for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
-                    let local = block.local[*column as usize];
-                    if local != u32::MAX {
-                        entry.columns.push((local, *derivative));
-                    }
-                }
                 if entry.columns.is_empty() {
                     continue;
                 }
                 if entry.mirror.resolve(&block.hessian, n) {
                     accumulate_block::<true>(
                         &mut block.hessian,
-                        &mut block.gradient,
+                        &mut block.hessian_gradient,
                         n,
                         &entry.columns,
                         contribution,
@@ -708,7 +836,7 @@ impl Problem {
                 } else {
                     accumulate_block::<false>(
                         &mut block.hessian,
-                        &mut block.gradient,
+                        &mut block.hessian_gradient,
                         n,
                         &entry.columns,
                         contribution,

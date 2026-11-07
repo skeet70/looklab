@@ -30,6 +30,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "patch"
+path = "fuzz_targets/patch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "raw_decode"
 path = "fuzz_targets/raw_decode.rs"
 test = false

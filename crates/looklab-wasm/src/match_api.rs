@@ -3,14 +3,15 @@
 
 use looklab_color::Mat3;
 use looklab_match::{
-    ControlCovariance, Emphasis, FitObservedOptions, MatchModel, MatchOptions, Permalink,
-    PermalinkSources, Plan, PreparedTarget, ScaleFitter, TargetSpec, VerifyRequest, optimize,
-    settings_card, verify_once,
+    Calibration, ControlCovariance, Emphasis, FitObservedOptions, MatchModel, MatchOptions,
+    Permalink, PermalinkSources, Plan, PreparedTarget, ScaleFitter, TargetSpec,
+    measure_target_error, optimize, settings_card,
 };
 use looklab_model::file::LookDocument;
-use looklab_model::realization::{ControlResponseModel, decode_crm};
+use looklab_model::realization::decode_crm;
 use looklab_model::{ProbeSet, ProbeSetVersion};
-use looklab_schema::ControlSchema;
+use looklab_publish::ExcludedSim;
+use looklab_schema::{ControlSchema, SimKey};
 use serde::{Deserialize, Serialize};
 
 use crate::dto::{CardDto, DeltaStatsDto, MatchReply, StatsDto, SuggestionDto, VerifyReply};
@@ -21,27 +22,40 @@ pub const TRANSFORM_FORMAT: &str = "looklab-transform/1";
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceNames {
     pub target_look: Option<String>,
-    pub base_look: Option<String>,
     pub body: Option<String>,
-    pub crm: Option<String>,
     pub transform: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimSources {
+    pub base: Option<String>,
+    pub crm: Option<String>,
     pub covariance: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SimInputs {
+    pub sim: SimKey,
+    pub base_look: Vec<u8>,
+    pub crm: Vec<u8>,
+    pub covariance: Option<Vec<u8>>,
+    pub sources: SimSources,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MatchInputs {
     pub target_look: Vec<u8>,
-    pub base_look: Option<Vec<u8>>,
+    pub sims: Vec<SimInputs>,
+    pub excluded: Vec<ExcludedSim>,
     pub body_yaml: String,
-    pub crm: Vec<u8>,
     pub transform_yaml: Option<String>,
-    pub covariance: Option<Vec<u8>>,
     pub emphasis: String,
     pub epoch: u32,
     pub input_transform_version: u32,
     pub realization_version: u32,
     pub seed: u64,
     pub sources: SourceNames,
+    pub calibration: Calibration,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -55,36 +69,28 @@ pub struct VerifyRequestMessage {
     pub observed_blobs: Vec<Vec<u8>>,
 }
 
+struct LoadedSim {
+    input: SimInputs,
+    base: LookDocument,
+    model: MatchModel,
+}
+
 struct Case {
     target: LookDocument,
-    base: LookDocument,
     schema: ControlSchema,
-    crm: ControlResponseModel,
-    transform: Mat3,
-    covariance: Option<ControlCovariance>,
     emphasis: Emphasis,
     probes: ProbeSet,
     options: MatchOptions,
     sources: SourceNames,
     inputs: MatchInputs,
+    sims: Vec<LoadedSim>,
 }
 
 impl Case {
     fn new(inputs: &MatchInputs) -> Result<Self, FacadeError> {
         let target = LookDocument::decode(&inputs.target_look)?;
-        let base = match &inputs.base_look {
-            Some(bytes) => LookDocument::decode(bytes)?,
-            None => target.clone(),
-        };
         let schema = looklab_schema::validate_control_schema(&inputs.body_yaml)
             .map_err(FacadeError::Schema)?;
-        let crm = decode_crm(&inputs.crm)?;
-        if crm.epoch != inputs.epoch {
-            return Err(FacadeError::Input(format!(
-                "control-response model is for epoch {}, not {}",
-                crm.epoch, inputs.epoch
-            )));
-        }
         if target.file.probe_set != ProbeSetVersion::V1 {
             return Err(FacadeError::Input("unsupported probe set".to_owned()));
         }
@@ -92,19 +98,45 @@ impl Case {
             Some(yaml) => parse_transform(yaml)?,
             None => Mat3::IDENTITY,
         };
-        let covariance = match &inputs.covariance {
-            Some(bytes) => Some(ControlCovariance::from_json(bytes)?),
-            None => None,
-        };
         let emphasis = Emphasis::parse(&inputs.emphasis)
             .ok_or_else(|| FacadeError::Input(format!("unknown emphasis {}", inputs.emphasis)))?;
+        let mut sims = Vec::with_capacity(inputs.sims.len());
+        for input in &inputs.sims {
+            let base = LookDocument::decode(&input.base_look)?;
+            let crm = decode_crm(&input.crm)?;
+            if crm.epoch != inputs.epoch {
+                return Err(FacadeError::Input(format!(
+                    "control-response model for {} is for epoch {}, not {}",
+                    input.sim, crm.epoch, inputs.epoch
+                )));
+            }
+            if crm.base_sim != input.sim {
+                return Err(FacadeError::Input(format!(
+                    "control-response model for {} names base sim {}",
+                    input.sim, crm.base_sim
+                )));
+            }
+            let covariance = match &input.covariance {
+                Some(bytes) => Some(ControlCovariance::from_json(bytes)?),
+                None => None,
+            };
+            let model = MatchModel::new(
+                base.look.clone(),
+                crm,
+                transform,
+                covariance,
+                inputs.input_transform_version,
+                inputs.realization_version,
+            )?;
+            sims.push(LoadedSim {
+                input: input.clone(),
+                base,
+                model,
+            });
+        }
         Ok(Self {
             target,
-            base,
             schema,
-            crm,
-            transform,
-            covariance,
             emphasis,
             probes: looklab_model::probes::v1(),
             options: MatchOptions {
@@ -113,6 +145,7 @@ impl Case {
             },
             sources: inputs.sources.clone(),
             inputs: inputs.clone(),
+            sims,
         })
     }
 
@@ -128,19 +161,29 @@ impl Case {
         })?)
     }
 
-    fn model(&self) -> Result<MatchModel, FacadeError> {
-        Ok(MatchModel::new(
-            self.base.look.clone(),
-            self.crm.clone(),
-            self.transform,
-            self.covariance.clone(),
-            self.inputs.input_transform_version,
-            self.inputs.realization_version,
-        )?)
-    }
-
     fn plan(&self) -> Result<Plan, FacadeError> {
         Ok(Plan::new(&self.schema, self.inputs.epoch)?)
+    }
+
+    fn sim(&self, sim: &SimKey) -> Result<&LoadedSim, FacadeError> {
+        self.sims
+            .iter()
+            .find(|loaded| &loaded.input.sim == sim)
+            .ok_or_else(|| FacadeError::Input(format!("no loaded input for sim {sim}")))
+    }
+
+    fn models(&self, plan: &Plan) -> Result<Vec<MatchModel>, FacadeError> {
+        let sims: Vec<SimKey> = self
+            .sims
+            .iter()
+            .map(|loaded| loaded.input.sim.clone())
+            .collect();
+        self.inputs.calibration.validate(&sims, plan)?;
+        Ok(self
+            .sims
+            .iter()
+            .map(|loaded| self.inputs.calibration.apply(&loaded.model))
+            .collect::<looklab_match::Result<Vec<_>>>()?)
     }
 
     fn epoch_map_version(&self) -> u32 {
@@ -153,16 +196,16 @@ impl Case {
             .unwrap_or(0)
     }
 
-    fn permalink(&self, model: &MatchModel, sim: &looklab_schema::SimKey) -> String {
+    fn permalink(&self, loaded: &LoadedSim, sim: &SimKey, calibration: &Calibration) -> String {
         Permalink {
             target_slug: self.target.file.look.slug.to_string(),
             target_version: self.target.file.look.version.to_string(),
-            base_slug: self.base.file.look.slug.to_string(),
-            base_version: self.base.file.look.version.to_string(),
+            base_slug: loaded.base.file.look.slug.to_string(),
+            base_version: loaded.base.file.look.version.to_string(),
             body: self.schema.body.to_string(),
             epoch: self.inputs.epoch,
             sim: sim.to_string(),
-            crm_version: model.version(),
+            crm_version: loaded.model.version(),
             input_transform_version: self.inputs.input_transform_version,
             realization_params_version: self.inputs.realization_version,
             epoch_map_version: self.epoch_map_version(),
@@ -172,18 +215,19 @@ impl Case {
             seed: self.inputs.seed,
             sources: PermalinkSources {
                 target_look: self.sources.target_look.clone(),
-                base_look: self.sources.base_look.clone(),
+                base_look: loaded.input.sources.base.clone(),
                 body: self.sources.body.clone(),
-                crm: self.sources.crm.clone(),
+                crm: loaded.input.sources.crm.clone(),
                 transform: self.sources.transform.clone(),
-                covariance: self.sources.covariance.clone(),
+                covariance: loaded.input.sources.covariance.clone(),
             },
+            calibration: calibration.clone(),
         }
         .canonical()
     }
 }
 
-/// Runs the optimizer on the published inputs.
+/// Runs the optimizer on every sim the published bundle supplies.
 ///
 /// # Errors
 /// Reports malformed site artifacts, an unsupported probe set or a match with
@@ -192,26 +236,34 @@ pub fn run_match(message: &MatchRequest) -> Result<MatchReply, FacadeError> {
     let case = Case::new(&message.inputs)?;
     let plan = case.plan()?;
     let target = case.target()?;
-    let model = case.model()?;
-    let outcome = optimize(std::slice::from_ref(&model), &target, &plan, &case.options)?;
+    let models = case.models(&plan)?;
+    let outcome = optimize(&models, &target, &plan, &case.options)?;
     let best = outcome
         .results
         .first()
         .ok_or_else(|| FacadeError::Input("no settings suggestion".to_owned()))?;
-    let card = settings_card(&target, &plan, &model, best)?;
-    let realization = model.realize(&best.settings)?;
-    let realization_lut =
-        looklab_publish::bake_lut(&realization.look, |xyz| model.input_xyz(&realization, xyz));
+    let winner_index = case
+        .sims
+        .iter()
+        .position(|loaded| loaded.input.sim == best.sim)
+        .ok_or_else(|| FacadeError::Input(format!("no loaded input for sim {}", best.sim)))?;
+    let winner = &case.sims[winner_index];
+    let winner_model = &models[winner_index];
+    let card = settings_card(&target, &plan, winner_model, best)?;
+    let realization = winner_model.realize(&best.settings)?;
+    let realization_lut = looklab_publish::bake_lut(&realization.look, |xyz| {
+        winner_model.input_xyz(&realization, xyz)
+    });
     Ok(MatchReply {
         target_slug: case.target.file.look.slug.clone(),
         target_version: case.target.file.look.version.clone(),
-        base_slug: case.base.file.look.slug.clone(),
-        base_version: case.base.file.look.version.clone(),
+        base_slug: winner.base.file.look.slug.clone(),
+        base_version: winner.base.file.look.version.clone(),
         body: case.schema.body.clone(),
         epoch: case.inputs.epoch,
         epoch_map_version: case.epoch_map_version(),
-        crm_version: model.version(),
-        permalink: case.permalink(&model, &best.sim),
+        crm_version: winner.model.version(),
+        permalink: case.permalink(winner, &best.sim, &case.inputs.calibration),
         card: CardDto::from_card(&card),
         results: outcome
             .results
@@ -220,6 +272,7 @@ pub fn run_match(message: &MatchRequest) -> Result<MatchReply, FacadeError> {
             .collect(),
         stats: StatsDto::from_outcome(&outcome),
         realization_lut,
+        excluded: case.inputs.excluded.clone(),
     })
 }
 
@@ -231,30 +284,66 @@ pub fn run_verify(message: &VerifyRequestMessage) -> Result<VerifyReply, FacadeE
     let case = Case::new(&message.inputs)?;
     let plan = case.plan()?;
     let target = case.target()?;
-    let model = case.model()?;
+    if case.sims.is_empty() {
+        return Err(FacadeError::Input(
+            "verification needs at least one sim input".to_owned(),
+        ));
+    }
     let observed = decode_observed(&message.observed_blobs)?;
-    let request = VerifyRequest {
-        target: &target,
-        plan: &plan,
-        model: &model,
-        observed: &observed,
-        options: &case.options,
-        fit_options: FitObservedOptions::default(),
-        truth: None,
+    if observed.is_empty() {
+        return Err(looklab_match::MatchError::EmptyObserved.into());
+    }
+    let models = case.models(&plan)?;
+    let first_outcome = optimize(&models, &target, &plan, &case.options)?;
+    let first = first_outcome
+        .results
+        .into_iter()
+        .next()
+        .ok_or_else(|| FacadeError::Input("no settings suggestion".to_owned()))?;
+    let winner_index = case
+        .sims
+        .iter()
+        .position(|loaded| loaded.input.sim == first.sim)
+        .ok_or_else(|| FacadeError::Input(format!("no loaded input for sim {}", first.sim)))?;
+    let winner = &case.sims[winner_index];
+    let (fitted, scales) = ScaleFitter.fit_with_scales(
+        &models[winner_index],
+        &plan,
+        &first.settings,
+        &observed,
+        &FitObservedOptions::default(),
+    )?;
+    let updated = models[winner_index].with_crm(fitted)?;
+    let next_calibration = case.inputs.calibration.merged(&first.sim, &scales)?;
+    let mut updated_models = models;
+    updated_models[winner_index] = updated.clone();
+    let second_outcome = optimize(&updated_models, &target, &plan, &case.options)?;
+    let second = second_outcome
+        .results
+        .into_iter()
+        .next()
+        .ok_or_else(|| FacadeError::Input("no settings suggestion".to_owned()))?;
+    let second_index = case
+        .sims
+        .iter()
+        .position(|loaded| loaded.input.sim == second.sim)
+        .ok_or_else(|| FacadeError::Input(format!("no loaded input for sim {}", second.sim)))?;
+    let card_model = if second.sim == first.sim {
+        &updated
+    } else {
+        &updated_models[second_index]
     };
-    let outcome = verify_once(&request, &ScaleFitter)?;
-    let card = settings_card(&target, &plan, &outcome.updated, &outcome.second)?;
+    let first_measured = measure_target_error(&target, &winner.model, &first.settings, &observed)?;
+    let card = settings_card(&target, &plan, card_model, &second)?;
+    let next_sim = case.sim(&second.sim)?;
     Ok(VerifyReply {
-        permalink: case.permalink(&model, &outcome.first.sim),
-        first: SuggestionDto::from_suggestion(&outcome.first),
-        second: SuggestionDto::from_suggestion(&outcome.second),
-        first_measured: DeltaStatsDto::from_stats(&outcome.first_measured),
-        second_measured: outcome
-            .second_measured
-            .as_ref()
-            .map(DeltaStatsDto::from_stats),
-        reduction: outcome.reduction,
-        updated_crm_version: outcome.updated.version(),
+        permalink: case.permalink(next_sim, &second.sim, &next_calibration),
+        first: SuggestionDto::from_suggestion(&first),
+        second: SuggestionDto::from_suggestion(&second),
+        first_measured: DeltaStatsDto::from_stats(&first_measured),
+        second_measured: None,
+        reduction: None,
+        updated_crm_version: updated.version(),
         card: CardDto::from_card(&card),
     })
 }
@@ -361,15 +450,32 @@ pub fn encode_verify_request(request: &VerifyRequestMessage) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use looklab_match::synth;
+    use looklab_match::{Calibration, Permalink, synth};
     use looklab_model::Look;
     use looklab_model::file::identity;
-    use looklab_model::realization::encode_crm;
+    use looklab_model::realization::{ControlResponseModel, encode_crm};
+    use looklab_publish::{ExcludedSim, SimExclusion};
     use looklab_schema::SimKey;
 
-    use super::{ControlResponseModel, LookDocument, MatchInputs, MatchRequest, SourceNames};
+    use super::{LookDocument, MatchInputs, MatchRequest, SimInputs, SimSources, SourceNames};
 
-    fn request(look: Look, crm: &ControlResponseModel) -> (MatchRequest, LookDocument) {
+    fn sim_input(look: Look, crm: &ControlResponseModel) -> SimInputs {
+        let sim = crm.base_sim.as_str();
+        let document = LookDocument::from_look(
+            identity(&format!("base-{sim}"), "1.0.0").expect("identity"),
+            look,
+        )
+        .expect("document");
+        SimInputs {
+            sim: crm.base_sim.clone(),
+            base_look: document.encode().expect("encode look"),
+            crm: encode_crm(crm).expect("encode CRM"),
+            covariance: None,
+            sources: SimSources::default(),
+        }
+    }
+
+    fn request(look: Look, sims: Vec<SimInputs>) -> (MatchRequest, LookDocument) {
         let document = LookDocument::from_look(
             identity("preview-regression", "1.0.0").expect("identity"),
             look,
@@ -378,17 +484,17 @@ mod tests {
         let request = MatchRequest {
             inputs: MatchInputs {
                 target_look: document.encode().expect("encode look"),
-                base_look: None,
+                sims,
+                excluded: Vec::new(),
                 body_yaml: synth::SYNTH_SCHEMA.to_owned(),
-                crm: encode_crm(crm).expect("encode CRM"),
                 transform_yaml: None,
-                covariance: None,
                 emphasis: "balanced".to_owned(),
                 epoch: 1,
                 input_transform_version: 1,
                 realization_version: 1,
                 seed: 7,
                 sources: SourceNames::default(),
+                calibration: Calibration::default(),
             },
         };
         (request, document)
@@ -417,7 +523,10 @@ mod tests {
         for step in &mut crm.exposure.steps {
             step.ev_per_step = 0.0;
         }
-        let (request, document) = request(Look::colorimetric(), &crm);
+        let (request, document) = request(
+            Look::colorimetric(),
+            vec![sim_input(Look::colorimetric(), &crm)],
+        );
         let reply = crate::run_match(&request).expect("match");
         assert_finite_bounded_lut(&reply.realization_lut);
         assert_eq!(
@@ -429,8 +538,146 @@ mod tests {
     #[test]
     fn nontrivial_realization_lut_is_finite_and_bounded_across_the_full_shaped_grid() {
         let body = synth::body(9).expect("synthetic body");
-        let (request, _) = request(body.model.base_look, &body.model.crm);
+        let (request, _) = request(
+            body.model.base_look.clone(),
+            vec![sim_input(body.model.base_look, &body.model.crm)],
+        );
         let reply = crate::run_match(&request).expect("match");
         assert_finite_bounded_lut(&reply.realization_lut);
+    }
+
+    #[test]
+    fn two_sims_rank_the_one_whose_realization_is_the_target() {
+        let provia = SimKey::new("provia").expect("sim");
+        let classic = synth::body(9).expect("synthetic body");
+        let provia_body = synth::body_for_sim(10, &provia).expect("synthetic body");
+        let mut request = request(
+            provia_body.model.base_look.clone(),
+            vec![
+                sim_input(classic.model.base_look.clone(), &classic.model.crm),
+                sim_input(provia_body.model.base_look.clone(), &provia_body.model.crm),
+            ],
+        )
+        .0;
+        request.inputs.excluded = vec![ExcludedSim {
+            sim: SimKey::new("eterna").expect("sim"),
+            reason: SimExclusion::NoPublishedLook,
+        }];
+        let reply = crate::run_match(&request).expect("match");
+        let best = reply.results.first().expect("a suggestion");
+        assert_eq!(best.sim.as_str(), "provia");
+        assert_eq!(reply.card.sim.as_str(), "provia");
+        assert!(best.median_delta_e < 0.05, "median {}", best.median_delta_e);
+        assert_eq!(reply.stats.sims_considered, 2);
+        assert_eq!(reply.excluded[0].sim.as_str(), "eterna");
+    }
+
+    fn verify_replay(
+        request: &MatchRequest,
+        observed: &looklab_samples::SampleSet,
+    ) -> super::VerifyReply {
+        let blob = looklab_samples::encode(observed).expect("encode samples");
+        crate::run_verify(&crate::VerifyRequestMessage {
+            inputs: request.inputs.clone(),
+            observed_blobs: vec![blob],
+        })
+        .expect("verify")
+    }
+
+    #[test]
+    fn verification_fits_the_settings_the_full_bundle_showed() {
+        let provia = SimKey::new("provia").expect("sim");
+        let classic = synth::body(9).expect("synthetic body");
+        let provia_body = synth::body_for_sim(10, &provia).expect("synthetic body");
+        let (request, _) = request(
+            provia_body.model.base_look.clone(),
+            vec![
+                sim_input(classic.model.base_look.clone(), &classic.model.crm),
+                sim_input(provia_body.model.base_look.clone(), &provia_body.model.crm),
+            ],
+        );
+        let reply = crate::run_match(&request).expect("match");
+        let shown = reply.results.first().expect("a suggestion").clone();
+        assert_eq!(shown.sim, provia);
+        assert_ne!(request.inputs.sims[0].sim, shown.sim);
+        assert_eq!(request.inputs.sims[1].sim, shown.sim);
+        let observed = synth::observed(&provia_body.model, &shown.settings, &synth::probes(), 300)
+            .expect("observed");
+        let verified = verify_replay(&request, &observed);
+        assert_eq!(verified.first.sim, shown.sim);
+        assert_eq!(verified.first.settings, shown.settings);
+        assert!(verified.first_measured.count > 0);
+    }
+
+    #[test]
+    fn verification_keeps_the_single_sim_settings() {
+        let body = synth::body(9).expect("synthetic body");
+        let (request, _) = request(
+            body.model.base_look.clone(),
+            vec![sim_input(body.model.base_look.clone(), &body.model.crm)],
+        );
+        let reply = crate::run_match(&request).expect("match");
+        let shown = reply.results.first().expect("a suggestion").clone();
+        let observed =
+            synth::observed(&body.model, &shown.settings, &synth::probes(), 200).expect("observed");
+        let verified = verify_replay(&request, &observed);
+        assert_eq!(verified.first.sim, shown.sim);
+        assert_eq!(verified.first.settings, shown.settings);
+    }
+
+    #[test]
+    fn verification_persists_calibration_when_the_winner_changes() {
+        let plan = synth::plan();
+        let first_sim = SimKey::new("classic_chrome").expect("sim");
+        let second_sim = SimKey::new("provia").expect("sim");
+        let first_body = synth::body_for_sim(9, &first_sim).expect("synthetic body");
+        let second_body = synth::body_for_sim(9, &second_sim).expect("synthetic body");
+        let target_look = first_body
+            .model
+            .realize(&first_body.settings)
+            .expect("target realization")
+            .look;
+        let (request, _) = request(
+            target_look,
+            vec![
+                sim_input(first_body.model.base_look.clone(), &first_body.model.crm),
+                sim_input(second_body.model.base_look.clone(), &second_body.model.crm),
+            ],
+        );
+        let matched = crate::run_match(&request).expect("match");
+        let shown = matched.results.first().expect("a suggestion").clone();
+        let observed = synth::observed(&first_body.model, &plan.default, &synth::probes(), 200)
+            .expect("observed at defaults");
+        let blob = looklab_samples::encode(&observed).expect("encode samples");
+        let verified = crate::run_verify(&crate::VerifyRequestMessage {
+            inputs: request.inputs.clone(),
+            observed_blobs: vec![blob.clone()],
+        })
+        .expect("verify");
+        assert_eq!(verified.first.sim, shown.sim);
+        assert_eq!(verified.first.settings, shown.settings);
+        assert_ne!(verified.second.sim, verified.first.sim);
+
+        let next = Permalink::parse(&verified.permalink).expect("next permalink");
+        assert!(!next.calibration.is_empty());
+        assert_eq!(next.sim, verified.second.sim.to_string());
+        let mut reloaded = request.inputs.clone();
+        reloaded.calibration = next.calibration;
+        let replay = crate::run_match(&crate::MatchRequest {
+            inputs: reloaded.clone(),
+        })
+        .expect("replay");
+        let replayed = replay.results.first().expect("a suggestion");
+        assert_eq!(replayed.sim, verified.second.sim);
+        assert_eq!(replayed.settings, verified.second.settings);
+        assert_eq!(replay.permalink, verified.permalink);
+
+        let round_two = crate::run_verify(&crate::VerifyRequestMessage {
+            inputs: reloaded,
+            observed_blobs: vec![blob],
+        })
+        .expect("verify again");
+        assert_eq!(round_two.first.sim, verified.second.sim);
+        assert_eq!(round_two.first.settings, verified.second.settings);
     }
 }

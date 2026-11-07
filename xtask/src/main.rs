@@ -261,12 +261,7 @@ fn spdx() -> Result<()> {
     let root = workspace_root()?;
     let mut checked = 0usize;
     let mut missing = Vec::new();
-    for dir in ["crates", "xtask", "fuzz"] {
-        let dir = root.join(dir);
-        if dir.is_dir() {
-            collect_rs(&dir, &mut checked, &mut missing)?;
-        }
-    }
+    collect_rs(&root, &mut checked, &mut missing)?;
     if !missing.is_empty() {
         let list = missing
             .iter()
@@ -286,7 +281,9 @@ fn collect_rs(dir: &Path, checked: &mut usize, missing: &mut Vec<PathBuf>) -> Re
     for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let path = entry?.path();
         if path.is_dir() {
-            if path.file_name().is_some_and(|name| name == "target") {
+            if let Some(name) = path.file_name().and_then(|name| name.to_str())
+                && (name == "target" || name == ".git" || name.starts_with("target-"))
+            {
                 continue;
             }
             collect_rs(&path, checked, missing)?;

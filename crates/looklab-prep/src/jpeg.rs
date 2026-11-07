@@ -8,8 +8,10 @@ use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
 
+use looklab_meta::Orientation;
+
 use crate::error::PrepError;
-use crate::image::Image3;
+use crate::image::{Image3, LinearPixels, orientation_size, orientation_source};
 
 /// The decoded JPEG in its own primaries, still in stored orientation.
 #[derive(Clone, Debug, PartialEq)]
@@ -22,39 +24,152 @@ pub struct DecodedJpeg {
     pub code_values_near_clip: Vec<bool>,
 }
 
-impl DecodedJpeg {
-    pub fn apply_orientation(&self, orientation: looklab_meta::Orientation) -> DecodedJpeg {
-        let (out_width, out_height) =
-            crate::image::orientation_size(self.image.width, self.image.height, orientation);
-        let last_x = self.image.width - 1;
-        let last_y = self.image.height - 1;
-        let mut flags = vec![false; usize::try_from(out_width * out_height).expect("fits usize")];
-        for y in 0..out_height {
-            for x in 0..out_width {
-                let (source_x, source_y) =
-                    crate::image::orientation_source(x, y, last_x, last_y, orientation);
-                let source = usize::try_from(source_y).expect("row fits usize")
-                    * usize::try_from(self.image.width).expect("width fits usize")
-                    + usize::try_from(source_x).expect("column fits usize");
-                flags[usize::try_from(y).expect("row fits usize")
-                    * usize::try_from(out_width).expect("width fits usize")
-                    + usize::try_from(x).expect("column fits usize")] = self
-                    .code_values_near_clip
-                    .get(source)
-                    .copied()
-                    .expect("flags match the image");
-            }
-        }
-        DecodedJpeg {
-            image: self.image.apply_orientation(orientation),
-            space: self.space,
-            space_assumed: self.space_assumed,
-            code_values_near_clip: flags,
-        }
+impl LinearPixels for DecodedJpeg {
+    fn width(&self) -> u32 {
+        self.image.width
+    }
+
+    fn height(&self) -> u32 {
+        self.image.height
+    }
+
+    fn pixel(&self, x: u32, y: u32) -> Option<[f32; 3]> {
+        Image3::pixel(&self.image, x, y)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.image.data.is_empty()
+    }
+
+    fn sample_bilinear(&self, x: f64, y: f64) -> Option<[f32; 3]> {
+        Image3::sample_bilinear(&self.image, x, y)
+    }
+
+    fn downsample_area(&self, max_pixels: u32) -> Image3 {
+        Image3::downsample_area(&self.image, max_pixels)
     }
 }
 
-pub fn decode_jpeg(bytes: &[u8]) -> Result<DecodedJpeg, PrepError> {
+/// A JPEG that can be sampled and tested for near-clipped code values.
+pub(crate) trait JpegPixels: LinearPixels {
+    fn space(&self) -> OutputSpace;
+    fn near_clip(&self, x: u32, y: u32) -> bool;
+}
+
+impl JpegPixels for DecodedJpeg {
+    fn space(&self) -> OutputSpace {
+        self.space
+    }
+
+    fn near_clip(&self, x: u32, y: u32) -> bool {
+        if x >= self.image.width || y >= self.image.height {
+            return false;
+        }
+        let index = usize::try_from(y).expect("row fits usize")
+            * usize::try_from(self.image.width).expect("width fits usize")
+            + usize::try_from(x).expect("column fits usize");
+        self.code_values_near_clip
+            .get(index)
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
+/// Decoded RGB8 codes with a per-space linear table.
+pub(crate) struct JpegPlane {
+    width: u32,
+    height: u32,
+    oriented_width: u32,
+    oriented_height: u32,
+    data: Vec<u8>,
+    lut: [f32; 256],
+    orientation: Orientation,
+    space: OutputSpace,
+    space_assumed: bool,
+}
+
+impl JpegPlane {
+    pub(crate) fn orient(mut self, orientation: Orientation) -> Self {
+        let (width, height) = orientation_size(self.width, self.height, orientation);
+        self.oriented_width = width;
+        self.oriented_height = height;
+        self.orientation = orientation;
+        self
+    }
+
+    fn source(&self, x: u32, y: u32) -> Option<(u32, u32)> {
+        if x >= self.oriented_width || y >= self.oriented_height {
+            return None;
+        }
+        Some(orientation_source(
+            x,
+            y,
+            self.width - 1,
+            self.height - 1,
+            self.orientation,
+        ))
+    }
+}
+
+impl LinearPixels for JpegPlane {
+    fn width(&self) -> u32 {
+        self.oriented_width
+    }
+
+    fn height(&self) -> u32 {
+        self.oriented_height
+    }
+
+    fn pixel(&self, x: u32, y: u32) -> Option<[f32; 3]> {
+        let (source_x, source_y) = self.source(x, y)?;
+        let base = (usize::try_from(source_y).ok()? * usize::try_from(self.width).ok()?
+            + usize::try_from(source_x).ok()?)
+            * 3;
+        let codes = self.data.get(base..base + 3)?;
+        Some([
+            self.lut[usize::from(codes[0])],
+            self.lut[usize::from(codes[1])],
+            self.lut[usize::from(codes[2])],
+        ])
+    }
+
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
+impl JpegPixels for JpegPlane {
+    fn space(&self) -> OutputSpace {
+        self.space
+    }
+
+    fn near_clip(&self, x: u32, y: u32) -> bool {
+        let Some((source_x, source_y)) = self.source(x, y) else {
+            return false;
+        };
+        let base = (usize::try_from(source_y).expect("row fits usize")
+            * usize::try_from(self.width).expect("width fits usize")
+            + usize::try_from(source_x).expect("column fits usize"))
+            * 3;
+        self.data
+            .get(base..base + 3)
+            .is_some_and(|codes| codes.iter().any(|&value| value >= 250 || value <= 2))
+    }
+}
+
+fn rgb_space(space: OutputSpace) -> RgbSpace {
+    match space {
+        OutputSpace::Srgb => RgbSpace::Srgb,
+        OutputSpace::AdobeRgb => RgbSpace::AdobeRgb,
+    }
+}
+
+fn linear_lut(space: OutputSpace) -> [f32; 256] {
+    let rgb_space = rgb_space(space);
+    std::array::from_fn(|code| rgb_space.decode(f64::from(code as u8) / 255.0) as f32)
+}
+
+pub(crate) fn decode_jpeg_plane(bytes: &[u8]) -> Result<JpegPlane, PrepError> {
     let options = DecoderOptions::default()
         .jpeg_set_out_colorspace(ColorSpace::RGB)
         .set_use_unsafe(false);
@@ -79,31 +194,44 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<DecodedJpeg, PrepError> {
     }
 
     let (space, space_assumed) = detect_space(bytes);
-    let rgb_space = match space {
-        OutputSpace::Srgb => RgbSpace::Srgb,
-        OutputSpace::AdobeRgb => RgbSpace::AdobeRgb,
-    };
-    let (chunks, remainder) = pixels.as_chunks::<3>();
-    if !remainder.is_empty() {
-        return Err(PrepError::JpegStructure("decoded sample count mismatch"));
-    }
+    Ok(JpegPlane {
+        width,
+        height,
+        oriented_width: width,
+        oriented_height: height,
+        data: pixels,
+        lut: linear_lut(space),
+        orientation: Orientation::Normal,
+        space,
+        space_assumed,
+    })
+}
+
+pub fn decode_jpeg(bytes: &[u8]) -> Result<DecodedJpeg, PrepError> {
+    let plane = decode_jpeg_plane(bytes)?;
+    let count = usize::try_from(plane.width)
+        .ok()
+        .and_then(|w| {
+            usize::try_from(plane.height)
+                .ok()
+                .and_then(|h| w.checked_mul(h))
+        })
+        .ok_or(PrepError::ImageTooLarge)?;
     let mut data = Vec::with_capacity(count);
     let mut code_values_near_clip = Vec::with_capacity(count);
-    for codes in chunks {
+    for codes in plane.data.chunks_exact(3) {
         code_values_near_clip.push(codes.iter().any(|&value| value >= 250 || value <= 2));
-        let mut linear = [0.0_f32; 3];
-        for channel in 0..3 {
-            let encoded = f64::from(codes[channel]) / 255.0;
-            let encoded = encoded.clamp(0.0, 1.0);
-            linear[channel] = rgb_space.decode(encoded) as f32;
-        }
-        data.push(linear);
+        data.push([
+            plane.lut[usize::from(codes[0])],
+            plane.lut[usize::from(codes[1])],
+            plane.lut[usize::from(codes[2])],
+        ]);
     }
 
     Ok(DecodedJpeg {
-        image: Image3::new(width, height, data)?,
-        space,
-        space_assumed,
+        image: Image3::new(plane.width, plane.height, data)?,
+        space: plane.space,
+        space_assumed: plane.space_assumed,
         code_values_near_clip,
     })
 }

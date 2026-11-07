@@ -2,13 +2,12 @@
 //! Published-version uncertainty: image bootstrap, leave-one-body-out disagreement, and support (docs/02 §5).
 
 use looklab_color::RgbSpace;
+use looklab_model::realization::ControlResponseModel;
 use looklab_model::{Look, LookInput};
 use looklab_samples::OutputSpace;
 
 use crate::hierarchical::BodyGroup;
-use crate::model_error::{
-    MODEL_HUE_BINS, MODEL_S_BINS, ModelErrorField, estimate_model_error, region,
-};
+use crate::model_error::{ModelErrorField, estimate_model_error};
 use crate::problem::Xorshift;
 use crate::types::{
     Density, FitImage, FitOptions, FitResult, ImageIntent, PreviousSupport, ProbeEstimate,
@@ -103,8 +102,13 @@ fn covariance(rows: &[Vec<looklab_color::ucs::Ucs>]) -> Vec<Cov3> {
     out
 }
 
-fn refit(_look: &Look, images: &[FitImage], options: &FitOptions) -> Result<FitResult> {
-    crate::fit::run_quick(images, options, None)
+fn refit(
+    _look: &Look,
+    images: &[FitImage],
+    options: &FitOptions,
+    model: Option<&ControlResponseModel>,
+) -> Result<FitResult> {
+    crate::fit::run_quick(images, options, None, model)
 }
 
 /// `Σ_fit` is the bootstrap covariance when available, else the sandwich; `Σ_total` adds the leave-one-body-out disagreement.
@@ -119,6 +123,7 @@ pub fn published_uncertainty(
     bootstrap: &BootstrapOptions,
     clip_k: f64,
     previous: Option<&PreviousSupport>,
+    model: Option<&ControlResponseModel>,
 ) -> Result<PublishedUncertainty> {
     let space = images.first().map_or(RgbSpace::Srgb, |image| {
         space_of(image.samples.header().output_space)
@@ -142,7 +147,7 @@ pub fn published_uncertainty(
         if sample.is_empty() {
             continue;
         }
-        let result = refit(look, &sample, options)?;
+        let result = refit(look, &sample, options, model)?;
         bootstrap_rows.push(predictions(&result.look));
     }
     let boot = covariance(&bootstrap_rows);
@@ -160,7 +165,7 @@ pub fn published_uncertainty(
             if kept.is_empty() {
                 continue;
             }
-            let result = refit(look, &kept, options)?;
+            let result = refit(look, &kept, options, model)?;
             leave_one_out_rows.push(predictions(&result.look));
         }
     }
@@ -191,40 +196,17 @@ pub fn published_uncertainty(
     };
 
     let probes_v1 = looklab_model::probes::v1();
-    let mut reference_sums = vec![0.0_f64; MODEL_HUE_BINS * MODEL_S_BINS];
-    let mut reference_counts = vec![0.0_f64; MODEL_HUE_BINS * MODEL_S_BINS];
-    for (index, probe) in probes_v1.probes.iter().enumerate() {
-        let fit = fit_covariance.get(index).copied().unwrap_or([[0.0; 3]; 3]);
-        let extra = disagreement.get(index).copied().unwrap_or([[0.0; 3]; 3]);
-        let variance = (0..3)
-            .map(|channel| fit[channel][channel] + extra[channel][channel])
-            .sum::<f64>();
-        let input = LookInput::new(probe.xyz);
-        let bin = region(input.s, input.h_in);
-        reference_sums[bin] += variance;
-        reference_counts[bin] += 1.0;
-    }
-    let reference_variance: Vec<f64> = reference_sums
-        .iter()
-        .zip(reference_counts.iter())
-        .map(|(sum, count)| if *count > 0.0 { sum / count } else { 0.0 })
-        .collect();
-    let model = estimate_model_error(images, groups, &reference_variance, options, clip_k)?;
+    let model = estimate_model_error(images, groups, model, options, clip_k)?;
 
     let mut probes = Vec::with_capacity(probes_v1.probes.len());
-    let mut supported = 0usize;
     for (index, probe) in probes_v1.probes.iter().enumerate() {
         let fit = fit_covariance.get(index).copied().unwrap_or([[0.0; 3]; 3]);
         let extra = disagreement.get(index).copied().unwrap_or([[0.0; 3]; 3]);
-        let model_variance = model.at(LookInput::new(probe.xyz).s, LookInput::new(probe.xyz).h_in);
         let mut covariance = [[0.0_f64; 3]; 3];
         for a in 0..3 {
             for b in 0..3 {
                 covariance[a][b] = fit[a][b] + extra[a][b];
             }
-        }
-        for (channel, row) in covariance.iter_mut().enumerate() {
-            row[channel] += model_variance / 3.0;
         }
         let sigma_de = (covariance[0][0] + covariance[1][1] + covariance[2][2])
             .max(0.0)
@@ -245,7 +227,6 @@ pub fn published_uncertainty(
                 post_covariance[a][b] = sum;
             }
         }
-        crate::uncertainty::floor_post_covariance(&covariance, &mut post_covariance);
         let post_sigma_de = (post_covariance[0][0] + post_covariance[1][1] + post_covariance[2][2])
             .max(0.0)
             .sqrt();
@@ -258,25 +239,6 @@ pub fn published_uncertainty(
             .probes
             .get(index)
             .map_or(0.0, |estimate| estimate.bias_de);
-        let previous_sigma = previous
-            .and_then(|state| state.sigma.get(index).copied())
-            .unwrap_or(false);
-        let previous_bias = previous
-            .and_then(|state| state.bias.get(index).copied())
-            .unwrap_or(false);
-        let flags = crate::uncertainty::mark_support(
-            post_sigma_de,
-            bias_de,
-            local_density,
-            clusters,
-            density.floor,
-            previous_sigma,
-            previous_bias,
-            options,
-        );
-        if flags.all() {
-            supported += 1;
-        }
         probes.push(ProbeEstimate {
             id_hint: index,
             ucs: prediction,
@@ -286,29 +248,39 @@ pub fn published_uncertainty(
             post_covariance,
             post_sigma_de,
             bias_de,
-            pre_clip_reliable: crate::predict::clip_derivative_min(prediction, space, clip_k)
-                >= 0.25,
+            pre_clip_reliable: false,
             gamut_edge: probe.id.as_str().split('-').nth(2) == Some("80"),
             density: local_density,
-            supported_sigma: flags.sigma,
-            supported_density: flags.density,
-            supported_clusters: flags.clusters,
-            supported_bias: flags.bias,
-            supported: flags.all(),
+            supported_sigma: false,
+            supported_density: false,
+            supported_clusters: false,
+            supported_bias: false,
+            supported_evidence: false,
+            supported: false,
             clusters,
         });
     }
-    let fraction = supported as f64 / probes.len().max(1) as f64;
+    let mut published = ProbeUncertainty {
+        probes,
+        ids: probes_v1
+            .probes
+            .iter()
+            .map(|probe| probe.id.clone())
+            .collect(),
+        supported_fraction: 0.0,
+    };
+    crate::model_error::apply_model_error(
+        &mut published,
+        &model,
+        look,
+        density,
+        space,
+        options,
+        clip_k,
+        previous,
+    );
     Ok(PublishedUncertainty {
-        probes: ProbeUncertainty {
-            probes,
-            ids: probes_v1
-                .probes
-                .iter()
-                .map(|probe| probe.id.clone())
-                .collect(),
-            supported_fraction: fraction,
-        },
+        probes: published,
         fit_method,
         fit_covariance,
         disagreement,

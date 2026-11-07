@@ -4,8 +4,9 @@
 mod common;
 
 use looklab_samples::{
-    BlobKind, Error, Field, InputSpace, OutputSpace, PatchId, PatchRow, PatchTable,
-    PatchTableHeader, PrepVersion, decode_patch_table, encode_patch_table,
+    BlobKind, DECOMPRESS_HEADROOM, Error, Field, InputSpace, MAX_WINDOW_BYTES, OutputSpace,
+    PATCH_MAGIC, PATCH_ROW_BYTES, PATCH_VERSION, PatchId, PatchRow, PatchTable, PatchTableHeader,
+    PrepVersion, decode_patch_table, encode_patch_table,
 };
 
 use common::{compress, container};
@@ -177,4 +178,66 @@ fn trailing_bytes_after_a_patch_frame_are_rejected() {
         decode_patch_table(&bytes),
         Err(Error::TrailingBodyBytes)
     ));
+}
+
+#[test]
+fn a_patch_header_over_the_limit_is_rejected() {
+    let mut bytes = encode_patch_table(&table(vec![row(1, 0.1)])).expect("encodes");
+    bytes[8..12].copy_from_slice(&5000u32.to_le_bytes());
+    assert!(matches!(
+        decode_patch_table(&bytes),
+        Err(Error::HeaderTooLong { len: 5000, .. })
+    ));
+}
+
+#[test]
+fn a_patch_header_length_of_u32_max_is_rejected_before_the_offset_arithmetic() {
+    let mut bytes = encode_patch_table(&table(vec![row(1, 0.1)])).expect("encodes");
+    bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(matches!(
+        decode_patch_table(&bytes),
+        Err(Error::HeaderTooLong { len: u32::MAX, .. })
+    ));
+}
+
+#[test]
+fn a_patch_zip_bomb_is_capped_before_allocation() {
+    let bomb = vec![0u8; 4 << 20];
+    let bytes = container(
+        PATCH_MAGIC,
+        PATCH_VERSION,
+        &header_bytes(1),
+        &compress(&bomb),
+    );
+    match decode_patch_table(&bytes) {
+        Err(Error::BodySizeMismatch { actual, expected }) => {
+            assert_eq!(expected, PATCH_ROW_BYTES);
+            assert_eq!(actual, PATCH_ROW_BYTES + DECOMPRESS_HEADROOM);
+        }
+        other => panic!("expected BodySizeMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_oversized_patch_zstd_window_is_rejected_before_decoding() {
+    let body = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 24u8 << 3];
+    let bytes = container(PATCH_MAGIC, PATCH_VERSION, &header_bytes(1), &body);
+    match decode_patch_table(&bytes) {
+        Err(Error::WindowTooLarge { window, max }) => {
+            assert_eq!(window, 1u64 << 34);
+            assert_eq!(max, MAX_WINDOW_BYTES);
+        }
+        other => panic!("expected WindowTooLarge, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_committed_patch_fuzz_seed_decodes() {
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fuzz/corpus/patch/seed_patch_table"
+    ))
+    .expect("the fuzz seed is committed");
+    let table = decode_patch_table(&bytes).expect("the committed seed is a version 1 blob");
+    assert_eq!(table.rows().len(), 3);
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -10,9 +11,10 @@ use looklab_model::file::{
 use looklab_model::{LookDocument, emulation_matches_camera_rendering};
 use looklab_publish::{
     ArtifactBlob, ArtifactHash, ArtifactName, AuditEntry, AuditEvent, AuditLog, BodyExtras,
-    BodyPage, Decision, LookListing, LookPage, LookRef, LookStatus, LookVersionPage, ProposalRef,
-    Role, Scene, SceneName, SiteData, SitePath, SiteSink, SplitKind, Timestamp, VersionNotes,
-    VersionRef, compare_versions, write_site,
+    BodyPage, ConformanceEntry, Decision, LookListing, LookPage, LookRef, LookStatus,
+    LookVersionPage, ProposalRef, Role, SCENE_SOURCE_INDEX, Scene, SiteData, SitePath, SiteSink,
+    SplitKind, Timestamp, VersionNotes, VersionRef, compare_versions, read_scene_sources,
+    test_chart_scenes, write_conformance_pack, write_site,
 };
 use looklab_server::admin::{self, ListingState, LookListingRecord, ManifestArtifact};
 use looklab_upload::LookSlug;
@@ -31,7 +33,32 @@ pub struct PublishConfig {
     pub db: PathBuf,
     pub blobs: PathBuf,
     pub data: PathBuf,
+    /// Body input transforms, one `<make>-<model>.yaml` per body.
+    pub transforms: PathBuf,
     pub out: PathBuf,
+}
+
+/// Hidden inside the output directory so every publisher of the same tree shares it.
+const OUT_LOCK_FILE: &str = ".looklab-publish.lock";
+
+/// An exclusive hold on one output directory, released when dropped.
+#[derive(Debug)]
+pub struct OutputLock {
+    _file: File,
+}
+
+impl OutputLock {
+    fn acquire(out: &Path) -> Result<Self> {
+        std::fs::create_dir_all(out)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(out.join(OUT_LOCK_FILE))?;
+        file.lock()?;
+        Ok(Self { _file: file })
+    }
 }
 
 impl PublishConfig {
@@ -40,8 +67,20 @@ impl PublishConfig {
             db: config.db.clone(),
             blobs: config.blobs.clone(),
             data: config.data.clone(),
+            transforms: config.transforms.clone(),
             out: config.site.clone(),
         }
+    }
+
+    /// Blocks while another publisher of `out` holds it.
+    pub fn lock_output(&self) -> Result<OutputLock> {
+        OutputLock::acquire(&self.out)
+    }
+
+    /// Waits on the blocking pool so a queued publisher leaves the executor free.
+    pub(crate) async fn lock_output_async(&self) -> Result<OutputLock> {
+        let out = self.out.clone();
+        tokio::task::spawn_blocking(move || OutputLock::acquire(&out)).await?
     }
 }
 
@@ -60,10 +99,21 @@ pub async fn publish_with_pool(
     pool: &SqlitePool,
     config: &PublishConfig,
 ) -> Result<PublishSummary> {
+    let lock = config.lock_output_async().await?;
+    publish_with_pool_locked(pool, config, &lock).await
+}
+
+pub(crate) async fn publish_with_pool_locked(
+    pool: &SqlitePool,
+    config: &PublishConfig,
+    _lock: &OutputLock,
+) -> Result<PublishSummary> {
     let site = site_data(pool, config).await?;
+    let conformance = conformance_entries(&config.data.join("card/conformance-v1"))?;
     let mut sink = DirSink::new(&config.out);
     let root = write_site(&mut sink, &site)?;
     prune_unlisted(&config.out, &site)?;
+    write_conformance_pack(&mut sink, &conformance)?;
     write_site_root(&config.out, root.as_str())?;
     Ok(PublishSummary {
         root: root.as_str().to_owned(),
@@ -71,12 +121,51 @@ pub async fn publish_with_pool(
     })
 }
 
+fn conformance_entries(root: &Path) -> Result<Vec<ConformanceEntry>> {
+    let mut entries = Vec::new();
+    collect_conformance(root, root, &mut entries)?;
+    Ok(entries)
+}
+
+fn collect_conformance(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<ConformanceEntry>,
+) -> Result<()> {
+    let mut paths = std::fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort();
+    for path in paths {
+        let kind = std::fs::symlink_metadata(&path)?.file_type();
+        if kind.is_dir() {
+            collect_conformance(root, &path, entries)?;
+        } else if kind.is_file() {
+            let relative = path.strip_prefix(root).map_err(|_| {
+                WorkerError::Data(format!(
+                    "{} is outside the conformance tree",
+                    path.display()
+                ))
+            })?;
+            let name = relative
+                .to_str()
+                .ok_or_else(|| WorkerError::Data(format!("{} is not UTF-8", relative.display())))?;
+            entries.push(ConformanceEntry {
+                path: SitePath::new(name)?,
+                bytes: std::fs::read(&path)?,
+            });
+        } else {
+            return Err(WorkerError::Data(format!(
+                "{} is not a regular conformance file",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn write_site_root(out: &Path, root: &str) -> Result<PathBuf> {
-    let parent = match out.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => out,
-    };
-    let path = parent.join("site-root.txt");
+    let path = out.join("site-root.txt");
     std::fs::write(&path, format!("{root}\n"))?;
     Ok(path)
 }
@@ -171,11 +260,12 @@ async fn supersede_looks(
 }
 
 async fn site_data(pool: &SqlitePool, config: &PublishConfig) -> Result<SiteData> {
+    let resources = DataDir::new(&config.data).bodies()?;
     let mut bodies = Vec::new();
-    for resources in DataDir::new(&config.data).bodies()? {
+    for entry in &resources {
         bodies.push(BodyPage::from_schema(
-            &resources.body,
-            &resources.schema,
+            &entry.body,
+            &entry.schema,
             &BodyExtras::default(),
         )?);
     }
@@ -302,144 +392,27 @@ async fn site_data(pool: &SqlitePool, config: &PublishConfig) -> Result<SiteData
         bodies,
         looks,
         audit_log: audit_log(pool).await?,
-        scenes: canonical_scenes(),
+        scenes: canonical_scenes(config)?,
         reference_preview: None,
     })
 }
 
 const SCENE_SIZE: u32 = 128;
 
-/// Neutral/hue gradient, hue wheel and memory-colour patches in scene-linear
-/// D65 XYZ (docs/03 §5).
-fn canonical_scenes() -> Vec<Scene> {
-    vec![gradient_scene(), hue_wheel_scene(), patches_scene()]
-}
-
-fn gradient_scene() -> Scene {
-    let colours = [
-        [0.82, 0.18, 0.16],
-        [0.88, 0.55, 0.18],
-        [0.86, 0.82, 0.24],
-        [0.28, 0.62, 0.30],
-        [0.22, 0.44, 0.78],
-        [0.48, 0.28, 0.66],
-    ];
-    let mut xyz = Vec::with_capacity((SCENE_SIZE * SCENE_SIZE) as usize);
-    for y in 0..SCENE_SIZE {
-        let v = f64::from(y) / f64::from(SCENE_SIZE - 1);
-        for x in 0..SCENE_SIZE {
-            let u = f64::from(x) / f64::from(SCENE_SIZE - 1);
-            let encoded = if u < 0.5 {
-                let level = 0.002 + (u / 0.5);
-                [level, level, level]
-            } else {
-                let band =
-                    (((u - 0.5) * colours.len() as f64).floor() as usize).min(colours.len() - 1);
-                let shade = 0.10 + 0.90 * (1.0 - v);
-                [
-                    colours[band][0] * shade,
-                    colours[band][1] * shade,
-                    colours[band][2] * shade,
-                ]
-            };
-            xyz.push(encoded_xyz(encoded));
-        }
+/// Photo scenes prepared under `<data>/scenes`, then the test charts.
+fn canonical_scenes(config: &PublishConfig) -> Result<Vec<Scene>> {
+    let sources = config.data.join("scenes");
+    let mut scenes = Vec::new();
+    if sources.join(SCENE_SOURCE_INDEX).is_file() {
+        scenes.extend(read_scene_sources(&sources)?);
+    } else {
+        tracing::warn!(
+            path = %sources.display(),
+            "no prepared photo scenes; publishing test charts only"
+        );
     }
-    Scene::new(
-        SceneName::new("gradient").expect("scene name"),
-        SCENE_SIZE,
-        SCENE_SIZE,
-        xyz,
-    )
-    .expect("gradient scene")
-}
-
-fn hue_wheel_scene() -> Scene {
-    let mut xyz = Vec::with_capacity((SCENE_SIZE * SCENE_SIZE) as usize);
-    let centre = f64::from(SCENE_SIZE - 1) / 2.0;
-    for y in 0..SCENE_SIZE {
-        for x in 0..SCENE_SIZE {
-            let dx = f64::from(x) - centre;
-            let dy = f64::from(y) - centre;
-            let distance = (dx * dx + dy * dy).sqrt() / centre;
-            let angle = dy.atan2(dx);
-            let hue = (angle / (2.0 * core::f64::consts::PI)).rem_euclid(1.0);
-            let saturation = distance.clamp(0.0, 1.0);
-            let value = 1.0 - 0.55 * saturation;
-            xyz.push(encoded_xyz(hsv(hue, saturation, value)));
-        }
-    }
-    Scene::new(
-        SceneName::new("hue-wheel").expect("scene name"),
-        SCENE_SIZE,
-        SCENE_SIZE,
-        xyz,
-    )
-    .expect("hue wheel scene")
-}
-
-fn patches_scene() -> Scene {
-    let patches = [
-        [0.91, 0.76, 0.66],
-        [0.55, 0.36, 0.26],
-        [0.22, 0.42, 0.16],
-        [0.44, 0.66, 0.92],
-        [0.18, 0.18, 0.18],
-        [0.92, 0.92, 0.92],
-        [0.04, 0.04, 0.04],
-        [0.78, 0.12, 0.10],
-        [0.16, 0.60, 0.22],
-        [0.12, 0.32, 0.78],
-        [0.96, 0.72, 0.28],
-        [0.10, 0.09, 0.12],
-    ];
-    let cols = 4_u32;
-    let rows = 3_u32;
-    let mut xyz = Vec::with_capacity((SCENE_SIZE * SCENE_SIZE) as usize);
-    for y in 0..SCENE_SIZE {
-        let row = (y * rows / SCENE_SIZE).min(rows - 1) as usize;
-        let v = f64::from(y % (SCENE_SIZE / rows)) / f64::from(SCENE_SIZE / rows);
-        for x in 0..SCENE_SIZE {
-            let col = (x * cols / SCENE_SIZE).min(cols - 1) as usize;
-            let patch = patches[(row * cols as usize + col).min(patches.len() - 1)];
-            let shade = 0.72 + 0.28 * v;
-            xyz.push(encoded_xyz([
-                patch[0] * shade,
-                patch[1] * shade,
-                patch[2] * shade,
-            ]));
-        }
-    }
-    Scene::new(
-        SceneName::new("patches").expect("scene name"),
-        SCENE_SIZE,
-        SCENE_SIZE,
-        xyz,
-    )
-    .expect("patches scene")
-}
-
-fn encoded_xyz(encoded: [f64; 3]) -> [f32; 3] {
-    let xyz = looklab_color::RgbSpace::Srgb
-        .rgb_encoded_to_xyz(looklab_color::Rgb::new(encoded[0], encoded[1], encoded[2]));
-    [xyz.x as f32, xyz.y as f32, xyz.z as f32]
-}
-
-fn hsv(h: f64, s: f64, v: f64) -> [f64; 3] {
-    let h6 = h * 6.0;
-    let i = h6.floor();
-    let f = h6 - i;
-    let p = v * (1.0 - s);
-    let q = v * (1.0 - s * f);
-    let t = v * (1.0 - s * (1.0 - f));
-    match (i as i64).rem_euclid(6) {
-        0 => [v, t, p],
-        1 => [q, v, p],
-        2 => [p, v, t],
-        3 => [p, q, v],
-        4 => [t, p, v],
-        _ => [v, p, q],
-    }
+    scenes.extend(test_chart_scenes(SCENE_SIZE)?);
+    Ok(scenes)
 }
 
 fn load_blobs(config: &PublishConfig, artifacts: &[ManifestArtifact]) -> Result<Vec<ArtifactBlob>> {

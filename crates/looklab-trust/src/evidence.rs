@@ -73,6 +73,26 @@ impl EvidenceGrid {
         self.counts.iter().sum()
     }
 
+    /// Counts added as whole weights are exact, so a union minus one image reproduces
+    /// that image's leave-one-out grid.
+    pub fn subtract(&mut self, other: &EvidenceGrid) -> Result<()> {
+        if self.bins() != other.bins() {
+            return Err(TrustError::InvalidShare);
+        }
+        if self
+            .counts
+            .iter()
+            .zip(&other.counts)
+            .any(|(count, remove)| *count < *remove)
+        {
+            return Err(TrustError::InvalidShare);
+        }
+        for (count, remove) in self.counts.iter_mut().zip(&other.counts) {
+            *count -= remove;
+        }
+        Ok(())
+    }
+
     pub fn bins(&self) -> (usize, usize, usize) {
         (self.s_bins, self.hue_bins, self.chroma_bins)
     }

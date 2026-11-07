@@ -8,7 +8,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::File;
 
 use crate::{
-    base::site_url,
+    base::{publication_url, site_url},
     data,
     ui::{DeltaE, Disclosure, DropZone, EmptyState, Notice, NoticeKind, closeness_level},
 };
@@ -57,7 +57,9 @@ fn ConformanceDownload() -> impl IntoView {
     spawn_local(async move {
         let result = async {
             let response =
-                gloo_net::http::Request::get(&site_url("/data/developers/conformance-v1.json"))
+                gloo_net::http::Request::get(&publication_url(
+                    "/data/developers/conformance-v1.json",
+                ))
                     .send()
                     .await
                     .map_err(|error| error.to_string())?;
@@ -88,7 +90,7 @@ fn ConformanceDownload() -> impl IntoView {
                     </a>
                 }.into_any(),
                 data::Load::Ready(download) => view! {
-                    <a href=site_url(&format!("/{}", download.archive.as_str())) download="looklab-conformance-v1.zip">
+                    <a href=publication_url(&format!("/{}", download.archive.as_str())) download="looklab-conformance-v1.zip">
                         <strong>"Download conformance vectors"</strong>
                         <span>"ZIP: valid and malformed cards, grid outputs and render tags"</span>
                     </a>

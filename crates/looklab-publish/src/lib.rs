@@ -4,10 +4,16 @@
 
 mod audit;
 mod body;
+mod conformance;
 mod hash;
 mod manifest;
+mod match_bundle;
+#[cfg(feature = "photo-scenes")]
+pub mod photo;
 mod preview;
 mod scene;
+#[cfg(feature = "scene-sources")]
+mod scene_sources;
 mod site;
 
 pub use audit::{
@@ -20,18 +26,32 @@ pub use body::{
     InputTransformPage, MappingStatus, NativeLookCard, NativeSimPage, RealizationNote,
     SolvePlanStepPage, ToleratedPage, TransformSource,
 };
+pub use conformance::{
+    CONFORMANCE_ARCHIVE_PATH, CONFORMANCE_METADATA_PATH, ConformanceArchive, ConformanceEntry,
+    build_conformance_archive, write_conformance_pack,
+};
 pub use hash::{ArtifactHash, ArtifactName, SitePath};
 pub use manifest::{
     ArtifactBlob, ArtifactEntry, BodyUse, CARD_ARTIFACT, DOCUMENT_ARTIFACT, GateCheck, GateSummary,
     HashMismatch, LookArtifact, LookStatus, PREVIEW_LUT_ARTIFACT, ProvenanceSummary,
     VersionManifest, verify_artifact,
 };
+pub use match_bundle::{
+    ExcludedSim, MATCH_BUNDLE_FORMAT, MatchBundle, MatchBundleFormat, MatchSim, SimArtifacts,
+    SimExclusion, body_artifact, bundle_artifact, sim_artifacts, transform_artifact,
+};
 pub use preview::{
     LUT_BYTES, LUT_SIZE, PREVIEW_HIGH_EV, PREVIEW_LOW_EV, PREVIEW_PIVOT, PreparedScene, bake_lut,
     bake_preview_lut, preview_shaper, preview_unshaper, render_preview,
 };
 pub use scene::{
-    SCENE_FORMAT, Scene, SceneArtifact, SceneCredit, SceneIndex, SceneKind, SceneName, SceneSummary,
+    SCENE_FORMAT, Scene, SceneArtifact, SceneCredit, SceneIndex, SceneKind, SceneName,
+    SceneSummary, test_chart_scenes,
+};
+#[cfg(feature = "scene-sources")]
+pub use scene_sources::{
+    SCENE_SOURCE_FORMAT, SCENE_SOURCE_INDEX, SceneSource, SceneSourceIndex, read_scene_sources,
+    write_scene_sources,
 };
 pub use site::{
     AUDIT_LOG_PATH, BodySummary, INDEX_PATH, LicensePage, LookListing, LookPage, LookSummary,
@@ -45,12 +65,16 @@ pub use site::{
 pub enum PublishError {
     #[error("invalid path `{0}`")]
     Path(String),
+    #[error("match bundle: {0}")]
+    MatchBundle(String),
     #[error("invalid artifact hash `{0}`")]
     Hash(String),
     #[error("look `{look}` version `{version}` has no artifacts")]
     NoArtifacts { look: String, version: String },
     #[error("artifact `{0}` appears twice")]
     DuplicateArtifact(String),
+    #[error("conformance archive: {0}")]
+    Conformance(String),
     #[error("body `{body}` does not match schema body `{schema}`")]
     BodyMismatch { body: String, schema: String },
     #[error("body `{0}` appears twice")]
@@ -65,6 +89,10 @@ pub enum PublishError {
     DuplicateScene(String),
     #[error("scene dimensions do not match the sample count")]
     SceneDimensions,
+    #[error("chart scene size {0} is not in 3..=1600")]
+    ChartSize(u32),
+    #[error("scene sources: {0}")]
+    SceneSources(String),
     #[error("scene contains a value that is not finite")]
     SceneValue,
     #[error("invalid prepared scene bytes")]

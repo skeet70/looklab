@@ -2,14 +2,71 @@
 //! Local file reading and download ([docs/06 §7](../../../docs/06-privacy-and-payload.md)).
 
 use js_sys::Uint8Array;
+use looklab_prep::{FileKind, LocalImageKey};
+use looklab_wasm::MetadataFile;
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Blob, BlobPropertyBag, HtmlAnchorElement, HtmlInputElement, Url};
+use web_sys::{Blob, BlobPropertyBag, File, HtmlAnchorElement, Url};
 
-#[derive(Clone, Debug, PartialEq)]
+/// A selected file, backed by the browser's `File` or a stored draft `Blob`.
+#[derive(Clone)]
 pub struct LocalFile {
-    pub name: String,
-    pub bytes: Vec<u8>,
+    name: String,
+    blob: Blob,
+    size: u64,
+}
+
+impl LocalFile {
+    fn from_file(file: File) -> Self {
+        let name = file.name();
+        let blob: Blob = file.unchecked_into();
+        let size = blob.size() as u64;
+        Self { name, blob, size }
+    }
+
+    fn from_blob(name: String, blob: Blob) -> Self {
+        let size = blob.size() as u64;
+        Self { name, blob, size }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn is_jpeg(&self) -> bool {
+        LocalImageKey::new(&self.name).is_some_and(|key| key.kind() == FileKind::Jpeg)
+    }
+
+    /// # Errors
+    /// Reports a file the browser cannot read.
+    pub async fn bytes(&self) -> Result<Vec<u8>, String> {
+        let buffer = JsFuture::from(self.blob.array_buffer())
+            .await
+            .map_err(|error| format!("{}: {error:?}", self.name))?;
+        Ok(Uint8Array::new(&buffer).to_vec())
+    }
+
+    fn blob(&self) -> &Blob {
+        &self.blob
+    }
+}
+
+pub(crate) fn selected_files(selected: Vec<File>) -> Vec<LocalFile> {
+    selected.into_iter().map(LocalFile::from_file).collect()
+}
+
+/// One file's bytes are live at a time.
+pub(crate) async fn scan_metadata(files: &[LocalFile]) -> Result<Vec<MetadataFile>, String> {
+    let mut scanned = Vec::with_capacity(files.len());
+    for file in files {
+        let bytes = file.bytes().await?;
+        scanned.push(MetadataFile::new(file.name.clone(), &bytes));
+    }
+    Ok(scanned)
 }
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -50,8 +107,10 @@ export class ContributionDraftStore {
             let value;
             if (request) request.onsuccess = () => { value = request.result; };
             transaction.oncomplete = () => resolve(value);
-            transaction.onerror = () => reject(transaction.error);
-            transaction.onabort = () => reject(transaction.error);
+            transaction.onerror = () => {
+                try { transaction.abort(); } catch {}
+            };
+            transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB transaction aborted"));
         });
     }
     cancelPending() {
@@ -61,10 +120,12 @@ export class ContributionDraftStore {
     }
     replaceFiles(files) {
         this.cancelPending();
-        return this.enqueue(() => this.transaction("readwrite", store => {
-            store.clear();
-            for (const [key, bytes] of files) store.put(bytes, ["file", key]);
-        }));
+        return this.enqueue(async () => {
+            await this.transaction("readwrite", store => store.clear());
+            return this.transaction("readwrite", store => {
+                for (const [key, file] of files) store.put(file, ["file", key]);
+            });
+        });
     }
     schedule(text) {
         const revision = ++this.revision;
@@ -137,7 +198,7 @@ pub(crate) fn draft_file_entries(
                 u32::try_from(index).map_err(|_| "Too many files for a local draft.".to_owned())?;
             let entry = js_sys::Array::new();
             entry.push(&JsValue::from(key));
-            entry.push(&Uint8Array::from(file.bytes.as_slice()));
+            entry.push(&JsValue::from(file.blob().clone()));
             entries.push(&entry);
             Ok(DraftFile {
                 name: file.name.clone(),
@@ -152,47 +213,28 @@ pub(crate) async fn read_draft_file(
     pending: js_sys::Promise,
     file: &DraftFile,
 ) -> Result<LocalFile, String> {
-    let bytes = JsFuture::from(pending)
+    let value = JsFuture::from(pending)
         .await
         .map_err(|error| format!("{error:?}"))?;
-    if bytes.is_undefined() {
+    if value.is_undefined() || value.is_null() {
         return Err(
             "The local draft's files are no longer available. Add your originals again.".to_owned(),
         );
     }
-    Ok(LocalFile {
-        name: file.name.clone(),
-        bytes: Uint8Array::new(&bytes).to_vec(),
-    })
-}
-
-/// # Errors
-/// Reports a file the browser cannot read.
-pub async fn read_input(input: &HtmlInputElement) -> Result<Vec<LocalFile>, String> {
-    let Some(list) = input.files() else {
-        return Ok(Vec::new());
+    let blob = if value.is_instance_of::<Blob>() {
+        value.unchecked_into::<Blob>()
+    } else {
+        let bytes = value
+            .dyn_into::<Uint8Array>()
+            .map_err(|_| "The local draft's files are no longer available.".to_owned())?;
+        let parts = js_sys::Array::new();
+        parts.push(&JsValue::from(bytes));
+        let options = BlobPropertyBag::new();
+        options.set_type("application/octet-stream");
+        Blob::new_with_u8_array_sequence_and_options(&parts, &options)
+            .map_err(|error| format!("{error:?}"))?
     };
-    read_files(
-        (0..list.length())
-            .filter_map(|index| list.get(index))
-            .collect(),
-    )
-    .await
-}
-
-pub(crate) async fn read_files(selected: Vec<web_sys::File>) -> Result<Vec<LocalFile>, String> {
-    let mut files = Vec::with_capacity(selected.len());
-    for file in selected {
-        let buffer = JsFuture::from(file.array_buffer())
-            .await
-            .map_err(|error| format!("{}: {error:?}", file.name()))?;
-        let bytes = Uint8Array::new(&buffer).to_vec();
-        files.push(LocalFile {
-            name: file.name(),
-            bytes,
-        });
-    }
-    Ok(files)
+    Ok(LocalFile::from_blob(file.name.clone(), blob))
 }
 
 /// # Errors

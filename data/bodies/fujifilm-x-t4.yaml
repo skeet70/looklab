@@ -34,30 +34,39 @@ epochs:
         makernote: { tag: FilmMode, value: 0x0900 }
       - key: acros
         look: acros
+        monochrome: true
         makernote: { tag: Saturation, value: 0x0500 }
       - key: acros_ye
         look: acros
+        monochrome: true
         makernote: { tag: Saturation, value: 0x0502 }
       - key: acros_r
         look: acros
+        monochrome: true
         makernote: { tag: Saturation, value: 0x0501 }
       - key: acros_g
         look: acros
+        monochrome: true
         makernote: { tag: Saturation, value: 0x0503 }
       - key: monochrome
         look: monochrome
+        monochrome: true
         makernote: { tag: Saturation, value: 0x0300 }
       - key: monochrome_ye
         look: monochrome
+        monochrome: true
         makernote: { tag: Saturation, value: 0x0302 }
       - key: monochrome_r
         look: monochrome
+        monochrome: true
         makernote: { tag: Saturation, value: 0x0301 }
       - key: monochrome_g
         look: monochrome
+        monochrome: true
         makernote: { tag: Saturation, value: 0x0303 }
       - key: sepia
         look: sepia
+        monochrome: true
         makernote: { tag: Saturation, value: 0x0310 }
     exposure_modes:
       - key: dr100

@@ -2,5 +2,7 @@ artifacts/
 coverage/
 corpus/decode/*
 !corpus/decode/seed_*
+corpus/patch/*
+!corpus/patch/seed_*
 corpus/raw_decode/*
 !corpus/raw_decode/seed_*

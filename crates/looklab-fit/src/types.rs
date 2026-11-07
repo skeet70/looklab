@@ -14,6 +14,8 @@ pub enum FitError {
     EmptyImage { image: usize },
     #[error("no samples left after subsampling")]
     NoSamples,
+    #[error("held-out model error has no evidence")]
+    NoModelErrorEvidence,
     #[error("image {image}: sample_trust has {found} entries, expected {expected}")]
     SampleTrustLength {
         image: usize,
@@ -269,6 +271,8 @@ pub struct ProbeEstimate {
     pub supported_density: bool,
     pub supported_clusters: bool,
     pub supported_bias: bool,
+    /// Independent held-out model-error evidence exists at this encoding and cell.
+    pub supported_evidence: bool,
     pub supported: bool,
     /// Images with non-negligible weight in the probe's region.
     pub clusters: usize,
@@ -317,10 +321,33 @@ impl Density {
     }
 }
 
+/// Objective samples charged to the staged solve, including reference initialization and value-only trials.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+pub struct SampleEvaluations(u64);
+
+impl SampleEvaluations {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl core::ops::AddAssign<usize> for SampleEvaluations {
+    fn add_assign(&mut self, rhs: usize) {
+        self.0 += rhs as u64;
+    }
+}
+
+impl core::ops::AddAssign for SampleEvaluations {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Diagnostics {
     pub sweeps: usize,
     pub evaluations: usize,
+    pub sample_evaluations: SampleEvaluations,
     pub final_cost: f64,
     pub sigma_v: Vec<(ContributorId, f64)>,
     pub gcv: StageLambdas,
@@ -348,4 +375,11 @@ pub struct FitResult {
     pub diagnostics: Diagnostics,
     pub control_response: Option<ControlResponseFit>,
     pub excluded: Vec<ExcludedImage>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageScores {
+    pub image_stats: Vec<ImageFitStats>,
+    pub excluded: Vec<ExcludedImage>,
+    pub diagnostics: Diagnostics,
 }

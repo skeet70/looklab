@@ -116,11 +116,8 @@ pub fn run(args: &ExportArgs) -> Result<()> {
 }
 
 fn ensure_matchable(document: &LookDocument) -> Result<()> {
-    if !document.is_matchable() {
-        bail!(
-            "{} is not matchable: its display base is not pinned",
-            document.file.look.slug
-        );
+    if let Some(refusal) = document.match_refusal() {
+        bail!("{} is not matchable: {refusal}", document.file.look.slug);
     }
     Ok(())
 }
@@ -258,7 +255,7 @@ mod tests {
     use super::*;
     use looklab_model::file::{
         BaseField, BaseReference, BaseStatus, DeclaredEncoding, LicenseRecord, LutData,
-        LutDefinition, OutputEncoding,
+        LutDefinition, MatchRefusal, OutputEncoding,
     };
     use looklab_model::{Look, LookIdentity, LookKind, WbPolicy};
 
@@ -296,6 +293,11 @@ mod tests {
 
     #[test]
     fn export_rejects_a_non_matchable_look() {
-        assert!(ensure_matchable(&non_matchable()).is_err());
+        let document = non_matchable();
+        assert_eq!(
+            document.match_refusal(),
+            Some(MatchRefusal::DisplayBaseUnpinned)
+        );
+        assert!(ensure_matchable(&document).is_err());
     }
 }

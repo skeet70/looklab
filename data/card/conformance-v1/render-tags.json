@@ -1,8 +1,8 @@
 [
   {
-    "input": "looklab-card/1 fw=fujifilm-x-t5/1.00 look=conformance-tone@1.0.0 cid=4117568fb39de99c",
+    "input": "looklab-card/1 fw=fujifilm-x-t5/1.00 look=conformance-tone@1.0.0 cid=88edf14868e66098",
     "result": {
-      "cid_prefix": "4117568fb39de99c",
+      "cid_prefix": "88edf14868e66098",
       "firmware_id": "fujifilm-x-t5",
       "firmware_version": "1.00",
       "look_slug": "conformance-tone",
@@ -10,9 +10,9 @@
     }
   },
   {
-    "input": "looklab-card/1 fw=a/0.1+b look=conformance-tone@1.0.0 cid=4117568fb39de99c",
+    "input": "looklab-card/1 fw=a/0.1+b look=conformance-tone@1.0.0 cid=88edf14868e66098",
     "result": {
-      "cid_prefix": "4117568fb39de99c",
+      "cid_prefix": "88edf14868e66098",
       "firmware_id": "a",
       "firmware_version": "0.1+b",
       "look_slug": "conformance-tone",

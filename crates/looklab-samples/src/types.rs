@@ -368,3 +368,45 @@ fn validate_columns(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A coordinate field must fail to compile here before it can ship.
+    #[test]
+    fn a_sample_set_has_no_field_beyond_its_columns() {
+        let set = SampleSet::new(
+            SampleHeader {
+                n: 1,
+                input_space: InputSpace::CameraRgbWbLinear,
+                output_space: OutputSpace::Srgb,
+                wb_multipliers: [1.0; 3],
+                cct_hint_k: 5500.0,
+                exposure_hint_ev: 0.0,
+                rerender_group: None,
+                prep_version: PrepVersion::new(1),
+                prior_transform_version: PriorTransformVersion::new(1),
+                prep_params_hash: PrepParamsHash::new([0; 32]),
+            },
+            vec![[0.5; 3]],
+            vec![[0.5; 3]],
+            vec![1.0],
+            vec![SampleFlags::NONE],
+        )
+        .expect("valid columns");
+
+        let SampleSet {
+            header,
+            in_rgb,
+            out_rgb,
+            density_w,
+            flags,
+        } = set;
+        assert_eq!(header.n, 1);
+        assert_eq!(
+            (in_rgb.len(), out_rgb.len(), density_w.len(), flags.len()),
+            (1, 1, 1, 1)
+        );
+    }
+}

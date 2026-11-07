@@ -37,7 +37,7 @@ JOURNAL_FILE = ".looklab-generation.applying.json"
 SCHEMA = 2
 LANE_DIRECTORIES = {"native": "target", "ui": "target-ui"}
 DEFAULT_NATIVE_COMMANDS = (
-    ("sh", "site/scripts/wasm-assets.sh", "--prep", "--scene"),
+    ("sh", "site/scripts/wasm-assets.sh", "--prep", "--scene", "--match"),
     ("cargo", "test", "--locked", "--workspace", "--features", "looklab-fit/synth"),
 )
 UI_IGNORED_PREFIXES = ("docs/", "LICENSES/", "site/styles/", "site/checks/")

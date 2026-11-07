@@ -53,3 +53,13 @@ of looklab (this repository), as required by LGPL-2.1 section 6.
 libm
 Copyright (c) The Rust Project Developers
 Licensed under either of MIT or Apache-2.0, at your option.
+
+jpeg-encoder, MIT OR Apache-2.0, plus the IJG terms
+Copyright (c) 2021 Volker Ströbel
+
+The forward DCT in jpeg-encoder is ported from mozjpeg and was part of the
+Independent JPEG Group's software: Copyright (C) 1991-1996, Thomas G. Lane;
+libjpeg-turbo modifications Copyright (C) 2015, 2020, D. R. Commander.
+
+This software is based in part on the work of the Independent JPEG Group.
+

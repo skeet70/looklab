@@ -12,7 +12,7 @@ use crate::control::{Control, ControlType, ScalarValue};
 use crate::ids::{ControlKey, SimKey};
 use crate::mapping::MappingError;
 use crate::rational::Rational;
-use crate::schema::{ControlSchema, Epoch};
+use crate::schema::{ControlSchema, Epoch, NativeSim};
 
 /// A tag a control mapping reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +218,23 @@ pub fn settings_from_makernote_partial(
 /// # Errors
 /// No native simulation matches, or several do.
 pub fn sim_from_makernote(epoch: &Epoch, values: &MakernoteValues) -> Result<SimKey, MappingError> {
+    let matches = matching_sims(epoch, values);
+    match matches.as_slice() {
+        [] => Err(MappingError::UnknownSim),
+        [sim] => Ok(sim.key.clone()),
+        _ => Err(MappingError::AmbiguousSim),
+    }
+}
+
+/// An ambiguous match set that includes a monochrome sim counts as monochrome.
+pub fn monochrome_sim(epoch: &Epoch, values: &MakernoteValues) -> Option<SimKey> {
+    matching_sims(epoch, values)
+        .into_iter()
+        .find(|sim| sim.monochrome)
+        .map(|sim| sim.key.clone())
+}
+
+fn matching_sims<'a>(epoch: &'a Epoch, values: &MakernoteValues) -> Vec<&'a NativeSim> {
     let mut matches = Vec::new();
     for sim in &epoch.native_sims {
         let Some(source) = MakernoteSource::from_name(sim.makernote.tag.as_str()) else {
@@ -228,11 +245,7 @@ pub fn sim_from_makernote(epoch: &Epoch, values: &MakernoteValues) -> Result<Sim
             matches.push(sim);
         }
     }
-    match matches.as_slice() {
-        [] => Err(MappingError::UnknownSim),
-        [sim] => Ok(sim.key.clone()),
-        _ => Err(MappingError::AmbiguousSim),
-    }
+    matches
 }
 
 /// The look-affecting controls of `epoch` that a makernote can supply.

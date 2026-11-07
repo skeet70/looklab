@@ -379,6 +379,7 @@ fn a_mapping_applies_into_its_epoch_and_the_document_still_validates() {
             tag: "FilmMode".try_into().expect("tag"),
             value: MakernoteValue(1792),
         },
+        monochrome: false,
     };
     let updated = apply_sim_mapping(schema, 1, &from, None, &sim).expect("applied");
     let parsed = validate_control_schema(&updated).expect("the updated document validates");
@@ -389,7 +390,27 @@ fn a_mapping_applies_into_its_epoch_and_the_document_still_validates() {
         .expect("the new sim");
     assert_eq!(reala.look.as_str(), "reala-ace");
     assert_eq!(reala.makernote.value, MakernoteValue(1792));
-    assert_eq!(parsed.epochs[0].native_sims.len(), 3);
+    assert_eq!(parsed.epochs[0].native_sims.len(), 12);
+}
+
+#[test]
+fn a_native_sim_marks_a_monochrome_render() {
+    let yaml = format!(
+        "{HEADER}    native_sims:\n      - key: acros\n        look: acros\n        makernote: {{ tag: Saturation, value: 0x0500 }}\n        monochrome: true\n      - key: provia\n        look: provia\n        makernote: {{ tag: FilmMode, value: 0x0000 }}\n    exposure_modes: []\n    controls: []\n    solve_plan: []\n"
+    );
+    let schema = validate_control_schema(&yaml).expect("the schema validates");
+    let epoch = &schema.epochs[0];
+    let acros = epoch.native_sim(&"acros".try_into().expect("sim key"));
+    assert!(acros.is_some_and(|sim| sim.monochrome));
+    assert!(
+        epoch
+            .native_sim(&"provia".try_into().expect("sim key"))
+            .is_some_and(|sim| !sim.monochrome)
+    );
+
+    let text = serde_norway::to_string(acros.expect("the acros entry")).expect("serializes");
+    let round_tripped: NativeSim = serde_norway::from_str(&text).expect("round-trips");
+    assert_eq!(&round_tripped, acros.expect("the acros entry"));
 }
 
 #[test]
@@ -403,6 +424,7 @@ fn a_mapping_for_another_firmware_range_is_rejected() {
             tag: "FilmMode".try_into().expect("tag"),
             value: MakernoteValue(1792),
         },
+        monochrome: false,
     };
     let errors = apply_sim_mapping(schema, 1, &from, None, &sim).unwrap_err();
     assert_eq!(errors[0].path, "firmware_from");

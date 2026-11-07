@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Staged Gauss-Newton/Levenberg-Marquardt with block solves and per-stage GCV.
 
-use looklab_model::LookInput;
-use looklab_model::basis::{RESIDUAL_COEFS, S_COEFS, TONE_COEFS};
+use looklab_model::basis::{CORE_TERMS, RESIDUAL_COEFS, S_COEFS, TONE_COEFS, VOLUME_COEFS};
 use looklab_model::realization::{
     ControlResponseModel, ControlValue, LayerKind, ResponseComponent, ResponseParamId,
 };
@@ -10,20 +9,23 @@ use looklab_schema::{Control, ControlDefault, ControlSchema, ScalarValue, Tolera
 
 use crate::basis;
 use crate::density;
-use crate::layout::{BlockKind, Layout, Params};
-use crate::model_error::{MODEL_HUE_BINS, MODEL_S_BINS, estimate_model_error, region};
+use crate::layout::{BlockKind, Layout, NUISANCE_PER_IMAGE, Params};
+use crate::model_error::{apply_model_error, estimate_model_error};
 use crate::outlier;
 use crate::problem::{ActiveColumns, BlockAcc, IntentFilter, PassOutput, Problem, ResidualSample};
 use crate::solve::{factor_in_place, select_lambda, select_lambda_diagonal, solve_in_place};
 use crate::types::{
     ControlResponseFit, Diagnostics, ExcludeReason, ExcludedImage, ExposureOffset, FitImage,
     FitOptions, FitResult, FitState, ImageIntent, ImageNuisances, PreviousSupport,
-    ProbeUncertainty, Realization, Result, StageLambdas, Verdict,
+    ProbeUncertainty, Realization, Result, SampleEvaluations, StageLambdas, Verdict,
 };
 use crate::uncertainty;
 
 const RESIDUAL_NODES: usize = RESIDUAL_COEFS / 3;
 const RESIDUAL_GRID: usize = 17;
+const STEP_RADIUS: f64 = 2.0;
+const STATIONARY_GRADIENT: f64 = 1e-3;
+const STATIONARY_DECREMENT_NATS: f64 = 1e-3;
 
 struct Stage {
     blocks: &'static [BlockKind],
@@ -164,6 +166,10 @@ fn converged(recent: &[f64]) -> bool {
     (oldest - newest).abs() <= 1e-3 * oldest.abs().max(1.0)
 }
 
+fn fit_diag() -> bool {
+    std::env::var_os("LOOKLAB_FIT_DIAG").is_some()
+}
+
 pub(crate) fn filter_spatial(
     images: &[FitImage],
     schema: &ControlSchema,
@@ -261,7 +267,37 @@ pub(crate) fn run_with(
     model: Option<ControlResponseModel>,
     excluded: Vec<ExcludedImage>,
 ) -> Result<FitResult> {
-    run_inner(images, options, model, excluded, None, true, None, None).map(|(result, _)| result)
+    run_inner(
+        images,
+        options,
+        model,
+        excluded,
+        None,
+        true,
+        None,
+        None,
+        FitMode::Main,
+    )
+    .map(|(result, _)| result)
+}
+
+pub(crate) fn run_with_initial(
+    images: &[FitImage],
+    options: &FitOptions,
+    initial: &looklab_model::Look,
+) -> Result<FitResult> {
+    run_inner(
+        images,
+        options,
+        None,
+        Vec::new(),
+        Some(initial),
+        true,
+        None,
+        None,
+        FitMode::Main,
+    )
+    .map(|(result, _)| result)
 }
 
 pub(crate) fn run_with_history(
@@ -271,8 +307,18 @@ pub(crate) fn run_with_history(
     excluded: Vec<ExcludedImage>,
     previous: Option<&PreviousSupport>,
 ) -> Result<FitResult> {
-    run_inner(images, options, model, excluded, None, true, previous, None)
-        .map(|(result, _)| result)
+    run_inner(
+        images,
+        options,
+        model,
+        excluded,
+        None,
+        true,
+        previous,
+        None,
+        FitMode::Main,
+    )
+    .map(|(result, _)| result)
 }
 
 pub(crate) fn run_with_history_resumable(
@@ -284,8 +330,62 @@ pub(crate) fn run_with_history_resumable(
     resume: Option<&FitState>,
 ) -> Result<(FitResult, Option<FitState>)> {
     run_inner(
-        images, options, model, excluded, None, true, previous, resume,
+        images,
+        options,
+        model,
+        excluded,
+        None,
+        true,
+        previous,
+        resume,
+        FitMode::Main,
     )
+}
+
+pub(crate) fn run_scoring(
+    images: &[FitImage],
+    options: &FitOptions,
+    model: ControlResponseModel,
+    excluded: Vec<ExcludedImage>,
+) -> Result<FitResult> {
+    run_inner(
+        images,
+        options,
+        Some(model),
+        excluded,
+        None,
+        false,
+        None,
+        None,
+        FitMode::Main,
+    )
+    .map(|(result, _)| result)
+}
+
+fn run_reference(
+    images: &[FitImage],
+    options: &FitOptions,
+    model: Option<&ControlResponseModel>,
+) -> Result<FitResult> {
+    let exposure_model = model.map(|model| {
+        let mut model = model.clone();
+        model.controls.clear();
+        model.interactions.clear();
+        model.wb.controls.clear();
+        model
+    });
+    run_inner(
+        images,
+        options,
+        exposure_model,
+        Vec::new(),
+        None,
+        false,
+        None,
+        None,
+        FitMode::Reference,
+    )
+    .map(|(result, _)| result)
 }
 
 /// Result of a conditional Look-only solve.
@@ -360,12 +460,13 @@ pub(crate) fn run_look_only(
         } else {
             stage.sweeps.min(options.max_sweeps.max(1))
         };
-        let mut sample_evaluations = 0.0_f64;
+        let mut sample_evaluations = SampleEvaluations::default();
         for _ in 0..stage_sweeps {
-            if sample_evaluations + problem.samples.len() as f64 > options.sweep_budget {
+            if sample_evaluations.get() as f64 + problem.samples.len() as f64 > options.sweep_budget
+            {
                 break;
             }
-            sample_evaluations += problem.samples.len() as f64;
+            sample_evaluations += problem.samples.len();
             for block in &mut blocks {
                 block.reset();
             }
@@ -379,6 +480,7 @@ pub(crate) fn run_look_only(
                 IntentFilter::NativeOnly,
             );
             evaluations += 1;
+            let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
             let cost =
                 pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
             if let Some((previous_cost, previous_params)) = &previous
@@ -439,16 +541,20 @@ pub(crate) fn run_look_only(
                     &params,
                     &lambdas,
                     damping,
+                    hessian_scale,
+                    StepLimit::WholeStep,
                 );
             }
             if kinds.contains(&BlockKind::Residual) {
                 let lambda = lam(&lambdas, BlockKind::Residual);
                 let delta = residual_step(
                     &pass.residual_samples,
+                    &pass.residual_gradient,
                     &params.theta[layout.residual.clone()],
                     lambda,
                     damping,
-                    1.0,
+                    hessian_scale,
+                    StepLimit::WholeStep,
                 );
                 for (index, value) in delta.iter().enumerate() {
                     step[layout.residual.start + index] = *value;
@@ -518,23 +624,306 @@ pub(crate) fn run_look_only(
     })
 }
 
+pub(crate) struct ConditionedNuisances {
+    pub images: Vec<ImageNuisances>,
+    pub converged: bool,
+    pub accepted: usize,
+    pub attempts: usize,
+    pub damping: f64,
+    pub last_step: f64,
+    pub gradient_max: f64,
+}
+
+/// Per-image exposure and WB offsets with the Look fixed, fitted on `images`.
+pub(crate) fn condition_nuisances(
+    images: &[FitImage],
+    options: &FitOptions,
+    look: &looklab_model::Look,
+    model: Option<&ControlResponseModel>,
+    clip_k: f64,
+) -> Result<ConditionedNuisances> {
+    let problem = Problem::new_with(images, model, options)?;
+    let layout = problem.layout.clone();
+    let mut params = params_from_look(&problem, look);
+    if let Some(model) = model {
+        seed_response_params(&problem, &mut params, model);
+        seed_mode_params(&problem, &mut params, model);
+    }
+    for index in 0..problem.images.len() {
+        let range = layout.image(index);
+        params.theta[range.start] = problem.images[index].exposure_hint.clamp(-8.0, 8.0);
+        params.theta[range.start + 1] = 0.0;
+        params.theta[range.start + 2] = 0.0;
+    }
+    params.theta[layout.clip] = crate::layout::zeta_from_clip(clip_k);
+    let active = ActiveColumns {
+        image: true,
+        mode: false,
+        wb: true,
+        clip: false,
+        response: false,
+    };
+    let mut blocks: Vec<BlockAcc> = (0..problem.images.len())
+        .map(|index| make_image_block(&layout, index, active))
+        .collect();
+    let penalties: Vec<Vec<f64>> = blocks
+        .iter()
+        .map(|block| block_penalty(&problem, block))
+        .collect();
+    let roles = prior_roles(&problem, &layout);
+    let lambdas = options.initial_lambdas;
+    let mut damping = 1e-3;
+    let mut recent: Vec<f64> = Vec::new();
+    let mut converged_fit = false;
+    let mut accepted_count = 0usize;
+    let mut attempts = 0usize;
+    let mut last_step = 0.0_f64;
+    let mut last_gradient = 0.0_f64;
+    let max_attempts = options.max_sweeps.clamp(1, 8).max(5) * 3;
+    for block in &mut blocks {
+        block.reset();
+    }
+    let mut pass = problem.pass(
+        &params,
+        active,
+        &mut blocks,
+        false,
+        false,
+        false,
+        IntentFilter::All,
+    );
+    let mut cost =
+        pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
+    recent.push(cost);
+    for _ in 0..max_attempts {
+        attempts += 1;
+        if fit_diag() {
+            eprintln!(
+                "nuisance attempt {attempts} start cost {cost:.12e} damping {damping:.3e} history {}",
+                recent.len()
+            );
+        }
+        let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
+        let mut step = vec![0.0_f64; layout.total];
+        for (index, block) in blocks.iter().enumerate() {
+            let (prior_gradient, prior_curvature) =
+                prior_terms(&problem, &roles, &params, options, block);
+            solve_block(
+                &layout,
+                block,
+                &mut step,
+                &penalties[index],
+                &prior_gradient,
+                &prior_curvature,
+                &params,
+                &lambdas,
+                damping,
+                hessian_scale,
+                StepLimit::WholeStep,
+            );
+        }
+        let mut trial = params.clone();
+        apply_step(&mut trial, &step);
+        last_step = step.iter().fold(0.0_f64, |acc, value| {
+            if value.is_finite() {
+                acc.max(value.abs())
+            } else {
+                f64::INFINITY
+            }
+        });
+        for block in &mut blocks {
+            block.reset();
+        }
+        let trial_pass = problem.pass(
+            &trial,
+            active,
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::All,
+        );
+        let trial_cost =
+            trial_pass.cost + total_cost(&problem, &trial, &blocks, &penalties, &lambdas, options);
+        if accepted(cost, trial_cost) {
+            accepted_count += 1;
+            params = trial;
+            pass = trial_pass;
+            cost = trial_cost;
+            let gradient = gradient_max(
+                &layout,
+                &problem,
+                &params,
+                options,
+                &blocks,
+                &penalties,
+                &lambdas,
+                &roles,
+            );
+            let accepted_damping = damping;
+            damping = (damping * 0.3).max(1e-6);
+            recent.push(cost);
+            if recent.len() > 5 {
+                recent.remove(0);
+            }
+            let stationary = gradient <= STATIONARY_GRADIENT;
+            last_gradient = gradient;
+            let stable_step = accepted_damping <= 1e-2 && last_step <= 1e-6 && stationary;
+            let stable_cost = accepted_damping <= 1e-2
+                && stationary
+                && recent.len() >= 3
+                && {
+                    let last = recent[recent.len() - 1];
+                    let previous = recent[recent.len() - 2];
+                    (last - previous).abs() <= 1e-4 * last.abs().max(1.0)
+                };
+            if fit_diag() {
+                eprintln!(
+                    "nuisance attempt {attempts} accepted cost {cost:.12e} gradient {gradient:.9e} damping {accepted_damping:.3e} step {last_step:.9e} history {}",
+                    recent.len()
+                );
+                print_block_gradients(
+                    "nuisance",
+                    &layout,
+                    &problem,
+                    &params,
+                    options,
+                    &blocks,
+                    &penalties,
+                    &lambdas,
+                    &roles,
+                );
+            }
+            if gradient <= 1e-5
+                || stable_step
+                || stable_cost
+                || (accepted_damping <= 1e-2 && stationary && converged(&recent))
+            {
+                converged_fit = true;
+                break;
+            }
+        } else {
+            damping = (damping * 10.0).min(1e6);
+            if damping >= 1e6 {
+                if fit_diag() {
+                    eprintln!(
+                        "nuisance attempt {attempts} rejected damping cap cost {cost:.12e} history {}",
+                        recent.len()
+                    );
+                }
+                break;
+            }
+            for block in &mut blocks {
+                block.reset();
+            }
+            pass = problem.pass(
+                &params,
+                active,
+                &mut blocks,
+                false,
+                false,
+                false,
+                IntentFilter::All,
+            );
+            cost =
+                pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
+            recent.push(cost);
+            if recent.len() > 5 {
+                recent.remove(0);
+            }
+            let gradient = gradient_max(
+                &layout,
+                &problem,
+                &params,
+                options,
+                &blocks,
+                &penalties,
+                &lambdas,
+                &roles,
+            );
+            last_gradient = gradient;
+            if fit_diag() {
+                eprintln!(
+                    "nuisance attempt {attempts} rejected cost {cost:.12e} gradient {gradient:.9e} damping {damping:.3e} step {last_step:.9e} history {}",
+                    recent.len()
+                );
+                print_block_gradients(
+                    "nuisance",
+                    &layout,
+                    &problem,
+                    &params,
+                    options,
+                    &blocks,
+                    &penalties,
+                    &lambdas,
+                    &roles,
+                );
+            }
+            if gradient <= 1e-5 || (gradient <= STATIONARY_GRADIENT && converged(&recent)) {
+                converged_fit = true;
+                break;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(problem.images.len());
+    for index in 0..problem.images.len() {
+        let nuisance = params.image(index);
+        out.push(ImageNuisances {
+            exposure: nuisance[0],
+            wb_log_r: nuisance[1],
+            wb_log_b: nuisance[2],
+            exposure_mode: images[index].exposure_mode,
+            contributor: images[index].contributor,
+            weight: problem.images[index].trust,
+        });
+    }
+    if fit_diag() {
+        eprintln!(
+            "nuisance done converged {converged_fit} accepted {accepted_count} attempts {attempts} damping {damping:.3e} step {last_step:.9e} gradient {last_gradient:.9e}"
+        );
+    }
+    Ok(ConditionedNuisances {
+        images: out,
+        converged: converged_fit,
+        accepted: accepted_count,
+        attempts,
+        damping,
+        last_step,
+        gradient_max: last_gradient,
+    })
+}
+
 /// Fit without the probe/response uncertainty.
 pub(crate) fn run_quick(
     images: &[FitImage],
     options: &FitOptions,
     initial: Option<&looklab_model::Look>,
+    model: Option<&ControlResponseModel>,
 ) -> Result<FitResult> {
     run_inner(
         images,
         options,
-        None,
+        model.cloned(),
         Vec::new(),
         initial,
         false,
         None,
         None,
+        FitMode::Main,
     )
     .map(|(result, _)| result)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FitMode {
+    Main,
+    Reference,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StepLimit {
+    WholeStep,
+    PerBlock,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -547,7 +936,9 @@ fn run_inner(
     want_uncertainty: bool,
     previous: Option<&PreviousSupport>,
     resume: Option<&FitState>,
+    mode: FitMode,
 ) -> Result<(FitResult, Option<FitState>)> {
+    let reference_mode = mode == FitMode::Reference;
     let mut native_positions: Vec<Option<usize>> = vec![None; images.len()];
     let mut native = Vec::new();
     for (index, image) in images.iter().enumerate() {
@@ -560,6 +951,17 @@ fn run_inner(
         return Err(crate::types::FitError::NoNativeImages);
     }
     let mut problem = Problem::new_with(&native, model.as_ref(), options)?;
+    if fit_diag() {
+        eprintln!(
+            "fit start reference {reference_mode} resume {} images {} samples {} hessian {} max_sweeps {} budget {:.3e}",
+            resume.is_some(),
+            problem.images.len(),
+            problem.samples.len(),
+            problem.hessian.len(),
+            options.max_sweeps,
+            options.sweep_budget
+        );
+    }
     // Warm-up subsampling only saves time on large pools; small many-image pools pay
     // little for the full set and start the final stage from a converged point.
     let subsample_warmup = model.is_some()
@@ -589,7 +991,8 @@ fn run_inner(
         lambdas = state.lambdas;
     }
 
-    if model.is_some() {
+    let mut sample_evaluations = SampleEvaluations::default();
+    if !reference_mode && model.is_some() && resume.is_none() {
         let reference: Vec<FitImage> = native
             .iter()
             .enumerate()
@@ -597,8 +1000,9 @@ fn run_inner(
             .map(|(_, image)| image.clone())
             .collect();
         if reference.len() >= 4 && reference.len() < native.len() {
-            let reference_fit = run_with(&reference, options, None, Vec::new())?;
+            let reference_fit = run_reference(&reference, options, model.as_ref())?;
             evaluations += reference_fit.diagnostics.evaluations;
+            sample_evaluations += reference_fit.diagnostics.sample_evaluations;
             apply_look(&problem, &mut params, &reference_fit.look);
         }
         if !problem.layout.response.is_empty() {
@@ -613,13 +1017,10 @@ fn run_inner(
         }
     }
 
-    // The warm-up stages keep their own budget; the convergent stage spends up to
-    // `FitOptions::max_sweeps` and stops on the objective and step tolerances.
     let warmup_allowed =
         (options.sweep_budget / problem.samples.len().max(1) as f64).clamp(8.0, 64.0) as usize;
     let mut final_converged = false;
     let mut resume_state: Option<FitState> = None;
-    let mut sample_evaluations = 0.0_f64;
     let start_stage = resume.map_or(0, |state| state.stage.min(STAGES.len()));
     for (stage_index, stage) in STAGES.iter().enumerate() {
         if stage_index < start_stage {
@@ -683,11 +1084,26 @@ fn run_inner(
         } else {
             1e-3
         };
-        let mut previous: Option<(f64, Params)> = None;
+        let mut last_cost: Option<f64> = None;
         let mut gcv_done = false;
+        let mut accepted_state = false;
         let mut recent: Vec<f64> = Vec::new();
+        if fit_diag() && resuming {
+            eprintln!(
+                "fit resume stage {stage_index} start_sweep {start_sweep} of {stage_sweeps} empty {} damping {damping:.3e}",
+                start_sweep >= stage_sweeps
+            );
+        }
         for sweep_index in start_sweep..stage_sweeps {
-            if sample_evaluations + stage_problem.samples.len() as f64 > options.sweep_budget {
+            let samples_per_pass = stage_problem.samples.len();
+            if sample_evaluations.get() as f64 + 2.0 * samples_per_pass as f64
+                > options.sweep_budget
+            {
+                if fit_diag() {
+                    eprintln!(
+                        "fit checkpoint stage {stage_index} sweep {sweep_index} reason budget damping {damping:.3e}"
+                    );
+                }
                 resume_state = Some(FitState {
                     theta: params.theta.clone(),
                     lambdas,
@@ -698,11 +1114,11 @@ fn run_inner(
                 });
                 break;
             }
-            sample_evaluations += stage_problem.samples.len() as f64;
+            sample_evaluations += samples_per_pass;
             for block in &mut blocks {
                 block.reset();
             }
-            let pass = stage_problem.pass(
+            let pass = stage_problem.pass_with_rows(
                 &params,
                 stage.active,
                 &mut blocks,
@@ -710,39 +1126,50 @@ fn run_inner(
                 false,
                 stage.neutral,
                 IntentFilter::NativeOnly,
+                stage.converge,
+                false,
             );
             evaluations += 1;
             let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
-            let cost =
+            let mut cost =
                 pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
-            if let Some((previous_cost, previous_params)) = &previous
-                && !accepted(*previous_cost, cost)
-            {
-                params = previous_params.clone();
-                damping = (damping * 10.0).min(1e6_f64);
-                if damping >= 1e6 {
-                    resume_state = Some(FitState {
-                        theta: params.theta.clone(),
-                        lambdas,
-                        stage: stage_index,
-                        sweep: sweep_index,
-                        damping,
-                        converged: false,
-                    });
-                    break;
+            if stage.converge {
+                if accepted_state {
+                    recent.push(cost);
+                    if recent.len() > 5 {
+                        recent.remove(0);
+                    }
+                    accepted_state = false;
                 }
-                continue;
-            }
-            if previous
-                .as_ref()
-                .is_none_or(|(previous_cost, _)| cost < *previous_cost)
-            {
+            } else if last_cost.is_none_or(|previous| cost < previous) {
                 recent.push(cost);
                 if recent.len() > 5 {
                     recent.remove(0);
                 }
+            } else {
+                recent.clear();
             }
-            previous = Some((cost, params.clone()));
+            last_cost = Some(cost);
+
+            if fit_diag() && stage.converge {
+                eprintln!(
+                    "fit stage {stage_index} sweep {sweep_index} cost {cost:.12e} history {} damping {damping:.3e} active {} hessian {} scale {hessian_scale:.6}",
+                    recent.len(),
+                    pass.active_samples,
+                    pass.hessian_rows
+                );
+                print_block_gradients(
+                    "current",
+                    &layout,
+                    &problem,
+                    &params,
+                    options,
+                    &blocks,
+                    &penalties,
+                    &lambdas,
+                    &roles,
+                );
+            }
 
             if stage.gcv && !gcv_done && options.run_gcv {
                 choose_lambdas(
@@ -755,21 +1182,58 @@ fn run_inner(
                     options,
                 );
                 gcv_done = true;
-                previous = Some((
-                    pass.cost
-                        + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options),
-                    params.clone(),
-                ));
+                cost = pass.cost
+                    + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
+                last_cost = Some(cost);
+                recent.clear();
+            }
+
+            if converged(&recent) {
+                if !stage.converge {
+                    break;
+                }
+                let decrement = stationarity_decrement(
+                    &layout, &problem, &params, options, &blocks, &penalties, &lambdas,
+                    &roles, &pass, hessian_scale,
+                );
+                if fit_diag() {
+                    eprintln!(
+                        "fit stage {stage_index} sweep {sweep_index} plateau decrement {decrement:.9e} nats threshold {STATIONARY_DECREMENT_NATS:.3e}"
+                    );
+                    print_block_gradients(
+                        "plateau",
+                        &layout,
+                        &problem,
+                        &params,
+                        options,
+                        &blocks,
+                        &penalties,
+                        &lambdas,
+                        &roles,
+                    );
+                }
+                if decrement <= STATIONARY_DECREMENT_NATS {
+                    final_converged = true;
+                    break;
+                }
             }
 
             let mut step = vec![0.0_f64; layout.total];
+            let mut prediction = 0.0;
+            let coupled_prediction = stage.converge.then(|| coupled_step(
+                &layout, &problem, &params, options, &blocks, &penalties, &lambdas,
+                &roles, &pass, hessian_scale, damping, &mut step,
+            )).flatten();
+            if let Some(value) = coupled_prediction {
+                prediction = value;
+            } else {
             for (index, block) in blocks.iter().enumerate() {
                 if block.kind == BlockKind::Residual {
                     continue;
                 }
                 let (prior_gradient, prior_curvature) =
                     prior_terms(&problem, &roles, &params, options, block);
-                solve_block(
+                prediction += solve_block(
                     &layout,
                     block,
                     &mut step,
@@ -779,36 +1243,206 @@ fn run_inner(
                     &params,
                     &lambdas,
                     damping,
+                    hessian_scale,
+                    StepLimit::PerBlock,
                 );
+            }
             }
             if kinds.contains(&BlockKind::Residual) {
                 let lambda = lam(&lambdas, BlockKind::Residual);
                 let delta = residual_step(
                     &pass.residual_samples,
+                    &pass.residual_gradient,
                     &params.theta[layout.residual.clone()],
                     lambda,
                     damping,
                     hessian_scale,
+                    StepLimit::PerBlock,
                 );
                 for (index, value) in delta.iter().enumerate() {
                     step[layout.residual.start + index] = *value;
                 }
             }
-            apply_step(&mut params, &step);
+            let step_max = step
+                .iter()
+                .filter(|value| value.is_finite())
+                .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+            let step_params = params.clone();
+            let mut directional_reduction = 0.0;
+            if stage.converge {
+                for (index, block) in blocks.iter().enumerate() {
+                    if block.kind == BlockKind::Residual {
+                        continue;
+                    }
+                    let gradients = block_gradients(
+                        &layout, &problem, &params, options, block, &penalties[index],
+                        block_lambda(block, &lambdas), &roles,
+                    );
+                    directional_reduction -= gradients.iter().zip(&block.params)
+                        .map(|(gradient, global)| gradient * step[*global]).sum::<f64>();
+                }
+            }
+            if stage.converge {
+                apply_step_unclamped(&mut params, &step);
+            } else {
+                apply_step(&mut params, &step);
+            }
             if kinds.contains(&BlockKind::Residual) {
                 pin_residual(&mut params, &layout, &pass.residual_samples);
+                let lambda = lam(&lambdas, BlockKind::Residual);
+                let ridge = 2.0 * lambda;
+                let identity = identity_weight(BlockKind::Residual);
+                let penalty = residual_penalty_diagonal();
+                let before = &step_params.theta[layout.residual.clone()];
+                let after = &params.theta[layout.residual.clone()];
+                let mut rhs = vec![0.0_f64; RESIDUAL_COEFS];
+                let mut effective = vec![0.0_f64; RESIDUAL_COEFS];
+                for index in 0..RESIDUAL_COEFS {
+                    effective[index] = after[index] - before[index];
+                    rhs[index] = pass.residual_gradient[index]
+                        - ridge * laplacian_at(before, index, &penalty)
+                        - identity * before[index];
+                }
+                let mut curvature = vec![0.0_f64; RESIDUAL_COEFS];
+                residual_undamped_apply(
+                    &pass.residual_samples,
+                    &effective,
+                    &mut curvature,
+                    &penalty,
+                    ridge,
+                    identity,
+                    hessian_scale,
+                );
+                let first: f64 = rhs.iter().zip(effective.iter()).map(|(r, d)| r * d).sum();
+                let quadratic: f64 = effective
+                    .iter()
+                    .zip(curvature.iter())
+                    .map(|(d, b)| d * b)
+                    .sum();
+                directional_reduction += first;
+                prediction += first - 0.5 * quadratic;
             }
-            update_sigma(stage_problem, &mut params, &pass, options);
-            damping = (damping * 0.3).max(1e-6);
-            if converged(&recent) {
-                final_converged = stage.converge;
-                break;
+            let full_prediction = prediction;
+            let mut fraction = 1.0;
+            let (trial, trial_cost) = loop {
+                let trial = stage_problem.pass(
+                    &params,
+                    stage.active,
+                    &mut [],
+                    false,
+                    false,
+                    stage.neutral,
+                    IntentFilter::NativeOnly,
+                );
+                evaluations += 1;
+                sample_evaluations += samples_per_pass;
+                let trial_cost = trial.cost
+                    + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
+                if !stage.converge || accepted(cost, trial_cost)
+                    || directional_reduction <= 0.0
+                    || sample_evaluations.get() as f64 + samples_per_pass as f64 > options.sweep_budget
+                {
+                    break (trial, trial_cost);
+                }
+                fraction *= 0.5;
+                let mut changed = false;
+                for (global, value) in params.theta.iter_mut().enumerate() {
+                    let next = if step[global].is_finite() {
+                        step_params.theta[global] + fraction * step[global]
+                    } else {
+                        step_params.theta[global]
+                    };
+                    changed |= next != *value;
+                    *value = next;
+                }
+                if kinds.contains(&BlockKind::Residual) {
+                    pin_residual(&mut params, &layout, &pass.residual_samples);
+                }
+                prediction = fraction * directional_reduction
+                    - fraction * fraction * (directional_reduction - full_prediction);
+                if !changed {
+                    break (trial, trial_cost);
+                }
+            };
+            let step_max = fraction * step_max;
+            if !accepted(cost, trial_cost) {
+                params = step_params;
+                damping = (damping * 10.0).min(1e6_f64);
+                if fit_diag() && stage.converge {
+                    eprintln!(
+                        "fit stage {stage_index} sweep {sweep_index} rejected trial {trial_cost:.12e} current {cost:.12e} step {step_max:.9e} prediction {prediction:.9e} damping {damping:.3e} history {}",
+                        recent.len()
+                    );
+                }
+                if damping >= 1e6 {
+                    if fit_diag() {
+                        eprintln!(
+                            "fit checkpoint stage {stage_index} sweep {sweep_index} reason damping damping {damping:.3e} history {}",
+                            recent.len()
+                        );
+                    }
+                    resume_state = Some(FitState {
+                        theta: params.theta.clone(),
+                        lambdas,
+                        stage: stage_index,
+                        sweep: sweep_index,
+                        damping,
+                        converged: false,
+                    });
+                    break;
+                }
+                continue;
             }
+            let ratio = if prediction.is_finite() && prediction > 0.0 {
+                (cost - trial_cost) / prediction
+            } else {
+                f64::NAN
+            };
+            if fraction < 1.0 {
+                damping = (damping * 2.0).min(1e6);
+            } else if ratio.is_finite() {
+                if ratio > 0.75 {
+                    damping = (damping * 0.3).max(1e-6);
+                } else if ratio < 0.25 {
+                    damping = (damping * 2.0).min(1e6);
+                }
+            }
+            if fit_diag() && stage.converge {
+                eprintln!(
+                    "fit stage {stage_index} sweep {sweep_index} accepted trial {trial_cost:.12e} ratio {ratio:.6} prediction {prediction:.9e} step {step_max:.9e} damping {damping:.3e} history {}",
+                    recent.len()
+                );
+            }
+            if fit_diag() && stage.converge && matches!(sweep_index, 96 | 112 | 127) {
+                diagnose_directional_curvature(
+                    stage_problem, &step_params, &params, options, &blocks, &penalties,
+                    &lambdas, &roles, &pass, hessian_scale, stage.active, stage.neutral,
+                );
+            }
+            update_sigma(stage_problem, &mut params, &trial, options);
+            accepted_state = true;
         }
         if resume_state.is_some() {
             break;
         }
         if stage.converge && !final_converged {
+            if fit_diag() {
+                eprintln!(
+                    "fit stage {stage_index} not converged after {stage_sweeps} sweeps: history {:?} last_cost {last_cost:?} damping {damping:.3e}",
+                    recent
+                );
+                print_block_gradients(
+                    "final",
+                    &layout,
+                    &problem,
+                    &params,
+                    options,
+                    &blocks,
+                    &penalties,
+                    &lambdas,
+                    &roles,
+                );
+            }
             resume_state = Some(FitState {
                 theta: params.theta.clone(),
                 lambdas,
@@ -820,8 +1454,9 @@ fn run_inner(
             break;
         }
     }
+    let want_uncertainty = want_uncertainty && final_converged;
 
-    if model.is_some() && !problem.layout.response.is_empty() {
+    if !reference_mode && model.is_some() && !problem.layout.response.is_empty() {
         run_frozen_responses(
             &problem,
             &mut params,
@@ -873,6 +1508,7 @@ fn run_inner(
                 IntentFilter::All,
             );
             evaluations += 1;
+            let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
             let mut step = vec![0.0_f64; layout.total];
             for (index, block) in blocks.iter().enumerate() {
                 let (prior_gradient, prior_curvature) =
@@ -887,6 +1523,8 @@ fn run_inner(
                     &all_params,
                     &lambdas,
                     damping,
+                    hessian_scale,
+                    StepLimit::WholeStep,
                 );
             }
             apply_step(&mut all_params, &step);
@@ -913,15 +1551,16 @@ fn run_inner(
         &params,
         ActiveColumns::ALL,
         &mut blocks,
-        true,
-        true,
+        !reference_mode,
+        want_uncertainty,
         false,
         IntentFilter::All,
     );
     evaluations += 1;
-    // The exposure/body gauge is a definition (docs/02 §2.1), not an estimate, so
-    // the Look's covariance is conditional on the exposure nuisances.
-    let uncertainty_columns = ActiveColumns::ALL;
+    let uncertainty_columns = ActiveColumns {
+        response: problem.terms.iter().any(|terms| !terms.is_empty()),
+        ..ActiveColumns::ALL
+    };
     let mut uncertainty_blocks = want_uncertainty.then(|| {
         vec![
             make_look_block(&layout, uncertainty_columns),
@@ -978,7 +1617,11 @@ fn run_inner(
         .collect::<Vec<_>>();
 
     let density = density::build(&problem, &params, options.density_floor);
-    let image_stats = outlier::score(&problem, &final_pass, options);
+    let image_stats = if reference_mode {
+        Vec::new()
+    } else {
+        outlier::score(&problem, &final_pass, options)
+    };
     let mut grl_precision_ratio = Vec::new();
     let (mut probe_result, parameter_ids, covariance) =
         match (uncertainty_blocks.as_ref(), uncertainty_pass.as_ref()) {
@@ -988,7 +1631,7 @@ fn run_inner(
                     &layout,
                     &lambdas,
                     uncertainty_blocks[0].len(),
-                    true,
+                    uncertainty_columns.response,
                 ));
                 let block = &uncertainty_blocks[0];
                 let scale = uncertainty_pass.active_samples.max(1) as f64
@@ -1093,35 +1736,40 @@ fn run_inner(
     if want_uncertainty && (4..=64).contains(&native.len()) && !probe_result.probes.is_empty() {
         // The published σ includes the same body/image K-fold model-error term the
         // bootstrap path uses, so systematic basis misfit widens support probes.
-        let probes_v1 = looklab_model::probes::v1();
-        let mut sums = vec![0.0_f64; MODEL_HUE_BINS * MODEL_S_BINS];
-        let mut counts = vec![0.0_f64; MODEL_HUE_BINS * MODEL_S_BINS];
-        for (index, probe) in probe_result.probes.iter().enumerate() {
-            let input = LookInput::new(probes_v1.probes[index].xyz);
-            let bin = region(input.s, input.h_in);
-            sums[bin] += probe.post_sigma_de * probe.post_sigma_de;
-            counts[bin] += 1.0;
-        }
-        let reference_variance: Vec<f64> = sums
-            .iter()
-            .zip(counts.iter())
-            .map(|(sum, count)| if *count > 0.0 { sum / count } else { 0.0 })
-            .collect();
         let clip_k = params.clip_k();
-        let field = estimate_model_error(&native, &[], &reference_variance, options, clip_k)?;
-        for (index, probe) in probe_result.probes.iter_mut().enumerate() {
-            let input = LookInput::new(probes_v1.probes[index].xyz);
-            let variance = field.at(input.s, input.h_in);
-            probe.post_sigma_de = (probe.post_sigma_de * probe.post_sigma_de + variance).sqrt();
-        }
+        let field = estimate_model_error(&native, &[], model.as_ref(), options, clip_k)?;
+        let space = problem
+            .images
+            .first()
+            .map_or(looklab_color::RgbSpace::Srgb, |image| image.space);
+        apply_model_error(
+            &mut probe_result,
+            &field,
+            &look,
+            &density,
+            space,
+            options,
+            clip_k,
+            previous,
+        );
     }
-    let control_response = model.map(|template| {
-        build_control_response(template, &problem, &params, parameter_ids, covariance)
-    });
+    let control_response = if reference_mode {
+        None
+    } else {
+        model.map(|template| {
+            let (ids, covariance) = if want_uncertainty {
+                (parameter_ids, covariance)
+            } else {
+                (problem.parameter_ids.clone(), Vec::new())
+            };
+            build_control_response(template, &problem, &params, ids, covariance)
+        })
+    };
 
     let mut diagnostics = Diagnostics {
         sweeps: 0,
         evaluations,
+        sample_evaluations,
         final_cost: final_pass.cost + prior_cost,
         sigma_v: sigma_v.clone(),
         gcv: lambdas,
@@ -1290,6 +1938,7 @@ fn run_frozen_responses(
             intents,
         );
         *evaluations += 1;
+        let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
         let mut step = vec![0.0_f64; layout.total];
         for (index, block) in blocks.iter().enumerate() {
             let (prior_gradient, prior_curvature) =
@@ -1304,6 +1953,8 @@ fn run_frozen_responses(
                 params,
                 lambdas,
                 damping,
+                hessian_scale,
+                StepLimit::WholeStep,
             );
         }
         apply_step(params, &step);
@@ -1360,6 +2011,7 @@ pub(crate) fn run_responses(
             false,
             IntentFilter::All,
         );
+        let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
         let mut step = vec![0.0_f64; layout.total];
         for (index, block) in blocks.iter().enumerate() {
             let (prior_gradient, prior_curvature) =
@@ -1374,6 +2026,8 @@ pub(crate) fn run_responses(
                 &params,
                 &lambdas,
                 damping,
+                hessian_scale,
+                StepLimit::WholeStep,
             );
         }
         apply_step(&mut params, &step);
@@ -1416,7 +2070,7 @@ pub(crate) fn run_responses(
     ))
 }
 
-fn params_from_look(problem: &Problem, look: &looklab_model::Look) -> Params {
+pub(crate) fn params_from_look(problem: &Problem, look: &looklab_model::Look) -> Params {
     let mut params = Params::initial(problem.layout.clone(), problem.contributors.len());
     apply_look(problem, &mut params, look);
     params
@@ -1439,6 +2093,22 @@ fn apply_look(problem: &Problem, params: &mut Params, look: &looklab_model::Look
     params.theta[problem.layout.lambda.clone()].copy_from_slice(&coef[layout.lambda.clone()]);
     params.theta[problem.layout.residual.clone()].copy_from_slice(&coef[layout.residual.clone()]);
     params.theta[problem.layout.clip] = crate::layout::zeta_from_clip(look.clip.k);
+}
+
+pub(crate) fn seed_mode_params(
+    problem: &Problem,
+    params: &mut Params,
+    model: &ControlResponseModel,
+) {
+    for (index, mode) in model.exposure.modes.iter().enumerate() {
+        if let Some(position) = problem
+            .modes
+            .iter()
+            .position(|candidate| candidate.0 as usize == index)
+        {
+            params.theta[problem.layout.mode_of(position)] = mode.ev;
+        }
+    }
 }
 
 pub(crate) fn seed_response_params(
@@ -1767,7 +2437,7 @@ fn response_component(kind: BlockKind) -> Option<ResponseComponent> {
     }
 }
 
-/// One dense block over every look coefficient the covariance needs, plus the WB nuisances and clip.
+/// One dense block over the look coefficients plus the active image nuisances, modes and clip.
 fn make_look_block(layout: &Layout, active: ActiveColumns) -> BlockAcc {
     let mut params = Vec::with_capacity(2300);
     params.push(layout.tone_c0);
@@ -1950,6 +2620,22 @@ fn penalty_for(kind: BlockKind) -> Vec<f64> {
                             .collect();
                         accumulate_row(&mut s, n, &indices);
                     }
+                }
+            }
+            for term in 0..CORE_TERMS {
+                for row in basis::second_difference(S_COEFS, false) {
+                    let indices: Vec<(usize, f64)> = row
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, value)| **value != 0.0)
+                        .map(|(s_index, value)| {
+                            (
+                                S_COEFS + VOLUME_COEFS + s_index * CORE_TERMS + term,
+                                *value,
+                            )
+                        })
+                        .collect();
+                    accumulate_row(&mut s, n, &indices);
                 }
             }
             s
@@ -2239,6 +2925,10 @@ fn lam(lambdas: &StageLambdas, kind: BlockKind) -> f64 {
     }
 }
 
+fn block_lambda(block: &BlockAcc, lambdas: &StageLambdas) -> f64 {
+    lam(lambdas, block.kind)
+}
+
 fn set_lam(lambdas: &mut StageLambdas, kind: BlockKind, value: f64) {
     match kind {
         BlockKind::Tone => lambdas.tone = value,
@@ -2328,11 +3018,10 @@ fn total_cost(
     let mut cost = prior_cost(problem, params, options);
     for (index, block) in blocks.iter().enumerate() {
         if block.kind == BlockKind::Residual {
-            cost += lam(lambdas, BlockKind::Residual)
-                * residual_penalty_value(&params.theta[problem.layout.residual.clone()]);
+            cost += residual_cost(&problem.layout, &params.theta, lam(lambdas, BlockKind::Residual));
             continue;
         }
-        cost += lam(lambdas, block.kind)
+        cost += block_lambda(block, lambdas)
             * penalty_value(&params.theta, &block.params, &penalties[index]);
         cost += identity_cost(&problem.layout, block, &params.theta);
     }
@@ -2350,9 +3039,14 @@ fn prior_and_reg(
     let mut reg = 0.0;
     for (index, block) in blocks.iter().enumerate() {
         if block.kind == BlockKind::Residual {
+            reg += residual_cost(
+                &problem.layout,
+                &params.theta,
+                lam(lambdas, BlockKind::Residual),
+            );
             continue;
         }
-        reg += lam(lambdas, block.kind)
+        reg += block_lambda(block, lambdas)
             * penalty_value(&params.theta, &block.params, &penalties[index]);
         reg += identity_cost(&problem.layout, block, &params.theta);
     }
@@ -2371,29 +3065,38 @@ fn choose_lambdas(
     // The objective is tempered by n_eff per image, so the effective observation count is
     // `3 * n_eff * n_images`, not the raw sample count (docs/02 §4.1).
     let observations = 3.0 * options.n_eff * problem.active_images.max(1) as f64;
+    let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
+    let roles = prior_roles(problem, &problem.layout);
     for (index, block) in blocks.iter().enumerate() {
         if block.kind == BlockKind::Nuisance || lam(lambdas, block.kind) != 0.0 {
             continue;
         }
         let choice = if block.kind == BlockKind::Residual {
-            let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
             let identity = identity_weight(BlockKind::Residual);
             let diagonal: Vec<f64> = residual_diagonal(&pass.residual_samples)
                 .into_iter()
-                .map(|value| value * hessian_scale + identity)
+                .map(|value| value * hessian_scale)
                 .collect();
+            let fixed_diagonal = vec![identity; diagonal.len()];
             let penalty_diagonal: Vec<f64> = residual_penalty_diagonal()
                 .into_iter()
                 .map(|v| 2.0 * v)
                 .collect();
             let (residual_rhs, rss) = residual_gradient(&pass.residual_samples);
+            let gradient: Vec<f64> = residual_rhs
+                .into_iter()
+                .map(|value| -value * hessian_scale)
+                .collect();
             let theta = &params.theta[problem.layout.residual.clone()];
+            let fixed_gradient: Vec<f64> = theta.iter().map(|value| identity * value).collect();
             select_lambda_diagonal(
                 &diagonal,
+                &fixed_diagonal,
                 &penalty_diagonal,
-                &residual_rhs,
+                &gradient,
+                &fixed_gradient,
                 theta,
-                rss.max(1e-12),
+                (rss * hessian_scale).max(1e-12),
                 observations,
             )
         } else {
@@ -2402,17 +3105,38 @@ fn choose_lambdas(
                 .iter()
                 .map(|index| params.theta[*index])
                 .collect();
+            let (prior_gradient, prior_curvature) =
+                prior_terms(problem, &roles, params, options, block);
             let identity = identity_curvature(&problem.layout, block);
-            let mut hessian = block.hessian.clone();
-            for i in 0..block.len() {
-                hessian[i * block.len() + i] += identity[i];
-            }
+            let fixed_curvature: Vec<f64> = identity
+                .iter()
+                .zip(prior_curvature.iter())
+                .map(|(left, right)| left + right)
+                .collect();
+            let fixed_gradient: Vec<f64> = prior_gradient
+                .iter()
+                .zip(identity.iter())
+                .zip(theta0.iter())
+                .map(|((prior, curvature), theta)| prior + curvature * theta)
+                .collect();
+            let hessian: Vec<f64> = block
+                .hessian
+                .iter()
+                .map(|value| value * hessian_scale)
+                .collect();
+            let gradient: Vec<f64> = block
+                .hessian_gradient
+                .iter()
+                .map(|value| value * hessian_scale)
+                .collect();
             select_lambda(
                 &hessian,
+                &fixed_curvature,
                 &penalties[index],
-                &block.gradient,
+                &gradient,
+                &fixed_gradient,
                 &theta0,
-                pass.rss.max(1e-12),
+                (pass.hessian_rss * hessian_scale).max(1e-12),
                 block.len(),
                 observations,
                 4,
@@ -2435,7 +3159,7 @@ fn choose_lambdas(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
     Exposure(usize),
     Wb(usize),
@@ -2501,6 +3225,702 @@ fn prior_terms(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn block_gradients(
+    layout: &Layout,
+    problem: &Problem,
+    params: &Params,
+    options: &FitOptions,
+    block: &BlockAcc,
+    penalty: &[f64],
+    lambda: f64,
+    roles: &[Role],
+) -> Vec<f64> {
+    if block.params.is_empty() {
+        return Vec::new();
+    }
+    let (prior_gradient, _) = prior_terms(problem, roles, params, options, block);
+    let identity = identity_apply(layout, block, &params.theta);
+    let n = block.len();
+    (0..n)
+        .map(|local| {
+            let mut regularizer = 0.0_f64;
+            for other in 0..n {
+                regularizer += penalty[local * n + other] * params.theta[block.params[other]];
+            }
+            block.gradient[local] + prior_gradient[local] + identity[local] + lambda * regularizer
+        })
+        .collect()
+}
+
+/// Largest penalized-objective derivative over one block, with the parameter carrying it.
+#[allow(clippy::too_many_arguments)]
+fn block_gradient_peak(
+    layout: &Layout,
+    problem: &Problem,
+    params: &Params,
+    options: &FitOptions,
+    block: &BlockAcc,
+    penalty: &[f64],
+    lambda: f64,
+    roles: &[Role],
+) -> (f64, Option<usize>) {
+    let gradients = block_gradients(layout, problem, params, options, block, penalty, lambda, roles);
+    let mut largest = 0.0_f64;
+    let mut worst = None;
+    for (local, gradient) in gradients.iter().enumerate() {
+        if gradient.abs() > largest {
+            largest = gradient.abs();
+            worst = Some(block.params[local]);
+        }
+    }
+    (largest, worst)
+}
+
+/// Largest absolute derivative of the penalized objective over the active blocks.
+fn gradient_max(
+    layout: &Layout,
+    problem: &Problem,
+    params: &Params,
+    options: &FitOptions,
+    blocks: &[BlockAcc],
+    penalties: &[Vec<f64>],
+    lambdas: &StageLambdas,
+    roles: &[Role],
+) -> f64 {
+    blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block.kind != BlockKind::Residual && !block.params.is_empty())
+        .map(|(index, block)| {
+            block_gradient_peak(
+                layout,
+                problem,
+                params,
+                options,
+                block,
+                &penalties[index],
+                block_lambda(block, lambdas),
+                roles,
+            )
+            .0
+        })
+        .fold(0.0_f64, f64::max)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stationarity_decrement(
+    layout: &Layout,
+    problem: &Problem,
+    params: &Params,
+    options: &FitOptions,
+    blocks: &[BlockAcc],
+    penalties: &[Vec<f64>],
+    lambdas: &StageLambdas,
+    roles: &[Role],
+    pass: &PassOutput,
+    data_scale: f64,
+) -> f64 {
+    let Some(system) = CoupledSystem::new(
+        layout, problem, params, options, blocks, penalties, lambdas, roles, pass, data_scale, 0.0,
+    ) else {
+        return f64::INFINITY;
+    };
+    let lower_bound = if system.exact_data.is_some() { 0.0 } else { system.energy_lower_bound() };
+    if lower_bound > STATIONARY_DECREMENT_NATS {
+        if fit_diag() {
+            eprintln!("fit decrement rejected by lower bound {lower_bound:.9e} nats");
+        }
+        return lower_bound;
+    }
+    let Some(solution) = system.solve() else {
+        return f64::INFINITY;
+    };
+    let mut energy = 0.5 * crate::solve::dot(&system.rhs, &solution);
+    if !energy.is_finite() || energy < 0.0 {
+        return f64::INFINITY;
+    }
+    if blocks.iter().any(|block| block.kind == BlockKind::Residual) {
+        energy += residual_decrement(pass, layout, params, lambdas, data_scale);
+    }
+    energy
+}
+
+#[cfg(test)]
+fn undamped_decrement(mut curvature: Vec<f64>, rhs: &[f64]) -> f64 {
+    let n = rhs.len();
+    if !factor_in_place(&mut curvature, n) {
+        return f64::INFINITY;
+    }
+    let mut solution = rhs.to_vec();
+    solve_in_place(&curvature, n, &mut solution);
+    let energy = 0.5 * rhs.iter().zip(solution).map(|(g, z)| g * z).sum::<f64>();
+    if energy.is_finite() && energy >= 0.0 {
+        energy
+    } else {
+        f64::INFINITY
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diagnose_directional_curvature(
+    problem: &Problem, before: &Params, after: &Params, options: &FitOptions,
+    blocks: &[BlockAcc], penalties: &[Vec<f64>], lambdas: &StageLambdas,
+    roles: &[Role], pass: &PassOutput, data_scale: f64, active: ActiveColumns, neutral: bool,
+) {
+    let layout = &problem.layout;
+    let gradient = diagnostic_gradient_parts(problem, before, options, blocks, penalties, lambdas, roles, pass);
+    let accepted: Vec<f64> = after.theta.iter().zip(&before.theta).map(|(a, b)| a - b).collect();
+    let mut steepest: Vec<f64> = gradient.iter().map(|parts| -parts.iter().sum::<f64>()).collect();
+    let norm = steepest.iter().fold(0.0_f64, |max, value| max.max(value.abs()));
+    if norm > 0.0 {
+        for value in &mut steepest {
+            *value /= norm;
+        }
+    }
+    let mut diagnostic_blocks: Vec<BlockAcc> = blocks.iter().map(|block| {
+        let mut copy = BlockAcc::new(block.kind, block.params.clone(), layout.total);
+        copy.image = block.image;
+        copy
+    }).collect();
+    let full_pass = problem.pass_with_rows(
+        before, active, &mut diagnostic_blocks, false, false, neutral, IntentFilter::NativeOnly, true, true,
+    );
+    let full_models = [&accepted, &steepest].map(|direction| {
+        diagnostic_model_curvature(
+            problem, before, options, &diagnostic_blocks, penalties, lambdas, roles,
+            &full_pass, 1.0, false, direction,
+        )
+    });
+    let sigma: Vec<f64> = (0..problem.contributors.len()).map(|i| before.sigma(i)).collect();
+    eprintln!("fit curvature start images {} sigma_v {sigma:?} sampled_rows {} all_rows {}",
+        problem.images.len(), pass.hessian_rows, full_pass.hessian_rows);
+    for (which, direction) in [accepted, steepest].iter().enumerate() {
+        let label = if which == 0 { "accepted" } else { "steepest" };
+        let model = diagnostic_model_curvature(
+            problem, before, options, blocks, penalties, lambdas, roles,
+            pass, data_scale, true, direction,
+        );
+        let mut groups: Vec<(Option<BlockKind>, Role, f64, f64)> = Vec::new();
+        for (global, value) in direction.iter().enumerate().filter(|(_, value)| **value != 0.0) {
+            let kind = kind_of(layout, global);
+            let role = match roles[global] {
+                Role::Exposure(_) => Role::Exposure(0),
+                Role::Wb(_) => Role::Wb(0),
+                Role::Mode(_) => Role::Mode(0),
+                role => role,
+            };
+            if let Some(group) = groups.iter_mut().find(|group| group.0 == kind && group.1 == role) {
+                group.2 += value * value;
+                group.3 = group.3.max(value.abs());
+            } else {
+                groups.push((kind, role, value * value, value.abs()));
+            }
+        }
+        for (kind, role, squared_norm, peak) in groups {
+            eprintln!("fit curvature direction {label} role {kind:?}/{role:?} norm {:.9e} max {peak:.9e}", squared_norm.sqrt());
+        }
+        for h in [1e-3, 1e-4] {
+            let gradients = [-h, h].map(|offset| {
+                let mut perturbed = before.clone();
+                for (theta, value) in perturbed.theta.iter_mut().zip(direction) {
+                    *theta += offset * value;
+                }
+                for block in &mut diagnostic_blocks {
+                    block.reset();
+                }
+                let perturbed_pass = problem.pass(
+                    &perturbed, active, &mut diagnostic_blocks, false, false, neutral, IntentFilter::NativeOnly,
+                );
+                let parts = diagnostic_gradient_parts(
+                    problem, &perturbed, options, &diagnostic_blocks, penalties, lambdas, roles, &perturbed_pass,
+                );
+                let mut projected = [0.0; 4];
+                for (values, value) in parts.iter().zip(direction) {
+                    for component in 0..4 {
+                        projected[component] += values[component] * value;
+                    }
+                }
+                projected
+            });
+            let actual = std::array::from_fn::<_, 4, _>(|i| (gradients[1][i] - gradients[0][i]) / (2.0 * h));
+            let full = full_models[which];
+            eprintln!("fit curvature {label} h {h:.1e} sampled {:.12e} true {:.12e} all {:.12e} data {:.12e}/{:.12e}/{:.12e} prior {:.12e}/{:.12e}/{:.12e} identity {:.12e}/{:.12e}/{:.12e} penalty {:.12e}/{:.12e}/{:.12e}",
+                model.iter().sum::<f64>(), actual.iter().sum::<f64>(), full.iter().sum::<f64>(),
+                model[0], actual[0], full[0], model[1], actual[1], full[1],
+                model[2], actual[2], full[2], model[3], actual[3], full[3]);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diagnostic_gradient_parts(
+    problem: &Problem, params: &Params, options: &FitOptions, blocks: &[BlockAcc],
+    penalties: &[Vec<f64>], lambdas: &StageLambdas, roles: &[Role], pass: &PassOutput,
+) -> Vec<[f64; 4]> {
+    let layout = &problem.layout;
+    let mut parts = vec![[0.0; 4]; layout.total];
+    for (index, block) in blocks.iter().enumerate() {
+        if block.kind == BlockKind::Residual {
+            let diagonal = residual_penalty_diagonal();
+            let theta = &params.theta[layout.residual.clone()];
+            for i in 0..RESIDUAL_COEFS {
+                parts[layout.residual.start + i] = [
+                    -pass.residual_gradient[i], 0.0, identity_weight(BlockKind::Residual) * theta[i],
+                    2.0 * lambdas.residual * laplacian_at(theta, i, &diagonal),
+                ];
+            }
+            continue;
+        }
+        let (prior, _) = prior_terms(problem, roles, params, options, block);
+        let identity = identity_apply(layout, block, &params.theta);
+        for (i, &global) in block.params.iter().enumerate() {
+            let regularizer: f64 = (0..block.len())
+                .map(|j| penalties[index][i * block.len() + j] * params.theta[block.params[j]]).sum();
+            parts[global] = [block.gradient[i], prior[i], identity[i], block_lambda(block, lambdas) * regularizer];
+        }
+    }
+    parts
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diagnostic_model_curvature(
+    problem: &Problem, params: &Params, options: &FitOptions, blocks: &[BlockAcc],
+    penalties: &[Vec<f64>], lambdas: &StageLambdas, roles: &[Role], pass: &PassOutput,
+    data_scale: f64, reconcile: bool, direction: &[f64],
+) -> [f64; 4] {
+    let layout = &problem.layout;
+    let mut result = [0.0; 4];
+    let mut scales = vec![1.0; layout.total];
+    for (index, block) in blocks.iter().enumerate() {
+        if block.kind == BlockKind::Residual {
+            let residual = &direction[layout.residual.clone()];
+            let diagonal = residual_penalty_diagonal();
+            for sample in &pass.residual_samples {
+                let mut projected = [0.0; 3];
+                for (m, node) in sample.nodes.iter().enumerate() {
+                    for channel in 0..3 {
+                        for row in 0..3 {
+                            projected[row] += sample.clip.0[row][channel] * sample.weights[m]
+                                * residual[*node as usize * 3 + channel];
+                        }
+                    }
+                }
+                result[0] += data_scale * sample.alpha * projected.iter().map(|v| v * v).sum::<f64>();
+            }
+            for i in 0..RESIDUAL_COEFS {
+                result[2] += (identity_weight(BlockKind::Residual) + 1e-3) * residual[i] * residual[i];
+                result[3] += 2.0 * lambdas.residual * residual[i] * laplacian_at(residual, i, &diagonal);
+            }
+            continue;
+        }
+        let (_, prior) = prior_terms(problem, roles, params, options, block);
+        let identity = identity_curvature(layout, block);
+        for (i, &global) in block.params.iter().enumerate() {
+            if reconcile {
+                let sampled = data_scale * block.hessian[i * block.len() + i];
+                if sampled > 0.0 {
+                    scales[global] = (block.full_diagonal[i] / sampled).max(0.0).sqrt();
+                } else {
+                    result[0] += block.full_diagonal[i] * direction[global] * direction[global];
+                }
+            }
+            result[1] += prior[i] * direction[global] * direction[global];
+            result[2] += identity[i] * direction[global] * direction[global];
+            for (j, &other) in block.params.iter().enumerate() {
+                result[3] += block_lambda(block, lambdas) * penalties[index][i * block.len() + j]
+                    * direction[global] * direction[other];
+            }
+        }
+    }
+    for row in &pass.coupled_rows {
+        let mut projected = [0.0; 3];
+        for (global, derivative) in &row.columns {
+            let value = direction[*global as usize] * scales[*global as usize];
+            for channel in 0..3 {
+                projected[channel] += derivative[channel] * value;
+            }
+        }
+        result[0] += data_scale * row.weight * projected.iter().map(|v| v * v).sum::<f64>();
+    }
+    result
+}
+
+struct CoupledFactor {
+    range: core::ops::Range<usize>,
+    factor: Vec<f64>,
+}
+
+struct CoarseSpace {
+    basis: Vec<Vec<f64>>,
+    images: Vec<Vec<f64>>,
+    factor: Vec<f64>,
+}
+
+struct ExactDataCurvature<'a> {
+    problem: &'a Problem,
+    params: &'a Params,
+}
+
+impl ExactDataCurvature<'_> {
+    fn add_product(&self, globals: &[usize], v: &[f64], product: &mut [f64]) {
+        let relative = globals.iter().zip(v).fold(0.0_f64, |max, (global, value)| {
+            max.max(value.abs() / (1.0 + self.params.theta[*global].abs()))
+        });
+        if relative == 0.0 {
+            return;
+        }
+        let epsilon = 1e-5 / relative;
+        let mut negative = vec![0.0; globals.len()];
+        let mut gradient = vec![0.0; globals.len()];
+        for sign in [-1.0, 1.0] {
+            let mut perturbed = self.params.clone();
+            for (&global, value) in globals.iter().zip(v) {
+                perturbed.theta[global] += sign * epsilon * value;
+            }
+            let pass = self.problem.pass(
+                &perturbed, ActiveColumns::ALL, &mut [], false, true, false, IntentFilter::NativeOnly,
+            );
+            gradient.fill(0.0);
+            for image in &pass.per_image_gradient {
+                for (i, &global) in globals.iter().enumerate() {
+                    gradient[i] += image[global];
+                }
+            }
+            if sign < 0.0 {
+                negative.copy_from_slice(&gradient);
+            } else {
+                for i in 0..globals.len() {
+                    product[i] += (gradient[i] - negative[i]) / (2.0 * epsilon);
+                }
+            }
+        }
+    }
+}
+
+struct CoupledSystem<'a> {
+    pass: &'a PassOutput,
+    globals: Vec<usize>,
+    local: Vec<usize>,
+    scales: Vec<f64>,
+    diagonal: Vec<f64>,
+    damping_diagonal: Vec<f64>,
+    penalty: Vec<(usize, usize, f64)>,
+    factors: Vec<CoupledFactor>,
+    rhs: Vec<f64>,
+    data_scale: f64,
+    labels: Vec<(Option<BlockKind>, Role)>,
+    coarse_groups: Vec<Vec<usize>>,
+    exact_data: Option<ExactDataCurvature<'a>>,
+}
+
+impl<'a> CoupledSystem<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        layout: &Layout, problem: &'a Problem, params: &'a Params, options: &FitOptions,
+        blocks: &[BlockAcc], penalties: &[Vec<f64>], lambdas: &StageLambdas,
+        roles: &[Role], pass: &'a PassOutput, data_scale: f64, damping: f64,
+    ) -> Option<Self> {
+        let mut out = Self {
+            pass, globals: Vec::new(), local: vec![usize::MAX; layout.total],
+            scales: Vec::new(), diagonal: Vec::new(), damping_diagonal: Vec::new(),
+            penalty: Vec::new(), factors: Vec::new(), rhs: Vec::new(), data_scale,
+            labels: Vec::new(),
+            coarse_groups: vec![Vec::new(); problem.modes.len() + 4],
+            exact_data: std::env::var_os("LOOKLAB_FIT_EXACT_HV").is_some()
+                .then_some(ExactDataCurvature { problem, params }),
+        };
+        for (index, block) in blocks.iter().enumerate() {
+            if block.kind == BlockKind::Residual || block.params.is_empty() {
+                continue;
+            }
+            let n = block.len();
+            let start = out.globals.len();
+            let lambda = block_lambda(block, lambdas);
+            let (prior_gradient, prior_curvature) = prior_terms(problem, roles, params, options, block);
+            let (mut factor, rhs) = block_system(
+                layout, block, &penalties[index], &prior_gradient, &prior_curvature,
+                params, lambda, damping, data_scale, StepLimit::PerBlock,
+            );
+            if !factor_in_place(&mut factor, n) {
+                if fit_diag() {
+                    eprintln!("fit cg factor failure block {:?} damping {damping:.9e}", block.kind);
+                }
+                return None;
+            }
+            out.factors.push(CoupledFactor { range: start..start + n, factor });
+            out.rhs.extend(rhs);
+            let identity = identity_curvature(layout, block);
+            for (i, &global) in block.params.iter().enumerate() {
+                out.local[global] = start + i;
+                out.globals.push(global);
+                out.labels.push((kind_of(layout, global), roles[global]));
+                let group = match roles[global] {
+                    Role::Exposure(_) => Some(0),
+                    Role::Wb(_) => Some(if (global - layout.images.start) % NUISANCE_PER_IMAGE == 1 { 1 } else { 2 }),
+                    Role::Mode(mode) => Some(3 + mode),
+                    Role::Clip => Some(3 + problem.modes.len()),
+                    Role::None => None,
+                };
+                if let Some(group) = group {
+                    out.coarse_groups[group].push(start + i);
+                }
+                let sampled = data_scale * block.hessian[i * n + i];
+                let full = block.full_diagonal[i];
+                out.scales.push(if sampled > 0.0 { (full / sampled).max(0.0).sqrt() } else { 1.0 });
+                let damp = damping * full.max(1e-12);
+                out.damping_diagonal.push(damp);
+                let mut prior = prior_curvature[i];
+                if out.exact_data.is_some() && matches!(roles[global], Role::Clip) {
+                    let (mean, sd) = options.clip_prior;
+                    let p = (params.clip_k() - 0.005) / 0.095;
+                    prior += (params.clip_k() - mean) * params.clip_slope() * (1.0 - 2.0 * p) / (sd * sd);
+                }
+                out.diagonal.push(prior + identity[i] + damp
+                    + if sampled > 0.0 || out.exact_data.is_some() { 0.0 } else { full });
+                for j in 0..n {
+                    let value = lambda * penalties[index][i * n + j];
+                    if value != 0.0 {
+                        out.penalty.push((start + i, start + j, value));
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
+    fn apply(&self, v: &[f64], product: &mut [f64]) {
+        for (i, value) in product.iter_mut().enumerate() {
+            *value = self.diagonal[i] * v[i];
+        }
+        if let Some(exact) = &self.exact_data {
+            exact.add_product(&self.globals, v, product);
+        } else {
+        for row in &self.pass.coupled_rows {
+            let mut projected = [0.0; 3];
+            for (global, derivative) in &row.columns {
+                let i = self.local[*global as usize];
+                let value = self.scales[i] * v[i];
+                for channel in 0..3 {
+                    projected[channel] += derivative[channel] * value;
+                }
+            }
+            let weight = self.data_scale * row.weight;
+            for (global, derivative) in &row.columns {
+                let i = self.local[*global as usize];
+                product[i] += weight * self.scales[i]
+                    * (derivative[0] * projected[0] + derivative[1] * projected[1]
+                        + derivative[2] * projected[2]);
+            }
+        }
+        }
+        for &(i, j, value) in &self.penalty {
+            product[i] += value * v[j];
+        }
+    }
+
+    fn block_precondition(&self, residual: &[f64], z: &mut [f64]) {
+        for block in &self.factors {
+            z[block.range.clone()].copy_from_slice(&residual[block.range.clone()]);
+            solve_in_place(&block.factor, block.range.len(), &mut z[block.range.clone()]);
+        }
+    }
+
+    // (gᵀd)² / (2 dᵀBd) ≤ ½ gᵀB⁻¹g.
+    fn energy_lower_bound(&self) -> f64 {
+        let mut direction = vec![0.0; self.rhs.len()];
+        self.block_precondition(&self.rhs, &mut direction);
+        let first = crate::solve::dot(&self.rhs, &direction);
+        if first == 0.0 {
+            return 0.0;
+        }
+        let mut product = vec![0.0; direction.len()];
+        self.apply(&direction, &mut product);
+        let curvature = crate::solve::dot(&direction, &product);
+        if first.is_finite() && curvature.is_finite() && curvature > 0.0 {
+            first * first / (2.0 * curvature)
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    fn coarse_space(&self) -> Option<CoarseSpace> {
+        let n = self.rhs.len();
+        let mut look_factors = Vec::with_capacity(self.factors.len());
+        for block in &self.factors {
+            let width = block.range.len();
+            let look = block.range.clone().take_while(|i| self.labels[*i].0.is_some()).count();
+            let principal = if look > 0 && look < width {
+                let mut principal = vec![0.0; look * look];
+                for i in 0..look {
+                    principal[i * look..(i + 1) * look]
+                        .copy_from_slice(&block.factor[i * width..i * width + look]);
+                }
+                Some(principal)
+            } else {
+                None
+            };
+            look_factors.push((look, principal));
+        }
+        let mut basis = Vec::new();
+        let mut images = Vec::new();
+        for group in self.coarse_groups.iter().filter(|group| !group.is_empty()) {
+            let mut vector = vec![0.0; n];
+            for &i in group {
+                vector[i] = 1.0;
+            }
+            let mut image = vec![0.0; n];
+            self.apply(&vector, &mut image);
+            for (block, (look, principal)) in self.factors.iter().zip(&look_factors) {
+                if *look == 0 {
+                    continue;
+                }
+                let range = block.range.start..block.range.start + *look;
+                vector[range.clone()].copy_from_slice(&image[range.clone()]);
+                solve_in_place(principal.as_ref().unwrap_or(&block.factor), *look, &mut vector[range.clone()]);
+                for value in &mut vector[range] {
+                    *value = -*value;
+                }
+            }
+            self.apply(&vector, &mut image);
+            basis.push(vector);
+            images.push(image);
+        }
+        let m = basis.len();
+        if m == 0 {
+            return None;
+        }
+        let mut factor = vec![0.0; m * m];
+        for i in 0..m {
+            for j in 0..=i {
+                let value = crate::solve::dot(&basis[i], &images[j]);
+                factor[i * m + j] = value;
+                factor[j * m + i] = value;
+            }
+        }
+        factor_in_place(&mut factor, m).then_some(CoarseSpace { basis, images, factor })
+    }
+
+    fn solve(&self) -> Option<Vec<f64>> {
+        let n = self.rhs.len();
+        let mut solution = vec![0.0; n];
+        let coarse = self.coarse_space();
+        let m = coarse.as_ref().map_or(0, |space| space.basis.len());
+        let mut coefficients = vec![0.0; m];
+        let mut correction = vec![0.0; m];
+        let mut projected_residual = vec![0.0; n];
+        let report = crate::solve::conjugate_gradient_preconditioned(
+            n, |v, product| self.apply(v, product),
+            |residual, z| {
+                if let Some(space) = &coarse {
+                    for (i, basis) in space.basis.iter().enumerate() {
+                        coefficients[i] = crate::solve::dot(basis, residual);
+                    }
+                    solve_in_place(&space.factor, m, &mut coefficients);
+                    projected_residual.copy_from_slice(residual);
+                    for (image, coefficient) in space.images.iter().zip(&coefficients) {
+                        crate::solve::scaled_add(&mut projected_residual, image, -*coefficient);
+                    }
+                    self.block_precondition(&projected_residual, z);
+                    for (i, image) in space.images.iter().enumerate() {
+                        correction[i] = crate::solve::dot(image, z);
+                    }
+                    solve_in_place(&space.factor, m, &mut correction);
+                    for (i, basis) in space.basis.iter().enumerate() {
+                        crate::solve::scaled_add(z, basis, coefficients[i] - correction[i]);
+                    }
+                } else {
+                    self.block_precondition(residual, z);
+                }
+            },
+            &self.rhs, &mut solution, 256, 1e-8,
+        );
+        let mut product = vec![0.0; n];
+        self.apply(&solution, &mut product);
+        let error: f64 = product.iter().zip(&self.rhs).map(|(a, b)| (a - b) * (a - b)).sum();
+        let norm = crate::solve::dot(&self.rhs, &self.rhs);
+        if fit_diag() {
+            let damped = self.damping_diagonal.iter().any(|v| *v > 0.0);
+            eprintln!("fit cg exact {} damped {damped} dim {n} coarse {m} iterations {} cap 256 relative_residual {:.9e} positive_curvature {} resolved {}",
+                self.exact_data.is_some(), report.iterations, (error / norm.max(1e-300)).sqrt(), report.positive_curvature,
+                report.positive_curvature && error.is_finite() && error <= 1e-12 * norm.max(1.0));
+            let mut worst: Vec<usize> = (0..n).collect();
+            worst.sort_by(|a, b| (product[*b] - self.rhs[*b]).abs().total_cmp(&(product[*a] - self.rhs[*a]).abs()));
+            for &i in worst.iter().take(3) {
+                eprintln!("fit cg residual param {} label {:?} residual {:.9e} rhs {:.9e} solution {:.9e}",
+                    self.globals[i], self.labels[i], product[i] - self.rhs[i], self.rhs[i], solution[i]);
+            }
+        }
+        (report.positive_curvature && error.is_finite() && error <= 1e-12 * norm.max(1.0)).then_some(solution)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn coupled_step(
+    layout: &Layout, problem: &Problem, params: &Params, options: &FitOptions,
+    blocks: &[BlockAcc], penalties: &[Vec<f64>], lambdas: &StageLambdas, roles: &[Role],
+    pass: &PassOutput, data_scale: f64, damping: f64, step: &mut [f64],
+) -> Option<f64> {
+    let system = CoupledSystem::new(
+        layout, problem, params, options, blocks, penalties, lambdas, roles, pass, data_scale, damping,
+    )?;
+    let mut delta = system.solve()?;
+    clamp_values(&mut delta, STEP_RADIUS);
+    let mut product = vec![0.0; delta.len()];
+    system.apply(&delta, &mut product);
+    let mut prediction = crate::solve::dot(&system.rhs, &delta);
+    for (i, &global) in system.globals.iter().enumerate() {
+        step[global] = delta[i];
+        prediction -= 0.5 * delta[i] * (product[i] - system.damping_diagonal[i] * delta[i]);
+    }
+    Some(prediction)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_block_gradients(
+    label: &str,
+    layout: &Layout,
+    problem: &Problem,
+    params: &Params,
+    options: &FitOptions,
+    blocks: &[BlockAcc],
+    penalties: &[Vec<f64>],
+    lambdas: &StageLambdas,
+    roles: &[Role],
+) {
+    for (index, block) in blocks.iter().enumerate() {
+        if block.kind == BlockKind::Residual || block.params.is_empty() {
+            continue;
+        }
+        let lambda = block_lambda(block, lambdas);
+        let gradients = block_gradients(
+            layout,
+            problem,
+            params,
+            options,
+            block,
+            &penalties[index],
+            lambda,
+            roles,
+        );
+        let (peak, worst) = gradients.iter().enumerate().fold(
+            (0.0_f64, None),
+            |(largest, worst), (local, gradient)| {
+                if gradient.abs() > largest {
+                    (gradient.abs(), Some(block.params[local]))
+                } else {
+                    (largest, worst)
+                }
+            },
+        );
+        let theta = worst.map_or(f64::NAN, |global| params.theta[global]);
+        eprintln!(
+            "fit {label} block {:?} gradient {peak:.9e} param {worst:?} theta {theta:.9e}",
+            block.kind
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn solve_block(
     layout: &Layout,
     block: &BlockAcc,
@@ -2511,19 +3931,97 @@ fn solve_block(
     params: &Params,
     lambdas: &StageLambdas,
     damping: f64,
-) {
+    data_scale: f64,
+    step_limit: StepLimit,
+) -> f64 {
     let n = block.len();
     if n == 0 {
-        return;
+        return 0.0;
     }
-    let lambda = lam(lambdas, block.kind);
-    let mut a = block.hessian.clone();
+    let lambda = block_lambda(block, lambdas);
+    let (a, rhs) = block_system(
+        layout,
+        block,
+        penalty,
+        prior_gradient,
+        prior_curvature,
+        params,
+        lambda,
+        damping,
+        data_scale,
+        step_limit,
+    );
+    let damping_diag: Vec<f64> = data_diagonal(block, data_scale, step_limit)
+        .into_iter()
+        .map(|value| damping * value.max(1e-12))
+        .collect();
+    if block.kind == BlockKind::Nuisance
+        && solve_nuisance_schur(layout, block, &a, &rhs, step)
+    {
+        let mut delta: Vec<f64> = block.params.iter().map(|global| step[*global]).collect();
+        if step_limit == StepLimit::PerBlock {
+            clamp_block_step(step, &block.params, STEP_RADIUS);
+            delta = block.params.iter().map(|global| step[*global]).collect();
+        }
+        return predicted_reduction(&a, &rhs, &delta, &damping_diag);
+    }
+    let mut delta = rhs.clone();
+    let mut factor = a.clone();
+    if !factor_in_place(&mut factor, n) {
+        return 0.0;
+    }
+    solve_in_place(&factor, n, &mut delta);
+    if step_limit == StepLimit::PerBlock {
+        clamp_values(&mut delta, STEP_RADIUS);
+    }
+    for i in 0..n {
+        step[block.params[i]] = delta[i];
+    }
+    predicted_reduction(&a, &rhs, &delta, &damping_diag)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn block_system(
+    layout: &Layout,
+    block: &BlockAcc,
+    penalty: &[f64],
+    prior_gradient: &[f64],
+    prior_curvature: &[f64],
+    params: &Params,
+    lambda: f64,
+    damping: f64,
+    data_scale: f64,
+    step_limit: StepLimit,
+) -> (Vec<f64>, Vec<f64>) {
+    let n = block.len();
+    let mut a: Vec<f64> = block
+        .hessian
+        .iter()
+        .map(|value| value * data_scale)
+        .collect();
+    if step_limit == StepLimit::PerBlock && block.full_diagonal.len() == n {
+        let mut scales = vec![1.0_f64; n];
+        for (index, scale) in scales.iter_mut().enumerate() {
+            let sampled = block.hessian[index * n + index] * data_scale;
+            if sampled > 0.0 {
+                *scale = (block.full_diagonal[index] / sampled).max(0.0).sqrt();
+            }
+        }
+        for i in 0..n {
+            for j in 0..n {
+                a[i * n + j] *= scales[i] * scales[j];
+            }
+        }
+    }
     for entry in 0..n * n {
         a[entry] += lambda * penalty[entry];
     }
+    let diagonal = data_diagonal(block, data_scale, step_limit);
     for i in 0..n {
-        let diagonal = block.hessian[i * n + i].max(1e-12);
-        a[i * n + i] += damping * diagonal + prior_curvature[i];
+        a[i * n + i] = diagonal[i]
+            + lambda * penalty[i * n + i]
+            + damping * diagonal[i].max(1e-12)
+            + prior_curvature[i];
     }
     let mut rhs: Vec<f64> = block.gradient.iter().map(|value| -value).collect();
     for i in 0..n {
@@ -2544,13 +4042,188 @@ fn solve_block(
         }
         rhs[i] -= sum;
     }
-    let mut delta = rhs.clone();
-    if !factor_in_place(&mut a, n) {
-        return;
+    (a, rhs)
+}
+
+/// Eliminate each image's independent nuisance block, leaving one small dense solve
+/// for the shared mode offsets and clip.
+fn solve_nuisance_schur(
+    layout: &Layout,
+    block: &BlockAcc,
+    a: &[f64],
+    rhs: &[f64],
+    step: &mut [f64],
+) -> bool {
+    let n = block.len();
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut global: Vec<usize> = Vec::new();
+    for (local, global_index) in block.params.iter().enumerate() {
+        if layout.images.contains(global_index) {
+            let image = (global_index - layout.images.start) / NUISANCE_PER_IMAGE;
+            match groups.last_mut() {
+                Some((owner, entries)) if *owner == image => entries.push(local),
+                _ => groups.push((image, vec![local])),
+            }
+        } else {
+            global.push(local);
+        }
     }
-    solve_in_place(&a, n, &mut delta);
+    if groups.is_empty() {
+        return false;
+    }
+    let mut owner: Vec<Option<usize>> = vec![None; n];
+    for (group, (_, entries)) in groups.iter().enumerate() {
+        for &entry in entries {
+            owner[entry] = Some(group);
+        }
+    }
+    for (i, first) in owner.iter().enumerate() {
+        if first.is_none() {
+            continue;
+        }
+        for (j, second) in owner.iter().enumerate() {
+            if second.is_none() || first == second {
+                continue;
+            }
+            if a[i * n + j] != 0.0 {
+                return false;
+            }
+        }
+    }
+    let g = global.len();
+    if g == 0 {
+        return false;
+    }
+    let mut schur = vec![0.0_f64; g * g];
+    let mut target = vec![0.0_f64; g];
+    for (row, &i) in global.iter().enumerate() {
+        target[row] = rhs[i];
+        for (column, &j) in global.iter().enumerate() {
+            schur[row * g + column] = a[i * n + j];
+        }
+    }
+    let mut solved_groups: Vec<Vec<f64>> = Vec::with_capacity(groups.len());
+    let mut couplings: Vec<Vec<f64>> = Vec::with_capacity(groups.len());
+    for (_, entries) in &groups {
+        let m = entries.len();
+        let mut factor = vec![0.0_f64; m * m];
+        for (row, &i) in entries.iter().enumerate() {
+            for (column, &j) in entries.iter().enumerate() {
+                factor[row * m + column] = a[i * n + j];
+            }
+        }
+        if !factor_in_place(&mut factor, m) {
+            return false;
+        }
+        let mut solved_rhs = vec![0.0_f64; m];
+        for (row, &i) in entries.iter().enumerate() {
+            solved_rhs[row] = rhs[i];
+        }
+        solve_in_place(&factor, m, &mut solved_rhs);
+        let mut coupling = vec![0.0_f64; m * g];
+        for (column, &j) in global.iter().enumerate() {
+            for (row, &i) in entries.iter().enumerate() {
+                coupling[row * g + column] = a[i * n + j];
+            }
+            let mut column_values = vec![0.0_f64; m];
+            for row in 0..m {
+                column_values[row] = coupling[row * g + column];
+            }
+            solve_in_place(&factor, m, &mut column_values);
+            for row in 0..m {
+                coupling[row * g + column] = column_values[row];
+            }
+        }
+        for (r, &i) in entries.iter().enumerate() {
+            for column in 0..g {
+                target[column] -= a[i * n + global[column]] * solved_rhs[r];
+            }
+        }
+        for (row, &i) in entries.iter().enumerate() {
+            for left in 0..g {
+                for right in 0..g {
+                    schur[left * g + right] -= a[i * n + global[left]] * coupling[row * g + right];
+                }
+            }
+        }
+        solved_groups.push(solved_rhs);
+        couplings.push(coupling);
+    }
+    let mut x0 = target;
+    if !factor_in_place(&mut schur, g) {
+        return false;
+    }
+    solve_in_place(&schur, g, &mut x0);
+    for (index, &i) in global.iter().enumerate() {
+        step[block.params[i]] = x0[index];
+    }
+    for (entry_index, (_, entries)) in groups.iter().enumerate() {
+        let m = entries.len();
+        let solved = &solved_groups[entry_index];
+        let coupling = &couplings[entry_index];
+        for row in 0..m {
+            let mut value = solved[row];
+            for column in 0..g {
+                value -= coupling[row * g + column] * x0[column];
+            }
+            step[block.params[entries[row]]] = value;
+        }
+    }
+    true
+}
+
+fn data_diagonal(block: &BlockAcc, data_scale: f64, step_limit: StepLimit) -> Vec<f64> {
+    let n = block.len();
+    if step_limit == StepLimit::PerBlock && block.full_diagonal.len() == n {
+        return block.full_diagonal.clone();
+    }
+    (0..n)
+        .map(|index| block.hessian[index * n + index] * data_scale)
+        .collect()
+}
+
+fn clamp_values(values: &mut [f64], radius: f64) {
+    let largest = values
+        .iter()
+        .filter(|value| value.is_finite())
+        .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+    if largest > radius {
+        let factor = radius / largest;
+        for value in values {
+            *value *= factor;
+        }
+    }
+}
+
+
+/// `-g·δ - 0.5 δᵀBδ` for the undamped model `B = A − damping·diag`.
+fn predicted_reduction(a: &[f64], rhs: &[f64], delta: &[f64], damping_diag: &[f64]) -> f64 {
+    let n = delta.len();
+    let first: f64 = rhs.iter().zip(delta.iter()).map(|(r, d)| r * d).sum();
+    let mut quadratic = 0.0_f64;
     for i in 0..n {
-        step[block.params[i]] = delta[i];
+        let mut row = 0.0_f64;
+        for j in 0..n {
+            row += a[i * n + j] * delta[j];
+        }
+        quadratic += delta[i] * row;
+    }
+    let damped: f64 = (0..n).map(|i| damping_diag[i] * delta[i] * delta[i]).sum();
+    first - 0.5 * (quadratic - damped)
+}
+
+fn clamp_block_step(step: &mut [f64], params: &[usize], radius: f64) {
+    let largest = params
+        .iter()
+        .filter_map(|global| step.get(*global))
+        .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+    if largest > radius {
+        let factor = radius / largest;
+        for global in params {
+            if let Some(value) = step.get_mut(*global) {
+                *value *= factor;
+            }
+        }
     }
 }
 
@@ -2566,6 +4239,14 @@ fn apply_step(params: &mut Params, step: &[f64]) {
     for (index, value) in step.iter().enumerate() {
         if value.is_finite() {
             params.theta[index] += factor * value;
+        }
+    }
+}
+
+fn apply_step_unclamped(params: &mut Params, step: &[f64]) {
+    for (index, value) in step.iter().enumerate() {
+        if value.is_finite() {
+            params.theta[index] += value;
         }
     }
 }
@@ -2701,6 +4382,16 @@ fn residual_gradient(samples: &[ResidualSample]) -> (Vec<f64>, f64) {
     (rhs, rss)
 }
 
+/// Residual smoothness and identity energy matching the residual step's ridge and identity.
+fn residual_cost(layout: &Layout, theta: &[f64], lambda: f64) -> f64 {
+    let residual = &theta[layout.residual.clone()];
+    let smoothness = 2.0 * lambda * residual_penalty_value(residual);
+    let identity = 0.5
+        * identity_weight(BlockKind::Residual)
+        * residual.iter().map(|value| value * value).sum::<f64>();
+    smoothness + identity
+}
+
 fn residual_penalty_value(theta: &[f64]) -> f64 {
     let diagonal = residual_penalty_diagonal();
     let mut value = 0.0;
@@ -2732,12 +4423,106 @@ fn residual_diagonal(samples: &[ResidualSample]) -> Vec<f64> {
     diagonal
 }
 
+fn residual_undamped_apply(
+    samples: &[ResidualSample],
+    v: &[f64],
+    product: &mut [f64],
+    penalty_diagonal: &[f64],
+    ridge: f64,
+    identity: f64,
+    hessian_scale: f64,
+) {
+    product.fill(0.0);
+    for sample in samples {
+        let mut y = [0.0_f64; 3];
+        for (m, node) in sample.nodes.iter().enumerate() {
+            let weight = sample.weights[m];
+            for channel in 0..3 {
+                let value = v[*node as usize * 3 + channel];
+                for (row, slot) in y.iter_mut().enumerate() {
+                    *slot += sample.clip.0[row][channel] * weight * value;
+                }
+            }
+        }
+        for (m, node) in sample.nodes.iter().enumerate() {
+            let weight = sample.weights[m];
+            for channel in 0..3 {
+                let mut gradient = 0.0;
+                for (row, value) in y.iter().enumerate() {
+                    gradient += sample.clip.0[row][channel] * value;
+                }
+                product[*node as usize * 3 + channel] +=
+                    hessian_scale * sample.alpha * weight * gradient;
+            }
+        }
+    }
+    for index in 0..RESIDUAL_COEFS {
+        product[index] += ridge * laplacian_at(v, index, penalty_diagonal);
+        product[index] += (1e-3 + identity) * v[index];
+    }
+}
+
+fn residual_decrement(
+    pass: &PassOutput,
+    layout: &Layout,
+    params: &Params,
+    lambdas: &StageLambdas,
+    data_scale: f64,
+) -> f64 {
+    let theta = &params.theta[layout.residual.clone()];
+    let penalty = residual_penalty_diagonal();
+    let ridge = 2.0 * lam(lambdas, BlockKind::Residual);
+    let identity = identity_weight(BlockKind::Residual);
+    let support = residual_support(&pass.residual_samples);
+    let peak = support.iter().copied().fold(0.0_f64, f64::max);
+    let free: Vec<bool> = support.iter().map(|s| peak > 0.0 && *s >= 1e-4 * peak).collect();
+    let mut rhs = vec![0.0; RESIDUAL_COEFS];
+    let mut diagonal = residual_diagonal(&pass.residual_samples);
+    for i in 0..RESIDUAL_COEFS {
+        if free[i] {
+            rhs[i] = pass.residual_gradient[i]
+                - ridge * laplacian_at(theta, i, &penalty) - identity * theta[i];
+        }
+        diagonal[i] = if free[i] {
+            data_scale * diagonal[i] + ridge * penalty[i] + identity
+        } else {
+            1.0
+        };
+    }
+    let apply = |v: &[f64], product: &mut [f64]| {
+        residual_undamped_apply(
+            &pass.residual_samples, v, product, &penalty, ridge, identity, data_scale,
+        );
+        for i in 0..RESIDUAL_COEFS {
+            product[i] = if free[i] { product[i] - 1e-3 * v[i] } else { v[i] };
+        }
+    };
+    let mut solution = vec![0.0; RESIDUAL_COEFS];
+    crate::solve::conjugate_gradient(
+        RESIDUAL_COEFS, apply, &diagonal, &rhs, &mut solution, 40, 1e-6,
+    );
+    let mut product = vec![0.0; RESIDUAL_COEFS];
+    apply(&solution, &mut product);
+    let error: f64 = product.iter().zip(&rhs).map(|(a, b)| (a - b) * (a - b)).sum();
+    let norm: f64 = rhs.iter().map(|v| v * v).sum();
+    let energy = 0.5 * rhs.iter().zip(solution).map(|(g, z)| g * z).sum::<f64>();
+    if error.is_finite() && error <= 1e-12 * norm.max(1.0)
+        && energy.is_finite() && energy >= 0.0
+    {
+        energy
+    } else {
+        f64::INFINITY
+    }
+}
+
 fn residual_step(
     samples: &[ResidualSample],
+    full_gradient: &[f64],
     theta: &[f64],
     lambda: f64,
     damping: f64,
     hessian_scale: f64,
+    step_limit: StepLimit,
 ) -> Vec<f64> {
     let dim = RESIDUAL_COEFS;
     let penalty_diagonal = residual_penalty_diagonal();
@@ -2745,7 +4530,7 @@ fn residual_step(
         .into_iter()
         .map(|value| value * hessian_scale)
         .collect();
-    let (mut rhs, _) = residual_gradient(samples);
+    let mut rhs = full_gradient.to_vec();
     // The objective is `lambda * theta' P theta`, so the ridge matrix is 2 * lambda * P.
     let ridge = 2.0 * lambda;
     let identity = identity_weight(BlockKind::Residual);
@@ -2760,34 +4545,17 @@ fn residual_step(
     crate::solve::conjugate_gradient(
         dim,
         |v, product| {
-            product.fill(0.0);
-            for sample in samples {
-                let mut y = [0.0_f64; 3];
-                for (m, node) in sample.nodes.iter().enumerate() {
-                    let weight = sample.weights[m];
-                    for channel in 0..3 {
-                        let value = v[*node as usize * 3 + channel];
-                        for (row, slot) in y.iter_mut().enumerate() {
-                            *slot += sample.clip.0[row][channel] * weight * value;
-                        }
-                    }
-                }
-                for (m, node) in sample.nodes.iter().enumerate() {
-                    let weight = sample.weights[m];
-                    for channel in 0..3 {
-                        let mut gradient = 0.0;
-                        for (row, value) in y.iter().enumerate() {
-                            gradient += sample.clip.0[row][channel] * value;
-                        }
-                        product[*node as usize * 3 + channel] +=
-                            hessian_scale * sample.alpha * weight * gradient;
-                    }
-                }
-            }
+            residual_undamped_apply(
+                samples,
+                v,
+                product,
+                &penalty_diagonal,
+                ridge,
+                identity,
+                hessian_scale,
+            );
             for index in 0..dim {
-                product[index] += ridge * laplacian_at(v, index, &penalty_diagonal);
-                product[index] +=
-                    (damping * data_diagonal[index].max(1e-9) + 1e-3 + identity) * v[index];
+                product[index] += damping * data_diagonal[index].max(1e-9) * v[index];
             }
         },
         &diagonal,
@@ -2796,6 +4564,9 @@ fn residual_step(
         40,
         1e-6,
     );
+    if step_limit == StepLimit::PerBlock {
+        clamp_values(&mut solution, STEP_RADIUS);
+    }
     solution
 }
 
@@ -2812,6 +4583,98 @@ mod review_tests {
         assert!(!accepted(100.0, 100.1));
         assert!(!accepted(100.0, f64::NAN));
         assert!(!accepted(100.0, f64::INFINITY));
+    }
+
+    #[test]
+    fn decrement_is_invariant_to_coordinate_units() {
+        let energy = undamped_decrement(vec![4.0], &[2.0]);
+        let rescaled = undamped_decrement(vec![4.0 * 57.3 * 57.3], &[2.0 * 57.3]);
+        assert!((energy - 0.5).abs() < 1e-12);
+        assert!((energy - rescaled).abs() < 1e-12);
+        assert!(undamped_decrement(vec![0.0], &[2.0]).is_infinite());
+    }
+
+    #[cfg(feature = "synth")]
+    #[test]
+    fn tiny_damped_steps_do_not_certify_stationarity() {
+        let data = crate::synth::dataset(&crate::synth::SynthConfig {
+            images: 2,
+            samples_per_image: 16,
+            ..crate::synth::SynthConfig::default()
+        });
+        let options = FitOptions::default();
+        let problem = Problem::new_with(&data.images, None, &options).expect("problem");
+        let layout = &problem.layout;
+        let mut params = initial_params(&problem);
+        params.theta[layout.tone_c0] = 0.0;
+        let mut block = BlockAcc::new(BlockKind::Tone, vec![layout.tone_c0], layout.total);
+        block.hessian[0] = 4.0;
+        block.full_diagonal[0] = 4.0;
+        block.gradient[0] = 2.0;
+        let penalty = vec![0.0];
+        let roles = prior_roles(&problem, layout);
+        let (prior_gradient, prior_curvature) =
+            prior_terms(&problem, &roles, &params, &options, &block);
+        let mut step = vec![0.0; layout.total];
+        solve_block(
+            layout, &block, &mut step, &penalty, &prior_gradient, &prior_curvature,
+            &params, &options.initial_lambdas, 1e12, 1.0, StepLimit::PerBlock,
+        );
+        assert!(step[layout.tone_c0].abs() < 1e-9);
+        let pass = problem.pass(
+            &params, ActiveColumns::ALL, &mut [], false, false, false, IntentFilter::NativeOnly,
+        );
+        let decrement = stationarity_decrement(
+            layout, &problem, &params, &options, &[block], &[penalty],
+            &options.initial_lambdas, &roles, &pass, 1.0,
+        );
+        assert!(converged(&[100.0; 5]));
+        assert!(decrement > STATIONARY_DECREMENT_NATS);
+    }
+
+    #[cfg(feature = "synth")]
+    #[test]
+    fn coupled_curvature_retains_cross_layer_products() {
+        let data = crate::synth::dataset(&crate::synth::SynthConfig {
+            images: 2,
+            samples_per_image: 16,
+            ..crate::synth::SynthConfig::default()
+        });
+        let options = FitOptions::default();
+        let problem = Problem::new_with(&data.images, None, &options).expect("problem");
+        let layout = &problem.layout;
+        let mut params = initial_params(&problem);
+        let globals = [layout.tone_c0, layout.tint_a.start];
+        let mut blocks = [
+            BlockAcc::new(BlockKind::Tone, vec![globals[0]], layout.total),
+            BlockAcc::new(BlockKind::Tint, vec![globals[1]], layout.total),
+        ];
+        for (i, block) in blocks.iter_mut().enumerate() {
+            params.theta[globals[i]] = 0.0;
+            let derivative = (i + 2) as f64;
+            block.hessian[0] = derivative * derivative;
+            block.full_diagonal[0] = derivative * derivative;
+            block.gradient[0] = -derivative;
+        }
+        let mut pass = problem.pass(
+            &params, ActiveColumns::ALL, &mut [], false, false, false, IntentFilter::NativeOnly,
+        );
+        pass.coupled_rows = vec![crate::problem::HessianRow {
+            columns: vec![(globals[0] as u32, [2.0, 0.0, 0.0]),
+                (globals[1] as u32, [3.0, 0.0, 0.0])],
+            weight: 1.0,
+        }];
+        let system = CoupledSystem::new(
+            layout, &problem, &params, &options, &blocks, &[vec![0.0], vec![0.0]],
+            &options.initial_lambdas, &prior_roles(&problem, layout), &pass, 1.0, 0.0,
+        ).expect("positive definite curvature");
+        let solution = system.solve().expect("resolved coupled solve");
+        assert!((5.0 * solution[0] + 6.0 * solution[1] - 2.0).abs() < 1e-10);
+        assert!((6.0 * solution[0] + 9.25 * solution[1] - 3.0).abs() < 1e-10);
+        let lower_bound = system.energy_lower_bound();
+        let energy = 0.5 * crate::solve::dot(&system.rhs, &solution);
+        assert!(lower_bound > STATIONARY_DECREMENT_NATS);
+        assert!(lower_bound <= energy + 1e-12);
     }
 
     #[test]
@@ -2898,5 +4761,253 @@ mod review_tests {
         for value in &applied {
             assert_eq!(*value, identity_weight(BlockKind::G));
         }
+    }
+
+    #[test]
+    fn gcv_fixed_priors_resolve_the_exposure_mode_gauge() {
+        // Rows for two image exposures plus their shared mode offset, and one tone coefficient.
+        // The exposure/mode columns have the null vector [1, 1, -1, 0].
+        let n = 4;
+        let rows = [
+            [1.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 2.0],
+        ];
+        let mut hessian = vec![0.0_f64; n * n];
+        for row in rows {
+            for i in 0..n {
+                for j in 0..n {
+                    hessian[i * n + j] += row[i] * row[j];
+                }
+            }
+        }
+        let mut penalty = vec![0.0_f64; n * n];
+        penalty[3 * n + 3] = 1.0;
+        let gradient = vec![0.2, -0.2, 0.0, 0.3];
+        let theta0 = vec![0.3, 0.4, 0.5, 0.2];
+        let precision = 1.0 / (0.3 * 0.3);
+        let fixed_curvature = vec![precision, precision, precision, 1.0];
+        let fixed_gradient: Vec<f64> = fixed_curvature
+            .iter()
+            .zip(theta0.iter())
+            .map(|(curvature, theta)| curvature * theta)
+            .collect();
+        let choice = select_lambda(
+            &hessian,
+            &fixed_curvature,
+            &penalty,
+            &gradient,
+            &fixed_gradient,
+            &theta0,
+            0.5,
+            n,
+            100.0,
+            4,
+            7,
+        );
+        assert!(choice.lambda.is_finite() && choice.lambda > 0.0);
+    }
+
+}
+
+#[cfg(test)]
+mod schur_tests {
+    use super::*;
+
+    struct NuisanceSystem {
+        layout: Layout,
+        params: Params,
+        block: BlockAcc,
+        penalty: Vec<f64>,
+        prior_gradient: Vec<f64>,
+        prior_curvature: Vec<f64>,
+        gradient: Vec<f64>,
+    }
+
+    fn nuisance_system(cross_image: f64) -> NuisanceSystem {
+        let layout = Layout::new(3, 1, 0);
+        let mut globals = Vec::new();
+        for image in 0..3 {
+            globals.extend(layout.image(image));
+        }
+        globals.push(layout.modes.start);
+        globals.push(layout.clip);
+        let n = globals.len();
+        let mut hessian = vec![0.0_f64; n * n];
+        for i in 0..n {
+            hessian[i * n + i] = 40.0 + i as f64;
+        }
+        let mode_local = globals
+            .iter()
+            .position(|global| *global == layout.modes.start)
+            .expect("mode offset is in the block");
+        let clip_local = globals
+            .iter()
+            .position(|global| *global == layout.clip)
+            .expect("clip parameter is in the block");
+        for image in 0..3 {
+            let base = image * 3;
+            for a in 0..3 {
+                for b in a + 1..3 {
+                    let value = 0.05 * (a + b + image + 1) as f64;
+                    hessian[(base + a) * n + base + b] = value;
+                    hessian[(base + b) * n + base + a] = value;
+                }
+                for global in [mode_local, clip_local] {
+                    let value = 0.12 * (a + 1) as f64 + 0.01 * image as f64;
+                    hessian[(base + a) * n + global] = value;
+                    hessian[global * n + base + a] = value;
+                }
+            }
+        }
+        hessian[mode_local * n + clip_local] = 0.2;
+        hessian[clip_local * n + mode_local] = 0.2;
+        hessian[3] += cross_image;
+        hessian[3 * n] += cross_image;
+
+        let mut params = Params::initial(layout.clone(), 0);
+        for (index, global) in globals.iter().enumerate() {
+            params.theta[*global] = 0.13 * index as f64 - 0.35;
+        }
+        let gradient: Vec<f64> = (0..n).map(|i| ((i * 7) % 5) as f64 * 0.1 - 0.2).collect();
+        let penalty: Vec<f64> = (0..n * n)
+            .map(|index| if index / n == index % n { 0.5 } else { 0.0 })
+            .collect();
+        let prior_curvature: Vec<f64> = (0..n).map(|i| 0.4 + 0.1 * i as f64).collect();
+        let prior_gradient: Vec<f64> = (0..n).map(|i| ((i * 3) % 7) as f64 * 0.03 - 0.05).collect();
+        let mut block = BlockAcc::new(BlockKind::Nuisance, globals, layout.total);
+        block.hessian = hessian;
+        block.gradient = gradient.clone();
+        NuisanceSystem {
+            layout,
+            params,
+            block,
+            penalty,
+            prior_gradient,
+            prior_curvature,
+            gradient,
+        }
+    }
+
+    fn dense_solution(system: &NuisanceSystem, lambda: f64) -> Vec<f64> {
+        let mut block = BlockAcc::new(
+            BlockKind::Tone,
+            system.block.params.clone(),
+            system.layout.total,
+        );
+        block.hessian = system.block.hessian.clone();
+        block.gradient = system.gradient.clone();
+        let (mut a, rhs) = block_system(
+            &system.layout,
+            &block,
+            &system.penalty,
+            &system.prior_gradient,
+            &system.prior_curvature,
+            &system.params,
+            lambda,
+            1e-3,
+            1.0,
+            StepLimit::WholeStep,
+        );
+        let n = block.len();
+        assert!(factor_in_place(&mut a, n));
+        let mut delta = rhs;
+        solve_in_place(&a, n, &mut delta);
+        delta
+    }
+
+    #[test]
+    fn nuisance_schur_matches_dense_solve_with_priors_and_shared_couplings() {
+        let system = nuisance_system(0.0);
+        let lambda = 0.9;
+        let mut dense_block = BlockAcc::new(
+            BlockKind::Tone,
+            system.block.params.clone(),
+            system.layout.total,
+        );
+        dense_block.hessian = system.block.hessian.clone();
+        dense_block.gradient = system.gradient.clone();
+        let (a, rhs) = block_system(
+            &system.layout,
+            &dense_block,
+            &system.penalty,
+            &system.prior_gradient,
+            &system.prior_curvature,
+            &system.params,
+            lambda,
+            1e-3,
+            1.0,
+            StepLimit::WholeStep,
+        );
+        let dense = dense_solution(&system, lambda);
+        let mut schur = vec![0.0_f64; system.layout.total];
+        assert!(solve_nuisance_schur(
+            &system.layout,
+            &system.block,
+            &a,
+            &rhs,
+            &mut schur
+        ));
+        for (local, global) in system.block.params.iter().enumerate() {
+            assert!(
+                (dense[local] - schur[*global]).abs() < 1e-9,
+                "index {global}: {} vs {}",
+                dense[local],
+                schur[*global]
+            );
+        }
+    }
+
+    #[test]
+    fn nuisance_schur_dispatches_from_the_block_solve() {
+        let system = nuisance_system(0.0);
+        let dense = dense_solution(&system, 0.0);
+        let mut step = vec![0.0_f64; system.layout.total];
+        solve_block(
+            &system.layout,
+            &system.block,
+            &mut step,
+            &system.penalty,
+            &system.prior_gradient,
+            &system.prior_curvature,
+            &system.params,
+            &StageLambdas::default(),
+            1e-3,
+            1.0,
+            StepLimit::WholeStep,
+        );
+        for (local, global) in system.block.params.iter().enumerate() {
+            assert!(
+                (dense[local] - step[*global]).abs() < 1e-9,
+                "index {global}: {} vs {}",
+                dense[local],
+                step[*global]
+            );
+        }
+    }
+
+    #[test]
+    fn nuisance_schur_falls_back_without_independent_image_blocks() {
+        let system = nuisance_system(0.5);
+        let (a, rhs) = block_system(
+            &system.layout,
+            &system.block,
+            &system.penalty,
+            &system.prior_gradient,
+            &system.prior_curvature,
+            &system.params,
+            0.9,
+            1e-3,
+            1.0,
+            StepLimit::WholeStep,
+        );
+        let mut step = vec![0.0_f64; system.layout.total];
+        assert!(!solve_nuisance_schur(
+            &system.layout,
+            &system.block,
+            &a,
+            &rhs,
+            &mut step
+        ));
     }
 }

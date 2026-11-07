@@ -9,7 +9,7 @@ use crate::proposal_form::{self, FixtureFile};
 use crate::{data, files};
 
 const EXAMPLE_FILES: &str = "\
-classic_chrome FilmMode=0x0700
+classic_chrome FilmMode=0x0600
 provia FilmMode=0x0000
 acros FilmMode=0x0500 GrainSize=0x0002";
 
@@ -104,26 +104,29 @@ pub fn ProposePage() -> impl IntoView {
     let labeled = RwSignal::new(Vec::<MenuFileDraft>::new());
     let read_mapping = Callback::new(move |selected| {
         spawn_local(async move {
-            match files::read_files(selected).await {
-                Ok(read) => {
-                    let mut parsed = Vec::new();
-                    for file in read {
-                        match proposal_form::file_menu_value(&file.bytes) {
-                            Ok(tags) => parsed.push(MenuFileDraft {
-                                name: file.name,
-                                answer: String::new(),
-                                parsed_values: tags.replace('\n', " "),
-                            }),
-                            Err(error) => {
-                                message.set(Some(error));
-                                return;
-                            }
-                        }
+            let read = files::selected_files(selected);
+            let mut parsed = Vec::new();
+            for file in read {
+                let bytes = match file.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        message.set(Some(error));
+                        return;
                     }
-                    labeled.set(parsed);
+                };
+                match proposal_form::file_menu_value(&bytes) {
+                    Ok(tags) => parsed.push(MenuFileDraft {
+                        name: file.name().to_owned(),
+                        answer: String::new(),
+                        parsed_values: tags.replace('\n', " "),
+                    }),
+                    Err(error) => {
+                        message.set(Some(error));
+                        return;
+                    }
                 }
-                Err(error) => message.set(Some(error)),
             }
+            labeled.set(parsed);
         });
     });
     let query = leptos_router::hooks::use_query_map();
@@ -223,24 +226,28 @@ pub fn ProposePage() -> impl IntoView {
 
     let on_fixtures = Callback::new(move |selected| {
         spawn_local(async move {
-            match files::read_files(selected).await {
-                Ok(read) => {
-                    let mut parsed = Vec::with_capacity(read.len());
-                    for file in read {
-                        match FixtureFile::new(file.name, file.bytes) {
-                            Ok(file) => parsed.push(file),
-                            Err(error) => {
-                                message.set(Some(error));
-                                return;
-                            }
-                        }
+            let read = files::selected_files(selected);
+            let mut parsed = Vec::with_capacity(read.len());
+            for file in read {
+                let name = file.name().to_owned();
+                let bytes = match file.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        message.set(Some(error));
+                        return;
                     }
-                    let flags = vec![false; parsed.len()];
-                    fixture_files.set(parsed);
-                    consented.set(flags);
+                };
+                match FixtureFile::new(name, bytes) {
+                    Ok(file) => parsed.push(file),
+                    Err(error) => {
+                        message.set(Some(error));
+                        return;
+                    }
                 }
-                Err(error) => message.set(Some(error)),
             }
+            let flags = vec![false; parsed.len()];
+            fixture_files.set(parsed);
+            consented.set(flags);
         });
     });
 
@@ -549,7 +556,7 @@ pub fn ProposePage() -> impl IntoView {
                             crate::base::site_url(&format!("/proposals/{}", proposal.id.as_str()));
                         view! {
                             <div class="valid">
-                                <p>"Submitted. It is now in the moderation queue."</p>
+                                <p>"Submitted. It is now in the review queue."</p>
                                 <a id="submitted-link" href=href>"Open the proposal"</a>
                             </div>
                         }

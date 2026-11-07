@@ -19,6 +19,7 @@ getrandom.workspace = true
 [dev-dependencies]
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 wasm-bindgen-test.workspace = true
 
 [lints]

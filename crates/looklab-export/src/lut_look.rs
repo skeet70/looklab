@@ -7,14 +7,14 @@
 
 use looklab_color::cam16::ViewingConditions;
 use looklab_color::{Mat3, Rgb, RgbSpace, Xyz};
-use looklab_fit::{FitImage, FitOptions, fit};
+use looklab_fit::{FitImage, FitOptions, ProbeUncertainty, fit};
 use looklab_model::baseline::{is_neutral_baseline, neutral_baseline_srgb_v1};
 use looklab_model::file::{
     BaseReference, DeclaredEncoding, LutData, LutDefinition, LutRecord, OutputEncoding,
 };
 use looklab_model::probes;
 use looklab_model::{
-    ClipFunction, ClipSettings, LookDocument, LookIdentity, ModelError, ProbeCovariance,
+    ClipFunction, ClipSettings, Density, LookDocument, LookIdentity, ModelError, ProbeCovariance,
     ProbeScalars, UncertaintyData,
 };
 use looklab_samples::{
@@ -136,7 +136,17 @@ pub fn import_lut_look(
         ));
     }
     let fitted = fit_composed(&cube.lut, &definition, base_look, options)?;
-    let document = LookDocument::from_lut_definition(identity, fitted.look, definition, lut)?;
+    let mut document = LookDocument::from_lut_definition(identity, fitted.look, definition, lut)?;
+    let base = pinned_base_document(&document, base_look);
+    document = compose_uncertainty(
+        document,
+        base,
+        &ApproximationUncertainty {
+            probes: &fitted.probes,
+            support: &fitted.support,
+        },
+        SUPPORT_SIGMA,
+    )?;
     let report = approximation_error(&document, base_look, &fitted.support)?;
     Ok(LutLookImport {
         document,
@@ -147,9 +157,34 @@ pub fn import_lut_look(
     })
 }
 
+/// Support threshold on inherited post-clip σ, in ΔE.
+const SUPPORT_SIGMA: f64 = 1.5;
+
 struct ComposedFit {
     look: looklab_model::Look,
     support: Vec<bool>,
+    probes: ProbeUncertainty,
+}
+
+struct ApproximationUncertainty<'a> {
+    probes: &'a ProbeUncertainty,
+    support: &'a [bool],
+}
+
+/// The measured base a pinned display-referred definition evaluates against.
+/// The neutral baseline is a fixed standard with zero uncertainty.
+fn pinned_base_document<'a>(
+    document: &LookDocument,
+    base_look: Option<&'a LookDocument>,
+) -> Option<&'a LookDocument> {
+    let definition = document.file.definition.as_ref()?;
+    let DeclaredEncoding::DisplayReferred { base, status } = &definition.encoding else {
+        return None;
+    };
+    if !status.is_pinned() || is_neutral_baseline(base) {
+        return None;
+    }
+    base_look
 }
 
 struct FitSamples {
@@ -165,14 +200,27 @@ fn fit_composed(
 ) -> Result<ComposedFit> {
     let points = sample_points(options.seed);
     let samples = fit_result(&points, lut, definition, base_look, options)?;
-    let mut look = samples.result.look.clone();
+    let FitSamples {
+        result,
+        informative,
+    } = samples;
+    let looklab_fit::FitResult {
+        mut look,
+        realization,
+        probes,
+        ..
+    } = result;
     look.clip = ClipSettings {
         function: ClipFunction::TanhSoftV1,
-        k: samples.result.realization.clip_k,
+        k: realization.clip_k,
     };
     look.validate()?;
-    let support = probe_support(&samples.informative, points.len(), options.density_floor);
-    Ok(ComposedFit { look, support })
+    let support = probe_support(&informative, points.len(), options.density_floor);
+    Ok(ComposedFit {
+        look,
+        support,
+        probes,
+    })
 }
 
 /// Probe support from the sample density in `(s, h_in, sqrt(C_in))` (docs/02 §5).
@@ -203,8 +251,24 @@ fn fit_result(
     let mut density = Vec::with_capacity(points.len());
     let mut flags = Vec::with_capacity(points.len());
     let mut informative = Vec::new();
+    let mut neutral_s = Vec::new();
+    let mut neutral_j = Vec::new();
     for xyz in points {
         let encoded = composed_encoded(lut, definition, base_look, *xyz)?;
+        let input = looklab_model::LookInput::new(*xyz);
+        if input.c_in <= 0.1 {
+            if neutral_s.len() < 3 {
+                eprintln!(
+                    "neutral point y {:.6} s {:.3} encoded {:?} j {:.3}",
+                    xyz.y,
+                    input.s,
+                    encoded,
+                    looklab_ucs(encoded).j
+                );
+            }
+            neutral_s.push(input.s);
+            neutral_j.push(looklab_ucs(encoded).j);
+        }
         let linear = linear_from_encoded(encoded);
         if [linear.r, linear.g, linear.b]
             .iter()
@@ -249,19 +313,55 @@ fn fit_result(
         exposure_mode_prior_sd: 1.0e-6,
         density_floor: options.density_floor,
         min_probe_clusters: 1,
-        support_sigma: 1.5,
+        support_sigma: SUPPORT_SIGMA,
         identity_scale: 0.0,
         prior_floor: false,
-        run_gcv: true,
+        run_gcv: false,
+        initial_lambdas: looklab_fit::StageLambdas {
+            tone: 0.1,
+            tint: 0.01,
+            grl: 0.1,
+            residual: 1.0,
+            ..Default::default()
+        },
         fit_residual: true,
         recipe_sweeps: 0,
         ..FitOptions::default()
     };
-    let result = fit(std::slice::from_ref(&image), &fit_options)?;
+    let result = match neutral_tone_look(&neutral_s, &neutral_j) {
+        Some(initial) => looklab_fit::fit_with_initial(
+            std::slice::from_ref(&image),
+            &fit_options,
+            &initial,
+        )?,
+        None => fit(std::slice::from_ref(&image), &fit_options)?,
+    };
     Ok(FitSamples {
         result,
         informative,
     })
+}
+
+/// Starting Look for the seeded fit.
+fn neutral_tone_look(s: &[f64], j_prime: &[f64]) -> Option<looklab_model::Look> {
+    if s.len() < 32 {
+        return None;
+    }
+    let tone = looklab_model::Tone::from_neutral_samples(s, j_prime).ok()?;
+    eprintln!(
+        "seed samples s {:?} j {:?}",
+        s.iter().take(5).collect::<Vec<_>>(),
+        j_prime.iter().take(5).collect::<Vec<_>>()
+    );
+    eprintln!(
+        "seed samples tail s {:?} j {:?}",
+        s.iter().rev().take(5).collect::<Vec<_>>(),
+        j_prime.iter().rev().take(5).collect::<Vec<_>>()
+    );
+    eprintln!("seed tone {tone:?} from {} neutral samples", s.len());
+    let mut look = looklab_model::Look::colorimetric_spline().ok()?;
+    look.tone = tone;
+    Some(look)
 }
 
 /// The composed target appearance of `xyz`, before the output clip.
@@ -363,16 +463,6 @@ fn looklab_ucs(encoded: Rgb) -> looklab_color::ucs::Ucs {
     looklab_model::solve::ucs_of_xyz(RgbSpace::Srgb.rgb_linear_to_xyz(linear))
 }
 
-fn soft_clip(value: f64, k: f64) -> f64 {
-    if value > 1.0 - k {
-        (1.0 - k) + k * libm::tanh((value - (1.0 - k)) / k)
-    } else if value < k {
-        k - k * libm::tanh((k - value) / k)
-    } else {
-        value
-    }
-}
-
 fn sample_points(seed: u64) -> Vec<Xyz> {
     let white = ViewingConditions::reference().white;
     let mut points = Vec::new();
@@ -450,7 +540,16 @@ fn approximation_error(
         }
         let target = composed_ucs(&lut, definition, base_look, probe.xyz)?;
         let pre = document.look.eval(probe.xyz);
-        if clip_derivative_min(pre, document.look.clip.k) >= 0.25 {
+        let reliable = match document
+            .uncertainty
+            .probe_pre_reliable
+            .as_ref()
+            .and_then(|values| values.values.get(index))
+        {
+            Some(value) => *value > 0.5,
+            None => clip_derivative_min(pre, document.look.clip.k) >= 0.25,
+        };
+        if reliable {
             pre_clip_identified += 1;
         }
         let actual = document.look.output_encode(pre, RgbSpace::Srgb);
@@ -568,12 +667,18 @@ fn summarize(mut values: Vec<f64>) -> DeltaSummary {
     }
 }
 
-/// Propagates encoded-space base covariance through the stored LUT to appearance
-/// covariance, and marks probes above the normal support threshold as unsupported.
-pub fn with_base_covariance(
-    document: &LookDocument,
-    base_encoded_covariance: &[[f64; 9]],
-    base_look: Option<&LookDocument>,
+/// Encoded-code perturbation for the composed Jacobians.
+const COVARIANCE_EPSILON: f64 = 1.0e-4;
+
+/// Variance stored for a probe whose uncertainty is missing or non-finite.
+/// The support mask keeps it out of matching.
+const UNKNOWN_VARIANCE: f64 = 1.0e30;
+
+/// Composes the fit's per-probe uncertainty with an optional measured base.
+fn compose_uncertainty(
+    document: LookDocument,
+    base: Option<&LookDocument>,
+    approximation: &ApproximationUncertainty<'_>,
     support_sigma: f64,
 ) -> Result<LookDocument> {
     let definition = document
@@ -581,61 +686,250 @@ pub fn with_base_covariance(
         .definition
         .as_ref()
         .ok_or(LutLookError::Unsupported("missing definition"))?;
-    let lut = lut3d(document)?;
+    let lut = lut3d(&document)?;
     let probe_set = probes::v1();
-    if base_encoded_covariance.len() != probe_set.probes.len() {
-        return Err(LutLookError::Unsupported("base covariance length"));
-    }
-    let mut values = Vec::with_capacity(probe_set.probes.len() * 9);
-    let mut support = Vec::with_capacity(probe_set.probes.len());
-    const EPSILON: f64 = 1.0e-4;
-    for (probe, covariance) in probe_set.probes.iter().zip(base_encoded_covariance) {
-        let center = base_encoded_for(definition, base_look, probe.xyz)?;
-        let mut jacobian = [[0.0_f64; 3]; 3];
-        for axis in 0..3 {
-            let mut low = center.to_array();
-            let mut high = center.to_array();
-            low[axis] -= EPSILON;
-            high[axis] += EPSILON;
-            let low = composed_from_code(&lut, definition, Rgb::from_array(low))?;
-            let high = composed_from_code(&lut, definition, Rgb::from_array(high))?;
-            jacobian[0][axis] = (high.j - low.j) / (2.0 * EPSILON);
-            jacobian[1][axis] = (high.a - low.a) / (2.0 * EPSILON);
-            jacobian[2][axis] = (high.b - low.b) / (2.0 * EPSILON);
-        }
-        let cov = [
-            [covariance[0], covariance[1], covariance[2]],
-            [covariance[3], covariance[4], covariance[5]],
-            [covariance[6], covariance[7], covariance[8]],
-        ];
-        let mut out = [[0.0_f64; 3]; 3];
-        for row in 0..3 {
-            for column in 0..3 {
-                let mut total = 0.0;
-                for i in 0..3 {
-                    for j in 0..3 {
-                        total += jacobian[row][i] * cov[i][j] * jacobian[column][j];
-                    }
-                }
-                out[row][column] = total;
-            }
-        }
-        let variance = out[0][0].max(0.0) + out[1][1].max(0.0) + out[2][2].max(0.0);
-        support.push(if variance.sqrt() <= support_sigma {
+    let count = probe_set.probes.len();
+    let mut covariance = Vec::with_capacity(count * 9);
+    let mut sigma_post = Vec::with_capacity(count);
+    let mut support = Vec::with_capacity(count);
+    let mut pre_reliable = Vec::with_capacity(count);
+    let mut density = Vec::with_capacity(count);
+    for (index, probe) in probe_set.probes.iter().enumerate() {
+        let estimate = approximation.probes.probes.get(index);
+        let fit_covariance = estimate.and_then(|estimate| {
+            covariance_is_finite(estimate.post_covariance).then_some(estimate.post_covariance)
+        });
+        let fit_supported = estimate.is_some_and(|estimate| estimate.supported)
+            && approximation.support.get(index).copied().unwrap_or(false);
+        let fit_reliable = estimate.is_some_and(|estimate| estimate.pre_clip_reliable);
+        let fit_density = estimate
+            .map(|estimate| estimate.density)
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        let inherited = base.and_then(|base| {
+            base_probe_covariance(base, index).and_then(|(values, post_clip)| {
+                let appearance = if post_clip {
+                    base.look
+                        .output_encode(base.look.eval(probe.xyz), RgbSpace::Srgb)
+                } else {
+                    base.look.eval(probe.xyz)
+                };
+                let encoded = encoded_jacobian(base, appearance, post_clip)?;
+                let encoded_covariance = sandwich(encoded, values)?;
+                let center = base_encoded_for(definition, Some(base), probe.xyz).ok()?;
+                let jacobian = lut_jacobian(&lut, definition, center)?;
+                sandwich(jacobian, encoded_covariance)
+            })
+        });
+        let total = match (base.is_some(), inherited, fit_covariance) {
+            (true, Some(inherited), Some(fit)) => sum_covariance(inherited, fit),
+            (false, _, Some(fit)) => Some(fit),
+            _ => None,
+        };
+        let known = total.is_some();
+        let total = total.unwrap_or_else(unknown_covariance);
+        let sigma = sigma_of(&total).unwrap_or(f64::MAX);
+        let base_supported = base.is_none_or(|base| {
+            base.uncertainty
+                .support
+                .as_ref()
+                .and_then(|mask| mask.values.get(index))
+                .is_none_or(|value| *value > 0.5)
+        });
+        let accepted = known && fit_supported && base_supported && sigma <= support_sigma;
+        support.push(if accepted { 1.0 } else { 0.0 });
+        sigma_post.push(sigma);
+        let base_reliable = base.is_none_or(|base| {
+            base.uncertainty
+                .probe_pre_reliable
+                .as_ref()
+                .and_then(|values| values.values.get(index))
+                .is_some_and(|value| *value > 0.5)
+        });
+        pre_reliable.push(if base_reliable && fit_reliable {
             1.0
         } else {
             0.0
         });
-        for row in &out {
-            values.extend_from_slice(row);
+        density.push(
+            base.and_then(|base| {
+                base.uncertainty
+                    .density
+                    .as_ref()
+                    .and_then(|density| density.values.get(index))
+                    .copied()
+            })
+            .or(fit_density)
+            .unwrap_or(0.0),
+        );
+        for row in &total {
+            covariance.extend_from_slice(row);
         }
     }
     let uncertainty = UncertaintyData {
-        probe_cov: Some(ProbeCovariance::new(probe_set.probes.len(), values)?),
+        probe_cov_post: Some(ProbeCovariance::new(count, covariance)?),
+        probe_sigma_post: Some(ProbeScalars::new(sigma_post)?),
+        probe_pre_reliable: Some(ProbeScalars::new(pre_reliable)?),
         support: Some(ProbeScalars::new(support)?),
+        density: Some(Density::new(density)?),
         ..UncertaintyData::default()
     };
-    Ok(document.clone().with_uncertainty(uncertainty)?)
+    Ok(document.with_uncertainty(uncertainty)?)
+}
+
+fn sum_covariance(left: [[f64; 3]; 3], right: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    let mut out = left;
+    add_covariance(&mut out, right);
+    covariance_is_finite(out).then_some(out)
+}
+
+/// Whether the covariance describes post-clip appearance; a pre-clip covariance
+/// is used only where the base marks the pre-clip value identifiable.
+fn base_probe_covariance(base: &LookDocument, index: usize) -> Option<([[f64; 3]; 3], bool)> {
+    let uncertainty = &base.uncertainty;
+    if let Some(covariance) = &uncertainty.probe_cov_post {
+        return covariance_at(covariance, index).map(|values| (values, true));
+    }
+    let reliable = uncertainty
+        .probe_pre_reliable
+        .as_ref()
+        .and_then(|values| values.values.get(index))
+        .is_some_and(|value| *value > 0.5);
+    if !reliable {
+        return None;
+    }
+    uncertainty
+        .probe_cov
+        .as_ref()
+        .and_then(|covariance| covariance_at(covariance, index))
+        .map(|values| (values, false))
+}
+
+fn covariance_at(covariance: &ProbeCovariance, index: usize) -> Option<[[f64; 3]; 3]> {
+    let start = index.checked_mul(9)?;
+    let values = covariance.values.get(start..start + 9)?;
+    let mut out = [[0.0_f64; 3]; 3];
+    for row in 0..3 {
+        for column in 0..3 {
+            out[row][column] = values[row * 3 + column];
+        }
+    }
+    covariance_is_finite(out).then_some(out)
+}
+
+/// Derivative of the base's encoded RGB output with respect to its appearance,
+/// before or after the base's output clip.
+fn encoded_jacobian(
+    base: &LookDocument,
+    appearance: looklab_color::ucs::Ucs,
+    post_clip: bool,
+) -> Option<[[f64; 3]; 3]> {
+    let mut jacobian = [[0.0_f64; 3]; 3];
+    for axis in 0..3 {
+        let mut low = [appearance.j, appearance.a, appearance.b];
+        let mut high = low;
+        low[axis] -= COVARIANCE_EPSILON;
+        high[axis] += COVARIANCE_EPSILON;
+        let low = encoded_code(
+            base,
+            looklab_color::ucs::Ucs::new(low[0], low[1], low[2]),
+            post_clip,
+        );
+        let high = encoded_code(
+            base,
+            looklab_color::ucs::Ucs::new(high[0], high[1], high[2]),
+            post_clip,
+        );
+        if !low.iter().chain(high.iter()).all(|value| value.is_finite()) {
+            return None;
+        }
+        for row in 0..3 {
+            jacobian[row][axis] = (high[row] - low[row]) / (2.0 * COVARIANCE_EPSILON);
+        }
+    }
+    covariance_is_finite(jacobian).then_some(jacobian)
+}
+
+fn encoded_code(
+    base: &LookDocument,
+    appearance: looklab_color::ucs::Ucs,
+    post_clip: bool,
+) -> [f64; 3] {
+    let appearance = if post_clip {
+        appearance
+    } else {
+        base.look.output_encode(appearance, RgbSpace::Srgb)
+    };
+    let linear = RgbSpace::Srgb.xyz_to_rgb_linear(ucs_to_xyz(appearance));
+    [
+        RgbSpace::Srgb.encode(linear.r),
+        RgbSpace::Srgb.encode(linear.g),
+        RgbSpace::Srgb.encode(linear.b),
+    ]
+}
+
+/// Derivative of the composed appearance with respect to the LUT's input code.
+fn lut_jacobian(lut: &Lut3d, definition: &LutDefinition, center: Rgb) -> Option<[[f64; 3]; 3]> {
+    let mut jacobian = [[0.0_f64; 3]; 3];
+    for axis in 0..3 {
+        let mut low = center.to_array();
+        let mut high = center.to_array();
+        low[axis] -= COVARIANCE_EPSILON;
+        high[axis] += COVARIANCE_EPSILON;
+        let low = composed_from_code(lut, definition, Rgb::from_array(low)).ok()?;
+        let high = composed_from_code(lut, definition, Rgb::from_array(high)).ok()?;
+        let low = [low.j, low.a, low.b];
+        let high = [high.j, high.a, high.b];
+        if !low.iter().chain(high.iter()).all(|value| value.is_finite()) {
+            return None;
+        }
+        for row in 0..3 {
+            jacobian[row][axis] = (high[row] - low[row]) / (2.0 * COVARIANCE_EPSILON);
+        }
+    }
+    covariance_is_finite(jacobian).then_some(jacobian)
+}
+
+fn sandwich(jacobian: [[f64; 3]; 3], covariance: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    let mut out = [[0.0_f64; 3]; 3];
+    for row in 0..3 {
+        for column in 0..3 {
+            let mut total = 0.0;
+            for i in 0..3 {
+                for j in 0..3 {
+                    total += jacobian[row][i] * covariance[i][j] * jacobian[column][j];
+                }
+            }
+            out[row][column] = total;
+        }
+    }
+    covariance_is_finite(out).then_some(out)
+}
+
+fn add_covariance(target: &mut [[f64; 3]; 3], addition: [[f64; 3]; 3]) {
+    for row in 0..3 {
+        for column in 0..3 {
+            target[row][column] += addition[row][column];
+        }
+    }
+}
+
+fn covariance_is_finite(covariance: [[f64; 3]; 3]) -> bool {
+    covariance
+        .iter()
+        .all(|row| row.iter().all(|value| value.is_finite()))
+}
+
+fn sigma_of(covariance: &[[f64; 3]; 3]) -> Option<f64> {
+    let trace = covariance[0][0] + covariance[1][1] + covariance[2][2];
+    trace.is_finite().then(|| trace.max(0.0).sqrt())
+}
+
+fn unknown_covariance() -> [[f64; 3]; 3] {
+    let mut covariance = [[0.0_f64; 3]; 3];
+    for (axis, row) in covariance.iter_mut().enumerate() {
+        row[axis] = UNKNOWN_VARIANCE;
+    }
+    covariance
 }
 
 fn composed_from_code(
@@ -669,518 +963,6 @@ fn base_encoded_for(
             } else {
                 base_encoded(base, base_look, xyz)
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod measure {
-    use super::*;
-    use crate::read_cube;
-    use looklab_model::BaseStatus;
-
-    fn distance(a: looklab_color::ucs::Ucs, b: looklab_color::ucs::Ucs) -> f64 {
-        let dj = a.j - b.j;
-        let da = a.a - b.a;
-        let db = a.b - b.b;
-        (dj * dj + da * da + db * db).sqrt()
-    }
-
-    fn stats(mut values: Vec<f64>) -> (usize, f64, f64, f64) {
-        if values.is_empty() {
-            return (0, 0.0, 0.0, 0.0);
-        }
-        values.sort_by(|a, b| a.total_cmp(b));
-        let at = |f: f64| values[((values.len() as f64 - 1.0) * f) as usize];
-        (values.len(), at(0.5), at(0.95), values[values.len() - 1])
-    }
-
-    fn definition_for(name: &str, cube: &CubeFile) -> LutDefinition {
-        let values: Vec<f64> = cube
-            .lut
-            .data
-            .iter()
-            .flat_map(|rgb| rgb.iter().map(|value| *value as f64))
-            .collect();
-        let lut = LutData::new(
-            cube.lut.size,
-            [cube.domain[0]; 3],
-            [cube.domain[1]; 3],
-            values,
-        )
-        .expect("lut");
-        let encoding = if name.contains("FLog2") || name.contains("synthetic") {
-            DeclaredEncoding::SceneReferred {
-                transfer: looklab_model::LogTransfer::Flog2,
-                gamut: looklab_model::Gamut::Fgamut,
-            }
-        } else {
-            DeclaredEncoding::DisplayReferred {
-                base: BaseReference::neutral_baseline(),
-                status: BaseStatus::BaseIdentifiedUnmeasured,
-            }
-        };
-        LutDefinition {
-            name: name.to_string(),
-            license: looklab_model::LicenseRecord {
-                own_work: false,
-                source_license: Some("CC0-1.0".to_string()),
-                source_url: None,
-                attribution: "donor".to_string(),
-            },
-            encoding,
-            output: OutputEncoding::Srgb,
-            lut: lut.record(),
-            emulates: None,
-            superseded_by: None,
-            notes: Vec::new(),
-        }
-    }
-
-    fn known_look() -> looklab_model::Look {
-        let mut look = looklab_model::Look::colorimetric_spline().expect("tone spline");
-        if let looklab_model::Tone::Spline { c0, beta } = &mut look.tone {
-            *c0 *= 1.06;
-            for coefficient in beta.iter_mut() {
-                *coefficient *= 1.03;
-            }
-        }
-        look.tint.a.fill(1.0);
-        look.tint.b.fill(-0.6);
-        look.color.g.plane.fill(0.04);
-        look.color.g.volume.fill(0.01);
-        look.color.r.plane.fill(1.5);
-        look.color.lambda.plane.fill(0.3);
-        look
-    }
-
-    fn cube_from_look(look: &looklab_model::Look) -> CubeFile {
-        let size = 33usize;
-        let mut data = Vec::with_capacity(size * size * size);
-        for b in 0..size {
-            for g in 0..size {
-                for r in 0..size {
-                    let code = [
-                        r as f64 / (size - 1) as f64,
-                        g as f64 / (size - 1) as f64,
-                        b as f64 / (size - 1) as f64,
-                    ];
-                    let linear = Rgb::new(
-                        looklab_color::flog2::decode(code[0]),
-                        looklab_color::flog2::decode(code[1]),
-                        looklab_color::flog2::decode(code[2]),
-                    );
-                    let xyz = Xyz::from_array(
-                        looklab_color::spaces::fgamut_to_xyz_matrix()
-                            .mul_vec([linear.r, linear.g, linear.b]),
-                    );
-                    let post = look.output_encode(look.eval(xyz), RgbSpace::Srgb);
-                    let srgb = RgbSpace::Srgb.xyz_to_rgb_linear(ucs_to_xyz(post));
-                    data.push([
-                        RgbSpace::Srgb.encode(srgb.r) as f32,
-                        RgbSpace::Srgb.encode(srgb.g) as f32,
-                        RgbSpace::Srgb.encode(srgb.b) as f32,
-                    ]);
-                }
-            }
-        }
-        CubeFile {
-            lut: Lut3d {
-                size: size as u32,
-                data,
-                shaper: None,
-            },
-            domain: [0.0, 1.0],
-        }
-    }
-
-    fn report(label: &str, cube: &CubeFile, definition: &LutDefinition, imported: &LutLookImport) {
-        let lut = &cube.lut;
-        let look = &imported.document.look;
-        let k = look.clip.k;
-        let options = LutLookOptions::default();
-        let points = sample_points(options.seed);
-        let mut informative = Vec::new();
-        for xyz in &points {
-            let linear = linear_from_encoded(
-                composed_encoded(lut, definition, None, *xyz).expect("encoded"),
-            );
-            if [linear.r, linear.g, linear.b]
-                .iter()
-                .all(|value| *value > 0.06 && *value < 0.94)
-            {
-                informative.push(*xyz);
-            }
-        }
-        let support = probe_support(&informative, points.len(), options.density_floor);
-        let probe_set = probes::v1();
-        let mut target_clipped = 0;
-        let mut base_clipped = 0;
-        let mut clipped_supported = 0;
-        let mut groups_all: std::collections::BTreeMap<probes::ProbeGroup, Vec<f64>> =
-            std::collections::BTreeMap::new();
-        let mut worst: Vec<(f64, &str, probes::ProbeGroup)> = Vec::new();
-        for (index, probe) in probe_set.probes.iter().enumerate() {
-            let target = composed_ucs(lut, definition, None, probe.xyz).expect("target");
-            let target_linear = linear_from_encoded(
-                composed_encoded(lut, definition, None, probe.xyz).expect("encoded"),
-            );
-            let target_clips = [target_linear.r, target_linear.g, target_linear.b]
-                .iter()
-                .any(|value| *value < k || *value > 1.0 - k);
-            if target_clips {
-                target_clipped += 1;
-            }
-            let base_input_clips = match &definition.encoding {
-                DeclaredEncoding::SceneReferred { .. } => {
-                    let linear = looklab_color::spaces::fgamut_from_xyz_matrix().mul_vec([
-                        probe.xyz.x,
-                        probe.xyz.y,
-                        probe.xyz.z,
-                    ]);
-                    linear.iter().any(|value| {
-                        let code = looklab_color::flog2::encode(*value);
-                        !(0.0..=1.0).contains(&code)
-                    })
-                }
-                DeclaredEncoding::DisplayReferred { .. } => {
-                    let linear = RgbSpace::Srgb.xyz_to_rgb_linear(probe.xyz);
-                    [linear.r, linear.g, linear.b]
-                        .iter()
-                        .any(|value| *value < 0.0 || *value > 1.0)
-                }
-            };
-            if base_input_clips {
-                base_clipped += 1;
-            }
-            if support[index] {
-                if target_clips {
-                    clipped_supported += 1;
-                }
-                let post = look.output_encode(look.eval(probe.xyz), RgbSpace::Srgb);
-                let delta = distance(post, target);
-                groups_all.entry(probe.group).or_default().push(delta);
-                worst.push((delta, probe.id.as_str(), probe.group));
-            }
-        }
-        let flat: Vec<f64> = groups_all.values().flatten().copied().collect();
-        let (n, m, p, x) = stats(flat);
-        println!(
-            "== {label}: k={k:.5} supported={} identified={} | post n={n} median={m:.3} p95={p:.3} max={x:.3} | target_clipped={target_clipped} clipped_supported={clipped_supported} base_clipped={base_clipped}",
-            imported.supported, imported.pre_clip_identified
-        );
-        for (group, values) in &groups_all {
-            let (n, m, p, x) = stats(values.clone());
-            println!("   {group:?}: n={n} median={m:.3} p95={p:.3} max={x:.3}");
-        }
-        worst.sort_by(|a, b| b.0.total_cmp(&a.0));
-        for (delta, id, group) in worst.iter().take(5) {
-            println!("   worst {id} {group:?} dE={delta:.3}");
-            if let Some(probe) = probe_set
-                .probes
-                .iter()
-                .find(|probe| probe.id.as_str() == *id)
-            {
-                let target = composed_ucs(lut, definition, None, probe.xyz).expect("target");
-                let pre = look.eval(probe.xyz);
-                let post = look.output_encode(pre, RgbSpace::Srgb);
-                let code = composed_encoded(lut, definition, None, probe.xyz).expect("encoded");
-                let input = looklab_model::LookInput::new(probe.xyz);
-                println!(
-                    "      input s={:.2} c={:.1} target {:.2},{:.2},{:.2} pre {:.2},{:.2},{:.2} post {:.2},{:.2},{:.2} code {:.3},{:.3},{:.3} y={:.6}",
-                    input.s,
-                    input.c_in,
-                    target.j,
-                    target.a,
-                    target.b,
-                    pre.j,
-                    pre.a,
-                    pre.b,
-                    post.j,
-                    post.a,
-                    post.b,
-                    code.r,
-                    code.g,
-                    code.b,
-                    probe.xyz.y
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn tone_trace() {
-        let text = std::fs::read_to_string("../../data/luts/Ricoh_GRIV_Cinema_Green_SRGB.cube")
-            .expect("read");
-        let cube = read_cube(&text).expect("cube");
-        let definition = definition_for("Ricoh_GRIV_Cinema_Green_SRGB.cube", &cube);
-        let imported = import_lut_look(
-            LookIdentity::new(
-                "trace",
-                "1.0.0",
-                looklab_model::LookKind::LutDefined,
-                looklab_model::WbPolicy::Adaptive,
-            )
-            .expect("identity"),
-            definition.clone(),
-            &cube,
-            None,
-            LutLookOptions::default(),
-        )
-        .expect("import");
-        let look = &imported.document.look;
-        if let looklab_model::Tone::Spline { c0, beta } = &look.tone {
-            println!("c0={c0:.3} beta={beta:?}");
-        }
-        let white = ViewingConditions::reference().white;
-        for step in 0..=24 {
-            let s = -10.0 + step as f64 * 0.25;
-            let y = 0.18 * libm::pow(2.0, s);
-            let xyz = Xyz::new(white.x * y, y, white.z * y);
-            let target = composed_ucs(&cube.lut, &definition, None, xyz).expect("target");
-            let pre = look.eval(xyz);
-            let post = look.output_encode(pre, RgbSpace::Srgb);
-            let tone = look.tone.eval(s);
-            println!(
-                "s={s:.2} tone={tone:.2} target={:.2},{:.2},{:.2} pre={:.2},{:.2},{:.2} post={:.2},{:.2},{:.2}",
-                target.j, target.a, target.b, pre.j, pre.a, pre.b, post.j, post.a, post.b
-            );
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn measure_luts() {
-        let files = match std::env::var("MEASURE_FILES") {
-            Ok(value) => value.split(',').map(str::to_string).collect::<Vec<_>>(),
-            Err(_) => vec![
-                "Ricoh_GRIV_Cinema_Green_FLog2.cube".to_string(),
-                "Ricoh_GRIV_Cinema_Green_SRGB.cube".to_string(),
-                "Leica_Classic_Gold_200.cube".to_string(),
-                "CineStill_800T_1600T_sRGB_V4.cube".to_string(),
-            ],
-        };
-        for file in &files {
-            let text = std::fs::read_to_string(format!("../../data/luts/{file}")).expect("read");
-            let cube = read_cube(&text).expect("cube");
-            let definition = definition_for(file, &cube);
-            let imported = import_lut_look(
-                LookIdentity::new(
-                    file,
-                    "1.0.0",
-                    looklab_model::LookKind::LutDefined,
-                    looklab_model::WbPolicy::Adaptive,
-                )
-                .expect("identity"),
-                definition.clone(),
-                &cube,
-                None,
-                LutLookOptions::default(),
-            )
-            .expect("import");
-            report(file, &cube, &definition, &imported);
-        }
-    }
-
-    fn tone_only_look() -> looklab_model::Look {
-        let mut look = looklab_model::Look::colorimetric_spline().expect("tone spline");
-        if let looklab_model::Tone::Spline { c0, beta } = &mut look.tone {
-            *c0 *= 1.06;
-            for coefficient in beta.iter_mut() {
-                *coefficient *= 1.03;
-            }
-        }
-        look
-    }
-
-    fn mild_look() -> looklab_model::Look {
-        let mut look = tone_only_look();
-        look.tint.a.fill(0.5);
-        look.tint.b.fill(-0.3);
-        look.color.g.plane.fill(0.02);
-        look.color.r.plane.fill(0.5);
-        look.color.lambda.plane.fill(0.15);
-        look
-    }
-
-    fn bt709_decode(code: f64) -> f64 {
-        if code < 0.081 {
-            code / 4.5
-        } else {
-            libm::pow((code + 0.099) / 1.099, 1.0 / 0.45)
-        }
-    }
-
-    fn cube_from_look_display(look: &looklab_model::Look) -> CubeFile {
-        let size = 33usize;
-        let mut data = Vec::with_capacity(size * size * size);
-        for b in 0..size {
-            for g in 0..size {
-                for r in 0..size {
-                    let code = [
-                        r as f64 / (size - 1) as f64,
-                        g as f64 / (size - 1) as f64,
-                        b as f64 / (size - 1) as f64,
-                    ];
-                    let linear = Rgb::new(
-                        bt709_decode(code[0]),
-                        bt709_decode(code[1]),
-                        bt709_decode(code[2]),
-                    );
-                    let xyz = RgbSpace::Srgb.rgb_linear_to_xyz(linear);
-                    let post = look.output_encode(look.eval(xyz), RgbSpace::Srgb);
-                    let srgb = RgbSpace::Srgb.xyz_to_rgb_linear(ucs_to_xyz(post));
-                    data.push([
-                        RgbSpace::Srgb.encode(srgb.r) as f32,
-                        RgbSpace::Srgb.encode(srgb.g) as f32,
-                        RgbSpace::Srgb.encode(srgb.b) as f32,
-                    ]);
-                }
-            }
-        }
-        CubeFile {
-            lut: Lut3d {
-                size: size as u32,
-                data,
-                shaper: None,
-            },
-            domain: [0.0, 1.0],
-        }
-    }
-
-    fn display_definition(name: &str, cube: &CubeFile) -> LutDefinition {
-        let mut definition = definition_for(name, cube);
-        definition.encoding = DeclaredEncoding::DisplayReferred {
-            base: BaseReference::neutral_baseline(),
-            status: BaseStatus::BaseIdentifiedUnmeasured,
-        };
-        definition
-    }
-
-    #[test]
-    #[ignore]
-    fn representation_display() {
-        let variants: [(&str, looklab_model::Look); 4] = [
-            (
-                "colorimetric",
-                looklab_model::Look::colorimetric_spline().expect("tone spline"),
-            ),
-            ("tone", tone_only_look()),
-            ("mild", mild_look()),
-            ("strong", known_look()),
-        ];
-        for (name, mut look) in variants {
-            look.clip = ClipSettings {
-                function: ClipFunction::TanhSoftV1,
-                k: 0.005,
-            };
-            let cube = cube_from_look_display(&look);
-            let definition = display_definition("display", &cube);
-            let mut all = Vec::new();
-            let mut unclipped = Vec::new();
-            for probe in &probes::v1().probes {
-                let target = composed_ucs(&cube.lut, &definition, None, probe.xyz).expect("target");
-                let truth = look.output_encode(look.eval(probe.xyz), RgbSpace::Srgb);
-                let delta = distance(truth, target);
-                all.push(delta);
-                let linear = linear_from_encoded(
-                    composed_encoded(&cube.lut, &definition, None, probe.xyz).expect("encoded"),
-                );
-                if [linear.r, linear.g, linear.b]
-                    .iter()
-                    .all(|value| *value >= 0.005 && *value <= 0.995)
-                {
-                    unclipped.push(delta);
-                }
-            }
-            for (label, values) in [("all", all), ("unclipped", unclipped)] {
-                let (n, m, p, x) = stats(values);
-                println!("== display {name} {label}: n={n} median={m:.3} p95={p:.3} max={x:.3}");
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn representation() {
-        let variants: [(&str, looklab_model::Look); 4] = [
-            (
-                "colorimetric",
-                looklab_model::Look::colorimetric_spline().expect("tone spline"),
-            ),
-            ("tone", tone_only_look()),
-            ("mild", mild_look()),
-            ("strong", known_look()),
-        ];
-        for (name, mut look) in variants {
-            look.clip = ClipSettings {
-                function: ClipFunction::TanhSoftV1,
-                k: 0.005,
-            };
-            let cube = cube_from_look(&look);
-            let definition = definition_for("synthetic", &cube);
-            let mut all = Vec::new();
-            let mut unclipped = Vec::new();
-            let mut gray = Vec::new();
-            for probe in &probes::v1().probes {
-                let target = composed_ucs(&cube.lut, &definition, None, probe.xyz).expect("target");
-                let truth = look.output_encode(look.eval(probe.xyz), RgbSpace::Srgb);
-                let delta = distance(truth, target);
-                all.push(delta);
-                let linear = linear_from_encoded(
-                    composed_encoded(&cube.lut, &definition, None, probe.xyz).expect("encoded"),
-                );
-                if [linear.r, linear.g, linear.b]
-                    .iter()
-                    .all(|value| *value >= 0.005 && *value <= 0.995)
-                {
-                    unclipped.push(delta);
-                }
-                if probe.group == probes::ProbeGroup::GrayRamp {
-                    gray.push(delta);
-                }
-            }
-            for (label, values) in [("all", all), ("unclipped", unclipped), ("gray", gray)] {
-                let (n, m, p, x) = stats(values);
-                println!("== {name} {label}: n={n} median={m:.3} p95={p:.3} max={x:.3}");
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn recovery() {
-        for (name, mut known) in [("mild", mild_look())] {
-            known.clip = ClipSettings {
-                function: ClipFunction::TanhSoftV1,
-                k: 0.005,
-            };
-            let cube = cube_from_look_display(&known);
-            let definition = display_definition("display", &cube);
-            let imported = import_lut_look(
-                LookIdentity::new(
-                    "synthetic",
-                    "1.0.0",
-                    looklab_model::LookKind::LutDefined,
-                    looklab_model::WbPolicy::Adaptive,
-                )
-                .expect("identity"),
-                definition.clone(),
-                &cube,
-                None,
-                LutLookOptions::default(),
-            )
-            .expect("import");
-            report(&format!("recovery-{name}"), &cube, &definition, &imported);
-            let mut representation = Vec::new();
-            for probe in &probes::v1().probes {
-                let target = composed_ucs(&cube.lut, &definition, None, probe.xyz).expect("target");
-                let truth = known.output_encode(known.eval(probe.xyz), RgbSpace::Srgb);
-                representation.push(distance(truth, target));
-            }
-            let (n, m, p, x) = stats(representation);
-            println!("   representation {name}: n={n} median={m:.3} p95={p:.3} max={x:.3}");
         }
     }
 }

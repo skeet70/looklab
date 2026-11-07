@@ -147,6 +147,9 @@ fn normalise(text: &str) -> String {
     out
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RenderingFirmware(String);
+
 /// The pairing fields of one file, extracted from parsed metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PairingFile {
@@ -156,6 +159,7 @@ pub struct PairingFile {
     image_number: Option<ImageNumber>,
     body: Option<BodyKey>,
     look: Option<LookSettings>,
+    firmware: Option<RenderingFirmware>,
 }
 
 impl PairingFile {
@@ -167,6 +171,12 @@ impl PairingFile {
             image_number: pairing.image_number,
             body: BodyKey::from_metadata(metadata),
             look: metadata.fuji.as_ref().map(|fuji| fuji.look.clone()),
+            firmware: metadata
+                .firmware
+                .as_deref()
+                .map(str::trim)
+                .filter(|version| !version.is_empty())
+                .map(|version| RenderingFirmware(version.to_owned())),
             key,
         }
     }
@@ -430,7 +440,7 @@ pub fn pair(files: &[PairingFile]) -> PairingOutcome {
             });
             continue;
         }
-        let mut seen: Vec<(LocalImageKey, LookSettings)> = Vec::new();
+        let mut seen: Vec<usize> = Vec::new();
         let mut members = Vec::new();
         for jpeg in jpeg_indices {
             let is_render = times_match(
@@ -444,14 +454,17 @@ pub fn pair(files: &[PairingFile]) -> PairingOutcome {
                 JpegRole::SeparateShot
             } else {
                 let look = files[jpeg].look.as_ref();
-                match seen
-                    .iter()
-                    .find(|(_, earlier)| !looks_differ(Some(earlier), look))
-                {
-                    Some((of, _)) => JpegRole::Duplicate { of: of.clone() },
+                match seen.iter().copied().find(|earlier| {
+                    files[jpeg].firmware.is_some()
+                        && files[*earlier].firmware == files[jpeg].firmware
+                        && !looks_differ(files[*earlier].look.as_ref(), look)
+                }) {
+                    Some(of) => JpegRole::Duplicate {
+                        of: files[of].key.clone(),
+                    },
                     None => {
-                        if let Some(look) = look {
-                            seen.push((files[jpeg].key.clone(), look.clone()));
+                        if look.is_some() {
+                            seen.push(jpeg);
                         }
                         JpegRole::Rerender
                     }

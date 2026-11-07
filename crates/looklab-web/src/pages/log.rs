@@ -369,7 +369,7 @@ pub(super) fn PublicList(endorsements: bool) -> impl IntoView {
                                         Some(looklab_trust::Grant::Admin) => ("administrator", "An administrator"),
                                         Some(looklab_trust::Grant::Moderator) => ("moderator", "A moderator"),
                                         Some(looklab_trust::Grant::Seeder) => ("seeder", "A seeder"),
-                                        None => ("endorsed contributor", "A trusted contributor"),
+                                        None => ("trusted contributor", "A trusted contributor"),
                                     };
                                     let name = record.subject_handle.unwrap_or_else(|| fallback.to_owned());
                                     view! {

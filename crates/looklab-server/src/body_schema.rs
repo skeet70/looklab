@@ -6,11 +6,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use looklab_schema::{
-    Control, ControlSchema, ControlType, Epoch, FirmwareVersion, ScalarValue, Tolerated,
-    mapped_controls, unmapped_controls, validate_body, validate_control_schema,
+    Control, ControlSchema, ControlType, Epoch, FirmwareVersion, MakernoteValues, ScalarValue,
+    Tolerated, mapped_controls, monochrome_sim, unmapped_controls, validate_body,
+    validate_control_schema,
 };
 use looklab_upload::{
-    BodyId, CommunitySnapshotVersion, ControlKey, ControlSettings, SettingReach,
+    BodyId, CommunitySnapshotVersion, ControlKey, ControlSettings, ManifestMetadata, SettingReach,
     SettingsSourceError, SimKey, validate_setting_sources,
 };
 
@@ -246,6 +247,8 @@ pub enum SettingsProblem {
     NoEpoch,
     #[error("the epoch has no native simulation `{0}`")]
     UnknownSim(SimKey),
+    #[error("`{0}` is a monochrome film simulation; B&W renders aren't supported yet")]
+    MonochromeSim(SimKey),
     #[error("control `{0}` is not in the schema")]
     UnknownControl(ControlKey),
     #[error("control `{0}` is outside its steps")]
@@ -264,12 +267,11 @@ pub fn validate_settings(
     card: bool,
 ) -> Result<(), SettingsProblem> {
     let epoch = resolve_epoch(&record.schema, firmware).ok_or(SettingsProblem::NoEpoch)?;
-    if !epoch
-        .native_sims
-        .iter()
-        .any(|sim| sim.key.as_str() == sim_key.as_str())
-    {
-        return Err(SettingsProblem::UnknownSim(sim_key.clone()));
+    let sim = epoch
+        .native_sim(sim_key)
+        .ok_or_else(|| SettingsProblem::UnknownSim(sim_key.clone()))?;
+    if sim.monochrome {
+        return Err(SettingsProblem::MonochromeSim(sim_key.clone()));
     }
 
     for entry in settings.entries() {
@@ -300,6 +302,22 @@ pub fn validate_settings(
             unmapped: unmapped_controls(epoch),
         },
     )?;
+    Ok(())
+}
+
+/// # Errors
+/// An image's makernotes select a monochrome sim, whatever `sim_key` claims.
+pub fn validate_render_sims<'a>(
+    record: &BodyRecord,
+    firmware: &str,
+    images: impl IntoIterator<Item = &'a ManifestMetadata>,
+) -> Result<(), SettingsProblem> {
+    let epoch = resolve_epoch(&record.schema, firmware).ok_or(SettingsProblem::NoEpoch)?;
+    for metadata in images {
+        if let Some(sim) = monochrome_sim(epoch, &MakernoteValues::from(metadata)) {
+            return Err(SettingsProblem::MonochromeSim(sim));
+        }
+    }
     Ok(())
 }
 
@@ -363,7 +381,7 @@ epochs:
     native_sims:
       - key: classic_chrome
         look: classic-chrome
-        makernote: { tag: FilmMode, value: 0x0700 }
+        makernote: { tag: FilmMode, value: 0x0600 }
     exposure_modes:
       - key: dr100
     controls:

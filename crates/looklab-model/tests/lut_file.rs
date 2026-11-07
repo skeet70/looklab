@@ -2,9 +2,12 @@
 
 use looklab_model::file::{
     BaseField, BaseReference, BaseStatus, CameraRendering, DeclaredEncoding, DynamicRange, Gamut,
-    LicenseRecord, LogTransfer, LutData, LutDefinition, LutEmulation, LutRecord, OutputEncoding,
+    LicenseRecord, LogTransfer, LutData, LutDefinition, LutEmulation, LutRecord, MatchRefusal,
+    OutputEncoding,
 };
-use looklab_model::{Look, LookDocument, LookIdentity, LookKind, WbPolicy};
+use looklab_model::{
+    Look, LookDocument, LookIdentity, LookKind, ProbeScalars, UncertaintyData, WbPolicy,
+};
 
 fn identity(slug: &str) -> LookIdentity {
     LookIdentity::new(slug, "1.0.0", LookKind::LutDefined, WbPolicy::Adaptive).expect("identity")
@@ -69,15 +72,16 @@ fn lut_defined_round_trip_is_exact() {
 
 #[test]
 fn display_base_is_recorded_and_pending_is_not_matchable() {
-    for (status, matchable) in [
-        (BaseStatus::Pinned, true),
+    for (status, refusal) in [
+        (BaseStatus::Pinned, None),
         (
             BaseStatus::BaseIncomplete {
                 missing: BaseField::FilmSimulation,
             },
-            false,
+            Some(MatchRefusal::DisplayBaseUnpinned),
         ),
     ] {
+        let matchable = refusal.is_none();
         let mut definition = scene_definition();
         definition.encoding = DeclaredEncoding::DisplayReferred {
             base: BaseReference::neutral_baseline(),
@@ -91,11 +95,35 @@ fn display_base_is_recorded_and_pending_is_not_matchable() {
         )
         .expect("document");
         assert_eq!(document.is_matchable(), matchable);
+        assert_eq!(document.match_refusal(), refusal);
         assert_eq!(
             document.file.provenance.base,
             Some(BaseReference::neutral_baseline())
         );
     }
+}
+
+#[test]
+fn a_native_look_without_admitted_probes_is_unsupported() {
+    let probes = looklab_model::probes::v1();
+    let document = LookDocument::from_look(
+        LookIdentity::new(
+            "native",
+            "1.0.0",
+            LookKind::NativeFamily,
+            WbPolicy::Adaptive,
+        )
+        .expect("identity"),
+        Look::colorimetric(),
+    )
+    .expect("document")
+    .with_uncertainty(UncertaintyData {
+        support: Some(ProbeScalars::new(vec![0.0; probes.probes.len()]).expect("support")),
+        ..UncertaintyData::default()
+    })
+    .expect("uncertainty");
+    assert_eq!(document.match_refusal(), Some(MatchRefusal::Unsupported));
+    assert!(!document.is_matchable());
 }
 
 #[test]

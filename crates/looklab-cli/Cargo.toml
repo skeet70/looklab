@@ -23,6 +23,7 @@ looklab-meta.workspace = true
 looklab-model.workspace = true
 looklab-prep.workspace = true
 looklab-prep-module.workspace = true
+looklab-publish.workspace = true
 looklab-raw.workspace = true
 looklab-report.workspace = true
 looklab-samples.workspace = true
@@ -32,6 +33,7 @@ looklab-trust.workspace = true
 looklab-upload.workspace = true
 looklab-worker.workspace = true
 postcard.workspace = true
+same-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_norway.workspace = true
@@ -45,6 +47,7 @@ wasmtime.workspace = true
 assert_cmd.workspace = true
 ciborium.workspace = true
 jpeg-encoder.workspace = true
+looklab-wasm = { workspace = true, default-features = false, features = ["worker"] }
 p256.workspace = true
 tempfile.workspace = true
 

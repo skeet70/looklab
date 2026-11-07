@@ -4,10 +4,35 @@ use std::collections::BTreeMap;
 
 use looklab_model::ProbeSetVersion;
 
+use crate::calibration::Calibration;
 use crate::emphasis::Emphasis;
 use crate::error::{MatchError, Result};
 
 pub const PERMALINK_FORMAT: &str = "looklab-match/1";
+
+pub const CALIBRATED_PERMALINK_FORMAT: &str = "looklab-match/2";
+
+const KNOWN_FIELDS: &[&str] = &[
+    "look",
+    "base",
+    "crm",
+    "input",
+    "realization",
+    "epoch_map",
+    "probes",
+    "optimizer",
+    "emphasis",
+    "seed",
+    "target_file",
+    "base_file",
+    "body_file",
+    "crm_file",
+    "transform_file",
+    "covariance_file",
+    "calibration",
+];
+
+const MAX_PERMALINK_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PermalinkSources {
@@ -19,7 +44,7 @@ pub struct PermalinkSources {
     pub covariance: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Permalink {
     pub target_slug: String,
     pub target_version: String,
@@ -37,11 +62,17 @@ pub struct Permalink {
     pub emphasis: Emphasis,
     pub seed: u64,
     pub sources: PermalinkSources,
+    pub calibration: Calibration,
 }
 
 impl Permalink {
     pub fn canonical(&self) -> String {
-        let mut out = String::from(PERMALINK_FORMAT);
+        let calibrated = !self.calibration.is_empty();
+        let mut out = String::from(if calibrated {
+            CALIBRATED_PERMALINK_FORMAT
+        } else {
+            PERMALINK_FORMAT
+        });
         let mut push = |key: &str, value: &str| {
             out.push('|');
             out.push_str(key);
@@ -85,17 +116,29 @@ impl Permalink {
         if let Some(value) = &self.sources.covariance {
             push("covariance_file", value);
         }
+        if calibrated {
+            push("calibration", &self.calibration.to_field());
+        }
         out
     }
 
     pub fn parse(text: &str) -> Result<Self> {
         let text = text.trim();
+        if text.len() > MAX_PERMALINK_BYTES {
+            return Err(MatchError::Permalink(format!(
+                "permalink is {} bytes, more than {MAX_PERMALINK_BYTES}",
+                text.len()
+            )));
+        }
         let mut parts = text.split('|');
-        match parts.next() {
-            Some(PERMALINK_FORMAT) => {}
-            _ => {
+        let format = parts
+            .next()
+            .ok_or_else(|| MatchError::Permalink("empty permalink".to_string()))?;
+        match format {
+            PERMALINK_FORMAT | CALIBRATED_PERMALINK_FORMAT => {}
+            other => {
                 return Err(MatchError::Permalink(format!(
-                    "expected {PERMALINK_FORMAT}"
+                    "expected {PERMALINK_FORMAT} or {CALIBRATED_PERMALINK_FORMAT}, got {other:?}"
                 )));
             }
         }
@@ -104,6 +147,9 @@ impl Permalink {
             let (key, value) = part
                 .split_once('=')
                 .ok_or_else(|| MatchError::Permalink(format!("malformed field {part:?}")))?;
+            if !KNOWN_FIELDS.contains(&key) {
+                return Err(MatchError::Permalink(format!("unknown field {key}")));
+            }
             if values.insert(key.to_string(), decode(value)?).is_some() {
                 return Err(MatchError::Permalink(format!("duplicate field {key}")));
             }
@@ -142,6 +188,17 @@ impl Permalink {
             transform: values.get("transform_file").cloned(),
             covariance: values.get("covariance_file").cloned(),
         };
+        let calibration = match format {
+            PERMALINK_FORMAT => {
+                if values.contains_key("calibration") {
+                    return Err(MatchError::Permalink(
+                        "calibration requires looklab-match/2".to_string(),
+                    ));
+                }
+                Calibration::default()
+            }
+            _ => Calibration::parse(required("calibration")?)?,
+        };
         Ok(Self {
             target_slug: target_slug.to_string(),
             target_version: target_version.to_string(),
@@ -161,6 +218,7 @@ impl Permalink {
                 .parse()
                 .map_err(|_| MatchError::Permalink("seed".to_string()))?,
             sources,
+            calibration,
         })
     }
 }

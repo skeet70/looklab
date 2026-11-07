@@ -8,8 +8,9 @@ use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use crate::basis::{
-    HUE_COEFS, RESIDUAL_COEFS, S_COEFS, TINT_COEFS, TONE_COEFS, ToneBasis, c_weights, hue_weights,
-    s_weights, tint_weights, trilinear,
+    CORE_COEFS, CORE_TERMS, RESIDUAL_COEFS, S_COEFS, TINT_COEFS, TONE_COEFS, ToneBasis,
+    VOLUME_COEFS, c_weights, core_weights, hue_weights, outer_weight, s_weights, tint_weights,
+    trilinear,
 };
 use crate::clip::ClipSettings;
 use crate::deriv::ReferenceCam16;
@@ -17,7 +18,7 @@ use crate::error::{ModelError, Result};
 use crate::solve;
 use crate::tone::Tone;
 
-pub const GRL_COEFS: usize = S_COEFS + HUE_COEFS * S_COEFS * 3;
+pub const GRL_COEFS: usize = S_COEFS + VOLUME_COEFS + CORE_COEFS;
 
 /// Residual grid bounds in `(s, a_in, b_in)`; v1 fixes them.
 pub const RESIDUAL_DOMAIN: [[f64; 2]; 3] = [[-12.0, 6.0], [-80.0, 80.0], [-80.0, 80.0]];
@@ -41,6 +42,24 @@ pub struct ResidualWeights {
     pub weights: [f64; 8],
 }
 
+/// Near-neutral blend weights at the input chroma.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlendWeights {
+    pub w: f64,
+    pub dw_dc: f64,
+}
+
+impl BlendWeights {
+    pub fn new(c: f64) -> Self {
+        let (w, dw_dc) = outer_weight(c);
+        Self { w, dw_dc }
+    }
+
+    pub fn core(self) -> f64 {
+        1.0 - self.w
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LookInput {
     pub xyz: Xyz,
@@ -51,6 +70,7 @@ pub struct LookInput {
     pub c_in: f64,
     pub a_in: f64,
     pub b_in: f64,
+    pub blend: BlendWeights,
     pub tone_weights: [f64; TONE_COEFS + 1],
     pub grl: GrlWeights,
     pub residual: ResidualWeights,
@@ -175,6 +195,7 @@ impl LookInput {
             c_in,
             a_in: chromaticity.a,
             b_in: chromaticity.b,
+            blend: BlendWeights::new(c_in),
             tone_weights,
             grl: GrlWeights {
                 hue_idx,
@@ -240,13 +261,16 @@ pub struct GrlComponent {
     pub plane: Vec<f64>,
     /// Coefficients for `C > 0`, indexed `[hue][s][c - 1]`.
     pub volume: Vec<f64>,
+    /// Near-neutral Cartesian coefficients, indexed `[s][term]`.
+    pub core: Vec<f64>,
 }
 
 impl GrlComponent {
     pub fn zeros() -> Self {
         Self {
             plane: vec![0.0; S_COEFS],
-            volume: vec![0.0; HUE_COEFS * S_COEFS * 3],
+            volume: vec![0.0; VOLUME_COEFS],
+            core: vec![0.0; CORE_COEFS],
         }
     }
 }
@@ -438,7 +462,7 @@ impl Look {
             n_a += weights[m] * self.tint.a[*index];
             n_b += weights[m] * self.tint.b[*index];
         }
-        let [log_g, r, lambda] = self.color.values(&input.grl);
+        let [log_g, r, lambda] = self.color.values(input);
         LayerValues {
             t,
             n_a,
@@ -654,7 +678,9 @@ impl Look {
             );
         }
 
-        let plane_weight = input.grl.c_w[0];
+        let outer = input.blend.w;
+        let near = input.blend.core();
+        let plane_weight = outer * input.grl.c_w[0] + near;
         for (position, index) in input.grl.s_idx.iter().enumerate() {
             let weight = plane_weight * input.grl.s_w[position];
             add(
@@ -673,7 +699,8 @@ impl Look {
         for (h, hue_index) in input.grl.hue_idx.iter().enumerate() {
             for (s, s_index) in input.grl.s_idx.iter().enumerate() {
                 for (c, c_index) in input.grl.c_idx.iter().enumerate().skip(1) {
-                    let weight = input.grl.hue_w[h] * input.grl.s_w[s] * input.grl.c_w[c];
+                    let weight =
+                        outer * input.grl.hue_w[h] * input.grl.s_w[s] * input.grl.c_w[c];
                     let node = (*hue_index * S_COEFS + *s_index) * 3 + (c_index - 1);
                     add(
                         layout.g.start + S_COEFS + node,
@@ -688,6 +715,25 @@ impl Look {
                         [0.0, 0.0, 0.0, 0.0, 0.0, weight, 0.0, 0.0, 0.0],
                     );
                 }
+            }
+        }
+        let basis = core_weights(input.a_in, input.b_in);
+        for (position, index) in input.grl.s_idx.iter().enumerate() {
+            for (term, basis_weight) in basis.iter().enumerate() {
+                let weight = near * input.grl.s_w[position] * basis_weight;
+                let node = S_COEFS + VOLUME_COEFS + *index * CORE_TERMS + term;
+                add(
+                    layout.g.start + node,
+                    [0.0, 0.0, 0.0, weight, 0.0, 0.0, 0.0, 0.0, 0.0],
+                );
+                add(
+                    layout.r.start + node,
+                    [0.0, 0.0, 0.0, 0.0, weight, 0.0, 0.0, 0.0, 0.0],
+                );
+                add(
+                    layout.lambda.start + node,
+                    [0.0, 0.0, 0.0, 0.0, 0.0, weight, 0.0, 0.0, 0.0],
+                );
             }
         }
 
@@ -713,12 +759,18 @@ impl Look {
 
 fn write_grl(out: &mut [f64], component: &GrlComponent) {
     out[..S_COEFS].copy_from_slice(&component.plane);
-    out[S_COEFS..].copy_from_slice(&component.volume);
+    out[S_COEFS..S_COEFS + VOLUME_COEFS].copy_from_slice(&component.volume);
+    out[S_COEFS + VOLUME_COEFS..].copy_from_slice(&component.core);
 }
 
 fn read_grl(component: &mut GrlComponent, input: &[f64]) {
     component.plane.copy_from_slice(&input[..S_COEFS]);
-    component.volume.copy_from_slice(&input[S_COEFS..]);
+    component
+        .volume
+        .copy_from_slice(&input[S_COEFS..S_COEFS + VOLUME_COEFS]);
+    component
+        .core
+        .copy_from_slice(&input[S_COEFS + VOLUME_COEFS..]);
 }
 
 impl Tint {
@@ -743,7 +795,8 @@ impl Tint {
 }
 
 impl ColorLayer {
-    fn values(&self, weights: &GrlWeights) -> [f64; 3] {
+    fn values(&self, input: &LookInput) -> [f64; 3] {
+        let weights = &input.grl;
         let mut plane = [0.0_f64; 3];
         for (weight, index) in weights.s_w.iter().zip(weights.s_idx.iter()) {
             plane[0] += weight * self.g.plane[*index];
@@ -764,20 +817,40 @@ impl ColorLayer {
                 }
             }
         }
+        let basis = core_weights(input.a_in, input.b_in);
+        let mut core = [0.0_f64; 3];
+        for (position, index) in weights.s_idx.iter().enumerate() {
+            let weight = weights.s_w[position];
+            let base = *index * CORE_TERMS;
+            for (component, values) in [&self.g.core, &self.r.core, &self.lambda.core]
+                .into_iter()
+                .enumerate()
+            {
+                core[component] += weight
+                    * (0..CORE_TERMS)
+                        .map(|term| values[base + term] * basis[term])
+                        .sum::<f64>();
+            }
+        }
+        let outer = input.blend.w;
+        let near = input.blend.core();
+        let c0 = weights.c_w[0];
         [
-            weights.c_w[0] * plane[0] + volume[0],
-            weights.c_w[0] * plane[1] + volume[1],
-            weights.c_w[0] * plane[2] + volume[2],
+            outer * (c0 * plane[0] + volume[0]) + near * (plane[0] + core[0]),
+            outer * (c0 * plane[1] + volume[1]) + near * (plane[1] + core[1]),
+            outer * (c0 * plane[2] + volume[2]) + near * (plane[2] + core[2]),
         ]
     }
 
     fn validate(&self) -> Result<()> {
         for component in [&self.g, &self.r, &self.lambda] {
-            if component.plane.len() != S_COEFS || component.volume.len() != HUE_COEFS * S_COEFS * 3
+            if component.plane.len() != S_COEFS
+                || component.volume.len() != VOLUME_COEFS
+                || component.core.len() != CORE_COEFS
             {
                 return Err(ModelError::CoefficientLength {
                     name: "grl".to_string(),
-                    found: component.plane.len() + component.volume.len(),
+                    found: component.plane.len() + component.volume.len() + component.core.len(),
                     expected: GRL_COEFS,
                 });
             }
@@ -785,6 +858,7 @@ impl ColorLayer {
                 .plane
                 .iter()
                 .chain(component.volume.iter())
+                .chain(component.core.iter())
                 .any(|value| !value.is_finite())
             {
                 return Err(ModelError::Invalid("non-finite grl".to_string()));
@@ -819,5 +893,81 @@ mod tests {
         assert_eq!(layout.tone.len(), 1 + TONE_COEFS);
         assert_eq!(layout.total, spline.coef_vector().len());
         assert_eq!(layout.residual.end, layout.total);
+    }
+
+    fn synthetic_input(a: f64, b: f64) -> LookInput {
+        let c = (a * a + b * b).sqrt();
+        let h = if c > 0.0 {
+            let degrees = libm::atan2(b, a) * (180.0 / PI);
+            if degrees < 0.0 { degrees + 360.0 } else { degrees }
+        } else {
+            0.0
+        };
+        let (hue_idx, hue_w) = hue_weights(h);
+        let (s_idx, s_w) = s_weights(0.0);
+        let (c_idx, c_w) = c_weights(c);
+        LookInput {
+            xyz: Xyz::new(0.0, 0.18, 0.0),
+            unit_xyz: Xyz::new(0.0, 1.0, 0.0),
+            y: 0.18,
+            s: 0.0,
+            h_in: h,
+            c_in: c,
+            a_in: a,
+            b_in: b,
+            blend: BlendWeights::new(c),
+            tone_weights: [0.0; TONE_COEFS + 1],
+            grl: GrlWeights {
+                hue_idx,
+                hue_w,
+                s_idx,
+                s_w,
+                c_idx,
+                c_w,
+            },
+            residual: ResidualWeights {
+                indices: [0; 8],
+                weights: [0.0; 8],
+            },
+        }
+    }
+
+    #[test]
+    fn core_and_join_are_smooth_in_cartesian_chroma() {
+        let mut look = Look::colorimetric_spline().unwrap();
+        for component in [&mut look.color.g, &mut look.color.r, &mut look.color.lambda] {
+            for value in component.core.iter_mut() {
+                *value = 0.1;
+            }
+            for value in component.volume.iter_mut() {
+                *value = 0.1;
+            }
+        }
+        for (radius, steps) in [(0.0, [1e-3, 1e-4]), (1.5, [1e-4, 1e-5])] {
+            for direction in 0..8 {
+                let angle = 2.0 * PI * direction as f64 / 8.0;
+                let (cos, sin) = (libm::cos(angle), libm::sin(angle));
+                let at = |t: f64| {
+                    look.color
+                        .values(&synthetic_input(radius * cos + t * cos, radius * sin + t * sin))
+                };
+                let [coarse_step, fine_step] = steps;
+                let coarse = at(coarse_step);
+                let coarse_back = at(-coarse_step);
+                let fine = at(fine_step);
+                let fine_back = at(-fine_step);
+                for channel in 0..3 {
+                    let coarse_derivative = (coarse[channel] - coarse_back[channel]) / (2.0 * coarse_step);
+                    let fine_derivative = (fine[channel] - fine_back[channel]) / (2.0 * fine_step);
+                    assert!(coarse_derivative.is_finite() && fine_derivative.is_finite());
+                    assert!(
+                        (coarse_derivative - fine_derivative).abs() < 1e-3,
+                        "radius {radius} direction {direction} channel {channel}: {} vs {}",
+                        coarse_derivative,
+                        fine_derivative
+                    );
+                }
+            }
+        }
     }
 }

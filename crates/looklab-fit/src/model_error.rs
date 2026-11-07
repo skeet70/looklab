@@ -2,8 +2,11 @@
 //! Body-held-out model error for the published uncertainty path (docs/02 §5).
 
 use looklab_color::RgbSpace;
+use looklab_color::linalg::Mat3;
 use looklab_color::ucs::{Ucs, delta_e_ucs};
-use looklab_model::Look;
+use looklab_model::basis::C_MAX;
+use looklab_model::realization::ControlResponseModel;
+use looklab_model::{Look, LookInput};
 
 use crate::hierarchical::BodyGroup;
 use crate::problem::Problem;
@@ -14,30 +17,164 @@ pub const MODEL_HUE_BINS: usize = 12;
 pub const MODEL_S_BINS: usize = 6;
 pub const MODEL_S_MIN: f64 = -12.0;
 pub const MODEL_S_MAX: f64 = 6.0;
-/// Tentative inflation of the cross-validated excess for a new body.
-pub const MODEL_SAFETY: f64 = 1.3;
+pub const MODEL_C_BINS: usize = 4;
+const MODEL_IMAGE_FOLDS: usize = 8;
+const MODEL_ENCODINGS: usize = RgbSpace::ALL.len();
+
+type CellMoment = [[f64; 3]; 3];
+
+fn zero_moment() -> CellMoment {
+    [[0.0; 3]; 3]
+}
+
+fn identity_moment(value: f64) -> CellMoment {
+    let mut out = zero_moment();
+    for (index, row) in out.iter_mut().enumerate() {
+        row[index] = value;
+    }
+    out
+}
+
+fn outer_moment(vector: [f64; 3]) -> CellMoment {
+    core::array::from_fn(|i| core::array::from_fn(|j| vector[i] * vector[j]))
+}
+
+fn moment_add(left: CellMoment, right: CellMoment) -> CellMoment {
+    core::array::from_fn(|i| core::array::from_fn(|j| left[i][j] + right[i][j]))
+}
+
+fn moment_sub(left: CellMoment, right: CellMoment) -> CellMoment {
+    core::array::from_fn(|i| core::array::from_fn(|j| left[i][j] - right[i][j]))
+}
+
+fn moment_scale(moment: CellMoment, scale: f64) -> CellMoment {
+    core::array::from_fn(|i| core::array::from_fn(|j| moment[i][j] * scale))
+}
+
+fn moment_trace(moment: CellMoment) -> f64 {
+    moment[0][0] + moment[1][1] + moment[2][2]
+}
+
+fn sample_covariance(vectors: &[[f64; 3]], mean: [f64; 3]) -> Option<CellMoment> {
+    if vectors.len() < 2 {
+        return None;
+    }
+    let count = vectors.len() as f64;
+    let mut out = zero_moment();
+    for vector in vectors {
+        let delta = [
+            vector[0] - mean[0],
+            vector[1] - mean[1],
+            vector[2] - mean[2],
+        ];
+        for i in 0..3 {
+            for j in 0..3 {
+                out[i][j] += delta[i] * delta[j];
+            }
+        }
+    }
+    for row in &mut out {
+        for value in row {
+            *value /= count - 1.0;
+        }
+    }
+    Some(out)
+}
+
+/// Jacobi rotations for a real symmetric 3x3 matrix (Golub & Van Loan, Matrix
+/// Computations, 4th ed., §8.5; eqs. 8.5.1 and 8.5.3; max-offdiagonal selection §8.5.3).
+fn project_psd(moment: CellMoment) -> CellMoment {
+    let mut a: CellMoment = core::array::from_fn(|i| {
+        core::array::from_fn(|j| 0.5 * (moment[i][j] + moment[j][i]))
+    });
+    let mut vectors = identity_moment(1.0);
+    for _ in 0..20 {
+        let candidates: [(usize, usize); 3] = [(0, 1), (0, 2), (1, 2)];
+        let (p, q) = candidates
+            .into_iter()
+            .max_by(|left, right| a[left.0][left.1].abs().total_cmp(&a[right.0][right.1].abs()))
+            .unwrap_or((0, 1));
+        let off = a[p][q];
+        if off.abs() <= 1e-14 * (a[p][p].abs() + a[q][q].abs() + 1.0) {
+            break;
+        }
+        let theta = 0.5 * libm::atan2(2.0 * off, a[q][q] - a[p][p]);
+        let cosine = libm::cos(theta);
+        let sine = libm::sin(theta);
+        let mut rotation = Mat3::IDENTITY;
+        rotation.0[p][p] = cosine;
+        rotation.0[p][q] = sine;
+        rotation.0[q][p] = -sine;
+        rotation.0[q][q] = cosine;
+        a = rotation.transpose().mul(&Mat3(a)).mul(&rotation).0;
+        vectors = Mat3(vectors).mul(&rotation).0;
+    }
+    let diagonal = Mat3::diag([
+        a[0][0].max(0.0),
+        a[1][1].max(0.0),
+        a[2][2].max(0.0),
+    ]);
+    Mat3(vectors)
+        .mul(&diagonal)
+        .mul(&Mat3(vectors).transpose())
+        .0
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelErrorField {
-    pub variance: Vec<f64>,
-    /// Held-out RMS ΔE per region, zero where no sample fell.
-    pub held_out_rms: Vec<f64>,
-    /// Reference (pre-model) RMS σ per region.
-    pub reference_rms: Vec<f64>,
+    /// Post-clip UCS second moment of the mean Look response, per encoding and cell.
+    pub post: Vec<[[f64; 3]; 3]>,
+    /// True where the cell has independent held-out mean-response evidence.
+    pub evidence: Vec<bool>,
+    /// Diagnostic root of the mean held-out body mean-response energy per encoding and cell.
+    pub held_out_mean_rms: Vec<f64>,
+    /// Independent body estimates contributing to each encoding/cell.
+    pub bodies: Vec<usize>,
+    /// Independent image units contributing to each encoding/cell.
+    pub repeats: Vec<usize>,
 }
 
 impl ModelErrorField {
     pub fn empty() -> Self {
+        let entries = MODEL_ENCODINGS * MODEL_HUE_BINS * MODEL_S_BINS * MODEL_C_BINS;
         Self {
-            variance: vec![0.0; MODEL_HUE_BINS * MODEL_S_BINS],
-            held_out_rms: vec![0.0; MODEL_HUE_BINS * MODEL_S_BINS],
-            reference_rms: vec![0.0; MODEL_HUE_BINS * MODEL_S_BINS],
+            post: vec![zero_moment(); entries],
+            evidence: vec![false; entries],
+            held_out_mean_rms: vec![0.0; entries],
+            bodies: vec![0; entries],
+            repeats: vec![0; entries],
         }
     }
 
-    pub fn at(&self, s: f64, hue_degrees: f64) -> f64 {
-        self.variance[region(s, hue_degrees)]
+    pub fn at(&self, input: &LookInput, space: RgbSpace) -> [[f64; 3]; 3] {
+        self.post[post_index(input, space)]
     }
+
+    pub fn evidence_at(&self, input: &LookInput, space: RgbSpace) -> bool {
+        self.evidence[post_index(input, space)]
+    }
+
+    pub fn radial(&self, input: &LookInput, space: RgbSpace) -> f64 {
+        moment_trace(self.post[post_index(input, space)])
+    }
+}
+
+fn encoding_index(space: RgbSpace) -> usize {
+    match space {
+        RgbSpace::Srgb => 0,
+        RgbSpace::AdobeRgb => 1,
+        RgbSpace::Rec2020 => 2,
+        RgbSpace::DisplayP3 => 3,
+        RgbSpace::ProPhoto => 4,
+    }
+}
+
+pub fn post_index(input: &LookInput, space: RgbSpace) -> usize {
+    encoding_index(space) * MODEL_HUE_BINS * MODEL_S_BINS * MODEL_C_BINS + cell(input)
+}
+
+pub fn cell(input: &LookInput) -> usize {
+    region(input.s, input.h_in) * MODEL_C_BINS + color_cell(input.c_in)
 }
 
 /// Region index: 12 hue bins of 30 degrees, 6 exposure bins over [-12, 6].
@@ -58,147 +195,564 @@ pub fn region_center(index: usize) -> (f64, f64) {
     (s, hue)
 }
 
-fn smooth(values: &[f64]) -> Vec<f64> {
-    let mut out = values.to_vec();
-    for _ in 0..2 {
-        let mut next = out.clone();
-        for hue in 0..MODEL_HUE_BINS {
-            for s in 0..MODEL_S_BINS {
-                let mut sum = 0.0;
-                let mut count = 0.0;
-                for dh in [-1i64, 0, 1] {
-                    let h = ((hue as i64 + dh + MODEL_HUE_BINS as i64) % MODEL_HUE_BINS as i64)
-                        as usize;
-                    for ds in [-1i64, 0, 1] {
-                        let bin = s as i64 + ds;
-                        if !(0..MODEL_S_BINS as i64).contains(&bin) {
-                            continue;
-                        }
-                        sum += out[h * MODEL_S_BINS + bin as usize];
-                        count += 1.0;
-                    }
-                }
-                next[hue * MODEL_S_BINS + s] = sum / count;
-            }
-        }
-        out = next;
-    }
-    out.into_iter().map(|value| value.max(0.0)).collect()
+fn color_cell(c: f64) -> usize {
+    (((c / C_MAX) * MODEL_C_BINS as f64).floor() as isize).clamp(0, MODEL_C_BINS as isize - 1)
+        as usize
 }
 
-/// K-fold over bodies, or over images for a single-body pool.
+fn equivalent_images(a: &FitImage, b: &FitImage) -> bool {
+    a.transform == b.transform
+        && a.exposure_hint.to_bits() == b.exposure_hint.to_bits()
+        && a.trust_weight.to_bits() == b.trust_weight.to_bits()
+        && a.sample_trust == b.sample_trust
+        && a.exposure_mode == b.exposure_mode
+        && a.contributor == b.contributor
+        && a.intent == b.intent
+        && a.settings == b.settings
+        && a.samples == b.samples
+}
+
+fn deduplicate_copies(images: &[FitImage]) -> Vec<FitImage> {
+    let mut out: Vec<FitImage> = Vec::new();
+    for image in images {
+        let group = image.samples.header().rerender_group;
+        if group.is_some()
+            && out.iter().any(|kept| {
+                kept.samples.header().rerender_group == group && equivalent_images(image, kept)
+            })
+        {
+            continue;
+        }
+        out.push(image.clone());
+    }
+    out
+}
+
+#[derive(Clone, Copy)]
+struct ImageRegion {
+    mean: [f64; 3],
+    within: Option<CellMoment>,
+}
+
+#[derive(Clone, Copy)]
+struct BodyRegion {
+    mean: [f64; 3],
+    /// From independently repeated image units.
+    mean_covariance: Option<CellMoment>,
+    /// Used when there is no independent repeat.
+    within_image: Option<CellMoment>,
+    repeats: usize,
+}
+
+impl BodyRegion {
+    fn from_units(units: &[ImageRegion]) -> Option<Self> {
+        if units.is_empty() {
+            return None;
+        }
+        let count = units.len() as f64;
+        let mean: [f64; 3] = core::array::from_fn(|channel| {
+            units.iter().map(|unit| unit.mean[channel]).sum::<f64>() / count
+        });
+        if units.len() < 2 {
+            return Some(Self {
+                mean,
+                mean_covariance: None,
+                within_image: units[0].within,
+                repeats: 1,
+            });
+        }
+        let covariance = sample_covariance(
+            &units.iter().map(|unit| unit.mean).collect::<Vec<_>>(),
+            mean,
+        )
+        .map(|covariance| moment_scale(covariance, 1.0 / count));
+        Some(Self {
+            mean,
+            mean_covariance: covariance,
+            within_image: None,
+            repeats: units.len(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct RegionAccum {
+    sum: [f64; 3],
+    outer: CellMoment,
+    weight: f64,
+    weight_sq: f64,
+}
+
+impl RegionAccum {
+    fn add(&mut self, residual: [f64; 3], weight: f64) {
+        if weight <= 0.0 {
+            return;
+        }
+        for i in 0..3 {
+            self.sum[i] += weight * residual[i];
+            for j in 0..3 {
+                self.outer[i][j] += weight * residual[i] * residual[j];
+            }
+        }
+        self.weight += weight;
+        self.weight_sq += weight * weight;
+    }
+
+    fn finish(&self) -> Option<ImageRegion> {
+        if self.weight <= 0.0 {
+            return None;
+        }
+        let weight = self.weight;
+        let mean = self.sum.map(|sum| sum / weight);
+        let denominator = weight - self.weight_sq / weight;
+        let within = if denominator > 1e-12 {
+            let covariance: CellMoment = core::array::from_fn(|i| {
+                core::array::from_fn(|j| {
+                    (self.outer[i][j] - self.sum[i] * self.sum[j] / weight) / denominator
+                })
+            });
+            Some(project_psd(covariance))
+        } else {
+            None
+        };
+        Some(ImageRegion { mean, within })
+    }
+}
+
+/// Groups images whose rerender group says they share one input.
+fn image_units(images: &[FitImage]) -> Vec<Vec<usize>> {
+    let mut units: Vec<(Option<looklab_samples::RerenderGroupId>, Vec<usize>)> = Vec::new();
+    for (index, image) in images.iter().enumerate() {
+        match image.samples.header().rerender_group {
+            Some(group) => {
+                if let Some((_, members)) = units
+                    .iter_mut()
+                    .find(|(candidate, _)| *candidate == Some(group))
+                {
+                    members.push(index);
+                } else {
+                    units.push((Some(group), vec![index]));
+                }
+            }
+            None => units.push((None, vec![index])),
+        }
+    }
+    units.into_iter().map(|(_, members)| members).collect()
+}
+
+fn image_folds(images: &[FitImage]) -> Vec<Vec<usize>> {
+    let units = image_units(images);
+    if units.is_empty() {
+        return Vec::new();
+    }
+    // Three units per fold when possible, two for smaller pools; one-unit folds
+    // only when the pool cannot give a held-out fit and an independent repeat.
+    let count = if units.len() >= 6 {
+        (units.len() / 3).min(MODEL_IMAGE_FOLDS)
+    } else if units.len() >= 4 {
+        (units.len() / 2).min(MODEL_IMAGE_FOLDS)
+    } else {
+        units.len()
+    };
+    let mut folds = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = index * units.len() / count;
+        let end = (index + 1) * units.len() / count;
+        if start == end {
+            continue;
+        }
+        let mut fold_images = Vec::new();
+        for unit in &units[start..end] {
+            fold_images.extend(unit.iter().copied());
+        }
+        folds.push(fold_images);
+    }
+    folds
+}
+
+/// Normal-body-mean delta method: `(B-1)S²/σ² ~ χ²_{B-1}`, `Var(S²)≈2σ⁴/(B-1)`;
+/// the Student-t multiplier is finite-B inflation, approximate for heavy tails.
+fn variance_upper_factor(count: f64) -> f64 {
+    1.0 + student_t_95(count - 1.0) * (2.0 / (count - 1.0)).sqrt()
+}
+
+fn body_point(bodies: &[BodyRegion]) -> f64 {
+    let count = bodies.len() as f64;
+    bodies
+        .iter()
+        .map(|body| moment_trace(outer_moment(body.mean)))
+        .sum::<f64>()
+        / count
+}
+
+#[derive(Clone, Copy)]
+enum CellClass {
+    Supported(CellMoment),
+    Local(CellMoment),
+    Unknown,
+}
+
+fn cell_estimate(bodies: &[BodyRegion]) -> CellClass {
+    let count = bodies.len() as f64;
+    if bodies.len() == 1 {
+        let body = bodies[0];
+        let coherent = outer_moment(body.mean);
+        if let Some(covariance) = body.mean_covariance {
+            let t = student_t_95(body.repeats as f64 - 1.0);
+            CellClass::Supported(moment_add(coherent, moment_scale(covariance, t * t)))
+        } else if let Some(within) = body.within_image {
+            CellClass::Local(moment_add(coherent, within))
+        } else {
+            CellClass::Unknown
+        }
+    } else {
+        let mean: [f64; 3] = core::array::from_fn(|channel| {
+            bodies.iter().map(|body| body.mean[channel]).sum::<f64>() / count
+        });
+        let between = sample_covariance(
+            &bodies.iter().map(|body| body.mean).collect::<Vec<_>>(),
+            mean,
+        )
+        .unwrap_or_else(zero_moment);
+        let sampling = bodies.iter().fold(zero_moment(), |mut sum, body| {
+            if let Some(covariance) = body.mean_covariance {
+                sum = moment_add(sum, covariance);
+            }
+            sum
+        });
+        let sampling = moment_scale(sampling, 1.0 / count);
+        let t = student_t_95(count - 1.0);
+        let factor = variance_upper_factor(count);
+        let coherent = outer_moment(mean);
+        let excess = project_psd(moment_sub(moment_scale(between, factor), sampling));
+        // Sampling covariance of the grand mean, separate from heterogeneity.
+        let mean_uncertainty = moment_scale(sampling, t * t / count);
+        CellClass::Supported(project_psd(moment_add(
+            moment_add(coherent, excess),
+            mean_uncertainty,
+        )))
+    }
+}
+
+fn model_error_diag() -> bool {
+    std::env::var_os("LOOKLAB_MODEL_ERROR_DIAG").is_some()
+}
+
+/// K-fold over whole bodies or whole images, conditioning held nuisances on the
+/// kept Look; variance is squared coherent mean plus inflated body-to-body heterogeneity.
 pub fn estimate_model_error(
     images: &[FitImage],
     groups: &[BodyGroup],
-    reference_variance: &[f64],
+    model: Option<&ControlResponseModel>,
     options: &FitOptions,
     clip_k: f64,
 ) -> Result<ModelErrorField> {
-    let mut field = ModelErrorField::empty();
-    let folds: Vec<BodyGroup> = if groups.len() >= 2 {
-        groups.to_vec()
-    } else {
-        let chunk_size = images.len().div_ceil(5).max(1);
-        let mut folds = Vec::new();
-        for (index, slice) in images.chunks(chunk_size).enumerate() {
-            let start = index * chunk_size;
-            let id = looklab_body::BodyId::new(format!("image-fold-{index}"))
-                .map_err(|error| crate::types::FitError::Hierarchy(error.to_string()))?;
-            folds.push(BodyGroup {
-                body: id,
-                images: (start..start + slice.len()).collect(),
-            });
-        }
-        folds
-    };
-    if folds.len() < 2 {
-        return Ok(field);
+    if images.is_empty() {
+        return Err(crate::types::FitError::NoImages);
     }
-    let mut fold_squared: Vec<Vec<f64>> = Vec::new();
-    let mut fold_counts: Vec<Vec<f64>> = Vec::new();
-    for held in &folds {
-        let kept: Vec<FitImage> = images
+    let mut field = ModelErrorField::empty();
+    let bins = MODEL_HUE_BINS * MODEL_S_BINS;
+    let cells = bins * MODEL_C_BINS;
+    let body_holdouts = groups.iter().filter(|group| !group.images.is_empty()).count() >= 2;
+    let folds = if body_holdouts {
+        groups
+            .iter()
+            .filter(|group| !group.images.is_empty())
+            .map(|group| group.images.clone())
+            .collect()
+    } else {
+        image_folds(images)
+    };
+    if folds.is_empty() {
+        return Err(crate::types::FitError::NoModelErrorEvidence);
+    }
+    let mut per_cell: Vec<Vec<BodyRegion>> =
+        vec![Vec::new(); MODEL_ENCODINGS * cells];
+    let mut single_body_units = (!body_holdouts).then(|| vec![Vec::new(); MODEL_ENCODINGS * cells]);
+    let mut evidence = false;
+    let mut failed = false;
+    for (fold_index, held) in folds.iter().enumerate() {
+        let kept_raw: Vec<FitImage> = images
             .iter()
             .enumerate()
-            .filter(|(index, _)| !held.images.contains(index))
+            .filter(|(index, _)| !held.contains(index))
             .map(|(_, image)| image.clone())
             .collect();
+        let kept = deduplicate_copies(&kept_raw);
         if kept.is_empty() {
+            if model_error_diag() {
+                eprintln!("model_error fold {fold_index}: kept set empty");
+            }
+            failed = true;
             continue;
         }
-        let Ok(result) = crate::fit::run_quick(&kept, options, None) else {
+        let Ok(result) = crate::fit::run_quick(&kept, options, None, model) else {
+            if model_error_diag() {
+                eprintln!("model_error fold {fold_index}: kept quick fit failed");
+            }
+            failed = true;
             continue;
         };
-        let held_images: Vec<FitImage> = held
+        if model_error_diag() {
+            eprintln!(
+                "model_error fold {fold_index}: kept converged={} cost={} evaluations={}",
+                result.diagnostics.converged,
+                result.diagnostics.final_cost,
+                result.diagnostics.evaluations,
+            );
+        }
+        if !result.diagnostics.converged {
+            failed = true;
+            continue;
+        }
+        let learned = result
+            .control_response
+            .as_ref()
+            .map(|fit| &fit.model)
+            .or(model);
+        let held_raw: Vec<FitImage> = held.iter().map(|index| images[*index].clone()).collect();
+        let held_images = deduplicate_copies(&held_raw);
+        if held_images.is_empty() {
+            continue;
+        }
+        let Ok(problem) = Problem::new_with(&held_images, learned, options) else {
+            if model_error_diag() {
+                eprintln!("model_error fold {fold_index}: held problem construction failed");
+            }
+            failed = true;
+            continue;
+        };
+        let image_encoding: Vec<usize> = problem
             .images
             .iter()
-            .map(|index| images[*index].clone())
+            .map(|image| encoding_index(image.space))
             .collect();
-        let Ok(problem) = Problem::new_with(&held_images, None, options) else {
+        let Ok(conditioned) =
+            crate::fit::condition_nuisances(&held_images, options, &result.look, learned, clip_k)
+        else {
+            if model_error_diag() {
+                eprintln!("model_error fold {fold_index}: nuisance conditioning failed");
+            }
+            failed = true;
             continue;
         };
-        let mut squared = vec![0.0_f64; field.variance.len()];
-        let mut counts = vec![0.0_f64; field.variance.len()];
-        for sample in &problem.samples {
-            let index = sample.image as usize;
-            let image = &held_images[index];
-            let scale = libm::pow(2.0, image.exposure_hint);
-            let xyz = looklab_color::Xyz::from_array(image.transform.mul_vec([
-                sample.rgb[0] * scale,
-                sample.rgb[1] * scale,
-                sample.rgb[2] * scale,
-            ]));
-            let input = looklab_model::LookInput::new(xyz);
-            let context = crate::predict::ImageCtx {
-                transform: image.transform,
-                a0: image.transform,
-                space: problem.images[index].space,
-                exposure_scale: scale,
-                wb_r: 1.0,
-                wb_b: 1.0,
-            };
-            let prediction =
-                crate::predict::predict_only(&result.look, &context, sample.rgb, clip_k);
-            let error = delta_e_ucs(prediction, sample.target);
-            let bin = region(input.s, input.h_in);
-            let weight = sample.weight.max(0.0);
-            squared[bin] += weight * error * error;
-            counts[bin] += weight;
-        }
-        fold_squared.push(squared);
-        fold_counts.push(counts);
-    }
-    let mut raw = vec![0.0_f64; field.variance.len()];
-    for bin in 0..raw.len() {
-        let mut values = Vec::new();
-        for (squared, counts) in fold_squared.iter().zip(fold_counts.iter()) {
-            if counts[bin] > 0.0 {
-                values.push(squared[bin] / counts[bin]);
+        if !conditioned.converged {
+            if model_error_diag() {
+                eprintln!(
+                    "model_error fold {fold_index}: nuisance conditioning not converged accepted={} attempts={} damping={} last_step={} gradient_max={}",
+                    conditioned.accepted,
+                    conditioned.attempts,
+                    conditioned.damping,
+                    conditioned.last_step,
+                    conditioned.gradient_max
+                );
             }
-        }
-        if values.is_empty() {
+            failed = true;
             continue;
         }
-        let mean = values.iter().sum::<f64>() / values.len() as f64;
-        field.held_out_rms[bin] = mean.sqrt();
-        let mut excess = (mean - reference_variance[bin]).max(0.0);
-        if values.len() > 1 {
-            let variance = values
-                .iter()
-                .map(|value| (value - mean) * (value - mean))
-                .sum::<f64>()
-                / (values.len() - 1) as f64;
-            let t = student_t_95((values.len() - 1) as f64);
-            excess += t * variance.sqrt() * (1.0 + 1.0 / values.len() as f64).sqrt();
+        let nuisances = conditioned.images;
+        let mut params = crate::fit::params_from_look(&problem, &result.look);
+        if let Some(model) = learned {
+            crate::fit::seed_response_params(&problem, &mut params, model);
+            crate::fit::seed_mode_params(&problem, &mut params, model);
         }
-        raw[bin] = excess * MODEL_SAFETY;
-        field.reference_rms[bin] = reference_variance[bin].max(0.0).sqrt();
+        for (index, nuisance) in nuisances.iter().enumerate() {
+            let range = params.layout.image(index);
+            params.theta[range.start] = nuisance.exposure;
+            params.theta[range.start + 1] = nuisance.wb_log_r;
+            params.theta[range.start + 2] = nuisance.wb_log_b;
+        }
+        params.theta[params.layout.clip] = crate::layout::zeta_from_clip(clip_k);
+        let realized: Vec<Look> = (0..held_images.len())
+            .map(|index| problem.realized_look(&params, index))
+            .collect();
+        let mut accum: Vec<Vec<RegionAccum>> = (0..held_images.len())
+            .map(|_| vec![RegionAccum::default(); cells])
+            .collect();
+        for sample in &problem.samples {
+            let index = sample.image as usize;
+            let context = problem.image_ctx(&params, index);
+            let xyz = looklab_color::Xyz::from_array(context.transform.mul_vec([
+                sample.rgb[0] * context.wb_r * context.exposure_scale,
+                sample.rgb[1] * context.exposure_scale,
+                sample.rgb[2] * context.wb_b * context.exposure_scale,
+            ]));
+            let input = LookInput::new(xyz);
+            let prediction =
+                crate::predict::predict_only(&realized[index], &context, sample.rgb, clip_k);
+            let residual = [
+                prediction.j - sample.target.j,
+                prediction.a - sample.target.a,
+                prediction.b - sample.target.b,
+            ];
+            let cell = region(input.s, input.h_in) * MODEL_C_BINS + color_cell(input.c_in);
+            accum[index][cell].add(residual, sample.weight.max(0.0));
+        }
+        let image_regions: Vec<Vec<Option<ImageRegion>>> = accum
+            .iter()
+            .map(|regions| regions.iter().map(RegionAccum::finish).collect())
+            .collect();
+        let units = image_units(&held_images);
+        for indexed in 0..MODEL_ENCODINGS * cells {
+            let encoding = indexed / cells;
+            let cell = indexed % cells;
+            let mut unit_regions = Vec::new();
+            for unit in &units {
+                let mut means = Vec::new();
+                let mut within: Option<CellMoment> = None;
+                for image_index in unit {
+                    if image_encoding[*image_index] != encoding {
+                        continue;
+                    }
+                    if let Some(region) = image_regions[*image_index][cell] {
+                        means.push(region.mean);
+                        if let Some(value) = region.within {
+                            if within.is_none_or(|current| {
+                                moment_trace(value) > moment_trace(current)
+                            }) {
+                                within = Some(value);
+                            }
+                        }
+                    }
+                }
+                if means.is_empty() {
+                    continue;
+                }
+                let count = means.len() as f64;
+                let mean: [f64; 3] = core::array::from_fn(|channel| {
+                    means.iter().map(|value| value[channel]).sum::<f64>() / count
+                });
+                unit_regions.push(ImageRegion { mean, within });
+            }
+            if let Some(all_units) = single_body_units.as_mut() {
+                all_units[indexed].extend(unit_regions);
+            } else if let Some(body) = BodyRegion::from_units(&unit_regions) {
+                per_cell[indexed].push(body);
+                evidence = true;
+            }
+        }
     }
-    field.variance = smooth(&raw);
+    if failed {
+        return Err(crate::types::FitError::NoModelErrorEvidence);
+    }
+    if let Some(units_by_cell) = single_body_units {
+        for (indexed, units) in units_by_cell.iter().enumerate() {
+            if let Some(body) = BodyRegion::from_units(units) {
+                per_cell[indexed].push(body);
+                evidence = true;
+            }
+        }
+    }
+    if !evidence {
+        return Err(crate::types::FitError::NoModelErrorEvidence);
+    }
+
+    let entries = MODEL_ENCODINGS * cells;
+    let mut post = vec![zero_moment(); entries];
+    let mut held_rms = vec![0.0_f64; entries];
+    let mut bodies_count = vec![0usize; entries];
+    let mut repeats = vec![0usize; entries];
+    let mut evidence_cells = vec![false; entries];
+    let mut classes = vec![CellClass::Unknown; entries];
+    let mut bin_supported = vec![0.0_f64; MODEL_ENCODINGS * bins];
+    let mut encoding_supported = [false; MODEL_ENCODINGS];
+    let mut encoding_global = [0.0_f64; MODEL_ENCODINGS];
+    let mut any_supported = false;
+    for indexed in 0..entries {
+        let bodies = &per_cell[indexed];
+        if bodies.is_empty() {
+            continue;
+        }
+        let encoding = indexed / cells;
+        let cell = indexed % cells;
+        let bin = cell / MODEL_C_BINS;
+        bodies_count[indexed] = bodies.len();
+        repeats[indexed] = bodies.iter().map(|body| body.repeats).sum();
+        held_rms[indexed] = body_point(bodies).max(0.0).sqrt();
+        let estimate = cell_estimate(bodies);
+        classes[indexed] = estimate;
+        match estimate {
+            CellClass::Supported(moment) => {
+                post[indexed] = moment;
+                evidence_cells[indexed] = true;
+                let radial = moment_trace(moment);
+                bin_supported[encoding * bins + bin] =
+                    bin_supported[encoding * bins + bin].max(radial);
+                encoding_global[encoding] = encoding_global[encoding].max(radial);
+                encoding_supported[encoding] = true;
+                any_supported = true;
+            }
+            CellClass::Local(moment) => post[indexed] = moment,
+            CellClass::Unknown => {}
+        }
+    }
+    if !any_supported {
+        return Err(crate::types::FitError::NoModelErrorEvidence);
+    }
+    let global_all = encoding_global.iter().copied().fold(0.0_f64, f64::max);
+    for indexed in 0..entries {
+        let encoding = indexed / cells;
+        let cell = indexed % cells;
+        let bin = cell / MODEL_C_BINS;
+        let region_supported = bin_supported[encoding * bins + bin];
+        let encoding_fallback = if encoding_supported[encoding] {
+            encoding_global[encoding]
+        } else {
+            global_all
+        };
+        let fallback = if region_supported > 0.0 {
+            region_supported
+        } else {
+            encoding_fallback
+        };
+        match classes[indexed] {
+            CellClass::Supported(_) => {}
+            CellClass::Local(moment) => {
+                post[indexed] = identity_moment(moment_trace(moment).max(fallback));
+            }
+            CellClass::Unknown => post[indexed] = identity_moment(fallback),
+        }
+    }
+    field.post = post;
+    field.evidence = evidence_cells;
+    field.held_out_mean_rms = held_rms;
+    field.bodies = bodies_count;
+    field.repeats = repeats;
+    if model_error_diag() {
+        if let Some((indexed, moment)) = field
+            .post
+            .iter()
+            .enumerate()
+            .max_by(|left, right| {
+                moment_trace(*left.1).total_cmp(&moment_trace(*right.1))
+            })
+        {
+            let encoding = indexed / cells;
+            let cell = indexed % cells;
+            eprintln!(
+                "model_error peak encoding={encoding} cell={cell} radial={} rms={} repeats={} evidence={} class={}",
+                moment_trace(*moment),
+                field.held_out_mean_rms[indexed],
+                field.repeats[indexed],
+                field.evidence[indexed],
+                match classes[indexed] {
+                    CellClass::Supported(_) => "supported",
+                    CellClass::Local(_) => "local",
+                    CellClass::Unknown => "unknown",
+                }
+            );
+            for body in &per_cell[indexed] {
+                eprintln!(
+                    "model_error cell={cell} repeats={} mean={:?} mean_covariance={:?} within={:?}",
+                    body.repeats, body.mean, body.mean_covariance, body.within_image,
+                );
+            }
+        }
+    }
     Ok(field)
 }
 
-/// Add the stored model variance to an interactive probe set and re-mark support.
+/// Add measured post-clip model moments; reliable probes also get inverse-transported pre-clip.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_model_error(
     probes: &mut ProbeUncertainty,
@@ -214,26 +768,38 @@ pub fn apply_model_error(
     let mut supported = 0usize;
     for (index, probe) in probes.probes.iter_mut().enumerate() {
         let input = looklab_model::LookInput::new(probes_v1.probes[index].xyz);
-        let extra = field.at(input.s, input.h_in) / 3.0;
-        for (channel, row) in probe.covariance.iter_mut().enumerate() {
-            row[channel] += extra;
+        let has_evidence = field.evidence_at(&input, space);
+        let prediction = look.eval(probes_v1.probes[index].xyz);
+        let chain = crate::predict::clip_jacobian(prediction, space, clip_k);
+        let model_post = field.at(&input, space);
+        for a in 0..3 {
+            for b in 0..3 {
+                probe.post_covariance[a][b] += model_post[a][b];
+            }
+        }
+        let mut pre_clip_reliable =
+            crate::predict::clip_derivative_min(prediction, space, clip_k) >= 0.25;
+        if pre_clip_reliable {
+            if let Some(inverse) = chain.inverse() {
+                let transported = inverse
+                    .mul(&Mat3(model_post))
+                    .mul(&inverse.transpose())
+                    .0;
+                let transported: CellMoment = core::array::from_fn(|i| {
+                    core::array::from_fn(|j| 0.5 * (transported[i][j] + transported[j][i]))
+                });
+                for a in 0..3 {
+                    for b in 0..3 {
+                        probe.covariance[a][b] += transported[a][b];
+                    }
+                }
+            } else {
+                pre_clip_reliable = false;
+            }
         }
         probe.sigma_de = (probe.covariance[0][0] + probe.covariance[1][1] + probe.covariance[2][2])
             .max(0.0)
             .sqrt();
-        let prediction = look.eval(probes_v1.probes[index].xyz);
-        let chain = crate::predict::clip_jacobian(prediction, space, clip_k);
-        for a in 0..3 {
-            for b in 0..3 {
-                let mut sum = 0.0;
-                for c in 0..3 {
-                    for d in 0..3 {
-                        sum += chain.0[a][c] * probe.covariance[c][d] * chain.0[b][d];
-                    }
-                }
-                probe.post_covariance[a][b] = sum;
-            }
-        }
         crate::uncertainty::floor_post_covariance(&probe.covariance, &mut probe.post_covariance);
         probe.post_sigma_de = (probe.post_covariance[0][0]
             + probe.post_covariance[1][1]
@@ -242,8 +808,7 @@ pub fn apply_model_error(
             .sqrt();
         probe.post_ucs =
             crate::predict::post_clip(look, probes_v1.probes[index].xyz, space, clip_k);
-        probe.pre_clip_reliable =
-            crate::predict::clip_derivative_min(prediction, space, clip_k) >= 0.25;
+        probe.pre_clip_reliable = pre_clip_reliable;
         probe.gamut_edge = probes_v1.probes[index].id.as_str().split('-').nth(2) == Some("80");
         let previous_sigma = previous
             .and_then(|state| state.sigma.get(index).copied())
@@ -265,7 +830,8 @@ pub fn apply_model_error(
         probe.supported_density = flags.density;
         probe.supported_clusters = flags.clusters;
         probe.supported_bias = flags.bias;
-        probe.supported = flags.all();
+        probe.supported_evidence = has_evidence;
+        probe.supported = flags.all() && has_evidence;
         if probe.supported {
             supported += 1;
         }
@@ -333,6 +899,7 @@ mod review_tests {
                 supported_density: false,
                 supported_clusters: false,
                 supported_bias: false,
+                supported_evidence: false,
                 supported: false,
                 clusters: 5,
             })
@@ -345,10 +912,11 @@ mod review_tests {
     }
 
     #[test]
-    fn radial_model_variance_is_divided_across_three_axes() {
+    fn directional_post_moment_is_not_divided_or_clipped_twice() {
         let look = Look::colorimetric_spline().expect("look");
         let mut field = ModelErrorField::empty();
-        field.variance.fill(3.0);
+        let moment = [[4.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        field.post.fill(moment);
         let mut estimates = probes();
         apply_model_error(
             &mut estimates,
@@ -363,9 +931,70 @@ mod review_tests {
             0.03,
             None,
         );
-        let sigma = estimates.probes[0].sigma_de;
-        assert!((sigma * sigma - 3.0).abs() < 1e-12);
-        assert!(estimates.probes[0].post_sigma_de <= sigma + 1e-12);
+        let post = estimates.probes[0].post_covariance;
+        assert!(post[0][0] >= 4.0 - 1e-12);
+        assert!(estimates.probes[0].post_sigma_de >= 2.0 - 1e-12);
+    }
+
+    #[test]
+    fn pre_clip_transport_only_for_reliable_probes() {
+        let mut look = Look::colorimetric_spline().expect("look");
+        for value in &mut look.color.g.plane {
+            *value = 0.5;
+        }
+        for value in &mut look.color.g.volume {
+            *value = 0.5;
+        }
+        let mut field = ModelErrorField::empty();
+        let moment = [[4.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        field.post.fill(moment);
+        let mut estimates = probes();
+        apply_model_error(
+            &mut estimates,
+            &field,
+            &look,
+            &density(),
+            RgbSpace::Srgb,
+            &FitOptions {
+                density_floor: 0.0,
+                ..FitOptions::default()
+            },
+            0.03,
+            None,
+        );
+        let mut reliable = false;
+        let mut unreliable = false;
+        for probe in &estimates.probes {
+            let pre = moment_trace(probe.covariance);
+            let post = moment_trace(probe.post_covariance);
+            if probe.pre_clip_reliable {
+                reliable = true;
+                assert!(pre > 1e-12, "reliable probe got no pre-clip model term");
+            } else {
+                unreliable = true;
+                assert!(pre < 1e-12, "unreliable probe invented a pre-clip term");
+            }
+            assert!(post >= 4.0 - 1e-12, "post model moment missing");
+        }
+        assert!(reliable, "fixture has no reliable probe");
+        assert!(unreliable, "fixture has no unreliable probe");
+    }
+
+    #[test]
+    fn large_body_variance_keeps_mean_uncertainty() {
+        let body = |mean: f64| BodyRegion {
+            mean: [mean, 0.0, 0.0],
+            mean_covariance: Some(identity_moment(100.0)),
+            within_image: None,
+            repeats: 2,
+        };
+        let CellClass::Supported(moment) = cell_estimate(&[body(1.0), body(-1.0)]) else {
+            panic!("two independent bodies are supported");
+        };
+        assert!(
+            moment_trace(moment) > 1.0,
+            "large body variance erased mean uncertainty"
+        );
     }
 
     #[cfg(feature = "synth")]
@@ -379,17 +1008,12 @@ mod review_tests {
         let options = FitOptions {
             max_samples_per_image: 200,
             hessian_samples: 500,
-            max_sweeps: 3,
+            max_sweeps: 64,
+            sweep_budget: 2_000_000.0,
             ..FitOptions::default()
         };
-        let field = estimate_model_error(
-            &data.images,
-            &[],
-            &vec![0.0; MODEL_HUE_BINS * MODEL_S_BINS],
-            &options,
-            0.03,
-        )
-        .expect("image folds");
-        assert!(field.held_out_rms.iter().any(|value| *value > 0.0));
+        let field =
+            estimate_model_error(&data.images, &[], None, &options, 0.03).expect("image folds");
+        assert!(field.held_out_mean_rms.iter().any(|value| *value > 0.0));
     }
 }

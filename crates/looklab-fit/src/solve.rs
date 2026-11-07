@@ -133,34 +133,58 @@ pub(crate) fn conjugate_gradient(
     max_iterations: usize,
     tolerance: f64,
 ) {
+    conjugate_gradient_preconditioned(
+        dim, apply,
+        |residual, z| {
+            for i in 0..dim {
+                z[i] = residual[i] / diagonal[i].max(1e-12);
+            }
+        },
+        rhs, x, max_iterations, tolerance,
+    );
+}
+
+pub(crate) struct CgReport {
+    pub iterations: usize,
+    pub positive_curvature: bool,
+}
+
+pub(crate) fn conjugate_gradient_preconditioned(
+    dim: usize,
+    apply: impl Fn(&[f64], &mut [f64]),
+    mut precondition: impl FnMut(&[f64], &mut [f64]),
+    rhs: &[f64],
+    x: &mut [f64],
+    max_iterations: usize,
+    tolerance: f64,
+) -> CgReport {
     x.fill(0.0);
     let mut residual = rhs.to_vec();
     let mut z = vec![0.0_f64; dim];
     let mut direction = vec![0.0_f64; dim];
     let mut product = vec![0.0_f64; dim];
-    for i in 0..dim {
-        z[i] = residual[i] / diagonal[i].max(1e-12);
-        direction[i] = z[i];
-    }
+    precondition(&residual, &mut z);
+    direction.copy_from_slice(&z);
     let mut rz = dot(&residual, &z);
     let target = rz * tolerance * tolerance;
+    let mut report = CgReport { iterations: 0, positive_curvature: true };
     for _ in 0..max_iterations {
         if rz <= target || rz <= 0.0 {
             break;
         }
         apply(&direction, &mut product);
         let curvature = dot(&direction, &product);
-        if curvature <= 0.0 {
+        if !curvature.is_finite() || curvature <= 0.0 {
+            report.positive_curvature = false;
             break;
         }
+        report.iterations += 1;
         let step = rz / curvature;
         scaled_add(x, &direction, step);
         for i in 0..dim {
             residual[i] -= step * product[i];
         }
-        for i in 0..dim {
-            z[i] = residual[i] / diagonal[i].max(1e-12);
-        }
+        precondition(&residual, &mut z);
         let next = dot(&residual, &z);
         let beta = next / rz;
         for i in 0..dim {
@@ -168,6 +192,7 @@ pub(crate) fn conjugate_gradient(
         }
         rz = next;
     }
+    report
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -179,8 +204,10 @@ pub(crate) struct GcvChoice {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select_lambda(
     hessian: &[f64],
+    fixed_curvature: &[f64],
     penalty: &[f64],
     gradient: &[f64],
+    fixed_gradient: &[f64],
     theta0: &[f64],
     rss: f64,
     n: usize,
@@ -210,6 +237,9 @@ pub(crate) fn select_lambda(
         for index in 0..n * n {
             a[index] += lambda * penalty[index];
         }
+        for (index, curvature) in fixed_curvature.iter().enumerate() {
+            a[index * n + index] += curvature;
+        }
         if !factor_in_place(&mut a, n) {
             continue;
         }
@@ -219,7 +249,7 @@ pub(crate) fn select_lambda(
             for j in 0..n {
                 offset += penalty[i * n + j] * theta0[j];
             }
-            delta[i] = -gradient[i] - lambda * offset;
+            delta[i] = -gradient[i] - fixed_gradient[i] - lambda * offset;
         }
         solve_in_place(&a, n, &mut delta);
         let h_delta = dense_mat_vec(hessian, n, &delta);
@@ -248,10 +278,13 @@ pub(crate) fn select_lambda(
 }
 
 /// Diagonal-only GCV, for the matrix-free residual block.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn select_lambda_diagonal(
     hessian_diagonal: &[f64],
+    fixed_diagonal: &[f64],
     penalty_diagonal: &[f64],
     gradient: &[f64],
+    fixed_gradient: &[f64],
     theta0: &[f64],
     rss: f64,
     observations: f64,
@@ -270,12 +303,15 @@ pub(crate) fn select_lambda_diagonal(
         let mut dof = 0.0;
         for index in 0..hessian_diagonal.len() {
             let h = hessian_diagonal[index];
-            let a = h + lambda * penalty_diagonal[index];
+            let a = h + fixed_diagonal[index] + lambda * penalty_diagonal[index];
             if a <= 0.0 {
                 continue;
             }
             dof += h / a;
-            let delta = (-gradient[index] - lambda * penalty_diagonal[index] * theta0[index]) / a;
+            let delta = (-gradient[index]
+                - fixed_gradient[index]
+                - lambda * penalty_diagonal[index] * theta0[index])
+                / a;
             fitted += 2.0 * delta * gradient[index] + h * delta * delta;
         }
         let dof = dof.min(observations * 0.999).max(0.0);

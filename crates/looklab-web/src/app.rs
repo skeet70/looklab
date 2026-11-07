@@ -6,6 +6,7 @@ use leptos::task::spawn_local;
 use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::hooks::use_location;
 use leptos_router::path;
+use wasm_bindgen::JsCast;
 
 use crate::pages::*;
 use crate::{base, ui, webauthn};
@@ -38,7 +39,13 @@ fn Shell() -> impl IntoView {
     let sign_in = session.dialog_open;
     let account_error = RwSignal::new(None::<String>);
     view! {
-        <a class="skip-link" href="#main" hidden=move || !chrome()>"Skip to content"</a>
+        <a class="skip-link" href="#main" hidden=move || !chrome() on:click=move |_| {
+            if let Some(main) = document().get_element_by_id("main")
+                .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+            {
+                let _ = main.focus();
+            }
+        }>"Skip to content"</a>
         <div class="preview-banner" role="note" hidden=move || !chrome() || !notice.get()>
             <span>"Demo with sample data. Sign-in and sharing are turned off."</span>
             <button aria-label="Dismiss demo notice" on:click=move |_| notice.set(false)>"Dismiss"</button>
@@ -73,7 +80,7 @@ fn Shell() -> impl IntoView {
                 <button on:click=move |_| account_error.set(None)>"Dismiss"</button>
             </div>
         })}
-        <main id="main">
+        <main id="main" tabindex="-1">
             <Routes fallback=|| view! {
                 <NotFound/>
             }>

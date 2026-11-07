@@ -17,7 +17,6 @@ pub use types::{
     VersionResponse,
 };
 
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -83,7 +82,7 @@ pub fn dispatch(fn_id: u32, input: &[u8]) -> Vec<u8> {
         None => Err(ModuleError::UnknownFunction { fn_id }),
         Some(Function::Version) => request::<VersionRequest>(Function::Version, input)
             .map(|_| Response::Version(version())),
-        Some(Function::Prepare) => request::<PrepareRequest>(Function::Prepare, input)
+        Some(Function::Prepare) => request::<ops::PrepareInput<'_>>(Function::Prepare, input)
             .and_then(|request| ops::prepare(request).map(Response::Prepare)),
         Some(Function::BuildManifest) => {
             request::<BuildManifestRequest>(Function::BuildManifest, input)
@@ -106,7 +105,7 @@ pub fn dispatch(fn_id: u32, input: &[u8]) -> Vec<u8> {
     postcard::to_allocvec(&result).expect("module responses always encode")
 }
 
-fn request<T: DeserializeOwned>(function: Function, input: &[u8]) -> Result<T, ModuleError> {
+fn request<'a, T: Deserialize<'a>>(function: Function, input: &'a [u8]) -> Result<T, ModuleError> {
     let (request, rest) =
         postcard::take_from_bytes(input).map_err(|error| ModuleError::Request {
             function,

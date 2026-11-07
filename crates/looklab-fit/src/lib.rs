@@ -45,20 +45,30 @@ pub use looklab_model::realization::{
 };
 pub use looklab_model::{Look, LookInput, Probe, ProbeId, ProbeSet};
 pub use model_error::{
-    MODEL_HUE_BINS, MODEL_S_BINS, ModelErrorField, apply_model_error, estimate_model_error, region,
+    MODEL_C_BINS, MODEL_HUE_BINS, MODEL_S_BINS, ModelErrorField, apply_model_error, cell,
+    estimate_model_error, post_index, region,
 };
 pub use predict::post_clip;
 pub use types::{
     ContributorId, ControlResponseFit, Density, Diagnostics, ExcludeReason, ExcludedImage,
     ExposureModeId, ExposureOffset, FitError, FitImage, FitOptions, FitResult, FitState,
-    ImageFitStats, ImageIntent, ImageNuisances, OutlierReason, PreviousSupport, ProbeEstimate,
-    ProbeUncertainty, Realization, Result, StageLambdas, Verdict,
+    ImageFitStats, ImageIntent, ImageNuisances, ImageScores, OutlierReason, PreviousSupport,
+    ProbeEstimate, ProbeUncertainty, Realization, Result, SampleEvaluations, StageLambdas, Verdict,
 };
 pub use uncertainty::small_cluster_factor;
 
 /// Fit one body's single Look at the reference control setting.
 pub fn fit(images: &[FitImage], options: &FitOptions) -> Result<FitResult> {
     fit::run(images, options, None)
+}
+
+/// Fit one body's single Look starting from `initial`.
+pub fn fit_with_initial(
+    images: &[FitImage],
+    options: &FitOptions,
+    initial: &Look,
+) -> Result<FitResult> {
+    fit::run_with_initial(images, options, initial)
 }
 
 /// Fit with the previous published support state, for hysteresis.
@@ -84,6 +94,27 @@ pub fn fit_controlled(
         return Err(FitError::NoNativeImages);
     }
     fit::run_with(&kept, options, Some(model), excluded)
+}
+
+/// Joint θ/D fit for per-image scores, without publication covariance.
+pub fn score_controlled(
+    images: &[FitImage],
+    schema: &looklab_schema::ControlSchema,
+    epoch: &looklab_schema::Epoch,
+    base_sim: &looklab_schema::SimKey,
+    options: &FitOptions,
+) -> Result<ImageScores> {
+    let model = ControlResponseModel::zeroed(schema, epoch.id, base_sim, 1)?;
+    let (kept, excluded) = fit::filter_spatial(images, schema, epoch.id)?;
+    if !kept.iter().any(|image| image.intent == ImageIntent::Native) {
+        return Err(FitError::NoNativeImages);
+    }
+    let result = fit::run_scoring(&kept, options, model, excluded)?;
+    Ok(ImageScores {
+        image_stats: result.image_stats,
+        excluded: result.excluded,
+        diagnostics: result.diagnostics,
+    })
 }
 
 pub fn fit_with_history_resumable(

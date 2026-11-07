@@ -27,6 +27,7 @@ use crate::trust::NEW_CREDENTIAL_STANDING;
 pub struct NonceResponse {
     nonce: String,
     expires_in_seconds: u64,
+    rp_id: String,
     pow: crate::config::PowConfig,
 }
 
@@ -43,6 +44,7 @@ pub async fn nonce(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
         Json(NonceResponse {
             nonce: URL_SAFE_NO_PAD.encode(nonce.as_bytes()),
             expires_in_seconds: ttl,
+            rp_id: state.config.rp_id.clone(),
             pow: {
                 let params = state.trust.pow_params(NEW_CREDENTIAL_STANDING);
                 crate::config::PowConfig {

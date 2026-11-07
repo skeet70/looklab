@@ -1,0 +1,30 @@
+# /etc/systemd/system/looklab-server.service
+[Unit]
+Description=looklab API and site server
+After=network.target
+
+[Service]
+Type=simple
+User=looklab
+Group=looklab
+ExecStartPre=/usr/local/bin/looklab-server init --config /etc/looklab/looklab.toml
+ExecStart=/usr/local/bin/looklab-server --config /etc/looklab/looklab.toml
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=60
+StateDirectory=looklab
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/looklab
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
