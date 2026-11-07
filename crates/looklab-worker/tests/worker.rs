@@ -9,6 +9,7 @@ use looklab_export::card::read_card;
 #[cfg(feature = "integration")]
 use looklab_fit::synth::LookSelector;
 use looklab_fit::synth::{SynthConfig, SyntheticDataset};
+#[cfg(feature = "integration")]
 use looklab_model::LookDocument;
 #[cfg(feature = "integration")]
 use looklab_publish::{ArtifactName, CARD_ARTIFACT, SiteIndex, VersionManifest, verify_artifact};

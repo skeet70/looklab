@@ -63,7 +63,7 @@ jobs:
             target/release/build
             target/release/.fingerprint
       - name: Worker fitter-to-trust contracts
-        run: nix develop -c cargo nextest run --locked -p looklab-worker --features integration --release --test worker --no-fail-fast --ignore-default-filter
+        run: nix develop -c cargo nextest run --locked -p looklab-worker --features integration --release --test worker --test lut_rebase --test match_bundle --no-fail-fast --ignore-default-filter
       - uses: ./.github/actions/cache
         if: ${{ !cancelled() }}
         with:

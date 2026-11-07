@@ -1,25 +1,37 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+#[cfg(feature = "integration")]
 use looklab_export::{CubeFile, Lut3d, LutLookOptions, import_lut_look};
+use looklab_model::file::{BaseReference, BaseStatus, LookVersion, Slug};
+#[cfg(feature = "integration")]
 use looklab_model::file::{
-    BaseReference, BaseStatus, CameraRendering, DeclaredEncoding, DynamicRange, LicenseRecord,
-    LookVersion, LutDefinition, OutputEncoding, Slug,
+    CameraRendering, DeclaredEncoding, DynamicRange, LicenseRecord, LutDefinition, OutputEncoding,
 };
+#[cfg(feature = "integration")]
 use looklab_model::{
     Look, LookDocument, LookIdentity, LookKind, ProbeCovariance, ProbeScalars, UncertaintyData,
     WbPolicy,
 };
-use looklab_server::admin::{self, AdminError, ManifestArtifact};
+#[cfg(feature = "integration")]
+use looklab_server::admin::ManifestArtifact;
+use looklab_server::admin::{self, AdminError};
+#[cfg(feature = "integration")]
 use looklab_server::{CredentialId, RootAdmissionId};
+#[cfg(feature = "integration")]
 use looklab_trust::{Actor, Scope, ScopeRule, VersionId};
 use looklab_upload::LookSlug;
+#[cfg(feature = "integration")]
 use looklab_worker::jobs::{JobId, JobKind, JobOwnership};
 use looklab_worker::{Worker, WorkerConfig};
+#[cfg(feature = "integration")]
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+#[cfg(feature = "integration")]
 const LUT: &str = "donor-lut";
+#[cfg(feature = "integration")]
 const BASE: &str = "classic-chrome";
+#[cfg(feature = "integration")]
 const RENDERING: &str = "Classic Chrome";
 
 struct Fixture {
@@ -40,6 +52,7 @@ async fn fixture() -> Fixture {
     Fixture { _dir: dir, worker }
 }
 
+#[cfg(feature = "integration")]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -52,6 +65,7 @@ fn model_slug(text: &str) -> Slug {
     Slug::new(text).expect("slug")
 }
 
+#[cfg(feature = "integration")]
 fn identity_cube() -> CubeFile {
     let size = 2;
     let mut data = Vec::new();
@@ -73,6 +87,7 @@ fn identity_cube() -> CubeFile {
     }
 }
 
+#[cfg(feature = "integration")]
 fn family(rendering: &str, dynamic_range: Option<DynamicRange>) -> BaseReference {
     BaseReference::FamilyRendering {
         maker: "Fujifilm".to_owned(),
@@ -82,6 +97,7 @@ fn family(rendering: &str, dynamic_range: Option<DynamicRange>) -> BaseReference
     }
 }
 
+#[cfg(feature = "integration")]
 fn lut_document(
     slug: &str,
     version: &str,
@@ -129,6 +145,7 @@ fn lut_document(
     .document
 }
 
+#[cfg(feature = "integration")]
 fn pending_family_lut() -> LookDocument {
     let values = vec![0.5; 24];
     let lut = looklab_model::LutData::new(2, [0.0; 3], [1.0; 3], values).expect("lut");
@@ -156,6 +173,7 @@ fn pending_family_lut() -> LookDocument {
         .expect("document")
 }
 
+#[cfg(feature = "integration")]
 /// A pending family LUT fitted against a measured base.
 fn oracle_family_lut(
     slug: &str,
@@ -185,6 +203,7 @@ fn oracle_family_lut(
     document
 }
 
+#[cfg(feature = "integration")]
 fn native_document(
     slug: &str,
     version: &str,
@@ -221,6 +240,7 @@ fn native_document(
         .expect("uncertainty")
 }
 
+#[cfg(feature = "integration")]
 fn native_at(
     version: &str,
     clip_k: f64,
@@ -231,10 +251,12 @@ fn native_at(
     native_document(BASE, version, clip_k, maker, rendering, volume_shift)
 }
 
+#[cfg(feature = "integration")]
 fn native(version: &str, clip_k: f64) -> LookDocument {
     native_at(version, clip_k, "Fujifilm", RENDERING, None)
 }
 
+#[cfg(feature = "integration")]
 async fn publish(worker: &Worker, slug: &str, version: u32, document: &LookDocument) {
     let look = look_slug(slug);
     looklab_worker::lut_rebase::record_lut_pin(worker.pool(), &look, version, document)
@@ -257,6 +279,7 @@ async fn publish(worker: &Worker, slug: &str, version: u32, document: &LookDocum
     .expect("manifest");
 }
 
+#[cfg(feature = "integration")]
 async fn artifact(worker: &Worker, slug: &str, version: u32, name: &str) -> Vec<u8> {
     let artifacts = looklab_worker::db::manifest_artifacts(worker.pool(), slug, version)
         .await
@@ -269,14 +292,17 @@ async fn artifact(worker: &Worker, slug: &str, version: u32, name: &str) -> Vec<
     std::fs::read(worker.config().blobs.join(&artifact.sha256)).expect("blob")
 }
 
+#[cfg(feature = "integration")]
 async fn artifact_bytes(worker: &Worker, slug: &str, version: u32) -> Vec<u8> {
     artifact(worker, slug, version, "look.looklab").await
 }
 
+#[cfg(feature = "integration")]
 async fn published(worker: &Worker, slug: &str, version: u32) -> LookDocument {
     LookDocument::decode(&artifact_bytes(worker, slug, version).await).expect("document")
 }
 
+#[cfg(feature = "integration")]
 fn broken_lut_document(slug: &str) -> LookDocument {
     let values = vec![0.5; 24];
     let lut =
@@ -305,6 +331,7 @@ fn broken_lut_document(slug: &str) -> LookDocument {
         .expect("document")
 }
 
+#[cfg(feature = "integration")]
 async fn drain(worker: &Worker) {
     loop {
         sqlx::query("DELETE FROM jobs WHERE kind = 'publish_site' AND status = 'queued'")
@@ -319,6 +346,7 @@ async fn drain(worker: &Worker) {
     }
 }
 
+#[cfg(feature = "integration")]
 async fn drain_fails(worker: &Worker) -> bool {
     loop {
         sqlx::query("DELETE FROM jobs WHERE kind = 'publish_site' AND status = 'queued'")
@@ -333,6 +361,7 @@ async fn drain_fails(worker: &Worker) -> bool {
     }
 }
 
+#[cfg(feature = "integration")]
 async fn established() -> Fixture {
     let fixture = fixture().await;
     let base = native("1.0.0", 0.005);
@@ -362,6 +391,7 @@ async fn established() -> Fixture {
     fixture
 }
 
+#[cfg(feature = "integration")]
 async fn insert_root(worker: &Worker, look: &str, version: u32) -> RootAdmissionId {
     let root = RootAdmissionId::new();
     let credential = CredentialId::new();
@@ -408,6 +438,7 @@ async fn insert_root(worker: &Worker, look: &str, version: u32) -> RootAdmission
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn publishing_the_family_base_resolves_the_pending_pin() {
     let fixture = established().await;
     let document = published(&fixture.worker, LUT, 2).await;
@@ -422,6 +453,7 @@ async fn publishing_the_family_base_resolves_the_pending_pin() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_family_base_with_settings_stays_pending() {
     let fixture = fixture().await;
     let base = native("1.0.0", 0.005);
@@ -461,6 +493,7 @@ async fn a_family_base_with_settings_stays_pending() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn normalized_rendering_labels_resolve_the_family_base() {
     let fixture = fixture().await;
     let base = native_at("1.0.0", 0.005, "fujifilm", "classic-chrome", None);
@@ -542,6 +575,7 @@ async fn self_and_cycle_closing_pins_are_rejected() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_later_base_version_creates_a_candidate_without_touching_old_bytes() {
     let fixture = established().await;
     let old = artifact_bytes(&fixture.worker, LUT, 2).await;
@@ -565,6 +599,7 @@ async fn a_later_base_version_creates_a_candidate_without_touching_old_bytes() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn an_explicit_re_anchor_selects_the_later_anchor() {
     let fixture = established().await;
     sqlx::query("INSERT INTO audit_log (type, payload, ts) VALUES ('re_anchor', ?, 0)")
@@ -583,6 +618,7 @@ async fn an_explicit_re_anchor_selects_the_later_anchor() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn revoking_the_base_root_marks_the_lut_dependent() {
     let fixture = established().await;
     publish(&fixture.worker, BASE, 2, &native("2.0.0", 0.005)).await;
@@ -634,6 +670,7 @@ async fn revoking_the_base_root_marks_the_lut_dependent() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn an_already_pending_dependent_is_still_reported_by_revocation() {
     let fixture = established().await;
     publish(&fixture.worker, BASE, 2, &native("2.0.0", 0.005)).await;
@@ -681,6 +718,7 @@ async fn an_already_pending_dependent_is_still_reported_by_revocation() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn revoked_ancestry_keeps_dependents_blocked() {
     let fixture = established().await;
     let mid = "mid-lut";
@@ -752,6 +790,7 @@ async fn revoked_ancestry_keeps_dependents_blocked() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_stale_attempt_does_not_publish_work() {
     let fixture = established().await;
     publish(&fixture.worker, BASE, 2, &native("2.0.0", 0.005)).await;
@@ -787,6 +826,7 @@ async fn a_stale_attempt_does_not_publish_work() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn retrying_completed_work_does_not_publish_another_version() {
     let fixture = established().await;
     publish(&fixture.worker, BASE, 2, &native("2.0.0", 0.005)).await;
@@ -817,6 +857,7 @@ async fn retrying_completed_work_does_not_publish_another_version() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_tampered_source_document_is_rejected() {
     let fixture = established().await;
     let artifacts = looklab_worker::db::manifest_artifacts(fixture.worker.pool(), LUT, 1)
@@ -846,6 +887,7 @@ async fn a_tampered_source_document_is_rejected() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_committed_candidate_requests_publication_before_later_failures() {
     let fixture = fixture().await;
     let broken = "zzz-lut";
@@ -878,6 +920,7 @@ async fn a_committed_candidate_requests_publication_before_later_failures() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_base_published_before_selection_is_the_fitted_target() {
     let fixture = established().await;
     publish(
@@ -908,6 +951,7 @@ async fn a_base_published_before_selection_is_the_fitted_target() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_root_revoked_during_commit_does_not_publish() {
     let fixture = established().await;
     publish(&fixture.worker, BASE, 2, &native("2.0.0", 0.005)).await;
@@ -947,6 +991,7 @@ async fn a_root_revoked_during_commit_does_not_publish() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn an_obsolete_gate_failure_keeps_the_newer_work() {
     let fixture = established().await;
     publish(
@@ -1009,6 +1054,7 @@ async fn an_obsolete_gate_failure_keeps_the_newer_work() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn losing_the_lease_during_fit_does_not_hold_work() {
     let fixture = established().await;
     publish(
@@ -1058,6 +1104,7 @@ async fn losing_the_lease_during_fit_does_not_hold_work() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_matching_family_look_publishing_during_fit_keeps_work() {
     let fixture = fixture().await;
     let source = "family-lut";
@@ -1157,6 +1204,7 @@ async fn a_matching_family_look_publishing_during_fit_keeps_work() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_failed_rebase_gate_keeps_the_old_version() {
     let fixture = established().await;
     let old = artifact_bytes(&fixture.worker, LUT, 2).await;

@@ -38,12 +38,13 @@ The noisy tone-recovery study fits two 20-image × 10,000-sample datasets and al
 
 Before publishing a release, push its `v*` candidate tag or manually dispatch **Pre-release integration** for the release commit, and require both compact and worker integration jobs to pass. Neither job enables full-scale studies. Ordinary CI eligibility requires approximately two minutes or less of total integration-job wall time.
 
-Worker tests retain nine fit-free or budget-short-circuit cases in ordinary CI. Eighteen normal-budget native/consistency fitter cases require `looklab-worker/integration` and run before releases with their original fixtures and assertions. The ignored 1,000-image benchmark additionally requires `looklab-worker/full-scale`.
+Worker tests retain ten fit-free or budget-short-circuit cases across `worker.rs` and `lut_rebase.rs` in ordinary CI, plus separate supersession coverage. Forty fitter-dependent cases across `worker.rs`, `lut_rebase.rs` and `match_bundle.rs` require `looklab-worker/integration` and run before releases with their original fixtures and assertions. The ignored 1,000-image benchmark and fixture-convergence diagnostic additionally require `looklab-worker/full-scale`.
 
 | Compact integration measurement | Total job | Test execution | Evidence |
 |---|---:|---:|---|
 | Initial ordinary-CI placement | 2m 53s | 11.809s | [Successful measured job](https://github.com/skeet70/looklab/actions/runs/42342765350/job/128313878421); exceeds the ordinary-CI budget |
 | Pre-release workflow, cold integration compiler cache | 2m 47s | 18.576s | [Successful manual smoke](https://github.com/skeet70/looklab/actions/runs/42343763203); no release published |
+| After the numerical application migration | 4m 40s | 125.517s | [Failed compact job](https://github.com/skeet70/looklab/actions/runs/42349668698/job/128334912687), `MissingProbe(0)`; not a passing integration result |
 
 The compact contract performs one real fit over 3 images × 500 samples. Supported output publishes, and a constructed historical anchor mismatch is rejected.
 
@@ -79,6 +80,16 @@ The first test-tier runs retained the existing native `opt-level=1` profile and 
 | Compact integration moved to pre-release | 37m 59s | [Completed run](https://github.com/skeet70/looklab/actions/runs/42343683475), all 129 targeted trust cases passed |
 
 These are failed-run measurements on separate runner allocations, not a controlled speed comparison or a green-CI result. WASM release passed in both runs.
+
+After the application migration, [CI at `3283f16`](https://github.com/skeet70/looklab/actions/runs/42350900059) completed in 2h 11m 51s. Native tests compiled in 9m 42s and reported 1,093 passed, 58 failed and two ignored across 144 test/doctest summaries. Targeted trust and WASM release passed; lint failed formatting. This is a failed correctness run, not evidence of a completed build-speed improvement.
+
+| Current-application test binary | Passed | Failed | Ignored | Test execution |
+|---|---:|---:|---:|---:|
+| `looklab-fit --test model_error` | 2 | 12 | 0 | 1,981.62s |
+| `looklab-worker --test lut_rebase` | 3 | 16 | 0 | 1,328.07s |
+| `looklab-worker --test match_bundle` | 0 | 4 | 1 | 1,238.69s |
+
+The model-error failures returned `NoModelErrorEvidence`. These measurements include application changes absent from the earlier test-tier runs; they are not a same-source optimization comparison. The nine ordinary `worker.rs` cases passed in 0.85s.
 
 Historical full CI measurements below predate the test-tier split. They used the same application base and failed Clippy, the CLI E2E flow and 10 release trust red-team cases:
 

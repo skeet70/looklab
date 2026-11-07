@@ -3,6 +3,8 @@
 //! A release assembles one match bundle per body epoch of a matchable version,
 //! and the published bundle ranks the sims the site can match to (docs/04 §2).
 
+#![cfg(feature = "integration")]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -610,6 +612,7 @@ fn rank(dir: &Path, target: &LookDocument) -> (String, f64) {
     )
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "fixture convergence diagnostic; run with --ignored --nocapture"]
 fn classic_fixture_controlled_fit_converges() {
