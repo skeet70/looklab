@@ -7,7 +7,7 @@ use sqlx::SqlitePool;
 use crate::clock::now_unix;
 use crate::config::WorkerConfig;
 use crate::db;
-use crate::error::Result;
+use crate::error::{Result, WorkerError};
 use crate::jobs::{self, ClaimedJob, JobId, JobKind, JobPayload};
 use crate::publish::{self, PublishConfig, PublishSummary};
 use crate::refit::{self, RefitOutcome};
@@ -126,9 +126,30 @@ impl Worker {
     }
 
     pub async fn run_until_idle(&self) -> Result<usize> {
+        self.run_until_idle_bounded(usize::MAX, Duration::MAX).await
+    }
+
+    /// Fails once `max_jobs` have run or `deadline` passes; the clock is read between jobs.
+    pub async fn run_until_idle_bounded(
+        &self,
+        max_jobs: usize,
+        deadline: Duration,
+    ) -> Result<usize> {
+        let started = std::time::Instant::now();
         let mut completed = 0;
         while self.run_once().await?.is_some() {
             completed += 1;
+            if completed >= max_jobs {
+                return Err(WorkerError::Job(format!(
+                    "drained {completed} jobs without reaching idle; a job is re-enqueuing itself"
+                )));
+            }
+            if started.elapsed() > deadline {
+                return Err(WorkerError::Job(format!(
+                    "drained {completed} jobs in {:?} without reaching idle",
+                    started.elapsed()
+                )));
+            }
         }
         Ok(completed)
     }

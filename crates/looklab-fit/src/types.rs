@@ -343,6 +343,18 @@ impl core::ops::AddAssign for SampleEvaluations {
     }
 }
 
+/// Samples a fit dropped because they left the evaluator's domain at some permitted nuisance value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DomainExclusion {
+    /// Exposure `s` bin, quarter stop.
+    pub s_bin: i32,
+    /// Input hue bin, 15 degrees.
+    pub hue_bin: i32,
+    /// Input `sqrt(C)` bin, unit 1.
+    pub chroma_bin: i32,
+    pub samples: usize,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Diagnostics {
     pub sweeps: usize,
@@ -352,6 +364,12 @@ pub struct Diagnostics {
     pub sigma_v: Vec<(ContributorId, f64)>,
     pub gcv: StageLambdas,
     pub hessian_samples: usize,
+    /// Samples excluded before refinement because a permitted nuisance left the evaluator's domain.
+    pub excluded_samples: usize,
+    /// Excluded samples by `(s, hue, chroma)` bin; exclusions reduce coverage evidence.
+    pub excluded_regions: Vec<DomainExclusion>,
+    /// Rows the final-stage curvature operator used: all active rows when they fit the retention bound.
+    pub operator_rows: usize,
     pub objective_samples: usize,
     pub quarantined: usize,
     pub down_weighted: usize,

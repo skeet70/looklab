@@ -1,10 +1,10 @@
 # Litestream replication and restore drill
 
-`looklab-server` and `looklab-worker` share one SQLite database in WAL mode ([03 §4](../03-data-model.md)). Litestream 0.5 runs beside them as a third process, reads committed WAL pages and writes LTX files to a replica. Replication is asynchronous, so the recovery point is the last sync, not the last commit.
+`looklab-server` and `looklab-worker` share one SQLite database in WAL mode ([03 §4](../03-data-model.md)). Litestream 0.5 runs beside them as a third process, reads committed WAL pages and writes LTX files to a replica. Replication is asynchronous, so the recovery point is the last sync, not the last commit. Production currently relies on OVH's automatic daily VPS backup instead ([deployment.md](deployment.md)); Litestream is the upgrade path for a finer recovery point and is disabled by default.
 
 ## Replication
 
-The production example is [deploy/litestream.yml.example](../../deploy/litestream.yml.example):
+On a NixOS host `services.looklab.litestream` generates `/etc/looklab/litestream.yml` from the module options. [deploy/litestream.yml.example](../../deploy/litestream.yml.example) is the same 0.5 schema for a hand-written file:
 
 ```yaml
 dbs:

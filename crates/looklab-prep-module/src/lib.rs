@@ -11,10 +11,10 @@ pub use error::ModuleError;
 pub use looklab_prep::PREP_VERSION;
 pub use types::{
     AlignmentSummary, AssertionFields, BlobSummary, BuildManifestRequest, BuildManifestResponse,
-    EncodeEnvelopeRequest, EncodeEnvelopeResponse, ManifestImageInput, ParseEnvelopeRequest,
-    ParseEnvelopeResponse, PowParamsSpec, PrepareRequest, PrepareResponse, PreparedImageView,
-    PriorTransformSpec, Response, SolvePowRequest, SolvePowResponse, VersionRequest,
-    VersionResponse,
+    BuildSendManifestRequest, BuildSendManifestResponse, EncodeEnvelopeRequest,
+    EncodeEnvelopeResponse, ManifestImageInput, ParseEnvelopeRequest, ParseEnvelopeResponse,
+    PowParamsSpec, PrepareRequest, PrepareResponse, PreparedImageView, PriorTransformSpec, Response,
+    SolvePowRequest, SolvePowResponse, VersionRequest, VersionResponse,
 };
 
 use serde::{Deserialize, Serialize};
@@ -26,7 +26,7 @@ const BUILD_ID_TABLE: &[u8] = concat!(
     "looklab-prep-module/",
     env!("CARGO_PKG_VERSION"),
     "\0ll_alloc\0ll_free\0ll_call\0",
-    "version\0prepare\0build_manifest\0encode_envelope\0solve_pow\0parse_envelope\0",
+    "version\0prepare\0build_manifest\0build_send_manifest\0encode_envelope\0solve_pow\0parse_envelope\0",
     "abi=1\0prep=1",
 )
 .as_bytes();
@@ -47,6 +47,7 @@ pub enum Function {
     EncodeEnvelope = 4,
     SolvePow = 5,
     ParseEnvelope = 6,
+    BuildSendManifest = 7,
 }
 
 impl Function {
@@ -62,6 +63,7 @@ impl Function {
             4 => Self::EncodeEnvelope,
             5 => Self::SolvePow,
             6 => Self::ParseEnvelope,
+            7 => Self::BuildSendManifest,
             _ => return None,
         })
     }
@@ -87,6 +89,11 @@ pub fn dispatch(fn_id: u32, input: &[u8]) -> Vec<u8> {
         Some(Function::BuildManifest) => {
             request::<BuildManifestRequest>(Function::BuildManifest, input)
                 .and_then(|request| ops::build_manifest(request).map(Response::BuildManifest))
+        }
+        Some(Function::BuildSendManifest) => {
+            request::<BuildSendManifestRequest>(Function::BuildSendManifest, input).and_then(
+                |request| ops::build_send_manifest(request).map(Response::BuildSendManifest),
+            )
         }
         Some(Function::EncodeEnvelope) => {
             request::<EncodeEnvelopeRequest>(Function::EncodeEnvelope, input)

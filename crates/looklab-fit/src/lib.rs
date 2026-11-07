@@ -62,15 +62,6 @@ pub fn fit(images: &[FitImage], options: &FitOptions) -> Result<FitResult> {
     fit::run(images, options, None)
 }
 
-/// Fit one body's single Look starting from `initial`.
-pub fn fit_with_initial(
-    images: &[FitImage],
-    options: &FitOptions,
-    initial: &Look,
-) -> Result<FitResult> {
-    fit::run_with_initial(images, options, initial)
-}
-
 /// Fit with the previous published support state, for hysteresis.
 pub fn fit_with_history(
     images: &[FitImage],

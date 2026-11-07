@@ -56,13 +56,12 @@ fn ConformanceDownload() -> impl IntoView {
     let archive = RwSignal::new(data::Load::Loading);
     spawn_local(async move {
         let result = async {
-            let response =
-                gloo_net::http::Request::get(&publication_url(
-                    "/data/developers/conformance-v1.json",
-                ))
-                    .send()
-                    .await
-                    .map_err(|error| error.to_string())?;
+            let response = gloo_net::http::Request::get(&publication_url(
+                "/data/developers/conformance-v1.json",
+            ))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
             if !response.ok() {
                 return Err(format!("HTTP {}", response.status()));
             }

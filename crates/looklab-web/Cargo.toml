@@ -29,7 +29,7 @@ js-sys.workspace = true
 console_error_panic_hook.workspace = true
 gloo-net.workspace = true
 serde.workspace = true
-serde_json = { workspace = true, features = ["float_roundtrip"] }
+serde_json.workspace = true
 sha2.workspace = true
 qrcodegen.workspace = true
 

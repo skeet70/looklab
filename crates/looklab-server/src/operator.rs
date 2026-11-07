@@ -41,8 +41,9 @@ pub struct DisplayHandle(String);
 
 impl DisplayHandle {
     pub fn parse(value: &str) -> Option<Self> {
-        let valid =
-            !value.is_empty() && value.chars().count() <= 64 && !value.chars().any(char::is_control);
+        let valid = !value.is_empty()
+            && value.chars().count() <= 64
+            && !value.chars().any(char::is_control);
         valid.then(|| Self(value.to_owned()))
     }
 
@@ -121,16 +122,13 @@ pub async fn bootstrap_admin(
 ) -> Result<GrantRecord, OperatorError> {
     let pool = db::open(&config.db_path).await?;
     let subject = resolve(&pool, subject).await?;
-    let record = admin::grant_credential(&pool, Actor::Cli, &subject, Grant::Admin, None, reason)
-        .await?;
+    let record =
+        admin::grant_credential(&pool, Actor::Cli, &subject, Grant::Admin, None, reason).await?;
     pool.close().await;
     Ok(record)
 }
 
-async fn resolve(
-    pool: &SqlitePool,
-    subject: AdminSubject,
-) -> Result<CredentialId, OperatorError> {
+async fn resolve(pool: &SqlitePool, subject: AdminSubject) -> Result<CredentialId, OperatorError> {
     match subject {
         AdminSubject::Credential(subject) => {
             ensure_active(pool, &subject).await?;
@@ -163,11 +161,10 @@ async fn resolve(
 }
 
 async fn ensure_active(pool: &SqlitePool, subject: &CredentialId) -> Result<(), OperatorError> {
-    let status: Option<String> =
-        sqlx::query_scalar("SELECT status FROM credentials WHERE id = ?")
-            .bind(subject.as_str())
-            .fetch_optional(pool)
-            .await?;
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM credentials WHERE id = ?")
+        .bind(subject.as_str())
+        .fetch_optional(pool)
+        .await?;
     let Some(status) = status else {
         return Err(OperatorError::NoSuchCredential(subject.to_string()));
     };

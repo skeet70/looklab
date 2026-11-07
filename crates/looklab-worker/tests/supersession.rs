@@ -25,6 +25,10 @@ const MATCHING: &str = "classic-chrome-lut";
 const OTHER: &str = "leica-lut";
 const PREVIEW: &str = "preview-only";
 
+/// Jobs one fixture queue may run before it must settle.
+const DRAIN_JOBS: usize = 64;
+const DRAIN_DEADLINE: Duration = Duration::from_secs(900);
+
 struct Fixture {
     _dir: TempDir,
     pool: SqlitePool,
@@ -338,7 +342,10 @@ fn read_index(out: &Path) -> SiteIndex {
 
 /// A manifest write queues a LUT rebase job; publication tests settle it first.
 async fn drain_manifest_jobs(worker: &Worker) {
-    worker.run_until_idle().await.expect("manifest jobs");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("manifest jobs");
 }
 
 /// Claims the queued publisher before it takes its snapshot and writes.
@@ -428,7 +435,10 @@ async fn a_superseded_claim_cannot_overwrite_a_newer_publisher() {
     jobs::request_publish(worker.pool(), 0)
         .await
         .expect("publication request");
-    worker.run_until_idle().await.expect("initial publication");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("initial publication");
     assert!(page(&out, OTHER).is_some());
 
     let (stale_job, stale_attempts, _observed) = pause_publisher(&worker).await;
@@ -450,7 +460,13 @@ async fn a_superseded_claim_cannot_overwrite_a_newer_publisher() {
     )
     .await
     .expect("hide");
-    assert_eq!(worker.run_until_idle().await.expect("second publisher"), 1);
+    assert_eq!(
+        worker
+            .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+            .await
+            .expect("second publisher"),
+        1
+    );
     assert!(
         !read_index(&out)
             .looks
@@ -688,7 +704,10 @@ async fn a_permanent_publication_failure_waits_for_a_new_request() {
         .await
         .expect("repair request");
     assert_eq!(
-        worker.run_until_idle().await.expect("repaired publication"),
+        worker
+            .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+            .await
+            .expect("repaired publication"),
         1
     );
     assert!(page(&out, OTHER).is_some());
@@ -726,7 +745,10 @@ async fn a_hide_during_publication_reaches_the_site_without_another_request() {
     jobs::request_publish(worker.pool(), 0)
         .await
         .expect("publication request");
-    worker.run_until_idle().await.expect("initial publication");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("initial publication");
     assert!(page(&out, OTHER).is_some());
 
     let (job, attempts, observed) = pause_publisher(&worker).await;
@@ -750,7 +772,13 @@ async fn a_hide_during_publication_reaches_the_site_without_another_request() {
             .await
             .expect("complete")
     );
-    assert_eq!(worker.run_until_idle().await.expect("successor"), 1);
+    assert_eq!(
+        worker
+            .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+            .await
+            .expect("successor"),
+        1
+    );
 
     let index = read_index(&out);
     assert!(!index.looks.iter().any(|look| look.slug.as_str() == OTHER));
@@ -784,7 +812,10 @@ async fn a_relist_during_publication_restores_the_site_without_another_request()
     admin::hide_look(worker.pool(), &moderator, &slug, "a rights claim")
         .await
         .expect("hide");
-    worker.run_until_idle().await.expect("initial publication");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("initial publication");
     assert!(page(&out, OTHER).is_none());
 
     let (job, attempts, observed) = pause_publisher(&worker).await;
@@ -803,7 +834,13 @@ async fn a_relist_during_publication_restores_the_site_without_another_request()
             .await
             .expect("complete")
     );
-    assert_eq!(worker.run_until_idle().await.expect("successor"), 1);
+    assert_eq!(
+        worker
+            .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+            .await
+            .expect("successor"),
+        1
+    );
 
     let index = read_index(&out);
     assert!(index.looks.iter().any(|look| look.slug.as_str() == OTHER));

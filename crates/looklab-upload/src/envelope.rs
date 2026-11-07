@@ -15,15 +15,19 @@ use crate::manifest::{
     BatchManifest, BlobKind, IntentError, canonical_manifest_bytes, manifest_hash,
 };
 use crate::metadata::MetadataError;
-use crate::nonce::{Challenge, ManifestHash, Nonce};
+use crate::nonce::{Challenge, ManifestHash, Nonce, SendManifestHash};
 use crate::pow::{POW_K, PowSolutions};
+use crate::send::{
+    DEFAULT_MAX_BATCHES, SendManifest, SendManifestError, canonical_send_manifest_bytes,
+    send_manifest_hash,
+};
 use crate::webauthn::{
     MAX_AUTHENTICATOR_DATA, MAX_CLIENT_DATA_JSON, MAX_CREDENTIAL_ID, MAX_SIGNATURE,
     WebAuthnAssertion,
 };
 
 pub const MAGIC: [u8; 6] = *b"LLUPLD";
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 const NONCE_OFFSET: usize = MAGIC.len() + 2;
 
@@ -38,6 +42,7 @@ pub struct Limits {
     pub max_manifest_bytes: usize,
     pub max_images: usize,
     pub max_blob_bytes: usize,
+    pub max_batches: usize,
 }
 
 impl Default for Limits {
@@ -47,6 +52,7 @@ impl Default for Limits {
             max_manifest_bytes: DEFAULT_MAX_MANIFEST_BYTES,
             max_images: DEFAULT_MAX_IMAGES,
             max_blob_bytes: DEFAULT_MAX_BLOB_BYTES,
+            max_batches: DEFAULT_MAX_BATCHES,
         }
     }
 }
@@ -54,6 +60,7 @@ impl Default for Limits {
 #[derive(Clone, Copy)]
 pub struct EnvelopeParts<'a> {
     pub nonce: Nonce,
+    pub send_manifest: &'a SendManifest,
     pub manifest: &'a BatchManifest,
     pub assertion: &'a WebAuthnAssertion,
     pub pow: &'a PowSolutions,
@@ -63,6 +70,9 @@ pub struct EnvelopeParts<'a> {
 
 pub struct Envelope {
     pub nonce: Nonce,
+    pub send_manifest: SendManifest,
+    pub send_manifest_bytes: Vec<u8>,
+    pub send_manifest_hash: SendManifestHash,
     pub manifest: BatchManifest,
     pub manifest_bytes: Vec<u8>,
     pub assertion: WebAuthnAssertion,
@@ -77,6 +87,10 @@ impl Envelope {
     }
 
     pub fn challenge(&self) -> Challenge {
+        Challenge::for_send(&self.nonce, &self.send_manifest_hash)
+    }
+
+    pub fn pow_challenge(&self) -> Challenge {
         Challenge::new(&self.nonce, &self.manifest_hash())
     }
 }
@@ -122,6 +136,22 @@ pub enum EnvelopeError {
     ManifestTrailingBytes { len: usize },
     #[error("manifest is not in canonical encoding")]
     ManifestNotCanonical,
+    #[error("send manifest of {len} bytes exceeds the {max}-byte limit")]
+    SendManifestTooLong { len: usize, max: usize },
+    #[error("send manifest is not a valid postcard SendManifest")]
+    SendManifestCodec(#[source] postcard::Error),
+    #[error("send manifest has {len} unexpected trailing bytes")]
+    SendManifestTrailingBytes { len: usize },
+    #[error("send manifest is not in canonical encoding")]
+    SendManifestNotCanonical,
+    #[error("send manifest has {count} batches, outside 1..={max}")]
+    SendManifestCountOutOfRange { count: usize, max: usize },
+    #[error("send manifest entry {index} repeats an earlier batch hash")]
+    SendManifestDuplicate { index: usize },
+    #[error("send manifest entry {index} is not in canonical order")]
+    SendManifestOrder { index: usize },
+    #[error("the batch manifest hash is not listed in the send manifest")]
+    BatchNotInSendManifest,
     #[error("batch has {count} images, outside 1..={max}")]
     ImageCountOutOfRange { count: usize, max: usize },
     #[error("{field} of {len} bytes exceeds the {max}-byte limit")]
@@ -183,7 +213,19 @@ pub enum EnvelopeError {
 /// If a field length exceeds its envelope limit; [`parse_envelope_strict`]
 /// enforces the same limits on the wire.
 pub fn encode_envelope(parts: &EnvelopeParts<'_>) -> Vec<u8> {
+    let send_manifest_bytes = canonical_send_manifest_bytes(parts.send_manifest);
     let manifest_bytes = canonical_manifest_bytes(parts.manifest);
+    assert!(
+        parts
+            .send_manifest
+            .validate(DEFAULT_MAX_BATCHES)
+            .is_ok(),
+        "send manifest is not canonical"
+    );
+    assert!(
+        parts.send_manifest.contains(&manifest_hash(parts.manifest)),
+        "the batch manifest is not listed in the send manifest"
+    );
     assert!(
         parts.blobs.len() == parts.manifest.images.len(),
         "blob count must match the manifest image count"
@@ -210,11 +252,20 @@ pub fn encode_envelope(parts: &EnvelopeParts<'_>) -> Vec<u8> {
     );
 
     let mut out = Vec::with_capacity(
-        NONCE_OFFSET + 32 + 4 + manifest_bytes.len() + 1024 + parts.blobs.len() * 1024,
+        NONCE_OFFSET
+            + 32
+            + 4
+            + send_manifest_bytes.len()
+            + 4
+            + manifest_bytes.len()
+            + 1024
+            + parts.blobs.len() * 1024,
     );
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.extend_from_slice(parts.nonce.as_bytes());
+    out.extend_from_slice(&(send_manifest_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&send_manifest_bytes);
     out.extend_from_slice(&(manifest_bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(&manifest_bytes);
 
@@ -289,6 +340,38 @@ pub fn parse_envelope_strict(bytes: &[u8], limits: &Limits) -> Result<Envelope, 
     }
     let nonce = Nonce::from_slice(reader.take(32)?).expect("slice of the requested length");
 
+    let send_manifest_len = reader.u32()? as usize;
+    if send_manifest_len > limits.max_manifest_bytes {
+        return Err(EnvelopeError::SendManifestTooLong {
+            len: send_manifest_len,
+            max: limits.max_manifest_bytes,
+        });
+    }
+    let send_manifest_bytes = reader.take(send_manifest_len)?;
+    let (send_manifest, rest) = postcard::take_from_bytes::<SendManifest>(send_manifest_bytes)
+        .map_err(EnvelopeError::SendManifestCodec)?;
+    if !rest.is_empty() {
+        return Err(EnvelopeError::SendManifestTrailingBytes { len: rest.len() });
+    }
+    if canonical_send_manifest_bytes(&send_manifest) != send_manifest_bytes {
+        return Err(EnvelopeError::SendManifestNotCanonical);
+    }
+    send_manifest
+        .validate(limits.max_batches)
+        .map_err(|error| match error {
+            SendManifestError::Empty => EnvelopeError::SendManifestCountOutOfRange {
+                count: 0,
+                max: limits.max_batches,
+            },
+            SendManifestError::TooMany { count, max } => {
+                EnvelopeError::SendManifestCountOutOfRange { count, max }
+            }
+            SendManifestError::Duplicate { index } => {
+                EnvelopeError::SendManifestDuplicate { index }
+            }
+            SendManifestError::NotSorted { index } => EnvelopeError::SendManifestOrder { index },
+        })?;
+
     let manifest_len = reader.u32()? as usize;
     if manifest_len > limits.max_manifest_bytes {
         return Err(EnvelopeError::ManifestTooLong {
@@ -312,6 +395,9 @@ pub fn parse_envelope_strict(bytes: &[u8], limits: &Limits) -> Result<Envelope, 
     }
     if canonical_manifest_bytes(&manifest) != manifest_bytes {
         return Err(EnvelopeError::ManifestNotCanonical);
+    }
+    if !send_manifest.contains(&manifest_hash(&manifest)) {
+        return Err(EnvelopeError::BatchNotInSendManifest);
     }
     if manifest.images.is_empty() || manifest.images.len() > limits.max_images {
         return Err(EnvelopeError::ImageCountOutOfRange {
@@ -408,6 +494,9 @@ pub fn parse_envelope_strict(bytes: &[u8], limits: &Limits) -> Result<Envelope, 
 
     Ok(Envelope {
         nonce,
+        send_manifest_hash: send_manifest_hash(&send_manifest),
+        send_manifest_bytes: send_manifest_bytes.to_vec(),
+        send_manifest,
         manifest,
         manifest_bytes: manifest_bytes.to_vec(),
         assertion: WebAuthnAssertion {

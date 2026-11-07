@@ -11,9 +11,10 @@ use looklab_upload::webauthn::{
     WebAuthnAssertion,
 };
 use looklab_upload::{
-    Challenge, Envelope, EnvelopeParts, ManifestImage, PowParams, PowSolutions, RerenderGroupId,
-    canonical_manifest_bytes, encode_envelope as encode_upload_envelope, manifest_hash,
-    parse_envelope_strict, solve,
+    Challenge, DEFAULT_MAX_BATCHES, Envelope, EnvelopeParts, ManifestImage, PowParams, PowSolutions,
+    RerenderGroupId, SendManifest, canonical_manifest_bytes, canonical_send_manifest_bytes,
+    encode_envelope as encode_upload_envelope, manifest_hash, parse_envelope_strict,
+    send_manifest_hash, solve,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -21,8 +22,9 @@ use sha2::{Digest, Sha256};
 use crate::error::ModuleError;
 use crate::types::{
     AlignmentSummary, AssertionFields, BlobSummary, BuildManifestRequest, BuildManifestResponse,
-    EncodeEnvelopeRequest, EncodeEnvelopeResponse, ParseEnvelopeRequest, ParseEnvelopeResponse,
-    PrepareResponse, PreparedImageView, PriorTransformSpec, SolvePowRequest, SolvePowResponse,
+    BuildSendManifestRequest, BuildSendManifestResponse, EncodeEnvelopeRequest,
+    EncodeEnvelopeResponse, ParseEnvelopeRequest, ParseEnvelopeResponse, PrepareResponse,
+    PreparedImageView, PriorTransformSpec, SolvePowRequest, SolvePowResponse,
 };
 
 const SEED_KEY: &str = "module-input";
@@ -183,9 +185,38 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+pub(crate) fn build_send_manifest(
+    request: BuildSendManifestRequest,
+) -> Result<BuildSendManifestResponse, ModuleError> {
+    let send_manifest = SendManifest::canonical(request.manifest_hashes)
+        .map_err(|error| ModuleError::SendManifest {
+            message: error.to_string(),
+        })?;
+    let hash = send_manifest_hash(&send_manifest);
+    Ok(BuildSendManifestResponse {
+        send_manifest_bytes: canonical_send_manifest_bytes(&send_manifest),
+        send_manifest_hash: hash,
+        challenge: Challenge::for_send(&request.nonce, &hash),
+    })
+}
+
 pub(crate) fn encode_envelope(
     request: EncodeEnvelopeRequest,
 ) -> Result<EncodeEnvelopeResponse, ModuleError> {
+    let send_manifest: SendManifest = postcard::from_bytes(&request.send_manifest_bytes)
+        .map_err(|error| ModuleError::SendManifest {
+            message: error.to_string(),
+        })?;
+    if canonical_send_manifest_bytes(&send_manifest) != request.send_manifest_bytes {
+        return Err(ModuleError::SendManifest {
+            message: "bytes are not the canonical encoding of the send manifest".to_owned(),
+        });
+    }
+    send_manifest
+        .validate(DEFAULT_MAX_BATCHES)
+        .map_err(|error| ModuleError::SendManifest {
+            message: error.to_string(),
+        })?;
     let manifest: looklab_upload::BatchManifest = postcard::from_bytes(&request.manifest_bytes)
         .map_err(|error| ModuleError::Manifest {
             message: error.to_string(),
@@ -193,6 +224,12 @@ pub(crate) fn encode_envelope(
     if canonical_manifest_bytes(&manifest) != request.manifest_bytes {
         return Err(ModuleError::Manifest {
             message: "bytes are not the canonical encoding of the manifest".to_owned(),
+        });
+    }
+    let hash = manifest_hash(&manifest);
+    if !send_manifest.contains(&hash) {
+        return Err(ModuleError::SendManifest {
+            message: "the batch manifest is not listed in the send manifest".to_owned(),
         });
     }
     let images = manifest.images.len();
@@ -237,17 +274,19 @@ pub(crate) fn encode_envelope(
     let pow = PowSolutions::new(request.pow);
     let parts = EnvelopeParts {
         nonce: request.nonce,
+        send_manifest: &send_manifest,
         manifest: &manifest,
         assertion: &assertion,
         pow: &pow,
         serial: serial.as_ref(),
         blobs: &request.blobs,
     };
-    let hash = manifest_hash(&manifest);
+    let send_hash = send_manifest_hash(&send_manifest);
     Ok(EncodeEnvelopeResponse {
         envelope: encode_upload_envelope(&parts),
         manifest_hash: hash,
-        challenge: Challenge::new(&request.nonce, &hash),
+        send_manifest_hash: send_hash,
+        challenge: Challenge::for_send(&request.nonce, &send_hash),
     })
 }
 
@@ -302,6 +341,9 @@ pub(crate) fn parse_envelope(
         .map_err(ModuleError::parse_envelope)?;
     let Envelope {
         nonce,
+        send_manifest,
+        send_manifest_bytes,
+        send_manifest_hash,
         manifest,
         manifest_bytes,
         assertion,
@@ -324,6 +366,9 @@ pub(crate) fn parse_envelope(
     Ok(ParseEnvelopeResponse {
         body_bytes: request.bytes.len() as u64,
         nonce,
+        send_manifest,
+        send_manifest_bytes,
+        send_manifest_hash,
         manifest,
         manifest_bytes,
         manifest_hash: hash,

@@ -138,7 +138,10 @@ async fn expected_site_root() -> Result<String, String> {
 }
 
 pub async fn body(make: &str, model: &str) -> Result<BodyPage, String> {
-    get_json(&publication_url(&format!("/data/bodies/{make}/{model}.json"))).await
+    get_json(&publication_url(&format!(
+        "/data/bodies/{make}/{model}.json"
+    )))
+    .await
 }
 
 pub async fn look(slug: &str) -> Result<LookPage, String> {

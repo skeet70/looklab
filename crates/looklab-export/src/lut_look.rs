@@ -251,24 +251,8 @@ fn fit_result(
     let mut density = Vec::with_capacity(points.len());
     let mut flags = Vec::with_capacity(points.len());
     let mut informative = Vec::new();
-    let mut neutral_s = Vec::new();
-    let mut neutral_j = Vec::new();
     for xyz in points {
         let encoded = composed_encoded(lut, definition, base_look, *xyz)?;
-        let input = looklab_model::LookInput::new(*xyz);
-        if input.c_in <= 0.1 {
-            if neutral_s.len() < 3 {
-                eprintln!(
-                    "neutral point y {:.6} s {:.3} encoded {:?} j {:.3}",
-                    xyz.y,
-                    input.s,
-                    encoded,
-                    looklab_ucs(encoded).j
-                );
-            }
-            neutral_s.push(input.s);
-            neutral_j.push(looklab_ucs(encoded).j);
-        }
         let linear = linear_from_encoded(encoded);
         if [linear.r, linear.g, linear.b]
             .iter()
@@ -328,40 +312,11 @@ fn fit_result(
         recipe_sweeps: 0,
         ..FitOptions::default()
     };
-    let result = match neutral_tone_look(&neutral_s, &neutral_j) {
-        Some(initial) => looklab_fit::fit_with_initial(
-            std::slice::from_ref(&image),
-            &fit_options,
-            &initial,
-        )?,
-        None => fit(std::slice::from_ref(&image), &fit_options)?,
-    };
+    let result = fit(std::slice::from_ref(&image), &fit_options)?;
     Ok(FitSamples {
         result,
         informative,
     })
-}
-
-/// Starting Look for the seeded fit.
-fn neutral_tone_look(s: &[f64], j_prime: &[f64]) -> Option<looklab_model::Look> {
-    if s.len() < 32 {
-        return None;
-    }
-    let tone = looklab_model::Tone::from_neutral_samples(s, j_prime).ok()?;
-    eprintln!(
-        "seed samples s {:?} j {:?}",
-        s.iter().take(5).collect::<Vec<_>>(),
-        j_prime.iter().take(5).collect::<Vec<_>>()
-    );
-    eprintln!(
-        "seed samples tail s {:?} j {:?}",
-        s.iter().rev().take(5).collect::<Vec<_>>(),
-        j_prime.iter().rev().take(5).collect::<Vec<_>>()
-    );
-    eprintln!("seed tone {tone:?} from {} neutral samples", s.len());
-    let mut look = looklab_model::Look::colorimetric_spline().ok()?;
-    look.tone = tone;
-    Some(look)
 }
 
 /// The composed target appearance of `xyz`, before the output clip.

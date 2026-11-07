@@ -109,6 +109,7 @@ struct LimitsFile {
     max_manifest_bytes: usize,
     max_images: usize,
     max_blob_bytes: usize,
+    max_batches: usize,
 }
 
 impl Default for LimitsFile {
@@ -119,6 +120,7 @@ impl Default for LimitsFile {
             max_manifest_bytes: limits.max_manifest_bytes,
             max_images: limits.max_images,
             max_blob_bytes: limits.max_blob_bytes,
+            max_batches: limits.max_batches,
         }
     }
 }
@@ -130,6 +132,7 @@ impl LimitsFile {
             max_manifest_bytes: self.max_manifest_bytes,
             max_images: self.max_images,
             max_blob_bytes: self.max_blob_bytes,
+            max_batches: self.max_batches,
         }
     }
 }

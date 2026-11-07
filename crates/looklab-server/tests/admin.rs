@@ -837,13 +837,29 @@ async fn revert_validates_permission_reason_version_and_credentials_before_mutat
     .await
     .expect("provisional version");
 
-    let error = admin::revert(db, &fixture.blobs, actor(&moderator), &look(LOOK_1), 2, &[], "not published")
-        .await
-        .expect_err("unpublished target");
+    let error = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        2,
+        &[],
+        "not published",
+    )
+    .await
+    .expect_err("unpublished target");
     assert!(matches!(error, AdminError::VersionNotPublished));
-    let error = admin::revert(db, &fixture.blobs, actor(&moderator), &look(LOOK_1), 9, &[], "missing")
-        .await
-        .expect_err("unknown target");
+    let error = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        9,
+        &[],
+        "missing",
+    )
+    .await
+    .expect_err("unknown target");
     assert!(matches!(error, AdminError::UnknownVersion));
     let error = admin::revert(
         db,
@@ -869,27 +885,41 @@ async fn revert_validates_permission_reason_version_and_credentials_before_mutat
     .await
     .expect_err("unknown credential");
     assert!(matches!(error, AdminError::UnknownCredential));
-    let error = admin::revert(db, &fixture.blobs, actor(&moderator), &look(LOOK_1), 1, &[], "   ")
-        .await
-        .expect_err("empty reason");
+    let error = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        &[],
+        "   ",
+    )
+    .await
+    .expect_err("empty reason");
     assert!(matches!(error, AdminError::InvalidReason));
-    let error = admin::revert(db, &fixture.blobs, actor(&outsider), &look(LOOK_1), 1, &[], "not a moderator")
-        .await
-        .expect_err("insufficient role");
+    let error = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&outsider),
+        &look(LOOK_1),
+        1,
+        &[],
+        "not a moderator",
+    )
+    .await
+    .expect_err("insufficient role");
     assert!(matches!(error, AdminError::NotAuthorized));
 
-    let versions: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM look_versions WHERE look = ?")
-            .bind(LOOK_1)
-            .fetch_one(db)
-            .await
-            .expect("versions");
+    let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM look_versions WHERE look = ?")
+        .bind(LOOK_1)
+        .fetch_one(db)
+        .await
+        .expect("versions");
     assert_eq!(versions, 2);
-    let exclusions: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM look_credential_exclusions")
-            .fetch_one(db)
-            .await
-            .expect("exclusions");
+    let exclusions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM look_credential_exclusions")
+        .fetch_one(db)
+        .await
+        .expect("exclusions");
     assert_eq!(exclusions, 0);
     let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE type = 'revert'")
         .fetch_one(db)
@@ -925,15 +955,9 @@ async fn revert_marks_pinned_lut_dependents_for_rebase() {
         1,
         serde_json::json!({"probes": []}),
     );
-    admin::write_version_manifest(
-        db,
-        &look(LOOK_1),
-        VersionId::new(1),
-        &artifact,
-        &[],
-    )
-    .await
-    .expect("base version");
+    admin::write_version_manifest(db, &look(LOOK_1), VersionId::new(1), &artifact, &[])
+        .await
+        .expect("base version");
     let dependent = look("donor-lut");
     let dependent_artifacts = version_artifacts(
         &fixture.blobs,
@@ -954,15 +978,9 @@ async fn revert_marks_pinned_lut_dependents_for_rebase() {
     )
     .await
     .expect("base pin");
-    admin::write_version_manifest(
-        db,
-        &dependent,
-        VersionId::new(1),
-        &dependent_artifacts,
-        &[],
-    )
-    .await
-    .expect("dependent version");
+    admin::write_version_manifest(db, &dependent, VersionId::new(1), &dependent_artifacts, &[])
+        .await
+        .expect("dependent version");
     sqlx::query("DELETE FROM jobs")
         .execute(db)
         .await
@@ -996,11 +1014,12 @@ async fn revert_marks_pinned_lut_dependents_for_rebase() {
     assert!(pending.iter().any(|work| {
         work.look == dependent && work.version == 1 && work.reason == LutRebaseReason::BasePublished
     }));
-    let queued: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'lut_rebase' AND status = 'queued'")
-            .fetch_one(db)
-            .await
-            .expect("lut rebase job");
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'lut_rebase' AND status = 'queued'",
+    )
+    .fetch_one(db)
+    .await
+    .expect("lut rebase job");
     assert_eq!(queued, 1);
 }
 

@@ -106,6 +106,46 @@ fn colorimetric_identity_holds_on_chromatic_probes() {
 }
 
 #[test]
+fn near_neutral_colour_error_is_reported_in_ucs() {
+    use looklab_color::ucs::delta_e_ucs;
+
+    let mut tinted = Look::colorimetric();
+    for value in tinted.tint.a.iter_mut() {
+        *value = 0.5;
+    }
+    for value in tinted.tint.b.iter_mut() {
+        *value = -0.3;
+    }
+    let probe = v1()
+        .probes
+        .into_iter()
+        .find(|probe| probe.group == ProbeGroup::GrayRamp)
+        .expect("a gray probe");
+    let input = LookInput::new(probe.xyz);
+    let values = tinted.layer_values(&input);
+    let paths = tinted.chroma_paths(&input, &values);
+    assert_eq!(paths.internal, [values.n_a, values.n_b]);
+    let expected = looklab_model::solve::ucs_of_xyz(looklab_model::internal_chroma_to_xyz(
+        paths.internal,
+        paths.ucs.j,
+    ));
+    let identity = Look::colorimetric().eval_input(&input);
+    let output = tinted.eval_input(&input);
+    assert!(
+        (output.a - expected.a).abs() < 1e-9,
+        "{output:?} {expected:?}"
+    );
+    assert!((output.b - expected.b).abs() < 1e-9);
+    let delta = delta_e_ucs(identity, output);
+    let magnitude = (expected.a * expected.a + expected.b * expected.b).sqrt();
+    assert!(magnitude > 0.0);
+    assert!(
+        (delta - magnitude).abs() < 1e-9,
+        "delta {delta} expected {magnitude}"
+    );
+}
+
+#[test]
 fn neutral_probes_have_zero_chroma() {
     let look = Look::colorimetric();
     for probe in v1()
@@ -145,7 +185,7 @@ fn tone_only_looks_keep_the_reference_chroma_and_hue() {
             let y_ref = solve_y_ref(values.t, 0.18 * libm::pow(2.0, input.s));
             let reference = colorimetric(input.unit_xyz.scale(y_ref));
             let m_ref = (reference.a * reference.a + reference.b * reference.b).sqrt();
-            if m_ref < 1e-9 {
+            if input.blend.w < 1.0 {
                 continue;
             }
             let output = look.eval_input(&input);
@@ -197,7 +237,7 @@ fn y_ref_solve_converges() {
 }
 
 #[test]
-fn neutral_output_equals_the_tint() {
+fn neutral_internal_output_equals_the_tint() {
     let mut look = Look::colorimetric_spline().expect("v1 tone knots");
     look.tint.a[3] = 0.6;
     look.tint.b[4] = -0.5;
@@ -215,15 +255,31 @@ fn neutral_output_equals_the_tint() {
         let input = LookInput::new(probe.xyz);
         assert_eq!(input.c_in, 0.0);
         let values = look.layer_values(&input);
-        let output = look.eval_input(&input);
+        let paths = look.chroma_paths(&input, &values);
+        assert_eq!(paths.blend, 0.0);
         assert!(
-            (output.a - values.n_a).abs() < 1e-12 && (output.b - values.n_b).abs() < 1e-12,
-            "probe {} output ({}, {}) tint ({}, {})",
+            (paths.internal[0] - values.n_a).abs() < 1e-12
+                && (paths.internal[1] - values.n_b).abs() < 1e-12,
+            "probe {} internal ({}, {}) tint ({}, {})",
+            probe.id.as_str(),
+            paths.internal[0],
+            paths.internal[1],
+            values.n_a,
+            values.n_b
+        );
+        let output = look.eval_input(&input);
+        let expected = looklab_model::solve::ucs_of_xyz(looklab_model::internal_chroma_to_xyz(
+            paths.internal,
+            paths.ucs.j,
+        ));
+        assert!(
+            (output.a - expected.a).abs() < 1e-9 && (output.b - expected.b).abs() < 1e-9,
+            "probe {} output ({}, {}) expected ({}, {})",
             probe.id.as_str(),
             output.a,
             output.b,
-            values.n_a,
-            values.n_b
+            expected.a,
+            expected.b
         );
     }
 }
@@ -232,10 +288,14 @@ fn neutral_output_equals_the_tint() {
 fn colorimetric_tone_spline_tracks_the_exact_tone() {
     let tone = Tone::colorimetric(&TONE_KNOTS).expect("v1 tone knots");
     let mut worst = 0.0_f64;
+    let mut worst_s = 0.0_f64;
     for step in 0..=360 {
         let s = -12.0 + 18.0 * step as f64 / 360.0;
         let difference = (tone.eval(s) - Tone::Colorimetric.eval(s)).abs();
-        worst = worst.max(difference);
+        if difference > worst {
+            worst = difference;
+            worst_s = s;
+        }
     }
-    assert!(worst < 1e-3, "worst tone fit error {worst}");
+    assert!(worst < 1e-3, "worst tone fit error {worst} at s {worst_s}");
 }

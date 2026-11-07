@@ -463,6 +463,7 @@ fn body_pass(
             wb_b_extra: layout.omega[wb_position][1].map(|index| index + layout.offset),
             clip_extra: Some(layout.clip + layout.offset),
             delta: Some(layout.delta.map(|index| index + layout.offset)),
+            second: false,
         };
         let evaluated = evaluate_sample(
             look,
@@ -474,14 +475,10 @@ fn body_pass(
             1.0,
             slopes,
             &terms[position],
+            &sample.target,
             &mut jac,
         );
-        let target = sample.target;
-        let residual = [
-            evaluated.prediction.j - target.j,
-            evaluated.prediction.a - target.a,
-            evaluated.prediction.b - target.b,
-        ];
+        let residual = evaluated.residual;
         let squared =
             residual[0] * residual[0] + residual[1] * residual[1] + residual[2] * residual[2];
         let contributor = contributor_index(contributors, tag.image.contributor);
@@ -960,14 +957,10 @@ pub fn firmware_images(
             1.0,
             &slopes,
             &[],
+            &sample.target,
             &mut jac,
         );
-        let target = sample.target;
-        let residual = [
-            evaluated.prediction.j - target.j,
-            evaluated.prediction.a - target.a,
-            evaluated.prediction.b - target.b,
-        ];
+        let residual = evaluated.residual;
         let mut basis = [[0.0_f64; 3]; crate::epoch::PROJECTION_DIM];
         for (column, derivative) in jac.cols.iter().zip(jac.derivs.iter()) {
             let column = *column as usize;
@@ -1113,14 +1106,10 @@ fn estimate_firmware(
             1.0,
             &slopes,
             &[],
+            &sample.target,
             &mut jac,
         );
-        let target = sample.target;
-        let residual = [
-            evaluated.prediction.j - target.j,
-            evaluated.prediction.a - target.a,
-            evaluated.prediction.b - target.b,
-        ];
+        let residual = evaluated.residual;
         let squared =
             residual[0] * residual[0] + residual[1] * residual[1] + residual[2] * residual[2];
         let contributor = contributor_index(contributors, pool[index].contributor);

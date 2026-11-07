@@ -267,12 +267,11 @@ async fn site_root(State(assets): State<Arc<Assets>>) -> Response {
             Json(SiteRootReply { root }),
         )
             .into_response(),
-        Err(IndexError::Missing) => {
-            error(StatusCode::SERVICE_UNAVAILABLE, "site data is not published")
-        }
-        Err(IndexError::Invalid) => {
-            error(StatusCode::SERVICE_UNAVAILABLE, "site index is invalid")
-        }
+        Err(IndexError::Missing) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "site data is not published",
+        ),
+        Err(IndexError::Invalid) => error(StatusCode::SERVICE_UNAVAILABLE, "site index is invalid"),
     }
 }
 
@@ -419,7 +418,16 @@ async fn read_file(file: PathBuf, immutable: bool) -> Option<Response> {
         .await
         .ok()?
         .ok()?;
-    Some(([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, cache)], bytes).into_response())
+    Some(
+        (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, cache),
+            ],
+            bytes,
+        )
+            .into_response(),
+    )
 }
 
 fn safe_relative(requested: &str) -> Option<PathBuf> {

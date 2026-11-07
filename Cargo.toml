@@ -35,7 +35,8 @@ libm = "0.2"
 thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# Bit-exact f64 JSON parsing must not depend on which packages a cargo selection unifies.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_norway = "0.9"
 saphyr-parser = "0.3"
 postcard = { version = "1", features = ["alloc"] }

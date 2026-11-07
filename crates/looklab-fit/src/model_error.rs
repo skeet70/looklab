@@ -84,15 +84,18 @@ fn sample_covariance(vectors: &[[f64; 3]], mean: [f64; 3]) -> Option<CellMoment>
 /// Jacobi rotations for a real symmetric 3x3 matrix (Golub & Van Loan, Matrix
 /// Computations, 4th ed., §8.5; eqs. 8.5.1 and 8.5.3; max-offdiagonal selection §8.5.3).
 fn project_psd(moment: CellMoment) -> CellMoment {
-    let mut a: CellMoment = core::array::from_fn(|i| {
-        core::array::from_fn(|j| 0.5 * (moment[i][j] + moment[j][i]))
-    });
+    let mut a: CellMoment =
+        core::array::from_fn(|i| core::array::from_fn(|j| 0.5 * (moment[i][j] + moment[j][i])));
     let mut vectors = identity_moment(1.0);
     for _ in 0..20 {
         let candidates: [(usize, usize); 3] = [(0, 1), (0, 2), (1, 2)];
         let (p, q) = candidates
             .into_iter()
-            .max_by(|left, right| a[left.0][left.1].abs().total_cmp(&a[right.0][right.1].abs()))
+            .max_by(|left, right| {
+                a[left.0][left.1]
+                    .abs()
+                    .total_cmp(&a[right.0][right.1].abs())
+            })
             .unwrap_or((0, 1));
         let off = a[p][q];
         if off.abs() <= 1e-14 * (a[p][p].abs() + a[q][q].abs() + 1.0) {
@@ -109,11 +112,7 @@ fn project_psd(moment: CellMoment) -> CellMoment {
         a = rotation.transpose().mul(&Mat3(a)).mul(&rotation).0;
         vectors = Mat3(vectors).mul(&rotation).0;
     }
-    let diagonal = Mat3::diag([
-        a[0][0].max(0.0),
-        a[1][1].max(0.0),
-        a[2][2].max(0.0),
-    ]);
+    let diagonal = Mat3::diag([a[0][0].max(0.0), a[1][1].max(0.0), a[2][2].max(0.0)]);
     Mat3(vectors)
         .mul(&diagonal)
         .mul(&Mat3(vectors).transpose())
@@ -453,7 +452,11 @@ pub fn estimate_model_error(
     let mut field = ModelErrorField::empty();
     let bins = MODEL_HUE_BINS * MODEL_S_BINS;
     let cells = bins * MODEL_C_BINS;
-    let body_holdouts = groups.iter().filter(|group| !group.images.is_empty()).count() >= 2;
+    let body_holdouts = groups
+        .iter()
+        .filter(|group| !group.images.is_empty())
+        .count()
+        >= 2;
     let folds = if body_holdouts {
         groups
             .iter()
@@ -466,8 +469,7 @@ pub fn estimate_model_error(
     if folds.is_empty() {
         return Err(crate::types::FitError::NoModelErrorEvidence);
     }
-    let mut per_cell: Vec<Vec<BodyRegion>> =
-        vec![Vec::new(); MODEL_ENCODINGS * cells];
+    let mut per_cell: Vec<Vec<BodyRegion>> = vec![Vec::new(); MODEL_ENCODINGS * cells];
     let mut single_body_units = (!body_holdouts).then(|| vec![Vec::new(); MODEL_ENCODINGS * cells]);
     let mut evidence = false;
     let mut failed = false;
@@ -578,12 +580,18 @@ pub fn estimate_model_error(
                 sample.rgb[2] * context.wb_b * context.exposure_scale,
             ]));
             let input = LookInput::new(xyz);
-            let prediction =
-                crate::predict::predict_only(&realized[index], &context, sample.rgb, clip_k);
+            let (prediction, _, _) = crate::predict::predict_only(
+                &realized[index],
+                &context,
+                sample.rgb,
+                clip_k,
+                &sample.target,
+            );
+            let target = &sample.target.ucs;
             let residual = [
-                prediction.j - sample.target.j,
-                prediction.a - sample.target.a,
-                prediction.b - sample.target.b,
+                prediction.j - target.j,
+                prediction.a - target.a,
+                prediction.b - target.b,
             ];
             let cell = region(input.s, input.h_in) * MODEL_C_BINS + color_cell(input.c_in);
             accum[index][cell].add(residual, sample.weight.max(0.0));
@@ -606,12 +614,11 @@ pub fn estimate_model_error(
                     }
                     if let Some(region) = image_regions[*image_index][cell] {
                         means.push(region.mean);
-                        if let Some(value) = region.within {
-                            if within.is_none_or(|current| {
-                                moment_trace(value) > moment_trace(current)
-                            }) {
-                                within = Some(value);
-                            }
+                        if let Some(value) = region.within
+                            && within
+                                .is_none_or(|current| moment_trace(value) > moment_trace(current))
+                        {
+                            within = Some(value);
                         }
                     }
                 }
@@ -718,35 +725,32 @@ pub fn estimate_model_error(
     field.held_out_mean_rms = held_rms;
     field.bodies = bodies_count;
     field.repeats = repeats;
-    if model_error_diag() {
-        if let Some((indexed, moment)) = field
+    if model_error_diag()
+        && let Some((indexed, moment)) = field
             .post
             .iter()
             .enumerate()
-            .max_by(|left, right| {
-                moment_trace(*left.1).total_cmp(&moment_trace(*right.1))
-            })
-        {
-            let encoding = indexed / cells;
-            let cell = indexed % cells;
-            eprintln!(
-                "model_error peak encoding={encoding} cell={cell} radial={} rms={} repeats={} evidence={} class={}",
-                moment_trace(*moment),
-                field.held_out_mean_rms[indexed],
-                field.repeats[indexed],
-                field.evidence[indexed],
-                match classes[indexed] {
-                    CellClass::Supported(_) => "supported",
-                    CellClass::Local(_) => "local",
-                    CellClass::Unknown => "unknown",
-                }
-            );
-            for body in &per_cell[indexed] {
-                eprintln!(
-                    "model_error cell={cell} repeats={} mean={:?} mean_covariance={:?} within={:?}",
-                    body.repeats, body.mean, body.mean_covariance, body.within_image,
-                );
+            .max_by(|left, right| moment_trace(*left.1).total_cmp(&moment_trace(*right.1)))
+    {
+        let encoding = indexed / cells;
+        let cell = indexed % cells;
+        eprintln!(
+            "model_error peak encoding={encoding} cell={cell} radial={} rms={} repeats={} evidence={} class={}",
+            moment_trace(*moment),
+            field.held_out_mean_rms[indexed],
+            field.repeats[indexed],
+            field.evidence[indexed],
+            match classes[indexed] {
+                CellClass::Supported(_) => "supported",
+                CellClass::Local(_) => "local",
+                CellClass::Unknown => "unknown",
             }
+        );
+        for body in &per_cell[indexed] {
+            eprintln!(
+                "model_error cell={cell} repeats={} mean={:?} mean_covariance={:?} within={:?}",
+                body.repeats, body.mean, body.mean_covariance, body.within_image,
+            );
         }
     }
     Ok(field)
@@ -781,10 +785,7 @@ pub fn apply_model_error(
             crate::predict::clip_derivative_min(prediction, space, clip_k) >= 0.25;
         if pre_clip_reliable {
             if let Some(inverse) = chain.inverse() {
-                let transported = inverse
-                    .mul(&Mat3(model_post))
-                    .mul(&inverse.transpose())
-                    .0;
+                let transported = inverse.mul(&Mat3(model_post)).mul(&inverse.transpose()).0;
                 let transported: CellMoment = core::array::from_fn(|i| {
                     core::array::from_fn(|j| 0.5 * (transported[i][j] + transported[j][i]))
                 });
@@ -856,7 +857,10 @@ pub fn image_errors(
             sample.rgb[1] * scale,
             sample.rgb[2] * scale,
         ]));
-        out.push((delta_e_ucs(look.eval(xyz), sample.target), sample.target));
+        out.push((
+            delta_e_ucs(look.eval(xyz), sample.target.ucs),
+            sample.target.ucs,
+        ));
     }
     Ok(out)
 }
@@ -939,12 +943,8 @@ mod review_tests {
     #[test]
     fn pre_clip_transport_only_for_reliable_probes() {
         let mut look = Look::colorimetric_spline().expect("look");
-        for value in &mut look.color.g.plane {
-            *value = 0.5;
-        }
-        for value in &mut look.color.g.volume {
-            *value = 0.5;
-        }
+        look.color.g.plane.fill(0.5);
+        look.color.g.volume.fill(0.5);
         let mut field = ModelErrorField::empty();
         let moment = [[4.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
         field.post.fill(moment);

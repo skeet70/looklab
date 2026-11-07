@@ -4,10 +4,11 @@
 use looklab_meta::RawSerial;
 use looklab_prep::PrepParams;
 use looklab_prep_module::{
-    AssertionFields, BuildManifestRequest, BuildManifestResponse, EncodeEnvelopeRequest,
-    EncodeEnvelopeResponse, Function, ManifestImageInput, ModuleError, ParseEnvelopeRequest,
-    ParseEnvelopeResponse, PowParamsSpec, PrepareRequest, PrepareResponse, PreparedImageView,
-    PriorTransformSpec, Response, SolvePowRequest, SolvePowResponse,
+    AssertionFields, BuildManifestRequest, BuildManifestResponse, BuildSendManifestRequest,
+    BuildSendManifestResponse, EncodeEnvelopeRequest, EncodeEnvelopeResponse, Function,
+    ManifestImageInput, ModuleError, ParseEnvelopeRequest, ParseEnvelopeResponse, PowParamsSpec,
+    PrepareRequest, PrepareResponse, PreparedImageView, PriorTransformSpec, Response,
+    SolvePowRequest, SolvePowResponse,
 };
 use looklab_upload::{
     BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion, ContributionKind,
@@ -97,6 +98,7 @@ pub enum ModuleFunction {
     Version,
     Prepare,
     BuildManifest,
+    BuildSendManifest,
     EncodeEnvelope,
     SolvePow,
     ParseEnvelope,
@@ -108,6 +110,7 @@ impl ModuleFunction {
             Self::Version => Function::Version,
             Self::Prepare => Function::Prepare,
             Self::BuildManifest => Function::BuildManifest,
+            Self::BuildSendManifest => Function::BuildSendManifest,
             Self::EncodeEnvelope => Function::EncodeEnvelope,
             Self::SolvePow => Function::SolvePow,
             Self::ParseEnvelope => Function::ParseEnvelope,
@@ -184,8 +187,25 @@ pub fn build_manifest_request(
     Ok(postcard::to_allocvec(&request).expect("manifest request is encodable"))
 }
 
+/// Builds the one manifest a send's passkey approval covers.
+///
+/// # Errors
+/// Rejects a nonce that is not 32 bytes or a hash list the manifest cannot hold.
+pub fn build_send_manifest_request(
+    nonce: [u8; 32],
+    manifest_hashes: Vec<ManifestHash>,
+) -> Result<Vec<u8>, FacadeError> {
+    let request = BuildSendManifestRequest {
+        nonce: Nonce::from_slice(&nonce)
+            .ok_or_else(|| FacadeError::Input("nonce is not 32 bytes".to_owned()))?,
+        manifest_hashes,
+    };
+    Ok(postcard::to_allocvec(&request).expect("send manifest request is encodable"))
+}
+
 pub fn encode_envelope_request(
     nonce: [u8; 32],
+    send_manifest_bytes: Vec<u8>,
     manifest_bytes: Vec<u8>,
     assertion: AssertionFields,
     pow: [u64; looklab_upload::POW_K],
@@ -195,6 +215,7 @@ pub fn encode_envelope_request(
     let request = EncodeEnvelopeRequest {
         nonce: Nonce::from_slice(&nonce)
             .ok_or_else(|| FacadeError::Input("nonce is not 32 bytes".to_owned()))?,
+        send_manifest_bytes,
         manifest_bytes,
         assertion,
         pow,
@@ -257,6 +278,18 @@ pub fn decode_build_manifest_reply(bytes: &[u8]) -> Result<BuildManifestResponse
     }
 }
 
+pub fn decode_build_send_manifest_reply(
+    bytes: &[u8],
+) -> Result<BuildSendManifestResponse, FacadeError> {
+    match decode_reply(bytes)? {
+        Response::BuildSendManifest(response) => Ok(response),
+        other => Err(FacadeError::Reply(format!(
+            "send manifest reply came back as {}",
+            response_name(&other)
+        ))),
+    }
+}
+
 pub fn decode_encode_reply(bytes: &[u8]) -> Result<EncodeEnvelopeResponse, FacadeError> {
     match decode_reply(bytes)? {
         Response::EncodeEnvelope(response) => Ok(response),
@@ -292,6 +325,7 @@ fn response_name(response: &Response) -> &'static str {
         Response::Version(_) => "version",
         Response::Prepare(_) => "prepare",
         Response::BuildManifest(_) => "manifest",
+        Response::BuildSendManifest(_) => "send manifest",
         Response::EncodeEnvelope(_) => "envelope",
         Response::SolvePow(_) => "pow",
         Response::ParseEnvelope(_) => "parse",

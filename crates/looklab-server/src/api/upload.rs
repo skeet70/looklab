@@ -8,22 +8,29 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use http_body_util::BodyExt as _;
-use looklab_upload::{Challenge, Envelope, parse_envelope_strict, peek_nonce};
+use looklab_upload::{
+    Challenge, Envelope, Nonce, WebAuthnAssertion, parse_envelope_strict, peek_nonce,
+};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::task;
+use webauthn_rs::prelude::Passkey;
 
-use crate::api::consume_nonce;
 use crate::blob::{BlobHash, BlobStore};
 use crate::body_schema::{
     SettingsProblem, SnapshotVersionError, validate_render_sims, validate_settings,
 };
+use crate::db::now_unix;
 use crate::error::{ApiError, ApiResult, ErrorCode};
 use crate::ids::{ContributionId, CredentialId, RawCredentialId, StatusToken};
-use crate::preparse::parse_header;
+use crate::preparse::{EnvelopeHeader, parse_header};
 use crate::rate_limit::{Action, RateKey};
-use crate::state::AppState;
-use crate::store::{self, ContributionKind, IntentKind, NewContribution, NewImage};
-use crate::trust::NEW_CREDENTIAL_STANDING;
+use crate::state::{AppState, BatchAdmissionError};
+use crate::store::{
+    self, ContributionKind, EstablishSend, IntentKind, NewContribution, NewImage, NewSend,
+    StoredSend,
+};
+use crate::trust::{CredentialStanding, NEW_CREDENTIAL_STANDING};
 use crate::verify::verify_assertion;
 
 const NONCE_END: usize = 40;
@@ -57,8 +64,7 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         if bytes.len() < NONCE_END {
             return Err(ApiError::new(ErrorCode::MalformedEnvelope));
         }
-        let nonce = peek_nonce(&bytes).map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
-        consume_nonce(&state, &nonce).await?;
+        peek_nonce(&bytes).map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
         read_rest(&mut body, &mut bytes, max_bytes).await?;
         Ok::<Bytes, ApiError>(Bytes::from(bytes))
     };
@@ -81,29 +87,79 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
     } else {
         None
     };
-
-    let (passkey, standing, existing_credential, display_handle) = match (stored, pending) {
-        (Some(credential), _) => (
-            credential.passkey,
-            credential.standing,
-            Some(credential.id),
-            None,
-        ),
-        (None, Some((passkey, display_handle))) => {
-            (passkey, NEW_CREDENTIAL_STANDING, None, display_handle)
-        }
+    let resolved = match (stored, pending) {
+        (Some(credential), _) => ResolvedCredential {
+            passkey: credential.passkey,
+            standing: credential.standing,
+            existing: Some(credential.id),
+            display_handle: None,
+        },
+        (None, Some((passkey, display_handle))) => ResolvedCredential {
+            passkey,
+            standing: NEW_CREDENTIAL_STANDING,
+            existing: None,
+            display_handle,
+        },
         (None, None) => return Err(ApiError::new(ErrorCode::CredentialUnknown)),
     };
 
-    let challenge = Challenge::new(&header.nonce, &header.manifest_hash);
-    let verified_passkey = verify_assertion(
-        &passkey,
-        &header.assertion,
-        challenge,
-        &state.config.origin,
-        &state.config.rp_id,
-    )
-    .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
+    let assertion_hash = assertion_digest(&header.assertion);
+    let send = store::find_send(&state.db, &header.nonce)
+        .await
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+    let mut passkey = resolved.passkey;
+    match send {
+        Some(send) => {
+            check_send_binding(&send, &header, &assertion_hash)?;
+            check_send_open(&send)?;
+            check_batch_pending(&state, &header).await?;
+        }
+        None => {
+            let challenge = Challenge::for_send(&header.nonce, &header.send_manifest_hash);
+            passkey = verify_assertion(
+                &passkey,
+                &header.assertion,
+                challenge,
+                &state.config.origin,
+                &state.config.rp_id,
+            )
+            .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
+            if let Some(id) = &resolved.existing {
+                store::update_credential_passkey(&state.db, id, &passkey)
+                    .await
+                    .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+            } else {
+                state.advance_pending_credential(&passkey);
+            }
+            let batch_hashes = header
+                .send_manifest
+                .batches
+                .iter()
+                .map(|hash| *hash.as_bytes())
+                .collect::<Vec<_>>();
+            let new_send = NewSend {
+                manifest_hash: header.send_manifest_hash.as_bytes(),
+                nonce: &header.nonce,
+                credential_id: &header.assertion.credential_id,
+                assertion_hash: &assertion_hash,
+                batch_hashes: &batch_hashes,
+            };
+            match store::establish_send(&state.db, &new_send)
+                .await
+                .map_err(|_| ApiError::new(ErrorCode::Internal))?
+            {
+                EstablishSend::Established => {}
+                EstablishSend::Existing(send) => {
+                    check_send_binding(&send, &header, &assertion_hash)?;
+                    check_send_open(&send)?;
+                    check_batch_pending(&state, &header).await?;
+                }
+                EstablishSend::Unknown => return Err(ApiError::new(ErrorCode::NonceUnknown)),
+                EstablishSend::Expired => return Err(ApiError::new(ErrorCode::NonceExpired)),
+                EstablishSend::Replayed => return Err(ApiError::new(ErrorCode::NonceReplayed)),
+            }
+        }
+    };
     if !state.rate_limiter.check(&RateKey::Assertion {
         action: Action::Upload,
         id: raw_id.clone(),
@@ -111,12 +167,20 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
 
-    let params = state.trust.pow_params(standing);
+    let attempt = state
+        .batch_admission
+        .try_begin(header.nonce.as_bytes(), header.manifest_hash.as_bytes())
+        .map_err(|error| match error {
+            BatchAdmissionError::InFlight => ApiError::new(ErrorCode::Busy),
+            BatchAdmissionError::Exhausted => ApiError::new(ErrorCode::RateLimited),
+        })?;
+
+    let params = state.trust.pow_params(resolved.standing);
     let n_images = header.n_images();
     let pow_json = serde_json::to_string(header.pow.as_array())
         .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+    let pow_challenge = header.pow_challenge();
     let pow = header.pow;
-    let pow_challenge = challenge;
     task::spawn_blocking(move || looklab_upload::verify(&pow_challenge, n_images, &params, &pow))
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?
@@ -135,7 +199,10 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))??;
 
-    if envelope.nonce != header.nonce || envelope.challenge() != challenge {
+    if envelope.nonce != header.nonce
+        || envelope.send_manifest_hash != header.send_manifest_hash
+        || envelope.manifest_hash() != header.manifest_hash
+    {
         return Err(ApiError::new(ErrorCode::MalformedEnvelope));
     }
 
@@ -221,7 +288,7 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         }
     };
 
-    let first_contribution = existing_credential.is_none();
+    let first_contribution = resolved.existing.is_none();
     let token = if first_contribution {
         Some(StatusToken::generate().map_err(|_| ApiError::new(ErrorCode::Internal))?)
     } else {
@@ -230,16 +297,15 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
     let contribution_id = ContributionId::new();
     let completion = complete(
         &state,
-        existing_credential.clone(),
+        resolved.existing.clone(),
         raw_id.as_slice(),
-        &verified_passkey,
-        display_handle.as_deref(),
+        &passkey,
+        resolved.display_handle.as_deref(),
         NewContribution {
             id: contribution_id.clone(),
-            credential_id: existing_credential
-                .clone()
-                .unwrap_or_else(CredentialId::new),
+            credential_id: resolved.existing.clone().unwrap_or_else(CredentialId::new),
             manifest_hash: *header.manifest_hash.as_bytes(),
+            send_nonce: header.nonce,
             signature: assertion.signature,
             pow: pow_json,
             kind: ContributionKind::from_upload(manifest.kind),
@@ -255,9 +321,12 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
             images,
         },
         token.as_ref(),
+        &header.nonce,
+        header.manifest_hash.as_bytes(),
     )
     .await;
     completion?;
+    attempt.succeed();
 
     state.remove_pending_credential(raw_id.as_slice());
     Ok((
@@ -270,15 +339,82 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         .into_response())
 }
 
+struct ResolvedCredential {
+    passkey: Passkey,
+    standing: CredentialStanding,
+    existing: Option<CredentialId>,
+    display_handle: Option<String>,
+}
+
+fn check_send_binding(
+    send: &StoredSend,
+    header: &EnvelopeHeader,
+    assertion_hash: &[u8; 32],
+) -> ApiResult<()> {
+    if send.manifest_hash != *header.send_manifest_hash.as_bytes() {
+        return Err(ApiError::new(ErrorCode::SendManifestInvalid));
+    }
+    if send.credential_id != header.assertion.credential_id
+        || send.assertion_hash != *assertion_hash
+    {
+        return Err(ApiError::new(ErrorCode::SendCredentialMismatch));
+    }
+    Ok(())
+}
+
+fn check_send_open(send: &StoredSend) -> ApiResult<()> {
+    if send.completed_at.is_some() {
+        return Err(ApiError::new(ErrorCode::SendReplayed));
+    }
+    if now_unix() > send.expires_at {
+        return Err(ApiError::new(ErrorCode::SendExpired));
+    }
+    Ok(())
+}
+
+async fn check_batch_pending(state: &AppState, header: &EnvelopeHeader) -> ApiResult<()> {
+    match store::find_send_batch(
+        &state.db,
+        &header.nonce,
+        header.manifest_hash.as_bytes(),
+    )
+    .await
+    .map_err(|_| ApiError::new(ErrorCode::Internal))?
+    {
+        None => Err(ApiError::new(ErrorCode::SendManifestInvalid)),
+        Some(Some(_)) => Err(ApiError::new(ErrorCode::BatchReplayed)),
+        Some(None) => Ok(()),
+    }
+}
+
+fn assertion_digest(assertion: &WebAuthnAssertion) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for field in [
+        &assertion.credential_id,
+        &assertion.authenticator_data,
+        &assertion.client_data_json,
+        &assertion.signature,
+    ] {
+        hasher.update(u32::try_from(field.len()).unwrap_or(u32::MAX).to_le_bytes());
+        hasher.update(field);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn complete(
     state: &AppState,
     existing_credential: Option<CredentialId>,
     raw_id: &[u8],
-    passkey: &webauthn_rs::prelude::Passkey,
+    passkey: &Passkey,
     display_handle: Option<&str>,
     mut contribution: NewContribution,
     token: Option<&StatusToken>,
+    nonce: &Nonce,
+    batch_hash: &[u8; 32],
 ) -> ApiResult<()> {
     let mut tx = state.db.begin().await?;
     let credential_id = match existing_credential {
@@ -296,6 +432,10 @@ async fn complete(
     };
     contribution.credential_id = credential_id.clone();
     store::insert_contribution(&mut tx, &contribution).await?;
+    if !store::mark_send_batch_received(&mut tx, nonce, batch_hash, &contribution.id).await? {
+        return Err(ApiError::new(ErrorCode::BatchReplayed));
+    }
+    store::increment_send_received(&mut tx, nonce).await?;
     if let Some(token) = token {
         store::insert_status_token(&mut tx, &credential_id, &token.hash()).await?;
     }

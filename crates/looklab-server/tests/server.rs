@@ -27,8 +27,9 @@ use looklab_upload::{
     BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion,
     ContributionKind, ControlEntry, ControlKey, ControlSettings, EnvelopeParts,
     FirmwareVersionString, Intent, Limits, ManifestHash, ManifestImage, ManifestMetadata, Nonce,
-    PowParams, PowSolutions, RawSerial, SerialHmacKey, SettingSource, SimKey, StepIndex,
-    WebAuthnAssertion, encode_envelope, manifest_hash, parse_render_tag, solve,
+    PowParams, PowSolutions, RawSerial, SendManifest, SerialHmacKey, SettingSource, SimKey,
+    StepIndex, WebAuthnAssertion, encode_envelope, manifest_hash, parse_render_tag,
+    send_manifest_hash, solve,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -133,6 +134,7 @@ impl TestServer {
                 max_manifest_bytes: 1 << 16,
                 max_images: 8,
                 max_blob_bytes: 1 << 16,
+                max_batches: 8,
             },
         };
         let db_path = config.db_path.clone();
@@ -310,23 +312,17 @@ impl TestServer {
         serial: Option<&RawSerial>,
     ) -> (StatusCode, Value) {
         let nonce = self.nonce().await;
-        let challenge = Challenge::new(&nonce, &manifest_hash(manifest));
+        let pow_challenge = Challenge::new(&nonce, &manifest_hash(manifest));
+        let challenge = send_challenge(&nonce, manifest);
         let assertion = self.assertion(&challenge).await;
         let pow = solve(
-            &challenge,
+            &pow_challenge,
             u32::try_from(manifest.images.len()).expect("image count"),
             &pow_params(),
             0,
         )
         .expect("proof-of-work");
-        let bytes = encode_envelope(&EnvelopeParts {
-            nonce,
-            manifest,
-            assertion: &assertion,
-            pow: &pow,
-            serial,
-            blobs,
-        });
+        let bytes = envelope(nonce, manifest, blobs, serial, &assertion, &pow);
         self.upload_bytes(bytes).await
     }
 
@@ -383,6 +379,7 @@ async fn nonce_advertises_the_configured_parent_rp_id() {
             max_manifest_bytes: 1 << 16,
             max_images: 8,
             max_blob_bytes: 1 << 16,
+            max_batches: 8,
         },
     };
     let state = Arc::new(AppState::new(config).await.expect("state"));
@@ -764,6 +761,11 @@ fn manifest_at(
     (manifest, blobs)
 }
 
+fn send_challenge(nonce: &Nonce, manifest: &BatchManifest) -> Challenge {
+    let send = SendManifest::canonical(vec![manifest_hash(manifest)]).expect("send manifest");
+    Challenge::for_send(nonce, &send_manifest_hash(&send))
+}
+
 fn envelope(
     nonce: Nonce,
     manifest: &BatchManifest,
@@ -772,14 +774,63 @@ fn envelope(
     assertion: &WebAuthnAssertion,
     pow: &PowSolutions,
 ) -> Vec<u8> {
+    let send = SendManifest::canonical(vec![manifest_hash(manifest)]).expect("send manifest");
     encode_envelope(&EnvelopeParts {
         nonce,
+        send_manifest: &send,
         manifest,
         assertion,
         pow,
         serial,
         blobs,
     })
+}
+
+fn send_envelope(
+    nonce: Nonce,
+    send: &SendManifest,
+    manifest: &BatchManifest,
+    blobs: &[Vec<u8>],
+    assertion: &WebAuthnAssertion,
+) -> Vec<u8> {
+    let pow = solve(
+        &Challenge::new(&nonce, &manifest_hash(manifest)),
+        u32::try_from(manifest.images.len()).expect("image count"),
+        &pow_params(),
+        0,
+    )
+    .expect("proof-of-work");
+    encode_envelope(&EnvelopeParts {
+        nonce,
+        send_manifest: send,
+        manifest,
+        assertion,
+        pow: &pow,
+        serial: None,
+        blobs,
+    })
+}
+
+fn assertion_from(
+    soft: &mut SoftPasskey,
+    credential_id: &[u8],
+    challenge: &Challenge,
+) -> WebAuthnAssertion {
+    let options = request_options(challenge.as_bytes(), credential_id, true).public_key;
+    let client_data_json = format!(
+        r#"{{"type":"webauthn.get","challenge":"{}","origin":"{ORIGIN}"}}"#,
+        URL_SAFE_NO_PAD.encode(challenge.as_bytes())
+    );
+    let hash = Sha256::digest(client_data_json.as_bytes()).to_vec();
+    let credential = soft
+        .perform_auth(hash, options, 60_000)
+        .expect("software authenticator");
+    WebAuthnAssertion {
+        credential_id: credential.raw_id,
+        authenticator_data: credential.response.authenticator_data,
+        client_data_json: client_data_json.into_bytes(),
+        signature: credential.response.signature,
+    }
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -907,10 +958,11 @@ async fn invalid_signature_is_rejected() {
     let mut server = TestServer::start().await;
     let (manifest, blobs) = manifest(valid_settings());
     let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let mut assertion = server.assertion(&challenge).await;
     assertion.signature[0] ^= 0xff;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     let (status, body) = server.upload_bytes(bytes).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -945,9 +997,10 @@ async fn missing_user_verification_is_rejected() {
     let mut server = TestServer::start().await;
     let (manifest, blobs) = manifest(valid_settings());
     let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion_with_verification(&challenge, false).await;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     let (status, body) = server.upload_bytes(bytes).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -959,15 +1012,189 @@ async fn replayed_nonce_is_rejected() {
     let mut server = TestServer::start().await;
     let (manifest, blobs) = manifest(valid_settings());
     let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion(&challenge).await;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     let (status, _) = server.upload_bytes(bytes.clone()).await;
     assert_eq!(status, StatusCode::CREATED);
     let (status, body) = server.upload_bytes(bytes).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["error"], "NONCE_REPLAYED");
+    assert_eq!(body["error"], "SEND_REPLAYED");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parallel_batch_replay_creates_one_contribution() {
+    let mut server = TestServer::start().await;
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, _) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let body = send_envelope(nonce, &send, &first, &first_blobs, &assertion);
+
+    let (left, right) = tokio::join!(
+        server.upload_bytes(body.clone()),
+        server.upload_bytes(body)
+    );
+    let statuses = [left.0, right.0];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CREATED)
+            .count(),
+        1,
+        "{left:?} {right:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CONFLICT
+                || **status == StatusCode::SERVICE_UNAVAILABLE)
+            .count(),
+        1,
+        "{left:?} {right:?}"
+    );
+    let batch_hash = manifest_hash(&first);
+    let contributions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM contributions WHERE batch_manifest_hash = ?",
+    )
+    .bind(batch_hash.as_bytes().as_slice())
+    .fetch_one(&server.db)
+    .await
+    .expect("contributions");
+    assert_eq!(contributions, 1);
+    let refs: i64 = sqlx::query_scalar("SELECT ref_count FROM blobs WHERE hash = ?")
+        .bind(first.images[0].blob_sha256.as_slice())
+        .fetch_one(&server.db)
+        .await
+        .expect("blob refs");
+    assert_eq!(refs, 1);
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'consistency_score'")
+            .fetch_one(&server.db)
+            .await
+            .expect("jobs");
+    assert_eq!(jobs, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_send_rejects_a_continuation() {
+    let mut server = TestServer::start().await;
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, second_blobs) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let first_body = send_envelope(nonce, &send, &first, &first_blobs, &assertion);
+    assert_eq!(
+        server.upload_bytes(first_body).await.0,
+        StatusCode::CREATED
+    );
+    sqlx::query("UPDATE send_manifests SET expires_at = 0 WHERE nonce = ?")
+        .bind(hex(nonce.as_bytes()))
+        .execute(&server.db)
+        .await
+        .expect("expire send");
+
+    let second_body = send_envelope(nonce, &send, &second, &second_blobs, &assertion);
+    let (status, body) = server.upload_bytes(second_body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "SEND_EXPIRED");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_batches_under_a_fresh_nonce_are_a_new_send() {
+    let mut server = TestServer::start().await;
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, second_blobs) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    for _ in 0..2 {
+        let nonce = server.nonce().await;
+        let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+            .expect("send manifest");
+        let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+        let assertion = server.assertion(&challenge).await;
+        assert_eq!(
+            server
+                .upload_bytes(send_envelope(
+                    nonce,
+                    &send,
+                    &first,
+                    &first_blobs,
+                    &assertion
+                ))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            server
+                .upload_bytes(send_envelope(
+                    nonce,
+                    &send,
+                    &second,
+                    &second_blobs,
+                    &assertion
+                ))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+    }
+    let contributions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contributions")
+        .fetch_one(&server.db)
+        .await
+        .expect("contributions");
+    assert_eq!(contributions, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_credential_cannot_continue_a_bound_send() {
+    let mut server = TestServer::start().await;
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, second_blobs) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    assert_eq!(
+        server
+            .upload_bytes(send_envelope(
+                nonce,
+                &send,
+                &first,
+                &first_blobs,
+                &assertion
+            ))
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+
+    let mut other = SoftPasskey::new(true);
+    let other_id = register(&server.app, &mut other).await;
+    let other_assertion = assertion_from(&mut other, &other_id, &challenge);
+    let (status, body) = server
+        .upload_bytes(send_envelope(
+            nonce,
+            &send,
+            &second,
+            &second_blobs,
+            &other_assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "SEND_CREDENTIAL_MISMATCH");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -975,9 +1202,10 @@ async fn bad_pow_is_rejected() {
     let mut server = TestServer::start().await;
     let (manifest, blobs) = manifest(valid_settings());
     let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion(&challenge).await;
-    let pow = bad_pow(&challenge, 2);
+    let pow = bad_pow(&pow_challenge, 2);
     let bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     let (status, body) = server.upload_bytes(bytes).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -989,9 +1217,10 @@ async fn non_canonical_envelope_is_rejected() {
     let mut server = TestServer::start().await;
     let (manifest, blobs) = manifest(valid_settings());
     let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion(&challenge).await;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let mut bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     bytes.push(0);
     let (status, body) = server.upload_bytes(bytes).await;
@@ -1004,9 +1233,10 @@ async fn schema_invalid_settings_are_rejected() {
     let mut server = TestServer::start().await;
     let (manifest, blobs) = manifest(settings_at(&[("highlight_tone", 0)]));
     let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion(&challenge).await;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     let (status, body) = server.upload_bytes(bytes).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1559,9 +1789,10 @@ async fn nothing_sensitive_reaches_disk_logs_or_responses() {
     let nonce = nonce_from_json(&body);
 
     let (manifest, blobs) = manifest(valid_settings());
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion(&challenge).await;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let bytes = envelope(nonce, &manifest, &blobs, Some(&serial), &assertion, &pow);
     let (status, body) = tcp_request(
         addr,
@@ -1587,10 +1818,11 @@ async fn nothing_sensitive_reaches_disk_logs_or_responses() {
     assert_eq!(status, 201);
     responses.push(body.clone());
     let nonce = nonce_from_json(&body);
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let mut assertion = server.assertion(&challenge).await;
     assertion.signature[0] ^= 0xff;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let (status, body) = tcp_request(
         addr,
         "POST",
@@ -1606,9 +1838,10 @@ async fn nothing_sensitive_reaches_disk_logs_or_responses() {
     assert_eq!(status, 201);
     responses.push(body.clone());
     let nonce = nonce_from_json(&body);
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion(&challenge).await;
-    let pow = bad_pow(&challenge, 2);
+    let pow = bad_pow(&pow_challenge, 2);
     let (status, body) = tcp_request(
         addr,
         "POST",
@@ -2411,11 +2644,10 @@ async fn moderator_revert_route_republishes_and_requests_a_refit() {
     .expect("new manifest");
     assert_eq!(manifests, 1);
 
-    let audit: String =
-        sqlx::query_scalar("SELECT type FROM audit_log ORDER BY seq DESC LIMIT 1")
-            .fetch_one(&server.db)
-            .await
-            .expect("audit");
+    let audit: String = sqlx::query_scalar("SELECT type FROM audit_log ORDER BY seq DESC LIMIT 1")
+        .fetch_one(&server.db)
+        .await
+        .expect("audit");
     assert_eq!(audit, "revert");
     let queued: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM jobs WHERE kind = 'revert_refit' AND status = 'queued'",

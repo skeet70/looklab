@@ -64,12 +64,14 @@ for fixture in manifest["fixture"]:
     )
 PY
 )
-  if command -v python3 >/dev/null 2>&1; then
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import tomllib' 2>/dev/null; then
     python3 -c "$reader" "$manifest"
   else
     nix shell nixpkgs#python3 -c python3 -c "$reader" "$manifest"
   fi
 }
+
+entries=$(read_manifest)
 
 status=0
 while IFS=$'\t' read -r file url sha size placement; do
@@ -121,6 +123,6 @@ while IFS=$'\t' read -r file url sha size placement; do
     rm -f "$dest"
     status=1
   fi
-done < <(read_manifest)
+done <<<"$entries"
 
 exit "$status"

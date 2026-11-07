@@ -51,9 +51,111 @@ enum PendingStage {
 const MAX_PENDING_REGISTRATIONS: usize = 1024;
 const UPLOAD_MEMORY_BUDGET: u64 = 1 << 30;
 
+const MAX_BATCH_ATTEMPTS: u8 = 3;
+const MAX_BATCH_ENTRIES: usize = 4096;
+const BATCH_ENTRY_TTL: Duration = Duration::from_secs(15 * 60);
+
 fn upload_slots(max_body_bytes: usize) -> usize {
     let per_upload = 2 * max_body_bytes.max(1) as u64;
     usize::try_from((UPLOAD_MEMORY_BUDGET / per_upload).clamp(1, 16)).unwrap_or(1)
+}
+
+#[derive(Debug, Default)]
+pub struct BatchAdmission {
+    entries: Mutex<HashMap<([u8; 32], [u8; 32]), BatchEntry>>,
+}
+
+#[derive(Debug)]
+struct BatchEntry {
+    in_flight: bool,
+    failures: u8,
+    touched: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchAdmissionError {
+    InFlight,
+    Exhausted,
+}
+
+pub struct BatchAttempt<'a> {
+    admission: &'a BatchAdmission,
+    key: ([u8; 32], [u8; 32]),
+    finished: bool,
+}
+
+impl BatchAdmission {
+    /// One in-flight attempt per pending batch, and at most
+    /// [`MAX_BATCH_ATTEMPTS`] failed attempts before a new send is required.
+    pub fn try_begin(
+        &self,
+        nonce: &[u8; 32],
+        batch: &[u8; 32],
+    ) -> Result<BatchAttempt<'_>, BatchAdmissionError> {
+        let key = (*nonce, *batch);
+        let Ok(mut entries) = self.entries.lock() else {
+            return Err(BatchAdmissionError::InFlight);
+        };
+        if entries.len() >= MAX_BATCH_ENTRIES {
+            entries.retain(|_, entry| entry.in_flight || entry.touched.elapsed() < BATCH_ENTRY_TTL);
+        }
+        let entry = entries.entry(key).or_insert(BatchEntry {
+            in_flight: false,
+            failures: 0,
+            touched: Instant::now(),
+        });
+        entry.touched = Instant::now();
+        if entry.in_flight {
+            return Err(BatchAdmissionError::InFlight);
+        }
+        if entry.failures >= MAX_BATCH_ATTEMPTS {
+            return Err(BatchAdmissionError::Exhausted);
+        }
+        entry.in_flight = true;
+        Ok(BatchAttempt {
+            admission: self,
+            key,
+            finished: false,
+        })
+    }
+
+    fn record_failure(&self, key: ([u8; 32], [u8; 32])) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        if let Some(entry) = entries.get_mut(&key) {
+            entry.failures = entry.failures.saturating_add(1);
+            entry.in_flight = false;
+            entry.touched = Instant::now();
+        }
+    }
+
+    fn release(&self, key: ([u8; 32], [u8; 32]), remove: bool) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        if remove {
+            entries.remove(&key);
+        } else if let Some(entry) = entries.get_mut(&key) {
+            entry.in_flight = false;
+            entry.touched = Instant::now();
+        }
+    }
+}
+
+impl BatchAttempt<'_> {
+    pub fn succeed(mut self) {
+        self.admission.release(self.key, true);
+        self.finished = true;
+    }
+}
+
+impl Drop for BatchAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.admission.record_failure(self.key);
+        }
+    }
 }
 
 pub const MOD_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
@@ -136,6 +238,7 @@ pub struct AppState {
     pub trust: Arc<dyn TrustPolicy>,
     pub upload_slots: Arc<Semaphore>,
     pub mod_sessions: ModSessions,
+    pub batch_admission: BatchAdmission,
     pending: Mutex<HashMap<RegistrationHandle, PendingRegistration>>,
 }
 
@@ -182,6 +285,7 @@ impl AppState {
             trust,
             upload_slots: Arc::new(Semaphore::new(slots)),
             mod_sessions: ModSessions::default(),
+            batch_admission: BatchAdmission::default(),
             pending: Mutex::new(HashMap::new()),
         })
     }
@@ -284,6 +388,22 @@ impl AppState {
             }
             _ => None,
         })
+    }
+
+    /// Stores the passkey signature verification returned.
+    pub fn advance_pending_credential(&self, passkey: &Passkey) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        for entry in pending.values_mut() {
+            if let PendingStage::Credential {
+                passkey: stored, ..
+            } = &mut entry.stage
+                && stored.cred_id().as_slice() == passkey.cred_id().as_slice()
+            {
+                *stored = Box::new(passkey.clone());
+            }
+        }
     }
 
     pub fn remove_pending_credential(&self, credential_id: &[u8]) {

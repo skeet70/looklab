@@ -25,8 +25,10 @@ pub use file::{
     Renderer, UncertaintyData, WbPolicy, emulation_matches_camera_rendering, lut_value_count,
 };
 pub use look::{
-    CoefTerm, ColorLayer, GrlComponent, GrlWeights, LayerValues, Look, LookInput, ParamLayout,
-    Residual, ResidualWeights, Tint,
+    ChromaPaths, CoefTerm, ColorLayer, GrlComponent, GrlWeights, LayerValues, Look, LookInput,
+    NeutralChroma, ParamLayout, Residual, ResidualWeights, Tint, barrier, barrier_derivatives,
+    domain_margin, internal_chroma_from_ucs, internal_chroma_to_xyz, j_prime_xyz_gradient,
+    neutral_scale, prediction_margin, ucs_chroma_from_internal, ucs_reference_jacobian,
 };
 pub use probes::{Probe, ProbeGroup, ProbeId, ProbeSet, ProbeSetFile, V1_PROBE_COUNT};
 pub use solve::{

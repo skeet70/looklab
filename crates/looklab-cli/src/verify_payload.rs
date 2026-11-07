@@ -27,9 +27,10 @@ use looklab_upload::{
     BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion,
     ContributionKind, ControlEntry, ControlKey, ControlSettings, Envelope, EnvelopeParts,
     ExpectedAssertion, FirmwareId, FirmwareVersion, FirmwareVersionString, Intent, Limits,
-    LookSlug, ManifestImage, ManifestMetadata, Nonce, PowParams, RawSerial as UploadSerial,
-    SignatureAlgorithm, StepIndex, StructuralVerdict, TopOriginReview, WebAuthnAssertion,
-    check_structure, encode_envelope, parse_envelope_strict, verify as verify_pow,
+    LookSlug, ManifestHash, ManifestImage, ManifestMetadata, Nonce, PowParams,
+    RawSerial as UploadSerial, SignatureAlgorithm, StepIndex, StructuralVerdict,
+    TopOriginReview, WebAuthnAssertion, check_structure, encode_envelope, parse_envelope_strict,
+    verify as verify_pow,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -49,7 +50,7 @@ const FILM_MODE_TAG: &str = "FilmMode";
 const RESIDUAL_CHANNELS: &[&str] = &[
     "Residual channels (documented, not closed):",
     "- a client can choose which valid proof-of-work solutions it sends, leaking a few bits per batch at exponentially more work;",
-    "- the signature itself: a site that forges keys can choose signature bytes freely (tens to hundreds of bytes per batch, depending on algorithm);",
+    "- the signature itself: one signature per send, because every batch must carry the same assertion; a site that forges keys can choose its bytes freely (tens to hundreds of bytes per send, depending on algorithm);",
     "- the credential ID chosen at passkey registration: a forged-key site picks it once (≤ 255 bytes, a one-time leak; it's then fixed by the identical-ID check);",
     "- timing.",
 ];
@@ -298,7 +299,7 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
     };
 
     let mut credentials: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut covered = vec![false; reproduced.len()];
+    let mut covered = vec![0usize; reproduced.len()];
     for (path, har) in &hars {
         findings.note("");
         findings.note(format!(
@@ -340,26 +341,49 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
                 path.display()
             ));
         }
+        let mut parsed = Vec::new();
         for (index, entry) in uploads.iter().enumerate() {
-            let label = format!("upload {} of {}", index + 1, file_name(path));
             findings.note("");
-            findings.note(label.clone());
-            if let Some(upload) = verify_upload(&entry.request, &service, &mut findings) {
-                for image in upload.images {
-                    covered[image] = true;
-                }
-                credentials.push((label, upload.credential));
+            findings.note(format!("upload {} of {}", index + 1, file_name(path)));
+            if let Some(upload) = parse_upload(&entry.request, &mut findings) {
+                parsed.push(upload);
             }
+        }
+        let mut sends: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
+        for (index, upload) in parsed.iter().enumerate() {
+            sends
+                .entry(*upload.envelope.nonce.as_bytes())
+                .or_default()
+                .push(index);
+        }
+        for (nonce, indices) in sends {
+            let label = format!("send {} of {}", hex(&nonce[..4]), file_name(path));
+            findings.note("");
+            findings.note(format!("{label}: {} batch(es)", indices.len()));
+            verify_send(
+                &parsed,
+                &indices,
+                &service,
+                &label,
+                &mut findings,
+                &mut covered,
+                &mut credentials,
+            );
         }
     }
 
     if findings.failures.is_empty() {
-        for (index, named) in covered.iter().enumerate() {
-            if !named {
-                findings.fail(format!(
+        for (index, count) in covered.iter().enumerate() {
+            match count {
+                1 => {}
+                0 => findings.fail(format!(
                     "no upload names the reproduced image {index} (blob {}); the HAR does not cover every prepared image",
                     hex(&reproduced[index].blob_sha256)
-                ));
+                )),
+                _ => findings.fail(format!(
+                    "the reproduced image {index} (blob {}) appears in {count} uploads; each prepared image belongs to one batch",
+                    hex(&reproduced[index].blob_sha256)
+                )),
             }
         }
     }
@@ -890,16 +914,12 @@ struct ReproducedImage {
     blob_sha256: [u8; 32],
 }
 
-struct VerifiedUpload {
-    credential: Vec<u8>,
-    images: Vec<usize>,
+struct ParsedUpload {
+    envelope: Envelope,
+    body: Vec<u8>,
 }
 
-fn verify_upload(
-    request: &HarRequest,
-    service: &Service<'_>,
-    findings: &mut Findings,
-) -> Option<VerifiedUpload> {
+fn parse_upload(request: &HarRequest, findings: &mut Findings) -> Option<ParsedUpload> {
     if let Some(mime_type) = request
         .post_data
         .as_ref()
@@ -927,21 +947,116 @@ fn verify_upload(
         }
     };
     findings.note(format!(
-        "  envelope: canonical LLUPLD version 1, {} bytes, no trailing bytes",
+        "  envelope: canonical LLUPLD version 2, {} bytes, no trailing bytes",
         body.len()
     ));
     findings.note(format!(
         "  nonce: {} bytes",
         envelope.nonce.as_bytes().len()
     ));
+    findings.note(format!(
+        "  send manifest: {} batch(es)",
+        envelope.send_manifest.batches.len()
+    ));
+    Some(ParsedUpload { envelope, body })
+}
 
-    let selected = select_images(&envelope, service.reproduced, findings);
+fn verify_send(
+    parsed: &[ParsedUpload],
+    indices: &[usize],
+    service: &Service<'_>,
+    label: &str,
+    findings: &mut Findings,
+    covered: &mut [usize],
+    credentials: &mut Vec<(String, Vec<u8>)>,
+) {
+    let first = &parsed[indices[0]].envelope;
+    for &index in &indices[1..] {
+        let other = &parsed[index].envelope;
+        if other.send_manifest_bytes != first.send_manifest_bytes {
+            findings.fail(format!(
+                "{label}: the send's batches carry different send manifests"
+            ));
+        }
+        if other.assertion != first.assertion {
+            findings.fail(format!(
+                "{label}: the send's batches carry different assertions; the browser approved more than once"
+            ));
+        }
+    }
+
+    let mut present: Vec<ManifestHash> = indices
+        .iter()
+        .map(|&index| parsed[index].envelope.manifest_hash())
+        .collect();
+    present.sort_unstable();
+    if present != first.send_manifest.batches {
+        let listed: BTreeSet<ManifestHash> = first.send_manifest.batches.iter().copied().collect();
+        let found: BTreeSet<ManifestHash> = present.iter().copied().collect();
+        for hash in listed.difference(&found) {
+            findings.fail(format!(
+                "{label}: batch {} is missing from the HAR",
+                hex(hash.as_bytes())
+            ));
+        }
+        for hash in found.difference(&listed) {
+            findings.fail(format!(
+                "{label}: batch {} is not in the send manifest",
+                hex(hash.as_bytes())
+            ));
+        }
+        if present.len() != found.len() {
+            findings.fail(format!("{label}: a batch appears more than once in the HAR"));
+        } else if present.len() != listed.len() && found == listed {
+            findings.fail(format!(
+                "{label}: the HAR carries {} batches but the send manifest lists {}",
+                present.len(),
+                listed.len()
+            ));
+        }
+    }
+
+    findings.note(format!(
+        "  one assertion over {} batch(es)",
+        indices.len()
+    ));
+    check_assertion(
+        &first.assertion,
+        service,
+        first.challenge(),
+        "H(nonce ‖ send manifest hash)",
+        findings,
+    );
+    for &index in indices {
+        verify_upload(&parsed[index], service, findings, covered);
+    }
+    credentials.push((label.to_owned(), first.assertion.credential_id.clone()));
+}
+
+fn verify_upload(
+    upload: &ParsedUpload,
+    service: &Service<'_>,
+    findings: &mut Findings,
+    covered: &mut [usize],
+) {
+    let envelope = &upload.envelope;
+    let selected = select_images(envelope, service.reproduced, findings);
     let images = selected.as_ref().map(|indices| {
         indices
             .iter()
             .map(|&index| &service.reproduced[index])
             .collect::<Vec<_>>()
     });
+    if let Some(indices) = &selected {
+        for &index in indices {
+            covered[index] += 1;
+            if covered[index] > 1 {
+                findings.fail(format!(
+                    "the reproduced image {index} appears in more than one upload; each prepared image belongs to one batch"
+                ));
+            }
+        }
+    }
     if let Some(images) = &images {
         findings.note(format!(
             "  images: {} of {} reproduced, in the manifest's order",
@@ -961,7 +1076,7 @@ fn verify_upload(
                 print_batch_fields(derived.as_ref(), &declared, service.bodies, findings);
                 if let Some(fields) = &derived {
                     let expected = expected_manifest(fields, &declared, images);
-                    check_images(&envelope, &expected, images, service, findings);
+                    check_images(envelope, &expected, images, service, findings);
                 } else {
                     findings.fail(
                         "the manifest cannot be reproduced: the batch fields are not determined",
@@ -976,14 +1091,8 @@ fn verify_upload(
         findings.fail("the manifest cannot be reproduced: the upload's images are not reproduced");
     }
 
-    check_webauthn(&envelope, service, findings);
-    check_pow(&envelope, service, findings);
-    check_serial(&envelope, service, &body, findings);
-
-    Some(VerifiedUpload {
-        credential: envelope.assertion.credential_id,
-        images: selected.unwrap_or_default(),
-    })
+    check_pow(envelope, service, findings);
+    check_serial(envelope, service, &upload.body, findings);
 }
 
 /// The reproduced images one upload names, in its manifest's order.
@@ -1237,16 +1346,6 @@ fn manifest_differences(site: &BatchManifest, expected: &BatchManifest) -> Vec<S
     differences
 }
 
-fn check_webauthn(envelope: &Envelope, service: &Service<'_>, findings: &mut Findings) {
-    check_assertion(
-        &envelope.assertion,
-        service,
-        envelope.challenge(),
-        "H(nonce ‖ manifest hash)",
-        findings,
-    );
-}
-
 /// Structural WebAuthn checks against `challenge`; returns whether some supported
 /// signature algorithm passed.
 fn check_assertion(
@@ -1351,7 +1450,12 @@ fn webauthn_line(service: &Service<'_>, algorithm: SignatureAlgorithm) -> String
 
 fn check_pow(envelope: &Envelope, service: &Service<'_>, findings: &mut Findings) {
     let n_images = u32::try_from(envelope.manifest.images.len()).unwrap_or(u32::MAX);
-    match verify_pow(&envelope.challenge(), n_images, &service.pow, &envelope.pow) {
+    match verify_pow(
+        &envelope.pow_challenge(),
+        n_images,
+        &service.pow,
+        &envelope.pow,
+    ) {
         Ok(()) => {
             let bits = service.pow.difficulty_bits(n_images).unwrap_or(0);
             findings.note(format!(
@@ -1373,6 +1477,7 @@ fn check_serial(envelope: &Envelope, service: &Service<'_>, body: &[u8], finding
     for (name, serial) in &candidates {
         let parts = EnvelopeParts {
             nonce: envelope.nonce,
+            send_manifest: &envelope.send_manifest,
             manifest: &envelope.manifest,
             assertion: &envelope.assertion,
             pow: &envelope.pow,

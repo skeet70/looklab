@@ -114,8 +114,7 @@ pub async fn look_listing(
         LookAction::Revert => {
             let request: RevertRequest =
                 serde_json::from_value(payload).map_err(|_| malformed())?;
-            let look = looklab_upload::LookSlug::try_from(request.look)
-                .map_err(|_| malformed())?;
+            let look = looklab_upload::LookSlug::try_from(request.look).map_err(|_| malformed())?;
             let excluded = request
                 .excluded_credentials
                 .iter()
@@ -136,8 +135,7 @@ pub async fn look_listing(
         LookAction::Listing(listing) => {
             let request: ListingRequest =
                 serde_json::from_value(payload).map_err(|_| malformed())?;
-            let look = looklab_upload::LookSlug::try_from(request.look)
-                .map_err(|_| malformed())?;
+            let look = looklab_upload::LookSlug::try_from(request.look).map_err(|_| malformed())?;
             let record = match listing {
                 ListingAction::Hide => {
                     admin::hide_look(&state.db, &moderator, &look, &request.reason).await?

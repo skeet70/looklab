@@ -14,6 +14,7 @@ mod manifest;
 mod metadata;
 mod nonce;
 mod pow;
+mod send;
 pub mod webauthn;
 
 pub use envelope::{
@@ -41,8 +42,12 @@ pub use metadata::{
     MonochromeFilter, NoiseReduction, Saturation, Sharpness, Tagged, WhiteBalanceFineTune,
     WhiteBalanceMode, WhiteBalanceMultipliers, WhiteBalanceShift,
 };
-pub use nonce::{Challenge, ManifestHash, Nonce};
+pub use nonce::{Challenge, ManifestHash, Nonce, SendManifestHash};
 pub use pow::{POW_K, PowError, PowParams, PowSolutions, solve, verify};
+pub use send::{
+    DEFAULT_MAX_BATCHES, SendManifest, SendManifestError, canonical_send_manifest_bytes,
+    send_manifest_hash,
+};
 pub use webauthn::{
     ClientDataExtra, ExpectedAssertion, ExtensionEntry, Extensions, ReviewValue,
     SignatureAlgorithm, StructuralError, StructuralVerdict, TopOriginReview, WebAuthnAssertion,

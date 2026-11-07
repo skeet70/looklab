@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Spline values and derivatives over the model's knot vectors. Cubic B-splines per Piegl & Tiller (1997) A2.2.
 
-use looklab_model::basis::{
-    C_MAX, HUE_COEFS, RESIDUAL_GRID, S_COEFS, S_KNOTS, TINT_COEFS, TINT_KNOTS,
-};
+use looklab_model::basis::{C_MAX, HUE_COEFS, S_KNOTS};
 
 static TONE_BASIS: std::sync::LazyLock<looklab_model::basis::ToneBasis> =
     std::sync::LazyLock::new(looklab_model::basis::ToneBasis::new);
@@ -16,10 +14,18 @@ pub(crate) fn tone_basis_derivative(s: f64) -> [f64; 20] {
 pub(crate) fn find_span(knots: &[f64], degree: usize, x: f64) -> usize {
     let n = knots.len() - degree - 1;
     if x >= knots[n] {
-        return n - 1;
+        let mut index = n - 1;
+        while index > degree && knots[index] == knots[index + 1] {
+            index -= 1;
+        }
+        return index;
     }
     if x <= knots[degree] {
-        return degree;
+        let mut index = degree;
+        while index < n - 1 && knots[index] == knots[index + 1] {
+            index += 1;
+        }
+        return index;
     }
     let mut lo = degree;
     let mut hi = n;
@@ -79,18 +85,15 @@ pub(crate) fn cubic_with_derivative(knots: &[f64], x: f64) -> (usize, [f64; 4], 
     (start, values, derivative)
 }
 
-/// `s`-axis weights (`S_KNOTS`) and `d/ds`.
+/// `s`-axis weights (`S_KNOTS`) and `d/ds`; extrapolates outside the knot range.
 pub(crate) fn s_values(s: f64) -> ([usize; 4], [f64; 4], [f64; 4]) {
-    let (start, values, derivative) =
-        cubic_with_derivative(&S_KNOTS, s.clamp(S_KNOTS[3], S_KNOTS[S_COEFS]));
+    let (start, values, derivative) = cubic_with_derivative(&S_KNOTS, s);
     ([start, start + 1, start + 2, start + 3], values, derivative)
 }
 
-/// Tint weights over `J'_base` (`TINT_KNOTS`) and `d/dJ'`.
+/// Tint weights over `J'_base` and `d/dJ'`; the model's C² continuation above the join.
 pub(crate) fn tint_values(j_prime: f64) -> ([usize; 4], [f64; 4], [f64; 4]) {
-    let x = j_prime.clamp(TINT_KNOTS[3], TINT_KNOTS[TINT_COEFS]);
-    let (start, values, derivative) = cubic_with_derivative(&TINT_KNOTS, x);
-    ([start, start + 1, start + 2, start + 3], values, derivative)
+    looklab_model::basis::tint_weights(j_prime)
 }
 
 /// Periodic uniform cubic hue weights and `d/dh` (degrees).
@@ -143,73 +146,6 @@ pub(crate) fn c_values(c: f64) -> ([usize; 4], [f64; 4], [f64; 4]) {
         derivatives[m] = du[m] * du_dc;
     }
     ([0, 1, 2, 3], weights, derivatives)
-}
-
-/// Trilinear corner indices and weights plus `d/du`, `d/dv`, `d/dw` (normalized coords).
-#[allow(clippy::type_complexity)]
-pub(crate) fn trilinear(u: f64, v: f64, w: f64) -> ([usize; 8], [f64; 8], [[f64; 8]; 3]) {
-    let last = RESIDUAL_GRID - 1;
-    let coord = |value: f64| {
-        let g = value.clamp(0.0, 1.0) * last as f64;
-        let i = g.floor();
-        let f = g - i;
-        let i = (i as usize).min(last);
-        let i1 = (i + 1).min(last);
-        (i, i1, f)
-    };
-    let (i0, i1, fu) = coord(u);
-    let (j0, j1, fv) = coord(v);
-    let (k0, k1, fw) = coord(w);
-    let indices = [
-        i0 * RESIDUAL_GRID * RESIDUAL_GRID + j0 * RESIDUAL_GRID + k0,
-        i0 * RESIDUAL_GRID * RESIDUAL_GRID + j0 * RESIDUAL_GRID + k1,
-        i0 * RESIDUAL_GRID * RESIDUAL_GRID + j1 * RESIDUAL_GRID + k0,
-        i0 * RESIDUAL_GRID * RESIDUAL_GRID + j1 * RESIDUAL_GRID + k1,
-        i1 * RESIDUAL_GRID * RESIDUAL_GRID + j0 * RESIDUAL_GRID + k0,
-        i1 * RESIDUAL_GRID * RESIDUAL_GRID + j0 * RESIDUAL_GRID + k1,
-        i1 * RESIDUAL_GRID * RESIDUAL_GRID + j1 * RESIDUAL_GRID + k0,
-        i1 * RESIDUAL_GRID * RESIDUAL_GRID + j1 * RESIDUAL_GRID + k1,
-    ];
-    let weights = [
-        (1.0 - fu) * (1.0 - fv) * (1.0 - fw),
-        (1.0 - fu) * (1.0 - fv) * fw,
-        (1.0 - fu) * fv * (1.0 - fw),
-        (1.0 - fu) * fv * fw,
-        fu * (1.0 - fv) * (1.0 - fw),
-        fu * (1.0 - fv) * fw,
-        fu * fv * (1.0 - fw),
-        fu * fv * fw,
-    ];
-    let scale = last as f64;
-    let mut du = [0.0_f64; 8];
-    let mut dv = [0.0_f64; 8];
-    let mut dw = [0.0_f64; 8];
-    for index in 0..8 {
-        let high_u = index >= 4;
-        let high_v = (index & 2) != 0;
-        let high_w = (index & 1) != 0;
-        let sign = |high: bool| if high { 1.0 } else { -1.0 };
-        let bu = if high_u { fu } else { 1.0 - fu };
-        let bv = if high_v { fv } else { 1.0 - fv };
-        let bw = if high_w { fw } else { 1.0 - fw };
-        du[index] = sign(high_u) * scale * bv * bw;
-        dv[index] = sign(high_v) * scale * bu * bw;
-        dw[index] = sign(high_w) * scale * bu * bv;
-    }
-    (indices, weights, [du, dv, dw])
-}
-
-/// residual-grid coordinates for `(s, a_in, b_in)` in `[0, 1]^3`.
-pub(crate) fn residual_coords(s: f64, a: f64, b: f64) -> [f64; 3] {
-    let domain = looklab_model::look::RESIDUAL_DOMAIN;
-    let normalize = |value: f64, bounds: [f64; 2]| {
-        ((value - bounds[0]) / (bounds[1] - bounds[0])).clamp(0.0, 1.0)
-    };
-    [
-        normalize(s, domain[0]),
-        normalize(a, domain[1]),
-        normalize(b, domain[2]),
-    ]
 }
 
 /// Second-difference rows over `n` coefficients.

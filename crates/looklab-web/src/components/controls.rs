@@ -14,6 +14,7 @@ use web_sys::{File, HtmlInputElement};
 
 static NEXT_TABS_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_CAMERA_ID: AtomicUsize = AtomicUsize::new(0);
+static NEXT_STEPPER_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CameraOptionIndex(usize);
@@ -477,19 +478,20 @@ pub struct WizardStep {
     pub summary: Option<String>,
 }
 
-/// Wizard navigation with completed-step summaries.
 #[component]
 pub fn Stepper(
     steps: Vec<WizardStep>,
     current: RwSignal<StepIndex>,
     #[prop(into, default = Signal::derive(|| true))] can_advance: Signal<bool>,
     #[prop(into, default = Signal::derive(|| false))] locked: Signal<bool>,
+    #[prop(into, default = Signal::derive(|| false))] finished: Signal<bool>,
     #[prop(into, default = Signal::derive(Vec::new))] summaries: Signal<Vec<Option<String>>>,
     #[prop(optional)] children: Option<Children>,
     #[prop(optional)] on_finish: Option<Callback<()>>,
     #[prop(default = "Finish".to_owned())] finish_label: String,
 ) -> impl IntoView {
     let count = steps.len();
+    let instance = NEXT_STEPPER_ID.fetch_add(1, Ordering::Relaxed);
     let furthest = RwSignal::new(current.get_untracked());
     let final_step = Signal::derive(move || current.get().0.saturating_add(1) >= count);
     Effect::new(move |_| {
@@ -500,56 +502,84 @@ pub fn Stepper(
         <div class="stepper">
             <nav aria-label="Progress">
                 <ol>{steps.into_iter().enumerate().map(|(index, step)| {
+                    let title = step.title.clone();
                     let summary = Signal::derive(move || {
                         summaries.with(|summaries| summaries.get(index).cloned().flatten())
                             .or_else(|| step.summary.clone())
                     });
+                    let complete = move || index < furthest.get().0;
+                    let state = move || {
+                        if current.get().0 == index {
+                            "current"
+                        } else if complete() {
+                            "complete"
+                        } else {
+                            "upcoming"
+                        }
+                    };
+                    let marker = Signal::derive(move || {
+                        if complete() { "✓".to_owned() } else { (index + 1).to_string() }
+                    });
+                    let summary_id = format!("stepper-{instance}-step-{index}");
+                    let described_by = summary_id.clone();
                     view! {
-                        <li aria-current=move || (current.get().0 == index).then_some("step")>
+                        <li class="step-item" data-state=state
+                            aria-current=move || { (current.get().0 == index).then_some("step") }>
                             <button
                                 type="button"
+                                class="step-link"
+                                aria-describedby=move || complete().then(|| described_by.clone())
                                 disabled=move || { locked.get() || index > furthest.get().0 }
                                 on:click=move |_| {
                                     if !locked.get_untracked() { current.set(StepIndex(index)); }
                                 }
                             >
-                                {step.title}
+                                <span class="step-marker" aria-hidden="true">{marker}</span>
+                                <span class="step-title">{title}</span>
                             </button>
-                            {move || (index < furthest.get().0).then(|| summary.get()).flatten().map(|summary| view! {
-                                <span class="step-summary">{summary}</span>
+                            {move || complete().then(|| view! {
+                                <span class="step-summary" id=summary_id.clone()>
+                                    <span class="visually-hidden">"Completed. "</span>
+                                    {move || summary.get().unwrap_or_default()}
+                                </span>
                             })}
                         </li>
                     }
                 }).collect_view()}</ol>
             </nav>
             {children.map(|children| children())}
-            <div class="stepper-actions">
-                <button
-                    type="button"
-                    disabled=move || locked.get() || current.get().0 == 0
-                    on:click=move |_| {
-                        if !locked.get_untracked() {
-                            current.update(|step| step.0 = step.0.saturating_sub(1));
+            {move || (!finished.get()).then(|| {
+                let finish_label = finish_label.clone();
+                view! {
+                <div class="stepper-actions">
+                    <button
+                        type="button"
+                        disabled=move || locked.get() || current.get().0 == 0
+                        on:click=move |_| {
+                            if !locked.get_untracked() {
+                                current.update(|step| step.0 = step.0.saturating_sub(1));
+                            }
                         }
-                    }
-                >
-                    "Back"
-                </button>
-                <button type="button" disabled=move || { locked.get() || !can_advance.get() || count == 0 || (final_step.get() && on_finish.is_none()) }
-                    on:click=move |_| {
-                        if locked.get_untracked() { return; }
-                        let next = current.get_untracked().0.saturating_add(1);
-                        if next < count {
-                            current.set(StepIndex(next));
-                        } else if count > 0
-                            && let Some(finish) = on_finish
-                        {
-                            finish.run(());
-                        }
-                    }>
-                    {move || if final_step.get() && on_finish.is_some() { finish_label.clone() } else { "Next".to_owned() }}
-                </button>
-            </div>
+                    >
+                        "Back"
+                    </button>
+                    <button type="button" disabled=move || { locked.get() || !can_advance.get() || count == 0 || (final_step.get() && on_finish.is_none()) }
+                        on:click=move |_| {
+                            if locked.get_untracked() { return; }
+                            let next = current.get_untracked().0.saturating_add(1);
+                            if next < count {
+                                current.set(StepIndex(next));
+                            } else if count > 0
+                                && let Some(finish) = on_finish
+                            {
+                                finish.run(());
+                            }
+                        }>
+                        {move || if final_step.get() && on_finish.is_some() { finish_label.clone() } else { "Next".to_owned() }}
+                    </button>
+                </div>
+                }
+            })}
         </div>
     }
 }

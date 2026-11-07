@@ -30,6 +30,10 @@ const LOOK: &str = "classic-chrome";
 const FIRMWARE: &str = "1.50";
 const SIM: &str = "classic_chrome";
 
+/// Jobs one fixture queue may run before it must settle.
+const DRAIN_JOBS: usize = 64;
+const DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(900);
+
 struct Fixture {
     _dir: Option<TempDir>,
     worker: Worker,
@@ -551,7 +555,10 @@ async fn duplicates_are_merged_and_a_mislabelled_upload_is_quarantined() {
         .enqueue(&JobPayload::HonestDuplicateMerge, 0)
         .await
         .expect("enqueue merge");
-    worker.run_until_idle().await.expect("merge job");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("merge job");
     assert_eq!(
         image_field(worker, &duplicate_images[0], "duplicate_of").await,
         Some(images[4].clone())
@@ -570,7 +577,10 @@ async fn duplicates_are_merged_and_a_mislabelled_upload_is_quarantined() {
         )
         .await
         .expect("enqueue");
-    worker.run_until_idle().await.expect("jobs");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("jobs");
 
     assert_eq!(
         image_field(worker, &duplicate_images[0], "duplicate_of").await,
@@ -620,7 +630,10 @@ async fn nightly_refit_publishes_a_manifest_and_a_verifiable_site() {
         )
         .await
         .expect("enqueue");
-    worker.run_until_idle().await.expect("jobs");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("jobs");
 
     let versions = count(
         worker,
@@ -713,7 +726,10 @@ async fn a_revert_republishes_the_target_and_the_refit_drops_the_excluded_creden
         )
         .await
         .expect("enqueue");
-    worker.run_until_idle().await.expect("initial refit");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("initial refit");
     add_contribution(worker, &attacker, &dataset, &[4, 5, 6, 7], 200).await;
 
     let body = looklab_upload::BodyId::new(BODY).expect("body");
@@ -830,7 +846,10 @@ async fn a_revert_republishes_the_target_and_the_refit_drops_the_excluded_creden
             .any(|image| image.credential.id == honest)
     );
 
-    worker.run_until_idle().await.expect("revert refit");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("revert refit");
     let refit_status: String = sqlx::query_scalar(
         "SELECT status FROM jobs WHERE kind = 'revert_refit' ORDER BY created_at DESC LIMIT 1",
     )
@@ -919,7 +938,10 @@ async fn gate_failure_holds_the_candidate_and_opens_a_moderation_item() {
         )
         .await
         .expect("enqueue");
-    worker.run_until_idle().await.expect("first release");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("first release");
 
     sqlx::query("UPDATE contributions SET status = 'withdrawn' WHERE id = ?")
         .bind(first_id.as_str())
@@ -951,7 +973,7 @@ async fn gate_failure_holds_the_candidate_and_opens_a_moderation_item() {
         .await
         .expect("enqueue");
     worker
-        .run_until_idle()
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
         .await
         .expect("second release attempt");
 
@@ -1011,7 +1033,10 @@ async fn withdrawal_gc_deletes_blobs_after_retention() {
         )
         .await
         .expect("enqueue");
-    worker.run_until_idle().await.expect("gc");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("gc");
 
     assert!(!path.exists());
     let blobs = count(worker, "SELECT COUNT(*) FROM blobs").await;
@@ -1074,7 +1099,9 @@ async fn refit(worker: &Worker) {
         )
         .await
         .expect("enqueue");
-    let drained = worker.run_until_idle().await;
+    let drained = worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await;
     if std::env::var_os("LOOKLAB_DUMP_STATE").is_some() {
         dump_state(worker, "refit").await;
     }
@@ -1115,15 +1142,15 @@ async fn a_dual_illuminant_transform_file_resolves_per_image() {
 version: 2
 color_matrices:
   - cct: 2856.0
-xyz_to_camera:
-  - [1.0, 0.0, 0.0]
-  - [0.0, 1.0, 0.0]
-  - [0.0, 0.0, 1.0]
+    xyz_to_camera:
+      - [1.0, 0.0, 0.0]
+      - [0.0, 1.0, 0.0]
+      - [0.0, 0.0, 1.0]
   - cct: 6504.0
-xyz_to_camera:
-  - [1.0, 0.0, 0.0]
-  - [0.0, 1.0, 0.0]
-  - [0.0, 0.0, 1.0]
+    xyz_to_camera:
+      - [1.0, 0.0, 0.0]
+      - [0.0, 1.0, 0.0]
+      - [0.0, 0.0, 1.0]
 ";
     std::fs::write(
         worker.config().transforms.join("fujifilm-x-t5.yaml"),
@@ -1320,7 +1347,10 @@ async fn bounties_score_accepted_recipes_and_prune_withdrawn_ones() {
         .enqueue(&JobPayload::Bounties, 0)
         .await
         .expect("enqueue bounties");
-    worker.run_until_idle().await.expect("bounties");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("bounties");
 
     let (measured, n_verifications): (f64, i64) = sqlx::query_as(
         "SELECT measured_de, n_verifications FROM recipe_scores
@@ -1347,7 +1377,10 @@ async fn bounties_score_accepted_recipes_and_prune_withdrawn_ones() {
         .enqueue(&JobPayload::Bounties, 0)
         .await
         .expect("enqueue bounties");
-    worker.run_until_idle().await.expect("bounties");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("bounties");
 
     assert_eq!(
         count(worker, "SELECT COUNT(*) FROM recipe_observations").await,
@@ -1465,7 +1498,10 @@ async fn card_renders_never_change_a_fit_and_verify_per_firmware() {
         )
         .await
         .expect("enqueue intake");
-    worker.run_until_idle().await.expect("card validation");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("card validation");
     let status: String = sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
         .bind(rejected.as_str())
         .fetch_one(worker.pool())
@@ -1694,7 +1730,10 @@ async fn withdrawal_gc_releases_a_shared_blob_once() {
         )
         .await
         .expect("enqueue");
-    worker.run_until_idle().await.expect("gc");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("gc");
     assert!(path.exists());
     assert_eq!(
         count(worker, "SELECT ref_count FROM blobs LIMIT 1").await,
@@ -1710,7 +1749,10 @@ async fn withdrawal_gc_releases_a_shared_blob_once() {
         )
         .await
         .expect("enqueue");
-    worker.run_until_idle().await.expect("retry gc");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("retry gc");
     assert!(path.exists());
     assert_eq!(
         count(worker, "SELECT ref_count FROM blobs LIMIT 1").await,
@@ -1727,7 +1769,10 @@ async fn withdrawal_gc_releases_a_shared_blob_once() {
         )
         .await
         .expect("enqueue");
-    worker.run_until_idle().await.expect("gc");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("gc");
     assert!(!path.exists());
     assert_eq!(count(worker, "SELECT COUNT(*) FROM blobs").await, 0);
 }
@@ -1772,7 +1817,10 @@ async fn a_consistency_retry_preserves_a_quarantine() {
             )
             .await
             .expect("enqueue");
-        worker.run_until_idle().await.expect("consistency");
+        worker
+            .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+            .await
+            .expect("consistency");
         assert_eq!(
             image_field(worker, &images[3], "status").await.as_deref(),
             Some("quarantined")

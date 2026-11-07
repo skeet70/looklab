@@ -38,10 +38,10 @@ fn rejects_bad_magic() {
 fn rejects_unsupported_version() {
     let fixture = Fixture::new();
     let mut bytes = fixture.bytes();
-    write_u16(&mut bytes, fixture.offsets().version, 2);
+    write_u16(&mut bytes, fixture.offsets().version, 1);
     assert!(matches!(
         parse_error(&bytes, &compact_limits()),
-        EnvelopeError::UnsupportedVersion(2)
+        EnvelopeError::UnsupportedVersion(1)
     ));
 }
 
@@ -79,7 +79,7 @@ fn rejects_oversized_manifest() {
     };
     assert!(matches!(
         parse_error(&bytes, &limits),
-        EnvelopeError::ManifestTooLong { .. }
+        EnvelopeError::ManifestTooLong { .. } | EnvelopeError::SendManifestTooLong { .. }
     ));
 }
 

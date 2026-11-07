@@ -1200,10 +1200,7 @@ pub struct RevertRecord {
     pub reverted_at: i64,
 }
 
-async fn authorize_moderator(
-    conn: &mut SqliteConnection,
-    actor: Actor,
-) -> Result<(), AdminError> {
+async fn authorize_moderator(conn: &mut SqliteConnection, actor: Actor) -> Result<(), AdminError> {
     let Actor::Credential(actor_trust) = actor else {
         return Ok(());
     };
@@ -1320,8 +1317,7 @@ fn republish_artifacts(
         .cloned()
     {
         let bytes = read_artifact_blob(&store, &release_artifact)?;
-        let mut release: Value =
-            serde_json::from_slice(&bytes).map_err(|_| AdminError::Corrupt)?;
+        let mut release: Value = serde_json::from_slice(&bytes).map_err(|_| AdminError::Corrupt)?;
         let Value::Object(fields) = &mut release else {
             return Err(AdminError::Corrupt);
         };
@@ -1428,10 +1424,7 @@ async fn latest_release_value(
     ))
 }
 
-async fn enqueue_revert_refit(
-    conn: &mut SqliteConnection,
-    now: i64,
-) -> Result<bool, AdminError> {
+async fn enqueue_revert_refit(conn: &mut SqliteConnection, now: i64) -> Result<bool, AdminError> {
     let queued: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = ? AND status = 'queued'")
             .bind(crate::store::JobKind::RevertRefit.as_str())

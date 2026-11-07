@@ -18,8 +18,8 @@ use looklab_upload::{
     BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion,
     ContributionKind, ControlEntry, ControlKey, ControlSettings, EnvelopeParts, FirmwareId,
     FirmwareVersion, FirmwareVersionString, Intent, ManifestHash, ManifestImage, Nonce, POW_K,
-    PowParams, RawSerial, RerenderGroupId, SimKey, StepIndex, Tagged, WebAuthnAssertion,
-    encode_envelope, manifest_hash, parse_render_tag, solve,
+    PowParams, RawSerial, RerenderGroupId, SendManifest, SimKey, StepIndex, Tagged,
+    WebAuthnAssertion, encode_envelope, manifest_hash, parse_render_tag, send_manifest_hash, solve,
 };
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use serde_json::{Value, json};
@@ -211,17 +211,17 @@ fn verified_module() -> PathBuf {
     let root = workspace_root();
     let output = ProcessCommand::new("sh")
         .current_dir(&root)
-        .args([SCRIPT, "--prep", "--check"])
+        .args([SCRIPT, "--prep"])
         .output()
         .unwrap_or_else(|error| {
             panic!(
-                "run `nix develop -c sh {SCRIPT} --prep --check` in {}: {error}",
+                "run `nix develop -c sh {SCRIPT} --prep` in {}: {error}",
                 root.display()
             )
         });
     assert!(
         output.status.success(),
-        "the prep module is stale or missing; run `nix develop -c sh {SCRIPT} --prep` in {}:\n{}{}",
+        "the prep module could not be built; run `nix develop -c sh {SCRIPT} --prep` in {}:\n{}{}",
         root.display(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -715,10 +715,11 @@ impl Site {
 
     fn body(&self) -> Vec<u8> {
         let nonce = Nonce::from_bytes([0x42; 32]);
-        let hash = manifest_hash(&self.manifest);
+        let send = SendManifest::canonical(vec![manifest_hash(&self.manifest)])
+            .expect("send manifest");
         let challenge = self
             .challenge
-            .unwrap_or_else(|| Challenge::new(&nonce, &hash));
+            .unwrap_or_else(|| Challenge::for_send(&nonce, &send_manifest_hash(&send)));
         let assertion = assertion(
             &challenge,
             &self.origin,
@@ -727,6 +728,16 @@ impl Site {
             self.client_extra.as_ref(),
             self.extensions.as_deref(),
         );
+        self.body_with(&nonce, &send, &assertion)
+    }
+
+    fn body_with(
+        &self,
+        nonce: &Nonce,
+        send: &SendManifest,
+        assertion: &WebAuthnAssertion,
+    ) -> Vec<u8> {
+        let challenge = Challenge::new(nonce, &manifest_hash(&self.manifest));
         let pow = solve(&challenge, self.manifest.images.len() as u32, &POW, 0)
             .expect("proof-of-work solves");
         let serial = self
@@ -734,9 +745,10 @@ impl Site {
             .as_deref()
             .map(|ascii| RawSerial::from_envelope_ascii(ascii).expect("valid serial"));
         let parts = EnvelopeParts {
-            nonce,
+            nonce: *nonce,
+            send_manifest: send,
             manifest: &self.manifest,
-            assertion: &assertion,
+            assertion,
             pow: &pow,
             serial: serial.as_ref(),
             blobs: &self.blobs,
@@ -812,6 +824,39 @@ fn default_har(site: &Site) -> HarBuilder {
             "https://looklab.test/api/passkey/register/finish",
             br#"{"handle":"registration-handle","credential":{"id":"Y3JlZA","rawId":"Y3JlZA","type":"public-key","response":{"clientDataJSON":"e30","attestationObject":"oA"},"clientExtensionResults":{}}}"#,
         )
+}
+
+/// One send whose single assertion covers every site's batch.
+fn send_har(sites: &[&Site]) -> HarBuilder {
+    let uploaded = (0..sites.len()).collect::<Vec<_>>();
+    send_har_of(sites, &uploaded)
+}
+
+/// The manifest covers every site; only `uploaded` batches are in the HAR.
+fn send_har_of(sites: &[&Site], uploaded: &[usize]) -> HarBuilder {
+    let nonce = Nonce::from_bytes([0x42; 32]);
+    let hashes = sites
+        .iter()
+        .map(|site| manifest_hash(&site.manifest))
+        .collect::<Vec<_>>();
+    let send = SendManifest::canonical(hashes).expect("send manifest");
+    let first = sites[0];
+    let challenge = first
+        .challenge
+        .unwrap_or_else(|| Challenge::for_send(&nonce, &send_manifest_hash(&send)));
+    let assertion = assertion(
+        &challenge,
+        &first.origin,
+        &first.rp_id,
+        &first.credential_id,
+        first.client_extra.as_ref(),
+        first.extensions.as_deref(),
+    );
+    let mut har = HarBuilder::new().post("https://looklab.test/api/nonce");
+    for &index in uploaded {
+        har = har.upload(sites[index].body_with(&nonce, &send, &assertion));
+    }
+    har.get("https://looklab.test/status/abc123")
 }
 
 struct HarBuilder {
@@ -957,12 +1002,19 @@ fn state_path(name: &str) -> PathBuf {
     path
 }
 
+fn batch_manifest_start(body: &[u8]) -> usize {
+    let send_len =
+        u32::from_le_bytes(body[40..44].try_into().expect("send manifest length")) as usize;
+    44 + send_len + 4
+}
+
 fn splice_manifest(body: &[u8], extra: &[u8]) -> Vec<u8> {
     let mut out = body.to_vec();
-    let len = u32::from_le_bytes(out[40..44].try_into().expect("manifest length"));
+    let start = batch_manifest_start(&out);
+    let len = u32::from_le_bytes(out[start - 4..start].try_into().expect("manifest length"));
     let len = len as usize;
-    out.splice(44 + len..44 + len, extra.iter().copied());
-    out[40..44].copy_from_slice(&((len + extra.len()) as u32).to_le_bytes());
+    out.splice(start + len..start + len, extra.iter().copied());
+    out[start - 4..start].copy_from_slice(&((len + extra.len()) as u32).to_le_bytes());
     out
 }
 
@@ -1042,10 +1094,7 @@ fn reproduces_an_upload_and_passes() {
 fn multiple_native_batches_from_one_raw_verify() {
     let fixture = simulation_fixture();
     let (provia, chrome) = simulation_batches(fixture);
-    let har = har_path(
-        "simulations",
-        &default_har(&provia).upload(chrome.body()).json(),
-    );
+    let har = har_path("simulations", &send_har(&[&provia, &chrome]).json());
     let (success, output) = run(fixture, &[har.as_path()], &state_path("simulations"));
 
     assert!(success, "{output}");
@@ -1059,9 +1108,7 @@ fn each_render_verifies_its_own_firmware() {
     let render_version = Site::from_fixture(fixture).only(&[1]).with_firmware("1.10");
     let har = har_path(
         "render-firmware",
-        &default_har(&raw_version)
-            .upload(render_version.body())
-            .json(),
+        &send_har(&[&raw_version, &render_version]).json(),
     );
     let (success, output) = run(fixture, &[har.as_path()], &state_path("render-firmware"));
 
@@ -1348,7 +1395,7 @@ fn fails_on_a_batch_declaring_another_render_of_the_same_raw() {
     let (provia, chrome) = simulation_batches(fixture);
     let control = har_path(
         "mislabelled-control",
-        &default_har(&provia).upload(chrome.body()).json(),
+        &send_har(&[&provia, &chrome]).json(),
     );
     let (success, output) = run(
         fixture,
@@ -1362,11 +1409,156 @@ fn fails_on_a_batch_declaring_another_render_of_the_same_raw() {
         .with_sim("classic_chrome");
     let har = har_path(
         "mislabelled",
-        &default_har(&provia).upload(mislabelled.body()).json(),
+        &send_har(&[&provia, &mislabelled]).json(),
     );
     let (success, output) = run(fixture, &[har.as_path()], &state_path("mislabelled"));
 
     assert!(!success, "{output}");
+}
+
+#[test]
+fn fails_when_the_send_manifest_lists_a_batch_the_har_lacks() {
+    let fixture = simulation_fixture();
+    let (provia, chrome) = simulation_batches(fixture);
+    let har = har_path("missing-batch", &send_har_of(&[&provia, &chrome], &[0]).json());
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("missing-batch"));
+
+    assert!(!success, "{output}");
+    assert!(output.contains("missing from the HAR"), "{output}");
+}
+
+#[test]
+fn fails_when_a_batch_is_uploaded_twice() {
+    let fixture = fixture();
+    let site = Site::new();
+    let body = site.body();
+    let har = har_path(
+        "extra-batch",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .upload(body.clone())
+            .upload(body)
+            .json(),
+    );
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("extra-batch"));
+
+    assert!(!success, "{output}");
+    assert!(output.contains("more than once"), "{output}");
+}
+
+#[test]
+fn fails_when_a_batch_is_not_in_the_send_manifest() {
+    let fixture = simulation_fixture();
+    let (provia, chrome) = simulation_batches(fixture);
+    let mut bytes = provia.body();
+    let wrong = SendManifest::canonical(vec![manifest_hash(&chrome.manifest)]).expect("send");
+    let send_len =
+        u32::from_le_bytes(bytes[40..44].try_into().expect("send manifest length")) as usize;
+    let replacement = looklab_upload::canonical_send_manifest_bytes(&wrong);
+    assert_eq!(replacement.len(), send_len, "one-batch send manifests");
+    bytes[44..44 + send_len].copy_from_slice(&replacement);
+    let har = har_path(
+        "not-in-manifest",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .upload(bytes)
+            .json(),
+    );
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("not-in-manifest"));
+
+    assert!(!success, "{output}");
+    assert!(
+        output.contains("not listed in the send manifest"),
+        "{output}"
+    );
+}
+
+#[test]
+fn fails_when_a_batch_is_signed_by_another_credential() {
+    let fixture = simulation_fixture();
+    let (provia, chrome) = simulation_batches(fixture);
+    let nonce = Nonce::from_bytes([0x42; 32]);
+    let send = SendManifest::canonical(vec![
+        manifest_hash(&provia.manifest),
+        manifest_hash(&chrome.manifest),
+    ])
+    .expect("send");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let first = assertion(
+        &challenge,
+        &provia.origin,
+        &provia.rp_id,
+        &provia.credential_id,
+        None,
+        None,
+    );
+    let other = assertion(
+        &challenge,
+        &provia.origin,
+        &provia.rp_id,
+        b"credential-beta",
+        None,
+        None,
+    );
+    let har = har_path(
+        "another-credential",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .upload(provia.body_with(&nonce, &send, &first))
+            .upload(chrome.body_with(&nonce, &send, &other))
+            .json(),
+    );
+    let (success, output) = run(
+        fixture,
+        &[har.as_path()],
+        &state_path("another-credential"),
+    );
+
+    assert!(!success, "{output}");
+    assert!(output.contains("different assertions"), "{output}");
+}
+
+#[test]
+fn fails_when_a_send_mixes_nonces() {
+    let fixture = simulation_fixture();
+    let (provia, chrome) = simulation_batches(fixture);
+    let first_nonce = Nonce::from_bytes([0x42; 32]);
+    let second_nonce = Nonce::from_bytes([0x43; 32]);
+    let send = SendManifest::canonical(vec![
+        manifest_hash(&provia.manifest),
+        manifest_hash(&chrome.manifest),
+    ])
+    .expect("send");
+    let first_challenge = Challenge::for_send(&first_nonce, &send_manifest_hash(&send));
+    let first_assertion = assertion(
+        &first_challenge,
+        &provia.origin,
+        &provia.rp_id,
+        &provia.credential_id,
+        None,
+        None,
+    );
+    let second_challenge = Challenge::for_send(&second_nonce, &send_manifest_hash(&send));
+    let second_assertion = assertion(
+        &second_challenge,
+        &chrome.origin,
+        &chrome.rp_id,
+        &chrome.credential_id,
+        None,
+        None,
+    );
+    let har = har_path(
+        "mixed-nonce",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .upload(provia.body_with(&first_nonce, &send, &first_assertion))
+            .upload(chrome.body_with(&second_nonce, &send, &second_assertion))
+            .json(),
+    );
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("mixed-nonce"));
+
+    assert!(!success, "{output}");
+    assert!(output.contains("missing from the HAR"), "{output}");
 }
 
 #[test]
@@ -1768,9 +1960,10 @@ fn marks_a_non_canonical_client_data_json_for_review() {
 
 fn rewrite_client_data(body: &[u8], rewrite: impl Fn(String) -> String) -> Vec<u8> {
     let mut out = body.to_vec();
-    let manifest_len =
-        u32::from_le_bytes(out[40..44].try_into().expect("manifest length")) as usize;
-    let mut index = 44 + manifest_len;
+    let start = batch_manifest_start(&out);
+    let manifest_len = u32::from_le_bytes(out[start - 4..start].try_into().expect("manifest length"))
+        as usize;
+    let mut index = start + manifest_len;
     let credential_len = usize::from(out[index]);
     index += 1 + credential_len;
     let authenticator_len = usize::from(u16::from_le_bytes([out[index], out[index + 1]]));

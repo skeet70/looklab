@@ -13,10 +13,10 @@ use looklab_wasm::coverage::{CoverageMap, coverage_map, sample_points};
 use looklab_wasm::prep::{ModuleFunction, default_pow};
 use looklab_wasm::{
     CardCheckError, ControlSetting, GroupSettings, IntentChoice, PairingPlan, PowParamsSpec,
-    PrepSummary, PreparedImageView, build_manifest_request, check_card,
-    decode_build_manifest_reply, decode_encode_reply, decode_pow_reply, decode_prepare_reply,
-    encode_envelope_request, inspect_metadata, module_fn_id, prefill_settings_parsed,
-    prepare_request, serial_ascii_from_metadata, solve_pow_request,
+    PrepSummary, PreparedImageView, build_manifest_request, build_send_manifest_request,
+    check_card, decode_build_manifest_reply, decode_build_send_manifest_reply, decode_encode_reply,
+    decode_pow_reply, decode_prepare_reply, encode_envelope_request, inspect_metadata, module_fn_id,
+    prefill_settings_parsed, prepare_request, serial_ascii_from_metadata, solve_pow_request,
 };
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -515,6 +515,13 @@ enum Stage {
     Done,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SentSummary {
+    pub(crate) photos: usize,
+    pub(crate) cameras: usize,
+    pub(crate) parts: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HelpWay {
     ExistingPhotos,
@@ -775,6 +782,8 @@ pub fn ContributePage() -> impl IntoView {
     let coverage = RwSignal::new(None::<CoverageMap>);
     let points = RwSignal::new(Vec::<[f32; 3]>::new());
     let failures = RwSignal::new(Vec::<FailureRow>::new());
+    let send_parts = RwSignal::new(None::<(usize, usize)>);
+    let sent_summary = RwSignal::new(None::<SentSummary>);
     let busy = RwSignal::new(false);
     let message = RwSignal::new(None::<String>);
     let on_help_choose = Callback::new(move |event: leptos::ev::MouseEvent| {
@@ -1163,7 +1172,12 @@ pub fn ContributePage() -> impl IntoView {
             } else {
                 None
             };
-            pending.push((group.id, settings, images, serial));
+            pending.push(PendingBatch {
+                id: group.id,
+                settings,
+                images,
+                serial,
+            });
         }
         if pending.is_empty() {
             message.set(Some("Nothing is left to send.".to_owned()));
@@ -1177,43 +1191,42 @@ pub fn ContributePage() -> impl IntoView {
                 busy.set(false);
                 return;
             }
-            let mut sent = Vec::new();
-            for (position, (id, settings, images, serial)) in pending.into_iter().enumerate() {
-                let number = position + 1;
-                message.set(Some(format!(
-                    "Batch {number} of {total}: confirm on your device. Preparing upload (this keeps spam out)."
-                )));
-                match upload_batch(session_context, settings, images, serial).await {
-                    Ok(reply) => {
-                        if let Some(token) = reply.status_token.as_ref()
-                            && let Ok(token) = webauthn::StatusToken::try_from(token.clone())
-                        {
-                            let context = session_context;
-                            if let crate::session::SessionState::SignedIn(mut profile) =
-                                context.state.get_untracked()
-                            {
-                                profile.status_token = token;
-                                if context.set_signed_in(profile.clone()).await.is_err() {
-                                    context
-                                        .state
-                                        .set(crate::session::SessionState::SignedIn(profile));
-                                }
-                            }
+            send_parts.set(Some((0, total)));
+            message.set(Some(format!(
+                "Confirm once on your device. Preparing {total} {} (this keeps spam out).",
+                if total == 1 { "batch" } else { "batches" }
+            )));
+            let outcome = upload_send(session_context, pending, send_parts).await;
+            for (id, reply) in outcome.accepted {
+                if let Some(token) = reply.status_token.as_ref()
+                    && let Ok(token) = webauthn::StatusToken::try_from(token.clone())
+                {
+                    let context = session_context;
+                    if let crate::session::SessionState::SignedIn(mut profile) =
+                        context.state.get_untracked()
+                    {
+                        profile.status_token = token;
+                        if context.set_signed_in(profile.clone()).await.is_err() {
+                            context
+                                .state
+                                .set(crate::session::SessionState::SignedIn(profile));
                         }
-                        if let Some(token) = reply.status_token.as_ref() {
-                            let link = crate::base::site_url(&format!("/status/{token}"));
-                            status_links.update(|links| links.push(link));
-                        }
-                        completed.update(|done| done.push(id));
-                        sent.push(reply.contribution_id);
-                    }
-                    Err(error) => {
-                        message.set(Some(format!("Batch {} of {total}: {error}", position + 1)));
-                        busy.set(false);
-                        return;
                     }
                 }
+                if let Some(token) = reply.status_token.as_ref() {
+                    let link = crate::base::site_url(&format!("/status/{token}"));
+                    status_links.update(|links| links.push(link));
+                }
+                completed.update(|done| done.push(id));
             }
+            if let Some((position, error)) = outcome.error {
+                message.set(Some(format!("Batch {} of {total}: {error}", position + 1)));
+                busy.set(false);
+                return;
+            }
+            let groups = processed.get_untracked();
+            sent_summary.set(Some(sent_summary_for(&groups, &set, total)));
+            message.set(None);
             draft_complete.set(true);
             let pending = draft_store.with_value(ContributionDraftStore::clear);
             let _ = wasm_bindgen_futures::JsFuture::from(pending).await;
@@ -1225,12 +1238,6 @@ pub fn ContributePage() -> impl IntoView {
             parsed_metadata.set_value(Vec::new());
             points.set(Vec::new());
             current.set(StepIndex(5));
-            message.set(Some(format!(
-                "Uploaded {} in {} {}.",
-                sent.join(", "),
-                sent.len(),
-                if sent.len() == 1 { "batch" } else { "batches" }
-            )));
             busy.set(false);
         });
     };
@@ -1324,6 +1331,8 @@ pub fn ContributePage() -> impl IntoView {
         });
     };
 
+    let on_donate = Callback::new(donation);
+
     view! {
         <div class="contribute-page">
         <header class="contribute-intro" class:contribution-active=move || stage.get() != Stage::Drop>
@@ -1368,46 +1377,30 @@ pub fn ContributePage() -> impl IntoView {
         }}
         <Stepper
             current
-            steps=[
-                ("Add photos", "Local files only"),
-                ("Check groups", "Settings checked"),
-                ("Process", "Processed on this device"),
-                ("Review", "Color samples reviewed"),
-                ("Send", "Confirmed and sent"),
-                ("Done", "Complete"),
-            ].into_iter().map(|(title, summary)| WizardStep {
-                title: title.to_owned(),
-                summary: Some(summary.to_owned()),
-            }).collect()
+            steps=["Add photos", "Check groups", "Process", "Review", "Send", "Done"]
+                .into_iter()
+                .map(|title| WizardStep { title: title.to_owned(), summary: None })
+                .collect()
             summaries=Signal::derive(move || {
                 let pairs = plan.with(|plan| plan.as_ref().map(|plan| plan.groups.len()).unwrap_or(0));
+                let samples = points.with(Vec::len);
                 vec![
                     Some(format!("{pairs} {}", if pairs == 1 { "pair" } else { "pairs" })),
                     Some(format!("{pairs} {}", if pairs == 1 { "group" } else { "groups" })),
                     coverage.with(|map| map.as_ref().map(|map| format!("{} {} processed", map.images, if map.images == 1 { "photo" } else { "photos" }))),
-                    None,
-                    None,
+                    (samples > 0).then(|| format!("{samples} color samples")),
+                    sent_summary.get().map(|sent| format!("Sent in {} {}", sent.parts, if sent.parts == 1 { "part" } else { "parts" })),
                     None,
                 ]
             })
             locked=Signal::derive(move || busy.get() || draft_complete.get())
+            finished=Signal::derive(move || draft_complete.get())
             can_advance=Signal::derive(move || !busy.get() && matches!(stage.get(), Stage::Inspector))
         />
-        {move || message.get().map(|text| view! { <p class="notice" role="status">{text}</p> })}
+        {move || (stage.get() != Stage::Send).then(|| message.get()).flatten().map(|text| view! { <p class="notice" role="status">{text}</p> })}
         {move || draft_unavailable.get().then(|| view! {
             <p class="notice">"This browser couldn't keep a local draft, so these photos won't be restored after a reload. Processing and sending still work."</p>
         })}
-        {move || {
-            let rows = failures.get();
-            (!rows.is_empty()).then(|| view! {
-                <section class="notice" aria-label="Excluded photos">
-                    <h3>"Photos not included"</h3>
-                    <ul>{rows.into_iter().map(|row| view! {
-                        <li><strong>{row.name.clone()}</strong>": "{row.message.clone()}</li>
-                    }).collect_view()}</ul>
-                </section>
-            })
-        }}
 
         <section class="step" hidden=move || stage.get() != Stage::Drop>
             <h2>"Drop files or a folder"</h2>
@@ -1486,6 +1479,15 @@ pub fn ContributePage() -> impl IntoView {
                     <BatchEditor id=id first=first batches=batches firmware_ids=firmware_ids/>
                 }.into_any()
             }}
+            {move || {
+                let rows = failures.get();
+                (!rows.is_empty()).then(|| view! {
+                    <section class="excluded" aria-label="Excluded files">
+                        <h3>"Files left out"</h3>
+                        {excluded_files(rows, on_donate)}
+                    </section>
+                })
+            }}
             <Disclosure summary="Processing options".to_owned()>
             <label for="workers">"Parallel processing tasks"</label>
             <select id="workers" on:change=move |event| {
@@ -1501,9 +1503,15 @@ pub fn ContributePage() -> impl IntoView {
 
         <section class="step" hidden=move || stage.get() != Stage::Processing>
             <h2>"Processing on this device"</h2>
-            <progress aria-label="Processing photos"></progress>
+            {move || {
+                let done = processed.get().len();
+                let total = plan.with(|plan| plan.as_ref().map(|plan| plan.groups.len()).unwrap_or(0)).max(1);
+                view! {
+                    <p role="status">{format!("Processing photo {} of {total}", (done + 1).min(total))}</p>
+                    <progress aria-label="Processing photos" value=done.to_string() max=total.to_string()></progress>
+                }
+            }}
             <p>"Extracting color samples locally. Your photos stay on this device."</p>
-            <p role="status">{move || format!("{} of {} photo groups processed", processed.get().len(), plan.get().map(|plan| plan.groups.len()).unwrap_or(0))}</p>
             {move || coverage.get().map(|map| view! { <CoverageMapView map/> })}
         </section>
         <section class="step" hidden=move || stage.get() != Stage::Inspector>
@@ -1512,6 +1520,15 @@ pub fn ContributePage() -> impl IntoView {
                 <p class="payload-summary">{format!("{} color samples from {} {}, {:.0} KB. No pixels, no location.", points.with(Vec::len), map.images, if map.images == 1 { "photo" } else { "photos" }, processed.with(|groups| groups.iter().flat_map(|group| &group.images).map(|image| image.blob_len).sum::<usize>()) as f64 / 1024.0)}</p>
             })}
             {move || coverage.get().map(|map| view! { <CoverageMapView map/> })}
+            {move || {
+                let rows = failures.get();
+                (!rows.is_empty()).then(|| view! {
+                    <section class="excluded" aria-label="Excluded files">
+                        <h3>"Files left out"</h3>
+                        {excluded_files(rows, on_donate)}
+                    </section>
+                })
+            }}
             <Disclosure summary="See exactly what's sent".to_owned()>
             <h3>"Payload inspector"</h3>
             <p>
@@ -1580,36 +1597,11 @@ pub fn ContributePage() -> impl IntoView {
                 <code>"looklab verify-payload"</code> "."
             </p>
             <button on:click=download_payload>"Download payload (JSON, non-authoritative)"</button>
-            <button on:click=download_seeds>"Export seed file (SENSITIVE)"</button>
-            <p class="warn">
-                "The seed file reveals sampling order. It is never uploaded; keep it local."
-            </p>
             <p>
                 "Source: "
                 <a href="https://github.com/skeet70/looklab">"looklab (AGPL-3.0-or-later)"</a>
                 ". Prefer not to trust a served client? Use the CLI, which you can build from source."
             </p>
-            {move || {
-                let rows = failures.get();
-                (!rows.is_empty()).then(|| view! {
-                    <div class="error" role="alert">
-                        <h3>"Files excluded from the batch"</h3>
-                        <ul>
-                            {rows.into_iter().map(|row| view! {
-                                <li>
-                                    <strong>{row.name.clone()}</strong> ": " {row.message.clone()}
-                                    {(!row.donated).then(|| view! {
-                                        <button on:click={
-                                            let name = row.name.clone();
-                                            move |_| donation(name.clone())
-                                        }>"Donate this file as a test fixture"</button>
-                                    })}
-                                </li>
-                            }).collect_view()}
-                        </ul>
-                    </div>
-                })
-            }}
             <h3>"Timing"</h3>
             <table class="data-table">
                 <thead><tr><th scope="col">"RAW / batch"</th><th scope="col">"Size before → after"</th><th scope="col">Time</th><th scope="col">Worker memory</th></tr></thead>
@@ -1629,25 +1621,71 @@ pub fn ContributePage() -> impl IntoView {
         </section>
         <section class="step" hidden=move || stage.get() != Stage::Send>
             <h2>"Send your color samples"</h2>
-            <p>"Sign in or create a profile, then confirm this batch once on your device. You can follow its progress in Your contributions."</p>
+            <p>"Sign in or create a profile, then confirm once on your device. One confirmation covers every batch in this send. You can follow its progress in Your contributions."</p>
             {(!available).then(crate::ui::preview_notice)}
             <button class="button-primary" on:click=upload disabled=move || busy.get() || !available>"Send contribution"</button>
+            <button on:click=download_seeds>"Export seed file (SENSITIVE)"</button>
+            <p class="warn">
+                "The seed file reveals sampling order. It is never uploaded; keep it local."
+            </p>
+            {move || message.get().map(|text| view! { <p class="notice" role="status">{text}</p> })}
+            {move || send_parts.get().map(|(done, total)| view! {
+                <div class="send-progress">
+                    <p>{format!("Sending part {} of {total}", (done + 1).min(total))}</p>
+                    <progress aria-label="Parts sent" value=done.to_string() max=total.to_string()></progress>
+                </div>
+            })}
         </section>
         <section class="step contribution-done" hidden=move || stage.get() != Stage::Done>
-            <h2>"Thanks for helping build looks"</h2>
-            <p>"Your samples are sent. Feedback arrives in Your contributions after processing."</p>
-            <a class="button" href=crate::base::site_url("/me")>"Your contributions"</a>
-            <a href=crate::base::site_url("/contribute/wanted")>
-                "Next way to help: take a few wanted shots"
-            </a>
+            <h2>"Thanks, your color samples are in"</h2>
+            {move || sent_summary.get().map(|sent| view! {
+                <p class="done-summary">{format!(
+                    "{} {} from {} {}, sent in {} {}.",
+                    sent.photos, if sent.photos == 1 { "photo" } else { "photos" },
+                    sent.cameras, if sent.cameras == 1 { "camera" } else { "cameras" },
+                    sent.parts, if sent.parts == 1 { "part" } else { "parts" },
+                )}</p>
+            })}
+            <p>"Feedback arrives in Your contributions after processing."</p>
+            <a class="button button-primary" href=crate::base::site_url("/me")>"Your contributions"</a>
+            <section class="done-next" aria-labelledby="done-next-heading">
+                <h3 id="done-next-heading">"Next way to help"</h3>
+                <div class="help-grid">
+                    {[HelpWay::WantedShots, HelpWay::Rerender].into_iter().map(|way| {
+                        let guide = way.guide();
+                        let href = match way {
+                            HelpWay::WantedShots => crate::base::site_url("/contribute/wanted"),
+                            _ => crate::base::site_url("/contribute"),
+                        };
+                        view! {
+                            <a class="help-card help-card-link" href=href>
+                                <span class="help-meta">{guide.time} " · " {guide.impact.label()}</span>
+                                <span class="help-title">{guide.title}</span>
+                                <span class="help-description">{guide.description}</span>
+                            </a>
+                        }
+                    }).collect_view()}
+                </div>
+            </section>
+            {move || {
+                let rows = failures.get();
+                (!rows.is_empty()).then(|| view! {
+                    <section class="excluded" aria-label="Excluded files">
+                        <h3>"Files left out"</h3>
+                        {excluded_files(rows, on_donate)}
+                    </section>
+                })
+            }}
             {move || {
                 let links = status_links.get();
                 (!links.is_empty()).then(|| view! {
-                    <ul class="status-links">
-                        {links.into_iter().map(|link| view! {
-                            <li>"Status link: " <a href=link.clone()>{link.clone()}</a></li>
-                        }).collect_view()}
-                    </ul>
+                    <Disclosure summary="Keep a link to these contributions".to_owned()>
+                        <ul class="status-links">
+                            {links.into_iter().map(|link| view! {
+                                <li><a href=link.clone()>{link.clone()}</a></li>
+                            }).collect_view()}
+                        </ul>
+                    </Disclosure>
                 })
             }}
         </section>
@@ -2932,86 +2970,240 @@ async fn check_card_tags(groups: &mut [ProcessedGroup]) -> Vec<FailureRow> {
     failures
 }
 
-async fn upload_batch(
-    session: crate::session::SessionContext,
+fn group_failures(rows: Vec<FailureRow>) -> Vec<(String, Vec<FailureRow>)> {
+    let mut groups: Vec<(String, Vec<FailureRow>)> = Vec::new();
+    for row in rows {
+        match groups.iter_mut().find(|(message, _)| *message == row.message) {
+            Some((_, rows)) => rows.push(row),
+            None => groups.push((row.message.clone(), vec![row])),
+        }
+    }
+    groups
+}
+
+fn excluded_files(rows: Vec<FailureRow>, on_donate: Callback<String>) -> impl IntoView {
+    group_failures(rows)
+        .into_iter()
+        .map(|(message, rows)| {
+            let count = rows.len();
+            view! {
+                <details class="disclosure excluded-files">
+                    <summary>{format!("{count} {} left out: {message}", if count == 1 { "file" } else { "files" })}</summary>
+                    <ul>
+                        {rows.into_iter().map(|row| {
+                            let name = row.name.clone();
+                            view! {
+                                <li>
+                                    <span>{row.name.clone()}</span>
+                                    {(!row.donated).then(|| view! {
+                                        <button type="button" class="excluded-donate"
+                                            on:click=move |_| on_donate.run(name.clone())>
+                                            "Donate this file as a test fixture"
+                                        </button>
+                                    })}
+                                </li>
+                            }
+                        }).collect_view()}
+                    </ul>
+                </details>
+            }
+        })
+        .collect_view()
+}
+
+fn sent_summary_for(groups: &[ProcessedGroup], set: &BatchSet, parts: usize) -> SentSummary {
+    let mut cameras = set
+        .groups()
+        .iter()
+        .map(|group| group.fields.body.as_str())
+        .collect::<Vec<_>>();
+    cameras.sort_unstable();
+    cameras.dedup();
+    SentSummary {
+        photos: groups.iter().map(|group| group.images.len()).sum(),
+        cameras: cameras.len(),
+        parts,
+    }
+}
+
+struct PendingBatch {
+    id: BatchId,
     settings: GroupSettings,
     images: Vec<PreparedImageView>,
     serial: Option<Vec<u8>>,
-) -> Result<webauthn::UploadReply, String> {
-    if images.is_empty() {
-        return Err("nothing to upload".to_owned());
+}
+
+struct SendOutcome {
+    accepted: Vec<(BatchId, webauthn::UploadReply)>,
+    error: Option<(usize, String)>,
+}
+
+async fn upload_send(
+    session: crate::session::SessionContext,
+    pending: Vec<PendingBatch>,
+    send_parts: RwSignal<Option<(usize, usize)>>,
+) -> SendOutcome {
+    let total = pending.len();
+    let mut accepted = Vec::new();
+    let error = |position: usize, message: String| SendOutcome {
+        accepted: Vec::new(),
+        error: Some((position, message)),
+    };
+    if pending.iter().any(|batch| batch.images.is_empty()) {
+        return error(0, "nothing to upload".to_owned());
     }
-    session
-        .require_profile()
+    if session.require_profile().await.is_none() {
+        return error(
+            0,
+            "Sign in was cancelled. Your prepared samples are still here.".to_owned(),
+        );
+    }
+    let credential_id = match idb::get(idb::StorageKey::CREDENTIAL).await {
+        Ok(id) => id.and_then(|text| webauthn::decode_base64url(&text)),
+        Err(message) => return error(0, message),
+    };
+    let nonce = match webauthn::fetch_nonce().await {
+        Ok(nonce) => nonce,
+        Err(message) => return error(0, message),
+    };
+    let mut worker = match PrepWorker::spawn() {
+        Ok(worker) => worker,
+        Err(message) => return error(0, message),
+    };
+
+    let mut manifests = Vec::with_capacity(total);
+    for batch in &pending {
+        let request = match build_manifest_request(&batch.settings, &batch.images, nonce.nonce) {
+            Ok(request) => request,
+            Err(failure) => return error(0, failure.to_string()),
+        };
+        let reply = match worker
+            .call(module_fn_id(ModuleFunction::BuildManifest), request)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(failure) => return error(0, failure.message()),
+        };
+        match decode_build_manifest_reply(&reply.bytes) {
+            Ok(manifest) => manifests.push(manifest),
+            Err(failure) => return error(0, failure.to_string()),
+        }
+    }
+    let hashes = manifests
+        .iter()
+        .map(|manifest| manifest.manifest_hash)
+        .collect::<Vec<_>>();
+    let send_request = match build_send_manifest_request(nonce.nonce, hashes) {
+        Ok(request) => request,
+        Err(failure) => return error(0, failure.to_string()),
+    };
+    let send_reply = match worker
+        .call(module_fn_id(ModuleFunction::BuildSendManifest), send_request)
         .await
-        .ok_or_else(|| "Sign in was cancelled. Your prepared samples are still here.".to_owned())?;
-    let credential_id = idb::get(idb::StorageKey::CREDENTIAL)
-        .await?
-        .and_then(|text| webauthn::decode_base64url(&text));
-    let nonce = webauthn::fetch_nonce().await?;
-    let mut worker = PrepWorker::spawn()?;
-    let manifest_request = build_manifest_request(&settings, &images, nonce.nonce)
-        .map_err(|error| error.to_string())?;
-    let manifest_reply = worker
-        .call(
-            module_fn_id(ModuleFunction::BuildManifest),
-            manifest_request,
-        )
-        .await
-        .map_err(|error| error.message())?;
-    let manifest =
-        decode_build_manifest_reply(&manifest_reply.bytes).map_err(|error| error.to_string())?;
-    let challenge = *manifest.challenge.as_bytes();
-    let assertion =
-        webauthn::sign_batch(&challenge, credential_id.as_deref(), &nonce.rp_id).await?;
+    {
+        Ok(reply) => reply,
+        Err(failure) => return error(0, failure.message()),
+    };
+    let send = match decode_build_send_manifest_reply(&send_reply.bytes) {
+        Ok(send) => send,
+        Err(failure) => return error(0, failure.to_string()),
+    };
+    let assertion = match webauthn::sign_batch(
+        send.challenge.as_bytes(),
+        credential_id.as_deref(),
+        &nonce.rp_id,
+    )
+    .await
+    {
+        Ok(assertion) => assertion,
+        Err(message) => return error(0, message),
+    };
     let defaults = default_pow();
     let pow = nonce.pow.unwrap_or(webauthn::PowParameters {
         memory_kib: defaults.memory_kib,
         iterations: defaults.iterations,
         difficulty_bits_per_image: defaults.difficulty_bits_per_image,
     });
-    let n_images = u32::try_from(images.len()).map_err(|_| "too many images".to_owned())?;
-    let pow_request = solve_pow_request(
-        challenge,
-        n_images,
-        PowParamsSpec {
-            memory_kib: pow.memory_kib,
-            iterations: pow.iterations,
-            difficulty_bits_per_image: pow.difficulty_bits_per_image,
-        },
-        0,
-    )
-    .map_err(|error| error.to_string())?;
-    let pow_reply = worker
-        .call(module_fn_id(ModuleFunction::SolvePow), pow_request)
-        .await
-        .map_err(|error| error.message())?;
-    let pow = decode_pow_reply(&pow_reply.bytes)
-        .map_err(|error| error.to_string())?
-        .solutions;
-    let blobs = images.iter().map(|image| image.blob.clone()).collect();
-    let encode_request = encode_envelope_request(
-        nonce.nonce,
-        manifest.manifest_bytes.clone(),
-        assertion,
-        pow,
-        serial,
-        blobs,
-    )
-    .map_err(|error| error.to_string())?;
-    let encode_reply = worker
-        .call(module_fn_id(ModuleFunction::EncodeEnvelope), encode_request)
-        .await
-        .map_err(|error| error.message())?;
-    let envelope = decode_encode_reply(&encode_reply.bytes)
-        .map_err(|error| error.to_string())?
-        .envelope;
-    worker.terminate();
-    let reply = webauthn::upload_envelope(envelope).await?;
-    if let Some(token) = &reply.status_token {
-        let _ = idb::put(idb::StorageKey::STATUS_TOKEN, token).await;
+
+    for (position, (batch, manifest)) in pending.iter().zip(&manifests).enumerate() {
+        let n_images = match u32::try_from(batch.images.len()) {
+            Ok(count) => count,
+            Err(_) => return error(position, "too many images".to_owned()),
+        };
+        let pow_request = match solve_pow_request(
+            *manifest.challenge.as_bytes(),
+            n_images,
+            PowParamsSpec {
+                memory_kib: pow.memory_kib,
+                iterations: pow.iterations,
+                difficulty_bits_per_image: pow.difficulty_bits_per_image,
+            },
+            0,
+        ) {
+            Ok(request) => request,
+            Err(failure) => return error(position, failure.to_string()),
+        };
+        let pow_reply = match worker
+            .call(module_fn_id(ModuleFunction::SolvePow), pow_request)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(failure) => return error(position, failure.message()),
+        };
+        let pow = match decode_pow_reply(&pow_reply.bytes) {
+            Ok(reply) => reply.solutions,
+            Err(failure) => return error(position, failure.to_string()),
+        };
+        let blobs = batch
+            .images
+            .iter()
+            .map(|image| image.blob.clone())
+            .collect();
+        let encode_request = match encode_envelope_request(
+            nonce.nonce,
+            send.send_manifest_bytes.clone(),
+            manifest.manifest_bytes.clone(),
+            assertion.clone(),
+            pow,
+            batch.serial.clone(),
+            blobs,
+        ) {
+            Ok(request) => request,
+            Err(failure) => return error(position, failure.to_string()),
+        };
+        let encode_reply = match worker
+            .call(module_fn_id(ModuleFunction::EncodeEnvelope), encode_request)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(failure) => return error(position, failure.message()),
+        };
+        let envelope = match decode_encode_reply(&encode_reply.bytes) {
+            Ok(reply) => reply.envelope,
+            Err(failure) => return error(position, failure.to_string()),
+        };
+        match webauthn::upload_envelope(envelope).await {
+            Ok(reply) => {
+                if let Some(token) = &reply.status_token {
+                    let _ = idb::put(idb::StorageKey::STATUS_TOKEN, token).await;
+                }
+                accepted.push((batch.id, reply));
+                send_parts.set(Some((position + 1, total)));
+            }
+            Err(message) => {
+                worker.terminate();
+                return SendOutcome {
+                    accepted,
+                    error: Some((position, message)),
+                };
+            }
+        }
     }
-    Ok(reply)
+    worker.terminate();
+    SendOutcome {
+        accepted,
+        error: None,
+    }
 }
 
 fn find_file<'a>(files: &'a [LocalFile], name: &str) -> Option<&'a LocalFile> {
@@ -3121,6 +3313,27 @@ mod tests {
         let (usable, rows) = split_renders(&only_monochrome, &refused);
         assert!(usable.is_empty());
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn excluded_files_group_by_reason() {
+        let row = |name: &str, message: &str| FailureRow {
+            name: name.to_owned(),
+            message: message.to_owned(),
+            donated: false,
+        };
+        let groups = group_failures(vec![
+            row("a.jpg", "B&W renders aren't supported yet"),
+            row("b.jpg", "the JPEG file name is invalid"),
+            row("c.jpg", "B&W renders aren't supported yet"),
+        ]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "B&W renders aren't supported yet");
+        assert_eq!(
+            groups[0].1.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            vec!["a.jpg", "c.jpg"]
+        );
+        assert_eq!(groups[1].0, "the JPEG file name is invalid");
     }
 
     #[test]

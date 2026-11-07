@@ -204,6 +204,186 @@ pub async fn consume_nonce(db: &SqlitePool, nonce: &Nonce) -> Result<ConsumeNonc
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredSend {
+    pub manifest_hash: [u8; 32],
+    pub credential_id: Vec<u8>,
+    pub assertion_hash: [u8; 32],
+    pub expires_at: i64,
+    pub completed_at: Option<i64>,
+}
+
+pub async fn find_send(db: &SqlitePool, nonce: &Nonce) -> Result<Option<StoredSend>, sqlx::Error> {
+    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT manifest_hash, credential_id, assertion_hash, expires_at, completed_at
+         FROM send_manifests WHERE nonce = ?",
+    )
+    .bind(hex(nonce.as_bytes()))
+    .fetch_optional(db)
+    .await?;
+    row.map(|row| {
+        let manifest_hash = <[u8; 32]>::try_from(row.0)
+            .map_err(|_| sqlx::Error::Protocol("send manifest hash is not 32 bytes".to_owned()))?;
+        let assertion_hash = <[u8; 32]>::try_from(row.2)
+            .map_err(|_| sqlx::Error::Protocol("assertion hash is not 32 bytes".to_owned()))?;
+        Ok(StoredSend {
+            manifest_hash,
+            credential_id: row.1,
+            assertion_hash,
+            expires_at: row.3,
+            completed_at: row.4,
+        })
+    })
+    .transpose()
+}
+
+/// `None` when the send instance does not list the batch, otherwise whether it
+/// already arrived.
+pub async fn find_send_batch(
+    db: &SqlitePool,
+    nonce: &Nonce,
+    batch: &[u8; 32],
+) -> Result<Option<Option<i64>>, sqlx::Error> {
+    let row: Option<(Option<i64>,)> = sqlx::query_as(
+        "SELECT received_at FROM send_manifest_batches
+         WHERE send_nonce = ? AND batch_manifest_hash = ?",
+    )
+    .bind(hex(nonce.as_bytes()))
+    .bind(batch.as_slice())
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|row| row.0))
+}
+
+pub struct NewSend<'a> {
+    pub manifest_hash: &'a [u8; 32],
+    pub nonce: &'a Nonce,
+    pub credential_id: &'a [u8],
+    pub assertion_hash: &'a [u8; 32],
+    pub batch_hashes: &'a [[u8; 32]],
+}
+
+pub enum EstablishSend {
+    Established,
+    Existing(StoredSend),
+    Unknown,
+    Expired,
+    Replayed,
+}
+
+/// Consumes the nonce and inserts the send binding in one transaction. A
+/// competing request sees the winning row as [`EstablishSend::Existing`].
+pub async fn establish_send(
+    db: &SqlitePool,
+    send: &NewSend<'_>,
+) -> Result<EstablishSend, sqlx::Error> {
+    let key = hex(send.nonce.as_bytes());
+    let now = now_unix();
+    let mut tx = db.begin().await?;
+    let affected = sqlx::query(
+        "UPDATE nonces SET used_at = ? WHERE nonce = ? AND used_at IS NULL AND expires_at > ?",
+    )
+    .bind(now)
+    .bind(&key)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if affected == 1 {
+        let expires_at: i64 = sqlx::query_scalar("SELECT expires_at FROM nonces WHERE nonce = ?")
+            .bind(&key)
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO send_manifests
+             (nonce, manifest_hash, credential_id, assertion_hash, batch_count, received_count,
+              created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+        )
+        .bind(&key)
+        .bind(send.manifest_hash.as_slice())
+        .bind(send.credential_id)
+        .bind(send.assertion_hash.as_slice())
+        .bind(i64::try_from(send.batch_hashes.len()).unwrap_or(i64::MAX))
+        .bind(now)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        for hash in send.batch_hashes {
+            sqlx::query(
+                "INSERT INTO send_manifest_batches (send_nonce, batch_manifest_hash)
+                 VALUES (?, ?)",
+            )
+            .bind(&key)
+            .bind(hash.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        return Ok(EstablishSend::Established);
+    }
+    tx.rollback().await?;
+    let row: Option<(Option<i64>, i64)> =
+        sqlx::query_as("SELECT used_at, expires_at FROM nonces WHERE nonce = ?")
+            .bind(&key)
+            .fetch_optional(db)
+            .await?;
+    Ok(match row {
+        None => EstablishSend::Unknown,
+        Some((Some(_), _)) => match find_send(db, send.nonce).await? {
+            Some(existing) => EstablishSend::Existing(existing),
+            None => EstablishSend::Replayed,
+        },
+        Some((None, expires_at)) if expires_at <= now => EstablishSend::Expired,
+        Some((None, _)) => EstablishSend::Unknown,
+    })
+}
+
+/// Moves one batch from pending to received if the send is still open and
+/// unexpired; exactly one caller can win.
+pub async fn mark_send_batch_received(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    nonce: &Nonce,
+    batch: &[u8; 32],
+    contribution: &ContributionId,
+) -> Result<bool, sqlx::Error> {
+    let key = hex(nonce.as_bytes());
+    let now = now_unix();
+    let affected = sqlx::query(
+        "UPDATE send_manifest_batches SET received_at = ?, contribution_id = ?
+         WHERE send_nonce = ? AND batch_manifest_hash = ? AND received_at IS NULL
+           AND EXISTS (SELECT 1 FROM send_manifests
+                       WHERE nonce = ? AND completed_at IS NULL AND expires_at >= ?)",
+    )
+    .bind(now)
+    .bind(contribution.as_str())
+    .bind(&key)
+    .bind(batch.as_slice())
+    .bind(&key)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+pub async fn increment_send_received(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    nonce: &Nonce,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE send_manifests
+         SET received_count = received_count + 1,
+             completed_at = CASE WHEN received_count + 1 >= batch_count THEN ? ELSE completed_at END
+         WHERE nonce = ?",
+    )
+    .bind(now_unix())
+    .bind(hex(nonce.as_bytes()))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn find_credential(
     db: &SqlitePool,
     raw_id: &[u8],
@@ -372,6 +552,7 @@ pub struct NewContribution {
     pub id: ContributionId,
     pub credential_id: CredentialId,
     pub manifest_hash: [u8; 32],
+    pub send_nonce: Nonce,
     pub signature: Vec<u8>,
     pub pow: String,
     pub kind: ContributionKind,
@@ -392,13 +573,15 @@ pub async fn insert_contribution(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO contributions
-         (id, credential_id, batch_manifest_hash, signature, pow, kind, serial_hmac, intent,
-          target_look_id, card, body_id, firmware_version, sim_key, settings, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+         (id, credential_id, batch_manifest_hash, send_nonce, signature, pow, kind,
+          serial_hmac, intent, target_look_id, card, body_id, firmware_version, sim_key, settings,
+          status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
     )
     .bind(contribution.id.as_str())
     .bind(contribution.credential_id.as_str())
     .bind(contribution.manifest_hash.as_slice())
+    .bind(hex(contribution.send_nonce.as_bytes()))
     .bind(contribution.signature.as_slice())
     .bind(&contribution.pow)
     .bind(contribution.kind.as_str())

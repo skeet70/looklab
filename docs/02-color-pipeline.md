@@ -83,62 +83,83 @@ D = 1 is required. Inputs are already D65-adapted and the display white is D65. 
 - **WB:** ω = 1 for the **same designated body's** default WB mode class, per component. Other bodies' ω_c are free, with the prior from §1. A WB rendering shared by the bodies (e.g. a sim's intended warmth) is then carried by the Look's tint layer N, and a body-specific WB bias by ω_c.
 - **Bodies joining or leaving a component move neither gauge**, so nothing needs converting. Gauges change only when components **merge** (two components gain a shared Look) or a moderator **re-designates** the reference body. Each change is recorded in provenance.
 - **Handling a gauge change before gating** ([05 §8](05-trust-and-integrity.md)):
-  - **Exposure: exact conversion.** A scalar exposure scale commutes with every body's input transform, so the old Look in the new gauge is `L'(XYZ) = L(2^Δξ · XYZ)`. Evaluate the old Look on rescaled probe inputs; no refit is needed. One caveat: the s-clamp then sits at 6 − Δξ, which only affects the top gray-ramp probes when |Δξ| > 1. Exclude those from the gate for that release.
+  - **Exposure: exact conversion.** A scalar exposure scale commutes with every body's input transform, so the old Look in the new gauge is `L'(XYZ) = L(2^Δξ · XYZ)`. Evaluate the old Look on rescaled probe inputs; no refit is needed. The lookup saturation then sits at 6 − Δξ, which only affects the top gray-ramp probes when |Δξ| > 1; exclude those from the gate for that release.
   - **WB: refit + re-anchor.** A WB gain in camera space corresponds to `A_c · diag(Δω) · A_c⁻¹` in scene space, which differs per body. So no single transform of a shared Look reproduces a WB gauge change, and the WB constraint is only a near-degeneracy with N, not an exact symmetry. A WB reference change therefore triggers a full refit, and the result becomes a **logged re-anchor**: its gates compare against the previous version only for root non-regression, and a moderator approves it.
 
 ## 3. Look representation
 
 A Look maps adapted scene XYZ to CAM16-UCS `J'a'b'`. Input coordinates:
 
-- `s = log2(Y/0.18)`, clamped to [−12, +6].
-- `(h_in, C_in)`: hue and chroma of the input chromaticity, computed by scaling XYZ to Y = 0.18 and converting to CAM16-UCS. They're independent of exposure, and they're used **only as spline coordinates**.
+- `s = log2(Y/0.18)` is physical exposure and is not clamped.
+- `s_L = E(s)` is the bounded spline coordinate: identity on the tone range `[−12, +6]`, with C² quintic Hermite transitions outside it over `[−14, −12]` and `[6, 7]`, saturating at `−14` and `7`. The widths are `basis::S_SHADOW_TRANSITION = 2` and `basis::S_HIGHLIGHT_TRANSITION = 1` stops; `E` and `E'` are `basis::exposure_lookup` and `basis::exposure_lookup_derivative`. The tone spline, G/R/Λ and the residual use `s_L` and extrapolate their end cubic pieces outside the knot range, so the composite is C²; the colorimetric tone uses physical `s`.
+- `(n_a, n_b)`: the pre-power cone-opponent coordinates of the input chromaticity at `Y = 0.18`, normalized as `n = K·(a, b)/D` with `a = R'a − 12G'a/11 + B'a/11`, `b = (R'a + G'a − 2B'a)/9`, `D = R'a + G'a + 21B'a/20`, and `K = C0·D_ref/ρ0` from the reference viewing conditions (`K = 1204.4924`). They are C^∞ in the cone responses, linear at the origin with an isotropic Jacobian, carry neither the hue eccentricity factor `e_t(h)` nor the lightness factor, and vanish on the neutral axis. They are the core input, the near-neutral reference coordinates and the near-neutral residual coordinates. Derivation: `local://opponent-coords.md`.
+- `(h_in, C_in)`: hue and chroma of the same input in CAM16-UCS. They index the outer hue and `√C` axes only.
 
-Inputs whose CAM16 chromaticity is undefined (`Y ≤ 0`, or a chromaticity outside CAM16's forward domain) are contracted toward the D65 neutral at the same luminance until defined, so evaluation and output encoding stay finite.
+The domain is defined by predicates on the actual failing quantities, not on RGB signs: `Y > 0`; the pre-compression cone responses strictly away from zero, where the post-adaptation `0.42` power has a vertical tangent; the temporary-magnitude denominator `D > 0`; and the inverse's adapted responses strictly inside `|R'a − 0.1| < 400`, with the neutral `J'` limit `solve::neutral_j_prime_max()` derived from the actual inverse and the viewing conditions. `domain_margin` and `prediction_margin` return a signed distance that is positive strictly inside. The fit fixes its eligible sample set from the input margin, rejects a trial whose pre-clip prediction margin is non-positive, and adds `−log(margin)` as an interior barrier. Rendering contracts an out-of-domain input toward the D65 neutral at the same luminance so evaluation stays finite. There is no "any RGB channel ≤ 0" rule.
 
 ### 3.1 Tone `T`
-`J'_base = T(s)`. Monotone non-decreasing spline (I-spline), ~20 knots over [−12, +6], dense in [−4, +3], including the shoulder.
+`J'_base = T(s_L)`. Monotone non-decreasing spline (I-spline), ~20 knots over [−12, +6], dense in [−4, +3], including the shoulder. Outside the knot range the I-spline continues by integrating the end cubic piece, which is C³ at the join. The colorimetric tone is `T(s) = J'` of the neutral at physical `s`, clamped to the tone range.
 
 ### 3.2 Neutral tint `N`
-`(a'_N, b'_N) = N(J'_base)`, two smooth splines (~12 knots). With D = 1, a neutral input gives `M'_ref = 0` (§3.3), so N measures neutral tint exactly.
+`(a'_N, b'_N) = N(J'_base)`, two smooth splines (~12 knots) over `J' ∈ [0, 100]`. Above 100 the tint continues C²: it matches value, slope and second derivative at 100 and reaches zero slope and curvature at `J'_max = solve::neutral_j_prime_max()`, the neutral inverse limit, then stays constant. The continuation is linear in the tint coefficients, so the fit Jacobian uses the same weights. With D = 1, a neutral input gives `M'_ref = 0` (§3.3), so N measures neutral tint exactly.
 
 ### 3.3 Chroma, hue and lightness relative to a colorimetric reference
 To separate tone from color, G, R and Λ are defined **relative to what a purely colorimetric rendering would produce at the neutral-matched luminance**:
 
-1. Find `Y_ref`, the luminance of the neutral whose CAM16-UCS lightness equals `T(s)` (closed form). `XYZ_ref` is the input chromaticity at luminance `Y_ref`; `(J′_ref, M′_ref, h_ref)` are its colorimetric CAM16-UCS values.
-2. Layers over `(h_in, s, √C_in)`:
+1. Find `Y_ref`, the luminance of the neutral whose CAM16-UCS lightness equals `T(s_L)` (closed form). `XYZ_ref` is the input chromaticity at luminance `Y_ref`.
+2. Two pre-clip chroma paths are evaluated at `XYZ_ref`. The **UCS path** is the colorimetric CAM16-UCS chroma `U` with the layers applied in UCS; the **internal path** is the normalized opponent chroma `N` of `XYZ_ref` with the same layers applied in opponent coordinates. `J'` is shared. The join weight is the input's `w(|n|)` from §3.3.5.
+3. Layers over `(h_in, s_L, √C_in)`:
    - chroma gain `log G`;
    - hue rotation `R` (degrees);
    - lightness shift `Λ` (J′ units).
-3. Output:
+4. Output:
    ```
-   J'   = J'_ref + Λ(h_in, s, C_in)
-   M'   = G(h_in, s, C_in) · M'_ref
-   h    = h_ref + R(h_in, s, C_in)
-   a'b' = N(J'_base) + polar(M', h)
+   J'           = J'_ref + Λ(h_in, s_L, C_in)
+   (a'_U, b'_U) = N(J'_base) + G·rot(R)·U + residual
+   (n_a, n_b)   = N(J'_base) + G·rot(R)·N + residual
+   (a', b')     = w·(a'_U, b'_U) + (1 - w)·Φ(n_a, n_b, J')
    ```
+   `Φ` is the exact CAM16-UCS chroma of the stimulus the internal coordinates reconstruct (`Cam16Model::ucs_chroma_from_opponent`): `t = P·e_t(h)·|n|/K`, `C = t^0.9·√(J/100)·t_a`, `M' = ln(1 + c2·F_L^0.25·C)/c2`. `Φ(N_ref, J'_ref) = U`, so the identity Look is colorimetric on every probe, including exact neutral, where `Φ(0) = 0`. `w = 1` for `|n| ≥ C0`, so outside the join the UCS path is published unchanged. The residual is looked up at `(s_L, a_r, b_r)` with `(a_r, b_r) = w·(a_in, b_in) + (1 - w)·(n_a, n_b)`, the same blend applied to the input at `Y = 0.18`.
+
+5. The fitting residual is formed in the same two systems. For one sample with observed UCS `O`, predicted post-clip UCS `P` and post-clip internal chroma `M`:
+   ```
+   r = w·(P - O) + (1 - w)·(M - Ψ(O)),     Ψ = Φ⁻¹
+   ```
+   `Ψ(O)` is computed once per sample from the observation and stored. The lightness row is the same blend. Published predictions, comparisons, the 1.5 ΔE support threshold, release ceilings and card evaluation use `P` in CAM16-UCS.
+
 
 T is the neutral-axis tone curve. Chromatic colors keep their colorimetric lightness relative to the neutral of the same luminance.
 
-With colorimetric `T` (`T(s)` = neutral `J'` at `Y = 0.18·2^s`), `Y_ref = Y` and the output equals colorimetric CAM16-UCS of the input.
+With colorimetric `T` (`T(s)` = neutral `J'` at `Y = 0.18·2^s`), `Y_ref = Y` and, for `|N| ≥ C0`, the output equals colorimetric CAM16-UCS of the input.
 
 **G = 1, R = 0, Λ = 0 means "tone change only, otherwise colorimetric".** Two looks that differ only in tone report identical G/R/Λ.
 
-Splines are tensor-product B-splines: **periodic cubic in hue (24 knots)** × cubic in s × cubic in √C (4 knots). The **s-knots (10) are a subset of the tone knot vector**: dense where T is dense, including the shoulder, so highlight desaturation is representable. At `C_in = 0` the hue axis has no meaning, so the `C = 0` coefficient plane is shared across hue and G/R/Λ are hue-independent there.
+Splines are tensor-product B-splines: **periodic cubic in hue (24 knots)** × cubic in `s_L` × cubic in √C (4 knots). The **s-knots (10) are a subset of the tone knot vector**: dense where T is dense, including the shoulder, so highlight desaturation is representable. At `C_in = 0` the hue axis has no meaning, so the `C = 0` coefficient plane is shared across hue and G/R/Λ are hue-independent there.
 
 The outer representation `O(h, s, C) = c0·P(s) + Σ_{c=1..3} c_c·V_c(h, s)` is C^∞ for `C > 0`, but its Cartesian `(a, b)` derivative grows like `C^(-1/2)` at the neutral origin because `c1 ≈ 3√(C/C_MAX)`. A near-neutral **Cartesian core** replaces that singular behaviour:
 
 ```
-K(a, b, s) = Σ_s s_w(s) Σ_t κ[s,t] B_t(a/C0, b/C0)
-B = [a/C0, b/C0, (a/C0)², (a/C0)(b/C0), (b/C0)²]
-C0 = 2,  a = a_in, b = b_in  (CAM16-UCS at Y = 0.18)
-F = w(C)·O + (1 - w(C))·(P + K)
-w(C) = e^(-1/C) / (e^(-1/C) + e^(-1/(C0-C)))   for 0 < C < C0
-w(C) = 0 for C ≤ 0,   w(C) = 1 for C ≥ C0
+K(n_a, n_b, s_L) = Σ_s s_w(s_L) Σ_t κ[s,t] B_t(n_a/C0, n_b/C0)
+B = [n_a/C0, n_b/C0, (n_a/C0)², (n_a/C0)(n_b/C0), (n_b/C0)²]
+C0 = 2,  (n_a, n_b) = the normalized opponent chroma at Y = 0.18
+F = w(|n|)·O + (1 - w(|n|))·(P + K)
+|n|² = n_a² + n_b²
+w(|n|) = 1 - (1 - |n|²/C0²)³   for |n| < C0
+w(|n|) = 1 for |n| ≥ C0
 ```
 
-`w` is the standard C^∞ bump (Lee, *Introduction to Smooth Manifolds*, 2nd ed., §2), extended by its flat limits. It has all derivatives zero at `C = 0` and at `C = C0`. The outer term therefore contributes with a flat weight at the origin, while `P + K` is a polynomial in `(a, b)` times a cubic B-spline in `s`. `F` is C^∞ in Cartesian coordinates and C² in `s`, with continuous first derivatives and bounded continuous second derivatives across neutral and across the join. Hue harmonics of order `k ≥ 3` enter only through the outer term and are suppressed by the flat weight; the core itself has only harmonics 0, 1 and 2. Replacing `√C` with `C` alone would not do this: `C·cos(3h)` is not C¹ at the origin.
+`w` is a polynomial in `|n|²`, hence C^∞ in `(n_a, n_b)`. At the neutral end `w(0) = w'(0) = 0` and `w''(0) = 6/C0²`; at the join `w(1) = 1` and `w'(1) = w''(1) = 0`. So `w = O(|n|²)` at neutral and `1 - w = O((C0 - |n|)³)` at the join, with `max|w''| = 1.5`. Since `O - P = O(|n|^(9/20))` (the outer chroma term goes as `√C_in` and `C_in` as `|n|^(9/10)`), `w·(O - P) = O(|n|^(49/20))`; its first derivative is `O(|n|^(29/20))` and its second is `O(|n|^(9/20))`, both continuous and zero at the origin. `(1 - w)(P + K)` is C^∞ in `(n_a, n_b)` and C² in `s_L`. Thus `F` has continuous first derivatives and bounded continuous second derivatives across neutral and across the join, and is C² at the join. Hue harmonics of order `k ≥ 3` enter only through the outer term and are suppressed by `w = O(|n|²)`; the core itself is a quadratic polynomial with harmonics 0, 1 and 2. The normalized coordinates themselves are a scalar multiple of the identity at the origin, so no angular factor enters: the kink left by undoing only the `0.9` chroma power is the eccentricity factor `e_t(h)`, whose one-sided slopes are `e_t(0) = 0.8460` and `e_t(180°) = 1.0540`, and it is cancelled exactly.
 
-At `C = 0`, `K = 0` and `F = P`; at `C ≥ C0`, `F = O` exactly. The `C = 0` plane is still shared across hue, the neutral output is still `J' = J'_ref + P_Λ`, `a' = N_a`, `b' = N_b`, and a tone-only Look (`P = V = κ = 0`) still reports `G = 1`, `R = 0`, `Λ = 0`. For `C ≥ C0` the 24-knot hue spline is untouched. The core adds 5 coefficients per `s` per component (50 per component; `GRL_COEFS` 780). `C0` and the bump live in `basis::NEUTRAL_JOIN_C` and `basis::outer_weight`.
+At `|n| = 0`, `K = 0` and `F = P`; at `|n| ≥ C0`, `F = O` exactly. The `|n| = 0` plane is still shared across hue, the neutral output is still `J' = J'_ref + P_Λ`, `a' = N_a`, `b' = N_b`, and a tone-only Look (`P = V = κ = 0`) still reports `G = 1`, `R = 0`, `Λ = 0`. For `|n| ≥ C0` the 24-knot hue spline is untouched. The core adds 5 coefficients per `s` per component (50 per component; `GRL_COEFS` 780). `C0` and the weight live in `basis::NEUTRAL_JOIN_C` and `basis::outer_weight`.
+
+Volume-only control-response features are attenuated by `w` below the join; plane features are not. With `C0 = 2` and the polynomial weight:
+
+| `C` | `w` | volume-feature attenuation |
+|---|---|---|
+| 0.2 | 0.0297 | 3.0% |
+| 0.5 | 0.1760 | 17.6% |
+| 1.0 | 0.5781 | 57.8% |
+| 2.0 | 1.0 | 100% |
 
 ### 3.4 Output encoding and soft clip
 The Look predicts appearance before output encoding. To compare with JPEGs: J′a′b′ → XYZ → linear output RGB (the JPEG's primaries) → per-channel **soft clip** → back to XYZ → CAM16-UCS J′a′b′, where residuals are measured. (The JPEG side is decoded through its TRC to linear first, so no TRC round-trip is needed on the prediction side.)
@@ -154,7 +175,7 @@ The function is C¹ and maps (−∞, ∞) → (0, 1). `k` is a per-realization 
 Pre-clip values in saturated regions are only weakly constrained by data, because the clip's derivative → 0. Through the prior curvature floor (§5) this appears as a large pre-clip σ, while the post-clip value stays supported and gated. The clip derivative at the probe, not `x < k`, is the quantity that decides whether the pre-clip value is identifiable.
 
 ### 3.5 Residual LUT
-A 17³ grid over `(s, a_in, b_in)` outputs ΔJ′a′b′, trilinear. Regularization: Laplacian smoothness + L2. Nodes with negligible density are pinned to 0. A large residual is itself a diagnostic.
+A 17³ grid of control points over `(s_L, r_a, r_b)` outputs ΔJ′a′b′ through a uniform cubic B-spline, C² across cell faces. The residual coordinates are the blended `(r_a, r_b) = w·(a_in, b_in) + (1 − w)·(n_a, n_b)`, and the s axis extrapolates its end cubic piece outside the knot range. Regularization: Laplacian smoothness + L2. Control points with negligible density are pinned to 0. A large residual is itself a diagnostic.
 
 ### 3.6 Coverage / density
 A kernel density estimate of the training samples in `(s, h_in, √C_in)`, weighted by trust weights. Used for support (§5) and bounties.
@@ -187,6 +208,8 @@ Per-sample negative log-likelihood (multivariate Student-t, ν = 4, 3-D residual
 ℓ_ip = ((ν+3)/2) · log(1 + ||r_ip||² / (ν σ_v²)) + 3 log σ_v
 ```
 
+Inside the `C0` transition the residual LUT and its Jacobian use the near-neutral Cartesian coordinates of §3.3, blended with the UCS coordinates by `w`; outside they use CAM16-UCS. Published predictions, the 1.5 ΔE support threshold and the release ceilings remain CAM16-UCS.
+
 The total objective is:
 
 ```
@@ -207,13 +230,13 @@ The total objective is:
 3. Add G, R, Λ.
 4. Fit the residual on the residuals, then do a short joint refinement.
 
-**Regularization:** choose each λ **within its own stage** by generalized cross-validation (GCV) on that stage's linearized problem, using a 1-D search over ~8 log-spaced values. For a candidate λ, GCV solves `(H + C + λP)·δ = −g − g_fixed − λPθ̂`, where `H`, `g` and the RSS are data over the same sampled linearization rows and are scaled by active samples per Hessian row. The block step solve, including the matrix-free residual grid, uses that scaled Hessian with the exact full-data gradient, so the row cap changes the quadratic model, not the stationary point. `C` and `g_fixed` are the fixed prior curvatures and gradients (exposure, WB, mode, clip and identity priors), and `P` is the smoothness curvature. The fitted RSS uses `H` and `g`; the degrees of freedom are `tr(H·(H + C + λP)⁻¹)`. With the fixed priors in the system, the exposure/mode gauge direction is regularized rather than left singular. K-fold CV over images is a periodic quality check on a per-image subsample, not part of every fit. Store the chosen λ in the Look file. The response block's λ carries a floor of 1.0: the frozen response pass at a floor of 100 over-smoothed `D` and raised held-out re-render error from 1.15 to 2.21 ΔE on the controlled fixture.
+**Regularization:** choose each λ **within its own stage** by generalized cross-validation (GCV) on that stage's linearized problem, using a 1-D search over ~8 log-spaced values. For a candidate λ, GCV solves `(H + C + λP)·δ = −g − g_fixed − λPθ̂`, where `H`, `g` and the RSS are data over the same sampled linearization rows and are scaled by active samples per Hessian row. The block step solve, including the matrix-free residual grid, uses that scaled Hessian with the exact full-data gradient, so the row cap changes the quadratic model, not the stationary point. `C` and `g_fixed` are the fixed prior curvatures and gradients (exposure, WB, mode, clip and identity priors), and `P` is the smoothness curvature. The fitted RSS uses `H` and `g`; the degrees of freedom are `tr(H·(H + C + λP)⁻¹)`. With the fixed priors in the system, the exposure/mode gauge direction is regularized rather than left singular. The Student-t rank-one correction can make `H` indefinite, and then which candidate `λ` admit a factorization is an artifact of the factorization rather than of the data; when `H + C` is not positive definite the search uses the diagonal approximation of the same criterion. K-fold CV over images is a periodic quality check on a per-image subsample, not part of every fit. Store the chosen λ in the Look file. The response block's λ carries a floor of 1.0: the frozen response pass at a floor of 100 over-smoothed `D` and raised held-out re-render error from 1.15 to 2.21 ΔE on the controlled fixture.
 
 **Identity prior:** shrinkage toward the identity Look is a fixed Gaussian prior on each layer, not a smoothness term: energy `0.5·θ²/sd²`, curvature `1/sd²`. SDs are tone 1 J′ per stop, tint 2 J′a′b′, `log G` 0.3, hue rotation 15°, lightness 8 J′, residual 0.5 ΔE. Core coefficients use their layer's SD; the core basis functions are O(1) on `|a|, |b| ≤ C0`. These weights do not weaken as the pool grows. Their curvature enters `H`, the covariance floor and the prior-bias test (§5).
 
 Solver: Levenberg–Marquardt with dense Cholesky on each block and preconditioned conjugate gradients on the matrix-free residual grid. A candidate step is judged by a value-only trial at the current σ against the quadratic predicted reduction; damping follows the gain ratio and σ is re-optimized only from the accepted trial. A nuisance block whose image rows form independent per-image groups is solved by Schur elimination of those groups, leaving one dense solve over the shared mode offsets and clip; blocks without that structure fall back to dense Cholesky.
 
-**Near-neutral derivatives.** The G/R/Λ Jacobian columns are Cartesian: `∂F/∂a` and `∂F/∂b` combine the core's polynomial gradient with the outer's `∂/∂h` and `∂/∂C`, the latter multiplied by `w` and `w'`. At `C = 0` the code uses the core gradient and does not evaluate `1/C`; no arbitrary zero derivative is substituted. The residual grid is trilinear in `(s, a, b)`. The only non-smooth fallback left is the input contraction at the boundary of CAM16's forward domain, which is away from neutral and is not differentiated.
+**Near-neutral and boundary derivatives.** The G/R/Λ Jacobian columns are Cartesian in `(n_a, n_b)`: `∂F/∂n_a` and `∂F/∂n_b` combine the core's polynomial gradient with `(∂w/∂n)·(O − P − K)`, and the UCS columns `∂F/∂a`, `∂F/∂b` (the outer's `∂/∂h` and `∂/∂C`) are multiplied by `w`. At `|n| = 0` the code uses the core gradient and the weight gradient and does not evaluate `1/|n|` or `1/C_in`; no arbitrary zero derivative is substituted. The fit differentiates the §3.3.5 residual, not the published output: each path contributes its own `d residual/dθ` and the two are joined by `w`, with the `(∂w/∂θ)·(r_ucs − r_int)` term on the nuisance columns. The output clip path uses `clip::preclip_xyz_jacobian` for the UCS path and `clip::preclip_internal_xyz_jacobian` for the internal path; the latter is the inverse of the analytic forward Jacobian of `(n_a, n_b, J')` and is linear at the neutral origin, so no chroma power is differentiated. The published-output Jacobian (`Look::d_output_d_layer_values`) chains `Φ`; at a neutral internal chroma `Φ` has no finite Jacobian, so the model substitutes the internal derivative and `ChromaPaths::singular()` marks the location (see §5). The residual is a cubic B-spline in `(s_L, a_r, b_r)` with the same blend. Every spline layer's s-slope is multiplied by `E'(s)`; `E'` is 0 outside the lookup domain, 1 in the identity interior, and continuous at the joins. The tint continuation is C² at `J' = 100`. The clip Jacobian is `∂post/∂pre = J₁·T·diag(c')·F·∂XYZ/∂pre`; its chromatic columns vanish at a neutral pre-clip prediction, so no inverse is formed and no identity is substituted. The barrier margin is evaluated on the UCS pre-clip appearance and its exact `d margin/dθ` is returned per column (`EvalOutput::margin_terms`). The remaining domain is handled by explicit predicates on the failing quantity (nonpositive luminance, an adapted-cone response at its singularity, the inverse limit derived from the actual inverse and viewing conditions) and the `−log(margin)` interior barrier. A singular point is either smooth through the normalized coordinates and continuations or a domain failure; there is no identity-inverse fallback.
 
 ### 4.2 Joint Look + control-response fit
 **Reference setting:** every control marked `look_affecting: true` in the body's schema is at its declared `default`. This is the single definition of "target-defining" ([03 §1](03-data-model.md)). Spatial controls (grain, clarity, sharpening, NR) must be at default or at a schema-listed tolerated value for an image to be used at all.
@@ -282,6 +305,8 @@ Per Look version, each probe stores a 3×3 covariance for the **mean Look respon
 2. **Bootstrap (published versions):** B = 32 warm-started refits on image clusters resampled with replacement; a cluster is one body's images, so within-body correlation is kept (a single-body pool is the image bootstrap).
 3. **Cross-body disagreement:** covariance of leave-one-body-out predictions.
 
+At a neutral internal chroma, `Φ` has no finite Jacobian, so covariance must not be pushed through it. `ChromaPaths::singular()` marks that location and its covariance comes from the bootstrap (item 2); elsewhere the published-output Jacobian is the exact `Φ`-chained derivative and the existing path is kept.
+
 Use the bootstrap fit covariance when available, otherwise the sandwich estimate. Combine fit and cross-body disagreement covariance in the same response coordinates; add model-discrepancy covariance in its measured post-clip coordinates. Scalar `σ_ΔE = sqrt(tr Σ_total)`.
 
 Each probe carries both the **pre-clip** J′a′b′ the Look defines and the **post-clip** J′a′b′ in the reference output encoding (J′a′b′ → output RGB → soft clip with the realization's `k` → J′a′b′), each with its own 3×3 covariance. Before model discrepancy is added, the post-clip fit covariance is `M_clip Σ_fit M_clipᵀ` plus the clip-`k` term, with `M_clip` the clip Jacobian. Matching and drift gating use the post-clip prediction and covariance; gating also checks pre-clip J′ and hue `h` where `pre_clip_reliable` is true (smallest per-channel clip derivative ≥ 0.25 and an invertible clip Jacobian).
@@ -296,11 +321,11 @@ Each probe carries both the **pre-clip** J′a′b′ the Look defines and the *
 
 **Small clusters:** for the sandwich path the meat is scaled by `G/(G−1)` and `σ_ΔE` by `t_{0.95,G−1}/z_{0.95}`, where `G` is the number of active image clusters in the fit (Cameron & Miller 2015, *J. Hum. Resour.* 50(2), eq. 10-11; MacKinnon & White 1985). Published versions use the bootstrap when available.
 
-**Convergence:** final refinement requires both a relative objective plateau below `1e-3` over five accepted states and an undamped curvature-scaled decrement `E = ½ gᵀB⁻¹g ≤ 1e-3` nats. Here `g` is the full penalized gradient over active, unpinned parameters and `B` is the block-diagonal IRLS/Gauss-Newton curvature including priors and penalties. The residual grid contributes through its matrix-free curvature when enabled. This is model-scaled stationarity, not an exact bound on remaining nonlinear improvement; it is invariant to invertible linear changes of coordinates within each block. Damping, step clamps and backtracking fractions do not enter the certificate. Failed factorizations or unresolved matrix-free solves report nonconvergence. Budget exhaustion and the sweep cap report nonconvergence. Warm-up stages use `early_samples_per_image` (default 64) on large pools and response fits; final refinement, the frozen response pass and uncertainty estimation use the full set. Plain `fit` applies the image/body K-fold model-error term to pools of 4 to 64 images. The worker records convergence in `ReleaseRecord.converged` and the version's gate summary. A fit that exhausts its budget returns a `FitState`, resumes on the next batch, and does not publish until final refinement converges.
+**Convergence:** final refinement requires both a relative objective plateau below `1e-3` over five accepted states and an undamped curvature-scaled decrement `E = ½ gᵀB⁻¹g ≤ 1e-3` nats on the joint metric. Here `g` is a freshly evaluated full-data penalized gradient over active, unpinned parameters, and `B` is the undamped joint IRLS/Gauss-Newton curvature over the Look coefficients, every image exposure and WB coordinate, the shared mode-offset and clip border and the free residual grid, including identity priors, nuisance priors, smoothness at the frozen λ and the residual prior. The image blocks and the border are eliminated exactly with a two-level Schur complement before the solve, so the certificate resolves the same coupling the step does rather than a block-diagonal approximation. The outer conjugate-gradient preconditioner is the exact principal block of that reduced operator for each Look layer, with the diagonal correction as its fallback. Its solve stops on an iteration work limit or on three consecutive chunks of iterations that do not lower the explicit residual. The residual grid contributes through its own matrix-free solve over the residual coordinates, which omits the residual/Look cross curvature. The reported value is the certified upper bound `½ zᵀBz + zᵀr + ½ rᵀP₀⁻¹r` for `r = g − Bz` and the diagonal prior floor `P₀`, so an inexact solve is accepted only when the bound is at most `1e-3`; a missing floor, a failed factorization or an unresolved solve reports nonconvergence. This is model-scaled stationarity, not an exact bound on remaining nonlinear improvement; it is invariant to invertible linear changes of coordinates over the joint space. Damping, step clamps and the joint direction safeguard do not enter the certificate. Final refinement may step on the Student-t curvature `α JᵀJ − 2(ν+3)/q² (Jᵀr)(Jᵀr)ᵀ`; `B` stays the Gauss-Newton curvature, so the certificate measures the same stationarity whatever step model is used, and a step whose corrected curvature loses positive definiteness is damped and retried or replaced by the Gauss-Newton step. The inverse-domain `−log(margin)` barrier enters the objective, its gradient, the joint curvature and the certificate. The final-stage curvature operator uses all active rows when the pool fits the retained-row bound (8192 rows) and otherwise the deterministic `hessian_samples` subset scaled to the full data; `Diagnostics.operator_rows` reports which. Budget exhaustion and the sweep cap report nonconvergence. Warm-up stages use `early_samples_per_image` (default 64) on large pools and response fits; final refinement, the frozen response pass and uncertainty estimation use the full set. Plain `fit` applies the image/body K-fold model-error term to pools of 4 to 64 images. The worker records convergence in `ReleaseRecord.converged` and the version's gate summary. A fit that exhausts its budget returns a `FitState`, resumes on the next batch, and does not publish until final refinement converges.
 
 ## 6. Probe set (v1)
 
-Versioned in `data/probes/vN.yaml`, generated deterministically, in adapted scene XYZ (D65).
+Versioned in `data/probes/vN.yaml`, generated deterministically, in adapted scene XYZ (D65). The v1 reference inputs (`data/charts/colorchecker24_2014.json`, `data/probes/pointer_gamut.json`) are parsed with correctly rounded `f64` (`serde_json` `float_roundtrip`), so regeneration is independent of the cargo package selection.
 
 | Group | Contents | Weight |
 |---|---|---|
@@ -324,6 +349,8 @@ For two functions F₁ and F₂ on the probe set (Look vs Look, Look vs realizat
 8. One-line natural-language summary built from layer differences.
 
 Because G/R/Λ are relative to the colorimetric reference, layer differences are directly interpretable. CIEDE2000 is also reported for familiarity.
+
+**Fitter trace:** setting `LOOKLAB_FIT_DIAG` writes the staged solve's per-sweep cost, block gradients, joint-solve outcome and stationarity bound to stderr. It changes no numerics and is for local investigation only; the `Diagnostics` record carries the same quantities for released fits.
 
 ## 8. Implementation notes
 

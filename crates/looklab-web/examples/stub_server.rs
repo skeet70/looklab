@@ -144,7 +144,10 @@ async fn site_root(State(stub): State<Arc<Stub>>) -> Response {
             "root": looklab_publish::ArtifactHash::of(&bytes).as_str(),
         }))
         .into_response(),
-        Err(_) => error_response(StatusCode::SERVICE_UNAVAILABLE, "site data is not published"),
+        Err(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "site data is not published",
+        ),
     }
 }
 

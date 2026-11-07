@@ -5,7 +5,7 @@ use looklab_prep::PrepParams;
 use looklab_upload::{
     BatchManifest, BlobKind, BodyId, Challenge, CommunitySnapshotVersion, ContributionKind,
     ControlSettings, FirmwareVersionString, Intent, Limits, ManifestHash, ManifestMetadata, Nonce,
-    POW_K, SimKey,
+    POW_K, SendManifest, SendManifestHash, SimKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +78,19 @@ pub struct BuildManifestResponse {
     pub challenge: Challenge,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BuildSendManifestRequest {
+    pub nonce: Nonce,
+    pub manifest_hashes: Vec<ManifestHash>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildSendManifestResponse {
+    pub send_manifest_bytes: Vec<u8>,
+    pub send_manifest_hash: SendManifestHash,
+    pub challenge: Challenge,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssertionFields {
     pub credential_id: Vec<u8>,
@@ -89,6 +102,7 @@ pub struct AssertionFields {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EncodeEnvelopeRequest {
     pub nonce: Nonce,
+    pub send_manifest_bytes: Vec<u8>,
     pub manifest_bytes: Vec<u8>,
     pub assertion: AssertionFields,
     pub pow: [u64; POW_K],
@@ -100,6 +114,7 @@ pub struct EncodeEnvelopeRequest {
 pub struct EncodeEnvelopeResponse {
     pub envelope: Vec<u8>,
     pub manifest_hash: ManifestHash,
+    pub send_manifest_hash: SendManifestHash,
     pub challenge: Challenge,
 }
 
@@ -141,6 +156,9 @@ pub struct BlobSummary {
 pub struct ParseEnvelopeResponse {
     pub body_bytes: u64,
     pub nonce: Nonce,
+    pub send_manifest: SendManifest,
+    pub send_manifest_bytes: Vec<u8>,
+    pub send_manifest_hash: SendManifestHash,
     pub manifest: BatchManifest,
     pub manifest_bytes: Vec<u8>,
     pub manifest_hash: ManifestHash,
@@ -167,6 +185,7 @@ pub enum Response {
     Version(VersionResponse),
     Prepare(PrepareResponse),
     BuildManifest(BuildManifestResponse),
+    BuildSendManifest(BuildSendManifestResponse),
     EncodeEnvelope(EncodeEnvelopeResponse),
     SolvePow(SolvePowResponse),
     ParseEnvelope(Box<ParseEnvelopeResponse>),

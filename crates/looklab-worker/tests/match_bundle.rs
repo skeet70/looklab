@@ -31,6 +31,10 @@ const BODY: &str = "fujifilm/x-t5";
 const FIRMWARE: &str = "1.50";
 const EPOCH: u32 = 1;
 
+/// Jobs one fixture queue may run before it must settle.
+const DRAIN_JOBS: usize = 64;
+const DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(900);
+
 const TRANSFORM: &str = "format: looklab-transform/1
 version: 1
 camera_to_xyz:
@@ -191,7 +195,10 @@ async fn add_contribution(
 }
 
 async fn run_jobs(worker: &Worker) {
-    worker.run_until_idle().await.expect("jobs");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("jobs");
 }
 
 fn version_dir(site: &Path, look: &str) -> PathBuf {

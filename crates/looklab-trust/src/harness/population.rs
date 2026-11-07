@@ -103,7 +103,12 @@ pub fn artifact_hash(look: &Look) -> ArtifactHash {
         write(value.to_bits());
     }
     for component in [&look.color.g, &look.color.r, &look.color.lambda] {
-        for value in component.plane.iter().chain(&component.volume) {
+        for value in component
+            .plane
+            .iter()
+            .chain(&component.volume)
+            .chain(&component.core)
+        {
             write(value.to_bits());
         }
     }

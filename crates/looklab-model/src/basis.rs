@@ -49,8 +49,28 @@ pub const TINT_KNOTS: [f64; 16] = [
     0.0, 0.0, 0.0, 0.0, 1.0, 4.0, 10.0, 20.0, 32.0, 45.0, 60.0, 80.0, 100.0, 100.0, 100.0, 100.0,
 ];
 
+/// Tint axis join: the last tint knot, where the continuation starts.
+pub const TINT_JOIN: f64 = TINT_KNOTS[TINT_COEFS];
+
 /// Number of residual grid nodes per axis.
 pub const RESIDUAL_GRID: usize = 17;
+
+/// Open uniform cubic knots over `[0, 1]` for the 17 residual control points.
+pub const RESIDUAL_KNOTS: [f64; RESIDUAL_GRID + 4] = {
+    let mut knots = [0.0_f64; RESIDUAL_GRID + 4];
+    let interior = RESIDUAL_GRID - 3;
+    let mut index = 1;
+    while index < interior {
+        knots[3 + index] = index as f64 / interior as f64;
+        index += 1;
+    }
+    let mut tail = RESIDUAL_GRID;
+    while tail < RESIDUAL_GRID + 4 {
+        knots[tail] = 1.0;
+        tail += 1;
+    }
+    knots
+};
 
 /// Three channels per node, channel-minor.
 pub const RESIDUAL_COEFS: usize = RESIDUAL_GRID * RESIDUAL_GRID * RESIDUAL_GRID * 3;
@@ -59,10 +79,18 @@ pub const RESIDUAL_COEFS: usize = RESIDUAL_GRID * RESIDUAL_GRID * RESIDUAL_GRID 
 pub(crate) fn find_span(knots: &[f64], degree: usize, x: f64) -> usize {
     let n = knots.len() - degree - 1;
     if x >= knots[n] {
-        return n - 1;
+        let mut index = n - 1;
+        while index > degree && knots[index] == knots[index + 1] {
+            index -= 1;
+        }
+        return index;
     }
     if x <= knots[degree] {
-        return degree;
+        let mut index = degree;
+        while index < n - 1 && knots[index] == knots[index + 1] {
+            index += 1;
+        }
+        return index;
     }
     let mut lo = degree;
     let mut hi = n;
@@ -124,6 +152,55 @@ pub(crate) fn cubic_basis_with_derivative(knots: &[f64], x: f64) -> (usize, [f64
     (start, values, derivative)
 }
 
+/// `C'' = Σ_k e_k B_{k,1}`, `e_k = 6(d_k - d_{k-1})/(t_{k+2} - t_k)`,
+/// `d_k = 3(c_k - c_{k-1})/(t_{k+3} - t_k)` (Piegl & Tiller 1997, eq. 3.7 twice).
+fn cubic_basis_derivatives(knots: &[f64], x: f64) -> (usize, [f64; 4], [f64; 4], [f64; 4]) {
+    let (start, values, derivative) = cubic_basis_with_derivative(knots, x);
+    let mut linear = [0.0_f64; 2];
+    let start_linear = basis(knots, 1, x, &mut linear);
+    let mut second = [0.0_f64; 4];
+    for (position, k) in (start_linear..start_linear + 2).enumerate() {
+        let weight = linear[position];
+        let denominator = knots[k + 2] - knots[k];
+        if weight == 0.0 || denominator == 0.0 {
+            continue;
+        }
+        let left_span = knots[k + 3] - knots[k];
+        let right_span = if k >= 1 {
+            knots[k + 2] - knots[k - 1]
+        } else {
+            0.0
+        };
+        let left = if left_span == 0.0 {
+            0.0
+        } else {
+            1.0 / left_span
+        };
+        let right = if right_span == 0.0 {
+            0.0
+        } else {
+            1.0 / right_span
+        };
+        let scale = 6.0 * weight / denominator;
+        if k >= start && k < start + 4 {
+            second[k - start] += scale * left;
+        }
+        if k >= 1 {
+            let coefficient = k - 1;
+            if coefficient >= start && coefficient < start + 4 {
+                second[coefficient - start] -= scale * (left + right);
+            }
+        }
+        if k >= 2 {
+            let coefficient = k - 2;
+            if coefficient >= start && coefficient < start + 4 {
+                second[coefficient - start] += scale * right;
+            }
+        }
+    }
+    (start, values, derivative, second)
+}
+
 /// I-spline basis over [`TONE_KNOTS`].
 #[derive(Clone, Copy, Debug)]
 pub struct ToneBasis {
@@ -162,6 +239,36 @@ impl ToneBasis {
 
     /// `I_k(s)` for `k = 0..20`.
     pub fn values(&self, x: f64) -> [f64; TONE_COEFS] {
+        let first_knot = TONE_KNOTS[3];
+        let last_knot = TONE_KNOTS[TONE_COEFS];
+        if x > last_knot {
+            let mut out = self.values(last_knot);
+            let mid = 0.5 * (last_knot + x);
+            let half = 0.5 * (x - last_knot);
+            let delta = half / 3.0_f64.sqrt();
+            for node in [mid - delta, mid + delta] {
+                let mut weights = [0.0_f64; 4];
+                let first = basis(&TONE_KNOTS, 3, node, &mut weights);
+                for (m, weight) in weights.iter().enumerate() {
+                    out[first + m] += half * weight;
+                }
+            }
+            return out;
+        }
+        if x < first_knot {
+            let mid = 0.5 * (first_knot + x);
+            let half = 0.5 * (first_knot - x);
+            let delta = half / 3.0_f64.sqrt();
+            let mut out = [0.0_f64; TONE_COEFS];
+            for node in [mid - delta, mid + delta] {
+                let mut weights = [0.0_f64; 4];
+                let first = basis(&TONE_KNOTS, 3, node, &mut weights);
+                for (m, weight) in weights.iter().enumerate() {
+                    out[first + m] -= half * weight;
+                }
+            }
+            return out;
+        }
         let span = find_span(&TONE_KNOTS, 3, x);
         let a = TONE_KNOTS[span];
         let b = TONE_KNOTS[span + 1].min(x);
@@ -256,82 +363,228 @@ pub fn core_weights(a: f64, b: f64) -> [f64; CORE_TERMS] {
     [x, y, x * x, x * y, y * y]
 }
 
-/// Outer weight `w(C)` and `dw/dC`; the C^∞ step
-/// `e^(-1/x)/(e^(-1/x)+e^(-1/(1-x)))` (Lee, *Introduction to Smooth Manifolds*, §2).
+/// `w = 1 - (1 - t)³` with `t = C² / C0²`, `w = 1` for `C ≥ C0`; returns `(w, dw/dC)`.
 pub fn outer_weight(c: f64) -> (f64, f64) {
-    if !(c > 0.0) {
+    if c.is_nan() || c <= 0.0 {
         return (0.0, 0.0);
     }
-    if c >= NEUTRAL_JOIN_C {
+    let t = c * c / (NEUTRAL_JOIN_C * NEUTRAL_JOIN_C);
+    if t >= 1.0 {
         return (1.0, 0.0);
     }
-    let p = 1.0 / c;
-    let q = 1.0 / (NEUTRAL_JOIN_C - c);
-    let a = libm::exp(-p);
-    let b = libm::exp(-q);
-    let sum = a + b;
-    if sum == 0.0 {
-        return (0.0, 0.0);
-    }
-    let w = a / sum;
-    let slope = w * (1.0 - w) * (p * p + q * q);
+    let remainder = 1.0 - t;
+    let w = 1.0 - remainder * remainder * remainder;
+    let slope = 3.0 * remainder * remainder * 2.0 * c / (NEUTRAL_JOIN_C * NEUTRAL_JOIN_C);
     (w, slope)
 }
 
-/// Cubic B-spline weights on the `s` axis.
+/// Cubic B-spline weights on the `s` axis; the knot span is held at the ends,
+/// so a coordinate outside the domain extrapolates the end cubic piece.
 pub(crate) fn s_weights(s: f64) -> ([usize; 4], [f64; 4]) {
     let mut values = [0.0_f64; 4];
-    let start = basis(
-        &S_KNOTS,
-        3,
-        s.clamp(S_KNOTS[3], S_KNOTS[S_COEFS]),
-        &mut values,
-    );
+    let start = basis(&S_KNOTS, 3, s, &mut values);
     ([start, start + 1, start + 2, start + 3], values)
 }
 
-/// Cubic B-spline weights and derivative on the tint axis.
-pub(crate) fn tint_weights(j_prime: f64) -> ([usize; 4], [f64; 4], [f64; 4]) {
-    let x = j_prime.clamp(TINT_KNOTS[3], TINT_KNOTS[TINT_COEFS]);
-    let (start, values, derivative) = cubic_basis_with_derivative(&TINT_KNOTS, x);
-    ([start, start + 1, start + 2, start + 3], values, derivative)
+/// Width in stops of the shadow exposure transition, outside `-12`.
+pub const S_SHADOW_TRANSITION: f64 = 2.0;
+
+/// Width in stops of the highlight exposure transition, outside `6`.
+pub const S_HIGHLIGHT_TRANSITION: f64 = 1.0;
+
+/// Bounded spline coordinate for physical `s = log2(Y/0.18)`: identity on the
+/// tone range `[-12, 6]`, C² quintic Hermite transitions outside it.
+pub fn exposure_lookup(s: f64) -> f64 {
+    let low = S_KNOTS[3];
+    let high = S_KNOTS[S_COEFS];
+    if s >= low && s <= high {
+        return s;
+    }
+    if s < low {
+        let start = low - S_SHADOW_TRANSITION;
+        if s <= start {
+            return start;
+        }
+        let y = (s - start) / S_SHADOW_TRANSITION;
+        let y2 = y * y;
+        let y3 = y2 * y;
+        return start + S_SHADOW_TRANSITION * (3.0 * y3 * y2 - 8.0 * y2 * y2 + 6.0 * y3);
+    }
+    let end = high + S_HIGHLIGHT_TRANSITION;
+    if s >= end {
+        return end;
+    }
+    let y = (s - high) / S_HIGHLIGHT_TRANSITION;
+    let y2 = y * y;
+    let y3 = y2 * y;
+    high + S_HIGHLIGHT_TRANSITION * (3.0 * y3 * y2 - 7.0 * y2 * y2 + 4.0 * y3 + y)
 }
 
-/// Trilinear corner indices and weights for a point in `[0, 1]^3`.
-pub(crate) fn trilinear(u: f64, v: f64, w: f64) -> ([usize; 8], [f64; 8]) {
-    let last = RESIDUAL_GRID - 1;
-    let coord = |value: f64| {
-        let g = value.clamp(0.0, 1.0) * last as f64;
-        let i = g.floor();
-        let f = g - i;
-        let i = (i as usize).min(last);
-        let i1 = (i + 1).min(last);
-        (i, i1, f)
-    };
-    let (i0, i1, fu) = coord(u);
-    let (j0, j1, fv) = coord(v);
-    let (k0, k1, fw) = coord(w);
-    let indices = [
-        i0 * RESIDUAL_GRID * RESIDUAL_GRID + j0 * RESIDUAL_GRID + k0,
-        i0 * RESIDUAL_GRID * RESIDUAL_GRID + j0 * RESIDUAL_GRID + k1,
-        i0 * RESIDUAL_GRID * RESIDUAL_GRID + j1 * RESIDUAL_GRID + k0,
-        i0 * RESIDUAL_GRID * RESIDUAL_GRID + j1 * RESIDUAL_GRID + k1,
-        i1 * RESIDUAL_GRID * RESIDUAL_GRID + j0 * RESIDUAL_GRID + k0,
-        i1 * RESIDUAL_GRID * RESIDUAL_GRID + j0 * RESIDUAL_GRID + k1,
-        i1 * RESIDUAL_GRID * RESIDUAL_GRID + j1 * RESIDUAL_GRID + k0,
-        i1 * RESIDUAL_GRID * RESIDUAL_GRID + j1 * RESIDUAL_GRID + k1,
-    ];
-    let weights = [
-        (1.0 - fu) * (1.0 - fv) * (1.0 - fw),
-        (1.0 - fu) * (1.0 - fv) * fw,
-        (1.0 - fu) * fv * (1.0 - fw),
-        (1.0 - fu) * fv * fw,
-        fu * (1.0 - fv) * (1.0 - fw),
-        fu * (1.0 - fv) * fw,
-        fu * fv * (1.0 - fw),
-        fu * fv * fw,
-    ];
+pub fn exposure_lookup_derivative(s: f64) -> f64 {
+    let low = S_KNOTS[3];
+    let high = S_KNOTS[S_COEFS];
+    if s >= low && s <= high {
+        return 1.0;
+    }
+    if s < low {
+        let start = low - S_SHADOW_TRANSITION;
+        if s <= start {
+            return 0.0;
+        }
+        let y = (s - start) / S_SHADOW_TRANSITION;
+        let y2 = y * y;
+        return 15.0 * y2 * y2 - 32.0 * y2 * y + 18.0 * y2;
+    }
+    let end = high + S_HIGHLIGHT_TRANSITION;
+    if s >= end {
+        return 0.0;
+    }
+    let y = (s - high) / S_HIGHLIGHT_TRANSITION;
+    let y2 = y * y;
+    15.0 * y2 * y2 - 28.0 * y2 * y + 12.0 * y2 + 1.0
+}
+
+/// Largest tint argument the reference inverse can represent (the neutral `J'`
+/// limit of the viewing conditions).
+pub fn tint_continuation_end() -> f64 {
+    crate::solve::neutral_j_prime_max()
+}
+
+/// Cubic tint weights and `d/dJ'`, continued above [`TINT_JOIN`] by matching value, slope and second derivative and reaching zero slope and curvature at [`tint_continuation_end`].
+pub fn tint_weights(j_prime: f64) -> ([usize; 4], [f64; 4], [f64; 4]) {
+    let (start, values, derivative, second) =
+        cubic_basis_derivatives(&TINT_KNOTS, j_prime.clamp(TINT_KNOTS[3], TINT_JOIN));
+    let indices = [start, start + 1, start + 2, start + 3];
+    if j_prime <= TINT_JOIN {
+        return (indices, values, derivative);
+    }
+    let length = (tint_continuation_end() - TINT_JOIN).max(f64::MIN_POSITIVE);
+    let x = ((j_prime - TINT_JOIN) / length).clamp(0.0, 1.0);
+    let x2 = x * x;
+    let x3 = x2 * x;
+    let x4 = x3 * x;
+    let mut weights = [0.0_f64; 4];
+    let mut slope = [0.0_f64; 4];
+    for m in 0..4 {
+        let s0 = derivative[m];
+        let c0 = second[m];
+        let a = c0 * length + 2.0 * s0;
+        let b = -2.0 * c0 * length - 3.0 * s0;
+        let c = c0 * length;
+        weights[m] = values[m] + length * (0.25 * a * x4 + b * x3 / 3.0 + 0.5 * c * x2 + s0 * x);
+        slope[m] = a * x3 + b * x2 + c * x + s0;
+    }
+    (indices, weights, slope)
+}
+
+/// Cubic tint weights with first and second derivatives w.r.t. `J'`.
+pub fn tint_weights_second(j_prime: f64) -> ([usize; 4], [f64; 4], [f64; 4], [f64; 4]) {
+    let (start, values, derivative, second) =
+        cubic_basis_derivatives(&TINT_KNOTS, j_prime.clamp(TINT_KNOTS[3], TINT_JOIN));
+    let indices = [start, start + 1, start + 2, start + 3];
+    if j_prime <= TINT_JOIN {
+        return (indices, values, derivative, second);
+    }
+    let length = (tint_continuation_end() - TINT_JOIN).max(f64::MIN_POSITIVE);
+    let x = ((j_prime - TINT_JOIN) / length).clamp(0.0, 1.0);
+    let x2 = x * x;
+    let x3 = x2 * x;
+    let x4 = x3 * x;
+    let mut weights = [0.0_f64; 4];
+    let mut slope = [0.0_f64; 4];
+    let mut curvature = [0.0_f64; 4];
+    for m in 0..4 {
+        let s0 = derivative[m];
+        let c0 = second[m];
+        let a = c0 * length + 2.0 * s0;
+        let b = -2.0 * c0 * length - 3.0 * s0;
+        let c = c0 * length;
+        weights[m] = values[m] + length * (0.25 * a * x4 + b * x3 / 3.0 + 0.5 * c * x2 + s0 * x);
+        slope[m] = a * x3 + b * x2 + c * x + s0;
+        curvature[m] = (3.0 * a * x2 + 2.0 * b * x + c) / length;
+    }
+    (indices, weights, slope, curvature)
+}
+
+/// Cubic residual control-point indices and weights at `(s, a, b)`.
+pub fn residual_weights(s: f64, a: f64, b: f64) -> ([usize; 64], [f64; 64]) {
+    let (si, sw) = residual_axis(residual_s_coord(s));
+    let (aj, aw) = residual_axis(residual_coord(a, crate::look::RESIDUAL_DOMAIN[1]));
+    let (bk, bw) = residual_axis(residual_coord(b, crate::look::RESIDUAL_DOMAIN[2]));
+    let mut indices = [0_usize; 64];
+    let mut weights = [0.0_f64; 64];
+    let mut position = 0;
+    for i in 0..4 {
+        for j in 0..4 {
+            for k in 0..4 {
+                indices[position] = (si[i] * RESIDUAL_GRID + aj[j]) * RESIDUAL_GRID + bk[k];
+                weights[position] = sw[i] * aw[j] * bw[k];
+                position += 1;
+            }
+        }
+    }
     (indices, weights)
+}
+
+/// Residual control-point indices, weights and derivatives w.r.t. `(s, a, b)`.
+#[allow(clippy::type_complexity)]
+pub fn residual_values(s: f64, a: f64, b: f64) -> ([usize; 64], [f64; 64], [[f64; 64]; 3]) {
+    let (a_coord, a_scale) = residual_coord_and_scale(a, crate::look::RESIDUAL_DOMAIN[1]);
+    let (b_coord, b_scale) = residual_coord_and_scale(b, crate::look::RESIDUAL_DOMAIN[2]);
+    let (si, sw, dsw) = residual_axis_with_derivative(residual_s_coord(s));
+    let (aj, aw, daw) = residual_axis_with_derivative(a_coord);
+    let (bk, bw, dbw) = residual_axis_with_derivative(b_coord);
+    let span = [
+        crate::look::RESIDUAL_DOMAIN[0][1] - crate::look::RESIDUAL_DOMAIN[0][0],
+        crate::look::RESIDUAL_DOMAIN[1][1] - crate::look::RESIDUAL_DOMAIN[1][0],
+        crate::look::RESIDUAL_DOMAIN[2][1] - crate::look::RESIDUAL_DOMAIN[2][0],
+    ];
+    let mut indices = [0_usize; 64];
+    let mut weights = [0.0_f64; 64];
+    let mut derivatives = [[0.0_f64; 64]; 3];
+    let mut position = 0;
+    for i in 0..4 {
+        for j in 0..4 {
+            for k in 0..4 {
+                indices[position] = (si[i] * RESIDUAL_GRID + aj[j]) * RESIDUAL_GRID + bk[k];
+                weights[position] = sw[i] * aw[j] * bw[k];
+                derivatives[0][position] = dsw[i] * aw[j] * bw[k] / span[0];
+                derivatives[1][position] = sw[i] * daw[j] * bw[k] * a_scale / span[1];
+                derivatives[2][position] = sw[i] * aw[j] * dbw[k] * b_scale / span[2];
+                position += 1;
+            }
+        }
+    }
+    (indices, weights, derivatives)
+}
+
+fn residual_s_coord(s: f64) -> f64 {
+    (s - crate::look::RESIDUAL_DOMAIN[0][0])
+        / (crate::look::RESIDUAL_DOMAIN[0][1] - crate::look::RESIDUAL_DOMAIN[0][0])
+}
+
+fn residual_coord(value: f64, bounds: [f64; 2]) -> f64 {
+    ((value - bounds[0]) / (bounds[1] - bounds[0])).clamp(0.0, 1.0)
+}
+
+fn residual_coord_and_scale(value: f64, bounds: [f64; 2]) -> (f64, f64) {
+    let raw = (value - bounds[0]) / (bounds[1] - bounds[0]);
+    if raw > 0.0 && raw < 1.0 {
+        (raw, 1.0)
+    } else {
+        (raw.clamp(0.0, 1.0), 0.0)
+    }
+}
+
+fn residual_axis(x: f64) -> ([usize; 4], [f64; 4]) {
+    let mut values = [0.0_f64; 4];
+    let start = basis(&RESIDUAL_KNOTS, 3, x, &mut values);
+    ([start, start + 1, start + 2, start + 3], values)
+}
+
+fn residual_axis_with_derivative(x: f64) -> ([usize; 4], [f64; 4], [f64; 4]) {
+    let (start, values, derivative) = cubic_basis_with_derivative(&RESIDUAL_KNOTS, x);
+    ([start, start + 1, start + 2, start + 3], values, derivative)
 }
 
 #[cfg(test)]

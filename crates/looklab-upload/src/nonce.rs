@@ -46,8 +46,12 @@ bytes32_type!(
     Nonce
 );
 bytes32_type!(
-    /// SHA-256 of the canonical manifest bytes.
+    /// SHA-256 of the canonical batch manifest bytes.
     ManifestHash
+);
+bytes32_type!(
+    /// SHA-256 of the canonical send manifest bytes.
+    SendManifestHash
 );
 bytes32_type!(
     /// SHA-256 of `nonce ‖ manifest_hash`, signed through WebAuthn.
@@ -56,9 +60,18 @@ bytes32_type!(
 
 impl Challenge {
     pub fn new(nonce: &Nonce, manifest_hash: &ManifestHash) -> Self {
+        Self::digest(nonce, manifest_hash.as_bytes())
+    }
+
+    /// The one challenge per send.
+    pub fn for_send(nonce: &Nonce, send_manifest_hash: &SendManifestHash) -> Self {
+        Self::digest(nonce, send_manifest_hash.as_bytes())
+    }
+
+    fn digest(nonce: &Nonce, hash: &[u8; 32]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(nonce.as_bytes());
-        hasher.update(manifest_hash.as_bytes());
+        hasher.update(hash);
         let digest = hasher.finalize();
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&digest);

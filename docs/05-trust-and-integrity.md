@@ -21,7 +21,7 @@
 
 - **Passkeys (WebAuthn) only, and only for contributing.** Browsing, matching, previews and the verification loop are anonymous and need no credential. Server side: `webauthn-rs`.
 - **Platforms without a built-in passkey store** (common on Linux desktops) can use a phone via the cross-device QR flow, a security key, or a password manager that stores passkeys. The contribute page says so up front.
-- **Signing:** each upload batch is signed by a passkey assertion whose challenge is `H(server_nonce ‖ batch_manifest_hash)`. Withdrawal/deletion requests are signed the same way.
+- **Signing:** one passkey assertion per **send**, not per batch. The client builds a canonical send manifest listing every batch's manifest hash and signs `H(server_nonce ‖ send_manifest_hash)` once ([03 §2.3](03-data-model.md)). Every batch request carries that send manifest and the same assertion; the server binds the first accepted batch's credential and assertion digest to the send instance and rejects a batch whose send manifest, credential or assertion differs, a replayed send, and a batch that already arrived. The nonce is per send; the same prepared batches under a fresh nonce are a new send. Withdrawal/deletion requests are signed the same way, over their own domain digest.
 - **Lost passkey:** the contributor starts again as new, and a seeder can re-endorse them. Synced passkeys make this rare.
 - **Serial merging:**
   - The client sends the body serial (contributors may opt out). The server immediately computes `HMAC-SHA256(server_secret, make|model|serial)`. The raw serial lives only in a type that can be neither serialized nor printed with `Debug`, and it's never stored or logged.
@@ -150,18 +150,19 @@ A failed gate leaves the candidate provisional and opens a moderation item. A na
 
 ## 9. Anti-spam: proof-of-work
 
-- One proof-of-work per upload batch, bound to `H(server_nonce ‖ batch_manifest_hash)`, with **cost proportional to the number of images**. Proposals carry one too.
+- One proof-of-work per upload **batch**, bound to `H(server_nonce ‖ batch_manifest_hash)`, with **cost proportional to the number of images**. The nonce is issued once per send; the per-batch challenge keeps one batch's solutions from paying for a sibling. Proposals carry one too.
 - **Memory-hard** (Argon2id-based, 16 MB *(tentative)*) to narrow the native/GPU advantage.
 - **Split into k = 16 sub-puzzles** of equal expected cost. One puzzle's work is exponentially distributed (p95 ≈ 3× the mean); 16 sub-puzzles make waits predictable for photographers.
-- **Difficulty:** sub-puzzle `j` needs `d = round(difficulty_bits_per_image + log2(n_images) − log2(16))` leading zero bits of `Argon2id(password = H(nonce ‖ manifest hash) ‖ j ‖ x, salt = "looklab-pow-v1")`, so expected work is `n_images · 2^difficulty_bits_per_image` evaluations. Defaults: 16 MiB memory, 1 iteration, `difficulty_bits_per_image = 8` (about 256 evaluations, a few seconds, per image; verification is one evaluation per sub-puzzle).
+- **Difficulty:** sub-puzzle `j` needs `d = round(difficulty_bits_per_image + log2(n_images) − log2(16))` leading zero bits of `Argon2id(password = H(nonce ‖ batch_manifest_hash) ‖ j ‖ x, salt = "looklab-pow-v1")`, so expected work is `n_images · 2^difficulty_bits_per_image` evaluations. Defaults: 16 MiB memory, 1 iteration, `difficulty_bits_per_image = 8` (about 256 evaluations, a few seconds, per image; verification is one evaluation per sub-puzzle).
 - **Server cost:** verification is k Argon2 evaluations. Do the cheap checks first, so junk costs a lookup, not an Argon2 run:
   1. request size limit;
-  2. nonce (read at its fixed offset in the envelope header, [03 §2.3](03-data-model.md)) was issued by this server, is unused and unexpired (consume it);
-  3. WebAuthn signature;
-  4. sub-puzzles, in order, rejecting at the first failure;
-  5. strict parse of the full envelope and blobs.
+  2. send instance (the nonce at its fixed offset in the envelope header, [03 §2.3](03-data-model.md)): for a new send, consume the nonce and publish the send binding in one short transaction after step 3; for a continuation, match the send manifest hash, credential id and assertion digest, reject a completed or expired send, and reject a batch that already arrived;
+  3. WebAuthn signature and assertion counter, once when the send is established; continuations do not re-run them;
+  4. one in-flight attempt per pending batch, then its sub-puzzles in order, rejecting at the first failure;
+  5. strict parse of the full envelope and blobs. A failed post-PoW attempt counts against a small per-batch budget (three), so one solved puzzle cannot be replayed indefinitely against Argon2.
 
   Rate-limit nonce issuance and invalid submissions in memory. Keep the memory parameter small enough that a full verification stays well under a second.
+- **Expiry and partial sends:** an unused nonce expires with the nonce row. Once a send is established, its `expires_at` is copied from that row and never extended; continuations read only the send row, so nonce-table cleanup cannot affect them. Accepted batches of an expired or abandoned send stay; the client starts a new send with the batches it has not completed.
 - **Passkey registration** is otherwise unprotected. Hold registration challenges in memory with a short TTL, and **create the credential row only when its first valid upload arrives** (signature and proof-of-work both pass).
 - **Target cost:** a few seconds per image on a mid-range laptop. Decoding already takes several seconds per image, so this adds only a fraction to processing time.
 - **Difficulty is published** on the about page and scales down with tier and reputation.

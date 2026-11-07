@@ -143,11 +143,7 @@ fn neutral_probes() -> ProbeUncertainty {
         .collect();
     ProbeUncertainty {
         probes,
-        ids: v1
-            .probes
-            .iter()
-            .map(|probe| probe.id.clone())
-            .collect(),
+        ids: v1.probes.iter().map(|probe| probe.id.clone()).collect(),
         supported_fraction: 0.0,
     }
 }
@@ -627,10 +623,7 @@ fn opposing_chroma_errors_inside_a_region_are_retained() {
         .filter(|cell| field.repeats[*cell] > 0)
         .map(|cell| moment_trace(field.post[cell]))
         .fold(0.0_f64, f64::max);
-    assert!(
-        rms > 0.05,
-        "local chroma error collapsed: {rms}"
-    );
+    assert!(rms > 0.05, "local chroma error collapsed: {rms}");
     assert!(
         variance > 0.01,
         "local chroma variance collapsed: {variance}"
@@ -834,8 +827,7 @@ fn estimated_field_marks_thin_cell_without_evidence_and_keeps_encodings_separate
         .find(|(_, probe)| {
             let target = cell(&LookInput::new(probe.xyz));
             images.iter().any(|image| {
-                (0..image.samples.n())
-                    .any(|index| cell(&sample_input(image, index)) == target)
+                (0..image.samples.n()).any(|index| cell(&sample_input(image, index)) == target)
             })
         })
         .map(|(index, _)| index)
@@ -860,8 +852,7 @@ fn estimated_field_marks_thin_cell_without_evidence_and_keeps_encodings_separate
         .iter()
         .enumerate()
         .find(|(index, probe)| {
-            *index != target_probe
-                && field.evidence_at(&LookInput::new(probe.xyz), RgbSpace::Srgb)
+            *index != target_probe && field.evidence_at(&LookInput::new(probe.xyz), RgbSpace::Srgb)
         })
         .map(|(index, _)| index)
         .expect("another sRGB cell has evidence");

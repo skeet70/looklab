@@ -42,10 +42,10 @@ pub use prefill::{
 };
 pub use prep::{
     ControlSetting, GroupSettings, IntentChoice, PrepSummary, build_manifest_request,
-    decode_build_manifest_reply, decode_encode_reply, decode_parse_reply, decode_pow_reply,
-    decode_prepare_reply, encode_envelope_request, module_fn_id, parse_envelope_request,
-    prepare_request, serial_ascii, serial_ascii_for_file, serial_ascii_from_metadata,
-    solve_pow_request, version_request,
+    build_send_manifest_request, decode_build_manifest_reply, decode_build_send_manifest_reply,
+    decode_encode_reply, decode_parse_reply, decode_pow_reply, decode_prepare_reply,
+    encode_envelope_request, module_fn_id, parse_envelope_request, prepare_request, serial_ascii,
+    serial_ascii_for_file, serial_ascii_from_metadata, solve_pow_request, version_request,
 };
 pub use seedfile::build_seed_file;
 

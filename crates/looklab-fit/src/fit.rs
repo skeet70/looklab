@@ -9,9 +9,10 @@ use looklab_schema::{Control, ControlDefault, ControlSchema, ScalarValue, Tolera
 
 use crate::basis;
 use crate::density;
-use crate::layout::{BlockKind, Layout, NUISANCE_PER_IMAGE, Params};
+use crate::layout::{BlockKind, Layout, NUISANCE_PER_IMAGE, Params, zeta_from_clip};
 use crate::model_error::{apply_model_error, estimate_model_error};
 use crate::outlier;
+use crate::predict::Layer;
 use crate::problem::{ActiveColumns, BlockAcc, IntentFilter, PassOutput, Problem, ResidualSample};
 use crate::solve::{factor_in_place, select_lambda, select_lambda_diagonal, solve_in_place};
 use crate::types::{
@@ -26,6 +27,7 @@ const RESIDUAL_GRID: usize = 17;
 const STEP_RADIUS: f64 = 2.0;
 const STATIONARY_GRADIENT: f64 = 1e-3;
 const STATIONARY_DECREMENT_NATS: f64 = 1e-3;
+const INEXACT_DESCENT_RESIDUAL: f64 = 0.1;
 
 struct Stage {
     blocks: &'static [BlockKind],
@@ -166,7 +168,7 @@ fn converged(recent: &[f64]) -> bool {
     (oldest - newest).abs() <= 1e-3 * oldest.abs().max(1.0)
 }
 
-fn fit_diag() -> bool {
+pub(crate) fn fit_diag() -> bool {
     std::env::var_os("LOOKLAB_FIT_DIAG").is_some()
 }
 
@@ -273,25 +275,6 @@ pub(crate) fn run_with(
         model,
         excluded,
         None,
-        true,
-        None,
-        None,
-        FitMode::Main,
-    )
-    .map(|(result, _)| result)
-}
-
-pub(crate) fn run_with_initial(
-    images: &[FitImage],
-    options: &FitOptions,
-    initial: &looklab_model::Look,
-) -> Result<FitResult> {
-    run_inner(
-        images,
-        options,
-        None,
-        Vec::new(),
-        Some(initial),
         true,
         None,
         None,
@@ -413,7 +396,7 @@ pub(crate) fn run_look_only(
     let layout = problem.layout.clone();
     let mut params = match initial {
         Some(look) => params_from_look(&problem, look),
-        None => initial_params(&problem),
+        None => initial_params(&problem, options),
     };
     for index in 0..problem.images.len() {
         let range = layout.image(index);
@@ -642,6 +625,16 @@ pub(crate) fn condition_nuisances(
     model: Option<&ControlResponseModel>,
     clip_k: f64,
 ) -> Result<ConditionedNuisances> {
+    condition_nuisances_inner(images, options, look, model, clip_k)
+}
+
+fn condition_nuisances_inner(
+    images: &[FitImage],
+    options: &FitOptions,
+    look: &looklab_model::Look,
+    model: Option<&ControlResponseModel>,
+    clip_k: f64,
+) -> Result<ConditionedNuisances> {
     let problem = Problem::new_with(images, model, options)?;
     let layout = problem.layout.clone();
     let mut params = params_from_look(&problem, look);
@@ -705,10 +698,11 @@ pub(crate) fn condition_nuisances(
         }
         let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
         let mut step = vec![0.0_f64; layout.total];
+        let mut failed: Option<usize> = None;
         for (index, block) in blocks.iter().enumerate() {
             let (prior_gradient, prior_curvature) =
                 prior_terms(&problem, &roles, &params, options, block);
-            solve_block(
+            let outcome = solve_block(
                 &layout,
                 block,
                 &mut step,
@@ -721,6 +715,23 @@ pub(crate) fn condition_nuisances(
                 hessian_scale,
                 StepLimit::WholeStep,
             );
+            if outcome == BlockStep::Failed && failed.is_none() {
+                failed = Some(index);
+            }
+        }
+        if let Some(index) = failed {
+            // An unsolved image block leaves its nuisances unmoved; accepting the trial
+            // would count a no-op as progress and lower the damping.
+            damping = (damping * 10.0).min(1e6);
+            if fit_diag() {
+                eprintln!(
+                    "nuisance attempt {attempts} block {index} factorization failed damping {damping:.3e}"
+                );
+            }
+            if damping >= 1e6 {
+                break;
+            }
+            continue;
         }
         let mut trial = params.clone();
         apply_step(&mut trial, &step);
@@ -750,16 +761,16 @@ pub(crate) fn condition_nuisances(
             params = trial;
             pass = trial_pass;
             cost = trial_cost;
-            let gradient = gradient_max(
-                &layout,
-                &problem,
-                &params,
+            let gradient = gradient_max(GradientArgs {
+                layout: &layout,
+                problem: &problem,
+                params: &params,
                 options,
-                &blocks,
-                &penalties,
-                &lambdas,
-                &roles,
-            );
+                blocks: &blocks,
+                penalties: &penalties,
+                lambdas: &lambdas,
+                roles: &roles,
+            });
             let accepted_damping = damping;
             damping = (damping * 0.3).max(1e-6);
             recent.push(cost);
@@ -769,28 +780,18 @@ pub(crate) fn condition_nuisances(
             let stationary = gradient <= STATIONARY_GRADIENT;
             last_gradient = gradient;
             let stable_step = accepted_damping <= 1e-2 && last_step <= 1e-6 && stationary;
-            let stable_cost = accepted_damping <= 1e-2
-                && stationary
-                && recent.len() >= 3
-                && {
-                    let last = recent[recent.len() - 1];
-                    let previous = recent[recent.len() - 2];
-                    (last - previous).abs() <= 1e-4 * last.abs().max(1.0)
-                };
+            let stable_cost = accepted_damping <= 1e-2 && stationary && recent.len() >= 3 && {
+                let last = recent[recent.len() - 1];
+                let previous = recent[recent.len() - 2];
+                (last - previous).abs() <= 1e-4 * last.abs().max(1.0)
+            };
             if fit_diag() {
                 eprintln!(
                     "nuisance attempt {attempts} accepted cost {cost:.12e} gradient {gradient:.9e} damping {accepted_damping:.3e} step {last_step:.9e} history {}",
                     recent.len()
                 );
                 print_block_gradients(
-                    "nuisance",
-                    &layout,
-                    &problem,
-                    &params,
-                    options,
-                    &blocks,
-                    &penalties,
-                    &lambdas,
+                    "nuisance", &layout, &problem, &params, options, &blocks, &penalties, &lambdas,
                     &roles,
                 );
             }
@@ -831,16 +832,16 @@ pub(crate) fn condition_nuisances(
             if recent.len() > 5 {
                 recent.remove(0);
             }
-            let gradient = gradient_max(
-                &layout,
-                &problem,
-                &params,
+            let gradient = gradient_max(GradientArgs {
+                layout: &layout,
+                problem: &problem,
+                params: &params,
                 options,
-                &blocks,
-                &penalties,
-                &lambdas,
-                &roles,
-            );
+                blocks: &blocks,
+                penalties: &penalties,
+                lambdas: &lambdas,
+                roles: &roles,
+            });
             last_gradient = gradient;
             if fit_diag() {
                 eprintln!(
@@ -848,14 +849,7 @@ pub(crate) fn condition_nuisances(
                     recent.len()
                 );
                 print_block_gradients(
-                    "nuisance",
-                    &layout,
-                    &problem,
-                    &params,
-                    options,
-                    &blocks,
-                    &penalties,
-                    &lambdas,
+                    "nuisance", &layout, &problem, &params, options, &blocks, &penalties, &lambdas,
                     &roles,
                 );
             }
@@ -977,7 +971,7 @@ fn run_inner(
         None
     };
     let mut layout = problem.layout.clone();
-    let mut params = initial_params(&problem);
+    let mut params = initial_params(&problem, options);
     if let Some(look) = initial {
         apply_look(&problem, &mut params, look);
     }
@@ -1020,7 +1014,10 @@ fn run_inner(
     let warmup_allowed =
         (options.sweep_budget / problem.samples.len().max(1) as f64).clamp(8.0, 64.0) as usize;
     let mut final_converged = false;
+    let mut operator_rows = 0usize;
     let mut resume_state: Option<FitState> = None;
+    let mut step_warm: Option<Vec<f64>> = None;
+    let mut cert_warm: Option<Vec<f64>> = None;
     let start_stage = resume.map_or(0, |state| state.stage.min(STAGES.len()));
     for (stage_index, stage) in STAGES.iter().enumerate() {
         if stage_index < start_stage {
@@ -1087,6 +1084,7 @@ fn run_inner(
         let mut last_cost: Option<f64> = None;
         let mut gcv_done = false;
         let mut accepted_state = false;
+        let mut gradient_scale: Option<f64> = None;
         let mut recent: Vec<f64> = Vec::new();
         if fit_diag() && resuming {
             eprintln!(
@@ -1127,9 +1125,12 @@ fn run_inner(
                 stage.neutral,
                 IntentFilter::NativeOnly,
                 stage.converge,
-                false,
+                stage.converge && stage_problem.samples.len() <= FULL_ROW_LIMIT,
             );
             evaluations += 1;
+            if stage.converge {
+                operator_rows = pass.hessian_rows;
+            }
             let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
             let mut cost =
                 pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
@@ -1158,15 +1159,11 @@ fn run_inner(
                     pass.active_samples,
                     pass.hessian_rows
                 );
+                print_cost_breakdown(
+                    &problem, &params, &blocks, &penalties, &lambdas, options, &pass,
+                );
                 print_block_gradients(
-                    "current",
-                    &layout,
-                    &problem,
-                    &params,
-                    options,
-                    &blocks,
-                    &penalties,
-                    &lambdas,
+                    "current", &layout, &problem, &params, options, &blocks, &penalties, &lambdas,
                     &roles,
                 );
             }
@@ -1193,23 +1190,25 @@ fn run_inner(
                     break;
                 }
                 let decrement = stationarity_decrement(
-                    &layout, &problem, &params, options, &blocks, &penalties, &lambdas,
-                    &roles, &pass, hessian_scale,
+                    &layout,
+                    &problem,
+                    &params,
+                    options,
+                    &blocks,
+                    &penalties,
+                    &lambdas,
+                    &roles,
+                    &pass,
+                    hessian_scale,
+                    &mut cert_warm,
                 );
                 if fit_diag() {
                     eprintln!(
                         "fit stage {stage_index} sweep {sweep_index} plateau decrement {decrement:.9e} nats threshold {STATIONARY_DECREMENT_NATS:.3e}"
                     );
                     print_block_gradients(
-                        "plateau",
-                        &layout,
-                        &problem,
-                        &params,
-                        options,
-                        &blocks,
-                        &penalties,
-                        &lambdas,
-                        &roles,
+                        "plateau", &layout, &problem, &params, options, &blocks, &penalties,
+                        &lambdas, &roles,
                     );
                 }
                 if decrement <= STATIONARY_DECREMENT_NATS {
@@ -1218,22 +1217,64 @@ fn run_inner(
                 }
             }
 
+            if stage.converge {
+                match final_stage_step(
+                    &layout,
+                    &problem,
+                    stage_problem,
+                    stage,
+                    options,
+                    &mut params,
+                    &blocks,
+                    &penalties,
+                    &lambdas,
+                    &roles,
+                    &pass,
+                    hessian_scale,
+                    cost,
+                    &mut damping,
+                    &mut gradient_scale,
+                    &mut evaluations,
+                    &mut sample_evaluations,
+                    samples_per_pass,
+                    stage_index,
+                    sweep_index,
+                    recent.len(),
+                    &mut step_warm,
+                ) {
+                    FinalOutcome::Accepted(trial) => {
+                        update_sigma(stage_problem, &mut params, &trial, options);
+                        accepted_state = true;
+                        continue;
+                    }
+                    FinalOutcome::Budget | FinalOutcome::Stalled => {
+                        if fit_diag() {
+                            eprintln!(
+                                "fit checkpoint stage {stage_index} sweep {sweep_index} reason joint damping {damping:.3e} history {}",
+                                recent.len()
+                            );
+                        }
+                        resume_state = Some(FitState {
+                            theta: params.theta.clone(),
+                            lambdas,
+                            stage: stage_index,
+                            sweep: sweep_index,
+                            damping,
+                            converged: false,
+                        });
+                        break;
+                    }
+                }
+            }
+            let step_params = params.clone();
             let mut step = vec![0.0_f64; layout.total];
-            let mut prediction = 0.0;
-            let coupled_prediction = stage.converge.then(|| coupled_step(
-                &layout, &problem, &params, options, &blocks, &penalties, &lambdas,
-                &roles, &pass, hessian_scale, damping, &mut step,
-            )).flatten();
-            if let Some(value) = coupled_prediction {
-                prediction = value;
-            } else {
             for (index, block) in blocks.iter().enumerate() {
                 if block.kind == BlockKind::Residual {
                     continue;
                 }
                 let (prior_gradient, prior_curvature) =
                     prior_terms(&problem, &roles, &params, options, block);
-                prediction += solve_block(
+                solve_block(
                     &layout,
                     block,
                     &mut step,
@@ -1247,14 +1288,12 @@ fn run_inner(
                     StepLimit::PerBlock,
                 );
             }
-            }
             if kinds.contains(&BlockKind::Residual) {
-                let lambda = lam(&lambdas, BlockKind::Residual);
                 let delta = residual_step(
                     &pass.residual_samples,
                     &pass.residual_gradient,
                     &params.theta[layout.residual.clone()],
-                    lambda,
+                    lam(&lambdas, BlockKind::Residual),
                     damping,
                     hessian_scale,
                     StepLimit::PerBlock,
@@ -1263,124 +1302,33 @@ fn run_inner(
                     step[layout.residual.start + index] = *value;
                 }
             }
-            let step_max = step
-                .iter()
-                .filter(|value| value.is_finite())
-                .fold(0.0_f64, |largest, value| largest.max(value.abs()));
-            let step_params = params.clone();
-            let mut directional_reduction = 0.0;
-            if stage.converge {
-                for (index, block) in blocks.iter().enumerate() {
-                    if block.kind == BlockKind::Residual {
-                        continue;
-                    }
-                    let gradients = block_gradients(
-                        &layout, &problem, &params, options, block, &penalties[index],
-                        block_lambda(block, &lambdas), &roles,
-                    );
-                    directional_reduction -= gradients.iter().zip(&block.params)
-                        .map(|(gradient, global)| gradient * step[*global]).sum::<f64>();
-                }
-            }
-            if stage.converge {
-                apply_step_unclamped(&mut params, &step);
-            } else {
-                apply_step(&mut params, &step);
-            }
+            apply_step(&mut params, &step);
             if kinds.contains(&BlockKind::Residual) {
                 pin_residual(&mut params, &layout, &pass.residual_samples);
-                let lambda = lam(&lambdas, BlockKind::Residual);
-                let ridge = 2.0 * lambda;
-                let identity = identity_weight(BlockKind::Residual);
-                let penalty = residual_penalty_diagonal();
-                let before = &step_params.theta[layout.residual.clone()];
-                let after = &params.theta[layout.residual.clone()];
-                let mut rhs = vec![0.0_f64; RESIDUAL_COEFS];
-                let mut effective = vec![0.0_f64; RESIDUAL_COEFS];
-                for index in 0..RESIDUAL_COEFS {
-                    effective[index] = after[index] - before[index];
-                    rhs[index] = pass.residual_gradient[index]
-                        - ridge * laplacian_at(before, index, &penalty)
-                        - identity * before[index];
-                }
-                let mut curvature = vec![0.0_f64; RESIDUAL_COEFS];
-                residual_undamped_apply(
-                    &pass.residual_samples,
-                    &effective,
-                    &mut curvature,
-                    &penalty,
-                    ridge,
-                    identity,
-                    hessian_scale,
-                );
-                let first: f64 = rhs.iter().zip(effective.iter()).map(|(r, d)| r * d).sum();
-                let quadratic: f64 = effective
-                    .iter()
-                    .zip(curvature.iter())
-                    .map(|(d, b)| d * b)
-                    .sum();
-                directional_reduction += first;
-                prediction += first - 0.5 * quadratic;
             }
-            let full_prediction = prediction;
-            let mut fraction = 1.0;
-            let (trial, trial_cost) = loop {
-                let trial = stage_problem.pass(
-                    &params,
-                    stage.active,
-                    &mut [],
-                    false,
-                    false,
-                    stage.neutral,
-                    IntentFilter::NativeOnly,
-                );
-                evaluations += 1;
-                sample_evaluations += samples_per_pass;
-                let trial_cost = trial.cost
-                    + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
-                if !stage.converge || accepted(cost, trial_cost)
-                    || directional_reduction <= 0.0
-                    || sample_evaluations.get() as f64 + samples_per_pass as f64 > options.sweep_budget
-                {
-                    break (trial, trial_cost);
-                }
-                fraction *= 0.5;
-                let mut changed = false;
-                for (global, value) in params.theta.iter_mut().enumerate() {
-                    let next = if step[global].is_finite() {
-                        step_params.theta[global] + fraction * step[global]
-                    } else {
-                        step_params.theta[global]
-                    };
-                    changed |= next != *value;
-                    *value = next;
-                }
-                if kinds.contains(&BlockKind::Residual) {
-                    pin_residual(&mut params, &layout, &pass.residual_samples);
-                }
-                prediction = fraction * directional_reduction
-                    - fraction * fraction * (directional_reduction - full_prediction);
-                if !changed {
-                    break (trial, trial_cost);
-                }
-            };
-            let step_max = fraction * step_max;
-            if !accepted(cost, trial_cost) {
+            let trial = stage_problem.pass(
+                &params,
+                stage.active,
+                &mut [],
+                false,
+                false,
+                stage.neutral,
+                IntentFilter::NativeOnly,
+            );
+            evaluations += 1;
+            sample_evaluations += samples_per_pass;
+            let trial_cost =
+                trial.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
+            if trial.infeasible || !accepted(cost, trial_cost) {
                 params = step_params;
                 damping = (damping * 10.0).min(1e6_f64);
-                if fit_diag() && stage.converge {
+                if fit_diag() {
                     eprintln!(
-                        "fit stage {stage_index} sweep {sweep_index} rejected trial {trial_cost:.12e} current {cost:.12e} step {step_max:.9e} prediction {prediction:.9e} damping {damping:.3e} history {}",
+                        "fit stage {stage_index} sweep {sweep_index} rejected trial {trial_cost:.12e} current {cost:.12e} damping {damping:.3e} history {}",
                         recent.len()
                     );
                 }
                 if damping >= 1e6 {
-                    if fit_diag() {
-                        eprintln!(
-                            "fit checkpoint stage {stage_index} sweep {sweep_index} reason damping damping {damping:.3e} history {}",
-                            recent.len()
-                        );
-                    }
                     resume_state = Some(FitState {
                         theta: params.theta.clone(),
                         lambdas,
@@ -1392,32 +1340,6 @@ fn run_inner(
                     break;
                 }
                 continue;
-            }
-            let ratio = if prediction.is_finite() && prediction > 0.0 {
-                (cost - trial_cost) / prediction
-            } else {
-                f64::NAN
-            };
-            if fraction < 1.0 {
-                damping = (damping * 2.0).min(1e6);
-            } else if ratio.is_finite() {
-                if ratio > 0.75 {
-                    damping = (damping * 0.3).max(1e-6);
-                } else if ratio < 0.25 {
-                    damping = (damping * 2.0).min(1e6);
-                }
-            }
-            if fit_diag() && stage.converge {
-                eprintln!(
-                    "fit stage {stage_index} sweep {sweep_index} accepted trial {trial_cost:.12e} ratio {ratio:.6} prediction {prediction:.9e} step {step_max:.9e} damping {damping:.3e} history {}",
-                    recent.len()
-                );
-            }
-            if fit_diag() && stage.converge && matches!(sweep_index, 96 | 112 | 127) {
-                diagnose_directional_curvature(
-                    stage_problem, &step_params, &params, options, &blocks, &penalties,
-                    &lambdas, &roles, &pass, hessian_scale, stage.active, stage.neutral,
-                );
             }
             update_sigma(stage_problem, &mut params, &trial, options);
             accepted_state = true;
@@ -1432,14 +1354,7 @@ fn run_inner(
                     recent
                 );
                 print_block_gradients(
-                    "final",
-                    &layout,
-                    &problem,
-                    &params,
-                    options,
-                    &blocks,
-                    &penalties,
-                    &lambdas,
+                    "final", &layout, &problem, &params, options, &blocks, &penalties, &lambdas,
                     &roles,
                 );
             }
@@ -1774,6 +1689,9 @@ fn run_inner(
         sigma_v: sigma_v.clone(),
         gcv: lambdas,
         hessian_samples: problem.hessian.len(),
+        excluded_samples: problem.excluded_samples,
+        excluded_regions: problem.excluded_regions.clone(),
+        operator_rows,
         objective_samples: problem.samples.len(),
         quarantined: image_stats
             .iter()
@@ -1810,6 +1728,425 @@ fn run_inner(
         },
         resume_state,
     ))
+}
+
+enum FinalOutcome {
+    Accepted(Box<PassOutput>),
+    Budget,
+    Stalled,
+}
+
+/// One damped joint step at the frozen linearization, retried at higher damping until the objective decreases or damping caps.
+#[allow(clippy::too_many_arguments)]
+fn final_stage_step(
+    layout: &Layout,
+    problem: &Problem,
+    stage_problem: &Problem,
+    stage: &Stage,
+    options: &FitOptions,
+    params: &mut Params,
+    blocks: &[BlockAcc],
+    penalties: &[Vec<f64>],
+    lambdas: &StageLambdas,
+    roles: &[Role],
+    pass: &PassOutput,
+    data_scale: f64,
+    cost: f64,
+    damping: &mut f64,
+    gradient_scale: &mut Option<f64>,
+    evaluations: &mut usize,
+    sample_evaluations: &mut SampleEvaluations,
+    samples_per_pass: usize,
+    stage_index: usize,
+    sweep_index: usize,
+    history: usize,
+    warm: &mut Option<Vec<f64>>,
+) -> FinalOutcome {
+    let entry_damping = *damping;
+    let model = match JointModel::new(
+        layout, problem, params, options, blocks, penalties, lambdas, roles, pass, data_scale,
+        true, false,
+    ) {
+        Ok(model) => model,
+        Err(failure) => {
+            if fit_diag() {
+                eprintln!(
+                    "fit stage {stage_index} sweep {sweep_index} joint model failed: {}",
+                    failure.label()
+                );
+            }
+            return FinalOutcome::Stalled;
+        }
+    };
+    let outcome = joint_attempts(
+        &model,
+        layout,
+        problem,
+        stage_problem,
+        stage,
+        options,
+        params,
+        blocks,
+        penalties,
+        lambdas,
+        pass,
+        data_scale,
+        cost,
+        damping,
+        gradient_scale,
+        evaluations,
+        sample_evaluations,
+        samples_per_pass,
+        stage_index,
+        sweep_index,
+        history,
+        warm,
+    );
+    if !matches!(outcome, FinalOutcome::Stalled) {
+        return outcome;
+    }
+    if fit_diag() {
+        eprintln!(
+            "fit stage {stage_index} sweep {sweep_index} falling back to the GN curvature model"
+        );
+    }
+    *damping = entry_damping;
+    match JointModel::new(
+        layout, problem, params, options, blocks, penalties, lambdas, roles, pass, data_scale,
+        false, false,
+    ) {
+        Ok(model) => joint_attempts(
+            &model,
+            layout,
+            problem,
+            stage_problem,
+            stage,
+            options,
+            params,
+            blocks,
+            penalties,
+            lambdas,
+            pass,
+            data_scale,
+            cost,
+            damping,
+            gradient_scale,
+            evaluations,
+            sample_evaluations,
+            samples_per_pass,
+            stage_index,
+            sweep_index,
+            history,
+            warm,
+        ),
+        Err(failure) => {
+            if fit_diag() {
+                eprintln!(
+                    "fit stage {stage_index} sweep {sweep_index} GN model failed: {}",
+                    failure.label()
+                );
+            }
+            outcome
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn joint_attempts(
+    model: &JointModel,
+    layout: &Layout,
+    problem: &Problem,
+    stage_problem: &Problem,
+    stage: &Stage,
+    options: &FitOptions,
+    params: &mut Params,
+    blocks: &[BlockAcc],
+    penalties: &[Vec<f64>],
+    lambdas: &StageLambdas,
+    pass: &PassOutput,
+    data_scale: f64,
+    cost: f64,
+    damping: &mut f64,
+    gradient_scale: &mut Option<f64>,
+    evaluations: &mut usize,
+    sample_evaluations: &mut SampleEvaluations,
+    samples_per_pass: usize,
+    stage_index: usize,
+    sweep_index: usize,
+    history: usize,
+    warm: &mut Option<Vec<f64>>,
+) -> FinalOutcome {
+    let norm = crate::solve::dot(&model.rhs, &model.rhs).sqrt();
+    let reference = *gradient_scale.get_or_insert(norm.max(1e-300));
+    let tolerance = (0.02 * norm / reference).clamp(1e-3, 0.02);
+    let residual_active = blocks.iter().any(|block| block.kind == BlockKind::Residual);
+    let mut attempts = 0usize;
+    loop {
+        if sample_evaluations.get() as f64 + samples_per_pass as f64 > options.sweep_budget {
+            return FinalOutcome::Budget;
+        }
+        attempts += 1;
+        let outcome = JointSolve::new(model, *damping).and_then(|solve| {
+            solve.solve(model, tolerance, Some(STEP_RADIUS), warm.as_deref())
+        });
+        let solution = match outcome {
+            Ok(solution) if solution.relative_residual <= tolerance => solution,
+            Ok(solution) if solution.relative_residual <= INEXACT_DESCENT_RESIDUAL => {
+                // Ordinary descent takes the inexact step; the trial's gain ratio decides it.
+                if fit_diag() {
+                    eprintln!(
+                        "fit stage {stage_index} sweep {sweep_index} inexact step ({}) residual {:.3e} tolerance {:.3e} damping {:.3e} attempt {attempts}",
+                        solution.failure.map_or("residual", SolveFailure::label),
+                        solution.relative_residual,
+                        tolerance,
+                        *damping
+                    );
+                }
+                solution
+            }
+            Ok(solution) => {
+                if fit_diag() {
+                    eprintln!(
+                        "fit stage {stage_index} sweep {sweep_index} joint solve failed ({}) residual {:.3e} tolerance {:.3e} damping {:.3e} attempt {attempts}",
+                        solution.failure.map_or("residual", SolveFailure::label),
+                        solution.relative_residual,
+                        tolerance,
+                        *damping
+                    );
+                }
+                *damping = (*damping * 10.0).min(1e6);
+                if *damping >= 1e6 || attempts >= 12 {
+                    return FinalOutcome::Stalled;
+                }
+                continue;
+            }
+            Err(failure) => {
+                if fit_diag() {
+                    eprintln!(
+                        "fit stage {stage_index} sweep {sweep_index} joint solve failed ({}) damping {:.3e} attempt {attempts}",
+                        failure.label(),
+                        *damping
+                    );
+                }
+                *damping = (*damping * 10.0).min(1e6);
+                if *damping >= 1e6 || attempts >= 12 {
+                    return FinalOutcome::Stalled;
+                }
+                continue;
+            }
+        };
+        *warm = Some(solution.delta[..model.outer_count].to_vec());
+        let mut step = vec![0.0_f64; layout.total];
+        for (index, value) in solution.delta.iter().enumerate() {
+            step[model.globals[index]] = *value;
+        }
+        let residual_delta = if residual_active {
+            residual_step(
+                &pass.residual_samples,
+                &pass.residual_gradient,
+                &params.theta[layout.residual.clone()],
+                lam(lambdas, BlockKind::Residual),
+                *damping,
+                data_scale,
+                StepLimit::PerBlock,
+            )
+        } else {
+            Vec::new()
+        };
+        let step_max = step
+            .iter()
+            .chain(residual_delta.iter())
+            .filter(|value| value.is_finite())
+            .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+        let mut trial_params = params.clone();
+        apply_step_unclamped(&mut trial_params, &step);
+        for (index, value) in residual_delta.iter().enumerate() {
+            trial_params.theta[layout.residual.start + index] += value;
+        }
+        let mut prediction = solution.prediction;
+        let mut residual_part = 0.0_f64;
+        let mut cross_part = 0.0_f64;
+        if residual_active {
+            pin_residual(&mut trial_params, layout, &pass.residual_samples);
+            let effective: Vec<f64> = (0..RESIDUAL_COEFS)
+                .map(|index| {
+                    trial_params.theta[layout.residual.start + index]
+                        - params.theta[layout.residual.start + index]
+                })
+                .collect();
+            residual_part =
+                residual_prediction(layout, pass, params, &effective, lambdas, data_scale);
+            let cross = residual_cross(
+                &pass.coupled_rows,
+                &layout.residual,
+                model.robust,
+                &step,
+                &effective,
+                data_scale,
+            );
+            cross_part = cross;
+            prediction += residual_part - cross;
+        }
+        let step_worst = step
+            .iter()
+            .chain(residual_delta.iter())
+            .enumerate()
+            .filter(|(_, value)| value.is_finite())
+            .fold((0usize, 0.0_f64), |(index, largest), (slot, value)| {
+                if value.abs() > largest {
+                    (slot, value.abs())
+                } else {
+                    (index, largest)
+                }
+            });
+        let trial = stage_problem.pass(
+            &trial_params,
+            stage.active,
+            &mut [],
+            false,
+            false,
+            stage.neutral,
+            IntentFilter::NativeOnly,
+        );
+        *evaluations += 1;
+        *sample_evaluations += samples_per_pass;
+        let trial_cost =
+            trial.cost + total_cost(problem, &trial_params, blocks, penalties, lambdas, options);
+        if trial.infeasible {
+            if fit_diag() {
+                eprintln!(
+                    "fit stage {stage_index} sweep {sweep_index} infeasible trial damping {:.3e} attempt {attempts}",
+                    *damping
+                );
+            }
+            *damping = (*damping * 10.0).min(1e6);
+            if *damping >= 1e6 || attempts >= 12 {
+                return FinalOutcome::Stalled;
+            }
+            continue;
+        }
+        let decrease = cost - trial_cost;
+        let ratio = if prediction.is_finite() && prediction > 0.0 {
+            decrease / prediction
+        } else {
+            f64::NAN
+        };
+        let improves = if cost.is_finite() {
+            decrease > 1e-12 * cost.abs().max(1.0) && ratio >= 1e-4
+        } else {
+            true
+        };
+        if trial_cost.is_finite() && improves {
+            *params = trial_params;
+            if ratio > 0.75 {
+                *damping = (*damping * 0.3).max(1e-6);
+            } else if ratio < 0.25 {
+                *damping = (*damping * 2.0).min(1e6);
+            }
+            if fit_diag() {
+                eprintln!(
+                    "fit stage {stage_index} sweep {sweep_index} accepted trial {trial_cost:.12e} ratio {ratio:.6} prediction {prediction:.9e} joint prediction {:.9e} residual prediction {residual_part:.9e} cross {cross_part:.9e} step {step_max:.9e} at {} damping {:.3e} iterations {} residual {:.3e} history {history}",
+                    solution.prediction,
+                    step_worst.0,
+                    *damping,
+                    solution.iterations,
+                    solution.relative_residual
+                );
+            }
+            return FinalOutcome::Accepted(Box::new(trial));
+        }
+        if fit_diag() {
+            eprintln!(
+                "fit stage {stage_index} sweep {sweep_index} rejected trial {trial_cost:.12e} current {cost:.12e} ratio {ratio:.6} prediction {prediction:.9e} step {step_max:.9e} damping {:.3e} attempt {attempts}",
+                *damping
+            );
+        }
+        *damping = (*damping * 10.0).min(1e6);
+        if *damping >= 1e6 || attempts >= 12 {
+            return FinalOutcome::Stalled;
+        }
+    }
+}
+
+/// Residual-grid share of the model prediction for the applied residual delta.
+#[allow(clippy::too_many_arguments)]
+fn residual_prediction(
+    layout: &Layout,
+    pass: &PassOutput,
+    params: &Params,
+    delta: &[f64],
+    lambdas: &StageLambdas,
+    data_scale: f64,
+) -> f64 {
+    let ridge = 2.0 * lam(lambdas, BlockKind::Residual);
+    let identity = identity_weight(BlockKind::Residual);
+    let penalty = residual_penalty_diagonal();
+    let before = &params.theta[layout.residual.clone()];
+    let mut rhs = vec![0.0_f64; RESIDUAL_COEFS];
+    for index in 0..RESIDUAL_COEFS {
+        rhs[index] = pass.residual_gradient[index]
+            - ridge * laplacian_at(before, index, &penalty)
+            - identity * before[index];
+    }
+    let mut curvature = vec![0.0_f64; RESIDUAL_COEFS];
+    residual_undamped_apply(
+        &pass.residual_samples,
+        delta,
+        &mut curvature,
+        &penalty,
+        ridge,
+        identity,
+        data_scale,
+    );
+    crate::solve::dot(&rhs, delta) - 0.5 * crate::solve::dot(delta, &curvature)
+}
+
+/// `δ_lᵀ B_lr δ_r` over the retained rows: the GN, Student-t and barrier cross terms between
+/// the joint step and the residual step, projected from the same rows.
+fn residual_cross(
+    rows: &[crate::problem::HessianRow],
+    residual: &core::ops::Range<usize>,
+    robust: bool,
+    step: &[f64],
+    residual_step: &[f64],
+    data_scale: f64,
+) -> f64 {
+    let mut total = 0.0_f64;
+    for row in rows {
+        if row.residual_columns.is_empty() {
+            continue;
+        }
+        let mut projected = [0.0_f64; 3];
+        let mut robust_projection = 0.0_f64;
+        let mut margin_projection = 0.0_f64;
+        for (position, (column, derivative)) in row.columns.iter().enumerate() {
+            let value = step[*column as usize];
+            projected[0] += derivative[0] * value;
+            projected[1] += derivative[1] * value;
+            projected[2] += derivative[2] * value;
+            robust_projection += row.robust_terms[position] * value;
+            margin_projection += row.margin_terms[position] * value;
+        }
+        let mut residual_projected = [0.0_f64; 3];
+        let mut residual_robust = 0.0_f64;
+        let mut residual_margin = 0.0_f64;
+        for (column, derivative, robust_term, margin_term) in &row.residual_columns {
+            let value = residual_step[*column as usize - residual.start];
+            residual_projected[0] += derivative[0] * value;
+            residual_projected[1] += derivative[1] * value;
+            residual_projected[2] += derivative[2] * value;
+            residual_robust += robust_term * value;
+            residual_margin += margin_term * value;
+        }
+        total += row.weight * dot3(projected, residual_projected)
+            + if robust {
+                row.robust * robust_projection * residual_robust
+            } else {
+                0.0
+            }
+            + row.barrier * margin_projection * residual_margin;
+    }
+    data_scale * total
 }
 
 fn carry_params(
@@ -2281,12 +2618,14 @@ fn build_support(
     Support { controls }
 }
 
-fn initial_params(problem: &Problem) -> Params {
+fn initial_params(problem: &Problem, options: &FitOptions) -> Params {
     let mut params = Params::initial(problem.layout.clone(), problem.contributors.len());
     for (index, image) in problem.images.iter().enumerate() {
         let range = params.layout.image(index);
         params.theta[range.start] = image.exposure_hint.clamp(-8.0, 8.0);
     }
+    // The clip prior mean is the declared clip.
+    params.theta[problem.layout.clip] = zeta_from_clip(options.clip_prior.0);
     params
 }
 
@@ -2629,10 +2968,7 @@ fn penalty_for(kind: BlockKind) -> Vec<f64> {
                         .enumerate()
                         .filter(|(_, value)| **value != 0.0)
                         .map(|(s_index, value)| {
-                            (
-                                S_COEFS + VOLUME_COEFS + s_index * CORE_TERMS + term,
-                                *value,
-                            )
+                            (S_COEFS + VOLUME_COEFS + s_index * CORE_TERMS + term, *value)
                         })
                         .collect();
                     accumulate_row(&mut s, n, &indices);
@@ -3018,7 +3354,11 @@ fn total_cost(
     let mut cost = prior_cost(problem, params, options);
     for (index, block) in blocks.iter().enumerate() {
         if block.kind == BlockKind::Residual {
-            cost += residual_cost(&problem.layout, &params.theta, lam(lambdas, BlockKind::Residual));
+            cost += residual_cost(
+                &problem.layout,
+                &params.theta,
+                lam(lambdas, BlockKind::Residual),
+            );
             continue;
         }
         cost += block_lambda(block, lambdas)
@@ -3071,6 +3411,9 @@ fn choose_lambdas(
         if block.kind == BlockKind::Nuisance || lam(lambdas, block.kind) != 0.0 {
             continue;
         }
+        if fit_diag() {
+            eprintln!("fit gcv search block {:?}", block.kind);
+        }
         let choice = if block.kind == BlockKind::Residual {
             let identity = identity_weight(BlockKind::Residual);
             let diagonal: Vec<f64> = residual_diagonal(&pass.residual_samples)
@@ -3120,7 +3463,7 @@ fn choose_lambdas(
                 .map(|((prior, curvature), theta)| prior + curvature * theta)
                 .collect();
             let hessian: Vec<f64> = block
-                .hessian
+                .gn_hessian
                 .iter()
                 .map(|value| value * hessian_scale)
                 .collect();
@@ -3156,6 +3499,12 @@ fn choose_lambdas(
             value = value.max(RESPONSE_LAMBDA_FLOOR);
         }
         set_lam(lambdas, block.kind, value);
+        if fit_diag() {
+            eprintln!(
+                "fit gcv block {:?} choice {:.6e} used {value:.6e} admissible {} scale {:.6e}",
+                block.kind, choice.lambda, choice.admissible, choice.scale
+            );
+        }
     }
 }
 
@@ -3264,7 +3613,9 @@ fn block_gradient_peak(
     lambda: f64,
     roles: &[Role],
 ) -> (f64, Option<usize>) {
-    let gradients = block_gradients(layout, problem, params, options, block, penalty, lambda, roles);
+    let gradients = block_gradients(
+        layout, problem, params, options, block, penalty, lambda, roles,
+    );
     let mut largest = 0.0_f64;
     let mut worst = None;
     for (local, gradient) in gradients.iter().enumerate() {
@@ -3276,37 +3627,41 @@ fn block_gradient_peak(
     (largest, worst)
 }
 
+/// Inputs shared by [`gradient_max`] and its block scans.
+struct GradientArgs<'a> {
+    layout: &'a Layout,
+    problem: &'a Problem,
+    params: &'a Params,
+    options: &'a FitOptions,
+    blocks: &'a [BlockAcc],
+    penalties: &'a [Vec<f64>],
+    lambdas: &'a StageLambdas,
+    roles: &'a [Role],
+}
+
 /// Largest absolute derivative of the penalized objective over the active blocks.
-fn gradient_max(
-    layout: &Layout,
-    problem: &Problem,
-    params: &Params,
-    options: &FitOptions,
-    blocks: &[BlockAcc],
-    penalties: &[Vec<f64>],
-    lambdas: &StageLambdas,
-    roles: &[Role],
-) -> f64 {
-    blocks
+fn gradient_max(args: GradientArgs<'_>) -> f64 {
+    args.blocks
         .iter()
         .enumerate()
         .filter(|(_, block)| block.kind != BlockKind::Residual && !block.params.is_empty())
         .map(|(index, block)| {
             block_gradient_peak(
-                layout,
-                problem,
-                params,
-                options,
+                args.layout,
+                args.problem,
+                args.params,
+                args.options,
                 block,
-                &penalties[index],
-                block_lambda(block, lambdas),
-                roles,
+                &args.penalties[index],
+                block_lambda(block, args.lambdas),
+                args.roles,
             )
             .0
         })
         .fold(0.0_f64, f64::max)
 }
 
+/// `E = ½gᵀB⁻¹g` on the joint metric, certified by `½zᵀBz + zᵀr + ½rᵀP₀⁻¹r` for `r = g − Bz` and diagonal floor `P₀`.
 #[allow(clippy::too_many_arguments)]
 fn stationarity_decrement(
     layout: &Layout,
@@ -3319,30 +3674,103 @@ fn stationarity_decrement(
     roles: &[Role],
     pass: &PassOutput,
     data_scale: f64,
+    warm: &mut Option<Vec<f64>>,
 ) -> f64 {
-    let Some(system) = CoupledSystem::new(
-        layout, problem, params, options, blocks, penalties, lambdas, roles, pass, data_scale, 0.0,
-    ) else {
-        return f64::INFINITY;
+    stationarity_bound(
+        layout, problem, params, options, blocks, penalties, lambdas, roles, pass, data_scale,
+        warm,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stationarity_bound(
+    layout: &Layout,
+    problem: &Problem,
+    params: &Params,
+    options: &FitOptions,
+    blocks: &[BlockAcc],
+    penalties: &[Vec<f64>],
+    lambdas: &StageLambdas,
+    roles: &[Role],
+    pass: &PassOutput,
+    data_scale: f64,
+    warm: &mut Option<Vec<f64>>,
+) -> f64 {
+    let model = match JointModel::new(
+        layout, problem, params, options, blocks, penalties, lambdas, roles, pass, data_scale,
+        false, false,
+    ) {
+        Ok(model) => model,
+        Err(failure) => {
+            if fit_diag() {
+                eprintln!("fit certificate model failed: {}", failure.label());
+            }
+            return f64::INFINITY;
+        }
     };
-    let lower_bound = if system.exact_data.is_some() { 0.0 } else { system.energy_lower_bound() };
+    let solve = match JointSolve::new(&model, 0.0) {
+        Ok(solve) => solve,
+        Err(failure) => {
+            if fit_diag() {
+                eprintln!("fit certificate factor failed: {}", failure.label());
+            }
+            return f64::INFINITY;
+        }
+    };
+    let lower_bound = solve.energy_lower_bound(&model);
     if lower_bound > STATIONARY_DECREMENT_NATS {
         if fit_diag() {
-            eprintln!("fit decrement rejected by lower bound {lower_bound:.9e} nats");
+            eprintln!("fit certificate lower bound {lower_bound:.9e} nats");
         }
         return lower_bound;
     }
-    let Some(solution) = system.solve() else {
-        return f64::INFINITY;
+    let solution = match solve.solve(&model, CERTIFICATE_TOLERANCE, None, warm.as_deref()) {
+        Ok(solution) => solution,
+        Err(failure) => {
+            if fit_diag() {
+                eprintln!("fit certificate solve failed: {}", failure.label());
+            }
+            return f64::INFINITY;
+        }
     };
-    let mut energy = 0.5 * crate::solve::dot(&system.rhs, &solution);
-    if !energy.is_finite() || energy < 0.0 {
+    *warm = Some(solution.delta[..model.outer_count].to_vec());
+    let mut quadratic = 0.0_f64;
+    let mut first = 0.0_f64;
+    let mut residual_correction = 0.0_f64;
+    for index in 0..model.dim {
+        let residual = model.rhs[index] - solution.curvature[index];
+        // `λP` is only positive semidefinite, so `diag(λP)` is not a lower bound of `λP`
+        // in Loewner order; only the fixed prior floor is.
+        let floor = model.fixed[index];
+        if floor <= 0.0 || !floor.is_finite() {
+            if fit_diag() {
+                eprintln!("fit certificate has no SPD prior floor at joint coordinate {index}");
+            }
+            return f64::INFINITY;
+        }
+        quadratic += solution.delta[index] * solution.curvature[index];
+        first += solution.delta[index] * residual;
+        residual_correction += residual * residual / floor;
+    }
+    let bound = 0.5 * quadratic + first + 0.5 * residual_correction;
+    if fit_diag() {
+        eprintln!(
+            "fit certificate bound {bound:.9e} nats quadratic {quadratic:.9e} first {first:.9e} residual {residual_correction:.9e} iterations {} relative {:.3e} stalled {} joint {} outer {} border {}",
+            solution.iterations,
+            solution.relative_residual,
+            solution.failure.is_some(),
+            model.dim,
+            model.outer_count,
+            model.border_count
+        );
+    }
+    if !bound.is_finite() || bound < 0.0 {
         return f64::INFINITY;
     }
     if blocks.iter().any(|block| block.kind == BlockKind::Residual) {
-        energy += residual_decrement(pass, layout, params, lambdas, data_scale);
+        return bound + residual_decrement(pass, layout, params, lambdas, data_scale);
     }
-    energy
+    bound
 }
 
 #[cfg(test)]
@@ -3361,380 +3789,942 @@ fn undamped_decrement(mut curvature: Vec<f64>, rhs: &[f64]) -> f64 {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn diagnose_directional_curvature(
-    problem: &Problem, before: &Params, after: &Params, options: &FitOptions,
-    blocks: &[BlockAcc], penalties: &[Vec<f64>], lambdas: &StageLambdas,
-    roles: &[Role], pass: &PassOutput, data_scale: f64, active: ActiveColumns, neutral: bool,
-) {
-    let layout = &problem.layout;
-    let gradient = diagnostic_gradient_parts(problem, before, options, blocks, penalties, lambdas, roles, pass);
-    let accepted: Vec<f64> = after.theta.iter().zip(&before.theta).map(|(a, b)| a - b).collect();
-    let mut steepest: Vec<f64> = gradient.iter().map(|parts| -parts.iter().sum::<f64>()).collect();
-    let norm = steepest.iter().fold(0.0_f64, |max, value| max.max(value.abs()));
-    if norm > 0.0 {
-        for value in &mut steepest {
-            *value /= norm;
-        }
-    }
-    let mut diagnostic_blocks: Vec<BlockAcc> = blocks.iter().map(|block| {
-        let mut copy = BlockAcc::new(block.kind, block.params.clone(), layout.total);
-        copy.image = block.image;
-        copy
-    }).collect();
-    let full_pass = problem.pass_with_rows(
-        before, active, &mut diagnostic_blocks, false, false, neutral, IntentFilter::NativeOnly, true, true,
-    );
-    let full_models = [&accepted, &steepest].map(|direction| {
-        diagnostic_model_curvature(
-            problem, before, options, &diagnostic_blocks, penalties, lambdas, roles,
-            &full_pass, 1.0, false, direction,
-        )
-    });
-    let sigma: Vec<f64> = (0..problem.contributors.len()).map(|i| before.sigma(i)).collect();
-    eprintln!("fit curvature start images {} sigma_v {sigma:?} sampled_rows {} all_rows {}",
-        problem.images.len(), pass.hessian_rows, full_pass.hessian_rows);
-    for (which, direction) in [accepted, steepest].iter().enumerate() {
-        let label = if which == 0 { "accepted" } else { "steepest" };
-        let model = diagnostic_model_curvature(
-            problem, before, options, blocks, penalties, lambdas, roles,
-            pass, data_scale, true, direction,
-        );
-        let mut groups: Vec<(Option<BlockKind>, Role, f64, f64)> = Vec::new();
-        for (global, value) in direction.iter().enumerate().filter(|(_, value)| **value != 0.0) {
-            let kind = kind_of(layout, global);
-            let role = match roles[global] {
-                Role::Exposure(_) => Role::Exposure(0),
-                Role::Wb(_) => Role::Wb(0),
-                Role::Mode(_) => Role::Mode(0),
-                role => role,
-            };
-            if let Some(group) = groups.iter_mut().find(|group| group.0 == kind && group.1 == role) {
-                group.2 += value * value;
-                group.3 = group.3.max(value.abs());
-            } else {
-                groups.push((kind, role, value * value, value.abs()));
-            }
-        }
-        for (kind, role, squared_norm, peak) in groups {
-            eprintln!("fit curvature direction {label} role {kind:?}/{role:?} norm {:.9e} max {peak:.9e}", squared_norm.sqrt());
-        }
-        for h in [1e-3, 1e-4] {
-            let gradients = [-h, h].map(|offset| {
-                let mut perturbed = before.clone();
-                for (theta, value) in perturbed.theta.iter_mut().zip(direction) {
-                    *theta += offset * value;
-                }
-                for block in &mut diagnostic_blocks {
-                    block.reset();
-                }
-                let perturbed_pass = problem.pass(
-                    &perturbed, active, &mut diagnostic_blocks, false, false, neutral, IntentFilter::NativeOnly,
-                );
-                let parts = diagnostic_gradient_parts(
-                    problem, &perturbed, options, &diagnostic_blocks, penalties, lambdas, roles, &perturbed_pass,
-                );
-                let mut projected = [0.0; 4];
-                for (values, value) in parts.iter().zip(direction) {
-                    for component in 0..4 {
-                        projected[component] += values[component] * value;
-                    }
-                }
-                projected
-            });
-            let actual = std::array::from_fn::<_, 4, _>(|i| (gradients[1][i] - gradients[0][i]) / (2.0 * h));
-            let full = full_models[which];
-            eprintln!("fit curvature {label} h {h:.1e} sampled {:.12e} true {:.12e} all {:.12e} data {:.12e}/{:.12e}/{:.12e} prior {:.12e}/{:.12e}/{:.12e} identity {:.12e}/{:.12e}/{:.12e} penalty {:.12e}/{:.12e}/{:.12e}",
-                model.iter().sum::<f64>(), actual.iter().sum::<f64>(), full.iter().sum::<f64>(),
-                model[0], actual[0], full[0], model[1], actual[1], full[1],
-                model[2], actual[2], full[2], model[3], actual[3], full[3]);
+/// Retained-row bound for the final-stage operator; a row costs about 270 entries, so this
+/// is roughly 70 MB. Above it the operator keeps the scaled `hessian_samples` subset.
+const FULL_ROW_LIMIT: usize = 8192;
+
+/// Outer conjugate-gradient iterations between explicit-residual checks.
+const JOINT_CG_CHUNK: usize = 64;
+
+/// Hard limit on outer conjugate-gradient iterations; the stall detector ends a solve that
+/// stops improving well before it.
+const JOINT_CG_LIMIT: usize = 4096;
+
+/// Relative residual the final stationarity certificate must reach.
+const CERTIFICATE_TOLERANCE: f64 = 1e-10;
+
+/// Why a joint step was not returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SolveFailure {
+    /// The iteration limit or the stall detector stopped the solve.
+    WorkLimit,
+    /// The operator lost positive curvature.
+    NonpositiveCurvature,
+    /// An image or border factorization failed.
+    Factorization(&'static str),
+    /// Non-finite arithmetic.
+    Nonfinite,
+}
+
+impl SolveFailure {
+    fn label(self) -> &'static str {
+        match self {
+            Self::WorkLimit => "work limit",
+            Self::NonpositiveCurvature => "nonpositive curvature",
+            Self::Factorization("image") => "factorization (image)",
+            Self::Factorization("border") => "factorization (border)",
+            Self::Factorization(_) => "factorization",
+            Self::Nonfinite => "nonfinite arithmetic",
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn diagnostic_gradient_parts(
-    problem: &Problem, params: &Params, options: &FitOptions, blocks: &[BlockAcc],
-    penalties: &[Vec<f64>], lambdas: &StageLambdas, roles: &[Role], pass: &PassOutput,
-) -> Vec<[f64; 4]> {
-    let layout = &problem.layout;
-    let mut parts = vec![[0.0; 4]; layout.total];
-    for (index, block) in blocks.iter().enumerate() {
-        if block.kind == BlockKind::Residual {
-            let diagonal = residual_penalty_diagonal();
-            let theta = &params.theta[layout.residual.clone()];
-            for i in 0..RESIDUAL_COEFS {
-                parts[layout.residual.start + i] = [
-                    -pass.residual_gradient[i], 0.0, identity_weight(BlockKind::Residual) * theta[i],
-                    2.0 * lambdas.residual * laplacian_at(theta, i, &diagonal),
-                ];
-            }
-            continue;
-        }
-        let (prior, _) = prior_terms(problem, roles, params, options, block);
-        let identity = identity_apply(layout, block, &params.theta);
-        for (i, &global) in block.params.iter().enumerate() {
-            let regularizer: f64 = (0..block.len())
-                .map(|j| penalties[index][i * block.len() + j] * params.theta[block.params[j]]).sum();
-            parts[global] = [block.gradient[i], prior[i], identity[i], block_lambda(block, lambdas) * regularizer];
-        }
-    }
-    parts
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-#[allow(clippy::too_many_arguments)]
-fn diagnostic_model_curvature(
-    problem: &Problem, params: &Params, options: &FitOptions, blocks: &[BlockAcc],
-    penalties: &[Vec<f64>], lambdas: &StageLambdas, roles: &[Role], pass: &PassOutput,
-    data_scale: f64, reconcile: bool, direction: &[f64],
-) -> [f64; 4] {
-    let layout = &problem.layout;
-    let mut result = [0.0; 4];
-    let mut scales = vec![1.0; layout.total];
-    for (index, block) in blocks.iter().enumerate() {
-        if block.kind == BlockKind::Residual {
-            let residual = &direction[layout.residual.clone()];
-            let diagonal = residual_penalty_diagonal();
-            for sample in &pass.residual_samples {
-                let mut projected = [0.0; 3];
-                for (m, node) in sample.nodes.iter().enumerate() {
-                    for channel in 0..3 {
-                        for row in 0..3 {
-                            projected[row] += sample.clip.0[row][channel] * sample.weights[m]
-                                * residual[*node as usize * 3 + channel];
-                        }
-                    }
-                }
-                result[0] += data_scale * sample.alpha * projected.iter().map(|v| v * v).sum::<f64>();
-            }
-            for i in 0..RESIDUAL_COEFS {
-                result[2] += (identity_weight(BlockKind::Residual) + 1e-3) * residual[i] * residual[i];
-                result[3] += 2.0 * lambdas.residual * residual[i] * laplacian_at(residual, i, &diagonal);
-            }
-            continue;
-        }
-        let (_, prior) = prior_terms(problem, roles, params, options, block);
-        let identity = identity_curvature(layout, block);
-        for (i, &global) in block.params.iter().enumerate() {
-            if reconcile {
-                let sampled = data_scale * block.hessian[i * block.len() + i];
-                if sampled > 0.0 {
-                    scales[global] = (block.full_diagonal[i] / sampled).max(0.0).sqrt();
-                } else {
-                    result[0] += block.full_diagonal[i] * direction[global] * direction[global];
-                }
-            }
-            result[1] += prior[i] * direction[global] * direction[global];
-            result[2] += identity[i] * direction[global] * direction[global];
-            for (j, &other) in block.params.iter().enumerate() {
-                result[3] += block_lambda(block, lambdas) * penalties[index][i * block.len() + j]
-                    * direction[global] * direction[other];
-            }
-        }
-    }
-    for row in &pass.coupled_rows {
-        let mut projected = [0.0; 3];
-        for (global, derivative) in &row.columns {
-            let value = direction[*global as usize] * scales[*global as usize];
-            for channel in 0..3 {
-                projected[channel] += derivative[channel] * value;
-            }
-        }
-        result[0] += data_scale * row.weight * projected.iter().map(|v| v * v).sum::<f64>();
-    }
-    result
+struct JointRow {
+    columns: Vec<(u32, [f64; 3])>,
+    weight: f64,
+    /// `Jᵀr` per column.
+    robust_terms: Vec<f64>,
+    /// `−2(ν+3)/q²` times the sample weight and the data scale.
+    robust: f64,
+    /// `d margin/dθ` per column.
+    margin_terms: Vec<f64>,
+    /// `barrier''(margin)` times the sample weight and the data scale.
+    barrier: f64,
+    /// Layer value each column moves, `None` when it mixes layers.
+    layers: Vec<Option<Layer>>,
+    /// `∂(t, n_a, n_b)/∂θ` in the first three slots and `∂layer/∂θ` of `layers` in
+    /// the fourth.
+    layer_weights: Vec<[f64; 4]>,
+    /// `∂²layer/∂θ²` of a tone column, `∂w_m/∂t` of a tint column, zero otherwise.
+    layer_slopes: Vec<f64>,
+    /// `α w r·∂p/∂l_k + barrier' ∇margin·∂(J'a'b')/∂l_k` for `k = 0, 1, 2`, scaled.
+    motion: [f64; 3],
+    /// `Σ_m w''_m a_m`, `Σ_m w''_m b_m`, `Σ_m w'_m a_m`, `Σ_m w'_m b_m`.
+    tint: [f64; 4],
+    /// `α w Σ_c r_c ∂²p_c/∂l_k∂l_l + barrier' ∂²margin/∂l_k∂l_l`, scaled by `data_scale`.
+    second: Box<[f64; 81]>,
 }
 
-struct CoupledFactor {
-    range: core::ops::Range<usize>,
-    factor: Vec<f64>,
+struct JointGroup {
+    /// First outer index of the group.
+    start: usize,
+    /// Sampled data curvature plus `λ·P` over the group's coordinates.
+    matrix: Vec<f64>,
 }
 
-struct CoarseSpace {
-    basis: Vec<Vec<f64>>,
-    images: Vec<Vec<f64>>,
-    factor: Vec<f64>,
-}
-
-struct ExactDataCurvature<'a> {
-    problem: &'a Problem,
-    params: &'a Params,
-}
-
-impl ExactDataCurvature<'_> {
-    fn add_product(&self, globals: &[usize], v: &[f64], product: &mut [f64]) {
-        let relative = globals.iter().zip(v).fold(0.0_f64, |max, (global, value)| {
-            max.max(value.abs() / (1.0 + self.params.theta[*global].abs()))
-        });
-        if relative == 0.0 {
-            return;
-        }
-        let epsilon = 1e-5 / relative;
-        let mut negative = vec![0.0; globals.len()];
-        let mut gradient = vec![0.0; globals.len()];
-        for sign in [-1.0, 1.0] {
-            let mut perturbed = self.params.clone();
-            for (&global, value) in globals.iter().zip(v) {
-                perturbed.theta[global] += sign * epsilon * value;
-            }
-            let pass = self.problem.pass(
-                &perturbed, ActiveColumns::ALL, &mut [], false, true, false, IntentFilter::NativeOnly,
-            );
-            gradient.fill(0.0);
-            for image in &pass.per_image_gradient {
-                for (i, &global) in globals.iter().enumerate() {
-                    gradient[i] += image[global];
-                }
-            }
-            if sign < 0.0 {
-                negative.copy_from_slice(&gradient);
-            } else {
-                for i in 0..globals.len() {
-                    product[i] += (gradient[i] - negative[i]) / (2.0 * epsilon);
-                }
-            }
-        }
-    }
-}
-
-struct CoupledSystem<'a> {
-    pass: &'a PassOutput,
+/// Frozen final-stage linearization: full-data penalized gradient and undamped joint
+/// curvature. Image blocks and the border are eliminated, so the solve runs over Look coefficients.
+struct JointModel {
+    /// Per image: global indices of exposure, `log w_R` and `log w_B`.
+    images: Vec<Vec<usize>>,
+    /// Global parameter of each joint coordinate.
     globals: Vec<usize>,
-    local: Vec<usize>,
-    scales: Vec<f64>,
-    diagonal: Vec<f64>,
-    damping_diagonal: Vec<f64>,
-    penalty: Vec<(usize, usize, f64)>,
-    factors: Vec<CoupledFactor>,
+    /// Retained rows, columns already mapped to joint coordinates.
+    rows: Vec<JointRow>,
+    /// `-g` over the joint space, priors and penalties included.
     rhs: Vec<f64>,
-    data_scale: f64,
-    labels: Vec<(Option<BlockKind>, Role)>,
-    coarse_groups: Vec<Vec<usize>>,
-    exact_data: Option<ExactDataCurvature<'a>>,
+    /// Prior and identity curvature diagonal.
+    fixed: Vec<f64>,
+    /// `λ·P` curvature entries.
+    penalty: Vec<(u32, u32, f64)>,
+    /// `λ·P` diagonal, for the preconditioner's prior fallback.
+    penalty_diagonal: Vec<f64>,
+    /// Full-data curvature diagonal, for LM damping.
+    data_diagonal: Vec<f64>,
+    /// Data coupling of each image block to the outer coordinates, `m × q`.
+    image_outer: Vec<Vec<f64>>,
+    /// Data coupling of each image block to the border, `m × k`.
+    image_border: Vec<Vec<f64>>,
+    /// Data curvature of each image block, `m × m`.
+    image_data: Vec<Vec<f64>>,
+    /// Data coupling of the outer coordinates to the border, `q × k`.
+    outer_border: Vec<f64>,
+    /// Data curvature of the border block, `k × k`.
+    border_data: Vec<f64>,
+    /// Joint range of each image block.
+    image_range: Vec<(usize, usize)>,
+    /// Preconditioner blocks over the outer coordinates.
+    groups: Vec<JointGroup>,
+    outer_count: usize,
+    border_count: usize,
+    /// Largest image block width, for scratch sizing.
+    image_width: usize,
+    dim: usize,
+    /// Whether the rows carry the Student-t robust-weight correction.
+    robust: bool,
+    /// Whether the rows carry the prediction's second derivative.
+    second: bool,
 }
 
-impl<'a> CoupledSystem<'a> {
+impl JointModel {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        layout: &Layout, problem: &'a Problem, params: &'a Params, options: &FitOptions,
-        blocks: &[BlockAcc], penalties: &[Vec<f64>], lambdas: &StageLambdas,
-        roles: &[Role], pass: &'a PassOutput, data_scale: f64, damping: f64,
-    ) -> Option<Self> {
-        let mut out = Self {
-            pass, globals: Vec::new(), local: vec![usize::MAX; layout.total],
-            scales: Vec::new(), diagonal: Vec::new(), damping_diagonal: Vec::new(),
-            penalty: Vec::new(), factors: Vec::new(), rhs: Vec::new(), data_scale,
-            labels: Vec::new(),
-            coarse_groups: vec![Vec::new(); problem.modes.len() + 4],
-            exact_data: std::env::var_os("LOOKLAB_FIT_EXACT_HV").is_some()
-                .then_some(ExactDataCurvature { problem, params }),
-        };
+        layout: &Layout,
+        problem: &Problem,
+        params: &Params,
+        options: &FitOptions,
+        blocks: &[BlockAcc],
+        penalties: &[Vec<f64>],
+        lambdas: &StageLambdas,
+        roles: &[Role],
+        pass: &PassOutput,
+        data_scale: f64,
+        robust: bool,
+        second: bool,
+    ) -> Result<Self, SolveFailure> {
+        let mut seen = vec![false; layout.total];
+        let mut outer: Vec<usize> = Vec::new();
+        let mut border: Vec<usize> = Vec::new();
+        let mut images: Vec<Vec<usize>> = vec![Vec::new(); problem.images.len()];
+        for block in blocks {
+            if block.kind == BlockKind::Residual {
+                continue;
+            }
+            for &global in &block.params {
+                if seen[global] {
+                    continue;
+                }
+                seen[global] = true;
+                match roles[global] {
+                    Role::Exposure(image) | Role::Wb(image) => images[image].push(global),
+                    Role::Mode(_) | Role::Clip => border.push(global),
+                    Role::None => outer.push(global),
+                }
+            }
+        }
+        let outer_count = outer.len();
+        let border_count = border.len();
+        let mut joint_of = vec![u32::MAX; layout.total];
+        let mut globals: Vec<usize> = Vec::new();
+        for &global in outer.iter().chain(&border) {
+            joint_of[global] = globals.len() as u32;
+            globals.push(global);
+        }
+        let mut image_range = Vec::with_capacity(images.len());
+        let mut image_width = 0usize;
+        for globals_of_image in &images {
+            let start = globals.len();
+            for &global in globals_of_image {
+                joint_of[global] = globals.len() as u32;
+                globals.push(global);
+            }
+            image_range.push((start, globals_of_image.len()));
+            image_width = image_width.max(globals_of_image.len());
+        }
+        let dim = globals.len();
+
+        let mut fixed = vec![0.0_f64; dim];
+        let mut rhs = vec![0.0_f64; dim];
+        let mut data_diagonal = vec![0.0_f64; dim];
+        let mut penalty_diagonal = vec![0.0_f64; dim];
+        let mut penalty: Vec<(u32, u32, f64)> = Vec::new();
+        let mut groups: Vec<JointGroup> = Vec::new();
         for (index, block) in blocks.iter().enumerate() {
-            if block.kind == BlockKind::Residual || block.params.is_empty() {
+            if block.kind == BlockKind::Residual {
                 continue;
             }
             let n = block.len();
-            let start = out.globals.len();
             let lambda = block_lambda(block, lambdas);
-            let (prior_gradient, prior_curvature) = prior_terms(problem, roles, params, options, block);
-            let (mut factor, rhs) = block_system(
-                layout, block, &penalties[index], &prior_gradient, &prior_curvature,
-                params, lambda, damping, data_scale, StepLimit::PerBlock,
-            );
-            if !factor_in_place(&mut factor, n) {
-                if fit_diag() {
-                    eprintln!("fit cg factor failure block {:?} damping {damping:.9e}", block.kind);
-                }
-                return None;
-            }
-            out.factors.push(CoupledFactor { range: start..start + n, factor });
-            out.rhs.extend(rhs);
+            let (prior_gradient, prior_curvature) =
+                prior_terms(problem, roles, params, options, block);
             let identity = identity_curvature(layout, block);
-            for (i, &global) in block.params.iter().enumerate() {
-                out.local[global] = start + i;
-                out.globals.push(global);
-                out.labels.push((kind_of(layout, global), roles[global]));
-                let group = match roles[global] {
-                    Role::Exposure(_) => Some(0),
-                    Role::Wb(_) => Some(if (global - layout.images.start) % NUISANCE_PER_IMAGE == 1 { 1 } else { 2 }),
-                    Role::Mode(mode) => Some(3 + mode),
-                    Role::Clip => Some(3 + problem.modes.len()),
-                    Role::None => None,
-                };
-                if let Some(group) = group {
-                    out.coarse_groups[group].push(start + i);
+            for (local, &global) in block.params.iter().enumerate() {
+                let joint = joint_of[global] as usize;
+                fixed[joint] = prior_curvature[local] + identity[local];
+                data_diagonal[joint] = block.full_diagonal[local].max(0.0);
+                let mut regularizer = 0.0_f64;
+                for other in 0..n {
+                    regularizer +=
+                        penalties[index][local * n + other] * params.theta[block.params[other]];
                 }
-                let sampled = data_scale * block.hessian[i * n + i];
-                let full = block.full_diagonal[i];
-                out.scales.push(if sampled > 0.0 { (full / sampled).max(0.0).sqrt() } else { 1.0 });
-                let damp = damping * full.max(1e-12);
-                out.damping_diagonal.push(damp);
-                let mut prior = prior_curvature[i];
-                if out.exact_data.is_some() && matches!(roles[global], Role::Clip) {
-                    let (mean, sd) = options.clip_prior;
-                    let p = (params.clip_k() - 0.005) / 0.095;
-                    prior += (params.clip_k() - mean) * params.clip_slope() * (1.0 - 2.0 * p) / (sd * sd);
-                }
-                out.diagonal.push(prior + identity[i] + damp
-                    + if sampled > 0.0 || out.exact_data.is_some() { 0.0 } else { full });
-                for j in 0..n {
-                    let value = lambda * penalties[index][i * n + j];
+                rhs[joint] = -(block.gradient[local]
+                    + prior_gradient[local]
+                    + identity[local] * params.theta[global]
+                    + lambda * regularizer);
+                penalty_diagonal[joint] = lambda * penalties[index][local * n + local];
+                for other in 0..n {
+                    let value = lambda * penalties[index][local * n + other];
                     if value != 0.0 {
-                        out.penalty.push((start + i, start + j, value));
+                        penalty.push((joint as u32, joint_of[block.params[other]], value));
+                    }
+                }
+            }
+            let locals: Vec<usize> = (0..n)
+                .filter(|local| (joint_of[block.params[*local]] as usize) < outer_count)
+                .collect();
+            if locals.is_empty() {
+                continue;
+            }
+            let start = joint_of[block.params[locals[0]]] as usize;
+            for (offset, local) in locals.iter().enumerate() {
+                debug_assert_eq!(joint_of[block.params[*local]] as usize, start + offset);
+            }
+            let width = locals.len();
+            let mut matrix = vec![0.0_f64; width * width];
+            for (row, &left) in locals.iter().enumerate() {
+                for (column, &right) in locals.iter().enumerate() {
+                    matrix[row * width + column] = data_scale * block.hessian[left * n + right]
+                        + lambda * penalties[index][left * n + right];
+                }
+            }
+            groups.push(JointGroup { start, matrix });
+        }
+        if fixed
+            .iter()
+            .chain(rhs.iter())
+            .chain(data_diagonal.iter())
+            .any(|value| !value.is_finite())
+        {
+            if fit_diag() {
+                for (label, values) in [
+                    ("fixed", &fixed),
+                    ("rhs", &rhs),
+                    ("data diagonal", &data_diagonal),
+                ] {
+                    if let Some((index, value)) = values
+                        .iter()
+                        .enumerate()
+                        .find(|(_, value)| !value.is_finite())
+                    {
+                        eprintln!(
+                            "fit joint model nonfinite {label} joint {index} global {} value {value}",
+                            globals[index]
+                        );
+                    }
+                }
+            }
+            return Err(SolveFailure::Nonfinite);
+        }
+
+        let mut rows = Vec::with_capacity(pass.coupled_rows.len());
+        for row in &pass.coupled_rows {
+            let mut columns = Vec::with_capacity(row.columns.len());
+            let mut robust_terms = Vec::with_capacity(row.columns.len());
+            let mut margin_terms = Vec::with_capacity(row.columns.len());
+            let mut layers = Vec::with_capacity(row.columns.len());
+            let mut layer_weights = Vec::with_capacity(row.columns.len());
+            let mut layer_slopes = Vec::with_capacity(row.columns.len());
+            for (index, (global, derivative)) in row.columns.iter().enumerate() {
+                let joint = joint_of[*global as usize];
+                if joint != u32::MAX {
+                    columns.push((joint, *derivative));
+                    robust_terms.push(row.robust_terms[index]);
+                    margin_terms.push(row.margin_terms[index]);
+                    layers.push(row.layers[index]);
+                    layer_weights.push(row.layer_weights[index]);
+                    layer_slopes.push(row.layer_slopes[index]);
+                }
+            }
+            if columns.is_empty() {
+                continue;
+            }
+            let mut scaled = Box::new([0.0_f64; 81]);
+            for (value, source) in scaled.iter_mut().zip(row.second.iter()) {
+                *value = source * data_scale;
+            }
+            let motion = row.motion.map(|value| value * data_scale);
+            rows.push(JointRow {
+                columns,
+                weight: row.weight * data_scale,
+                robust_terms,
+                robust: row.robust * data_scale,
+                margin_terms,
+                barrier: row.barrier * data_scale,
+                layers,
+                layer_weights,
+                layer_slopes,
+                motion,
+                tint: row.tint,
+                second: scaled,
+            });
+        }
+
+        let mut image_outer: Vec<Vec<f64>> = images
+            .iter()
+            .map(|globals_of_image| vec![0.0_f64; globals_of_image.len() * outer_count])
+            .collect();
+        let mut image_border: Vec<Vec<f64>> = images
+            .iter()
+            .map(|globals_of_image| vec![0.0_f64; globals_of_image.len() * border_count])
+            .collect();
+        let mut image_data: Vec<Vec<f64>> = images
+            .iter()
+            .map(|globals_of_image| vec![0.0_f64; globals_of_image.len().pow(2)])
+            .collect();
+        let mut outer_border = vec![0.0_f64; outer_count * border_count];
+        let mut border_data = vec![0.0_f64; border_count * border_count];
+        let mut joint_image = vec![u32::MAX; dim];
+        let mut joint_local = vec![0u8; dim];
+        for (slot, globals_of_image) in images.iter().enumerate() {
+            for (local, &global) in globals_of_image.iter().enumerate() {
+                let joint = joint_of[global] as usize;
+                joint_image[joint] = slot as u32;
+                joint_local[joint] = local as u8;
+            }
+        }
+        let mut row_outer: Vec<(usize, [f64; 3], f64, f64)> = Vec::new();
+        let mut row_border: Vec<(usize, [f64; 3], f64, f64)> = Vec::new();
+        let mut row_image: Vec<(usize, [f64; 3], f64, f64)> = Vec::new();
+        for row in &rows {
+            row_outer.clear();
+            row_border.clear();
+            row_image.clear();
+            let mut slot = u32::MAX;
+            for (position, (joint, derivative)) in row.columns.iter().enumerate() {
+                let index = *joint as usize;
+                let robust_term = row.robust_terms[position];
+                let margin_term = row.margin_terms[position];
+                if index < outer_count {
+                    row_outer.push((index, *derivative, robust_term, margin_term));
+                } else if index < outer_count + border_count {
+                    row_border.push((index - outer_count, *derivative, robust_term, margin_term));
+                } else {
+                    slot = joint_image[index];
+                    row_image.push((
+                        joint_local[index] as usize,
+                        *derivative,
+                        robust_term,
+                        margin_term,
+                    ));
+                }
+            }
+            let weight = row.weight;
+            let robust = if robust { row.robust } else { 0.0 };
+            let barrier = row.barrier;
+            let pair =
+                |left: &(usize, [f64; 3], f64, f64), right: &(usize, [f64; 3], f64, f64)| -> f64 {
+                    weight * dot3(left.1, right.1)
+                        + robust * left.2 * right.2
+                        + barrier * left.3 * right.3
+                };
+            if slot != u32::MAX {
+                let slot = slot as usize;
+                let width = images[slot].len();
+                for left in &row_image {
+                    for right in &row_image {
+                        image_data[slot][left.0 * width + right.0] += pair(left, right);
+                    }
+                    for right in &row_outer {
+                        image_outer[slot][left.0 * outer_count + right.0] += pair(left, right);
+                    }
+                    for right in &row_border {
+                        image_border[slot][left.0 * border_count + right.0] += pair(left, right);
+                    }
+                }
+            }
+            for left in &row_outer {
+                for right in &row_border {
+                    outer_border[left.0 * border_count + right.0] += pair(left, right);
+                }
+            }
+            for left in &row_border {
+                for right in &row_border {
+                    border_data[left.0 * border_count + right.0] += pair(left, right);
+                }
+            }
+        }
+
+        Ok(Self {
+            images,
+            globals,
+            rows,
+            rhs,
+            fixed,
+            penalty,
+            penalty_diagonal,
+            data_diagonal,
+            image_outer,
+            image_border,
+            image_data,
+            outer_border,
+            border_data,
+            image_range,
+            groups,
+            outer_count,
+            border_count,
+            image_width,
+            dim,
+            robust,
+            second,
+        })
+    }
+
+    /// Retained-row curvature: GN, the Student-t correction when `self.robust`, the
+    /// barrier, and the prediction's second derivative when `self.second`.
+    fn apply_rows(&self, v: &[f64], out: &mut [f64]) {
+        self.apply_rows_with(v, out, true);
+    }
+
+    /// [`Self::apply_rows`] with the second-order term forced on or off.
+    fn apply_rows_with(&self, v: &[f64], out: &mut [f64], with_second: bool) {
+        let second = self.second && with_second;
+        for row in &self.rows {
+            let mut projected = [0.0_f64; 3];
+            let mut robust_projection = 0.0_f64;
+            let mut margin_projection = 0.0_f64;
+            let mut layer_direction = [0.0_f64; 9];
+            let mut tint_a_direction = 0.0_f64;
+            let mut tint_b_direction = 0.0_f64;
+            for (position, (column, derivative)) in row.columns.iter().enumerate() {
+                let value = v[*column as usize];
+                projected[0] += derivative[0] * value;
+                projected[1] += derivative[1] * value;
+                projected[2] += derivative[2] * value;
+                robust_projection += row.robust_terms[position] * value;
+                margin_projection += row.margin_terms[position] * value;
+                if second {
+                    let weights = row.layer_weights[position];
+                    for (k, direction) in layer_direction.iter_mut().enumerate().take(3) {
+                        *direction += weights[k] * value;
+                    }
+                    match row.layers[position] {
+                        Some(Layer::TintA) => {
+                            tint_a_direction += row.layer_slopes[position] * value;
+                        }
+                        Some(Layer::TintB) => {
+                            tint_b_direction += row.layer_slopes[position] * value;
+                        }
+                        Some(layer) if layer.index() >= 3 => {
+                            layer_direction[layer.index()] += weights[3] * value;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let weight = row.weight;
+            let robust = if self.robust { row.robust } else { 0.0 };
+            let barrier = row.barrier;
+            let mut layer_curvature = [0.0_f64; 9];
+            if second {
+                for (k, value) in layer_curvature.iter_mut().enumerate() {
+                    let mut total = 0.0;
+                    for (l, direction) in layer_direction.iter().enumerate() {
+                        total += row.second[k * 9 + l] * direction;
+                    }
+                    *value = total;
+                }
+            }
+            for (position, (column, derivative)) in row.columns.iter().enumerate() {
+                let mut total = weight * dot3(*derivative, projected)
+                    + robust * row.robust_terms[position] * robust_projection
+                    + barrier * row.margin_terms[position] * margin_projection;
+                if second {
+                    let layer = row.layers[position];
+                    let slope = row.layer_slopes[position];
+                    let value = v[*column as usize];
+                    let weights = row.layer_weights[position];
+                    total += weights[0] * layer_curvature[0]
+                        + weights[1] * layer_curvature[1]
+                        + weights[2] * layer_curvature[2];
+                    if let Some(layer) = layer
+                        && layer.index() >= 3
+                    {
+                        total += weights[3] * layer_curvature[layer.index()];
+                    }
+                    total += match layer {
+                        Some(Layer::Tone) => {
+                            let channel = weights[0];
+                            row.motion[0] * slope * value
+                                + row.motion[1]
+                                    * (row.tint[0] * channel * layer_direction[0]
+                                        + row.tint[2] * slope * value
+                                        + channel * tint_a_direction)
+                                + row.motion[2]
+                                    * (row.tint[1] * channel * layer_direction[0]
+                                        + row.tint[3] * slope * value
+                                        + channel * tint_b_direction)
+                        }
+                        Some(Layer::TintA) => row.motion[1] * slope * layer_direction[0],
+                        Some(Layer::TintB) => row.motion[2] * slope * layer_direction[0],
+                        _ => 0.0,
+                    };
+                }
+                out[*column as usize] += total;
+            }
+        }
+    }
+
+    /// Undamped joint curvature: retained rows, the fixed diagonal and `λ·P`.
+    fn apply_undamped(&self, v: &[f64], out: &mut [f64]) {
+        self.apply_undamped_with(v, out, true);
+    }
+
+    /// [`Self::apply_undamped`] with the second-order term forced on or off.
+    fn apply_undamped_with(&self, v: &[f64], out: &mut [f64], with_second: bool) {
+        out.fill(0.0);
+        self.apply_rows_with(v, out, with_second);
+        for (index, slot) in out.iter_mut().enumerate() {
+            *slot += self.fixed[index] * v[index];
+        }
+        for &(row, column, value) in &self.penalty {
+            out[row as usize] += value * v[column as usize];
+        }
+    }
+}
+
+/// Buffers shared by the reduced operator and its preconditioner.
+struct JointScratch<'a> {
+    joint: &'a mut [f64],
+    joint_out: &'a mut [f64],
+    image_rhs: &'a mut [f64],
+    border: &'a mut [f64],
+}
+
+fn scratch_buffer(model: &JointModel) -> Vec<f64> {
+    vec![0.0_f64; 2 * model.dim + model.image_width.max(1) + model.border_count.max(1)]
+}
+
+fn split_scratch<'a>(buffer: &'a mut [f64], model: &JointModel) -> JointScratch<'a> {
+    let dim = model.dim;
+    let border_count = model.border_count;
+    let (first, rest) = buffer.split_at_mut(dim);
+    let (second, rest) = rest.split_at_mut(dim);
+    let (image_rhs, border) = rest.split_at_mut(model.image_width.max(1));
+    JointScratch {
+        joint: first,
+        joint_out: second,
+        image_rhs,
+        border: &mut border[..border_count.max(1)],
+    }
+}
+
+/// Symmetric Jacobi scaling `D⁻¹ᐟ² A D⁻¹ᐟ²` before Cholesky, with `D = diag(A)`.
+fn scaled_factor(matrix: &[f64], width: usize) -> Option<(Vec<f64>, Vec<f64>)> {
+    let mut scale = vec![1.0_f64; width];
+    for row in 0..width {
+        let diagonal = matrix[row * width + row];
+        if !(diagonal.is_finite() && diagonal > 0.0) {
+            return None;
+        }
+        scale[row] = libm::sqrt(diagonal);
+    }
+    let mut factor = matrix.to_vec();
+    for row in 0..width {
+        for column in 0..width {
+            factor[row * width + column] /= scale[row] * scale[column];
+        }
+    }
+    factor_in_place(&mut factor, width).then_some((factor, scale))
+}
+
+/// The damped joint system with the per-image blocks and the border eliminated.
+struct JointSolve {
+    image_factor: Vec<Vec<f64>>,
+    border_factor: Vec<f64>,
+    /// Eliminated outer/border coupling, `q × k`.
+    outer_border: Vec<f64>,
+    /// Reduced right-hand side over the outer coordinates.
+    outer_rhs: Vec<f64>,
+    /// Reduced right-hand side over the border, before the `S_ss` solve.
+    border_rhs: Vec<f64>,
+    /// `(start, width, scaled factor, Jacobi scale)` of each outer preconditioner block.
+    groups: Vec<(usize, usize, Vec<f64>, Vec<f64>)>,
+    damping: f64,
+    zero_border: Vec<f64>,
+}
+
+impl JointSolve {
+    fn new(model: &JointModel, damping: f64) -> Result<Self, SolveFailure> {
+        Self::build(model, damping)
+    }
+
+    fn build(model: &JointModel, damping: f64) -> Result<Self, SolveFailure> {
+        let q = model.outer_count;
+        let k = model.border_count;
+        let mut image_factor = Vec::with_capacity(model.images.len());
+        let mut image_border_solved = Vec::with_capacity(model.images.len());
+        for (index, globals_of_image) in model.images.iter().enumerate() {
+            let m = globals_of_image.len();
+            if m == 0 {
+                image_factor.push(Vec::new());
+                image_border_solved.push(Vec::new());
+                continue;
+            }
+            let (start, _) = model.image_range[index];
+            let mut factor = model.image_data[index].clone();
+            for row in 0..m {
+                factor[row * m + row] += model.fixed[start + row]
+                    + damping * model.data_diagonal[start + row].max(1e-12);
+            }
+            if !factor_in_place(&mut factor, m) {
+                return Err(SolveFailure::Factorization("image"));
+            }
+            let mut solved = vec![0.0_f64; m * k];
+            for column in 0..k {
+                let mut values = vec![0.0_f64; m];
+                for row in 0..m {
+                    values[row] = model.image_border[index][row * k + column];
+                }
+                solve_in_place(&factor, m, &mut values);
+                for row in 0..m {
+                    solved[row * k + column] = values[row];
+                }
+            }
+            image_factor.push(factor);
+            image_border_solved.push(solved);
+        }
+
+        let mut border = model.border_data.clone();
+        for row in 0..k {
+            border[row * k + row] +=
+                model.fixed[q + row] + damping * model.data_diagonal[q + row].max(1e-12);
+        }
+        for (index, globals_of_image) in model.images.iter().enumerate() {
+            let m = globals_of_image.len();
+            if m == 0 {
+                continue;
+            }
+            let solved = &image_border_solved[index];
+            for row in 0..m {
+                for left in 0..k {
+                    let value = model.image_border[index][row * k + left];
+                    for right in 0..k {
+                        border[left * k + right] -= value * solved[row * k + right];
                     }
                 }
             }
         }
-        Some(out)
-    }
-
-    fn apply(&self, v: &[f64], product: &mut [f64]) {
-        for (i, value) in product.iter_mut().enumerate() {
-            *value = self.diagonal[i] * v[i];
+        let mut border_factor = border;
+        if k > 0 && !factor_in_place(&mut border_factor, k) {
+            return Err(SolveFailure::Factorization("border"));
         }
-        if let Some(exact) = &self.exact_data {
-            exact.add_product(&self.globals, v, product);
-        } else {
-        for row in &self.pass.coupled_rows {
-            let mut projected = [0.0; 3];
-            for (global, derivative) in &row.columns {
-                let i = self.local[*global as usize];
-                let value = self.scales[i] * v[i];
-                for channel in 0..3 {
-                    projected[channel] += derivative[channel] * value;
+
+        let mut outer_border = model.outer_border.clone();
+        for (index, globals_of_image) in model.images.iter().enumerate() {
+            let m = globals_of_image.len();
+            if m == 0 {
+                continue;
+            }
+            let solved = &image_border_solved[index];
+            for row in 0..m {
+                for left in 0..q {
+                    let value = model.image_outer[index][row * q + left];
+                    for right in 0..k {
+                        outer_border[left * k + right] -= value * solved[row * k + right];
+                    }
                 }
             }
-            let weight = self.data_scale * row.weight;
-            for (global, derivative) in &row.columns {
-                let i = self.local[*global as usize];
-                product[i] += weight * self.scales[i]
-                    * (derivative[0] * projected[0] + derivative[1] * projected[1]
-                        + derivative[2] * projected[2]);
+        }
+
+        let mut outer_rhs = model.rhs[..q].to_vec();
+        let mut border_rhs = model.rhs[q..q + k].to_vec();
+        for (index, globals_of_image) in model.images.iter().enumerate() {
+            let m = globals_of_image.len();
+            if m == 0 {
+                continue;
+            }
+            let (start, _) = model.image_range[index];
+            let mut values = model.rhs[start..start + m].to_vec();
+            solve_in_place(&image_factor[index], m, &mut values);
+            for row in 0..m {
+                for left in 0..q {
+                    outer_rhs[left] -= model.image_outer[index][row * q + left] * values[row];
+                }
+                for right in 0..k {
+                    border_rhs[right] -= model.image_border[index][row * k + right] * values[row];
+                }
             }
         }
+        let reduced_border = border_rhs.clone();
+        if k > 0 {
+            solve_in_place(&border_factor, k, &mut border_rhs);
+            for left in 0..q {
+                let mut sum = 0.0_f64;
+                for right in 0..k {
+                    sum += outer_border[left * k + right] * border_rhs[right];
+                }
+                outer_rhs[left] -= sum;
+            }
         }
-        for &(i, j, value) in &self.penalty {
-            product[i] += value * v[j];
+
+        let mut schur_diagonal = vec![0.0_f64; q];
+        let mut image_outer_solved: Vec<Vec<f64>> = Vec::with_capacity(model.images.len());
+        let mut column = vec![0.0_f64; model.image_width.max(1)];
+        for (index, globals_of_image) in model.images.iter().enumerate() {
+            let m = globals_of_image.len();
+            if m == 0 {
+                image_outer_solved.push(Vec::new());
+                continue;
+            }
+            let factor = &image_factor[index];
+            let mut solved = vec![0.0_f64; m * q];
+            for left in 0..q {
+                for row in 0..m {
+                    column[row] = model.image_outer[index][row * q + left];
+                }
+                solve_in_place(factor, m, &mut column[..m]);
+                let mut sum = 0.0_f64;
+                for row in 0..m {
+                    sum += column[row] * column[row];
+                    solved[row * q + left] = column[row];
+                }
+                schur_diagonal[left] += sum;
+            }
+            image_outer_solved.push(solved);
+        }
+
+        let mut groups = Vec::with_capacity(model.groups.len());
+        for group in &model.groups {
+            let width = (group.matrix.len() as f64).sqrt() as usize;
+            let start = group.start;
+            // `group.matrix` already carries the exact `λP` block.
+            let mut matrix = group.matrix.clone();
+            for row in 0..width {
+                let joint = start + row;
+                matrix[row * width + row] +=
+                    model.fixed[joint] + damping * model.data_diagonal[joint].max(1e-12);
+            }
+            // Principal block of the reduced operator.
+            let unreduced = matrix.clone();
+            let mut correction = vec![0.0_f64; width * width];
+            for (index, globals_of_image) in model.images.iter().enumerate() {
+                let m = globals_of_image.len();
+                if m == 0 {
+                    continue;
+                }
+                let solved = &image_outer_solved[index];
+                for left in 0..width {
+                    for right in 0..width {
+                        let mut sum = 0.0_f64;
+                        for row in 0..m {
+                            sum += model.image_outer[index][row * q + start + left]
+                                * solved[row * q + start + right];
+                        }
+                        correction[left * width + right] += sum;
+                    }
+                }
+            }
+            if k > 0 {
+                let mut border_solved = vec![0.0_f64; width * k];
+                for outer_index in 0..width {
+                    let mut values = vec![0.0_f64; k];
+                    for row in 0..k {
+                        values[row] = outer_border[(start + outer_index) * k + row];
+                    }
+                    solve_in_place(&border_factor, k, &mut values);
+                    for row in 0..k {
+                        border_solved[outer_index * k + row] = values[row];
+                    }
+                }
+                for left in 0..width {
+                    for right in 0..width {
+                        let mut sum = 0.0_f64;
+                        for row in 0..k {
+                            sum += outer_border[(start + left) * k + row]
+                                * border_solved[right * k + row];
+                        }
+                        correction[left * width + right] += sum;
+                    }
+                }
+            }
+            for (slot, value) in matrix.iter_mut().zip(correction.iter()) {
+                *slot -= value;
+            }
+            let mut choice = "reduced";
+            let mut scaled = scaled_factor(&matrix, width);
+            if scaled.is_none() {
+                // A principal block of the Schur complement is positive definite only when
+                // the full reduced operator is.
+                choice = "block";
+                scaled = scaled_factor(&unreduced, width);
+            }
+            if scaled.is_none() {
+                choice = "diagonal";
+                let mut diagonal = group.matrix.clone();
+                for row in 0..width {
+                    let joint = start + row;
+                    let total = diagonal[row * width + row].max(0.0)
+                        + model.fixed[joint]
+                        + damping * model.data_diagonal[joint].max(1e-12);
+                    diagonal[row * width + row] =
+                        total - schur_diagonal[joint].min(0.5 * total);
+                }
+                scaled = scaled_factor(&diagonal, width);
+            }
+            if scaled.is_none() {
+                choice = "prior";
+                let mut prior = vec![0.0_f64; width * width];
+                for row in 0..width {
+                    let joint = start + row;
+                    prior[row * width + row] =
+                        (model.fixed[joint] + model.penalty_diagonal[joint]).max(1e-12);
+                }
+                scaled = scaled_factor(&prior, width);
+            }
+            let Some((factor, scale)) = scaled else {
+                return Err(SolveFailure::Factorization("preconditioner"));
+            };
+            if fit_diag() && choice != "reduced" {
+                eprintln!("fit preconditioner group {start}+{width} falls back to {choice}");
+            }
+            groups.push((start, width, factor, scale));
+        }
+
+        Ok(Self {
+            image_factor,
+            border_factor,
+            outer_border,
+            outer_rhs,
+            border_rhs: reduced_border,
+            groups,
+            damping,
+            zero_border: vec![0.0_f64; k],
+        })
+    }
+
+    /// `[[S_yy, S_ys], [S_sy, S_ss]]` applied to `(v_outer, v_border)`, images eliminated.
+    fn eliminated(
+        &self,
+        model: &JointModel,
+        v_outer: &[f64],
+        v_border: &[f64],
+        out: &mut [f64],
+        scratch: &mut JointScratch<'_>,
+    ) {
+        let q = model.outer_count;
+        let k = model.border_count;
+        scratch.joint[..q].copy_from_slice(v_outer);
+        scratch.joint[q..q + k].copy_from_slice(v_border);
+        for slot in scratch.joint[q + k..].iter_mut() {
+            *slot = 0.0;
+        }
+        scratch.joint_out.fill(0.0);
+        model.apply_rows(scratch.joint, scratch.joint_out);
+        for index in 0..q + k {
+            out[index] = scratch.joint_out[index]
+                + (model.fixed[index] + self.damping * model.data_diagonal[index].max(1e-12))
+                    * scratch.joint[index];
+        }
+        for &(row, column, value) in &model.penalty {
+            out[row as usize] += value * scratch.joint[column as usize];
+        }
+        for (index, globals_of_image) in model.images.iter().enumerate() {
+            let m = globals_of_image.len();
+            if m == 0 {
+                continue;
+            }
+            for row in 0..m {
+                let mut value = 0.0_f64;
+                for left in 0..q {
+                    value += model.image_outer[index][row * q + left] * v_outer[left];
+                }
+                for right in 0..k {
+                    value += model.image_border[index][row * k + right] * v_border[right];
+                }
+                scratch.image_rhs[row] = value;
+            }
+            solve_in_place(&self.image_factor[index], m, &mut scratch.image_rhs[..m]);
+            for row in 0..m {
+                let weight = scratch.image_rhs[row];
+                for left in 0..q {
+                    out[left] -= model.image_outer[index][row * q + left] * weight;
+                }
+                for right in 0..k {
+                    out[q + right] -= model.image_border[index][row * k + right] * weight;
+                }
+            }
         }
     }
 
-    fn block_precondition(&self, residual: &[f64], z: &mut [f64]) {
-        for block in &self.factors {
-            z[block.range.clone()].copy_from_slice(&residual[block.range.clone()]);
-            solve_in_place(&block.factor, block.range.len(), &mut z[block.range.clone()]);
+    /// The reduced Schur operator over the outer coordinates.
+    fn apply_reduced(
+        &self,
+        model: &JointModel,
+        v: &[f64],
+        out: &mut [f64],
+        eliminated: &mut [f64],
+        scratch: &mut JointScratch<'_>,
+    ) {
+        let q = model.outer_count;
+        let k = model.border_count;
+        self.eliminated(model, v, &self.zero_border, eliminated, scratch);
+        if k == 0 {
+            out.copy_from_slice(&eliminated[..q]);
+            return;
+        }
+        scratch.border.copy_from_slice(&eliminated[q..q + k]);
+        solve_in_place(&self.border_factor, k, scratch.border);
+        for left in 0..q {
+            let mut sum = 0.0_f64;
+            for right in 0..k {
+                sum += self.outer_border[left * k + right] * scratch.border[right];
+            }
+            out[left] = eliminated[left] - sum;
         }
     }
 
-    // (gᵀd)² / (2 dᵀBd) ≤ ½ gᵀB⁻¹g.
-    fn energy_lower_bound(&self) -> f64 {
-        let mut direction = vec![0.0; self.rhs.len()];
-        self.block_precondition(&self.rhs, &mut direction);
-        let first = crate::solve::dot(&self.rhs, &direction);
-        if first == 0.0 {
-            return 0.0;
-        }
-        let mut product = vec![0.0; direction.len()];
-        self.apply(&direction, &mut product);
+    /// `(gᵀd)² / (2 dᵀBd)` for the preconditioned direction, a lower bound on `E`.
+    fn energy_lower_bound(&self, model: &JointModel) -> f64 {
+        let q = model.outer_count;
+        let k = model.border_count;
+        let mut buffer = scratch_buffer(model);
+        let mut scratch = split_scratch(&mut buffer, model);
+        let mut direction = vec![0.0_f64; q];
+        let mut product = vec![0.0_f64; q];
+        let mut eliminated = vec![0.0_f64; q + k];
+        self.precondition(&self.outer_rhs, &mut direction);
+        self.apply_reduced(
+            model,
+            &direction,
+            &mut product,
+            &mut eliminated,
+            &mut scratch,
+        );
+        let first = crate::solve::dot(&self.outer_rhs, &direction);
         let curvature = crate::solve::dot(&direction, &product);
         if first.is_finite() && curvature.is_finite() && curvature > 0.0 {
             first * first / (2.0 * curvature)
@@ -3743,136 +4733,348 @@ impl<'a> CoupledSystem<'a> {
         }
     }
 
-    fn coarse_space(&self) -> Option<CoarseSpace> {
-        let n = self.rhs.len();
-        let mut look_factors = Vec::with_capacity(self.factors.len());
-        for block in &self.factors {
-            let width = block.range.len();
-            let look = block.range.clone().take_while(|i| self.labels[*i].0.is_some()).count();
-            let principal = if look > 0 && look < width {
-                let mut principal = vec![0.0; look * look];
-                for i in 0..look {
-                    principal[i * look..(i + 1) * look]
-                        .copy_from_slice(&block.factor[i * width..i * width + look]);
-                }
-                Some(principal)
-            } else {
-                None
-            };
-            look_factors.push((look, principal));
-        }
-        let mut basis = Vec::new();
-        let mut images = Vec::new();
-        for group in self.coarse_groups.iter().filter(|group| !group.is_empty()) {
-            let mut vector = vec![0.0; n];
-            for &i in group {
-                vector[i] = 1.0;
+    fn precondition(&self, residual: &[f64], z: &mut [f64]) {
+        for (start, width, factor, scale) in &self.groups {
+            if *width == 0 {
+                continue;
             }
-            let mut image = vec![0.0; n];
-            self.apply(&vector, &mut image);
-            for (block, (look, principal)) in self.factors.iter().zip(&look_factors) {
-                if *look == 0 {
-                    continue;
-                }
-                let range = block.range.start..block.range.start + *look;
-                vector[range.clone()].copy_from_slice(&image[range.clone()]);
-                solve_in_place(principal.as_ref().unwrap_or(&block.factor), *look, &mut vector[range.clone()]);
-                for value in &mut vector[range] {
-                    *value = -*value;
-                }
+            for index in 0..*width {
+                z[*start + index] = residual[*start + index] / scale[index];
             }
-            self.apply(&vector, &mut image);
-            basis.push(vector);
-            images.push(image);
-        }
-        let m = basis.len();
-        if m == 0 {
-            return None;
-        }
-        let mut factor = vec![0.0; m * m];
-        for i in 0..m {
-            for j in 0..=i {
-                let value = crate::solve::dot(&basis[i], &images[j]);
-                factor[i * m + j] = value;
-                factor[j * m + i] = value;
+            solve_in_place(factor, *width, &mut z[*start..*start + *width]);
+            for index in 0..*width {
+                z[*start + index] /= scale[index];
             }
         }
-        factor_in_place(&mut factor, m).then_some(CoarseSpace { basis, images, factor })
     }
 
-    fn solve(&self) -> Option<Vec<f64>> {
-        let n = self.rhs.len();
-        let mut solution = vec![0.0; n];
-        let coarse = self.coarse_space();
-        let m = coarse.as_ref().map_or(0, |space| space.basis.len());
-        let mut coefficients = vec![0.0; m];
-        let mut correction = vec![0.0; m];
-        let mut projected_residual = vec![0.0; n];
-        let report = crate::solve::conjugate_gradient_preconditioned(
-            n, |v, product| self.apply(v, product),
-            |residual, z| {
-                if let Some(space) = &coarse {
-                    for (i, basis) in space.basis.iter().enumerate() {
-                        coefficients[i] = crate::solve::dot(basis, residual);
-                    }
-                    solve_in_place(&space.factor, m, &mut coefficients);
-                    projected_residual.copy_from_slice(residual);
-                    for (image, coefficient) in space.images.iter().zip(&coefficients) {
-                        crate::solve::scaled_add(&mut projected_residual, image, -*coefficient);
-                    }
-                    self.block_precondition(&projected_residual, z);
-                    for (i, image) in space.images.iter().enumerate() {
-                        correction[i] = crate::solve::dot(image, z);
-                    }
-                    solve_in_place(&space.factor, m, &mut correction);
-                    for (i, basis) in space.basis.iter().enumerate() {
-                        crate::solve::scaled_add(z, basis, coefficients[i] - correction[i]);
-                    }
-                } else {
-                    self.block_precondition(residual, z);
-                }
-            },
-            &self.rhs, &mut solution, 256, 1e-8,
-        );
-        let mut product = vec![0.0; n];
-        self.apply(&solution, &mut product);
-        let error: f64 = product.iter().zip(&self.rhs).map(|(a, b)| (a - b) * (a - b)).sum();
-        let norm = crate::solve::dot(&self.rhs, &self.rhs);
-        if fit_diag() {
-            let damped = self.damping_diagonal.iter().any(|v| *v > 0.0);
-            eprintln!("fit cg exact {} damped {damped} dim {n} coarse {m} iterations {} cap 256 relative_residual {:.9e} positive_curvature {} resolved {}",
-                self.exact_data.is_some(), report.iterations, (error / norm.max(1e-300)).sqrt(), report.positive_curvature,
-                report.positive_curvature && error.is_finite() && error <= 1e-12 * norm.max(1.0));
-            let mut worst: Vec<usize> = (0..n).collect();
-            worst.sort_by(|a, b| (product[*b] - self.rhs[*b]).abs().total_cmp(&(product[*a] - self.rhs[*a]).abs()));
-            for &i in worst.iter().take(3) {
-                eprintln!("fit cg residual param {} label {:?} residual {:.9e} rhs {:.9e} solution {:.9e}",
-                    self.globals[i], self.labels[i], product[i] - self.rhs[i], self.rhs[i], solution[i]);
+    /// Solve the damped joint system, recover the eliminated coordinates and report the
+    /// explicit residual of the original joint system.
+    fn solve(
+        &self,
+        model: &JointModel,
+        tolerance: f64,
+        radius: Option<f64>,
+        warm: Option<&[f64]>,
+    ) -> Result<JointSolution, SolveFailure> {
+        self.solve_inner(model, tolerance, radius, warm)
+    }
+
+    fn solve_inner(
+        &self,
+        model: &JointModel,
+        tolerance: f64,
+        radius: Option<f64>,
+        warm: Option<&[f64]>,
+    ) -> Result<JointSolution, SolveFailure> {
+        let q = model.outer_count;
+        let k = model.border_count;
+        let dim = model.dim;
+        let mut x = vec![0.0_f64; q];
+        let mut residual = self.outer_rhs.clone();
+        let mut z = vec![0.0_f64; q];
+        let mut direction = vec![0.0_f64; q];
+        let mut product = vec![0.0_f64; q];
+        let mut eliminated = vec![0.0_f64; q + k];
+        let mut buffer = scratch_buffer(model);
+        let mut scratch = split_scratch(&mut buffer, model);
+
+        let norm: f64 = crate::solve::dot(&self.outer_rhs, &self.outer_rhs);
+        if !norm.is_finite() {
+            return Err(SolveFailure::Nonfinite);
+        }
+        let mut warmed = false;
+        if let Some(values) = warm.filter(|values| values.len() == q) {
+            x.copy_from_slice(values);
+            self.apply_reduced(model, &x, &mut product, &mut eliminated, &mut scratch);
+            let mut error = 0.0_f64;
+            for index in 0..q {
+                residual[index] = self.outer_rhs[index] - product[index];
+                error += residual[index] * residual[index];
+            }
+            if error.is_finite() && error < norm {
+                warmed = true;
+            } else {
+                x.fill(0.0);
+                residual.copy_from_slice(&self.outer_rhs);
             }
         }
-        (report.positive_curvature && error.is_finite() && error <= 1e-12 * norm.max(1.0)).then_some(solution)
+        self.precondition(&residual, &mut z);
+        direction.copy_from_slice(&z);
+        let mut rz = crate::solve::dot(&residual, &z);
+        if !(rz.is_finite() && rz > 0.0) {
+            return Err(SolveFailure::Nonfinite);
+        }
+        let mut target = rz * tolerance * tolerance;
+        let mut iterations = 0usize;
+        let mut checked = 0usize;
+        let mut stalled = false;
+        let mut stagnant = 0usize;
+        let mut previous = f64::INFINITY;
+        loop {
+            if iterations >= JOINT_CG_LIMIT {
+                stalled = true;
+                break;
+            }
+            let recursive = rz <= target;
+            let chunk = (warmed && iterations == 0)
+                || iterations.saturating_sub(checked) >= JOINT_CG_CHUNK;
+            if recursive || chunk {
+                self.apply_reduced(model, &x, &mut product, &mut eliminated, &mut scratch);
+                let mut error = 0.0_f64;
+                for index in 0..q {
+                    residual[index] = self.outer_rhs[index] - product[index];
+                    error += residual[index] * residual[index];
+                }
+                let relative = (error / norm.max(1e-300)).sqrt();
+                if !relative.is_finite() {
+                    return Err(SolveFailure::Nonfinite);
+                }
+                if relative <= tolerance {
+                    break;
+                }
+                if chunk {
+                    stagnant = if relative > 0.999 * previous {
+                        stagnant + 1
+                    } else {
+                        0
+                    };
+                    if stagnant >= 3 {
+                        stalled = true;
+                        break;
+                    }
+                    previous = relative;
+                }
+                checked = iterations;
+                self.precondition(&residual, &mut z);
+                let reset = crate::solve::dot(&residual, &z);
+                if !(reset.is_finite() && reset > 0.0) {
+                    return Err(SolveFailure::Nonfinite);
+                }
+                direction.copy_from_slice(&z);
+                rz = reset;
+                target = rz * tolerance * tolerance;
+                if recursive {
+                    continue;
+                }
+            }
+            self.apply_reduced(
+                model,
+                &direction,
+                &mut product,
+                &mut eliminated,
+                &mut scratch,
+            );
+            let curvature = crate::solve::dot(&direction, &product);
+            if !curvature.is_finite() {
+                return Err(SolveFailure::Nonfinite);
+            }
+            if curvature <= 0.0 {
+                return Err(SolveFailure::NonpositiveCurvature);
+            }
+            iterations += 1;
+            let step = rz / curvature;
+            crate::solve::scaled_add(&mut x, &direction, step);
+            for index in 0..q {
+                residual[index] -= step * product[index];
+            }
+            self.precondition(&residual, &mut z);
+            let next = crate::solve::dot(&residual, &z);
+            if !next.is_finite() {
+                return Err(SolveFailure::Nonfinite);
+            }
+            let beta = next / rz;
+            for index in 0..q {
+                direction[index] = z[index] + beta * direction[index];
+            }
+            rz = next;
+        }
+
+        let mut delta = vec![0.0_f64; dim];
+        delta[..q].copy_from_slice(&x);
+        self.eliminated(model, &x, &self.zero_border, &mut eliminated, &mut scratch);
+        let mut border_delta = vec![0.0_f64; k];
+        for index in 0..k {
+            border_delta[index] = self.border_rhs[index] - eliminated[q + index];
+        }
+        if k > 0 {
+            solve_in_place(&self.border_factor, k, &mut border_delta);
+        }
+        delta[q..q + k].copy_from_slice(&border_delta);
+        for (index, globals_of_image) in model.images.iter().enumerate() {
+            let m = globals_of_image.len();
+            if m == 0 {
+                continue;
+            }
+            let (start, _) = model.image_range[index];
+            for row in 0..m {
+                let mut value = model.rhs[start + row];
+                for left in 0..q {
+                    value -= model.image_outer[index][row * q + left] * x[left];
+                }
+                for right in 0..k {
+                    value -= model.image_border[index][row * k + right] * border_delta[right];
+                }
+                scratch.image_rhs[row] = value;
+            }
+            solve_in_place(&self.image_factor[index], m, &mut scratch.image_rhs[..m]);
+            delta[start..start + m].copy_from_slice(&scratch.image_rhs[..m]);
+        }
+
+        if delta.iter().any(|value| !value.is_finite()) {
+            return Err(SolveFailure::Nonfinite);
+        }
+        let mut curvature = vec![0.0_f64; dim];
+        model.apply_undamped(&delta, &mut curvature);
+        for (index, value) in curvature.iter_mut().enumerate() {
+            *value += self.damping * model.data_diagonal[index].max(1e-12) * delta[index];
+        }
+        let mut error = 0.0_f64;
+        let mut scale = 0.0_f64;
+        for index in 0..dim {
+            let value = curvature[index] - model.rhs[index];
+            error += value * value;
+            scale += model.rhs[index] * model.rhs[index];
+        }
+        let relative_residual = (error / scale.max(1e-300)).sqrt();
+        if !relative_residual.is_finite() {
+            return Err(SolveFailure::Nonfinite);
+        }
+        if fit_diag() && (stalled || relative_residual > tolerance) {
+            let mut parts: Vec<(String, f64, f64)> = Vec::new();
+            let mut push = |label: String, from: usize, to: usize| {
+                let mut squared = 0.0_f64;
+                let mut rhs_squared = 0.0_f64;
+                let mut peak = 0.0_f64;
+                for index in from..to {
+                    let value = curvature[index] - model.rhs[index];
+                    squared += value * value;
+                    rhs_squared += model.rhs[index] * model.rhs[index];
+                    peak = peak.max(value.abs());
+                }
+                parts.push((label, squared.sqrt(), rhs_squared.sqrt().max(peak)));
+            };
+            let mut cursor = 0usize;
+            for (start, width, _, _) in &self.groups {
+                if *start > cursor {
+                    push(format!("gap {cursor}"), cursor, *start);
+                }
+                push(format!("group {start}+{width}"), *start, *start + *width);
+                cursor = *start + *width;
+            }
+            if cursor < q {
+                push(format!("outer tail {cursor}"), cursor, q);
+            }
+            if k > 0 {
+                push("border".to_string(), q, q + k);
+            }
+            for (index, (start, width)) in model.image_range.iter().enumerate() {
+                if *width > 0 {
+                    push(format!("image {index}"), *start, *start + *width);
+                }
+            }
+            eprintln!(
+                "fit joint residual {relative_residual:.3e} tolerance {tolerance:.3e} iterations {iterations} stalled {stalled} damping {:.3e} q {q} k {k}",
+                self.damping
+            );
+            for (label, residual_norm, rhs_norm) in parts {
+                if residual_norm > 1e-9 * rhs_norm.max(1e-300) {
+                    eprintln!(
+                        "fit joint residual {label} {residual_norm:.6e} of rhs {rhs_norm:.6e} ratio {:.3e}",
+                        residual_norm / rhs_norm.max(1e-300)
+                    );
+                }
+            }
+        }
+
+        if let Some(radius) = radius {
+            clamp_values(&mut delta, radius);
+            model.apply_undamped(&delta, &mut curvature);
+        } else {
+            for (index, value) in curvature.iter_mut().enumerate() {
+                *value -= self.damping * model.data_diagonal[index].max(1e-12) * delta[index];
+            }
+        }
+        let mut prediction = crate::solve::dot(&model.rhs, &delta);
+        prediction -= 0.5 * crate::solve::dot(&delta, &curvature);
+        Ok(JointSolution {
+            delta,
+            curvature,
+            prediction,
+            iterations,
+            relative_residual,
+            failure: stalled.then_some(SolveFailure::WorkLimit),
+        })
     }
 }
 
+struct JointSolution {
+    /// Joint-coordinate step.
+    delta: Vec<f64>,
+    /// `B δ` under the undamped joint model.
+    curvature: Vec<f64>,
+    /// `-g·δ - ½ δᵀBδ`.
+    prediction: f64,
+    iterations: usize,
+    /// Relative residual of the damped joint system after nuisance recovery.
+    relative_residual: f64,
+    /// Set when the iteration limit or the stall detector stopped the solve early.
+    failure: Option<SolveFailure>,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn coupled_step(
-    layout: &Layout, problem: &Problem, params: &Params, options: &FitOptions,
-    blocks: &[BlockAcc], penalties: &[Vec<f64>], lambdas: &StageLambdas, roles: &[Role],
-    pass: &PassOutput, data_scale: f64, damping: f64, step: &mut [f64],
-) -> Option<f64> {
-    let system = CoupledSystem::new(
-        layout, problem, params, options, blocks, penalties, lambdas, roles, pass, data_scale, damping,
-    )?;
-    let mut delta = system.solve()?;
-    clamp_values(&mut delta, STEP_RADIUS);
-    let mut product = vec![0.0; delta.len()];
-    system.apply(&delta, &mut product);
-    let mut prediction = crate::solve::dot(&system.rhs, &delta);
-    for (i, &global) in system.globals.iter().enumerate() {
-        step[global] = delta[i];
-        prediction -= 0.5 * delta[i] * (product[i] - system.damping_diagonal[i] * delta[i]);
+fn print_cost_breakdown(
+    problem: &Problem,
+    params: &Params,
+    blocks: &[BlockAcc],
+    penalties: &[Vec<f64>],
+    lambdas: &StageLambdas,
+    options: &FitOptions,
+    pass: &PassOutput,
+) {
+    let prior = prior_cost(problem, params, options);
+    let mut penalty_total = 0.0_f64;
+    let mut identity_total = 0.0_f64;
+    let mut residual_total = 0.0_f64;
+    for (index, block) in blocks.iter().enumerate() {
+        if block.kind == BlockKind::Residual {
+            residual_total += residual_cost(
+                &problem.layout,
+                &params.theta,
+                lam(lambdas, BlockKind::Residual),
+            );
+            continue;
+        }
+        let penalty = block_lambda(block, lambdas)
+            * penalty_value(&params.theta, &block.params, &penalties[index]);
+        let identity = identity_cost(&problem.layout, block, &params.theta);
+        penalty_total += penalty;
+        identity_total += identity;
+        if penalty.abs() + identity.abs() > 1e-6 * prior.abs().max(1.0) {
+            eprintln!(
+                "fit cost block {:?} penalty {penalty:.9e} identity {identity:.9e}",
+                block.kind
+            );
+        }
     }
-    Some(prediction)
+    eprintln!(
+        "fit cost likelihood {:.12e} prior {prior:.9e} penalty {penalty_total:.9e} identity {identity_total:.9e} residual {residual_total:.9e}",
+        pass.cost
+    );
+    for (index, image) in problem.images.iter().enumerate() {
+        let nuisance = params.image(index);
+        let mode = image.mode.map_or(0.0, |slot| params.mode_offset(slot));
+        if nuisance[0].abs() + nuisance[1].abs() + nuisance[2].abs() + mode.abs() > 5.0 {
+            eprintln!(
+                "fit cost image {index} exposure {:.6e} wb {:.6e} {:.6e} mode {mode:.6e} hint {:.6e}",
+                nuisance[0], nuisance[1], nuisance[2], image.exposure_hint
+            );
+        }
+    }
+    let sigma: Vec<f64> = (0..problem.contributors.len())
+        .map(|index| params.sigma(index))
+        .collect();
+    eprintln!("fit cost sigma {sigma:?} clip k {:.6e}", params.clip_k());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3920,6 +5122,15 @@ fn print_block_gradients(
     }
 }
 
+/// Outcome of one block's damped Newton solve.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BlockStep {
+    /// The block system factored; the value is the predicted reduction.
+    Solved(f64),
+    /// The block system could not be factorized; `step` was left untouched.
+    Failed,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn solve_block(
     layout: &Layout,
@@ -3933,10 +5144,10 @@ fn solve_block(
     damping: f64,
     data_scale: f64,
     step_limit: StepLimit,
-) -> f64 {
+) -> BlockStep {
     let n = block.len();
     if n == 0 {
-        return 0.0;
+        return BlockStep::Solved(0.0);
     }
     let lambda = block_lambda(block, lambdas);
     let (a, rhs) = block_system(
@@ -3955,20 +5166,18 @@ fn solve_block(
         .into_iter()
         .map(|value| damping * value.max(1e-12))
         .collect();
-    if block.kind == BlockKind::Nuisance
-        && solve_nuisance_schur(layout, block, &a, &rhs, step)
-    {
+    if block.kind == BlockKind::Nuisance && solve_nuisance_schur(layout, block, &a, &rhs, step) {
         let mut delta: Vec<f64> = block.params.iter().map(|global| step[*global]).collect();
         if step_limit == StepLimit::PerBlock {
             clamp_block_step(step, &block.params, STEP_RADIUS);
             delta = block.params.iter().map(|global| step[*global]).collect();
         }
-        return predicted_reduction(&a, &rhs, &delta, &damping_diag);
+        return BlockStep::Solved(predicted_reduction(&a, &rhs, &delta, &damping_diag));
     }
     let mut delta = rhs.clone();
     let mut factor = a.clone();
     if !factor_in_place(&mut factor, n) {
-        return 0.0;
+        return BlockStep::Failed;
     }
     solve_in_place(&factor, n, &mut delta);
     if step_limit == StepLimit::PerBlock {
@@ -3977,7 +5186,7 @@ fn solve_block(
     for i in 0..n {
         step[block.params[i]] = delta[i];
     }
-    predicted_reduction(&a, &rhs, &delta, &damping_diag)
+    BlockStep::Solved(predicted_reduction(&a, &rhs, &delta, &damping_diag))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3999,20 +5208,6 @@ fn block_system(
         .iter()
         .map(|value| value * data_scale)
         .collect();
-    if step_limit == StepLimit::PerBlock && block.full_diagonal.len() == n {
-        let mut scales = vec![1.0_f64; n];
-        for (index, scale) in scales.iter_mut().enumerate() {
-            let sampled = block.hessian[index * n + index] * data_scale;
-            if sampled > 0.0 {
-                *scale = (block.full_diagonal[index] / sampled).max(0.0).sqrt();
-            }
-        }
-        for i in 0..n {
-            for j in 0..n {
-                a[i * n + j] *= scales[i] * scales[j];
-            }
-        }
-    }
     for entry in 0..n * n {
         a[entry] += lambda * penalty[entry];
     }
@@ -4194,7 +5389,6 @@ fn clamp_values(values: &mut [f64], radius: f64) {
         }
     }
 }
-
 
 /// `-g·δ - 0.5 δᵀBδ` for the undamped model `B = A − damping·diag`.
 fn predicted_reduction(a: &[f64], rhs: &[f64], delta: &[f64], damping_diag: &[f64]) -> f64 {
@@ -4475,13 +5669,17 @@ fn residual_decrement(
     let identity = identity_weight(BlockKind::Residual);
     let support = residual_support(&pass.residual_samples);
     let peak = support.iter().copied().fold(0.0_f64, f64::max);
-    let free: Vec<bool> = support.iter().map(|s| peak > 0.0 && *s >= 1e-4 * peak).collect();
+    let free: Vec<bool> = support
+        .iter()
+        .map(|s| peak > 0.0 && *s >= 1e-4 * peak)
+        .collect();
     let mut rhs = vec![0.0; RESIDUAL_COEFS];
     let mut diagonal = residual_diagonal(&pass.residual_samples);
     for i in 0..RESIDUAL_COEFS {
         if free[i] {
             rhs[i] = pass.residual_gradient[i]
-                - ridge * laplacian_at(theta, i, &penalty) - identity * theta[i];
+                - ridge * laplacian_at(theta, i, &penalty)
+                - identity * theta[i];
         }
         diagonal[i] = if free[i] {
             data_scale * diagonal[i] + ridge * penalty[i] + identity
@@ -4491,24 +5689,42 @@ fn residual_decrement(
     }
     let apply = |v: &[f64], product: &mut [f64]| {
         residual_undamped_apply(
-            &pass.residual_samples, v, product, &penalty, ridge, identity, data_scale,
+            &pass.residual_samples,
+            v,
+            product,
+            &penalty,
+            ridge,
+            identity,
+            data_scale,
         );
         for i in 0..RESIDUAL_COEFS {
-            product[i] = if free[i] { product[i] - 1e-3 * v[i] } else { v[i] };
+            product[i] = if free[i] {
+                product[i] - 1e-3 * v[i]
+            } else {
+                v[i]
+            };
         }
     };
     let mut solution = vec![0.0; RESIDUAL_COEFS];
     crate::solve::conjugate_gradient(
-        RESIDUAL_COEFS, apply, &diagonal, &rhs, &mut solution, 40, 1e-6,
+        RESIDUAL_COEFS,
+        apply,
+        &diagonal,
+        &rhs,
+        &mut solution,
+        40,
+        1e-6,
     );
     let mut product = vec![0.0; RESIDUAL_COEFS];
     apply(&solution, &mut product);
-    let error: f64 = product.iter().zip(&rhs).map(|(a, b)| (a - b) * (a - b)).sum();
+    let error: f64 = product
+        .iter()
+        .zip(&rhs)
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum();
     let norm: f64 = rhs.iter().map(|v| v * v).sum();
     let energy = 0.5 * rhs.iter().zip(solution).map(|(g, z)| g * z).sum::<f64>();
-    if error.is_finite() && error <= 1e-12 * norm.max(1.0)
-        && energy.is_finite() && energy >= 0.0
-    {
+    if error.is_finite() && error <= 1e-12 * norm.max(1.0) && energy.is_finite() && energy >= 0.0 {
         energy
     } else {
         f64::INFINITY
@@ -4605,8 +5821,9 @@ mod review_tests {
         let options = FitOptions::default();
         let problem = Problem::new_with(&data.images, None, &options).expect("problem");
         let layout = &problem.layout;
-        let mut params = initial_params(&problem);
+        let mut params = initial_params(&problem, &options);
         params.theta[layout.tone_c0] = 0.0;
+
         let mut block = BlockAcc::new(BlockKind::Tone, vec![layout.tone_c0], layout.total);
         block.hessian[0] = 4.0;
         block.full_diagonal[0] = 4.0;
@@ -4617,16 +5834,40 @@ mod review_tests {
             prior_terms(&problem, &roles, &params, &options, &block);
         let mut step = vec![0.0; layout.total];
         solve_block(
-            layout, &block, &mut step, &penalty, &prior_gradient, &prior_curvature,
-            &params, &options.initial_lambdas, 1e12, 1.0, StepLimit::PerBlock,
+            layout,
+            &block,
+            &mut step,
+            &penalty,
+            &prior_gradient,
+            &prior_curvature,
+            &params,
+            &options.initial_lambdas,
+            1e12,
+            1.0,
+            StepLimit::PerBlock,
         );
         assert!(step[layout.tone_c0].abs() < 1e-9);
         let pass = problem.pass(
-            &params, ActiveColumns::ALL, &mut [], false, false, false, IntentFilter::NativeOnly,
+            &params,
+            ActiveColumns::ALL,
+            &mut [],
+            false,
+            false,
+            false,
+            IntentFilter::NativeOnly,
         );
         let decrement = stationarity_decrement(
-            layout, &problem, &params, &options, &[block], &[penalty],
-            &options.initial_lambdas, &roles, &pass, 1.0,
+            layout,
+            &problem,
+            &params,
+            &options,
+            &[block],
+            &[penalty],
+            &options.initial_lambdas,
+            &roles,
+            &pass,
+            1.0,
+            &mut None,
         );
         assert!(converged(&[100.0; 5]));
         assert!(decrement > STATIONARY_DECREMENT_NATS);
@@ -4643,7 +5884,7 @@ mod review_tests {
         let options = FitOptions::default();
         let problem = Problem::new_with(&data.images, None, &options).expect("problem");
         let layout = &problem.layout;
-        let mut params = initial_params(&problem);
+        let mut params = initial_params(&problem, &options);
         let globals = [layout.tone_c0, layout.tint_a.start];
         let mut blocks = [
             BlockAcc::new(BlockKind::Tone, vec![globals[0]], layout.total),
@@ -4657,24 +5898,55 @@ mod review_tests {
             block.gradient[0] = -derivative;
         }
         let mut pass = problem.pass(
-            &params, ActiveColumns::ALL, &mut [], false, false, false, IntentFilter::NativeOnly,
+            &params,
+            ActiveColumns::ALL,
+            &mut [],
+            false,
+            false,
+            false,
+            IntentFilter::NativeOnly,
         );
         pass.coupled_rows = vec![crate::problem::HessianRow {
-            columns: vec![(globals[0] as u32, [2.0, 0.0, 0.0]),
-                (globals[1] as u32, [3.0, 0.0, 0.0])],
+            columns: vec![
+                (globals[0] as u32, [2.0, 0.0, 0.0]),
+                (globals[1] as u32, [3.0, 0.0, 0.0]),
+            ],
             weight: 1.0,
+            robust_terms: vec![0.0, 0.0],
+            robust: 0.0,
+            margin_terms: vec![0.0, 0.0],
+            barrier: 0.0,
+            residual: [0.0; 3],
+            residual_columns: Vec::new(),
+            layers: vec![None; 2],
+            layer_weights: vec![[0.0; 4]; 2],
+            layer_slopes: vec![0.0; 2],
+            motion: [0.0; 3],
+            tint: [0.0; 4],
+            second: Box::new([0.0; 81]),
         }];
-        let system = CoupledSystem::new(
-            layout, &problem, &params, &options, &blocks, &[vec![0.0], vec![0.0]],
-            &options.initial_lambdas, &prior_roles(&problem, layout), &pass, 1.0, 0.0,
-        ).expect("positive definite curvature");
-        let solution = system.solve().expect("resolved coupled solve");
-        assert!((5.0 * solution[0] + 6.0 * solution[1] - 2.0).abs() < 1e-10);
-        assert!((6.0 * solution[0] + 9.25 * solution[1] - 3.0).abs() < 1e-10);
-        let lower_bound = system.energy_lower_bound();
-        let energy = 0.5 * crate::solve::dot(&system.rhs, &solution);
-        assert!(lower_bound > STATIONARY_DECREMENT_NATS);
-        assert!(lower_bound <= energy + 1e-12);
+        let model = JointModel::new(
+            layout,
+            &problem,
+            &params,
+            &options,
+            &blocks,
+            &[vec![0.0], vec![0.0]],
+            &options.initial_lambdas,
+            &prior_roles(&problem, layout),
+            &pass,
+            1.0,
+            true,
+            false,
+        )
+        .expect("positive definite curvature");
+        let solve = JointSolve::new(&model, 0.0).expect("factorization");
+        let solution = solve
+            .solve(&model, 1e-12, None, None)
+            .expect("resolved joint solve");
+        assert!((5.0 * solution.delta[0] + 6.0 * solution.delta[1] - 2.0).abs() < 1e-10);
+        assert!((6.0 * solution.delta[0] + 9.25 * solution.delta[1] - 3.0).abs() < 1e-10);
+        assert!(solution.prediction > STATIONARY_DECREMENT_NATS);
     }
 
     #[test]
@@ -4807,7 +6079,6 @@ mod review_tests {
         );
         assert!(choice.lambda.is_finite() && choice.lambda > 0.0);
     }
-
 }
 
 #[cfg(test)]
@@ -5009,5 +6280,1203 @@ mod schur_tests {
             &rhs,
             &mut step
         ));
+    }
+
+    fn joint_blocks(problem: &Problem, layers: bool) -> Vec<BlockAcc> {
+        let layout = &problem.layout;
+        let split = problem.images.len() > 64;
+        let mut blocks: Vec<BlockAcc> = STAGES[4]
+            .blocks
+            .iter()
+            .filter(|kind| **kind != BlockKind::Residual && !is_response_kind(**kind))
+            .filter(|kind| {
+                layers || !matches!(kind, BlockKind::G | BlockKind::R | BlockKind::Lambda)
+            })
+            .map(|kind| {
+                if *kind == BlockKind::Tone && !split {
+                    make_joint_tone_block(problem, ActiveColumns::ALL)
+                } else {
+                    make_block(problem, *kind, ActiveColumns::ALL)
+                }
+            })
+            .collect();
+        if split {
+            for index in 0..problem_image_count(layout) {
+                blocks.push(make_image_block(layout, index, ActiveColumns::ALL));
+            }
+            blocks.push(make_shared_nuisance_block(
+                problem,
+                layout,
+                ActiveColumns::ALL,
+            ));
+        }
+        blocks
+    }
+
+    /// The same joint curvature and right-hand side, assembled densely with no elimination.
+    #[allow(clippy::too_many_arguments)]
+    fn dense_joint_matrix(
+        layout: &Layout,
+        problem: &Problem,
+        params: &Params,
+        options: &FitOptions,
+        blocks: &[BlockAcc],
+        penalties: &[Vec<f64>],
+        lambdas: &StageLambdas,
+        roles: &[Role],
+        pass: &PassOutput,
+        damping: f64,
+        robust: bool,
+    ) -> (Vec<f64>, Vec<f64>, Vec<usize>, Vec<usize>) {
+        let mut globals: Vec<usize> = Vec::new();
+        let mut local = vec![usize::MAX; layout.total];
+        for block in blocks {
+            for &global in &block.params {
+                if local[global] == usize::MAX {
+                    local[global] = globals.len();
+                    globals.push(global);
+                }
+            }
+        }
+        let n = globals.len();
+        let mut a = vec![0.0_f64; n * n];
+        let mut rhs = vec![0.0_f64; n];
+        for row in &pass.coupled_rows {
+            for (position, (left, left_derivative)) in row.columns.iter().enumerate() {
+                let i = local[*left as usize];
+                if i == usize::MAX {
+                    continue;
+                }
+                for (other, (right, right_derivative)) in row.columns.iter().enumerate() {
+                    let j = local[*right as usize];
+                    if j == usize::MAX {
+                        continue;
+                    }
+                    a[i * n + j] += row.weight * dot3(*left_derivative, *right_derivative)
+                        + row.barrier * row.margin_terms[position] * row.margin_terms[other]
+                        + if robust {
+                            row.robust * row.robust_terms[position] * row.robust_terms[other]
+                        } else {
+                            0.0
+                        };
+                }
+            }
+        }
+        for (index, block) in blocks.iter().enumerate() {
+            let m = block.len();
+            let lambda = block_lambda(block, lambdas);
+            let (prior_gradient, prior_curvature) =
+                prior_terms(problem, roles, params, options, block);
+            let identity = identity_curvature(layout, block);
+            for (entry, &global) in block.params.iter().enumerate() {
+                let i = local[global];
+                let mut gradient = block.gradient[entry]
+                    + prior_gradient[entry]
+                    + identity[entry] * params.theta[global];
+                for (other, &target) in block.params.iter().enumerate() {
+                    let j = local[target];
+                    let value = lambda * penalties[index][entry * m + other];
+                    a[i * n + j] += value;
+                    gradient += value * params.theta[target];
+                }
+                a[i * n + i] += identity[entry]
+                    + prior_curvature[entry]
+                    + damping * block.full_diagonal[entry].max(1e-12);
+                rhs[i] = -gradient;
+            }
+        }
+        (a, rhs, globals, local)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dense_joint_solve(
+        layout: &Layout,
+        problem: &Problem,
+        params: &Params,
+        options: &FitOptions,
+        blocks: &[BlockAcc],
+        penalties: &[Vec<f64>],
+        lambdas: &StageLambdas,
+        roles: &[Role],
+        pass: &PassOutput,
+        damping: f64,
+        robust: bool,
+    ) -> Vec<f64> {
+        let (mut factor, rhs, globals, _) = dense_joint_matrix(
+            layout, problem, params, options, blocks, penalties, lambdas, roles, pass, damping,
+            robust,
+        );
+        let n = globals.len();
+        assert!(
+            factor_in_place(&mut factor, n),
+            "dense joint curvature is not positive definite"
+        );
+        let mut solution = rhs;
+        solve_in_place(&factor, n, &mut solution);
+        let mut out = vec![0.0_f64; layout.total];
+        for (index, &global) in globals.iter().enumerate() {
+            out[global] = solution[index];
+        }
+        out
+    }
+
+    fn schur_matches_direct_joint_solve(
+        images: usize,
+        samples: usize,
+        modes: bool,
+        zero_weight: bool,
+        damping: f64,
+        robust: bool,
+    ) {
+        let mut data = crate::synth::dataset(&crate::synth::SynthConfig {
+            images,
+            samples_per_image: samples,
+            ..crate::synth::SynthConfig::default()
+        });
+        if modes {
+            for image in data.images.iter_mut().skip(1).step_by(2) {
+                image.exposure_mode = crate::types::ExposureModeId(1);
+            }
+        }
+        if zero_weight {
+            data.images[1].trust_weight = 0.0;
+        }
+        let options = FitOptions {
+            hessian_samples: usize::MAX,
+            exposure_prior_sd: 1.0,
+            exposure_mode_prior_sd: 0.5,
+            ..FitOptions::default()
+        };
+        let problem = Problem::new_with(&data.images, None, &options).expect("problem");
+        let layout = &problem.layout;
+        let params = initial_params(&problem, &options);
+        let roles = prior_roles(&problem, layout);
+        let lambdas = StageLambdas {
+            tone: 1.0,
+            tint: 1.0,
+            grl: 1.0,
+            ..StageLambdas::default()
+        };
+        let mut blocks = joint_blocks(&problem, false);
+        let penalties: Vec<Vec<f64>> = blocks
+            .iter()
+            .map(|block| block_penalty(&problem, block))
+            .collect();
+        let pass = problem.pass_with_rows(
+            &params,
+            ActiveColumns::ALL,
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::NativeOnly,
+            true,
+            true,
+        );
+        let model = JointModel::new(
+            layout, &problem, &params, &options, &blocks, &penalties, &lambdas, &roles, &pass, 1.0,
+            robust, false,
+        )
+        .expect("joint model");
+        if robust {
+            let (a, _, globals, local) = dense_joint_matrix(
+                layout, &problem, &params, &options, &blocks, &penalties, &lambdas, &roles, &pass,
+                0.0, true,
+            );
+            let n = globals.len();
+            for seed in 0..4usize {
+                let mut v = vec![0.0_f64; model.dim];
+                let mut dense = vec![0.0_f64; n];
+                for index in 0..model.dim {
+                    let value = ((index * 37 + seed * 101) % 23) as f64 - 11.0;
+                    v[index] = value;
+                    dense[local[model.globals[index]]] = value;
+                }
+                let mut product = vec![0.0_f64; model.dim];
+                model.apply_undamped(&v, &mut product);
+                for index in 0..model.dim {
+                    let row = local[model.globals[index]];
+                    let mut sum = 0.0;
+                    for column in 0..n {
+                        sum += a[row * n + column] * dense[column];
+                    }
+                    assert!(
+                        (product[index] - sum).abs() <= 1e-8 * sum.abs().max(1.0),
+                        "robust operator entry {index}: model {} dense {}",
+                        product[index],
+                        sum
+                    );
+                }
+            }
+            return;
+        }
+        let solve = JointSolve::new(&model, damping).expect("factorization");
+        let solution = solve
+            .solve(&model, 1e-12, None, None)
+            .expect("resolved joint solve");
+        let dense = dense_joint_solve(
+            layout, &problem, &params, &options, &blocks, &penalties, &lambdas, &roles, &pass,
+            damping, robust,
+        );
+        let mut product = vec![0.0_f64; model.dim];
+        model.apply_undamped(&solution.delta, &mut product);
+        for (index, value) in product.iter_mut().enumerate() {
+            *value += damping * model.data_diagonal[index].max(1e-12) * solution.delta[index];
+        }
+        let mut blocks = vec![0.0_f64; 3];
+        for index in 0..model.dim {
+            let residual = product[index] - model.rhs[index];
+            let slot = if index < model.outer_count {
+                0
+            } else if index < model.outer_count + model.border_count {
+                1
+            } else {
+                2
+            };
+            blocks[slot] = blocks[slot].max(residual.abs());
+        }
+        assert!(
+            solution.relative_residual < 1e-9,
+            "recovered joint residual {} iterations {} failure {:?} q {} dim {} block residuals {blocks:?}",
+            solution.relative_residual,
+            solution.iterations,
+            solution.failure,
+            model.outer_count,
+            model.dim
+        );
+        let mut largest = 0.0_f64;
+        for (index, &global) in model.globals.iter().enumerate() {
+            largest = largest.max((solution.delta[index] - dense[global]).abs());
+        }
+        assert!(
+            largest < 1e-8,
+            "Schur and direct joint steps differ by {largest}"
+        );
+    }
+
+    #[cfg(feature = "synth")]
+    #[test]
+    fn schur_matches_direct_joint_solve_with_modes_and_weak_exposure_priors() {
+        schur_matches_direct_joint_solve(4, 32, true, false, 1e-2, false);
+    }
+
+    #[cfg(feature = "synth")]
+    #[test]
+    fn schur_matches_direct_joint_solve_with_a_zero_weight_image() {
+        schur_matches_direct_joint_solve(3, 32, true, true, 1e-3, false);
+    }
+
+    #[cfg(feature = "synth")]
+    #[test]
+    fn schur_matches_direct_joint_solve_below_the_nuisance_split() {
+        schur_matches_direct_joint_solve(64, 4, true, false, 1e-2, false);
+    }
+
+    #[cfg(feature = "synth")]
+    #[test]
+    fn schur_matches_direct_joint_solve_above_the_nuisance_split() {
+        schur_matches_direct_joint_solve(65, 4, true, false, 1e-2, false);
+    }
+
+    #[cfg(feature = "synth")]
+    #[test]
+    fn schur_matches_direct_joint_solve_with_the_robust_correction() {
+        schur_matches_direct_joint_solve(4, 32, true, false, 1e-2, true);
+    }
+
+    fn one_coordinate_certificate(identity_scale: f64) -> f64 {
+        let data = crate::synth::dataset(&crate::synth::SynthConfig {
+            images: 1,
+            samples_per_image: 8,
+            ..crate::synth::SynthConfig::default()
+        });
+        let options = FitOptions {
+            identity_scale,
+            ..FitOptions::default()
+        };
+        let problem = Problem::new_with(&data.images, None, &options).expect("problem");
+        let layout = &problem.layout;
+        let mut params = initial_params(&problem, &options);
+        params.theta[layout.tone_c0] = 0.0;
+        let roles = prior_roles(&problem, layout);
+        let mut block = BlockAcc::new(BlockKind::Tone, vec![layout.tone_c0], layout.total);
+        block.hessian[0] = 4.0;
+        block.full_diagonal[0] = 4.0;
+        block.gradient[0] = -2.0;
+        let mut pass = problem.pass(
+            &params,
+            ActiveColumns::ALL,
+            &mut [],
+            false,
+            false,
+            false,
+            IntentFilter::NativeOnly,
+        );
+        pass.coupled_rows = vec![crate::problem::HessianRow {
+            columns: vec![(layout.tone_c0 as u32, [2.0, 0.0, 0.0])],
+            weight: 1.0,
+            robust_terms: vec![0.0],
+            robust: 0.0,
+            margin_terms: vec![0.0],
+            barrier: 0.0,
+            residual: [0.0; 3],
+            residual_columns: Vec::new(),
+            layers: vec![None; 1],
+            layer_weights: vec![[0.0; 4]; 1],
+            layer_slopes: vec![0.0; 1],
+            motion: [0.0; 3],
+            tint: [0.0; 4],
+            second: Box::new([0.0; 81]),
+        }];
+        stationarity_decrement(
+            layout,
+            &problem,
+            &params,
+            &options,
+            &[block],
+            &[vec![0.0]],
+            &options.initial_lambdas,
+            &roles,
+            &pass,
+            1.0,
+            &mut None,
+        )
+    }
+
+    #[cfg(feature = "synth")]
+    #[test]
+    fn certificate_reports_the_exact_decrement_of_a_resolved_system() {
+        let decrement = one_coordinate_certificate(1.0);
+        assert!((decrement - 0.4).abs() < 1e-9, "decrement {decrement}");
+    }
+
+    #[cfg(feature = "synth")]
+    #[test]
+    fn certificate_rejects_a_missing_prior_floor() {
+        let decrement = one_coordinate_certificate(0.0);
+        assert!(
+            decrement > STATIONARY_DECREMENT_NATS,
+            "zero prior floor certified stationarity at {decrement}"
+        );
+    }
+}
+
+/// Exact-Hessian harness for the joint step model (test only).
+#[cfg(all(test, feature = "synth"))]
+mod curvature_tests {
+    use super::*;
+
+    struct Fixture {
+        problem: Problem,
+        options: FitOptions,
+        lambdas: StageLambdas,
+        kinds: Vec<BlockKind>,
+        roles: Vec<Role>,
+        truth: looklab_model::Look,
+    }
+
+    impl Fixture {
+        fn new(images: usize, samples: usize, seed: u64) -> Self {
+            let data = crate::synth::dataset(&crate::synth::SynthConfig {
+                seed,
+                images,
+                samples_per_image: samples,
+                ..crate::synth::SynthConfig::default()
+            });
+            let options = FitOptions::default();
+            let problem = Problem::new_with(&data.images, None, &options).expect("problem");
+            let roles = prior_roles(&problem, &problem.layout);
+            Self {
+                kinds: vec![
+                    BlockKind::Tone,
+                    BlockKind::Tint,
+                    BlockKind::G,
+                    BlockKind::R,
+                    BlockKind::Lambda,
+                ],
+                lambdas: StageLambdas {
+                    tone: 0.7,
+                    tint: 0.4,
+                    grl: 0.15,
+                    residual: 0.1,
+                    ..StageLambdas::default()
+                },
+                problem,
+                options,
+                roles,
+                truth: data.truth,
+            }
+        }
+
+        fn params(&self) -> Params {
+            let mut params = params_from_look(&self.problem, &self.truth);
+            let layout = &self.problem.layout;
+            for (offset, index) in layout.g.clone().enumerate() {
+                params.theta[index] += 0.02 * (1 + offset % 3) as f64;
+            }
+            for (offset, index) in layout.r.clone().enumerate() {
+                params.theta[index] -= 0.01 * (1 + offset % 2) as f64;
+            }
+            for (offset, index) in layout.lambda.clone().enumerate() {
+                params.theta[index] += 0.005 * (1 + offset % 4) as f64;
+            }
+            for (offset, index) in layout.tint_a.clone().enumerate() {
+                params.theta[index] += 0.01 * (1 + offset % 2) as f64;
+            }
+            for (offset, index) in layout.tone_beta.clone().enumerate() {
+                params.theta[index] += 0.02 * (1 + offset % 3) as f64;
+            }
+            params
+        }
+
+        fn blocks(&self) -> Vec<BlockAcc> {
+            self.kinds
+                .iter()
+                .map(|kind| make_block(&self.problem, *kind, ActiveColumns::ALL))
+                .collect()
+        }
+
+        fn joint(&self, params: &Params) -> (JointModel, PassOutput) {
+            let mut blocks = self.blocks();
+            let penalties: Vec<Vec<f64>> = blocks
+                .iter()
+                .map(|block| block_penalty(&self.problem, block))
+                .collect();
+            let pass = self.problem.pass_with_rows(
+                params,
+                ActiveColumns::ALL,
+                &mut blocks,
+                true,
+                false,
+                false,
+                IntentFilter::NativeOnly,
+                true,
+                true,
+            );
+            assert!(!pass.infeasible, "harness point is infeasible");
+            let model = JointModel::new(
+                &self.problem.layout,
+                &self.problem,
+                params,
+                &self.options,
+                &blocks,
+                &penalties,
+                &self.lambdas,
+                &self.roles,
+                &pass,
+                1.0,
+                true,
+                true,
+            )
+            .expect("joint model");
+            (model, pass)
+        }
+    }
+
+    struct Noise {
+        state: u64,
+    }
+
+    impl Noise {
+        fn signed(&mut self) -> f64 {
+            self.state ^= self.state << 13;
+            self.state ^= self.state >> 7;
+            self.state ^= self.state << 17;
+            2.0 * ((self.state >> 11) as f64 / (1u64 << 53) as f64) - 1.0
+        }
+    }
+
+    fn dot(a: &[f64], b: &[f64]) -> f64 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    /// Data Hessian-vector product from independent per-sample evaluations: the exact
+    /// central difference and the GN + Student-t + acceleration model.
+    fn sample_hessian_vectors(
+        problem: &Problem,
+        params: &Params,
+        v: &[f64],
+        h: f64,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let layout = &problem.layout;
+        let nu = problem.nu;
+        let mut plus = params.clone();
+        let mut minus = params.clone();
+        for (slot, value) in v.iter().enumerate() {
+            plus.theta[slot] += h * value;
+            minus.theta[slot] -= h * value;
+        }
+        let terms_at = |params: &Params, index: usize| {
+            let (look, slope) = problem.look_and_slope(params);
+            let sample = &problem.samples[index];
+            let image = sample.image as usize;
+            let context = problem.image_ctx(params, image);
+            let columns = problem.column_map(params, image, ActiveColumns::ALL);
+            let mut jac = crate::predict::Jac::default();
+            let out = crate::predict::evaluate_sample(
+                &look,
+                layout,
+                &context,
+                &columns,
+                sample.rgb,
+                params.clip_k(),
+                params.clip_slope(),
+                &slope,
+                &[],
+                &sample.target,
+                &mut jac,
+            );
+            let sigma = params.sigma(problem.images[image].contributor);
+            let squared = dot(&out.residual, &out.residual);
+            let alpha = sample.weight * (nu + 3.0) / (nu * sigma * sigma + squared);
+            let barrier_slope =
+                looklab_model::look::barrier_derivatives(out.margin).0 * sample.weight;
+            let gradient: Vec<f64> = jac
+                .derivs
+                .iter()
+                .enumerate()
+                .map(|(position, derivative)| {
+                    alpha * dot(&derivative[..], &out.residual)
+                        + barrier_slope * out.margin_terms[position]
+                })
+                .collect();
+            let barrier_gradient: Vec<f64> = out
+                .margin_terms
+                .iter()
+                .map(|term| barrier_slope * term)
+                .collect();
+            (
+                out.residual,
+                jac.cols,
+                jac.derivs,
+                alpha,
+                squared,
+                gradient,
+                barrier_gradient,
+            )
+        };
+        let mut model = vec![0.0_f64; layout.total];
+        let mut exact = vec![0.0_f64; layout.total];
+        let mut barrier_second = vec![0.0_f64; layout.total];
+        let mut gradient_sum = vec![0.0_f64; layout.total];
+        for index in 0..problem.samples.len() {
+            let (residual, cols, derivs, alpha, squared, gradient, _) = terms_at(params, index);
+            let (_, cols_plus, derivs_plus, _, _, gradient_plus, barrier_plus) =
+                terms_at(&plus, index);
+            let (_, _, derivs_minus, _, _, gradient_minus, barrier_minus) =
+                terms_at(&minus, index);
+            assert_eq!(cols, cols_plus);
+            let mut projected = [0.0_f64; 3];
+            for (column, derivative) in cols.iter().zip(&derivs) {
+                let value = v[*column as usize];
+                for channel in 0..3 {
+                    projected[channel] += derivative[channel] * value;
+                }
+            }
+            let mut robust_projection = 0.0;
+            for (column, derivative) in cols.iter().zip(&derivs) {
+                robust_projection += dot(&derivative[..], &residual) * v[*column as usize];
+            }
+            let image = problem.samples[index].image as usize;
+            let sigma = params.sigma(problem.images[image].contributor);
+            let q = nu * sigma * sigma + squared;
+            let robust = -2.0 * (nu + 3.0) / (q * q) * problem.samples[index].weight;
+            for position in 0..cols.len() {
+                let column = cols[position] as usize;
+                let mut accel = 0.0;
+                for channel in 0..3 {
+                    accel += alpha
+                        * residual[channel]
+                        * (derivs_plus[position][channel] - derivs_minus[position][channel])
+                        / (2.0 * h);
+                }
+                let gn = alpha
+                    * (derivs[position][0] * projected[0]
+                        + derivs[position][1] * projected[1]
+                        + derivs[position][2] * projected[2]);
+                let term = dot(&derivs[position][..], &residual);
+                model[column] += gn + robust * term * robust_projection + accel;
+                exact[column] += (gradient_plus[position] - gradient_minus[position]) / (2.0 * h);
+                barrier_second[column] +=
+                    (barrier_plus[position] - barrier_minus[position]) / (2.0 * h);
+                gradient_sum[column] += gradient[position];
+            }
+        }
+        (exact, model, gradient_sum, barrier_second)
+    }
+
+    fn norm(a: &[f64]) -> f64 {
+        dot(a, a).sqrt()
+    }
+
+    /// GN, robust and barrier curvature of the retained rows along `v`, joint coordinates.
+    fn row_curvature(
+        rows: &[crate::problem::HessianRow],
+        of: &[usize],
+        v: &[f64],
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let dim = v.len();
+        let mut gn = vec![0.0_f64; dim];
+        let mut robust = vec![0.0_f64; dim];
+        let mut barrier = vec![0.0_f64; dim];
+        for row in rows {
+            let mut projected = [0.0_f64; 3];
+            let mut robust_projection = 0.0_f64;
+            let mut margin_projection = 0.0_f64;
+            for (position, (global, derivative)) in row.columns.iter().enumerate() {
+                let value = v[of[*global as usize]];
+                projected[0] += derivative[0] * value;
+                projected[1] += derivative[1] * value;
+                projected[2] += derivative[2] * value;
+                robust_projection += row.robust_terms[position] * value;
+                margin_projection += row.margin_terms[position] * value;
+            }
+            for (position, (global, derivative)) in row.columns.iter().enumerate() {
+                let index = of[*global as usize];
+                gn[index] += row.weight * dot3(*derivative, projected);
+                robust[index] += row.robust * row.robust_terms[position] * robust_projection;
+                barrier[index] += row.barrier * row.margin_terms[position] * margin_projection;
+            }
+        }
+        (gn, robust, barrier)
+    }
+
+    /// `α Σ_c r_c ∂²p_c/∂θ² v` and the margin's second-derivative term, from central
+    /// differences of the retained Jacobian rows.
+    fn second_order_reference(
+        base: &PassOutput,
+        plus: &PassOutput,
+        minus: &PassOutput,
+        of: &[usize],
+        h: f64,
+    ) -> Vec<f64> {
+        assert_eq!(base.coupled_rows.len(), plus.coupled_rows.len());
+        assert_eq!(base.coupled_rows.len(), minus.coupled_rows.len());
+        let dim = of.len();
+        let mut accel = vec![0.0_f64; dim];
+        for ((row, row_plus), row_minus) in base
+            .coupled_rows
+            .iter()
+            .zip(&plus.coupled_rows)
+            .zip(&minus.coupled_rows)
+        {
+            assert_eq!(row.columns.len(), row_plus.columns.len());
+            assert_eq!(row.columns.len(), row_minus.columns.len());
+            for position in 0..row.columns.len() {
+                assert_eq!(row.columns[position].0, row_plus.columns[position].0);
+                assert_eq!(row.columns[position].0, row_minus.columns[position].0);
+                let index = of[row.columns[position].0 as usize];
+                let mut derivative = [0.0_f64; 3];
+                for channel in 0..3 {
+                    derivative[channel] = (row_plus.columns[position].1[channel]
+                        - row_minus.columns[position].1[channel])
+                        / (2.0 * h);
+                }
+                accel[index] += row.weight * dot3(row.residual, derivative);
+            }
+        }
+        accel
+    }
+
+    #[test]
+    fn single_sample_data_terms_match_differences() {
+        let fixture = Fixture::new(1, 8, 0x5eed_1234);
+        let problem = &fixture.problem;
+        let params = fixture.params();
+        let nu = problem.nu;
+        let layout = &problem.layout;
+
+        // The likelihood's data part for one sample, its Jacobian and residual.
+        let sample_terms = |params: &Params, index: usize| {
+            let (look, slope) = problem.look_and_slope(params);
+            let sample = &problem.samples[index];
+            let image = sample.image as usize;
+            let context = problem.image_ctx(params, image);
+            let columns = problem.column_map(params, image, ActiveColumns::ALL);
+            let mut jac = crate::predict::Jac::default();
+            let out = crate::predict::evaluate_sample(
+                &look,
+                layout,
+                &context,
+                &columns,
+                sample.rgb,
+                params.clip_k(),
+                params.clip_slope(),
+                &slope,
+                &[],
+                &sample.target,
+                &mut jac,
+            );
+            let sigma = params.sigma(problem.images[image].contributor);
+            let squared = dot(&out.residual, &out.residual);
+            let loss = sample.weight
+                * (0.5 * (nu + 3.0) * libm::log1p(squared / (nu * sigma * sigma))
+                    + 1.5 * libm::log(sigma * sigma));
+            let alpha = sample.weight * (nu + 3.0) / (nu * sigma * sigma + squared);
+            (loss, out.residual, jac.cols, jac.derivs, alpha)
+        };
+
+        let mut noise = Noise {
+            state: 0x0bad_c0de_1234_5678,
+        };
+        for index in [0usize, 3] {
+            let (loss, residual, cols, derivs, alpha) = sample_terms(&params, index);
+            assert!(loss.is_finite());
+            let mut v = vec![0.0_f64; layout.total];
+            for (column, _) in cols.iter().zip(&derivs) {
+                let column = *column as usize;
+                let scale = match kind_of(layout, column) {
+                    Some(BlockKind::Tone) => 0.05,
+                    Some(BlockKind::Tint) => 0.02,
+                    Some(BlockKind::G | BlockKind::R | BlockKind::Lambda) => 0.01,
+                    _ => 0.0,
+                };
+                v[column] = scale * noise.signed();
+            }
+            let projected = |derivs: &[[f64; 3]], cols: &[u32]| {
+                let mut out = [0.0_f64; 3];
+                for (column, derivative) in cols.iter().zip(derivs) {
+                    let value = v[*column as usize];
+                    out[0] += derivative[0] * value;
+                    out[1] += derivative[1] * value;
+                    out[2] += derivative[2] * value;
+                }
+                out
+            };
+            let gradient_along = |params: &Params| -> (f64, f64) {
+                let (_, residual, cols, derivs, alpha) = sample_terms(params, index);
+                let mut projected = [0.0_f64; 3];
+                for (column, derivative) in cols.iter().zip(&derivs) {
+                    let value = v[*column as usize];
+                    projected[0] += derivative[0] * value;
+                    projected[1] += derivative[1] * value;
+                    projected[2] += derivative[2] * value;
+                }
+                (alpha * dot(&residual, &projected), alpha)
+            };
+            let h = 1e-6;
+            let mut plus = params.clone();
+            let mut minus = params.clone();
+            for (slot, value) in v.iter().enumerate() {
+                plus.theta[slot] += h * value;
+                minus.theta[slot] -= h * value;
+            }
+            let (gradient, _) = gradient_along(&params);
+            let (gradient_plus, _) = gradient_along(&plus);
+            let (gradient_minus, _) = gradient_along(&minus);
+            let finite = (gradient_plus - gradient_minus) / (2.0 * h);
+            let (loss_plus, _, _, _, _) = sample_terms(&plus, index);
+            let (loss_minus, _, _, _, _) = sample_terms(&minus, index);
+            let first = (loss_plus - loss_minus) / (2.0 * h);
+            // Model pieces at the base point.
+            let base_projection = projected(&derivs, &cols);
+            let gn = alpha * dot(&base_projection, &base_projection);
+            let mut robust_terms = Vec::with_capacity(cols.len());
+            for derivative in &derivs {
+                robust_terms.push(dot(&derivative[..], &residual));
+            }
+            let mut robust_projection = 0.0;
+            for (column, term) in cols.iter().zip(&robust_terms) {
+                robust_projection += term * v[*column as usize];
+            }
+            let squared = dot(&residual, &residual);
+            let sigma = params.sigma(problem.images[problem.samples[index].image as usize].contributor);
+            let q = nu * sigma * sigma + squared;
+            let robust =
+                -2.0 * (nu + 3.0) / (q * q) * sample_weight(problem, index)
+                    * robust_projection
+                    * robust_projection;
+            let (_, _, cols_plus, derivs_plus, _) = sample_terms(&plus, index);
+            let (_, _, cols_minus, derivs_minus, _) = sample_terms(&minus, index);
+            assert_eq!(cols, cols_plus);
+            assert_eq!(cols, cols_minus);
+            let mut accel = 0.0;
+            for channel in 0..3 {
+                let plus_projection = projected(&derivs_plus, &cols_plus)[channel];
+                let minus_projection = projected(&derivs_minus, &cols_minus)[channel];
+                accel += residual[channel] * (plus_projection - minus_projection) / (2.0 * h);
+            }
+            let accel = alpha * accel;
+            println!(
+                "sample {index}: gradient {gradient:.9e} difference {first:.9e} | loss {loss:.9e}"
+            );
+            println!(
+                "  curvature: finite {finite:.9e} gn {gn:.9e} robust {robust:.9e} accel {accel:.9e} sum {:.9e}",
+                gn + robust + accel
+            );
+            let scale = finite.abs().max(1.0);
+            assert!(
+                (gradient - first).abs() <= 1e-5 * scale,
+                "gradient {gradient:.9e} vs difference {first:.9e}"
+            );
+            assert!(
+                (gn + robust + accel - finite).abs() <= 1e-4 * scale,
+                "model curvature {:.9e} vs finite {finite:.9e}",
+                gn + robust + accel
+            );
+        }
+    }
+
+    fn sample_weight(problem: &Problem, index: usize) -> f64 {
+        problem.samples[index].weight
+    }
+
+    #[test]
+    fn single_sample_columns_match_differences() {
+        let fixture = Fixture::new(2, 24, 0x5eed_1234);
+        let problem = &fixture.problem;
+        let params = fixture.params();
+        let layout = &problem.layout;
+        let nu = problem.nu;
+
+        let sample_terms = |params: &Params, index: usize| {
+            let (look, slope) = problem.look_and_slope(params);
+            let sample = &problem.samples[index];
+            let image = sample.image as usize;
+            let context = problem.image_ctx(params, image);
+            let columns = problem.column_map(params, image, ActiveColumns::ALL);
+            let mut jac = crate::predict::Jac::default();
+            let out = crate::predict::evaluate_sample(
+                &look,
+                layout,
+                &context,
+                &columns,
+                sample.rgb,
+                params.clip_k(),
+                params.clip_slope(),
+                &slope,
+                &[],
+                &sample.target,
+                &mut jac,
+            );
+            let sigma = params.sigma(problem.images[image].contributor);
+            let squared = dot(&out.residual, &out.residual);
+            let alpha = sample.weight * (nu + 3.0) / (nu * sigma * sigma + squared);
+            let terms: Vec<f64> = jac
+                .derivs
+                .iter()
+                .map(|derivative| dot(&derivative[..], &out.residual))
+                .collect();
+            (out.residual, jac.cols, jac.derivs, alpha, squared, terms)
+        };
+
+        let mut noise = Noise {
+            state: 0x0bad_c0de_1234_5678,
+        };
+        let mut v = vec![0.0_f64; layout.total];
+        for global in layout.tone_c0..layout.lambda.end {
+            let scale = match kind_of(layout, global) {
+                Some(BlockKind::Tone) => 0.05,
+                Some(BlockKind::Tint) => 0.02,
+                Some(BlockKind::G | BlockKind::R | BlockKind::Lambda) => 0.01,
+                _ => 0.0,
+            };
+            v[global] = scale * noise.signed();
+        }
+        let h = 1e-6;
+        let mut plus = params.clone();
+        let mut minus = params.clone();
+        for (slot, value) in v.iter().enumerate() {
+            plus.theta[slot] += h * value;
+            minus.theta[slot] -= h * value;
+        }
+        let mut total = 0.0_f64;
+        let mut modelled_total = 0.0_f64;
+        let mut worst = (0.0_f64, 0usize);
+        for index in 0..problem.samples.len() {
+            let (residual, cols, derivs, alpha, squared, terms) = sample_terms(&params, index);
+            let (_, cols_plus, derivs_plus, alpha_plus, _, terms_plus) =
+                sample_terms(&plus, index);
+            let (_, cols_minus, derivs_minus, alpha_minus, _, terms_minus) =
+                sample_terms(&minus, index);
+            assert_eq!(cols, cols_plus);
+            assert_eq!(cols, cols_minus);
+            let mut projected = [0.0_f64; 3];
+            let mut robust_projection = 0.0;
+            for (column, derivative) in cols.iter().zip(&derivs) {
+                let value = v[*column as usize];
+                for channel in 0..3 {
+                    projected[channel] += derivative[channel] * value;
+                }
+            }
+            for (column, term) in cols.iter().zip(&terms) {
+                robust_projection += term * v[*column as usize];
+            }
+            let image = problem.samples[index].image as usize;
+            let sigma = params.sigma(problem.images[image].contributor);
+            let q = nu * sigma * sigma + squared;
+            let robust = -2.0 * (nu + 3.0) / (q * q) * problem.samples[index].weight;
+            let mut exact_norm = 0.0_f64;
+            let mut model_norm = 0.0_f64;
+            let mut gap_norm = 0.0_f64;
+            for position in 0..cols.len() {
+                let exact =
+                    (alpha_plus * terms_plus[position] - alpha_minus * terms_minus[position])
+                        / (2.0 * h);
+                let mut accel = 0.0;
+                for channel in 0..3 {
+                    accel += alpha
+                        * residual[channel]
+                        * (derivs_plus[position][channel] - derivs_minus[position][channel])
+                        / (2.0 * h);
+                }
+                let gn = alpha
+                    * (derivs[position][0] * projected[0]
+                        + derivs[position][1] * projected[1]
+                        + derivs[position][2] * projected[2]);
+                let modelled = gn + robust * terms[position] * robust_projection + accel;
+                exact_norm += exact * exact;
+                model_norm += modelled * modelled;
+                gap_norm += (exact - modelled) * (exact - modelled);
+            }
+            total += exact_norm;
+            modelled_total += model_norm;
+            let relative = gap_norm.sqrt() / exact_norm.sqrt().max(1e-12);
+            if relative > worst.0 {
+                worst = (relative, index);
+            }
+        }
+        println!(
+            "columns: |exact| {:.6e} |model| {:.6e} worst relative gap {:.3e} at sample {}",
+            total.sqrt(),
+            modelled_total.sqrt(),
+            worst.0,
+            worst.1
+        );
+        assert!(worst.0 < 1e-5, "relative gap {:.3e}", worst.0);
+    }
+
+    #[test]
+    fn joint_curvature_terms_match_the_objective_hessian() {
+        let fixture = Fixture::new(2, 24, 0x5eed_1234);
+        let params = fixture.params();
+        let layout = &fixture.problem.layout;
+        let (model, pass) = fixture.joint(&params);
+        let dim = model.dim;
+        let of = &model.globals;
+
+        let mut noise = Noise {
+            state: 0x1234_5678_9abc_def0,
+        };
+        for trial in 0..3 {
+            let mut v_global = vec![0.0_f64; layout.total];
+            let mut v = vec![0.0_f64; dim];
+            for (slot, &global) in of.iter().enumerate() {
+                let scale = match kind_of(layout, global) {
+                    Some(BlockKind::Tone) => 0.05,
+                    Some(BlockKind::Tint) => 0.02,
+                    Some(BlockKind::G | BlockKind::R | BlockKind::Lambda) => 0.01,
+                    _ => 0.0,
+                };
+                v[slot] = scale * noise.signed();
+                v_global[global] = v[slot];
+            }
+
+            let mut model_v = vec![0.0_f64; dim];
+            model.apply_undamped(&v, &mut model_v);
+            let mut plain_v = vec![0.0_f64; dim];
+            model.apply_undamped_with(&v, &mut plain_v, false);
+            let analytic_second: Vec<f64> = (0..dim).map(|i| model_v[i] - plain_v[i]).collect();
+            let blocks_of = |range: core::ops::Range<usize>| -> Vec<usize> {
+                (0..dim).filter(|slot| range.contains(&of[*slot])).collect()
+            };
+            let tone_slots = blocks_of(layout.tone_c0..layout.tint_a.start);
+            let mut best = f64::INFINITY;
+            for h in [1e-4, 1e-5, 1e-6, 1e-7] {
+                let mut plus = params.clone();
+                let mut minus = params.clone();
+                for (index, value) in v_global.iter().enumerate() {
+                    plus.theta[index] += h * value;
+                    minus.theta[index] -= h * value;
+                }
+                let (model_plus, pass_plus) = fixture.joint(&plus);
+                let (model_minus, pass_minus) = fixture.joint(&minus);
+                assert_eq!(model_plus.dim, dim);
+                assert_eq!(model_minus.dim, dim);
+                let exact: Vec<f64> = (0..dim)
+                    .map(|index| -(model_plus.rhs[index] - model_minus.rhs[index]) / (2.0 * h))
+                    .collect();
+                let accel = second_order_reference(&pass, &pass_plus, &pass_minus, of, h);
+                let gap: Vec<f64> = (0..dim)
+                    .map(|index| exact[index] - model_v[index] - accel[index])
+                    .collect();
+                let residual: Vec<f64> = (0..dim)
+                    .map(|index| exact[index] - model_v[index])
+                    .collect();
+                let relative = norm(&residual) / norm(&exact).max(1e-12);
+                best = best.min(relative);
+                println!(
+                    "trial {trial} h {h:.0e}: |exact| {:.9e} |residual| {:.9e} |gap| {:.9e} tone gap {:.6e} relative {relative:.3e}",
+                    norm(&exact),
+                    norm(&residual),
+                    norm(&gap),
+                    norm(&tone_slots.iter().map(|slot| gap[*slot]).collect::<Vec<f64>>())
+                );
+            }
+            assert!(
+                best <= 1e-6,
+                "the analytic second order misses the objective Hessian by {best:.3e}"
+            );
+            let h = 1e-6;
+            let mut plus = params.clone();
+            let mut minus = params.clone();
+            for (index, value) in v_global.iter().enumerate() {
+                plus.theta[index] += h * value;
+                minus.theta[index] -= h * value;
+            }
+            let (model_plus, pass_plus) = fixture.joint(&plus);
+            let (model_minus, pass_minus) = fixture.joint(&minus);
+            let exact: Vec<f64> = (0..dim)
+                .map(|index| -(model_plus.rhs[index] - model_minus.rhs[index]) / (2.0 * h))
+                .collect();
+            let (gn, robust, barrier) = row_curvature(&pass.coupled_rows, of, &v);
+            let accel = second_order_reference(&pass, &pass_plus, &pass_minus, of, h);
+            println!(
+                "  along v: exact {:.9e} model {:.9e} gn {:.9e} robust {:.9e} barrier {:.9e} acceleration {:.9e}",
+                dot(&v, &exact),
+                dot(&v, &model_v),
+                dot(&v, &gn),
+                dot(&v, &robust),
+                dot(&v, &barrier),
+                dot(&v, &accel)
+            );
+            let cost_at = |params: &Params| -> f64 {
+                let mut blocks = fixture.blocks();
+                let penalties: Vec<Vec<f64>> = blocks
+                    .iter()
+                    .map(|block| block_penalty(&fixture.problem, block))
+                    .collect();
+                let pass = fixture.problem.pass(
+                    params,
+                    ActiveColumns::ALL,
+                    &mut blocks,
+                    false,
+                    false,
+                    false,
+                    IntentFilter::NativeOnly,
+                );
+                pass.cost
+                    + total_cost(
+                        &fixture.problem,
+                        params,
+                        &blocks,
+                        &penalties,
+                        &fixture.lambdas,
+                        &fixture.options,
+                    )
+            };
+            let step = 1e-4;
+            let mut cost_plus = params.clone();
+            let mut cost_minus = params.clone();
+            for (index, value) in v_global.iter().enumerate() {
+                cost_plus.theta[index] += step * value;
+                cost_minus.theta[index] -= step * value;
+            }
+            let curvature =
+                (cost_at(&cost_plus) - 2.0 * cost_at(&params) + cost_at(&cost_minus)) / (step * step);
+            println!(
+                "  cost second difference {curvature:.9e} vs exact {:.9e} vs model {:.9e}",
+                dot(&v, &exact),
+                dot(&v, &model_v)
+            );
+            let (sample_exact, sample_model, sample_gradient, sample_barrier) =
+                sample_hessian_vectors(&fixture.problem, &params, &v_global, h);
+            let mut fixed = vec![0.0_f64; dim];
+            let mut penalty = vec![0.0_f64; dim];
+            for index in 0..dim {
+                fixed[index] = model.fixed[index] * v[index];
+            }
+            for &(row, column, value) in &model.penalty {
+                penalty[row as usize] += value * v[column as usize];
+            }
+            let data_exact: Vec<f64> = (0..dim)
+                .map(|index| exact[index] - fixed[index] - penalty[index])
+                .collect();
+            let data_model: Vec<f64> = (0..dim)
+                .map(|index| model_v[index] - fixed[index] - penalty[index])
+                .collect();
+            println!(
+                "  per-sample exact vs joint exact {:.6e}; per-sample model vs joint model {:.6e}",
+                norm(
+                    &(0..dim)
+                        .map(|index| sample_exact[of[index]] - data_exact[index])
+                        .collect::<Vec<f64>>()
+                ),
+                norm(
+                    &(0..dim)
+                        .map(|index| sample_model[of[index]] - data_model[index])
+                        .collect::<Vec<f64>>()
+                )
+            );
+            println!(
+                "  gradient: per-sample {:.6e} vs rhs {:.6e}",
+                norm(
+                    &(0..dim)
+                        .map(|index| sample_gradient[of[index]] + model.rhs[index])
+                        .collect::<Vec<f64>>()
+                ),
+                norm(&model.rhs)
+            );
+            println!(
+                "  norms: |accel| {:.4e} |barrier| {:.4e} |exact-model| {:.4e}",
+                norm(&accel),
+                norm(&barrier),
+                norm(
+                    &(0..dim)
+                        .map(|index| exact[index] - model_v[index])
+                        .collect::<Vec<f64>>()
+                )
+            );
+            println!(
+                "  barrier second (not in the step model): {:.4e}",
+                norm(&sample_barrier)
+            );
+            let mut worst: Vec<(f64, usize)> = tone_slots
+                .iter()
+                .map(|slot| {
+                    (
+                        (exact[*slot] - model_v[*slot] - accel[*slot]).abs(),
+                        *slot,
+                    )
+                })
+                .collect();
+            worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+            for (_, slot) in worst.iter().take(6) {
+                println!(
+                    "    slot {slot} global {} v {:.6e}: exact {:.6e} model {:.6e} gn {:.6e} robust {:.6e} barrier {:.6e} accel {:.6e} analytic {:.6e} diff {:.6e}",
+                    of[*slot],
+                    v[*slot],
+                    exact[*slot],
+                    model_v[*slot],
+                    gn[*slot],
+                    robust[*slot],
+                    barrier[*slot],
+                    accel[*slot],
+                    analytic_second[*slot],
+                    analytic_second[*slot] - accel[*slot]
+                );
+            }
+            let relative = norm(&(0..dim).map(|i| exact[i] - model_v[i]).collect::<Vec<f64>>())
+                / norm(&exact).max(1e-12);
+            let gap = norm(
+                &(0..dim)
+                    .map(|i| exact[i] - plain_v[i] - accel[i])
+                    .collect::<Vec<f64>>(),
+            );
+            println!(
+                "  second-order term: analytic vs data FD {:.3e} relative to |analytic| {:.3e}",
+                norm(
+                    &(0..dim)
+                        .map(|i| analytic_second[i] - accel[i])
+                        .collect::<Vec<f64>>()
+                ),
+                norm(&analytic_second)
+            );
+            println!("  exact vs model {relative:.3e} relative, exact vs model+FD acceleration {gap:.3e}");
+            assert!(
+                gap <= 5e-2 * norm(&(0..dim).map(|i| exact[i] - plain_v[i]).collect::<Vec<f64>>()),
+                "the reference acceleration leaves a gap {gap:.3e}"
+            );
+        }
     }
 }

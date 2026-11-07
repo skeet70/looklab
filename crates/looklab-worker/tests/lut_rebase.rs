@@ -34,6 +34,12 @@ const BASE: &str = "classic-chrome";
 #[cfg(feature = "integration")]
 const RENDERING: &str = "Classic Chrome";
 
+/// Jobs one fixture queue may run before it must settle.
+#[cfg(feature = "integration")]
+const DRAIN_JOBS: usize = 64;
+#[cfg(feature = "integration")]
+const DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(900);
+
 struct Fixture {
     _dir: TempDir,
     worker: Worker,
@@ -333,7 +339,7 @@ fn broken_lut_document(slug: &str) -> LookDocument {
 
 #[cfg(feature = "integration")]
 async fn drain(worker: &Worker) {
-    loop {
+    for _ in 0..DRAIN_JOBS {
         sqlx::query("DELETE FROM jobs WHERE kind = 'publish_site' AND status = 'queued'")
             .execute(worker.pool())
             .await
@@ -344,11 +350,12 @@ async fn drain(worker: &Worker) {
             Err(error) => panic!("job failed: {error}"),
         }
     }
+    panic!("queue did not settle after {DRAIN_JOBS} jobs");
 }
 
 #[cfg(feature = "integration")]
 async fn drain_fails(worker: &Worker) -> bool {
-    loop {
+    for _ in 0..DRAIN_JOBS {
         sqlx::query("DELETE FROM jobs WHERE kind = 'publish_site' AND status = 'queued'")
             .execute(worker.pool())
             .await
@@ -359,6 +366,7 @@ async fn drain_fails(worker: &Worker) -> bool {
             Err(_) => return true,
         }
     }
+    panic!("queue did not settle after {DRAIN_JOBS} jobs");
 }
 
 #[cfg(feature = "integration")]
@@ -908,7 +916,13 @@ async fn a_committed_candidate_requests_publication_before_later_failures() {
     publish(&fixture.worker, BASE, 1, &base).await;
     publish(&fixture.worker, BASE, 2, &native("2.0.0", 0.005)).await;
 
-    assert!(fixture.worker.run_until_idle().await.is_err());
+    assert!(
+        fixture
+            .worker
+            .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+            .await
+            .is_err()
+    );
     assert!(published(&fixture.worker, LUT, 2).await.is_matchable());
     let queued: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM jobs WHERE kind = 'publish_site' AND status = 'queued'",

@@ -202,13 +202,38 @@ fn coefficient_jacobian_matches_perturbations() {
 }
 
 #[test]
-fn tint_derivative_is_zero_outside_the_domain() {
+fn tint_derivative_follows_the_c2_continuation() {
     let look = full_look();
-    for t in [-1.0, 150.0] {
-        assert_eq!(look.d_tint_d_t(t), (0.0, 0.0));
+    let evaluate = |t: f64| {
+        let (indices, weights, _) = looklab_model::basis::tint_weights(t);
+        let mut a = 0.0;
+        let mut b = 0.0;
+        for (position, index) in indices.iter().enumerate() {
+            a += weights[position] * look.tint.a[*index];
+            b += weights[position] * look.tint.b[*index];
+        }
+        (a, b)
+    };
+    for t in [50.0, 120.0] {
+        let (a, b) = look.d_tint_d_t(t);
+        let h = 1e-6;
+        let plus = evaluate(t + h);
+        let minus = evaluate(t - h);
+        let numerical_a = (plus.0 - minus.0) / (2.0 * h);
+        let numerical_b = (plus.1 - minus.1) / (2.0 * h);
+        assert!(
+            (a - numerical_a).abs() < 1e-5,
+            "t {t} a {a} vs {numerical_a}"
+        );
+        assert!(
+            (b - numerical_b).abs() < 1e-5,
+            "t {t} b {b} vs {numerical_b}"
+        );
     }
-    let (a, b) = look.d_tint_d_t(50.0);
-    assert!(a != 0.0 || b != 0.0);
+    for t in [-1.0, 150.0] {
+        let (a, b) = look.d_tint_d_t(t);
+        assert!(a.is_finite() && b.is_finite());
+    }
 }
 
 #[test]

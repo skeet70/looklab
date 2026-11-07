@@ -12,8 +12,7 @@
 .match-methods span { margin-top: .6rem; font-size: .9rem; font-weight: 400; color: var(--muted); }
 .match-result { margin-block: 2rem; }
 .match-result > h2 { margin-block: 1.5rem; }
-.match-page .stepper-actions { display: flex; justify-content: space-between; gap: 1rem; max-width: 48rem; }
-.match-page .stepper-actions button:last-child:not(:disabled) { background: var(--accent); color: var(--accent-ink); }
+.match-page .stepper-actions { max-width: 48rem; }
 .match-preview-labels { display: flex; justify-content: space-between; gap: 1rem; margin-top: .6rem; font-size: .85rem; color: var(--muted); }
 .match-preview-labels span:last-child { text-align: right; }
 .recipe-card { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); padding: clamp(1.25rem, 4vw, 2.5rem); max-width: 48rem; margin: 2rem auto 1rem; }
