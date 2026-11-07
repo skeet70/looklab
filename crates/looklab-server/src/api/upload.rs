@@ -110,7 +110,7 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         .map_err(|_| ApiError::new(ErrorCode::Internal))?;
     let mut send_expires_at = send.as_ref().map(|send| send.expires_at);
     let passkey = resolved.passkey;
-    let mut promotion: Option<PendingPromotion<'_>> = None;
+    let mut promotion: Option<PendingPromotion> = None;
     match send {
         Some(send) => {
             check_send_binding(&send, &header, &assertion_hash)?;
@@ -407,9 +407,9 @@ struct ResolvedCredential {
     existing: Option<CredentialId>,
 }
 
-enum CredentialCompletion<'a> {
+enum CredentialCompletion {
     Existing(CredentialId),
-    Pending(PendingPromotion<'a>),
+    Pending(PendingPromotion),
 }
 
 fn check_send_binding(
@@ -468,7 +468,7 @@ fn assertion_digest(assertion: &WebAuthnAssertion) -> [u8; 32] {
 
 async fn complete(
     state: &AppState,
-    credential: CredentialCompletion<'_>,
+    credential: CredentialCompletion,
     mut contribution: NewContribution,
     token: Option<&StatusToken>,
     nonce: &Nonce,
@@ -504,9 +504,18 @@ async fn complete(
     }
     store::enqueue_consistency_score(&mut tx, &contribution.id).await?;
     store::clear_staged(&mut tx, &staged.attempt).await?;
-    tx.commit().await.map_err(database_error)?;
-    if let Some(promotion) = promotion {
-        promotion.finish();
+    match promotion {
+        Some(promotion) => {
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = done_tx.send(promotion.commit(tx).await);
+            });
+            done_rx
+                .await
+                .map_err(|_| ApiError::new(ErrorCode::Internal))?
+                .map_err(database_error)?;
+        }
+        None => tx.commit().await.map_err(database_error)?,
     }
     Ok(())
 }

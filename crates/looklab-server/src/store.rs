@@ -717,7 +717,7 @@ pub async fn discard_staged(
             continue;
         }
         blobs
-            .delete(BlobHash::from_bytes(**hash))
+            .delete(BlobHash::from_bytes(*hash))
             .map_err(|error| sqlx::Error::Io(std::io::Error::other(error)))?;
     }
     tx.commit().await

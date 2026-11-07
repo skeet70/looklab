@@ -66,15 +66,16 @@ pub enum PromotionError {
     Busy,
 }
 
-pub struct PendingPromotion<'a> {
-    pending: &'a Mutex<HashMap<RegistrationHandle, PendingRegistration>>,
+pub struct PendingPromotion {
+    pending: Arc<Mutex<HashMap<RegistrationHandle, PendingRegistration>>>,
     handle: RegistrationHandle,
     passkey: Passkey,
     display_handle: Option<String>,
+    committing: bool,
     finished: bool,
 }
 
-impl PendingPromotion<'_> {
+impl PendingPromotion {
     pub fn passkey(&self) -> &Passkey {
         &self.passkey
     }
@@ -84,24 +85,40 @@ impl PendingPromotion<'_> {
     }
 
     pub fn finish(mut self) {
-        finish_promotion(self.pending, &self.handle);
+        finish_promotion(self.pending.as_ref(), &self.handle);
         self.finished = true;
+    }
+
+    /// Removes the pending entry even when the commit outcome is unknown.
+    pub async fn commit(
+        mut self,
+        tx: sqlx::Transaction<'static, sqlx::Sqlite>,
+    ) -> Result<(), sqlx::Error> {
+        self.committing = true;
+        let outcome = tx.commit().await;
+        self.finish();
+        outcome
     }
 }
 
-impl Drop for PendingPromotion<'_> {
+impl Drop for PendingPromotion {
     fn drop(&mut self) {
-        if !self.finished {
-            cancel_promotion(self.pending, &self.handle);
+        if self.finished {
+            return;
+        }
+        if self.committing {
+            finish_promotion(self.pending.as_ref(), &self.handle);
+        } else {
+            cancel_promotion(self.pending.as_ref(), &self.handle);
         }
     }
 }
 
-fn begin_promotion<'a>(
-    pending: &'a Mutex<HashMap<RegistrationHandle, PendingRegistration>>,
+fn begin_promotion(
+    pending: &Arc<Mutex<HashMap<RegistrationHandle, PendingRegistration>>>,
     original: &Passkey,
     verified: &Passkey,
-) -> Result<PendingPromotion<'a>, PromotionError> {
+) -> Result<PendingPromotion, PromotionError> {
     let Ok(mut entries) = pending.lock() else {
         return Err(PromotionError::Busy);
     };
@@ -123,10 +140,11 @@ fn begin_promotion<'a>(
             *stored = Box::new(verified.clone());
             entry.promoting = true;
             return Ok(PendingPromotion {
-                pending,
+                pending: Arc::clone(pending),
                 handle: handle.clone(),
                 passkey: verified.clone(),
                 display_handle: display_handle.clone(),
+                committing: false,
                 finished: false,
             });
         }
@@ -338,7 +356,7 @@ pub struct AppState {
     pub upload_slots: Arc<Semaphore>,
     pub mod_sessions: ModSessions,
     pub batch_admission: BatchAdmission,
-    pending: Mutex<HashMap<RegistrationHandle, PendingRegistration>>,
+    pending: Arc<Mutex<HashMap<RegistrationHandle, PendingRegistration>>>,
 }
 
 impl core::fmt::Debug for AppState {
@@ -385,7 +403,7 @@ impl AppState {
             upload_slots: Arc::new(Semaphore::new(slots)),
             mod_sessions: ModSessions::default(),
             batch_admission: BatchAdmission::default(),
-            pending: Mutex::new(HashMap::new()),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -497,7 +515,7 @@ impl AppState {
         &self,
         original: &Passkey,
         verified: &Passkey,
-    ) -> Result<PendingPromotion<'_>, PromotionError> {
+    ) -> Result<PendingPromotion, PromotionError> {
         begin_promotion(&self.pending, original, verified)
     }
 
@@ -557,9 +575,9 @@ mod tests {
         .into()
     }
 
-    fn pending(passkey: Passkey) -> Mutex<HashMap<RegistrationHandle, PendingRegistration>> {
+    fn pending(passkey: Passkey) -> Arc<Mutex<HashMap<RegistrationHandle, PendingRegistration>>> {
         let handle = RegistrationHandle::generate().expect("handle");
-        Mutex::new(HashMap::from([(
+        Arc::new(Mutex::new(HashMap::from([(
             handle,
             PendingRegistration {
                 created: Instant::now(),
@@ -569,7 +587,7 @@ mod tests {
                     display_handle: None,
                 },
             },
-        )]))
+        )])))
     }
 
     fn key(index: usize) -> ([u8; 32], [u8; 32]) {
@@ -695,6 +713,17 @@ mod tests {
             purge_pending(&mut entries, ttl);
             assert!(entries.is_empty());
         }
+    }
+
+    #[test]
+    fn a_dropped_committing_promotion_removes_the_shadow() {
+        let original = passkey(1, false);
+        let pending = pending(original.clone());
+        let mut promotion =
+            begin_promotion(&pending, &original, &passkey(2, false)).expect("promotion");
+        promotion.committing = true;
+        drop(promotion);
+        assert!(pending.lock().expect("pending").is_empty());
     }
 
     #[test]

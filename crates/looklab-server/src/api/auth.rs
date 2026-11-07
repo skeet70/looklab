@@ -134,8 +134,14 @@ pub(crate) async fn authenticate_with_pow(
         )
         .await
         .map_err(super::upload::database_error)?;
-        tx.commit().await.map_err(super::upload::database_error)?;
-        promotion.finish();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = done_tx.send(promotion.commit(tx).await);
+        });
+        done_rx
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::Internal))?
+            .map_err(super::upload::database_error)?;
         Ok(credential)
     }
 }
