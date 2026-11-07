@@ -14,6 +14,8 @@ Cargo serializes competing builds with its existing locks. Wait for those locks 
 
 The integration owner runs the workspace-wide gates once after combining changes. Subagents run targeted crate or test checks for their slice and hand off their results. Keep one build owner per shared root; redundant Cargo commands queue behind the same locks. Use the checked-in profiles rather than per-agent profile overrides.
 
+Native dev and test builds keep line-table debug information for source-line backtraces rather than full type and variable information. For a debugging session that needs locals or types, use Cargo's `CARGO_PROFILE_DEV_DEBUG=full` or `CARGO_PROFILE_TEST_DEBUG=full` override. Return to the checked-in defaults afterward; do not make full debug output a per-agent build default.
+
 After merging or abandoning an agent task, stop its builds and services, remove any isolated build caches it created, and remove its clean worktree with `git worktree remove <path>`. Preserve uncommitted, untracked and unmerged work. The integration owner is responsible for this cleanup.
 
 UI build directories can contain `stub-state/`, including a local database and server secret. Preserve that state before retiring a UI build directory, and never delete a build directory while another task is using it.
