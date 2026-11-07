@@ -23,7 +23,7 @@ nix develop "$root" -c "$root/tools/build.sh" --lane native -- \
 (
   unset LOOKLAB_PREVIEW LOOKLAB_API_BASE
   nix develop "$root" -c "$root/tools/build.sh" --lane ui -- \
-    sh -c 'dist=$1; shift; cd site; exec trunk build --locked --dist "$dist" "$@"' _ "$dist"
+    sh site/scripts/build-site.sh --dist "$dist"
 )
 
 export LOOKLAB_BIND="127.0.0.1:$port"

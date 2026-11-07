@@ -26,7 +26,7 @@ The GitHub Pages workflow stays a serverless preview by default. Set the reposit
 | `/var/lib/looklab/site` | worker publication root (`--site`) | worker writes, not served |
 | `/var/lib/looklab/site/data` | published data tree | public under `/data/` |
 | `/var/lib/looklab/site/site-root.txt` | index digest for static builds | not served |
-| `/var/lib/looklab/site/dist` | built Trunk output | public at `/` |
+| `/var/lib/looklab/site/dist` | built site distribution from `site/scripts/build-site.sh` | public at `/` |
 
 Both units set `StateDirectoryMode=0700` and `UMask=0077`; `deploy/run-local.sh` sets `umask 077` before creating its state directory, so new database, blob and secret files are owner-only. Do not chmod an existing project or user directory to enforce this; create a new state root instead.
 
@@ -51,7 +51,7 @@ Configuration comes from `/etc/looklab/looklab.toml` (see `deploy/looklab.toml.e
 
 ## First start
 
-Create a `looklab` system user/group and install both service files under `/etc/systemd/system`. Build the binaries with `nix develop -c tools/build.sh --lane native -- cargo build --locked --release -p looklab-server -p looklab-worker`, then install them at `/usr/local/bin`. Build the SPA through the UI source-generation lease with `LOOKLAB_PREVIEW` and `LOOKLAB_API_BASE` unset and an absolute `--dist` path, then install that output under `/var/lib/looklab/site/dist`. Copy `data/` to `/var/lib/looklab/data`, generate the photo scene directory described above into `/var/lib/looklab/data/scenes`, and copy `deploy/looklab.toml.example` to `/etc/looklab/looklab.toml`, then edit the origin, RP ID and paths. Initialize and start:
+Create a `looklab` system user/group and install both service files under `/etc/systemd/system`. Build the binaries with `nix develop -c tools/build.sh --lane native -- cargo build --locked --release -p looklab-server -p looklab-worker`, then install them at `/usr/local/bin`. Build the SPA through the UI source-generation lease with `LOOKLAB_PREVIEW` and `LOOKLAB_API_BASE` unset and an absolute `--dist` path: `nix develop -c tools/build.sh --lane ui -- sh site/scripts/build-site.sh --release --dist /var/lib/looklab/site/dist`. Copy `data/` to `/var/lib/looklab/data`, generate the photo scene directory described above into `/var/lib/looklab/data/scenes`, and copy `deploy/looklab.toml.example` to `/etc/looklab/looklab.toml`, then edit the origin, RP ID and paths. Initialize and start:
 
 ```sh
 install -o looklab -g looklab -d /var/lib/looklab /var/lib/looklab/site

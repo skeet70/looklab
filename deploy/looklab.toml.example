@@ -18,7 +18,7 @@ rp_id = "looklab.example"
 cors_origins = []
 
 [site]
-# Built Trunk output. Omit to run API-only.
+# Built site distribution from site/scripts/build-site.sh. Omit to run API-only.
 dist_dir = "/var/lib/looklab/site/dist"
 # The data/ directory under the worker's --site root. Omit to withhold /data and the root endpoint.
 data_dir = "/var/lib/looklab/site/data"
