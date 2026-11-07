@@ -17,6 +17,11 @@ const THRESHOLDS: SupportThresholds = SupportThresholds {
     min_clusters: 3,
 };
 
+const PREVIOUS_FLOOR: f64 = 0.75;
+const PREVIOUS_CEILING: f64 = 2.0;
+const ANCHOR_FLOOR: f64 = 1.0;
+const ANCHOR_CEILING: f64 = 3.0;
+
 #[derive(Clone, Copy, Debug)]
 enum Cause {
     Sigma,
@@ -80,6 +85,21 @@ fn observation(id: usize, jab: [f64; 3]) -> RootObservation {
     RootObservation {
         id: ProbeId::new(format!("p{id}")),
         jab,
+    }
+}
+
+fn gate_params() -> TrustParams {
+    TrustParams {
+        gate_bound_scale: 2.0,
+        gate_previous_floor: PREVIOUS_FLOOR,
+        gate_previous_ceiling: PREVIOUS_CEILING,
+        gate_anchor_floor: ANCHOR_FLOOR,
+        gate_anchor_ceiling: ANCHOR_CEILING,
+        gate_over_bound_fraction: 0.02,
+        gate_p95_ratio: 1.0,
+        gate_support_margin: 0.1,
+        support_sigma_exit: THRESHOLDS.sigma_exit,
+        ..TrustParams::default()
     }
 }
 
@@ -228,6 +248,94 @@ fn drift_above_the_previous_ceiling_fails() {
 }
 
 #[test]
+fn cumulative_drift_within_each_previous_bound_fails_at_the_anchor_ceiling() {
+    let base = baseline();
+    let anchor = base.anchor;
+    let mut previous = base.previous;
+    let step = 0.5;
+
+    for release in 0..10 {
+        let mut candidate = previous.clone();
+        candidate.probes[50].post_clip[0] += step;
+        let report = gate_release(
+            &gate_params(),
+            &GateInput {
+                candidate: candidate.clone(),
+                previous: previous.clone(),
+                anchor: anchor.clone(),
+                root_observations: Vec::new(),
+                gated_since_anchor: GatedUnion::default(),
+            },
+        );
+        let cumulative = step * (release + 1) as f64;
+        assert!(
+            report.drift_previous.pass,
+            "release {release}: previous comparison failed: {:?}",
+            report.drift_previous
+        );
+        if cumulative <= ANCHOR_CEILING {
+            assert!(
+                report.passed,
+                "release {release}: cumulative {cumulative} should pass: {:?}",
+                report.violations
+            );
+            assert!(report.drift_anchor.over_ceiling.is_empty());
+        } else {
+            assert!(
+                !report.passed,
+                "release {release}: cumulative {cumulative} should fail"
+            );
+            assert_eq!(report.drift_anchor.over_ceiling.len(), 1);
+            let gated = &report.drift_anchor.over_ceiling[0];
+            assert_eq!(gated.probe, ProbeId::new("p50"));
+            assert!((gated.shift - cumulative).abs() < 1e-12);
+            assert!(violations_contain(&report, |violation| matches!(
+                violation,
+                Violation::OverCeiling {
+                    reference: GateReference::Anchor,
+                    probe,
+                    shift,
+                    ceiling,
+                } if probe == &ProbeId::new("p50")
+                    && (*shift - cumulative).abs() < 1e-12
+                    && (*ceiling - ANCHOR_CEILING).abs() < 1e-12
+            )));
+        }
+        previous = candidate;
+    }
+}
+
+#[test]
+fn a_concentrated_shift_inside_the_previous_allowance_fails_the_anchor_ceiling() {
+    let mut input = baseline();
+    input.root_observations.clear();
+    input.previous.probes[50].post_clip = [52.0, 0.0, 0.0];
+    input.candidate.probes[50].post_clip = [53.5, 0.0, 0.0];
+
+    let report = gate_release(&gate_params(), &input);
+
+    let expected_shift = ANCHOR_CEILING + 0.5;
+    assert!(report.drift_previous.pass, "{:?}", report.drift_previous);
+    assert!(!report.drift_anchor.pass);
+    assert_eq!(report.drift_anchor.over_ceiling.len(), 1);
+    let gated = &report.drift_anchor.over_ceiling[0];
+    assert_eq!(gated.probe, ProbeId::new("p50"));
+    assert!((gated.shift - expected_shift).abs() < 1e-12);
+    assert!((gated.bound - ANCHOR_CEILING).abs() < 1e-12);
+    assert!(violations_contain(&report, |violation| matches!(
+        violation,
+        Violation::OverCeiling {
+            reference: GateReference::Anchor,
+            probe,
+            shift,
+            ceiling,
+        } if probe == &ProbeId::new("p50")
+            && (*shift - expected_shift).abs() < 1e-12
+            && (*ceiling - ANCHOR_CEILING).abs() < 1e-12
+    )));
+}
+
+#[test]
 fn two_percent_of_gated_probes_may_exceed_their_bound() {
     let input = with_shift(baseline(), &[10, 11], 1.0);
     let report = gate_release(&TrustParams::default(), &input);
@@ -277,6 +385,26 @@ fn a_sigma_jump_that_loses_support_fails() {
     assert_eq!(report.supported_regressions, vec![ProbeId::new("p50")]);
     assert!(report.coverage_changes.is_empty());
     assert!(report.drift_previous.pass);
+    assert!(violations_contain(&report, |violation| matches!(
+        violation,
+        Violation::SupportedToUnsupported { probe, .. } if probe == &ProbeId::new("p50")
+    )));
+}
+
+#[test]
+fn a_probe_supported_only_in_the_anchor_still_fails_when_it_loses_support() {
+    let mut input = baseline();
+    input.previous.probes[50] = with_sigma(&input.previous.probes[50], 2.0);
+    input.anchor.probes[50] = with_sigma(&input.anchor.probes[50], 0.7);
+    input.candidate.probes[50] = with_sigma(&input.candidate.probes[50], 2.8);
+
+    let report = gate_release(&gate_params(), &input);
+
+    assert_eq!(report.supported_regressions, vec![ProbeId::new("p50")]);
+    assert!(!report.passed);
+    assert!(report.coverage_changes.is_empty());
+    assert!(report.drift_previous.pass);
+    assert!(report.drift_anchor.pass);
     assert!(violations_contain(&report, |violation| matches!(
         violation,
         Violation::SupportedToUnsupported { probe, .. } if probe == &ProbeId::new("p50")

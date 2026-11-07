@@ -11,6 +11,7 @@ publish = false
 default = []
 # `synth` is reused by the trust red-team harness and by report/export tests.
 synth = ["dep:rand_chacha"]
+full-scale = ["synth"]
 
 [dependencies]
 looklab-body.workspace = true
@@ -29,7 +30,11 @@ criterion.workspace = true
 [[bench]]
 name = "fit"
 harness = false
-required-features = ["synth"]
+required-features = ["full-scale"]
+
+[[test]]
+name = "sigma_stability"
+required-features = ["full-scale"]
 
 [lints]
 workspace = true

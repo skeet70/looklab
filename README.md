@@ -20,15 +20,17 @@ UI build directories can contain `stub-state/`, including a local database and s
 
 ## Build pipelines
 
-CI has independent `lint`, `native` and `wasm release` lanes plus four release trust test shards. The required `ci` check succeeds only when every lane and shard succeeds. Trust uses nextest count partitions with no fail-fast or default filter; shard 1 also runs release doctests. Native tests explicitly enable `looklab-fit/synth` in the workspace run; fit acceptance is not run a second time. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
+CI has independent `lint`, `native`, `wasm release` and targeted trust-policy lanes. The required `ci` check succeeds only when every required lane succeeds. Compact real fitter-to-trust integration belongs in ordinary CI only while its measured CI job wall time is approximately two minutes or less; otherwise it runs before releases. Test execution is recorded separately. Native tests explicitly enable `looklab-fit/synth`. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
 
 Pages generates release site data and release worker WASM in parallel. The UI job downloads both products and their receipts from the same run, verifies them, then builds the release preview. Worker optimization, UI `-Oz`, release LTO and the `/looklab/` public URL are unchanged.
 
-Cargo caches are partitioned by build family, toolchain, lock/configuration and compiler flags; incremental directories and local stub state are excluded. Cache saves are restricted to `main`. CI saves compiler artifacts after failed gates unless cancelled; generated products are saved only after their producer succeeds. One trust shard saves the shared release compiler cache. Generated-product caches are hints: source/tool/profile identities, output hashes and artifact policy are checked before reuse.
+Cargo caches are partitioned by build family, toolchain, lock/configuration and compiler flags; incremental directories and local stub state are excluded. Cache saves are restricted to `main`. CI saves compiler artifacts after failed gates unless cancelled; generated products are saved only after their producer succeeds. Generated-product caches are hints: source/tool/profile identities, output hashes and artifact policy are checked before reuse.
 
-Nix uses public binary substituters rather than a per-store GitHub Actions cache proxy. Synthetic trust shards skip RAW fixture downloads.
+Nix uses public binary substituters rather than a per-store GitHub Actions cache proxy. Synthetic trust jobs skip RAW fixture downloads.
 
 `tools/build_products.py` owns worker and site-data freshness. Receipts and shared writer locks live under the main checkout's `target/build-products/`. Worker inputs include the local Cargo source closure and the explicit compile-time input trees; data also binds the fetched scene sources. CSS and UI-only source edits do not invalidate these products. New include targets or generator modules outside the supported input selection fail closed; extend the selection in that helper when adding them. Run `nix develop -c python3 -m unittest discover -s tools/tests -v` for the isolated cache-boundary tests.
+
+Full-scale fitting studies and the growing-pool trust harness require an explicit maintainer request. They are excluded from default features and ordinary CI. Use the manually dispatched **Full-scale validation** workflow, or its local command in [trust validation tiers](docs/05-trust-and-integrity.md#10-red-team-harness-required-ci). There is no automatic scheduled or release full-scale run. Agents may recommend a run for affected behavior but must not launch it without that request; `cargo test --all-features` also opts into full-scale targets.
 
 Single-run validation on 2026-11-06 used application commit `c10b5d2` plus build and fitting-performance changes, excluding concurrent uncommitted application edits. Pages times cover the build critical path, not deployment:
 
@@ -52,7 +54,7 @@ Local pipeline measurements used the same application base and retained the exis
 | First pass, generated products missing | 7m 02s |
 | Unchanged pass, verified products reused | 7.10s |
 
-Full CI measurements used the same application base and failed Clippy, the CLI E2E flow and 10 release trust red-team cases:
+Historical full CI measurements below predate the test-tier split. They used the same application base and failed Clippy, the CLI E2E flow and 10 release trust red-team cases:
 
 | CI configuration | Elapsed | Evidence |
 |---|---:|---|
@@ -65,7 +67,7 @@ Full CI measurements used the same application base and failed Clippy, the CLI E
 
 The sharded run executed all 134 release trust cases: 124 passed and 10 failed. Its required aggregate check stayed red. The CLI E2E failure also reproduced on unmodified `c10b5d2` with the original Wasmtime defaults. No successful same-source full-CI baseline is available; the failing native E2E binary prevents later workspace tests from running.
 
-Eight count partitions still co-located the two longest cases. Twelve selected all 134 cases exactly once and separated those cases, but the measured critical path remained within the observed four-way range. Four shards are retained rather than tripling trust runner fan-out without a demonstrated latency gain. The trial restored all twelve compiler caches with no HTTP 429 observed. CI remains above twenty minutes; no sub-twenty-minute or green-CI result is established.
+Eight count partitions still co-located the two longest cases. Twelve selected all 134 cases exactly once and separated those cases, but the measured critical path remained within the observed four-way range. That trial restored all twelve compiler caches with no HTTP 429 observed. Those full-scale CI measurements remained above twenty minutes and established no green-CI result; the validation-tier policy now removes full-scale execution from ordinary CI.
 
 An isolated native-only [attempt 3](https://github.com/skeet70/looklab/actions/runs/42190766989/attempts/3) restored its compiler cache, compiled in 4m 44s, then hit the same CLI failure; the job took 13m 02s. After the timed runs, removing the per-store Nix cache proxy passed a [seven-runner setup/cache smoke](https://github.com/skeet70/looklab/actions/runs/42203798464): all seven compiler caches restored and all seven project toolchains ran, with no HTTP 429 observed. That smoke did not rerun the test suites or measure full-CI latency.
 

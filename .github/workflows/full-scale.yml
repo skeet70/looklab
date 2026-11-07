@@ -1,0 +1,43 @@
+name: Full-scale validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  full_scale:
+    name: Full-scale fitting and trust scenarios
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          fixtures: "false"
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: full-scale-release
+          salt: release-fit-trust-full-scale
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+      - name: Full-scale fitting and trust validation
+        run: nix develop -c cargo nextest run --locked --release -p looklab-fit -p looklab-trust --features looklab-fit/full-scale,looklab-trust/full-scale --run-ignored all --no-fail-fast --ignore-default-filter
+      - uses: ./.github/actions/cache
+        if: ${{ !cancelled() }}
+        with:
+          mode: save
+          family: full-scale-release
+          salt: release-fit-trust-full-scale
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint

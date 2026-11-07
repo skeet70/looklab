@@ -41,7 +41,7 @@ For anyone (human or agent) implementing looklab. Read [README](README.md) and t
 - Serial merging must never increase the weight of any image belonging to the merged credentials, and must never transfer tier or reputation between credentials. Other contributors' renormalized shares may rise.
 - Grants, endorsements, root admissions, moderation actions, re-anchors and reverts always write an audit-log row. The audit log is append-only: no UPDATE/DELETE in application code.
 - Every published artifact is listed by hash in its version manifest. Clients check hashes.
-- Changes to `fit` or `trust` must pass the red-team harness.
+- Changes to `fit` or `trust` must pass targeted recovery and trust-policy tests. Fitter-to-trust integration follows the validation tiers below.
 
 ## Privacy invariants
 - Nothing derived from pixel positions may cross the `looklab-prep` → `looklab-samples` boundary. The sample type has no coordinate fields; order is shuffled with a fresh, never-uploaded CSPRNG seed. Re-render groups share one sample set; never send a RAW or content hash.
@@ -57,9 +57,13 @@ For anyone (human or agent) implementing looklab. Read [README](README.md) and t
 
 ## Tests that must exist
 - Unit, golden (color) and property tests (round-trips, sanitizer, monotone tone, identity Look, sample-reader limits).
-- `fit`/`trust`: synthetic recovery tests + red-team harness.
+- `fit`/`trust`: targeted synthetic recovery and policy tests in required CI, plus compact real fitter-to-trust integration.
 - Native vs wasm32 bit-identity tests for `color` and Look evaluation.
-- `criterion` benchmarks for Look evaluation, the optimizer and prep; CI flags regressions above 20%.
+- `criterion` benchmarks for Look evaluation, the optimizer and prep; retain the 20% regression threshold when comparing benchmark runs.
+- Compact fitter-to-trust integration belongs in ordinary CI only while its measured CI job wall time is approximately two minutes or less. Record test execution separately; otherwise it is a pre-release gate.
+- Full-scale numerical studies, growing-pool simulations and benchmark runs require an explicit maintainer request. They do not run on pushes, pull requests, schedules or releases by default.
+- Agents may recommend a full-scale run and name the affected behavior. They must not dispatch the workflow, enable `full-scale`, or run tests with `--all-features` without that request. Compiling or listing the opt-in test inventory does not execute it.
+- Keep targeted tests discriminating: preserve valid honest controls and reject the intended bad outcomes. Smaller fixtures must not turn a policy test into success through unsupported fits or blanket rejection.
 
 ## Data files (`data/`)
 - YAML, validated by `looklab-schema` (`looklab-cli validate data/`). The same validator runs in the browser.

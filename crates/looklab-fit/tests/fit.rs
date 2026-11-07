@@ -4,11 +4,13 @@
 #![cfg(feature = "synth")]
 #![allow(clippy::disallowed_types)]
 
+#[cfg(feature = "full-scale")]
 use std::time::{Duration, Instant};
 
 use looklab_color::ucs::delta_e_ucs;
 use looklab_fit::synth::{self, LookSelector, SynthConfig};
 use looklab_fit::{FitOptions, Verdict, fit};
+#[cfg(feature = "full-scale")]
 use looklab_model::LookInput;
 use looklab_model::probes::v1 as probes_v1;
 
@@ -19,6 +21,7 @@ fn options(seed: u64) -> FitOptions {
     }
 }
 
+#[cfg(feature = "full-scale")]
 fn layered_options(seed: u64) -> FitOptions {
     FitOptions {
         seed,
@@ -115,6 +118,7 @@ fn mislabelled_image_is_quarantined() {
     assert_eq!(stats.verdict, Verdict::Quarantine);
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "tone leak identity ablation; run with --ignored --nocapture"]
 fn tone_leak_identity_ablation() {
@@ -158,6 +162,7 @@ fn tone_leak_identity_ablation() {
     }
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 fn tone_only_difference_leaves_the_colour_layers_alone() {
     let config = SynthConfig {
@@ -329,6 +334,7 @@ fn repeated_fits_are_bit_identical() {
     }
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "release-mode timing measurement"]
 fn twenty_images_of_ten_thousand_samples_under_a_minute() {

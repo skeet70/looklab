@@ -11,6 +11,7 @@ use looklab_fit::{FitOptions, FitResult, Look, fit};
 use looklab_model::Tone;
 use looklab_model::probes::v1 as probes_v1;
 
+#[cfg(feature = "full-scale")]
 const IMAGE_COUNTS: [usize; 4] = [3, 5, 10, 20];
 
 fn injected(seed: u64, gain: f64, hue: f64, shoulder: f64) -> Look {
@@ -70,6 +71,7 @@ fn gauge(result: &FitResult, data: &looklab_fit::synth::SyntheticDataset) -> f64
     shifts[shifts.len() / 2]
 }
 
+#[cfg(feature = "full-scale")]
 fn metrics(
     result: &FitResult,
     look: &Look,
@@ -143,6 +145,7 @@ fn median(values: &mut [f64]) -> f64 {
     values.get(values.len() / 2).copied().unwrap_or(0.0)
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "diagnostic study; run with --ignored --nocapture"]
 fn velvia_bias_diagnostic() {
@@ -250,6 +253,7 @@ fn velvia_bias_diagnostic() {
     }
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "clip-k experiment; run with --ignored --nocapture"]
 fn clip_prior_diagnostic() {
@@ -308,6 +312,7 @@ fn clip_prior_diagnostic() {
     }
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "convergence experiment; run with --ignored --nocapture"]
 fn convergence_diagnostic() {
@@ -443,6 +448,7 @@ fn convergence_diagnostic() {
     );
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "singular repro; run with --ignored --nocapture"]
 fn singular_repro() {
@@ -459,6 +465,7 @@ fn singular_repro() {
     );
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "controlled singular repro; run with --ignored --nocapture"]
 fn singular_controlled_repro() {
@@ -486,6 +493,7 @@ fn singular_controlled_repro() {
     );
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "convergence shapes; run with --ignored --nocapture"]
 fn convergence_shapes() {
@@ -537,6 +545,7 @@ fn convergence_removes_the_noise_free_bias_floor() {
     assert!(bias <= 0.35, "bias {bias}");
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "thin coverage diagnostic; run with --ignored --nocapture"]
 fn thin_coverage_diagnostic() {
@@ -599,6 +608,7 @@ fn thin_coverage_diagnostic() {
     }
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "bias floor diagnostic; run with --ignored --nocapture"]
 fn bias_floor_diagnostic() {
@@ -691,6 +701,7 @@ fn bias_floor_diagnostic() {
     }
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "sigma range check; run with --ignored --nocapture"]
 fn sigma_range_diagnostic() {
@@ -734,6 +745,7 @@ fn sigma_range_diagnostic() {
     }
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "bias threshold calibration; run with --ignored --nocapture"]
 fn bias_threshold_diagnostic() {
@@ -779,6 +791,7 @@ fn bias_threshold_diagnostic() {
     }
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "recovery study; run with --ignored --nocapture. Supported bias 0.10-0.27 dE, fixed 0.09-0.23, all-probe 0.23-0.32"]
 fn identity_prior_recovery_study() {

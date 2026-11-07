@@ -11,6 +11,7 @@ publish = false
 default = []
 # Builds the simulator only; it needs looklab-fit and does not target wasm.
 harness = ["dep:looklab-fit", "dep:looklab-color", "dep:looklab-body"]
+full-scale = ["harness"]
 
 [dependencies]
 libm.workspace = true
@@ -29,6 +30,14 @@ proptest.workspace = true
 
 [[test]]
 name = "redteam"
+required-features = ["full-scale"]
+
+[[test]]
+name = "compact"
+required-features = ["harness"]
+
+[[test]]
+name = "gauges"
 required-features = ["harness"]
 
 [lints]

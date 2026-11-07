@@ -6,10 +6,11 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::*;
-use looklab_meta::{ExposureTime, FocalLength, SanitizedMetadata};
+use looklab_meta::{ExposureTime, FocalLength, RawSerial, SanitizedMetadata, SerialHmacKey};
 use looklab_trust::{
-    CapReason, CaptureTuple, EffectiveContributorId, LookWeightReport, Region, RegionCoverage,
-    Standing, TrustParams, weight_body, weight_look,
+    CapReason, CaptureTuple, CredentialId, EffectiveContributorId, LookWeightReport, Region,
+    RegionCoverage, SerialLink, Standing, TrustParams, resolve_effective_contributors, weight_body,
+    weight_look,
 };
 use looklab_upload::{ContributionKind, Intent};
 
@@ -57,6 +58,26 @@ fn assert_look_caps(report: &LookWeightReport, params: &TrustParams) {
             "contributor {contributor}: {total} exceeds {share} of {}",
             report.total
         );
+    }
+}
+
+fn fixture_params() -> TrustParams {
+    TrustParams {
+        base_library: 0.25,
+        base_rerender: 1.0,
+        base_pattern: 1.0,
+        base_gradient: 1.0,
+        base_chart: 2.0,
+        tier_factor_new: 1.0,
+        tier_factor_trusted: 2.0,
+        reputation_min: 0.2,
+        reputation_max: 1.5,
+        new_group_cap: 0.3,
+        contributor_cap_factor: 2.0,
+        look_contributor_cap_floor: 0.05,
+        body_contributor_cap_floor: 0.2,
+        diminishing_scale: 20.0,
+        ..TrustParams::default()
     }
 }
 
@@ -109,6 +130,104 @@ fn new_tier_group_caps_above_thirty_percent() {
     assert!((region_weights.trusted - 12.0).abs() < 1e-12);
     assert!((region_weights.new - 12.0 * 0.3 / 0.7).abs() < 1e-12);
     assert!(has_reason(&report.caps, CapReason::NewTierGroupCap));
+}
+
+#[test]
+fn reputation_does_not_lift_new_tier_weight_past_the_group_cap() {
+    let mut images = Vec::new();
+    for index in 0..4u128 {
+        images.push(
+            ImageBuilder::new(&format!("trusted-{index}"), index + 1)
+                .standing(Standing::Endorsed)
+                .build(),
+        );
+    }
+    for index in 0..8u128 {
+        images.push(
+            ImageBuilder::new(&format!("new-{index}"), index + 20)
+                .standing(Standing::New)
+                .reputation(1.5)
+                .capture(vec![index as u8])
+                .build(),
+        );
+    }
+    let params = fixture_params();
+    let report = weight_look(&params, &look_input_with(images, &[(region(), 1.0)]));
+
+    let region_weights = &report.regions[0];
+    let ratio = params.new_group_cap / (1.0 - params.new_group_cap);
+    let expected_trusted = 1.0
+        + report
+            .images
+            .iter()
+            .filter(|image| image.id.as_str().starts_with("trusted-"))
+            .map(|image| image.raw)
+            .sum::<f64>();
+    assert!((region_weights.trusted - expected_trusted).abs() < 1e-12);
+    assert!(region_weights.new <= ratio * region_weights.trusted + 1e-9);
+    assert!(has_reason(&report.caps, CapReason::NewTierGroupCap));
+    for image in report
+        .images
+        .iter()
+        .filter(|image| image.id.as_str().starts_with("trusted-"))
+    {
+        assert!(
+            (image.total - image.raw).abs() < 1e-12,
+            "{} was reduced",
+            image.id
+        );
+    }
+    assert_look_caps(&report, &params);
+}
+
+#[test]
+fn group_and_contributor_caps_both_hold_without_reducing_trusted_weight() {
+    let mut images = Vec::new();
+    for index in 0..6u128 {
+        images.push(
+            ImageBuilder::new(&format!("trusted-{index}"), index + 1)
+                .standing(Standing::Endorsed)
+                .build(),
+        );
+    }
+    for index in 0..10u8 {
+        images.push(
+            ImageBuilder::new(&format!("new-{index}"), 100)
+                .standing(Standing::New)
+                .capture(vec![index])
+                .build(),
+        );
+    }
+    let params = fixture_params();
+    let report = weight_look(&params, &look_input_with(images, &[(region(), 0.0)]));
+
+    let region_weights = &report.regions[0];
+    let ratio = params.new_group_cap / (1.0 - params.new_group_cap);
+    let expected_trusted: f64 = report
+        .images
+        .iter()
+        .filter(|image| image.id.as_str().starts_with("trusted-"))
+        .map(|image| image.raw)
+        .sum();
+    assert!((region_weights.trusted - expected_trusted).abs() < 1e-12);
+    assert!(region_weights.new <= ratio * region_weights.trusted + 1e-9);
+    assert!(has_reason(&report.caps, CapReason::NewTierGroupCap));
+    assert!(has_reason(&report.caps, CapReason::ContributorCap));
+    let share = looklab_trust::look_contributor_cap(&params, report.contributors);
+    let contributor_total = contributor_totals(&report)[&contributor(100)];
+    assert!(contributor_total <= share * report.total + 1e-9);
+    for image in report
+        .images
+        .iter()
+        .filter(|image| image.id.as_str().starts_with("trusted-"))
+    {
+        assert!(
+            (image.total - image.raw).abs() < 1e-12,
+            "{} was reduced",
+            image.id
+        );
+    }
+    assert_look_caps(&report, &params);
 }
 
 #[test]
@@ -443,6 +562,17 @@ fn same_capture_different_contributors_are_not_duplicates() {
     let report = weight_look(&params(), &look_input(images));
     assert!(weight(&report, "first") > 0.0);
     assert!(weight(&report, "second") > 0.0);
+    for id in ["first", "second"] {
+        let image = report
+            .images
+            .iter()
+            .find(|image| image.id.as_str() == id)
+            .expect("image is in the report");
+        assert!(
+            (image.total - image.raw).abs() < 1e-12,
+            "{id} was down-weighted"
+        );
+    }
     assert!(!has_reason(&report.caps, CapReason::DuplicateMerge));
 }
 
@@ -607,6 +737,73 @@ fn body_contributor_cap_is_continuous() {
 }
 
 #[test]
+fn body_group_cap_bounds_new_tier_chart_claims() {
+    let mut images = Vec::new();
+    for index in 0..4u128 {
+        images.push(
+            ImageBuilder::new(&format!("trusted-{index}"), index + 1)
+                .kind(ContributionKind::Chart)
+                .standing(Standing::Endorsed)
+                .build(),
+        );
+    }
+    for index in 0..8u128 {
+        images.push(
+            ImageBuilder::new(&format!("claim-{index}"), index + 20)
+                .kind(ContributionKind::Chart)
+                .standing(Standing::New)
+                .capture(vec![index as u8])
+                .build(),
+        );
+    }
+    let params = fixture_params();
+    let report = weight_body(
+        &params,
+        &looklab_trust::BodyWeightInput {
+            images,
+            anchored_weight: 2.0,
+            rooted: true,
+        },
+    );
+
+    let expected_trusted = 2.0
+        + report
+            .images
+            .iter()
+            .filter(|image| image.id.as_str().starts_with("trusted-"))
+            .map(|image| image.raw)
+            .sum::<f64>();
+    let trusted_total: f64 = 2.0
+        + report
+            .images
+            .iter()
+            .filter(|image| image.id.as_str().starts_with("trusted-"))
+            .map(|image| image.final_weight)
+            .sum::<f64>();
+    let claim_total: f64 = report
+        .images
+        .iter()
+        .filter(|image| image.id.as_str().starts_with("claim-"))
+        .map(|image| image.final_weight)
+        .sum();
+    let ratio = params.new_group_cap / (1.0 - params.new_group_cap);
+    assert!((trusted_total - expected_trusted).abs() < 1e-12);
+    assert!(claim_total <= ratio * trusted_total + 1e-9);
+    assert!(has_reason(&report.caps, CapReason::NewTierGroupCap));
+    for image in report
+        .images
+        .iter()
+        .filter(|image| image.id.as_str().starts_with("trusted-"))
+    {
+        assert!(
+            (image.final_weight - image.raw).abs() < 1e-12,
+            "{} was reduced",
+            image.id
+        );
+    }
+}
+
+#[test]
 fn region_grid_boundaries() {
     let low = Region::from_probe(-12.0, 0.0).expect("probe in range");
     assert_eq!((low.hue(), low.exposure()), (0, 0));
@@ -692,6 +889,108 @@ fn serial_merge_does_not_raise_another_credentials_weight() {
         (credential_total(&merged, 12) - credential_total(&separate, 12)).abs() < 1e-12,
         "an unrelated credential keeps its weight"
     );
+}
+
+#[test]
+fn serial_merge_spares_the_endorsed_victim_and_caps_the_attackers() {
+    let key = SerialHmacKey::new([7u8; 32]);
+    let hmac = RawSerial::new(b"SN-VICTIM-01")
+        .expect("ASCII serial")
+        .hmac(&key, "MAKE", "MODEL");
+    let victim = 1u128;
+    let attackers = [2u128, 3];
+    let links: Vec<SerialLink> = std::iter::once(victim)
+        .chain(attackers)
+        .map(|id| SerialLink {
+            credential: credential(id),
+            hmac,
+        })
+        .collect();
+    let credentials: Vec<CredentialId> = (1..=29u128).map(credential).collect();
+    let resolved = resolve_effective_contributors(credentials, &links);
+    let mut params = fixture_params();
+    params.diminishing_scale = 0.0;
+
+    let mut images = vec![
+        ImageBuilder::new("victim", victim)
+            .standing(Standing::Endorsed)
+            .evidence(0.75)
+            .capture(vec![b'a', b'a'])
+            .build(),
+    ];
+    for (slot, attacker) in attackers.iter().enumerate() {
+        for index in 0..2u8 {
+            images.push(
+                ImageBuilder::new(&format!("attack-{attacker}-{index}"), *attacker)
+                    .standing(Standing::New)
+                    .capture(vec![b'z', b'a' + slot as u8, b'a' + index])
+                    .build(),
+            );
+        }
+    }
+    for index in 0..20u128 {
+        images.push(
+            ImageBuilder::new(&format!("trusted-{index}"), 10 + index)
+                .standing(Standing::Endorsed)
+                .capture(vec![b'o', index as u8])
+                .build(),
+        );
+    }
+
+    let before = weight_look(
+        &params,
+        &look_input_with(images.clone(), &[(region(), 0.0)]),
+    );
+    let mut merged = images;
+    for image in &mut merged {
+        image.contributor = resolved[&image.credential];
+    }
+    let after = weight_look(&params, &look_input_with(merged, &[(region(), 0.0)]));
+
+    let victim_before = weight(&before, "victim");
+    let victim_after = weight(&after, "victim");
+    let victim_raw = before
+        .images
+        .iter()
+        .find(|image| image.id.as_str() == "victim")
+        .expect("victim is in the report")
+        .raw;
+    assert!((victim_before - victim_raw).abs() < 1e-12);
+    assert!((victim_after - victim_before).abs() < 1e-12);
+    assert!(
+        !after.caps.reductions.iter().any(|reduction| reduction
+            .image
+            .as_ref()
+            .is_some_and(|id| id.as_str() == "victim")),
+        "the victim was capped"
+    );
+    for image in after
+        .images
+        .iter()
+        .filter(|image| image.id.as_str().starts_with("trusted-"))
+    {
+        assert!(
+            (image.total - image.raw).abs() < 1e-12,
+            "{} was reduced",
+            image.id
+        );
+    }
+    for attacker in attackers {
+        let before_total: f64 = (0..2)
+            .map(|index| weight(&before, format!("attack-{attacker}-{index}")))
+            .sum();
+        let after_total: f64 = (0..2)
+            .map(|index| weight(&after, format!("attack-{attacker}-{index}")))
+            .sum();
+        assert!(after_total <= before_total + 1e-9);
+    }
+    assert!(after.caps.reductions.iter().any(|reduction| {
+        reduction.reason == CapReason::ContributorCap
+            && reduction
+                .image
+                .as_ref()
+                .is_some_and(|id| id.as_str().starts_with("attack-"))
+    }));
 }
 
 #[test]

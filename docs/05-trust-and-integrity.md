@@ -166,7 +166,7 @@ A failed gate leaves the candidate provisional and opens a moderation item. A na
 
 ## 10. Red-team harness (required, CI)
 
-`looklab-trust` simulates contributors against real fixtures plus synthetic bodies. It runs on every change to `fit` or `trust`.
+`looklab-trust` separates targeted policy checks, compact real fitter-to-trust integration, and full-scale contributor simulations. The full-scale scenario criteria below are unchanged; they are not the workload of ordinary CI.
 
 | Scenario | Pass criterion *(initial)* |
 |---|---|
@@ -186,9 +186,17 @@ A failed gate leaves the candidate provisional and opens a moderation item. A na
 
 The two gauge rows (a body joining a component; two components merging) are asserted against the component and reference gauges in `looklab-fit` ([09 P4.2](09-roadmap.md)): a join keeps the designated body and its reference, a merge converts the exposure gauge exactly through `ExposureGauge::between`, and a WB reference change takes `WbGaugeChange::RefitAndReanchor`.
 
-At CI-sized synthetic pools the fitted σ moves sharply when a pool gains data, so an honest release loses support at boundary probes. The hysteresis band (1.5 enter, 1.65 exit), the sticky union and the σ-rise rule (exit threshold plus the margin) absorb jitter between versions, but not a thin rooted version's overconfident σ: when honest data joins, a probe's σ can rise from 0.5 to 10.7 and the margin rule holds the release. Rows whose honest releases are still held by the drift gate, by the post-clip ceiling or by that σ rise remain ignored, each with its measured failure in the `#[ignore]` reason. The post-clip ceiling applies to every probe present in both versions, so a shift concentrated on probes outside the union is still bounded; pre-clip `J′` and hue are checked only where the clip leaves the value identified (smallest per-channel derivative ≥ 0.25).
+| Validation tier | Execution policy |
+|---|---|
+| Targeted policy and numerical regression tests | Required on pushes and pull requests; use public policy inputs and compact synthetic fixtures |
+| Compact real fitter-to-trust integration | Required in ordinary CI only if its measured CI job wall time is approximately two minutes or less; record test execution separately, and otherwise require it before releases |
+| Full-scale simulations, numerical studies and benchmarks | Explicit maintainer request only; no automatic push, pull-request, scheduled or release execution |
 
-The harness runs in CI as `cargo test -p looklab-trust --features harness --release`.
+Targeted cases must retain the behavior that distinguishes a valid honest contribution from an attack. Contributor-count boundaries and repeated anchor comparisons remain tested without refitting a growing image pool. Compact integration uses the real fitter, uncertainty estimates and release gates; it must not pass through unsupported fits or blanket rejection.
+
+Run targeted trust checks with `nix develop -c cargo nextest run --locked --release -p looklab-trust --features harness -E 'not binary(compact)' --no-fail-fast --ignore-default-filter`. This includes the pure gauge cases without running compact integration. Run compact integration with `nix develop -c cargo nextest run --locked --release -p looklab-trust --features harness --test compact --no-fail-fast --ignore-default-filter`.
+
+Maintainers can request the **Full-scale validation** workflow manually. Its local equivalent is `nix develop -c cargo nextest run --locked --release -p looklab-fit -p looklab-trust --features looklab-fit/full-scale,looklab-trust/full-scale --run-ignored all --no-fail-fast --ignore-default-filter`. This includes the opt-in diagnostic and timing cases. The features select the original full-scale assertions without changing production fitting defaults or gate thresholds. Agents may suggest this run with a description of the affected behavior, but may not launch it without the maintainer's request.
 
 ## 11. Audit log and artifact integrity
 

@@ -3,8 +3,8 @@
 
 use looklab_meta::{RawSerial, SerialHmacKey};
 use looklab_trust::{
-    ArtifactHash, CredentialId, EffectiveContributorId, ImageRef, SerialLink,
-    resolve_effective_contributors,
+    ArtifactHash, CredentialId, EffectiveContributorId, ImageRef, SerialLink, TrustParams,
+    resolve_effective_contributors, serial_reuse,
 };
 
 fn credential(value: u128) -> CredentialId {
@@ -81,6 +81,46 @@ fn serial_links_union_transitively() {
     assert_eq!(
         resolved[&credential(4)],
         EffectiveContributorId::from(credential(4))
+    );
+}
+
+#[test]
+fn serial_reuse_flags_a_serial_shared_by_three_credentials() {
+    let shared = hmac(b"SERIAL-SHARED");
+    let unique = hmac(b"SERIAL-UNIQUE");
+    let links = vec![
+        SerialLink {
+            credential: credential(1),
+            hmac: shared,
+        },
+        SerialLink {
+            credential: credential(2),
+            hmac: shared,
+        },
+        SerialLink {
+            credential: credential(3),
+            hmac: shared,
+        },
+        SerialLink {
+            credential: credential(4),
+            hmac: unique,
+        },
+        SerialLink {
+            credential: credential(5),
+            hmac: unique,
+        },
+    ];
+
+    let params = TrustParams {
+        serial_reuse_credentials: 3,
+        ..TrustParams::default()
+    };
+    let flags = serial_reuse(&params, &links);
+
+    assert_eq!(flags.len(), 1);
+    assert_eq!(
+        flags[0].credentials,
+        vec![credential(1), credential(2), credential(3)]
     );
 }
 

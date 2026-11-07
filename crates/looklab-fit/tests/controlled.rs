@@ -188,6 +188,7 @@ fn trace(probe: &looklab_fit::ProbeUncertainty) -> f64 {
         .sum()
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "held-out vs sweep diagnostic; run with --ignored --nocapture"]
 fn held_out_vs_sweeps() {

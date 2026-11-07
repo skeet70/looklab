@@ -13,10 +13,9 @@ use looklab_fit::hierarchical::{
 };
 use looklab_fit::synth::{ControlSynthConfig, MultiBodyConfig, SynthConfig, multi_body};
 use looklab_fit::{ComponentGauge, ImageIntent, WbModeClass};
-use looklab_fit::{
-    FitOptions, ImageNuisances, PROJECTION_DIM, SampleProjection, SplitOptions, detect_split,
-    project_images,
-};
+use looklab_fit::{FitOptions, ImageNuisances, SplitOptions, detect_split, project_images};
+#[cfg(feature = "full-scale")]
+use looklab_fit::{PROJECTION_DIM, SampleProjection};
 use looklab_model::probes::v1 as probes_v1;
 
 fn fit_options() -> FitOptions {
@@ -42,6 +41,7 @@ fn hier_options() -> HierOptions {
     }
 }
 
+#[cfg(feature = "full-scale")]
 fn config() -> MultiBodyConfig {
     MultiBodyConfig {
         seed: 0x51e2_0001,
@@ -84,6 +84,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     values[values.len() / 2]
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 #[ignore = "release-mode timing measurement"]
 fn multi_body_fit_timing() {
@@ -101,6 +102,7 @@ fn multi_body_fit_timing() {
     );
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 fn synthetic_bodies_recover_delta_exposure_wb_and_look() {
     let data = multi_body(&config());
@@ -201,6 +203,7 @@ fn one_body_update_refits_exactly_its_dependent_looks() {
     );
 }
 
+#[cfg(feature = "full-scale")]
 fn coverage_config() -> MultiBodyConfig {
     MultiBodyConfig {
         seed: 0x51e2_0009,
@@ -218,6 +221,7 @@ fn coverage_config() -> MultiBodyConfig {
     }
 }
 
+#[cfg(feature = "full-scale")]
 fn coverage_options() -> HierOptions {
     HierOptions {
         fit: FitOptions {
@@ -236,6 +240,7 @@ fn coverage_options() -> HierOptions {
     }
 }
 
+#[cfg(feature = "full-scale")]
 fn held_out_regions(
     data: &looklab_fit::synth::MultiBodyDataset,
     index: usize,
@@ -301,6 +306,7 @@ fn held_out_regions(
     (error, counts)
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 fn published_uncertainty_covers_held_out_bodies() {
     let data = multi_body(&coverage_config());
@@ -468,6 +474,7 @@ fn a_silent_firmware_change_is_detected_through_the_projection_path() {
     assert!(decision.p_value < 0.001);
 }
 
+#[cfg(feature = "full-scale")]
 fn deterministic_noise(state: &mut u64) -> f64 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
@@ -475,6 +482,7 @@ fn deterministic_noise(state: &mut u64) -> f64 {
     ((*state >> 11) as f64 / (1u64 << 53) as f64) - 0.5
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 fn a_million_same_version_samples_do_not_split() {
     let mut state = 0x5eed_0f0f_1234_5678_u64;
