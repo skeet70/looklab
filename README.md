@@ -65,6 +65,8 @@ Build measurements on 2026-11-06 and 2026-11-07 used application commit `c10b5d2
 
 The corrected warm UI run restored its populated host/WASM cache and recompiled only workspace crates; no third-party dependencies recompiled.
 
+After the numerical application migration, Pages at [`fc7b15e`](https://github.com/skeet70/looklab/actions/runs/42348942720) and [`ffd2b6f`](https://github.com/skeet70/looklab/actions/runs/42349625376) failed site-data generation with `sunlit-negative: fit did not converge after 186 evaluations`; neither deployed. The subsequent test-only `3283f16` and `c90496d` Pages duplicates were canceled. The successful timings above do not establish current-application deployment latency.
+
 Local pipeline measurements used the same application base and retained the existing shared dependency cache. This was not an empty-cache build or an old/new pipeline comparison. Both passes included source capture, data handling, stub compilation, workers, the UI build and CSS publication.
 
 | Local pass | Elapsed |
@@ -81,15 +83,22 @@ The first test-tier runs retained the existing native `opt-level=1` profile and 
 
 These are failed-run measurements on separate runner allocations, not a controlled speed comparison or a green-CI result. WASM release passed in both runs.
 
-After the application migration, [CI at `3283f16`](https://github.com/skeet70/looklab/actions/runs/42350900059) completed in 2h 11m 51s. Native tests compiled in 9m 42s and reported 1,093 passed, 58 failed and two ignored across 144 test/doctest summaries. Targeted trust and WASM release passed; lint failed formatting. This is a failed correctness run, not evidence of a completed build-speed improvement.
+After the application migration, actual CI results were:
 
-| Current-application test binary | Passed | Failed | Ignored | Test execution |
+| Revision | CI wall time | Native compilation | Native passed | Native failed | Native ignored |
+|---|---:|---:|---:|---:|---:|
+| [`3283f16`](https://github.com/skeet70/looklab/actions/runs/42350900059) | 2h 11m 51s | 9m 42s | 1,093 | 58 | 2 |
+| [`c90496d`](https://github.com/skeet70/looklab/actions/runs/42362185273) | 1h 08m 35s | 8m 35s | 1,091 | 38 | 1 |
+
+Both runs completed 144 test/doctest summaries, passed targeted trust and WASM release, and failed native tests and lint formatting. Twenty failed worker cases moved into pre-release integration; they were not fixed or deleted. The remaining 38 failure names were unchanged. Runner allocations and cache outcomes differ; this is not a controlled optimizer benchmark or a green-CI result.
+
+| Slow test binary at `3283f16` | Passed | Failed | Ignored | Test execution |
 |---|---:|---:|---:|---:|
 | `looklab-fit --test model_error` | 2 | 12 | 0 | 1,981.62s |
 | `looklab-worker --test lut_rebase` | 3 | 16 | 0 | 1,328.07s |
 | `looklab-worker --test match_bundle` | 0 | 4 | 1 | 1,238.69s |
 
-The model-error failures returned `NoModelErrorEvidence`. These measurements include application changes absent from the earlier test-tier runs; they are not a same-source optimization comparison. The nine ordinary `worker.rs` cases passed in 0.85s.
+The model-error failures returned `NoModelErrorEvidence`; at `c90496d`, that binary still took 1,492.74s with two passed and twelve failed. These measurements include application changes absent from the earlier test-tier runs. The nine ordinary `worker.rs` cases passed in the measured runs.
 
 Historical full CI measurements below predate the test-tier split. They used the same application base and failed Clippy, the CLI E2E flow and 10 release trust red-team cases:
 
