@@ -189,12 +189,14 @@ The two gauge rows (a body joining a component; two components merging) are asse
 | Validation tier | Execution policy |
 |---|---|
 | Targeted policy and numerical regression tests | Required on pushes and pull requests; use public policy inputs and compact synthetic fixtures |
-| Compact real fitter-to-trust integration | Required in ordinary CI only if its measured CI job wall time is approximately two minutes or less; record test execution separately, and otherwise require it before releases |
+| Compact real fitter-to-trust integration | Required before releases through **Pre-release integration**, not ordinary CI; measured job wall time exceeded the approximately two-minute budget |
 | Full-scale simulations, numerical studies and benchmarks | Explicit maintainer request only; no automatic push, pull-request, scheduled or release execution |
 
 Targeted cases must retain the behavior that distinguishes a valid honest contribution from an attack. Contributor-count boundaries and repeated anchor comparisons remain tested without refitting a growing image pool. Compact integration uses the real fitter, uncertainty estimates and release gates; it must not pass through unsupported fits or blanket rejection.
 
-Run targeted trust checks with `nix develop -c cargo nextest run --locked --release -p looklab-trust --features harness -E 'not binary(compact)' --no-fail-fast --ignore-default-filter`. This includes the pure gauge cases without running compact integration. Run compact integration with `nix develop -c cargo nextest run --locked --release -p looklab-trust --features harness --test compact --no-fail-fast --ignore-default-filter`.
+Run targeted trust checks with `nix develop -c cargo nextest run --locked --release -p looklab-trust --features harness --no-fail-fast --ignore-default-filter`. This includes the pure gauge cases; the compact binary requires the separate `integration` feature. Run compact integration with `nix develop -c cargo nextest run --locked --release -p looklab-trust --features integration --test compact --no-fail-fast --ignore-default-filter`.
+
+The compact contract performs one noiseless colorimetric fit over three 500-sample images with production fitting defaults, verifies a supported mid-gray probe and publication, then checks the anchor ceiling against a constructed persisted-history mismatch. It does not claim to reproduce the full-scale attack populations. Before publishing a release, push its `v*` candidate tag or manually dispatch **Pre-release integration** for that commit and require a passing result. No full-scale feature is enabled by this workflow.
 
 Maintainers can request the **Full-scale validation** workflow manually. Its local equivalent is `nix develop -c cargo nextest run --locked --release -p looklab-fit -p looklab-trust --features looklab-fit/full-scale,looklab-trust/full-scale --run-ignored all --no-fail-fast --ignore-default-filter`. This includes the opt-in diagnostic and timing cases. The features select the original full-scale assertions without changing production fitting defaults or gate thresholds. Agents may suggest this run with a description of the affected behavior, but may not launch it without the maintainer's request.
 

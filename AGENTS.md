@@ -60,7 +60,7 @@ For anyone (human or agent) implementing looklab. Read [README](README.md) and t
 - `fit`/`trust`: targeted synthetic recovery and policy tests in required CI, plus compact real fitter-to-trust integration.
 - Native vs wasm32 bit-identity tests for `color` and Look evaluation.
 - `criterion` benchmarks for Look evaluation, the optimizer and prep; retain the 20% regression threshold when comparing benchmark runs.
-- Compact fitter-to-trust integration belongs in ordinary CI only while its measured CI job wall time is approximately two minutes or less. Record test execution separately; otherwise it is a pre-release gate.
+- Compact fitter-to-trust integration is a pre-release gate, not part of ordinary CI. Its measured CI job exceeded the approximately two-minute budget; record job wall time and test execution separately when reconsidering placement.
 - Full-scale numerical studies, growing-pool simulations and benchmark runs require an explicit maintainer request. They do not run on pushes, pull requests, schedules or releases by default.
 - Agents may recommend a full-scale run and name the affected behavior. They must not dispatch the workflow, enable `full-scale`, or run tests with `--all-features` without that request. Compiling or listing the opt-in test inventory does not execute it.
 - Keep targeted tests discriminating: preserve valid honest controls and reject the intended bad outcomes. Smaller fixtures must not turn a policy test into success through unsupported fits or blanket rejection.

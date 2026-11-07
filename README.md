@@ -20,7 +20,7 @@ UI build directories can contain `stub-state/`, including a local database and s
 
 ## Build pipelines
 
-CI has independent `lint`, `native`, `wasm release` and targeted trust-policy lanes. The required `ci` check succeeds only when every required lane succeeds. Compact real fitter-to-trust integration belongs in ordinary CI only while its measured CI job wall time is approximately two minutes or less; otherwise it runs before releases. Test execution is recorded separately. Native tests explicitly enable `looklab-fit/synth`. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
+CI has independent `lint`, `native`, `wasm release` and targeted trust-policy lanes. The required `ci` check succeeds only when every required lane succeeds. Compact real fitter-to-trust integration runs in the **Pre-release integration** workflow on `v*` tags or manual dispatch, not on ordinary pushes and pull requests. Native tests explicitly enable `looklab-fit/synth`. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
 
 Pages generates release site data and release worker WASM in parallel. The UI job downloads both products and their receipts from the same run, verifies them, then builds the release preview. Worker optimization, UI `-Oz`, release LTO and the `/looklab/` public URL are unchanged.
 
@@ -31,6 +31,13 @@ Nix uses public binary substituters rather than a per-store GitHub Actions cache
 `tools/build_products.py` owns worker and site-data freshness. Receipts and shared writer locks live under the main checkout's `target/build-products/`. Worker inputs include the local Cargo source closure and the explicit compile-time input trees; data also binds the fetched scene sources. CSS and UI-only source edits do not invalidate these products. New include targets or generator modules outside the supported input selection fail closed; extend the selection in that helper when adding them. Run `nix develop -c python3 -m unittest discover -s tools/tests -v` for the isolated cache-boundary tests.
 
 Full-scale fitting studies and the growing-pool trust harness require an explicit maintainer request. They are excluded from default features and ordinary CI. Use the manually dispatched **Full-scale validation** workflow, or its local command in [trust validation tiers](docs/05-trust-and-integrity.md#10-red-team-harness-required-ci). There is no automatic scheduled or release full-scale run. Agents may recommend a run for affected behavior but must not launch it without that request; `cargo test --all-features` also opts into full-scale targets.
+
+Before publishing a release, push its `v*` candidate tag or manually dispatch **Pre-release integration** for the release commit, and require that workflow to pass. It runs the same compact contract measured in CI, without enabling full-scale studies. Ordinary CI eligibility requires approximately two minutes or less of total integration-job wall time.
+
+| Compact integration measurement | Elapsed | Evidence |
+|---|---:|---|
+| CI job, including setup, compilation and cache handling | 2m 53s | [Successful measured job](https://github.com/skeet70/looklab/actions/runs/42342765350/job/128313878421); exceeds the ordinary-CI budget |
+| Test execution within that job | 11.809s | One real fit over 3 images × 500 samples; supported output publishes and a constructed historical anchor mismatch is rejected |
 
 Single-run validation on 2026-11-06 used application commit `c10b5d2` plus build and fitting-performance changes, excluding concurrent uncommitted application edits. Pages times cover the build critical path, not deployment:
 
