@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Dev-only stylesheet publisher and post_build injector; the Rust watcher excludes styles.
+// Dev-only stylesheet publisher and reload injector; the Rust watcher excludes styles.
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { watch } from "node:fs";
@@ -13,7 +13,7 @@ const BUILD_STAMP = "dev-build-stamp.txt";
 const CSS_PREFIX = "looklab-css ";
 const MARKER = "data-looklab-dev-generation";
 
-// Trunk flattens styles/*.css when filehash is false.
+// The dist keeps every stylesheet at its root, so the publisher walks both source levels.
 const sources = async (origin) => {
   const files = [join(origin, "site", "styles.css")];
   for (const name of (await readdir(join(origin, "site", "styles"))).sort()) {
@@ -63,7 +63,7 @@ const publish = async (dist, origin) => {
   return changed;
 };
 
-// A Trunk build can copy frozen stylesheets, so compare contents, not the stamp.
+// A site build copies the source stylesheets again, so compare contents, not the stamp.
 const reconcile = async (dist, origin) => {
   try {
     await stat(join(dist, "index.html"));
@@ -156,14 +156,11 @@ const reloader = (generation) => `<script ${MARKER}>
 })();
 </script>`;
 
-const runInject = async () => {
+const runInject = async (file) => {
   const generation = process.env.LOOKLAB_SOURCE_GENERATION;
   if (!generation) {
-    throw new Error("LOOKLAB_SOURCE_GENERATION is unset; run as a generation post_build hook");
+    throw new Error("LOOKLAB_SOURCE_GENERATION is unset; run as a generation build step");
   }
-  const staging = process.env.TRUNK_STAGING_DIR;
-  if (!staging) throw new Error("TRUNK_STAGING_DIR is unset; run as a Trunk post_build hook");
-  const file = join(staging, "index.html");
   const html = await readFile(file, "utf8");
   if (html.includes(MARKER)) return;
   const at = html.lastIndexOf("</body>");
@@ -192,8 +189,9 @@ switch (mode) {
     await publish(resolve(distArg), originRoot);
     break;
   case "inject":
-    await runInject();
+    if (!distArg) throw new Error("usage: dev-css.mjs inject <index.html>");
+    await runInject(resolve(distArg));
     break;
   default:
-    throw new Error("usage: dev-css.mjs watch|publish <dist> [origin] | inject");
+    throw new Error("usage: dev-css.mjs watch|publish <dist> [origin] | inject <index.html>");
 }

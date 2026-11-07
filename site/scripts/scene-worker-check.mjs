@@ -44,9 +44,10 @@ try {
         const lut = await verified(lutPath, lutEntry.sha256, lutEntry.bytes);
         const moduleUrl = `${location.origin}/generated/wasm/looklab_scene_module.wasm`;
         const moduleBytes = await fetchBytes(moduleUrl);
-        const uiModuleUrl = `${location.origin}/looklab-site.js`;
+        const uiModuleUrl = `${location.origin}/pkg/looklab-site.js`;
+        const uiWasmUrl = `${location.origin}/pkg/looklab-site.wasm`;
         const ui = await import(uiModuleUrl);
-        await ui.default();
+        await ui.default({ module_or_path: uiWasmUrl });
         if (typeof ui.looklab_prepare_scene_reference !== 'function' || typeof ui.looklab_render_scene_reference !== 'function') {
             throw new Error('The served UI module has no Rust scene parity reference exports');
         }
@@ -116,7 +117,7 @@ try {
         } finally {
             worker.terminate();
         }
-        return { siteRootSha256: root, moduleUrl, moduleSha256: await digest(moduleBytes), reference: { moduleUrl: uiModuleUrl, prepared: 'looklab_prepare_scene_reference', rgba: 'looklab_render_scene_reference', description: 'UI-compiled Rust PNG decode, scene preparation and rendering in Chromium main context' }, lut: { look: look.slug, version: version.version, path: lutPath, sha256: lutEntry.sha256, bytes: lut.length }, expectedSceneCount: 9, scenes };
+        return { siteRootSha256: root, moduleUrl, moduleSha256: await digest(moduleBytes), reference: { moduleUrl: uiModuleUrl, wasmUrl: uiWasmUrl, prepared: 'looklab_prepare_scene_reference', rgba: 'looklab_render_scene_reference', description: 'UI-compiled Rust PNG decode, scene preparation and rendering in Chromium main context' }, lut: { look: look.slug, version: version.version, path: lutPath, sha256: lutEntry.sha256, bytes: lut.length }, expectedSceneCount: 9, scenes };
     }, { root });
     const report = { origin, date: new Date().toISOString(), browser: browser.version(), ...evidence };
     await writeFile(`${out}/parity.json`, JSON.stringify(report, null, 2));

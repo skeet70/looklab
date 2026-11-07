@@ -5,21 +5,25 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content="looklab: measure, compare and reproduce camera looks from static data." />
     <title>looklab</title>
-    <link data-trunk rel="rust" data-wasm-opt="z" />
-    <link data-trunk rel="css" href="styles.css" />
-    <link data-trunk rel="css" href="styles/base.css" />
-    <link data-trunk rel="css" href="styles/components.css" />
-    <link data-trunk rel="css" href="styles/home.css" />
-    <link data-trunk rel="css" href="styles/looks.css" />
-    <link data-trunk rel="css" href="styles/compare.css" />
-    <link data-trunk rel="css" href="styles/match.css" />
-    <link data-trunk rel="css" href="styles/account.css" />
-    <link data-trunk rel="css" href="styles/contribute.css" />
-    <link data-trunk rel="css" href="styles/community.css" />
-    <link data-trunk rel="css" href="styles/developers.css" />
-    <link data-trunk rel="copy-dir" href="data" />
-    <link data-trunk rel="copy-dir" href="workers" />
-    <link data-trunk rel="copy-dir" href="generated" />
+    <link rel="stylesheet" href="__PREFIX__styles.css" />
+    <link rel="stylesheet" href="__PREFIX__base.css" />
+    <link rel="stylesheet" href="__PREFIX__components.css" />
+    <link rel="stylesheet" href="__PREFIX__home.css" />
+    <link rel="stylesheet" href="__PREFIX__looks.css" />
+    <link rel="stylesheet" href="__PREFIX__compare.css" />
+    <link rel="stylesheet" href="__PREFIX__match.css" />
+    <link rel="stylesheet" href="__PREFIX__account.css" />
+    <link rel="stylesheet" href="__PREFIX__contribute.css" />
+    <link rel="stylesheet" href="__PREFIX__community.css" />
+    <link rel="stylesheet" href="__PREFIX__developers.css" />
   </head>
-  <body></body>
+  <body>
+    <script type="module">
+      // base.rs reads the public prefix from this stylesheet link, so it stays ahead of the module.
+      const stylesheet = document.querySelector('link[rel="stylesheet"]');
+      const prefix = new URL(stylesheet.href).pathname.replace(/[^/]*$/, '');
+      const { default: init } = await import(prefix + 'pkg/looklab-site.js');
+      init({ module_or_path: prefix + 'pkg/looklab-site.wasm' });
+    </script>
+  </body>
 </html>

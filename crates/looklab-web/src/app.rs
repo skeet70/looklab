@@ -3,11 +3,13 @@
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use leptos_router::Lazy;
 use leptos_router::components::{A, Route, Router, Routes};
 use leptos_router::hooks::use_location;
 use leptos_router::path;
 use wasm_bindgen::JsCast;
 
+use crate::lazy_routes::*;
 use crate::pages::*;
 use crate::{base, ui, webauthn};
 
@@ -21,6 +23,7 @@ extern "C" {
 #[component]
 pub fn App() -> impl IntoView {
     crate::session::provide_session();
+    crate::prefetch::provide();
     view! {
         <Router base=base::router_base()>
             <Shell/>
@@ -38,6 +41,23 @@ fn Shell() -> impl IntoView {
     let session = crate::session::use_session();
     let sign_in = session.dialog_open;
     let account_error = RwSignal::new(None::<String>);
+    let bodies = Lazy::<BodiesRoute>::new();
+    let body = Lazy::<BodyRoute>::new();
+    let contribute = Lazy::<ContributeRoute>::new();
+    let bounties = Lazy::<BountiesRoute>::new();
+    let me = Lazy::<MeRoute>::new();
+    let status = Lazy::<StatusRoute>::new();
+    let passkeys = Lazy::<PasskeysRoute>::new();
+    let pattern = Lazy::<PatternRoute>::new();
+    let community = Lazy::<CommunityRoute>::new();
+    let log = Lazy::<LogRoute>::new();
+    let propose = Lazy::<ProposeRoute>::new();
+    let proposal = Lazy::<ProposalRoute>::new();
+    let review = Lazy::<ModQueueRoute>::new();
+    let developers = Lazy::<DevelopersRoute>::new();
+    let pipelines = Lazy::<PipelinesRoute>::new();
+    let how_it_works = Lazy::<HowItWorksRoute>::new();
+    let privacy = Lazy::<PrivacyRoute>::new();
     view! {
         <a class="skip-link" href="#main" hidden=move || !chrome() on:click=move |_| {
             if let Some(main) = document().get_element_by_id("main")
@@ -81,34 +101,33 @@ fn Shell() -> impl IntoView {
             </div>
         })}
         <main id="main" tabindex="-1">
-            <Routes fallback=|| view! {
-                <NotFound/>
+            <Routes fallback=|| {
+                crate::prefetch::route_rendered();
+                view! { <NotFound/> }
             }>
                 <Route path=path!("/") view=Landing/>
-                <Route path=path!("/cameras") view=BodiesPage/>
-                <Route path=path!("/cameras/:make/:model") view=BodyDetail/>
+                <Route path=path!("/cameras") view=bodies/>
+                <Route path=path!("/cameras/:make/:model") view=body/>
                 <Route path=path!("/looks") view=LooksPage/>
                 <Route path=path!("/looks/:look") view=LookDetail/>
                 <Route path=path!("/compare") view=ComparePage/>
                 <Route path=path!("/match") view=MatchPage/>
                 <Route path=path!("/match/r/:permalink") view=MatchResultPage/>
-                <Route path=path!("/contribute") view=ContributePage/>
-                <Route path=path!("/contribute/wanted") view=BountiesPage/>
-                <Route path=path!("/me") view=MePage/>
-                <Route path=path!("/status/:token") view=|| view! {
-                    <StatusPage/>
-                }/>
-                <Route path=path!("/help/passkeys") view=PasskeysPage/>
-                <Route path=path!("/pattern/:seed") view=PatternPage/>
-                <Route path=path!("/community") view=CommunityPage/>
-                <Route path=path!("/community/log") view=LogPage/>
-                <Route path=path!("/community/propose") view=ProposePage/>
-                <Route path=path!("/proposals/:id") view=ProposalDetail/>
-                <Route path=path!("/review") view=ModQueuePage/>
-                <Route path=path!("/developers") view=DevelopersPage/>
-                <Route path=path!("/developers/pipelines") view=PipelinesPage/>
-                <Route path=path!("/about/how-it-works") view=HowItWorksPage/>
-                <Route path=path!("/about/privacy") view=PrivacyPage/>
+                <Route path=path!("/contribute") view=contribute/>
+                <Route path=path!("/contribute/wanted") view=bounties/>
+                <Route path=path!("/me") view=me/>
+                <Route path=path!("/status/:token") view=status/>
+                <Route path=path!("/help/passkeys") view=passkeys/>
+                <Route path=path!("/pattern/:seed") view=pattern/>
+                <Route path=path!("/community") view=community/>
+                <Route path=path!("/community/log") view=log/>
+                <Route path=path!("/community/propose") view=propose/>
+                <Route path=path!("/proposals/:id") view=proposal/>
+                <Route path=path!("/review") view=review/>
+                <Route path=path!("/developers") view=developers/>
+                <Route path=path!("/developers/pipelines") view=pipelines/>
+                <Route path=path!("/about/how-it-works") view=how_it_works/>
+                <Route path=path!("/about/privacy") view=privacy/>
             </Routes>
         </main>
         <footer class="site-footer" hidden=move || !chrome()>
@@ -301,7 +320,7 @@ fn SignInDialog(open: RwSignal<bool>) -> impl IntoView {
 }
 
 #[component]
-fn MePage() -> impl IntoView {
+pub(crate) fn MePage() -> impl IntoView {
     let session = crate::session::use_session();
     view! {
         {move || match session.state.get() {

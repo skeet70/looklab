@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { gzipSync } from 'node:zlib';
 
@@ -20,6 +20,7 @@ try {
     for (const [name, path] of [['Home', '/'], ['Look', '/looks/sunlit-negative'], ['Compare', '/compare?a=sunlit-negative&b=cold-steel'], ['Match result', match]]) {
         const context = await browser.newContext({ viewport: { width: 1365, height: 900 } });
         await context.addInitScript(() => {
+            performance.setResourceTimingBufferSize(2000);
             const timings = { wasm: [], canvases: [], longtasks: [] };
             window.looklabPhotoTimings = timings;
             if (!PerformanceObserver.supportedEntryTypes.includes('longtask')) {
@@ -68,10 +69,15 @@ try {
             const firstPhotoMs = timings.canvases.find(entry => entry.paint !== null).paint;
             const fullPhotoMs = timings.canvases.find(entry => entry.width >= 1000 && entry.paint !== null).paint;
             const entries = timings.longtasks.filter(entry => entry.start < fullPhotoMs && entry.start + entry.duration > firstPhotoMs);
+            const wasmResources = performance.getEntriesByType('resource')
+                .filter(entry => new URL(entry.name).pathname.endsWith('.wasm'))
+                .map(entry => ({ url: entry.name, start: entry.startTime }));
             return {
                 timings,
                 firstPhotoMs,
                 fullPhotoMs,
+                wasmBeforeFirstPhoto: wasmResources.filter(entry => entry.start <= firstPhotoMs).map(entry => entry.url),
+                wasmResources,
                 upgradeLongtasks: {
                     interval: 'first-photo-paint-to-full-scene-paint',
                     startMs: firstPhotoMs,
@@ -111,10 +117,21 @@ try {
         }
         await context.close();
     }
-    const wasm = await readFile(`${dist}/looklab-site_bg.wasm`);
-    const report = { origin, date: new Date().toISOString(), initialWasmBytes: wasm.length, initialWasmGzipBytes: gzipSync(wasm).length, results };
+    const pkg = `${dist}/pkg`;
+    const wasm = await readFile(`${pkg}/looklab-site.wasm`);
+    const splitChunks = [];
+    let splitWasmBytes = 0;
+    let splitWasmGzipBytes = 0;
+    for (const file of (await readdir(pkg)).filter(name => /^(split_|chunk_).+\.wasm$/.test(name)).sort()) {
+        const bytes = await readFile(`${pkg}/${file}`);
+        const gzipBytes = gzipSync(bytes).length;
+        splitWasmBytes += bytes.length;
+        splitWasmGzipBytes += gzipBytes;
+        splitChunks.push({ file: `pkg/${file}`, bytes: bytes.length, gzipBytes });
+    }
+    const report = { origin, date: new Date().toISOString(), initialWasmBytes: wasm.length, initialWasmGzipBytes: gzipSync(wasm).length, splitWasmBytes, splitWasmGzipBytes, splitChunks, results };
     await writeFile(`${out}/timings.json`, JSON.stringify(report, null, 2));
-    console.log(JSON.stringify({ initialWasmBytes: report.initialWasmBytes, initialWasmGzipBytes: report.initialWasmGzipBytes, pages: results.map(result => ({ name: result.name, firstPhotoMs: result.firstPhotoMs, fullPhotoMs: result.fullPhotoMs, upgradeLongtasks: result.upgradeLongtasks, wasm: result.timings.wasm, measures: result.measures, switchMeasures: result.switchMeasures })) }, null, 2));
+    console.log(JSON.stringify({ initialWasmBytes: report.initialWasmBytes, initialWasmGzipBytes: report.initialWasmGzipBytes, splitWasmBytes: report.splitWasmBytes, splitWasmGzipBytes: report.splitWasmGzipBytes, splitChunks: report.splitChunks, pages: results.map(result => ({ name: result.name, firstPhotoMs: result.firstPhotoMs, fullPhotoMs: result.fullPhotoMs, upgradeLongtasks: result.upgradeLongtasks, wasm: result.timings.wasm, wasmBeforeFirstPhoto: result.wasmBeforeFirstPhoto, measures: result.measures, switchMeasures: result.switchMeasures })) }, null, 2));
 } finally {
     await browser.close();
 }

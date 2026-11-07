@@ -170,6 +170,7 @@ pub(crate) fn PreviewCanvas(
     scene: Signal<Arc<PreparedScene>>,
     label: String,
     style: Signal<String>,
+    #[prop(optional)] first_photo: bool,
 ) -> impl IntoView {
     let canvas = NodeRef::<Canvas>::new();
     let error = RwSignal::new(None::<String>);
@@ -181,7 +182,11 @@ pub(crate) fn PreviewCanvas(
             return;
         };
         let scene = scene.get();
-        error.set(paint(&element, &lut, &scene).err());
+        let result = paint(&element, &lut, &scene);
+        if result.is_ok() && first_photo {
+            crate::prefetch::first_photo_painted();
+        }
+        error.set(result.err());
     });
     view! {
         <canvas node_ref=canvas role="img" aria-label=label style=move || style.get()></canvas>
@@ -370,10 +375,10 @@ pub fn Viewer(
             </div>
             <div class="viewer-surround-frame" style=move || format!("padding:1rem;background:{}", selected_surround.get().color())>
                 <div class="viewer-images" style="position:relative;display:flex;--split:50%;min-height:3rem">
-                    <PreviewCanvas lut=Signal::derive(move || Some(lut_a.get())) scene=scene label=format!("Simulated: {label_a}") style=a_style/>
+                    <PreviewCanvas lut=Signal::derive(move || Some(lut_a.get())) scene=scene label=format!("Simulated: {label_a}") style=a_style first_photo=true/>
                     {lut_b.map(|lut_b| view! {
                         <PreviewCanvas lut=Signal::derive(move || Some(lut_b.get())) scene=scene
-                            label=format!("Simulated: {}", label_b.unwrap_or_else(|| "Look B".to_owned())) style=b_style/>
+                            label=format!("Simulated: {}", label_b.unwrap_or_else(|| "Look B".to_owned())) style=b_style first_photo=true/>
                     })}
                     <div node_ref=divider role="slider" tabindex="0" aria-label="Comparison divider"
                         aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" aria-orientation="horizontal"
@@ -513,7 +518,7 @@ pub fn LookCard(
                     <div style="background:rgb(119,119,119);min-height:5rem">
                         <PreviewCanvas lut=Signal::derive(move || if visible.get() { lut.get() } else { None })
                             scene=Signal::stored(scene) label=format!("Simulated: {name}")
-                            style=Signal::stored("display:block;width:100%;height:auto".to_owned())/>
+                            style=Signal::stored("display:block;width:100%;height:auto".to_owned()) first_photo=true/>
                     </div>
                 })}
                 <strong>{name}</strong>

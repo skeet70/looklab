@@ -189,21 +189,24 @@ jobs:
         with:
           mode: restore
           family: pages-ui
-          salt: trunk-release-looklab-web-wasm32
+          salt: leptos-release-looklab-web-wasm32
           paths: |
-            target/.rustc_info.json
-            target/release/deps
-            target/release/build
-            target/release/.fingerprint
-            target/wasm32-unknown-unknown/release/deps
-            target/wasm32-unknown-unknown/release/build
-            target/wasm32-unknown-unknown/release/.fingerprint
-      - name: Trunk build
-        working-directory: site
+            target-ui/front/.rustc_info.json
+            target-ui/front/release/deps
+            target-ui/front/release/build
+            target-ui/front/release/.fingerprint
+            target-ui/front/wasm32-unknown-unknown/release/deps
+            target-ui/front/wasm32-unknown-unknown/release/build
+            target-ui/front/wasm32-unknown-unknown/release/.fingerprint
+      # The ui lane sets RUSTC_WORKSPACE_WRAPPER, which changes the worker product identity
+      # and would reject the receipts handed off above.
+      - name: Site build
         env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target-ui
+          LOOKLAB_UI_TARGET_DIR: ${{ github.workspace }}/target-ui
           LOOKLAB_API_BASE: ${{ vars.LOOKLAB_PUBLIC_API_BASE }}
           LOOKLAB_PREVIEW: ${{ vars.LOOKLAB_PUBLIC_API_BASE == '' && '1' || '' }}
-        run: nix develop -c trunk build --locked --release --public-url /looklab/
+        run: nix develop -c sh site/scripts/build-site.sh --release --public-url /looklab/ --dist "${{ github.workspace }}/site/dist"
       - name: SPA deep-link fallback and fixture pattern page
         run: |
           cp site/dist/index.html site/dist/404.html
@@ -216,15 +219,15 @@ jobs:
         with:
           mode: save
           family: pages-ui
-          salt: trunk-release-looklab-web-wasm32
+          salt: leptos-release-looklab-web-wasm32
           paths: |
-            target/.rustc_info.json
-            target/release/deps
-            target/release/build
-            target/release/.fingerprint
-            target/wasm32-unknown-unknown/release/deps
-            target/wasm32-unknown-unknown/release/build
-            target/wasm32-unknown-unknown/release/.fingerprint
+            target-ui/front/.rustc_info.json
+            target-ui/front/release/deps
+            target-ui/front/release/build
+            target-ui/front/release/.fingerprint
+            target-ui/front/wasm32-unknown-unknown/release/deps
+            target-ui/front/wasm32-unknown-unknown/release/build
+            target-ui/front/wasm32-unknown-unknown/release/.fingerprint
 
   deploy:
     name: deploy

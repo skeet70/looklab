@@ -64,7 +64,6 @@ class Layout:
     runtime: Path
     stub_binary: Path
     stub_bin: Path
-    trunk_config: Path
     record: Path
     runtime_record: Path
     css_script: Path
@@ -99,7 +98,6 @@ class Layout:
             runtime=runtime,
             stub_binary=target / "debug" / "examples" / "stub_server",
             stub_bin=target / "stub-bin",
-            trunk_config=target / "Trunk.dev.toml",
             record=target / RECORD,
             runtime_record=runtime / RUNTIME_RECORD,
             css_script=target / "source" / "site" / "scripts" / "dev-css.mjs",
@@ -309,26 +307,6 @@ def exchange_dist(next_dist: Path, dist: Path) -> None:
             "atomic directory exchange failed; GNU coreutils mv with --exchange is required: "
             + (result.stderr.strip() or result.stdout.strip() or "unknown error")
         )
-
-
-def write_trunk_config(layout: Layout) -> None:
-    config = f"""[build]
-target = {toml_string(layout.view / "site" / "index.html")}
-dist = {toml_string(layout.next_dist)}
-public_url = "/"
-filehash = false
-
-[[hooks]]
-stage = "pre_build"
-command = "sh"
-command_arguments = [{toml_string(layout.view / "site" / "scripts" / "wasm-assets.sh")}]
-
-[[hooks]]
-stage = "post_build"
-command = "node"
-command_arguments = [{toml_string(layout.css_script)}, "inject"]
-"""
-    write_atomic(layout.trunk_config, config)
 
 
 def sanitized_base() -> dict[str, str]:
@@ -581,32 +559,24 @@ class Supervisor:
             env=environment,
         )
         binary = self.install_binary(generation.digest)
+        build_env = dict(environment)
+        build_env["CARGO_NET_OFFLINE"] = "true"
         run_step(
-            f"worker artifacts ({generation.digest[:12]})",
-            ["sh", view / "site" / "scripts" / "wasm-assets.sh"],
-            cwd=view,
-            env=environment,
-        )
-        write_trunk_config(layout)
-        shutil.rmtree(layout.next_dist, ignore_errors=True)
-        layout.next_dist.mkdir(parents=True)
-        trunk_environment = dict(environment)
-        trunk_environment["CARGO_NET_OFFLINE"] = "true"
-        run_step(
-            f"trunk build ({generation.digest[:12]})",
+            f"site build ({generation.digest[:12]})",
             [
-                "trunk",
-                "build",
-                "--locked",
-                "--config",
-                layout.trunk_config,
-                "--cargo-profile",
-                "web-dev",
-                "--release=false",
-                "--no-sri",
+                "sh",
+                view / "site" / "scripts" / "build-site.sh",
+                "--dist",
+                layout.next_dist,
             ],
             cwd=view,
-            env=trunk_environment,
+            env=build_env,
+        )
+        run_step(
+            f"reload injector ({generation.digest[:12]})",
+            ["node", layout.css_script, "inject", layout.next_dist / "index.html"],
+            cwd=layout.origin,
+            env=environment,
         )
         run_step(
             f"live stylesheets ({generation.digest[:12]})",

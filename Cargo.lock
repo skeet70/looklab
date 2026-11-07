@@ -3349,6 +3349,7 @@ name = "looklab-site"
 version = "0.1.0"
 dependencies = [
  "looklab-web",
+ "wasm-bindgen",
 ]
 
 [[package]]

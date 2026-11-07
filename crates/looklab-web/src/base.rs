@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Deployment paths: the public URL prefix and the API origin ([docs/01](../../../docs/01-architecture.md)).
-//! Trunk rewrites the asset URLs it generates, so the stylesheet link it emits carries the prefix at runtime.
+//! The site template writes the deployment prefix into its first stylesheet link, and the page derives every asset URL from it.
 
 use std::sync::LazyLock;
 

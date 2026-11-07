@@ -242,29 +242,12 @@ async fn serve_asset(stub: &Stub, uri: &Uri) -> Response {
         stub.dist.join("index.html")
     };
     match std::fs::read(&file) {
-        Ok(bytes) => {
-            let bytes = if file
-                .extension()
-                .is_some_and(|extension| extension == "html")
-            {
-                let authority = stub
-                    .origin
-                    .split_once("://")
-                    .map_or(stub.origin.as_str(), |(_, authority)| authority);
-                String::from_utf8_lossy(&bytes)
-                    .replace("{{__TRUNK_ADDRESS__}}", authority)
-                    .replace("{{__TRUNK_WS_BASE__}}", "/")
-                    .into_bytes()
-            } else {
-                bytes
-            };
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, content_type(&file))],
-                bytes,
-            )
-                .into_response()
-        }
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, content_type(&file))],
+            bytes,
+        )
+            .into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }

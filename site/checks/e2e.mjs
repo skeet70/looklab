@@ -17,7 +17,7 @@ const USAGE = `usage: node site/checks/e2e.mjs [options]
                                __EGL_VENDOR_LIBRARY_FILENAMES for Mesa's
                                libEGL_mesa, EGL_PLATFORM=surfaceless and
                                MESA_LOADER_DRIVER_OVERRIDE=swrast
-  --flow all|match|contribute|pages|flatness|propose|developers|compare|account
+  --flow all|match|contribute|pages|flatness|propose|developers|compare|account|lazy
   --origin URL                 stub server origin (default http://localhost:8099)
   --out DIR                    artifact directory (default /tmp/looklab-e2e)
   --state DIR                  stub server state, must match --state (default /tmp/looklab-stub-state)
@@ -168,6 +168,8 @@ async function open(viewport, harPath) {
     });
   }
   await page.bringToFront();
+  // The dev loop reloads when its build stamp changes; an empty stamp keeps a concurrent UI edit from replacing the document.
+  await page.route('**/dev-build-stamp.txt', route => route.fulfill({ status: 200, contentType: 'text/plain', body: '' }));
   const bodies = new Map();
   page.on('request', (request) => {
     if (!/\/api\/|\/status\//.test(request.url())) {
@@ -198,8 +200,6 @@ async function match(size) {
   const session = await open(VIEWPORTS[size]);
   const { page, problems } = session;
   try {
-    // Trunk reloads replace the document during concurrent UI edits.
-    await page.routeWebSocket(/\/trunk\/ws(?:\?|$)/, socket => socket.close());
     if (options.browser === 'chromium') {
       const cdp = await session.context.newCDPSession(page);
       await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
@@ -272,6 +272,11 @@ async function match(size) {
     const firstNext = page.getByRole('button', { name: 'Next', exact: true });
     const cameraPicker = await cameras.boundingBox();
     check((await firstNext.boundingBox()).y > cameraPicker.y + cameraPicker.height, `${size}: wizard navigation follows camera controls`);
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      if (await firstNext.isEnabled()) break;
+      await page.waitForTimeout(100);
+    }
+    check(await firstNext.isEnabled(), `${size}: wizard enables Next once the camera settings load`);
     await page.getByRole('button', { name: 'Next', exact: true }).focus();
     await page.keyboard.press('Enter');
     await page.getByRole('heading', { name: 'Which look?', exact: true }).waitFor();
@@ -329,7 +334,6 @@ async function contribute(size) {
   const harPath = `${options.out}/session-${size}.har`;
   const session = await open(VIEWPORTS[size], harPath);
   const { page, problems } = session;
-  await page.routeWebSocket('**/.well-known/trunk/ws', () => {});
   if (session.authenticator) {
     await session.authenticator.cdp.send('Network.enable');
     await session.authenticator.cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
@@ -1085,6 +1089,101 @@ async function developers() {
   }
 }
 
+function wasmRequests(page) {
+  return page.evaluate(() => performance.getEntriesByType('resource')
+    .filter(entry => new URL(entry.name).pathname.endsWith('.wasm'))
+    .map(entry => ({ path: new URL(entry.name).pathname, start: entry.startTime })));
+}
+
+const chunkName = path => path.split('/').pop();
+
+async function lazy() {
+  const session = await open(VIEWPORTS.desktop);
+  const { page } = session;
+  try {
+    await page.addInitScript(() => {
+      performance.setResourceTimingBufferSize(2000);
+      const timings = { canvases: [] };
+      window.looklabLazyChunks = timings;
+      const put = CanvasRenderingContext2D.prototype.putImageData;
+      CanvasRenderingContext2D.prototype.putImageData = function (...args) {
+        const result = put.apply(this, args);
+        const canvas = this.canvas;
+        const entry = { width: canvas.width, height: canvas.height, paint: null };
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          if (canvas.closest('.viewer') && canvas.getBoundingClientRect().width > 0) {
+            entry.paint = performance.now();
+            timings.canvases.push(entry);
+          }
+        }));
+        return result;
+      };
+    });
+    await page.goto(`${options.origin}/`, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => window.looklabLazyChunks.canvases.some(entry => entry.paint !== null), null, { timeout: 120_000 });
+    const firstPhoto = await page.evaluate(() => Math.min(...window.looklabLazyChunks.canvases.filter(entry => entry.paint !== null).map(entry => entry.paint)));
+    const stems = await page.evaluate(async () => {
+      const stylesheet = document.querySelector('link[rel="stylesheet"][href]');
+      const prefix = new URL(stylesheet.href).pathname.replace(/[^/]*$/, '');
+      const response = await fetch(`${prefix}pkg/__wasm_split_manifest.json`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`split manifest request failed with ${response.status}`);
+      const manifest = await response.json();
+      return [...new Set(Object.values(manifest).flat())];
+    });
+    check(stems.length > 0, `split manifest lists ${stems.length} chunk files`);
+    const chunkFiles = new Set(stems.map(stem => `${stem}.wasm`));
+    const chunkRequests = requests => requests.filter(entry => chunkFiles.has(chunkName(entry.path)));
+    const painted = chunkRequests(await wasmRequests(page));
+    check(painted.every(entry => entry.start >= firstPhoto), 'no route chunk is requested before the first photo paints');
+    await page.waitForFunction((expected) => {
+      const seen = new Set(performance.getEntriesByType('resource')
+        .filter(entry => new URL(entry.name).pathname.endsWith('.wasm'))
+        .map(entry => new URL(entry.name).pathname.split('/').pop().replace(/\.wasm$/, '')));
+      return expected.every(stem => seen.has(stem));
+    }, stems, { timeout: 120_000 });
+    await page.waitForTimeout(1000);
+    const idle = chunkRequests(await wasmRequests(page));
+    for (const stem of stems) {
+      const count = idle.filter(entry => chunkName(entry.path) === `${stem}.wasm`).length;
+      check(count === 1, `idle prefetch requests ${stem} exactly once`);
+    }
+    const requestCount = idle.length;
+    const navigate = async (route, heading) => {
+      await page.evaluate((route) => {
+        const stylesheet = document.querySelector('link[rel="stylesheet"][href]');
+        const prefix = new URL(stylesheet.href).pathname.replace(/[^/]*$/, '');
+        history.pushState({}, '', prefix + route.replace(/^\//, ''));
+        dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+      }, route);
+      await page.getByRole('heading', { name: heading, exact: true }).waitFor({ timeout: 120_000 });
+      await page.waitForTimeout(500);
+      check(chunkRequests(await wasmRequests(page)).length === requestCount, `${route} navigation after prefetch requests no route chunk`);
+    };
+    await navigate('/contribute', 'Help build looks');
+    await navigate('/review', 'Review queue');
+    await navigate('/developers', 'Make your firmware load looklab looks');
+    const direct = [];
+    for (const [route, heading] of [['/contribute', 'Help build looks'], ['/review', 'Review queue']]) {
+      const visit = await open(VIEWPORTS.desktop);
+      const { page: directPage } = visit;
+      try {
+        await directPage.addInitScript(() => performance.setResourceTimingBufferSize(2000));
+        await directPage.goto(`${options.origin}${route}`, { waitUntil: 'domcontentloaded' });
+        await directPage.getByRole('heading', { name: heading, exact: true }).waitFor({ timeout: 120_000 });
+        const rendered = await directPage.evaluate(() => performance.now());
+        const requests = chunkRequests(await wasmRequests(directPage));
+        check(requests.some(entry => entry.start < rendered), `${route} direct visit requests its route chunk before the page renders`);
+        direct.push({ route, chunks: requests.map(entry => chunkName(entry.path)) });
+      } finally {
+        await close(visit);
+      }
+    }
+    return { chunks: stems.length, requests: requestCount, direct };
+  } finally {
+    await close(session);
+  }
+}
+
 async function compareViews() {
   const session = await open(VIEWPORTS.desktop);
   const { page } = session;
@@ -1339,6 +1438,9 @@ if (options.flow === 'flatness') {
 }
 if (options.flow === 'all' || options.flow === 'developers') {
   result.developers = await developers();
+}
+if (options.flow === 'all' || options.flow === 'lazy') {
+  result.lazy = await lazy();
 }
 console.log(JSON.stringify(result, null, 2));
 if (options.flow === 'compare') {

@@ -41,6 +41,7 @@ pub fn loading() -> impl IntoView {
 }
 
 pub fn failure(message: &str) -> impl IntoView + use<> {
+    crate::prefetch::route_rendered();
     view! {
         <div class="error" role="alert">
             <strong>"Could not load this page."</strong>

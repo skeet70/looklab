@@ -66,7 +66,6 @@ def make_layout(
         runtime=runtime,
         stub_binary=target / "debug" / "examples" / "stub_server",
         stub_bin=target / "stub-bin",
-        trunk_config=target / "Trunk.dev.toml",
         record=target / "dev-generation.json",
         runtime_record=runtime / "generation.json",
         css_script=target / "source" / "site" / "scripts" / "dev-css.mjs",

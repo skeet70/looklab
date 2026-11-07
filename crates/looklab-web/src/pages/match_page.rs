@@ -233,6 +233,7 @@ pub fn MatchPage() -> impl IntoView {
         }.into_any() } else { match state.get() {
             Load::Loading => ui::loading().into_any(), Load::Failed(error) => ui::failure(&error).into_any(),
             Load::Ready(index) => {
+                crate::prefetch::route_rendered();
                 let items = index.looks.iter().filter(|look| look.visibility == looklab_publish::LookVisibility::Public).filter_map(|look| look.latest().filter(|version| version.matchable).map(|version| ui::LookCardItem {
                     slug: look.slug.clone(), version: version.version.clone(), name: look.name.clone(),
                     origin: ui::LookOrigin::BuiltIn { cameras: index.bodies.iter().filter(|body| body.looks.contains(&look.slug)).map(|body| format!("{} {}", body.make, body.model)).collect() },

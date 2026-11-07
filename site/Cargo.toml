@@ -1,11 +1,15 @@
 [package]
 name = "looklab-site"
-description = "Trunk entry point for the looklab static site."
+description = "cargo-leptos entry point for the looklab static site."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
+
+[lib]
+name = "looklab_site"
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "looklab-web"
@@ -13,6 +17,18 @@ path = "src/main.rs"
 
 [dependencies]
 looklab-web.workspace = true
+wasm-bindgen.workspace = true
+
+[package.metadata.leptos]
+output-name = "looklab-site"
+site-pkg-dir = "pkg"
+hash-files = false
+js-minify = true
+lib-features = []
+lib-default-features = false
+lib-profile-dev = "web-dev"
+bin-features = []
+bin-default-features = false
 
 [lints]
 workspace = true
