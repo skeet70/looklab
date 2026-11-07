@@ -66,6 +66,7 @@ fn held_out_latent_errors(
         .collect()
 }
 
+#[cfg(feature = "full-scale")]
 /// Supported probes whose latent error lies inside twice the published post-clip σ.
 fn supported_coverage(
     result: &looklab_fit::FitResult,
@@ -291,6 +292,7 @@ fn tone_only_difference_leaves_the_colour_layers_alone() {
     );
 }
 
+#[cfg(feature = "full-scale")]
 #[test]
 fn noisy_tone_fixtures_recover_their_latent_looks() {
     let config = SynthConfig {

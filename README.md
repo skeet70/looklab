@@ -34,6 +34,8 @@ Nix uses public binary substituters rather than a per-store GitHub Actions cache
 
 Full-scale fitting studies and the growing-pool trust harness require an explicit maintainer request. They are excluded from default features and ordinary CI. Use the manually dispatched **Full-scale validation** workflow, or its local command in [trust validation tiers](docs/05-trust-and-integrity.md#10-red-team-harness-required-ci). There is no automatic scheduled or release full-scale run. Agents may recommend a run for affected behavior but must not launch it without that request; `cargo test --all-features` also opts into full-scale targets.
 
+The noisy tone-recovery study fits two 20-image × 10,000-sample datasets and also requires `looklab-fit/full-scale`. Its coverage helper is compiled only with that feature.
+
 Before publishing a release, push its `v*` candidate tag or manually dispatch **Pre-release integration** for the release commit, and require both compact and worker integration jobs to pass. Neither job enables full-scale studies. Ordinary CI eligibility requires approximately two minutes or less of total integration-job wall time.
 
 Worker tests retain nine fit-free or budget-short-circuit cases in ordinary CI. Eighteen normal-budget native/consistency fitter cases require `looklab-worker/integration` and run before releases with their original fixtures and assertions. The ignored 1,000-image benchmark additionally requires `looklab-worker/full-scale`.
