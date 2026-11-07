@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "integration")]
+use std::path::PathBuf;
 
+#[cfg(feature = "integration")]
 use looklab_export::card::read_card;
-use looklab_fit::synth::{LookSelector, SynthConfig, SyntheticDataset};
+#[cfg(feature = "integration")]
+use looklab_fit::synth::LookSelector;
+use looklab_fit::synth::{SynthConfig, SyntheticDataset};
 use looklab_model::LookDocument;
+#[cfg(feature = "integration")]
 use looklab_publish::{ArtifactName, CARD_ARTIFACT, SiteIndex, VersionManifest, verify_artifact};
 use looklab_samples::{SampleSet, encode};
 use looklab_server::{ContributionId, CredentialId};
-use looklab_upload::{CardDeclaration, ContributionKind, ManifestMetadata, RenderTag};
-use looklab_worker::db::{ContributionIntent, ContributionStatus, ImageOutcome};
+#[cfg(feature = "integration")]
+use looklab_upload::CardDeclaration;
+use looklab_upload::{ContributionKind, ManifestMetadata, RenderTag};
+use looklab_worker::db::ContributionIntent;
+#[cfg(feature = "integration")]
+use looklab_worker::db::{ContributionStatus, ImageOutcome};
 use looklab_worker::{JobPayload, Worker, WorkerConfig, WorkerError};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -22,6 +32,7 @@ const SIM: &str = "classic_chrome";
 struct Fixture {
     _dir: Option<TempDir>,
     worker: Worker,
+    #[cfg(feature = "integration")]
     site: PathBuf,
 }
 
@@ -45,7 +56,6 @@ async fn fixture_with(write_transform: bool, configure: impl FnOnce(&mut WorkerC
     let dir = TempDir::new().expect("temp dir");
     let db = dir.path().join("looklab.sqlite3");
     let blobs = dir.path().join("blobs");
-    let site = dir.path().join("site/data");
     let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
     let transforms = dir.path().join("transforms");
     std::fs::create_dir_all(&transforms).expect("transform dir");
@@ -54,7 +64,7 @@ async fn fixture_with(write_transform: bool, configure: impl FnOnce(&mut WorkerC
     }
     let mut config = WorkerConfig::new(&db, &blobs);
     config.data = data;
-    config.site = site.clone();
+    config.site = dir.path().join("site/data");
     config.transforms = transforms;
     configure(&mut config);
     let worker = Worker::open(config).await.expect("worker");
@@ -63,14 +73,16 @@ async fn fixture_with(write_transform: bool, configure: impl FnOnce(&mut WorkerC
         std::mem::forget(dir);
         return Fixture {
             _dir: None,
+            #[cfg(feature = "integration")]
+            site: worker.config().site.clone(),
             worker,
-            site,
         };
     }
     Fixture {
         _dir: Some(dir),
+        #[cfg(feature = "integration")]
+        site: worker.config().site.clone(),
         worker,
-        site,
     }
 }
 
@@ -141,6 +153,7 @@ fn blob_for(dataset: &SyntheticDataset, index: usize) -> Vec<u8> {
     encode(&set).expect("encode")
 }
 
+#[cfg(feature = "integration")]
 /// A mislabel no per-image nuisance can absorb.
 fn mislabelled_look(truth: &looklab_model::Look) -> looklab_model::Look {
     let mut look = looklab_fit::synth::perturbed_look(truth);
@@ -188,6 +201,7 @@ async fn add_contribution_with(
     .await
 }
 
+#[cfg(feature = "integration")]
 async fn add_card_contribution(
     worker: &Worker,
     credential: &CredentialId,
@@ -484,6 +498,7 @@ async fn dump_state(worker: &Worker, at: &str) {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn duplicates_are_merged_and_a_mislabelled_upload_is_quarantined() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -575,6 +590,7 @@ async fn duplicates_are_merged_and_a_mislabelled_upload_is_quarantined() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn nightly_refit_publishes_a_manifest_and_a_verifiable_site() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -614,7 +630,7 @@ async fn nightly_refit_publishes_a_manifest_and_a_verifiable_site() {
     let manifests = count(
         worker,
         "SELECT COUNT(*) FROM version_manifests m JOIN look_versions v ON v.id = m.look_version_id
-         WHERE v.look = 'classic-chrome' AND v.version = 1",
+     WHERE v.look = 'classic-chrome' AND v.version = 1",
     )
     .await;
     assert_eq!(manifests, 1);
@@ -672,6 +688,7 @@ async fn nightly_refit_publishes_a_manifest_and_a_verifiable_site() {
     assert_eq!(artifact.bytes, bytes.len() as u64);
 }
 
+#[cfg(feature = "integration")]
 #[tokio::test]
 async fn a_revert_republishes_the_target_and_the_refit_drops_the_excluded_credential() {
     let fixture = fixture().await;
@@ -879,6 +896,7 @@ async fn a_revert_republishes_the_target_and_the_refit_drops_the_excluded_creden
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn gate_failure_holds_the_candidate_and_opens_a_moderation_item() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -1006,6 +1024,7 @@ async fn withdrawal_gc_deletes_blobs_after_retention() {
     assert_eq!(status.as_deref(), Some("deleted"));
 }
 
+#[cfg(feature = "integration")]
 async fn admit_root(worker: &Worker, seeder: &CredentialId, contribution: &ContributionId) {
     let scope = serde_json::json!({"rules": [{"body": BODY, "look": LOOK}]}).to_string();
     sqlx::query(
@@ -1036,6 +1055,7 @@ async fn withdraw(worker: &Worker, contribution: &ContributionId, credential: &C
     .expect("withdrawal");
 }
 
+#[cfg(feature = "integration")]
 fn read_release(fixture: &Fixture, version: u32) -> looklab_worker::ReleaseRecord {
     let path = fixture
         .site
@@ -1086,6 +1106,7 @@ async fn a_missing_body_transform_fails_the_job() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_dual_illuminant_transform_file_resolves_per_image() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -1093,15 +1114,15 @@ async fn a_dual_illuminant_transform_file_resolves_per_image() {
 version: 2
 color_matrices:
   - cct: 2856.0
-    xyz_to_camera:
-      - [1.0, 0.0, 0.0]
-      - [0.0, 1.0, 0.0]
-      - [0.0, 0.0, 1.0]
+xyz_to_camera:
+  - [1.0, 0.0, 0.0]
+  - [0.0, 1.0, 0.0]
+  - [0.0, 0.0, 1.0]
   - cct: 6504.0
-    xyz_to_camera:
-      - [1.0, 0.0, 0.0]
-      - [0.0, 1.0, 0.0]
-      - [0.0, 0.0, 1.0]
+xyz_to_camera:
+  - [1.0, 0.0, 0.0]
+  - [0.0, 1.0, 0.0]
+  - [0.0, 0.0, 1.0]
 ";
     std::fs::write(
         worker.config().transforms.join("fujifilm-x-t5.yaml"),
@@ -1128,6 +1149,7 @@ color_matrices:
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn root_admissions_feed_the_root_gate_and_the_manifest_dependencies() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -1167,6 +1189,7 @@ async fn root_admissions_feed_the_root_gate_and_the_manifest_dependencies() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn recipe_data_does_not_change_the_look_and_the_recipe_stage_is_persisted() {
     let plain = fixture().await;
     let recipe = fixture().await;
@@ -1259,6 +1282,7 @@ async fn recipe_data_does_not_change_the_look_and_the_recipe_stage_is_persisted(
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn bounties_score_accepted_recipes_and_prune_withdrawn_ones() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -1299,7 +1323,7 @@ async fn bounties_score_accepted_recipes_and_prune_withdrawn_ones() {
 
     let (measured, n_verifications): (f64, i64) = sqlx::query_as(
         "SELECT measured_de, n_verifications FROM recipe_scores
-         WHERE target_look = ? AND body_id = ?",
+     WHERE target_look = ? AND body_id = ?",
     )
     .bind(LOOK)
     .bind(BODY)
@@ -1332,6 +1356,7 @@ async fn bounties_score_accepted_recipes_and_prune_withdrawn_ones() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn card_renders_never_change_a_fit_and_verify_per_firmware() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -1404,7 +1429,7 @@ async fn card_renders_never_change_a_fit_and_verify_per_firmware() {
 
     let (firmware, images, median, p95): (String, i64, f64, f64) = sqlx::query_as(
         "SELECT firmware_id, images, median_de, p95_de FROM card_verifications
-         WHERE look_slug = ? AND look_version = '1.0.0'",
+     WHERE look_slug = ? AND look_version = '1.0.0'",
     )
     .bind(LOOK)
     .fetch_one(worker.pool())
@@ -1465,6 +1490,7 @@ async fn card_renders_never_change_a_fit_and_verify_per_firmware() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_release_carries_a_verifiable_preview_lut() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -1501,6 +1527,7 @@ async fn a_release_carries_a_verifiable_preview_lut() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn the_site_publishes_scenes_and_every_audit_kind() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -1558,6 +1585,7 @@ async fn the_site_publishes_scenes_and_every_audit_kind() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn publish_rejects_bytes_that_do_not_match_the_manifest() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -1704,6 +1732,7 @@ async fn withdrawal_gc_releases_a_shared_blob_once() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_consistency_retry_preserves_a_quarantine() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -1805,6 +1834,7 @@ async fn withdrawal_is_terminal_for_automated_status_writes() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn an_unchanged_pool_does_not_allocate_another_version() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -1829,6 +1859,7 @@ async fn an_unchanged_pool_does_not_allocate_another_version() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn reputation_is_applied_once_per_release() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -1848,13 +1879,13 @@ async fn reputation_is_applied_once_per_release() {
         .await
         .expect("reputation");
     assert_eq!(
-        count(
-            worker,
-            "SELECT COUNT(*) FROM release_reputation_applied WHERE look = 'classic-chrome' AND version = 1",
-        )
-        .await,
-        1
-    );
+    count(
+        worker,
+        "SELECT COUNT(*) FROM release_reputation_applied WHERE look = 'classic-chrome' AND version = 1",
+    )
+    .await,
+    1
+);
     for value in [0.4, 0.9] {
         let mut tx = worker.pool().begin().await.expect("tx");
         let applied =
@@ -1963,6 +1994,7 @@ async fn pool_conversion_keeps_enum_settings_typed() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_re_anchor_moves_the_reference_version() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -1989,7 +2021,7 @@ async fn a_re_anchor_moves_the_reference_version() {
         .expect("rooted");
     sqlx::query(
         "INSERT INTO look_versions (id, look, version, status, changelog, created_at)
-         VALUES (?, ?, 2, 'published', NULL, 0)",
+     VALUES (?, ?, 2, 'published', NULL, 0)",
     )
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(LOOK)
@@ -1998,11 +2030,11 @@ async fn a_re_anchor_moves_the_reference_version() {
     .expect("version row");
     sqlx::query(
         "INSERT INTO version_manifests (look_version_id, artifacts, created_at)
-         SELECT (SELECT id FROM look_versions WHERE look = ? AND version = 2),
-                m.artifacts, 0
-         FROM version_manifests m
-         JOIN look_versions v ON v.id = m.look_version_id
-         WHERE v.look = ? AND v.version = 1",
+     SELECT (SELECT id FROM look_versions WHERE look = ? AND version = 2),
+            m.artifacts, 0
+     FROM version_manifests m
+     JOIN look_versions v ON v.id = m.look_version_id
+     WHERE v.look = ? AND v.version = 1",
     )
     .bind(LOOK)
     .bind(LOOK)
@@ -2131,6 +2163,7 @@ async fn regional_weights_reach_the_samples_and_down_weighting_halves_the_image(
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_firmware_split_opens_a_worker_proposal_with_evidence() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -2208,6 +2241,7 @@ async fn a_firmware_split_opens_a_worker_proposal_with_evidence() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
 async fn a_non_converged_batch_publishes_nothing_and_resumes_to_convergence() {
     let fixture = fixture_with(true, |config| {
         config.sweep_budget = Some(2_000.0);
@@ -2310,6 +2344,7 @@ async fn three_non_converged_batches_open_one_moderation_item() {
 
 #[tokio::test]
 #[ignore = "release-mode timing check for 1000 images"]
+#[cfg(feature = "full-scale")]
 async fn refit_1000_images_under_target() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -2338,14 +2373,14 @@ async fn refit_1000_images_under_target() {
     println!("1000-image Look refit: {elapsed:?}");
     assert!(elapsed.as_secs() < 900, "{elapsed:?}");
     assert_eq!(
-        count(
-            worker,
-            "SELECT COUNT(*) FROM look_versions WHERE look = 'classic-chrome' AND status = 'published'",
-        )
-        .await,
-        1,
-        "one 1k batch published no version in {elapsed:?}",
-    );
+    count(
+        worker,
+        "SELECT COUNT(*) FROM look_versions WHERE look = 'classic-chrome' AND status = 'published'",
+    )
+    .await,
+    1,
+    "one 1k batch published no version in {elapsed:?}",
+);
     let release = read_release(&fixture, 1);
     assert!(
         release.converged,

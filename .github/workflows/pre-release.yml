@@ -44,3 +44,34 @@ jobs:
             target/release/build
             target/release/.fingerprint
 
+  worker_integration:
+    name: worker fitter-to-trust integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          fixtures: "false"
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: worker-integration
+          salt: release-worker-integration
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+      - name: Worker fitter-to-trust contracts
+        run: nix develop -c cargo nextest run --locked -p looklab-worker --features integration --release --test worker --no-fail-fast --ignore-default-filter
+      - uses: ./.github/actions/cache
+        if: ${{ !cancelled() }}
+        with:
+          mode: save
+          family: worker-integration
+          salt: release-worker-integration
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint

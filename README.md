@@ -22,6 +22,8 @@ UI build directories can contain `stub-state/`, including a local database and s
 
 CI has independent `lint`, `native`, `wasm release` and targeted trust-policy lanes. The required `ci` check succeeds only when every required lane succeeds. Compact real fitter-to-trust integration runs in the **Pre-release integration** workflow on `v*` tags or manual dispatch, not on ordinary pushes and pull requests. Native tests explicitly enable `looklab-fit/synth`. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
 
+Native CI sets `CARGO_PROFILE_TEST_OPT_LEVEL=3` for the workspace test command and its compiler-cache restore/save steps. Debug assertions and overflow checks remain enabled. The override does not affect Pages, WASM product builds or the local default test profile. Local numerical tests can use the same override through `nix develop -c env CARGO_PROFILE_TEST_OPT_LEVEL=3 cargo test -p looklab-fit --features synth`.
+
 Pages generates release site data and release worker WASM in parallel. The UI job downloads both products and their receipts from the same run, verifies them, then builds the release preview. Worker optimization, UI `-Oz`, release LTO and the `/looklab/` public URL are unchanged.
 
 Cargo caches are partitioned by build family, toolchain, lock/configuration and compiler flags; incremental directories and local stub state are excluded. Cache saves are restricted to `main`. CI saves compiler artifacts after failed gates unless cancelled; generated products are saved only after their producer succeeds. Generated-product caches are hints: source/tool/profile identities, output hashes and artifact policy are checked before reuse.
@@ -32,7 +34,9 @@ Nix uses public binary substituters rather than a per-store GitHub Actions cache
 
 Full-scale fitting studies and the growing-pool trust harness require an explicit maintainer request. They are excluded from default features and ordinary CI. Use the manually dispatched **Full-scale validation** workflow, or its local command in [trust validation tiers](docs/05-trust-and-integrity.md#10-red-team-harness-required-ci). There is no automatic scheduled or release full-scale run. Agents may recommend a run for affected behavior but must not launch it without that request; `cargo test --all-features` also opts into full-scale targets.
 
-Before publishing a release, push its `v*` candidate tag or manually dispatch **Pre-release integration** for the release commit, and require that workflow to pass. It runs the same compact contract measured in CI, without enabling full-scale studies. Ordinary CI eligibility requires approximately two minutes or less of total integration-job wall time.
+Before publishing a release, push its `v*` candidate tag or manually dispatch **Pre-release integration** for the release commit, and require both compact and worker integration jobs to pass. Neither job enables full-scale studies. Ordinary CI eligibility requires approximately two minutes or less of total integration-job wall time.
+
+Worker tests retain nine fit-free or budget-short-circuit cases in ordinary CI. Eighteen normal-budget native/consistency fitter cases require `looklab-worker/integration` and run before releases with their original fixtures and assertions. The ignored 1,000-image benchmark additionally requires `looklab-worker/full-scale`.
 
 | Compact integration measurement | Total job | Test execution | Evidence |
 |---|---:|---:|---|
@@ -41,7 +45,7 @@ Before publishing a release, push its `v*` candidate tag or manually dispatch **
 
 The compact contract performs one real fit over 3 images × 500 samples. Supported output publishes, and a constructed historical anchor mismatch is rejected.
 
-Single-run validation on 2026-11-06 used application commit `c10b5d2` plus build and fitting-performance changes, excluding concurrent uncommitted application edits. Pages times cover the build critical path, not deployment:
+Build measurements on 2026-11-06 and 2026-11-07 used application commit `c10b5d2` plus build, fitting-performance and test-tier changes, excluding concurrent uncommitted application edits. Pages times cover the build critical path, not deployment:
 
 | Pages run | Elapsed | Evidence |
 |---|---:|---|
@@ -53,6 +57,8 @@ Single-run validation on 2026-11-06 used application commit `c10b5d2` plus build
 | Main, changed fitting Rust source | 12m 25s | [Successful deployment](https://github.com/skeet70/looklab/actions/runs/42271818181), not an unchanged-source warm run |
 | Main, guarded Hessian and input/scoring reuse | 12m 28s | [Successful deployment](https://github.com/skeet70/looklab/actions/runs/42286293145), changed Rust source |
 | Main, unchanged Rust source after scheduling-only change | 7m 25s | [Successful deployment](https://github.com/skeet70/looklab/actions/runs/42293118758), warm generated products |
+| Main, initial test-tier feature split | 12m 40s | [Successful deployment](https://github.com/skeet70/looklab/actions/runs/42342765369), changed Cargo feature manifests |
+| Main, final compact-integration placement | 6m 57s | [Successful deployment](https://github.com/skeet70/looklab/actions/runs/42343683442), generated products reused |
 
 The corrected warm UI run restored its populated host/WASM cache and recompiled only workspace crates; no third-party dependencies recompiled.
 
@@ -62,6 +68,15 @@ Local pipeline measurements used the same application base and retained the exis
 |---|---:|
 | First pass, generated products missing | 7m 02s |
 | Unchanged pass, verified products reused | 7.10s |
+
+The first test-tier runs retained the existing native `opt-level=1` profile and enabled `--no-fail-fast`. They continued past the known CLI failure and exposed additional failures in card determinism, committed probe YAML and the worker firmware proposal:
+
+| Test-tier CI configuration before native optimization | Elapsed | Evidence |
+|---|---:|---|
+| Targeted trust plus compact integration | 43m 17s | [Completed run](https://github.com/skeet70/looklab/actions/runs/42342765350), native lane dominated |
+| Compact integration moved to pre-release | 37m 59s | [Completed run](https://github.com/skeet70/looklab/actions/runs/42343683475), all 129 targeted trust cases passed |
+
+These are failed-run measurements on separate runner allocations, not a controlled speed comparison or a green-CI result. WASM release passed in both runs.
 
 Historical full CI measurements below predate the test-tier split. They used the same application base and failed Clippy, the CLI E2E flow and 10 release trust red-team cases:
 
@@ -148,11 +163,11 @@ New stub profiles have no roles. For local moderation checks, POST `/api/__stub/
 
 `deploy/run-local.sh` is the one-command local production shape: it incrementally builds development `looklab-server`, `looklab-worker` and the SPA from captured source generations, creates a private state directory under `${XDG_STATE_HOME:-$HOME/.local/state}/looklab`, runs `looklab-server init` (server secret, directories, migrations), starts the worker so it publishes a real catalog, then serves API, `/data` and the SPA together on <http://localhost:8080>. Data updates are served from the worker output, so a new publication does not require rebuilding the frontend. The production profile has no `/api/__stub/*` routes; `deploy/run-local.sh` uses only server routes.
 
-The backend keeps SQLite, private blobs, the community snapshot, the server secret and the worker's publication tree under that state directory, with the worker root at `site/` and its served catalog at `site/data`. Do not serve the database, blob directory, secret, `data/bodies` source tree or fixture donation files: only `site/dist` and `site/data` are public. `deploy/looklab.toml.example` and `deploy/looklab-server.service` / `deploy/looklab-worker.service` are the VM packaging; containers run the same two processes on one persistent volume.
+The backend keeps SQLite, private blobs, the community snapshot, the server secret and the worker's publication tree under that state directory, with the worker root at `site/` and its served catalog at `site/data`. Do not serve the database, blob directory, secret, `data/bodies` source tree or fixture donation files: only `site/dist` and `site/data` are public. `nixosModules.looklab` (used by `nix/hosts/looklab-ovh.nix`) is the VM packaging: it builds the binaries and the SPA, runs both services under one user and generates `/etc/looklab/looklab.toml` from the module options. `deploy/looklab.toml.example` lists every config key for containers, which run the same two processes on one persistent volume.
 
 The Pages workflow remains a serverless preview by default; repository variable `LOOKLAB_PUBLIC_API_BASE` switches it to the split-origin build that reads the live root and catalog from that API. Health and readiness are `GET /healthz` and `GET /readyz`; readiness is 200 only when SQLite answers and, when `site.data_dir` is configured, the published `index.json` parses. `/data/site-root.json` advertises the SHA-256 of the bytes currently served at `/data/index.json`; a same-origin SPA verifies that root, while a serverless preview keeps the digest compiled into the wasm. A split-origin deployment must keep its static data hash-identical to the root the API advertises; the compiled pin applies only to the serverless preview. The trust boundary is the configured `origin`: clients trust it to name the current root but still verify every manifest, artifact and scene against it.
 
-After the first person registers a passkey, grant the first admin with the audited offline actor: `looklab-server bootstrap-admin --config <path> --credential <internal-id> --reason "first admin bootstrap"` (or `--display-handle <name>` when exactly one active credential matches). The command writes the grant and its audit entry atomically; there is no unauthenticated grant endpoint. Set `origin` and `rp_id` to the final public hostname before inviting anyone, because passkeys are bound to the RP ID. DNS, TLS and host provisioning are operator steps, not repository actions.
+After the first person registers a passkey, grant the first admin with the packaged operator CLI: `looklab admin grant --db <path> --subject <internal-id> --role admin --reason "first admin bootstrap"` (the server binary also offers `bootstrap-admin --config <path> --credential <internal-id>`, or `--display-handle <name>` when exactly one active credential matches). The command writes the grant and its audit entry atomically; there is no unauthenticated grant endpoint. Set `origin` and `rp_id` to the final public hostname before inviting anyone, because passkeys are bound to the RP ID. DNS, TLS and host provisioning are operator steps, not repository actions.
 
 Full volumes, environment variables, domain steps, sizing, smoke commands and restart checks are in [docs/ops/deployment.md](docs/ops/deployment.md). Litestream replication is in [docs/ops/litestream.md](docs/ops/litestream.md).
 
