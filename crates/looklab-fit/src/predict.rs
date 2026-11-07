@@ -712,8 +712,20 @@ fn push_look_columns(
         );
     }
     push_grl(jac, layout.g.start, Layer::LogG, input, column(d_layer, 3));
-    push_grl(jac, layout.r.start, Layer::Rotation, input, column(d_layer, 4));
-    push_grl(jac, layout.lambda.start, Layer::Lambda, input, column(d_layer, 5));
+    push_grl(
+        jac,
+        layout.r.start,
+        Layer::Rotation,
+        input,
+        column(d_layer, 4),
+    );
+    push_grl(
+        jac,
+        layout.lambda.start,
+        Layer::Lambda,
+        input,
+        column(d_layer, 5),
+    );
     for (m, node) in input.residual.indices.iter().enumerate() {
         let weight = input.residual.weights[m];
         for channel in 0..3 {
@@ -882,7 +894,8 @@ pub(crate) fn evaluate_sample(
             (first, chain, post)
         });
         let inner = int_path.as_ref().map(|path| {
-            let preclip = looklab_model::clip::preclip_internal_xyz_second(paths.internal, paths.ucs.j);
+            let preclip =
+                looklab_model::clip::preclip_internal_xyz_second(paths.internal, paths.ucs.j);
             let (first, chain) = preclip_chain(&path.preclip, &preclip, &d_layer_int, &int_second);
             let ucs = looklab_model::look::ucs_xyz_second(path.xyz_post);
             let neutral = looklab_model::look::neutral_chroma_second(path.xyz_post);
@@ -2067,15 +2080,16 @@ mod tests {
         let forward = evaluate(&plus);
         let backward = evaluate(&minus);
         let numerical = (0..3)
-            .map(|channel| out.residual[channel] * (forward[channel] - backward[channel]) / (2.0 * step))
+            .map(|channel| {
+                out.residual[channel] * (forward[channel] - backward[channel]) / (2.0 * step)
+            })
             .sum::<f64>();
         let value = |k: usize| {
             (0..3)
                 .map(|channel| out.residual[channel] * order.gradient[k][channel])
                 .sum::<f64>()
         };
-        let mut analytic =
-            value(1) * order.tint_curvature[0] + value(2) * order.tint_curvature[1];
+        let mut analytic = value(1) * order.tint_curvature[0] + value(2) * order.tint_curvature[1];
         for k in 0..3 {
             for l in 0..3 {
                 let mut contracted = 0.0;
@@ -2259,8 +2273,7 @@ mod tests {
                         let left = order.prediction[channel][k * 9 + l];
                         let right = order.prediction[channel][l * 9 + k];
                         assert!(
-                            (left - right).abs()
-                                <= 1e-9 * left.abs().max(right.abs()) + 1e-12,
+                            (left - right).abs() <= 1e-9 * left.abs().max(right.abs()) + 1e-12,
                             "{label} symmetry {k} {l} channel {channel}: {left:.9e} vs {right:.9e}"
                         );
                     }
@@ -2269,12 +2282,18 @@ mod tests {
             let families: [(&str, [f64; 9]); 3] = [
                 ("tone", [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
                 ("rotation", [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
-                ("tone-rotation", [0.5, 0.3, -0.2, 0.0, 0.9, 0.0, 0.0, 0.0, 0.0]),
+                (
+                    "tone-rotation",
+                    [0.5, 0.3, -0.2, 0.0, 0.9, 0.0, 0.0, 0.0, 0.0],
+                ),
             ];
             for (family, dl) in families {
                 let direction = layer_direction(&layout, &jac, &dl);
                 let expected = expected_acceleration(&jac, order, &dl, &direction);
-                let step = std::env::var("FIT_FD_STEP").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-6);
+                let step = std::env::var("FIT_FD_STEP")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1e-6);
                 let mut plus = params.clone();
                 let mut minus = params.clone();
                 for (index, value) in direction.iter().enumerate() {
@@ -2354,17 +2373,25 @@ mod tests {
                             let paths = at.look().chroma_paths(&input, &values);
                             let a0 = at.look().d_ucs_d_layer_values(&input, &values);
                             let a00 = at.look().path_second(&input, &values).0[0];
-                            let (xyz_pre, preclip) = looklab_model::clip::preclip_xyz_jacobian(paths.ucs);
+                            let (xyz_pre, preclip) =
+                                looklab_model::clip::preclip_xyz_jacobian(paths.ucs);
                             let ch = RgbSpace::Srgb.xyz_to_rgb_linear(xyz_pre);
                             let rgb = [ch.r, ch.g, ch.b];
                             let clipped = rgb.map(|v| looklab_model::soft_clip(v, params.clip_k()));
-                            let xyz_post = RgbSpace::Srgb.rgb_linear_to_xyz(Rgb::new(clipped[0], clipped[1], clipped[2]));
+                            let xyz_post = RgbSpace::Srgb
+                                .rgb_linear_to_xyz(Rgb::new(clipped[0], clipped[1], clipped[2]));
                             let rows = cam::ucs_jacobian(xyz_post).1;
-                            let clip = if rgb.iter().all(|v| *v >= params.clip_k() && *v <= 1.0 - params.clip_k()) {
+                            let clip = if rgb
+                                .iter()
+                                .all(|v| *v >= params.clip_k() && *v <= 1.0 - params.clip_k())
+                            {
                                 Mat3::IDENTITY
                             } else {
-                                RgbSpace::Srgb.to_xyz_matrix()
-                                    .mul(&Mat3::diag(rgb.map(|v| clip_derivative(v, params.clip_k()))))
+                                RgbSpace::Srgb
+                                    .to_xyz_matrix()
+                                    .mul(&Mat3::diag(
+                                        rgb.map(|v| clip_derivative(v, params.clip_k())),
+                                    ))
                                     .mul(&RgbSpace::Srgb.from_xyz_matrix())
                             };
                             let post = Mat3(rows).mul(&clip).mul(&Mat3(preclip));
@@ -2388,13 +2415,17 @@ mod tests {
                             }
                             let mut second = 0.0;
                             for c in 0..3 {
-                                second += (post_p.0[row][c] - post_m.0[row][c]) / (2.0 * hh) * a0[c];
+                                second +=
+                                    (post_p.0[row][c] - post_m.0[row][c]) / (2.0 * hh) * a0[c];
                             }
                             plain[row] = first;
                             fd[row] = first + second;
                         }
                         println!("  composed plain {plain:?} with FD(post) {fd:?}");
-                        println!("  analytic T[k][0] {:?} {:?} {:?}", order.prediction[0][0], order.prediction[0][9], order.prediction[0][18]);
+                        println!(
+                            "  analytic T[k][0] {:?} {:?} {:?}",
+                            order.prediction[0][0], order.prediction[0][9], order.prediction[0][18]
+                        );
                     }
                     let (c0, _) = jac
                         .cols
@@ -2440,8 +2471,8 @@ mod tests {
                 }
                 for index in 0..layout.total {
                     for channel in 0..3 {
-                        let numerical = (forward[index][channel] - backward[index][channel])
-                            / (2.0 * step);
+                        let numerical =
+                            (forward[index][channel] - backward[index][channel]) / (2.0 * step);
                         let value = analytic[index][channel];
                         let scale = numerical.abs().max(1e-3);
                         let gap = (value - numerical).abs() / scale;

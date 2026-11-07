@@ -13,8 +13,8 @@ pub use types::{
     AlignmentSummary, AssertionFields, BlobSummary, BuildManifestRequest, BuildManifestResponse,
     BuildSendManifestRequest, BuildSendManifestResponse, EncodeEnvelopeRequest,
     EncodeEnvelopeResponse, ManifestImageInput, ParseEnvelopeRequest, ParseEnvelopeResponse,
-    PowParamsSpec, PrepareRequest, PrepareResponse, PreparedImageView, PriorTransformSpec, Response,
-    SolvePowRequest, SolvePowResponse, VersionRequest, VersionResponse,
+    PowParamsSpec, PrepareRequest, PrepareResponse, PreparedImageView, PriorTransformSpec,
+    Response, SolvePowRequest, SolvePowResponse, VersionRequest, VersionResponse,
 };
 
 use serde::{Deserialize, Serialize};

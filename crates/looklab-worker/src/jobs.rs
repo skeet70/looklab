@@ -535,3 +535,15 @@ pub async fn nightly_due(pool: &SqlitePool, now: i64, interval: i64) -> Result<b
     .await?;
     Ok(last.is_none_or(|last| now - last >= interval))
 }
+
+/// Whether no blob sweep is queued or running and the last one is older than `interval`.
+pub async fn blob_gc_due(pool: &SqlitePool, now: i64, interval: i64) -> Result<bool> {
+    let last: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(created_at) FROM jobs
+         WHERE kind = 'blob_gc'
+           AND status IN ('queued', 'running', 'done', 'failed')",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(last.is_none_or(|last| now - last >= interval))
+}

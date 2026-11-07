@@ -238,9 +238,8 @@ fn accumulate_block<const CANONICAL: bool>(
                 + left_derivative[1] * right_derivative[1]
                 + left_derivative[2] * right_derivative[2];
             let data = contribution * dot;
-            let weighted = data
-                + robust * left_term * right_term
-                + barrier * left_margin * right_margin;
+            let weighted =
+                data + robust * left_term * right_term + barrier * left_margin * right_margin;
             if CANONICAL {
                 let (row, column) = if left <= right {
                     (*left, *right)

@@ -1576,11 +1576,7 @@ mod tests {
                 let pre = solve::ucs_of_xyz(xyz);
                 let (gradient, hessian) = prediction_margin_xyz_derivatives(pre, xyz);
                 let margin_at = |offset: [f64; 3]| {
-                    let moved = Xyz::new(
-                        xyz.x + offset[0],
-                        xyz.y + offset[1],
-                        xyz.z + offset[2],
-                    );
+                    let moved = Xyz::new(xyz.x + offset[0], xyz.y + offset[1], xyz.z + offset[2]);
                     prediction_margin(solve::ucs_of_xyz(moved)).0
                 };
                 let h = 1e-6 * scale.max(0.05);
@@ -1588,13 +1584,16 @@ mod tests {
                 for a in 0..3 {
                     let mut step = [0.0_f64; 3];
                     step[a] = h;
-                    let numerical = (margin_at(step) - margin_at([-step[0], -step[1], -step[2]]))
-                        / (2.0 * h);
+                    let numerical =
+                        (margin_at(step) - margin_at([-step[0], -step[1], -step[2]])) / (2.0 * h);
                     let scale = numerical.abs().max(1e-2);
                     let gap = (gradient[a] - numerical).abs() / scale;
                     if gap > worst {
                         worst = gap;
-                        println!("xyz {xyz:?} gradient {a}: analytic {} numerical {numerical:.9e}", gradient[a]);
+                        println!(
+                            "xyz {xyz:?} gradient {a}: analytic {} numerical {numerical:.9e}",
+                            gradient[a]
+                        );
                     }
                     for b in 0..3 {
                         let mut both = [0.0_f64; 3];
@@ -1664,8 +1663,7 @@ mod tests {
             let inner_minus = first_inner(&minus);
             for l in 0..9 {
                 for channel in 0..3 {
-                    let numerical =
-                        (outer_plus[channel][l] - outer_minus[channel][l]) / (2.0 * h);
+                    let numerical = (outer_plus[channel][l] - outer_minus[channel][l]) / (2.0 * h);
                     let analytic = outer[k * 9 + l][channel];
                     let scale = numerical.abs().max(1e-6);
                     let gap = (analytic - numerical).abs() / scale;
@@ -1677,8 +1675,7 @@ mod tests {
                     }
                 }
                 for channel in 0..2 {
-                    let numerical =
-                        (inner_plus[l][channel] - inner_minus[l][channel]) / (2.0 * h);
+                    let numerical = (inner_plus[l][channel] - inner_minus[l][channel]) / (2.0 * h);
                     let analytic = inner[k * 9 + l][channel];
                     let scale = numerical.abs().max(1e-6);
                     let gap = (analytic - numerical).abs() / scale;

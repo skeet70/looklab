@@ -13,6 +13,8 @@ use crate::publish::{self, PublishConfig, PublishSummary};
 use crate::refit::{self, RefitOutcome};
 use crate::{bounties, cards, consistency, duplicates, gc, lut_rebase};
 
+const BLOB_GC_INTERVAL_SECONDS: i64 = 3_600;
+
 pub struct Worker {
     pool: SqlitePool,
     config: WorkerConfig,
@@ -167,6 +169,16 @@ impl Worker {
                 jobs::enqueue(
                     &self.pool,
                     &JobPayload::NightlyRefit { bodies: Vec::new() },
+                    now,
+                )
+                .await?;
+            }
+            if jobs::blob_gc_due(&self.pool, now, BLOB_GC_INTERVAL_SECONDS).await? {
+                jobs::enqueue_if_idle(
+                    &self.pool,
+                    &JobPayload::BlobGc {
+                        contribution_id: None,
+                    },
                     now,
                 )
                 .await?;

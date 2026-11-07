@@ -74,6 +74,7 @@ uuid_id!(
 );
 uuid_id!(ContributionId);
 uuid_id!(ContributionImageId);
+uuid_id!(BlobAttemptId);
 uuid_id!(JobId);
 uuid_id!(WithdrawalId);
 uuid_id!(GrantId);

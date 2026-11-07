@@ -11,10 +11,10 @@ use looklab_upload::webauthn::{
     WebAuthnAssertion,
 };
 use looklab_upload::{
-    Challenge, DEFAULT_MAX_BATCHES, Envelope, EnvelopeParts, ManifestImage, PowParams, PowSolutions,
-    RerenderGroupId, SendManifest, canonical_manifest_bytes, canonical_send_manifest_bytes,
-    encode_envelope as encode_upload_envelope, manifest_hash, parse_envelope_strict,
-    send_manifest_hash, solve,
+    Challenge, DEFAULT_MAX_BATCHES, Envelope, EnvelopeParts, ManifestImage, PowParams,
+    PowSolutions, RerenderGroupId, SendManifest, canonical_manifest_bytes,
+    canonical_send_manifest_bytes, encode_envelope as encode_upload_envelope, manifest_hash,
+    parse_envelope_strict, send_manifest_hash, solve,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -188,10 +188,11 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 pub(crate) fn build_send_manifest(
     request: BuildSendManifestRequest,
 ) -> Result<BuildSendManifestResponse, ModuleError> {
-    let send_manifest = SendManifest::canonical(request.manifest_hashes)
-        .map_err(|error| ModuleError::SendManifest {
+    let send_manifest = SendManifest::canonical(request.manifest_hashes).map_err(|error| {
+        ModuleError::SendManifest {
             message: error.to_string(),
-        })?;
+        }
+    })?;
     let hash = send_manifest_hash(&send_manifest);
     Ok(BuildSendManifestResponse {
         send_manifest_bytes: canonical_send_manifest_bytes(&send_manifest),
@@ -203,9 +204,11 @@ pub(crate) fn build_send_manifest(
 pub(crate) fn encode_envelope(
     request: EncodeEnvelopeRequest,
 ) -> Result<EncodeEnvelopeResponse, ModuleError> {
-    let send_manifest: SendManifest = postcard::from_bytes(&request.send_manifest_bytes)
-        .map_err(|error| ModuleError::SendManifest {
-            message: error.to_string(),
+    let send_manifest: SendManifest =
+        postcard::from_bytes(&request.send_manifest_bytes).map_err(|error| {
+            ModuleError::SendManifest {
+                message: error.to_string(),
+            }
         })?;
     if canonical_send_manifest_bytes(&send_manifest) != request.send_manifest_bytes {
         return Err(ModuleError::SendManifest {

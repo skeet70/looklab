@@ -15,8 +15,9 @@ use looklab_wasm::{
     CardCheckError, ControlSetting, GroupSettings, IntentChoice, PairingPlan, PowParamsSpec,
     PrepSummary, PreparedImageView, build_manifest_request, build_send_manifest_request,
     check_card, decode_build_manifest_reply, decode_build_send_manifest_reply, decode_encode_reply,
-    decode_pow_reply, decode_prepare_reply, encode_envelope_request, inspect_metadata, module_fn_id,
-    prefill_settings_parsed, prepare_request, serial_ascii_from_metadata, solve_pow_request,
+    decode_pow_reply, decode_prepare_reply, encode_envelope_request, inspect_metadata,
+    module_fn_id, prefill_settings_parsed, prepare_request, serial_ascii_from_metadata,
+    solve_pow_request,
 };
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -1234,7 +1235,10 @@ pub fn ContributePage() -> impl IntoView {
             completed.set(Vec::new());
             processed.set(Vec::new());
             seeds.set(Vec::new());
-            all_files.set(Vec::new());
+            let excluded = failures.get_untracked();
+            all_files.update(|files| {
+                files.retain(|file| excluded.iter().any(|row| row.name == file.name()));
+            });
             parsed_metadata.set_value(Vec::new());
             points.set(Vec::new());
             current.set(StepIndex(5));
@@ -2973,7 +2977,10 @@ async fn check_card_tags(groups: &mut [ProcessedGroup]) -> Vec<FailureRow> {
 fn group_failures(rows: Vec<FailureRow>) -> Vec<(String, Vec<FailureRow>)> {
     let mut groups: Vec<(String, Vec<FailureRow>)> = Vec::new();
     for row in rows {
-        match groups.iter_mut().find(|(message, _)| *message == row.message) {
+        match groups
+            .iter_mut()
+            .find(|(message, _)| *message == row.message)
+        {
             Some((_, rows)) => rows.push(row),
             None => groups.push((row.message.clone(), vec![row])),
         }
@@ -3098,7 +3105,10 @@ async fn upload_send(
         Err(failure) => return error(0, failure.to_string()),
     };
     let send_reply = match worker
-        .call(module_fn_id(ModuleFunction::BuildSendManifest), send_request)
+        .call(
+            module_fn_id(ModuleFunction::BuildSendManifest),
+            send_request,
+        )
         .await
     {
         Ok(reply) => reply,
@@ -3125,10 +3135,14 @@ async fn upload_send(
         difficulty_bits_per_image: defaults.difficulty_bits_per_image,
     });
 
+    let error = |accepted, position, message| SendOutcome {
+        accepted,
+        error: Some((position, message)),
+    };
     for (position, (batch, manifest)) in pending.iter().zip(&manifests).enumerate() {
         let n_images = match u32::try_from(batch.images.len()) {
             Ok(count) => count,
-            Err(_) => return error(position, "too many images".to_owned()),
+            Err(_) => return error(accepted, position, "too many images".to_owned()),
         };
         let pow_request = match solve_pow_request(
             *manifest.challenge.as_bytes(),
@@ -3141,18 +3155,18 @@ async fn upload_send(
             0,
         ) {
             Ok(request) => request,
-            Err(failure) => return error(position, failure.to_string()),
+            Err(failure) => return error(accepted, position, failure.to_string()),
         };
         let pow_reply = match worker
             .call(module_fn_id(ModuleFunction::SolvePow), pow_request)
             .await
         {
             Ok(reply) => reply,
-            Err(failure) => return error(position, failure.message()),
+            Err(failure) => return error(accepted, position, failure.message()),
         };
         let pow = match decode_pow_reply(&pow_reply.bytes) {
             Ok(reply) => reply.solutions,
-            Err(failure) => return error(position, failure.to_string()),
+            Err(failure) => return error(accepted, position, failure.to_string()),
         };
         let blobs = batch
             .images
@@ -3169,18 +3183,18 @@ async fn upload_send(
             blobs,
         ) {
             Ok(request) => request,
-            Err(failure) => return error(position, failure.to_string()),
+            Err(failure) => return error(accepted, position, failure.to_string()),
         };
         let encode_reply = match worker
             .call(module_fn_id(ModuleFunction::EncodeEnvelope), encode_request)
             .await
         {
             Ok(reply) => reply,
-            Err(failure) => return error(position, failure.message()),
+            Err(failure) => return error(accepted, position, failure.message()),
         };
         let envelope = match decode_encode_reply(&encode_reply.bytes) {
             Ok(reply) => reply.envelope,
-            Err(failure) => return error(position, failure.to_string()),
+            Err(failure) => return error(accepted, position, failure.to_string()),
         };
         match webauthn::upload_envelope(envelope).await {
             Ok(reply) => {
@@ -3330,7 +3344,11 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].0, "B&W renders aren't supported yet");
         assert_eq!(
-            groups[0].1.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            groups[0]
+                .1
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["a.jpg", "c.jpg"]
         );
         assert_eq!(groups[1].0, "the JPEG file name is invalid");

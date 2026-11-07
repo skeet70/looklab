@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::Json;
@@ -22,10 +23,10 @@ use crate::body_schema::{
 };
 use crate::db::now_unix;
 use crate::error::{ApiError, ApiResult, ErrorCode};
-use crate::ids::{ContributionId, CredentialId, RawCredentialId, StatusToken};
+use crate::ids::{BlobAttemptId, ContributionId, CredentialId, RawCredentialId, StatusToken};
 use crate::preparse::{EnvelopeHeader, parse_header};
 use crate::rate_limit::{Action, RateKey};
-use crate::state::{AppState, BatchAdmissionError};
+use crate::state::{AppState, BatchAdmissionError, PendingPromotion, PromotionError};
 use crate::store::{
     self, ContributionKind, EstablishSend, IntentKind, NewContribution, NewImage, NewSend,
     StoredSend,
@@ -90,15 +91,15 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
     let resolved = match (stored, pending) {
         (Some(credential), _) => ResolvedCredential {
             passkey: credential.passkey,
+            revision: Some(credential.revision),
             standing: credential.standing,
             existing: Some(credential.id),
-            display_handle: None,
         },
-        (None, Some((passkey, display_handle))) => ResolvedCredential {
+        (None, Some((passkey, _))) => ResolvedCredential {
             passkey,
+            revision: None,
             standing: NEW_CREDENTIAL_STANDING,
             existing: None,
-            display_handle,
         },
         (None, None) => return Err(ApiError::new(ErrorCode::CredentialUnknown)),
     };
@@ -107,16 +108,25 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
     let send = store::find_send(&state.db, &header.nonce)
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?;
-    let mut passkey = resolved.passkey;
+    let mut send_expires_at = send.as_ref().map(|send| send.expires_at);
+    let passkey = resolved.passkey;
+    let mut promotion: Option<PendingPromotion<'_>> = None;
     match send {
         Some(send) => {
             check_send_binding(&send, &header, &assertion_hash)?;
             check_send_open(&send)?;
             check_batch_pending(&state, &header).await?;
+            if resolved.existing.is_none() {
+                promotion = Some(
+                    state
+                        .begin_promotion(&passkey, &passkey)
+                        .map_err(promotion_error)?,
+                );
+            }
         }
         None => {
             let challenge = Challenge::for_send(&header.nonce, &header.send_manifest_hash);
-            passkey = verify_assertion(
+            let verified = verify_assertion(
                 &passkey,
                 &header.assertion,
                 challenge,
@@ -125,11 +135,23 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
             )
             .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
             if let Some(id) = &resolved.existing {
-                store::update_credential_passkey(&state.db, id, &passkey)
-                    .await
-                    .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+                let revision = resolved
+                    .revision
+                    .as_ref()
+                    .ok_or_else(|| ApiError::new(ErrorCode::Internal))?;
+                match store::update_credential_passkey(&state.db, id, &verified, revision).await {
+                    Ok(store::CredentialUpdate::Applied) => {}
+                    Ok(store::CredentialUpdate::Stale) => {
+                        return Err(ApiError::new(ErrorCode::SignatureInvalid));
+                    }
+                    Err(_) => return Err(ApiError::new(ErrorCode::Internal)),
+                }
             } else {
-                state.advance_pending_credential(&passkey);
+                promotion = Some(
+                    state
+                        .begin_promotion(&passkey, &verified)
+                        .map_err(promotion_error)?,
+                );
             }
             let batch_hashes = header
                 .send_manifest
@@ -148,8 +170,17 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
                 .await
                 .map_err(|_| ApiError::new(ErrorCode::Internal))?
             {
-                EstablishSend::Established => {}
+                EstablishSend::Established => {
+                    send_expires_at = Some(
+                        store::find_send(&state.db, &header.nonce)
+                            .await
+                            .map_err(|_| ApiError::new(ErrorCode::Internal))?
+                            .ok_or_else(|| ApiError::new(ErrorCode::Internal))?
+                            .expires_at,
+                    );
+                }
                 EstablishSend::Existing(send) => {
+                    send_expires_at = Some(send.expires_at);
                     check_send_binding(&send, &header, &assertion_hash)?;
                     check_send_open(&send)?;
                     check_batch_pending(&state, &header).await?;
@@ -167,12 +198,18 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
 
+    let send_expires_at = send_expires_at.ok_or_else(|| ApiError::new(ErrorCode::Internal))?;
     let attempt = state
         .batch_admission
-        .try_begin(header.nonce.as_bytes(), header.manifest_hash.as_bytes())
+        .try_begin(
+            header.nonce.as_bytes(),
+            header.manifest_hash.as_bytes(),
+            send_expires_at,
+        )
         .map_err(|error| match error {
             BatchAdmissionError::InFlight => ApiError::new(ErrorCode::Busy),
             BatchAdmissionError::Exhausted => ApiError::new(ErrorCode::RateLimited),
+            BatchAdmissionError::Capacity => ApiError::new(ErrorCode::Busy),
         })?;
 
     let params = state.trust.pow_params(resolved.standing);
@@ -187,13 +224,12 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         .map_err(|_| ApiError::new(ErrorCode::PowInvalid))?;
 
     let limits = state.config.limits;
-    let store = state.blobs.clone();
     let body_for_parse = body.clone();
     let (mut envelope, counts) =
         task::spawn_blocking(move || -> Result<(Envelope, Vec<i64>), ApiError> {
             let envelope = parse_envelope_strict(&body_for_parse, &limits)
                 .map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
-            let counts = store_blobs(&store, &envelope)?;
+            let counts = blob_counts(&envelope)?;
             Ok((envelope, counts))
         })
         .await
@@ -246,6 +282,7 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
     let Envelope {
         manifest,
         assertion,
+        blobs,
         ..
     } = envelope;
 
@@ -295,12 +332,26 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         None
     };
     let contribution_id = ContributionId::new();
+    let staged = StagedUpload::new(
+        images.iter().map(|image| image.samples_hash).collect(),
+        blobs,
+        state.blobs.clone(),
+    );
+    store::stage_blobs(
+        &state.db,
+        &staged.attempt,
+        &staged.hashes,
+        staged.expires_at,
+    )
+    .await?;
     let completion = complete(
         &state,
-        resolved.existing.clone(),
-        raw_id.as_slice(),
-        &passkey,
-        resolved.display_handle.as_deref(),
+        match resolved.existing.clone() {
+            Some(id) => CredentialCompletion::Existing(id),
+            None => CredentialCompletion::Pending(
+                promotion.ok_or_else(|| ApiError::new(ErrorCode::Internal))?,
+            ),
+        },
         NewContribution {
             id: contribution_id.clone(),
             credential_id: resolved.existing.clone().unwrap_or_else(CredentialId::new),
@@ -323,9 +374,19 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         token.as_ref(),
         &header.nonce,
         header.manifest_hash.as_bytes(),
+        &staged,
     )
     .await;
-    completion?;
+    if let Err(error) = completion {
+        let _ = store::discard_staged(
+            &state.db,
+            state.blobs.as_ref(),
+            &staged.attempt,
+            &staged.hashes,
+        )
+        .await;
+        return Err(error);
+    }
     attempt.succeed();
 
     state.remove_pending_credential(raw_id.as_slice());
@@ -341,9 +402,14 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
 
 struct ResolvedCredential {
     passkey: Passkey,
+    revision: Option<store::CredentialRevision>,
     standing: CredentialStanding,
     existing: Option<CredentialId>,
-    display_handle: Option<String>,
+}
+
+enum CredentialCompletion<'a> {
+    Existing(CredentialId),
+    Pending(PendingPromotion<'a>),
 }
 
 fn check_send_binding(
@@ -373,13 +439,9 @@ fn check_send_open(send: &StoredSend) -> ApiResult<()> {
 }
 
 async fn check_batch_pending(state: &AppState, header: &EnvelopeHeader) -> ApiResult<()> {
-    match store::find_send_batch(
-        &state.db,
-        &header.nonce,
-        header.manifest_hash.as_bytes(),
-    )
-    .await
-    .map_err(|_| ApiError::new(ErrorCode::Internal))?
+    match store::find_send_batch(&state.db, &header.nonce, header.manifest_hash.as_bytes())
+        .await
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?
     {
         None => Err(ApiError::new(ErrorCode::SendManifestInvalid)),
         Some(Some(_)) => Err(ApiError::new(ErrorCode::BatchReplayed)),
@@ -404,30 +466,31 @@ fn assertion_digest(assertion: &WebAuthnAssertion) -> [u8; 32] {
     bytes
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn complete(
     state: &AppState,
-    existing_credential: Option<CredentialId>,
-    raw_id: &[u8],
-    passkey: &Passkey,
-    display_handle: Option<&str>,
+    credential: CredentialCompletion<'_>,
     mut contribution: NewContribution,
     token: Option<&StatusToken>,
     nonce: &Nonce,
     batch_hash: &[u8; 32],
+    staged: &StagedUpload,
 ) -> ApiResult<()> {
-    let mut tx = state.db.begin().await?;
-    let credential_id = match existing_credential {
-        Some(id) => {
-            store::update_credential_passkey_tx(&mut tx, &id, passkey).await?;
-            id
-        }
-        None => {
+    let tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = staged.acquire(tx).await?;
+    let (credential_id, promotion) = match credential {
+        CredentialCompletion::Existing(id) => (id, None),
+        CredentialCompletion::Pending(promotion) => {
             let id = CredentialId::new();
-            store::insert_credential(&mut tx, &id, raw_id, passkey, display_handle)
-                .await
-                .map_err(database_error)?;
-            id
+            store::insert_credential(
+                &mut tx,
+                &id,
+                promotion.passkey().cred_id().as_slice(),
+                promotion.passkey(),
+                promotion.display_handle(),
+            )
+            .await
+            .map_err(database_error)?;
+            (id, Some(promotion))
         }
     };
     contribution.credential_id = credential_id.clone();
@@ -440,20 +503,28 @@ async fn complete(
         store::insert_status_token(&mut tx, &credential_id, &token.hash()).await?;
     }
     store::enqueue_consistency_score(&mut tx, &contribution.id).await?;
+    store::clear_staged(&mut tx, &staged.attempt).await?;
     tx.commit().await.map_err(database_error)?;
+    if let Some(promotion) = promotion {
+        promotion.finish();
+    }
     Ok(())
 }
 
-fn store_blobs(store: &Arc<dyn BlobStore>, envelope: &Envelope) -> Result<Vec<i64>, ApiError> {
+pub(super) fn promotion_error(error: PromotionError) -> ApiError {
+    match error {
+        PromotionError::Stale => ApiError::new(ErrorCode::SignatureInvalid),
+        PromotionError::Busy => ApiError::new(ErrorCode::Busy),
+    }
+}
+
+fn blob_counts(envelope: &Envelope) -> Result<Vec<i64>, ApiError> {
     let mut counts = Vec::with_capacity(envelope.blobs.len());
     for (blob, image) in envelope.blobs.iter().zip(envelope.manifest.images.iter()) {
         let hash = BlobHash::of(blob);
         if hash.as_bytes() != &image.blob_sha256 {
             return Err(ApiError::new(ErrorCode::MalformedEnvelope));
         }
-        store
-            .put(hash, blob)
-            .map_err(|_| ApiError::new(ErrorCode::Internal))?;
         let n = match image.blob_kind {
             looklab_upload::BlobKind::Samples => looklab_samples::decode(blob)
                 .map_err(|_| ApiError::new(ErrorCode::Internal))?
@@ -466,6 +537,57 @@ fn store_blobs(store: &Arc<dyn BlobStore>, envelope: &Envelope) -> Result<Vec<i6
         counts.push(i64::try_from(n).unwrap_or(i64::MAX));
     }
     Ok(counts)
+}
+
+/// One upload's blob reservation and bytes.
+struct StagedUpload {
+    attempt: BlobAttemptId,
+    hashes: Vec<[u8; 32]>,
+    blobs: Arc<Vec<Vec<u8>>>,
+    store: Arc<dyn BlobStore>,
+    expires_at: i64,
+}
+
+impl StagedUpload {
+    fn new(hashes: Vec<[u8; 32]>, blobs: Vec<Vec<u8>>, store: Arc<dyn BlobStore>) -> Self {
+        Self {
+            attempt: BlobAttemptId::new(),
+            hashes,
+            blobs: Arc::new(blobs),
+            store,
+            expires_at: now_unix() + store::STAGED_TTL_SECONDS,
+        }
+    }
+
+    /// Verifies the reservation and writes under a transaction the blocking
+    /// task owns; a cancelled request cannot release the write lock early.
+    async fn acquire(
+        &self,
+        tx: sqlx::Transaction<'static, sqlx::Sqlite>,
+    ) -> ApiResult<sqlx::Transaction<'static, sqlx::Sqlite>> {
+        let mut tx = tx;
+        if !store::reservation_live(&mut tx, &self.attempt, self.distinct_hashes()).await? {
+            return Err(ApiError::new(ErrorCode::Busy));
+        }
+        let store = self.store.clone();
+        let hashes = self.hashes.clone();
+        let blobs = self.blobs.clone();
+        let (tx, ()) = crate::blob::write_guarded(tx, move || {
+            for (hash, blob) in hashes.iter().zip(blobs.iter()) {
+                if let Err(error) = store.put(BlobHash::from_bytes(*hash), blob) {
+                    return ((), Err(error));
+                }
+            }
+            ((), Ok(()))
+        })
+        .await
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+        Ok(tx)
+    }
+
+    fn distinct_hashes(&self) -> usize {
+        self.hashes.iter().collect::<BTreeSet<_>>().len()
+    }
 }
 
 fn settings_error(problem: SettingsProblem) -> ApiError {

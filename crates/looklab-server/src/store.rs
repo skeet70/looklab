@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+use std::collections::BTreeSet;
+
 use looklab_upload::Nonce;
 use serde::Serialize;
 use sqlx::{SqliteConnection, SqlitePool};
 use webauthn_rs::prelude::Passkey;
 
+use crate::blob::{BlobHash, BlobStore};
 use crate::db::now_unix;
 use crate::ids::{
-    ContributionId, ContributionImageId, CredentialId, JobId, TokenHash, WithdrawalId,
+    BlobAttemptId, ContributionId, ContributionImageId, CredentialId, JobId, TokenHash,
+    WithdrawalId,
 };
 use crate::trust::{CredentialStanding, Tier};
 
@@ -139,9 +143,19 @@ pub enum ConsumeNonce {
 }
 
 #[derive(Debug)]
+pub struct CredentialRevision(String);
+
+impl CredentialRevision {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug)]
 pub struct StoredCredential {
     pub id: CredentialId,
     pub passkey: Passkey,
+    pub revision: CredentialRevision,
     pub standing: CredentialStanding,
 }
 
@@ -408,6 +422,7 @@ pub async fn find_credential(
     Ok(Some(StoredCredential {
         id: CredentialId::try_from(id).map_err(|_| CredentialLoadError::Corrupt)?,
         passkey,
+        revision: CredentialRevision(passkey_json),
         standing,
     }))
 }
@@ -514,29 +529,37 @@ pub async fn insert_credential(
     Ok(())
 }
 
-pub async fn update_credential_passkey_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    credential_id: &CredentialId,
-    passkey: &Passkey,
-) -> Result<(), sqlx::Error> {
-    let passkey_json = serde_json::to_string(passkey)
-        .map_err(|_| sqlx::Error::Protocol("passkey does not serialize".to_owned()))?;
-    sqlx::query("UPDATE credentials SET webauthn_credential = ? WHERE id = ?")
-        .bind(passkey_json)
-        .bind(credential_id.as_str())
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialUpdate {
+    Applied,
+    Stale,
 }
 
+/// Replaces the state `original` was verified against; `Stale` means another
+/// assertion changed it first.
 pub async fn update_credential_passkey(
     db: &SqlitePool,
     credential_id: &CredentialId,
     passkey: &Passkey,
-) -> Result<(), sqlx::Error> {
-    let mut tx = db.begin().await?;
-    update_credential_passkey_tx(&mut tx, credential_id, passkey).await?;
-    tx.commit().await
+    revision: &CredentialRevision,
+) -> Result<CredentialUpdate, sqlx::Error> {
+    let passkey_json = serde_json::to_string(passkey)
+        .map_err(|_| sqlx::Error::Protocol("passkey does not serialize".to_owned()))?;
+    let updated = sqlx::query(
+        "UPDATE credentials SET webauthn_credential = ?
+         WHERE id = ? AND webauthn_credential = ?",
+    )
+    .bind(passkey_json)
+    .bind(credential_id.as_str())
+    .bind(revision.as_str())
+    .execute(db)
+    .await?
+    .rows_affected();
+    Ok(if updated == 1 {
+        CredentialUpdate::Applied
+    } else {
+        CredentialUpdate::Stale
+    })
 }
 
 pub struct NewImage {
@@ -623,6 +646,103 @@ pub async fn insert_contribution(
         .await?;
     }
     Ok(())
+}
+
+/// Blob reservations past this age are rejected and swept instead of published.
+pub const STAGED_TTL_SECONDS: i64 = 600;
+
+/// Commits the hashes this attempt will write, before any file is created.
+pub async fn stage_blobs(
+    db: &SqlitePool,
+    attempt: &BlobAttemptId,
+    hashes: &[[u8; 32]],
+    expires_at: i64,
+) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_unix();
+    for hash in hashes {
+        sqlx::query(
+            "INSERT INTO blob_staging (attempt_id, hash, staged_at, expires_at)
+             VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        )
+        .bind(attempt.as_str())
+        .bind(hash.as_slice())
+        .bind(now)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
+/// True when every hash this attempt staged is still inside its lifetime.
+pub async fn reservation_live(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attempt: &BlobAttemptId,
+    expected: usize,
+) -> Result<bool, sqlx::Error> {
+    let live: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM blob_staging WHERE attempt_id = ? AND expires_at > ?",
+    )
+    .bind(attempt.as_str())
+    .bind(now_unix())
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(usize::try_from(live).ok() == Some(expected))
+}
+
+/// Deletes the attempt's reservations in the caller's transaction.
+pub async fn clear_staged(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attempt: &BlobAttemptId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM blob_staging WHERE attempt_id = ?")
+        .bind(attempt.as_str())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Drops the attempt's reservation and unlinks files no other record names.
+pub async fn discard_staged(
+    db: &SqlitePool,
+    blobs: &dyn BlobStore,
+    attempt: &BlobAttemptId,
+    hashes: &[[u8; 32]],
+) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    clear_staged(&mut tx, attempt).await?;
+    for hash in hashes.iter().collect::<BTreeSet<_>>() {
+        if blob_referenced(&mut tx, hash).await? {
+            continue;
+        }
+        blobs
+            .delete(BlobHash::from_bytes(**hash))
+            .map_err(|error| sqlx::Error::Io(std::io::Error::other(error)))?;
+    }
+    tx.commit().await
+}
+
+/// Expires the attempt's reservation; the worker sweep removes its files.
+pub async fn abandon_staged(db: &SqlitePool, attempt: &BlobAttemptId) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("UPDATE blob_staging SET expires_at = 0 WHERE attempt_id = ?")
+        .bind(attempt.as_str())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+pub async fn blob_referenced(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    hash: &[u8; 32],
+) -> Result<bool, sqlx::Error> {
+    let referenced: i64 =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM blob_references WHERE hash = ?)")
+            .bind(hex(hash))
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok(referenced != 0)
 }
 
 #[derive(Serialize)]
@@ -804,4 +924,141 @@ fn hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use webauthn_rs_core::proto::{
+        AttestationFormat, COSEAlgorithm, COSEEC2Key, COSEKey, COSEKeyType, Credential, ECDSACurve,
+        ParsedAttestation, RegisteredExtensions, UserVerificationPolicy,
+    };
+
+    fn passkey(counter: u32, backup_state: bool) -> Passkey {
+        Credential {
+            cred_id: vec![1, 2, 3, 4],
+            cred: COSEKey {
+                type_: COSEAlgorithm::ES256,
+                key: COSEKeyType::EC_EC2(COSEEC2Key {
+                    curve: ECDSACurve::SECP256R1,
+                    x: vec![0; 32],
+                    y: vec![0; 32],
+                }),
+            },
+            counter,
+            transports: None,
+            user_verified: true,
+            backup_eligible: false,
+            backup_state,
+            registration_policy: UserVerificationPolicy::Required,
+            extensions: RegisteredExtensions::none(),
+            attestation: ParsedAttestation::default(),
+            attestation_format: AttestationFormat::None,
+        }
+        .into()
+    }
+
+    const RAW_ID: [u8; 4] = [1, 2, 3, 4];
+
+    async fn database() -> (tempfile::TempDir, SqlitePool, CredentialId) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = crate::db::open(&dir.path().join("looklab.sqlite3"))
+            .await
+            .expect("database");
+        let credential_id = CredentialId::new();
+        let mut tx = db.begin().await.expect("transaction");
+        insert_credential(&mut tx, &credential_id, &RAW_ID, &passkey(0, false), None)
+            .await
+            .expect("credential");
+        tx.commit().await.expect("commit");
+        (dir, db, credential_id)
+    }
+
+    async fn revision(db: &SqlitePool) -> CredentialRevision {
+        find_credential(db, &RAW_ID)
+            .await
+            .expect("credential")
+            .expect("credential")
+            .revision
+    }
+
+    async fn stored_state(db: &SqlitePool) -> (u32, bool) {
+        let stored = find_credential(db, &RAW_ID)
+            .await
+            .expect("credential")
+            .expect("credential");
+        let credential = Credential::from(stored.passkey);
+        (credential.counter, credential.backup_state)
+    }
+
+    #[tokio::test]
+    async fn a_stale_credential_update_is_rejected() {
+        let (_dir, db, credential_id) = database().await;
+        let original = revision(&db).await;
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(7, false), &original)
+                .await
+                .expect("newer update"),
+            CredentialUpdate::Applied
+        );
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(5, true), &original)
+                .await
+                .expect("stale update"),
+            CredentialUpdate::Stale
+        );
+        assert_eq!(stored_state(&db).await, (7, false));
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_credential_update_is_rejected() {
+        let (_dir, db, credential_id) = database().await;
+        let original = revision(&db).await;
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(1, false), &original)
+                .await
+                .expect("first update"),
+            CredentialUpdate::Applied
+        );
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(1, true), &original)
+                .await
+                .expect("duplicate update"),
+            CredentialUpdate::Stale
+        );
+        assert_eq!(stored_state(&db).await, (1, false));
+    }
+
+    #[tokio::test]
+    async fn a_zero_counter_credential_update_is_persisted() {
+        let (_dir, db, credential_id) = database().await;
+        let original = revision(&db).await;
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(0, true), &original)
+                .await
+                .expect("zero counter update"),
+            CredentialUpdate::Applied
+        );
+        assert_eq!(stored_state(&db).await, (0, true));
+    }
+
+    #[tokio::test]
+    async fn a_zero_counter_assertion_keeps_the_stored_counter() {
+        let (_dir, db, credential_id) = database().await;
+        let original = revision(&db).await;
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(7, false), &original)
+                .await
+                .expect("counted update"),
+            CredentialUpdate::Applied
+        );
+        let current = revision(&db).await;
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(7, true), &current)
+                .await
+                .expect("zero counter update"),
+            CredentialUpdate::Applied
+        );
+        assert_eq!(stored_state(&db).await, (7, true));
+    }
 }

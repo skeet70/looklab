@@ -1886,9 +1886,8 @@ fn joint_attempts(
             return FinalOutcome::Budget;
         }
         attempts += 1;
-        let outcome = JointSolve::new(model, *damping).and_then(|solve| {
-            solve.solve(model, tolerance, Some(STEP_RADIUS), warm.as_deref())
-        });
+        let outcome = JointSolve::new(model, *damping)
+            .and_then(|solve| solve.solve(model, tolerance, Some(STEP_RADIUS), warm.as_deref()));
         let solution = match outcome {
             Ok(solution) if solution.relative_residual <= tolerance => solution,
             Ok(solution) if solution.relative_residual <= INEXACT_DESCENT_RESIDUAL => {
@@ -3677,8 +3676,7 @@ fn stationarity_decrement(
     warm: &mut Option<Vec<f64>>,
 ) -> f64 {
     stationarity_bound(
-        layout, problem, params, options, blocks, penalties, lambdas, roles, pass, data_scale,
-        warm,
+        layout, problem, params, options, blocks, penalties, lambdas, roles, pass, data_scale, warm,
     )
 }
 
@@ -4590,8 +4588,7 @@ impl JointSolve {
                     let total = diagonal[row * width + row].max(0.0)
                         + model.fixed[joint]
                         + damping * model.data_diagonal[joint].max(1e-12);
-                    diagonal[row * width + row] =
-                        total - schur_diagonal[joint].min(0.5 * total);
+                    diagonal[row * width + row] = total - schur_diagonal[joint].min(0.5 * total);
                 }
                 scaled = scaled_factor(&diagonal, width);
             }
@@ -4817,8 +4814,8 @@ impl JointSolve {
                 break;
             }
             let recursive = rz <= target;
-            let chunk = (warmed && iterations == 0)
-                || iterations.saturating_sub(checked) >= JOINT_CG_CHUNK;
+            let chunk =
+                (warmed && iterations == 0) || iterations.saturating_sub(checked) >= JOINT_CG_CHUNK;
             if recursive || chunk {
                 self.apply_reduced(model, &x, &mut product, &mut eliminated, &mut scratch);
                 let mut error = 0.0_f64;
@@ -6863,8 +6860,7 @@ mod curvature_tests {
             let (residual, cols, derivs, alpha, squared, gradient, _) = terms_at(params, index);
             let (_, cols_plus, derivs_plus, _, _, gradient_plus, barrier_plus) =
                 terms_at(&plus, index);
-            let (_, _, derivs_minus, _, _, gradient_minus, barrier_minus) =
-                terms_at(&minus, index);
+            let (_, _, derivs_minus, _, _, gradient_minus, barrier_minus) = terms_at(&minus, index);
             assert_eq!(cols, cols_plus);
             let mut projected = [0.0_f64; 3];
             for (column, derivative) in cols.iter().zip(&derivs) {
@@ -7080,12 +7076,13 @@ mod curvature_tests {
                 robust_projection += term * v[*column as usize];
             }
             let squared = dot(&residual, &residual);
-            let sigma = params.sigma(problem.images[problem.samples[index].image as usize].contributor);
+            let sigma =
+                params.sigma(problem.images[problem.samples[index].image as usize].contributor);
             let q = nu * sigma * sigma + squared;
-            let robust =
-                -2.0 * (nu + 3.0) / (q * q) * sample_weight(problem, index)
-                    * robust_projection
-                    * robust_projection;
+            let robust = -2.0 * (nu + 3.0) / (q * q)
+                * sample_weight(problem, index)
+                * robust_projection
+                * robust_projection;
             let (_, _, cols_plus, derivs_plus, _) = sample_terms(&plus, index);
             let (_, _, cols_minus, derivs_minus, _) = sample_terms(&minus, index);
             assert_eq!(cols, cols_plus);
@@ -7185,8 +7182,7 @@ mod curvature_tests {
         let mut worst = (0.0_f64, 0usize);
         for index in 0..problem.samples.len() {
             let (residual, cols, derivs, alpha, squared, terms) = sample_terms(&params, index);
-            let (_, cols_plus, derivs_plus, alpha_plus, _, terms_plus) =
-                sample_terms(&plus, index);
+            let (_, cols_plus, derivs_plus, alpha_plus, _, terms_plus) = sample_terms(&plus, index);
             let (_, cols_minus, derivs_minus, alpha_minus, _, terms_minus) =
                 sample_terms(&minus, index);
             assert_eq!(cols, cols_plus);
@@ -7210,9 +7206,9 @@ mod curvature_tests {
             let mut model_norm = 0.0_f64;
             let mut gap_norm = 0.0_f64;
             for position in 0..cols.len() {
-                let exact =
-                    (alpha_plus * terms_plus[position] - alpha_minus * terms_minus[position])
-                        / (2.0 * h);
+                let exact = (alpha_plus * terms_plus[position]
+                    - alpha_minus * terms_minus[position])
+                    / (2.0 * h);
                 let mut accel = 0.0;
                 for channel in 0..3 {
                     accel += alpha
@@ -7310,7 +7306,12 @@ mod curvature_tests {
                     norm(&exact),
                     norm(&residual),
                     norm(&gap),
-                    norm(&tone_slots.iter().map(|slot| gap[*slot]).collect::<Vec<f64>>())
+                    norm(
+                        &tone_slots
+                            .iter()
+                            .map(|slot| gap[*slot])
+                            .collect::<Vec<f64>>()
+                    )
                 );
             }
             assert!(
@@ -7372,8 +7373,8 @@ mod curvature_tests {
                 cost_plus.theta[index] += step * value;
                 cost_minus.theta[index] -= step * value;
             }
-            let curvature =
-                (cost_at(&cost_plus) - 2.0 * cost_at(&params) + cost_at(&cost_minus)) / (step * step);
+            let curvature = (cost_at(&cost_plus) - 2.0 * cost_at(&params) + cost_at(&cost_minus))
+                / (step * step);
             println!(
                 "  cost second difference {curvature:.9e} vs exact {:.9e} vs model {:.9e}",
                 dot(&v, &exact),
@@ -7433,12 +7434,7 @@ mod curvature_tests {
             );
             let mut worst: Vec<(f64, usize)> = tone_slots
                 .iter()
-                .map(|slot| {
-                    (
-                        (exact[*slot] - model_v[*slot] - accel[*slot]).abs(),
-                        *slot,
-                    )
-                })
+                .map(|slot| ((exact[*slot] - model_v[*slot] - accel[*slot]).abs(), *slot))
                 .collect();
             worst.sort_by(|a, b| b.0.total_cmp(&a.0));
             for (_, slot) in worst.iter().take(6) {
@@ -7456,8 +7452,11 @@ mod curvature_tests {
                     analytic_second[*slot] - accel[*slot]
                 );
             }
-            let relative = norm(&(0..dim).map(|i| exact[i] - model_v[i]).collect::<Vec<f64>>())
-                / norm(&exact).max(1e-12);
+            let relative = norm(
+                &(0..dim)
+                    .map(|i| exact[i] - model_v[i])
+                    .collect::<Vec<f64>>(),
+            ) / norm(&exact).max(1e-12);
             let gap = norm(
                 &(0..dim)
                     .map(|i| exact[i] - plain_v[i] - accel[i])
@@ -7472,9 +7471,16 @@ mod curvature_tests {
                 ),
                 norm(&analytic_second)
             );
-            println!("  exact vs model {relative:.3e} relative, exact vs model+FD acceleration {gap:.3e}");
+            println!(
+                "  exact vs model {relative:.3e} relative, exact vs model+FD acceleration {gap:.3e}"
+            );
             assert!(
-                gap <= 5e-2 * norm(&(0..dim).map(|i| exact[i] - plain_v[i]).collect::<Vec<f64>>()),
+                gap <= 5e-2
+                    * norm(
+                        &(0..dim)
+                            .map(|i| exact[i] - plain_v[i])
+                            .collect::<Vec<f64>>()
+                    ),
                 "the reference acceleration leaves a gap {gap:.3e}"
             );
         }

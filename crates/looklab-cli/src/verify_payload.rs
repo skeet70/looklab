@@ -28,8 +28,8 @@ use looklab_upload::{
     ContributionKind, ControlEntry, ControlKey, ControlSettings, Envelope, EnvelopeParts,
     ExpectedAssertion, FirmwareId, FirmwareVersion, FirmwareVersionString, Intent, Limits,
     LookSlug, ManifestHash, ManifestImage, ManifestMetadata, Nonce, PowParams,
-    RawSerial as UploadSerial, SignatureAlgorithm, StepIndex, StructuralVerdict,
-    TopOriginReview, WebAuthnAssertion, check_structure, encode_envelope, parse_envelope_strict,
+    RawSerial as UploadSerial, SignatureAlgorithm, StepIndex, StructuralVerdict, TopOriginReview,
+    WebAuthnAssertion, check_structure, encode_envelope, parse_envelope_strict,
     verify as verify_pow,
 };
 use serde::Deserialize;
@@ -300,6 +300,7 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
 
     let mut credentials: Vec<(String, Vec<u8>)> = Vec::new();
     let mut covered = vec![0usize; reproduced.len()];
+    let mut parsed = Vec::new();
     for (path, har) in &hars {
         findings.note("");
         findings.note(format!(
@@ -341,7 +342,6 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
                 path.display()
             ));
         }
-        let mut parsed = Vec::new();
         for (index, entry) in uploads.iter().enumerate() {
             findings.note("");
             findings.note(format!("upload {} of {}", index + 1, file_name(path)));
@@ -349,27 +349,27 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
                 parsed.push(upload);
             }
         }
-        let mut sends: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
-        for (index, upload) in parsed.iter().enumerate() {
-            sends
-                .entry(*upload.envelope.nonce.as_bytes())
-                .or_default()
-                .push(index);
-        }
-        for (nonce, indices) in sends {
-            let label = format!("send {} of {}", hex(&nonce[..4]), file_name(path));
-            findings.note("");
-            findings.note(format!("{label}: {} batch(es)", indices.len()));
-            verify_send(
-                &parsed,
-                &indices,
-                &service,
-                &label,
-                &mut findings,
-                &mut covered,
-                &mut credentials,
-            );
-        }
+    }
+    let mut sends: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
+    for (index, upload) in parsed.iter().enumerate() {
+        sends
+            .entry(*upload.envelope.nonce.as_bytes())
+            .or_default()
+            .push(index);
+    }
+    for (nonce, indices) in sends {
+        let label = format!("send {}", hex(&nonce[..4]));
+        findings.note("");
+        findings.note(format!("{label}: {} batch(es)", indices.len()));
+        verify_send(
+            &parsed,
+            &indices,
+            &service,
+            &label,
+            &mut findings,
+            &mut covered,
+            &mut credentials,
+        );
     }
 
     if findings.failures.is_empty() {
@@ -1006,7 +1006,9 @@ fn verify_send(
             ));
         }
         if present.len() != found.len() {
-            findings.fail(format!("{label}: a batch appears more than once in the HAR"));
+            findings.fail(format!(
+                "{label}: a batch appears more than once in the HAR"
+            ));
         } else if present.len() != listed.len() && found == listed {
             findings.fail(format!(
                 "{label}: the HAR carries {} batches but the send manifest lists {}",
@@ -1016,10 +1018,7 @@ fn verify_send(
         }
     }
 
-    findings.note(format!(
-        "  one assertion over {} batch(es)",
-        indices.len()
-    ));
+    findings.note(format!("  one assertion over {} batch(es)", indices.len()));
     check_assertion(
         &first.assertion,
         service,

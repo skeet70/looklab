@@ -8,7 +8,7 @@ use looklab_server::admin::{self, ManifestArtifact};
 use looklab_server::{ContributionId, CredentialId};
 use looklab_trust::{CredentialId as TrustCredentialId, Reputation, Scope, Tier};
 use looklab_upload::{BodyId, ContributionKind, ControlSettings, LookSlug};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::error::{Result, WorkerError};
 
@@ -747,16 +747,17 @@ pub async fn mark_withdrawal_deleted(
     Ok(())
 }
 
-/// Releases one image's reference once per withdrawal. `None` means the reference
-/// was already released by an earlier attempt, so the caller must not delete again.
+/// Releases one image's reference once per withdrawal and unlinks the file
+/// when no other record names its hash.
 pub async fn release_blob_once(
     pool: &SqlitePool,
+    blobs: &Path,
     withdrawal: &WithdrawalId,
     image: &ImageId,
     hash: &[u8; 32],
     now: i64,
-) -> Result<Option<i64>> {
-    let mut tx = pool.begin().await?;
+) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     let inserted = sqlx::query(
         "INSERT INTO withdrawal_releases (withdrawal_id, image_id, released_at)
          VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
@@ -769,7 +770,7 @@ pub async fn release_blob_once(
     .rows_affected();
     if inserted == 0 {
         tx.rollback().await?;
-        return Ok(None);
+        return Ok(());
     }
     sqlx::query("UPDATE blobs SET ref_count = ref_count - 1 WHERE hash = ?")
         .bind(hash.as_slice())
@@ -779,15 +780,64 @@ pub async fn release_blob_once(
         .bind(hash.as_slice())
         .fetch_optional(&mut *tx)
         .await?;
-    let remaining = remaining.unwrap_or(0);
-    if remaining <= 0 {
+    if remaining.unwrap_or(0) <= 0 {
         sqlx::query("DELETE FROM blobs WHERE hash = ?")
             .bind(hash.as_slice())
             .execute(&mut *tx)
             .await?;
+        if !blob_referenced(&mut *tx, hash).await? {
+            remove_blob_file(blobs, hash)?;
+        }
     }
     tx.commit().await?;
-    Ok(Some(remaining))
+    Ok(())
+}
+
+pub async fn blob_referenced(conn: &mut SqliteConnection, hash: &[u8; 32]) -> Result<bool> {
+    let referenced: i64 =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM blob_references WHERE hash = ?)")
+            .bind(hex(hash))
+            .fetch_one(conn)
+            .await?;
+    Ok(referenced != 0)
+}
+
+pub async fn expired_staging_hashes(
+    conn: &mut SqliteConnection,
+    now: i64,
+) -> Result<Vec<[u8; 32]>> {
+    let rows: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT DISTINCT hash FROM blob_staging WHERE expires_at <= ?")
+            .bind(now)
+            .fetch_all(conn)
+            .await?;
+    rows.into_iter()
+        .map(|row| {
+            row.try_into()
+                .map_err(|_| WorkerError::Data("blob hash is not 32 bytes".to_owned()))
+        })
+        .collect()
+}
+
+pub async fn delete_expired_staging(
+    conn: &mut SqliteConnection,
+    hash: &[u8; 32],
+    now: i64,
+) -> Result<()> {
+    sqlx::query("DELETE FROM blob_staging WHERE hash = ? AND expires_at <= ?")
+        .bind(hash.as_slice())
+        .bind(now)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+pub fn remove_blob_file(root: &Path, hash: &[u8; 32]) -> Result<()> {
+    match std::fs::remove_file(blob_path(root, hash)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Versions a moderator explicitly re-anchored (docs/05 §8).

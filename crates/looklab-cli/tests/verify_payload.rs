@@ -715,8 +715,8 @@ impl Site {
 
     fn body(&self) -> Vec<u8> {
         let nonce = Nonce::from_bytes([0x42; 32]);
-        let send = SendManifest::canonical(vec![manifest_hash(&self.manifest)])
-            .expect("send manifest");
+        let send =
+            SendManifest::canonical(vec![manifest_hash(&self.manifest)]).expect("send manifest");
         let challenge = self
             .challenge
             .unwrap_or_else(|| Challenge::for_send(&nonce, &send_manifest_hash(&send)));
@@ -1102,6 +1102,40 @@ fn multiple_native_batches_from_one_raw_verify() {
 }
 
 #[test]
+fn one_send_split_across_hars_verifies() {
+    let fixture = simulation_fixture();
+    let (provia, chrome) = simulation_batches(fixture);
+    let first = har_path(
+        "split-send-first",
+        &send_har_of(&[&provia, &chrome], &[0]).json(),
+    );
+    let second = har_path(
+        "split-send-second",
+        &send_har_of(&[&provia, &chrome], &[1]).json(),
+    );
+    let (success, output) = run(
+        fixture,
+        &[first.as_path(), second.as_path()],
+        &state_path("split-send"),
+    );
+    assert!(success, "{output}");
+}
+
+#[test]
+fn conflicting_send_manifests_across_hars_fail() {
+    let fixture = simulation_fixture();
+    let (provia, chrome) = simulation_batches(fixture);
+    let first = har_path("conflicting-send-first", &default_har(&provia).json());
+    let second = har_path("conflicting-send-second", &default_har(&chrome).json());
+    let (success, output) = run(
+        fixture,
+        &[first.as_path(), second.as_path()],
+        &state_path("conflicting-send"),
+    );
+    assert!(!success, "{output}");
+}
+
+#[test]
 fn each_render_verifies_its_own_firmware() {
     let fixture = render_firmware_fixture();
     let raw_version = Site::from_fixture(fixture).only(&[0]);
@@ -1393,10 +1427,7 @@ fn fails_on_altered_samples_with_a_matching_manifest_hash() {
 fn fails_on_a_batch_declaring_another_render_of_the_same_raw() {
     let fixture = simulation_fixture();
     let (provia, chrome) = simulation_batches(fixture);
-    let control = har_path(
-        "mislabelled-control",
-        &send_har(&[&provia, &chrome]).json(),
-    );
+    let control = har_path("mislabelled-control", &send_har(&[&provia, &chrome]).json());
     let (success, output) = run(
         fixture,
         &[control.as_path()],
@@ -1407,10 +1438,7 @@ fn fails_on_a_batch_declaring_another_render_of_the_same_raw() {
     let mislabelled = Site::from_fixture(fixture)
         .only(&[0])
         .with_sim("classic_chrome");
-    let har = har_path(
-        "mislabelled",
-        &send_har(&[&provia, &mislabelled]).json(),
-    );
+    let har = har_path("mislabelled", &send_har(&[&provia, &mislabelled]).json());
     let (success, output) = run(fixture, &[har.as_path()], &state_path("mislabelled"));
 
     assert!(!success, "{output}");
@@ -1420,7 +1448,10 @@ fn fails_on_a_batch_declaring_another_render_of_the_same_raw() {
 fn fails_when_the_send_manifest_lists_a_batch_the_har_lacks() {
     let fixture = simulation_fixture();
     let (provia, chrome) = simulation_batches(fixture);
-    let har = har_path("missing-batch", &send_har_of(&[&provia, &chrome], &[0]).json());
+    let har = har_path(
+        "missing-batch",
+        &send_har_of(&[&provia, &chrome], &[0]).json(),
+    );
     let (success, output) = run(fixture, &[har.as_path()], &state_path("missing-batch"));
 
     assert!(!success, "{output}");
@@ -1508,11 +1539,7 @@ fn fails_when_a_batch_is_signed_by_another_credential() {
             .upload(chrome.body_with(&nonce, &send, &other))
             .json(),
     );
-    let (success, output) = run(
-        fixture,
-        &[har.as_path()],
-        &state_path("another-credential"),
-    );
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("another-credential"));
 
     assert!(!success, "{output}");
     assert!(output.contains("different assertions"), "{output}");
@@ -1961,8 +1988,8 @@ fn marks_a_non_canonical_client_data_json_for_review() {
 fn rewrite_client_data(body: &[u8], rewrite: impl Fn(String) -> String) -> Vec<u8> {
     let mut out = body.to_vec();
     let start = batch_manifest_start(&out);
-    let manifest_len = u32::from_le_bytes(out[start - 4..start].try_into().expect("manifest length"))
-        as usize;
+    let manifest_len =
+        u32::from_le_bytes(out[start - 4..start].try_into().expect("manifest length")) as usize;
     let mut index = start + manifest_len;
     let credential_len = usize::from(out[index]);
     index += 1 + credential_len;

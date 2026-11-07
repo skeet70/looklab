@@ -71,9 +71,20 @@ pub async fn withdraw(
     }) {
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
-    store::update_credential_passkey(&state.db, &credential.id, &passkey)
-        .await
-        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+    match store::update_credential_passkey(
+        &state.db,
+        &credential.id,
+        &passkey,
+        &credential.revision,
+    )
+    .await
+    {
+        Ok(store::CredentialUpdate::Applied) => {}
+        Ok(store::CredentialUpdate::Stale) => {
+            return Err(ApiError::new(ErrorCode::SignatureInvalid));
+        }
+        Err(_) => return Err(ApiError::new(ErrorCode::Internal)),
+    }
 
     let delete_after = now_unix() + i64::from(state.config.blob_retention_days) * 86_400;
     let delete_after = store::withdraw(&state.db, &contribution_id, &credential.id, delete_after)

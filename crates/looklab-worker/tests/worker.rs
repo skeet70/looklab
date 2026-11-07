@@ -1778,6 +1778,221 @@ async fn withdrawal_gc_releases_a_shared_blob_once() {
 }
 
 #[tokio::test]
+async fn blob_gc_keeps_a_live_reservation_and_sweeps_it_after_expiry() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 1,
+        samples_per_image: 200,
+        ..SynthConfig::default()
+    });
+    let credential = add_credential(worker, "new", 0.5).await;
+    let (contribution, _) = add_contribution(worker, &credential, &dataset, &[0], 100).await;
+    let hash: Vec<u8> = sqlx::query_scalar(
+        "SELECT samples_hash FROM contribution_images WHERE contribution_id = ?",
+    )
+    .bind(contribution.as_str())
+    .fetch_one(worker.pool())
+    .await
+    .expect("hash");
+    let path = worker.config().blobs.join(hex(&hash));
+    sqlx::query(
+        "INSERT INTO blob_staging (attempt_id, hash, staged_at, expires_at) VALUES (?, ?, 0, ?)",
+    )
+    .bind(ContributionId::new().as_str())
+    .bind(hash.as_slice())
+    .bind(looklab_worker::clock::now_unix() + 600)
+    .execute(worker.pool())
+    .await
+    .expect("reservation");
+
+    withdraw(worker, &contribution, &credential).await;
+    worker
+        .enqueue(
+            &JobPayload::BlobGc {
+                contribution_id: Some(contribution.clone()),
+            },
+            0,
+        )
+        .await
+        .expect("enqueue");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("gc");
+
+    assert!(path.exists());
+    assert_eq!(count(worker, "SELECT COUNT(*) FROM blobs").await, 0);
+    assert_eq!(count(worker, "SELECT COUNT(*) FROM blob_staging").await, 1);
+
+    sqlx::query("UPDATE blob_staging SET expires_at = 0")
+        .execute(worker.pool())
+        .await
+        .expect("expire");
+    worker
+        .enqueue(
+            &JobPayload::BlobGc {
+                contribution_id: None,
+            },
+            0,
+        )
+        .await
+        .expect("enqueue");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("sweep");
+
+    assert!(!path.exists());
+    assert_eq!(count(worker, "SELECT COUNT(*) FROM blob_staging").await, 0);
+}
+
+#[tokio::test]
+async fn blob_gc_sweeps_expired_staging_without_a_withdrawal() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let expired = [7u8; 32];
+    let live = [8u8; 32];
+    for hash in [&expired, &live] {
+        std::fs::write(worker.config().blobs.join(hex(hash)), b"blob").expect("blob file");
+    }
+    for (hash, expires_at) in [
+        (&expired, 0),
+        (&live, looklab_worker::clock::now_unix() + 600),
+    ] {
+        sqlx::query(
+            "INSERT INTO blob_staging (attempt_id, hash, staged_at, expires_at) VALUES (?, ?, 0, ?)",
+        )
+        .bind(ContributionId::new().as_str())
+        .bind(hash.as_slice())
+        .bind(expires_at)
+        .execute(worker.pool())
+        .await
+        .expect("reservation");
+    }
+
+    worker
+        .enqueue(
+            &JobPayload::BlobGc {
+                contribution_id: None,
+            },
+            0,
+        )
+        .await
+        .expect("enqueue");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("sweep");
+
+    assert!(!worker.config().blobs.join(hex(&expired)).exists());
+    assert!(worker.config().blobs.join(hex(&live)).exists());
+    assert_eq!(count(worker, "SELECT COUNT(*) FROM blob_staging").await, 1);
+}
+
+#[tokio::test]
+async fn blob_gc_keeps_files_named_by_fixtures_and_version_manifests() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let credential = add_credential(worker, "new", 0.5).await;
+    let fixture_hash = [9u8; 32];
+    let artifact_hash = [10u8; 32];
+    for hash in [&fixture_hash, &artifact_hash] {
+        std::fs::write(worker.config().blobs.join(hex(hash)), b"blob").expect("blob file");
+        sqlx::query(
+            "INSERT INTO blob_staging (attempt_id, hash, staged_at, expires_at) VALUES (?, ?, 0, 0)",
+        )
+        .bind(ContributionId::new().as_str())
+        .bind(hash.as_slice())
+        .execute(worker.pool())
+        .await
+        .expect("reservation");
+    }
+    sqlx::query(
+        "INSERT INTO fixture_uploads (sha256, credential_id, file, size, created_at)
+         VALUES (?, ?, 'donated.raf', 1, 0)",
+    )
+    .bind(fixture_hash.as_slice())
+    .bind(credential.as_str())
+    .execute(worker.pool())
+    .await
+    .expect("fixture upload");
+    let version_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO look_versions (id, look, version, status, changelog, created_at)
+         VALUES (?, ?, 1, 'published', '', 0)",
+    )
+    .bind(&version_id)
+    .bind(LOOK)
+    .execute(worker.pool())
+    .await
+    .expect("look version");
+    sqlx::query(
+        "INSERT INTO version_manifests (look_version_id, artifacts, created_at) VALUES (?, ?, 0)",
+    )
+    .bind(&version_id)
+    .bind(format!(
+        r#"[{{"name":"look.looklab","sha256":"{}"}}]"#,
+        hex(&artifact_hash)
+    ))
+    .execute(worker.pool())
+    .await
+    .expect("version manifest");
+
+    worker
+        .enqueue(
+            &JobPayload::BlobGc {
+                contribution_id: None,
+            },
+            0,
+        )
+        .await
+        .expect("enqueue");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("sweep");
+
+    assert!(worker.config().blobs.join(hex(&fixture_hash)).exists());
+    assert!(worker.config().blobs.join(hex(&artifact_hash)).exists());
+    assert_eq!(count(worker, "SELECT COUNT(*) FROM blob_staging").await, 0);
+}
+
+#[tokio::test]
+async fn blob_gc_removes_interrupted_temporary_writes() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let stale = worker.config().blobs.join(".deadbeef.1.1.tmp");
+    let fresh = worker.config().blobs.join(".deadbeef.2.2.tmp");
+    std::fs::write(&stale, b"partial").expect("stale temporary");
+    std::fs::write(&fresh, b"partial").expect("fresh temporary");
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .expect("open stale")
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7_200))
+        .expect("modify stale");
+
+    worker
+        .enqueue(
+            &JobPayload::BlobGc {
+                contribution_id: None,
+            },
+            0,
+        )
+        .await
+        .expect("enqueue");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("sweep");
+
+    assert!(!stale.exists());
+    assert!(fresh.exists());
+}
+
+#[tokio::test]
 #[cfg(feature = "integration")]
 async fn a_consistency_retry_preserves_a_quarantine() {
     let fixture = fixture().await;

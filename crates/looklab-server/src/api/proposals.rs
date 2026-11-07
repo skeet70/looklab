@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::api::auth;
 use crate::blob::BlobHash;
 use crate::error::{ApiError, ApiResult, ErrorCode};
-use crate::ids::ProposalId;
+use crate::ids::{BlobAttemptId, ProposalId};
 use crate::proposals::{
     MessageAuthor, ModProposal, ProposalError, ProposalMessage, SnapshotRecord, Submission,
 };
@@ -336,24 +336,46 @@ pub async fn donate_fixture(
     }
     let offset = body.len() - file_bytes.len();
     let payload = body.slice(offset..);
-    let store = state.blobs.clone();
-    tokio::task::spawn_blocking(move || store.put(hash, &payload))
-        .await
-        .map_err(|_| ApiError::new(ErrorCode::Internal))?
-        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
-    sqlx::query(
-        "INSERT INTO fixture_uploads (sha256, credential_id, file, size, created_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (sha256, credential_id)
-         DO UPDATE SET file = excluded.file, size = excluded.size",
+    let attempt = BlobAttemptId::new();
+    let hashes = [*hash.as_bytes()];
+    crate::store::stage_blobs(
+        &state.db,
+        &attempt,
+        &hashes,
+        crate::db::now_unix() + crate::store::STAGED_TTL_SECONDS,
     )
-    .bind(hash.as_bytes().as_slice())
-    .bind(credential.as_str())
-    .bind(&upload.file)
-    .bind(i64::try_from(upload.size).map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?)
-    .bind(crate::db::now_unix())
-    .execute(&state.db)
     .await?;
+    let published = async {
+        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+        if !crate::store::reservation_live(&mut tx, &attempt, 1).await? {
+            return Err(ApiError::new(ErrorCode::Busy));
+        }
+        let store = state.blobs.clone();
+        let (mut tx, ()) = crate::blob::write_guarded(tx, move || ((), store.put(hash, &payload)))
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+        sqlx::query(
+            "INSERT INTO fixture_uploads (sha256, credential_id, file, size, created_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (sha256, credential_id)
+             DO UPDATE SET file = excluded.file, size = excluded.size",
+        )
+        .bind(hash.as_bytes().as_slice())
+        .bind(credential.as_str())
+        .bind(&upload.file)
+        .bind(i64::try_from(upload.size).map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?)
+        .bind(crate::db::now_unix())
+        .execute(&mut *tx)
+        .await?;
+        crate::store::clear_staged(&mut tx, &attempt).await?;
+        tx.commit().await?;
+        Ok::<(), ApiError>(())
+    }
+    .await;
+    if let Err(error) = published {
+        let _ = crate::store::abandon_staged(&state.db, &attempt).await;
+        return Err(error);
+    }
     Ok((
         StatusCode::CREATED,
         Json(DonateResponse {

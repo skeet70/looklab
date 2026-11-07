@@ -133,9 +133,22 @@ fn envelope_round_trips_through_build_encode_and_parse() {
         built.challenge,
         Challenge::new(&nonce, &built.manifest_hash)
     );
+    let send = call(
+        Function::BuildSendManifest,
+        &looklab_prep_module::BuildSendManifestRequest {
+            nonce,
+            manifest_hashes: vec![built.manifest_hash],
+        },
+        |response| match response {
+            Response::BuildSendManifest(send) => send,
+            other => panic!("unexpected response {other:?}"),
+        },
+    )
+    .expect("send manifest builds");
 
     let encode = EncodeEnvelopeRequest {
         nonce,
+        send_manifest_bytes: send.send_manifest_bytes,
         manifest_bytes: built.manifest_bytes.clone(),
         assertion: AssertionFields {
             credential_id: vec![1],

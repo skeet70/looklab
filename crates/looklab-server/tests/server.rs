@@ -288,16 +288,7 @@ impl TestServer {
     }
 
     async fn upload_bytes(&self, bytes: Vec<u8>) -> (StatusCode, Value) {
-        let length = bytes.len();
-        let request = Request::builder()
-            .method("POST")
-            .uri("/api/upload")
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::CONTENT_LENGTH, length)
-            .body(Body::from(bytes))
-            .expect("request");
-        let (status, _, body) = send(&self.app, request).await;
-        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+        upload_request(&self.app, bytes).await
     }
 
     async fn upload_valid(&mut self, serial: Option<&RawSerial>) -> (StatusCode, Value) {
@@ -463,6 +454,19 @@ async fn post_json(app: &Router, path: &str, value: &Value) -> (StatusCode, Valu
         .uri(path)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_vec(value).expect("json")))
+        .expect("request");
+    let (status, _, body) = send(app, request).await;
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+async fn upload_request(app: &Router, bytes: Vec<u8>) -> (StatusCode, Value) {
+    let length = bytes.len();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/upload")
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, length)
+        .body(Body::from(bytes))
         .expect("request");
     let (status, _, body) = send(app, request).await;
     (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
@@ -1037,10 +1041,7 @@ async fn a_parallel_batch_replay_creates_one_contribution() {
     let assertion = server.assertion(&challenge).await;
     let body = send_envelope(nonce, &send, &first, &first_blobs, &assertion);
 
-    let (left, right) = tokio::join!(
-        server.upload_bytes(body.clone()),
-        server.upload_bytes(body)
-    );
+    let (left, right) = tokio::join!(server.upload_bytes(body.clone()), server.upload_bytes(body));
     let statuses = [left.0, right.0];
     assert_eq!(
         statuses
@@ -1060,13 +1061,12 @@ async fn a_parallel_batch_replay_creates_one_contribution() {
         "{left:?} {right:?}"
     );
     let batch_hash = manifest_hash(&first);
-    let contributions: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM contributions WHERE batch_manifest_hash = ?",
-    )
-    .bind(batch_hash.as_bytes().as_slice())
-    .fetch_one(&server.db)
-    .await
-    .expect("contributions");
+    let contributions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contributions WHERE batch_manifest_hash = ?")
+            .bind(batch_hash.as_bytes().as_slice())
+            .fetch_one(&server.db)
+            .await
+            .expect("contributions");
     assert_eq!(contributions, 1);
     let refs: i64 = sqlx::query_scalar("SELECT ref_count FROM blobs WHERE hash = ?")
         .bind(first.images[0].blob_sha256.as_slice())
@@ -1094,10 +1094,7 @@ async fn an_expired_send_rejects_a_continuation() {
     let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
     let assertion = server.assertion(&challenge).await;
     let first_body = send_envelope(nonce, &send, &first, &first_blobs, &assertion);
-    assert_eq!(
-        server.upload_bytes(first_body).await.0,
-        StatusCode::CREATED
-    );
+    assert_eq!(server.upload_bytes(first_body).await.0, StatusCode::CREATED);
     sqlx::query("UPDATE send_manifests SET expires_at = 0 WHERE nonce = ?")
         .bind(hex(nonce.as_bytes()))
         .execute(&server.db)
@@ -1241,6 +1238,102 @@ async fn schema_invalid_settings_are_rejected() {
     let (status, body) = server.upload_bytes(bytes).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "SCHEMA_INVALID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_validation_writes_no_blob_files() {
+    let mut server = TestServer::start().await;
+    let (invalid_settings, settings_blobs) = manifest(settings_at(&[("highlight_tone", 0)]));
+    let (status, body) = server
+        .upload_manifest(&invalid_settings, &settings_blobs, None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upload: {body}");
+    assert_eq!(body["error"], "SCHEMA_INVALID");
+
+    let (mut unknown_body, body_blobs) = manifest(valid_settings());
+    unknown_body.body = BodyId::new("fujifilm/unknown").expect("body id");
+    let (status, body) = server
+        .upload_manifest(&unknown_body, &body_blobs, None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upload: {body}");
+    assert_eq!(body["error"], "BODY_UNKNOWN");
+
+    assert_eq!(blob_files(&server.blob_dir), 0);
+    assert_eq!(staged_rows(&server.db).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_contribution_removes_its_staged_blobs_and_a_retry_succeeds() {
+    let mut server = TestServer::start().await;
+    sqlx::query(
+        "CREATE TRIGGER reject_contribution BEFORE INSERT ON contributions
+         BEGIN SELECT RAISE(ABORT, 'reject'); END",
+    )
+    .execute(&server.db)
+    .await
+    .expect("trigger");
+
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "upload: {body}");
+    assert_eq!(body["error"], "INTERNAL");
+    assert_eq!(blob_files(&server.blob_dir), 0);
+    assert_eq!(staged_rows(&server.db).await, 0);
+    assert_eq!(blob_rows(&server.db).await, 0);
+
+    sqlx::query("DROP TRIGGER reject_contribution")
+        .execute(&server.db)
+        .await
+        .expect("drop trigger");
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "retry: {body}");
+    assert_eq!(blob_files(&server.blob_dir), 2);
+    assert_eq!(staged_rows(&server.db).await, 0);
+    assert_eq!(blob_rows(&server.db).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_blob_reservation_is_rejected_without_writing_files() {
+    let mut server = TestServer::start().await;
+    sqlx::query(
+        "CREATE TRIGGER expire_staging AFTER INSERT ON blob_staging
+         BEGIN UPDATE blob_staging SET expires_at = 0 WHERE rowid = NEW.rowid; END",
+    )
+    .execute(&server.db)
+    .await
+    .expect("trigger");
+
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "upload: {body}");
+    assert_eq!(body["error"], "BUSY");
+    assert_eq!(blob_files(&server.blob_dir), 0);
+    assert_eq!(staged_rows(&server.db).await, 0);
+
+    sqlx::query("DROP TRIGGER expire_staging")
+        .execute(&server.db)
+        .await
+        .expect("drop trigger");
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "retry: {body}");
+    assert_eq!(blob_files(&server.blob_dir), 2);
+    assert_eq!(staged_rows(&server.db).await, 0);
+}
+
+fn blob_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir).expect("blob dir").count()
+}
+
+async fn staged_rows(db: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM blob_staging")
+        .fetch_one(db)
+        .await
+        .expect("staging rows")
+}
+
+async fn blob_rows(db: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
+        .fetch_one(db)
+        .await
+        .expect("blob rows")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3318,6 +3411,53 @@ async fn an_uploaded_fixture_is_exported_on_approval() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_fixture_donation_keeps_its_file_for_the_worker_sweep() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let bytes = b"looklab fixture bytes";
+    sqlx::query(
+        "CREATE TRIGGER reject_fixture BEFORE INSERT ON fixture_uploads
+         BEGIN SELECT RAISE(ABORT, 'reject'); END",
+    )
+    .execute(&server.db)
+    .await
+    .expect("trigger");
+
+    let (status, body) = server.donate_fixture("looklab-test.raf", bytes).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "donation: {body}"
+    );
+    let hash = hex(&Sha256::digest(bytes));
+    assert!(server.blob_dir.join(&hash).exists());
+    let staged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blob_staging")
+        .fetch_one(&server.db)
+        .await
+        .expect("reservation");
+    assert_eq!(staged, 1);
+    let fixtures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fixture_uploads")
+        .fetch_one(&server.db)
+        .await
+        .expect("fixture rows");
+    assert_eq!(fixtures, 0);
+
+    sqlx::query("DROP TRIGGER reject_fixture")
+        .execute(&server.db)
+        .await
+        .expect("drop trigger");
+    let (status, body) = server.donate_fixture("looklab-test.raf", bytes).await;
+    assert_eq!(status, StatusCode::CREATED, "retry: {body}");
+    assert!(server.blob_dir.join(&hash).exists());
+    let fixtures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fixture_uploads")
+        .fetch_one(&server.db)
+        .await
+        .expect("fixture rows");
+    assert_eq!(fixtures, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_fixture_source_needs_an_upload_by_the_proposer() {
     let mut server = TestServer::start().await;
     let (status, body) = server.upload_valid(None).await;
@@ -3525,4 +3665,65 @@ mapping_status: provisional
 ";
     let (status, body) = server.submit_proposal("body", anchored, &[], true).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "aliased body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continuation_keeps_the_newer_assertion_state() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, second_blobs) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    assert_eq!(
+        server
+            .upload_bytes(send_envelope(
+                nonce,
+                &send,
+                &first,
+                &first_blobs,
+                &assertion
+            ))
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+
+    let newer = signed_session_request(&mut server, RequestDomain::Session).await;
+    let (status, body) = post_json(&server.app, "/api/session", &newer).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        server
+            .upload_bytes(send_envelope(
+                nonce,
+                &send,
+                &second,
+                &second_blobs,
+                &assertion
+            ))
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+
+    let credential_json: String = sqlx::query_scalar("SELECT webauthn_credential FROM credentials")
+        .fetch_one(&server.db)
+        .await
+        .expect("credential");
+    let passkey: webauthn_rs::prelude::Passkey =
+        serde_json::from_str(&credential_json).expect("stored passkey");
+    let credential: webauthn_rs::prelude::Credential = passkey.into();
+    assert_eq!(credential.counter, 2);
+
+    // SoftPasskey cannot emit two assertions with the same counter, so the
+    // equal-counter transition is covered by the store CAS tests.
+    let follow_on = signed_session_request(&mut server, RequestDomain::Session).await;
+    let (status, body) = post_json(&server.app, "/api/session", &follow_on).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }

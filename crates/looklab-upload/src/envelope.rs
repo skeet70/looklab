@@ -216,10 +216,7 @@ pub fn encode_envelope(parts: &EnvelopeParts<'_>) -> Vec<u8> {
     let send_manifest_bytes = canonical_send_manifest_bytes(parts.send_manifest);
     let manifest_bytes = canonical_manifest_bytes(parts.manifest);
     assert!(
-        parts
-            .send_manifest
-            .validate(DEFAULT_MAX_BATCHES)
-            .is_ok(),
+        parts.send_manifest.validate(DEFAULT_MAX_BATCHES).is_ok(),
         "send manifest is not canonical"
     );
     assert!(

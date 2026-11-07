@@ -242,23 +242,20 @@ fn arb_envelope() -> impl Strategy<Value = Generated> {
         arb_pow(),
         arb_serial(),
     )
-        .prop_map(
-            |((manifest, blobs), nonce, assertion, pow, serial)| {
-                let send_manifest = SendManifest::canonical(vec![looklab_upload::manifest_hash(
-                    &manifest,
-                )])
-                .expect("send manifest");
-                Generated {
-                    nonce,
-                    send_manifest,
-                    manifest,
-                    assertion,
-                    pow,
-                    serial,
-                    blobs,
-                }
-            },
-        )
+        .prop_map(|((manifest, blobs), nonce, assertion, pow, serial)| {
+            let send_manifest =
+                SendManifest::canonical(vec![looklab_upload::manifest_hash(&manifest)])
+                    .expect("send manifest");
+            Generated {
+                nonce,
+                send_manifest,
+                manifest,
+                assertion,
+                pow,
+                serial,
+                blobs,
+            }
+        })
 }
 
 proptest! {

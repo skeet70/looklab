@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::Parser;
+use looklab_worker::jobs::JobPayload;
 use looklab_worker::{Worker, WorkerConfig, clock, jobs};
 
 #[derive(Debug, Parser)]
@@ -64,10 +65,19 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Publishes a missing catalog, re-queues a requested publication, and keeps pending jobs in the table.
+/// Publishes a missing catalog, re-queues a requested publication, sweeps staged
+/// blob leftovers, and keeps pending jobs in the table.
 async fn schedule_startup(worker: &Worker) -> anyhow::Result<()> {
     let now = clock::now_unix();
     jobs::enqueue_pending_publication(worker.pool(), now).await?;
+    jobs::enqueue_if_idle(
+        worker.pool(),
+        &JobPayload::BlobGc {
+            contribution_id: None,
+        },
+        now,
+    )
+    .await?;
     if !worker.config().site.join("data/index.json").is_file() {
         jobs::request_publish(worker.pool(), now).await?;
     }
