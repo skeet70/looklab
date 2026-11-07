@@ -40,6 +40,8 @@ Before publishing a release, push its `v*` candidate tag or manually dispatch **
 
 Worker tests retain ten fit-free or budget-short-circuit cases across `worker.rs` and `lut_rebase.rs` in ordinary CI, plus separate supersession coverage. Forty fitter-dependent cases across `worker.rs`, `lut_rebase.rs` and `match_bundle.rs` require `looklab-worker/integration` and run before releases with their original fixtures and assertions. The ignored 1,000-image benchmark and fixture-convergence diagnostic additionally require `looklab-worker/full-scale`.
 
+The [worker pre-release job at `ffd2b6f`](https://github.com/skeet70/looklab/actions/runs/42349668698/job/128334912333) selected 27 cases and was canceled after 6h 00m 17s. Four cases passed, two failed and 21 had no completed result; no final test summary was produced. The expanded 50-case selection at `c90496d` compiled and listed, and one newly selected LUT case passed locally, but the complete expanded suite has not passed. Release verification remains blocked.
+
 | Compact integration measurement | Total job | Test execution | Evidence |
 |---|---:|---:|---|
 | Initial ordinary-CI placement | 2m 53s | 11.809s | [Successful measured job](https://github.com/skeet70/looklab/actions/runs/42342765350/job/128313878421); exceeds the ordinary-CI budget |
