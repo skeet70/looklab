@@ -31,6 +31,7 @@ use looklab_upload::{
     SerialHmacKey, SettingSource, SimKey, StepIndex, WebAuthnAssertion, encode_envelope,
     manifest_hash, parse_render_tag, send_manifest_hash, solve,
 };
+use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::SqliteConnectOptions;
@@ -4465,4 +4466,248 @@ async fn a_continuation_keeps_the_newer_assertion_state() {
     let follow_on = signed_session_request(&mut server, RequestDomain::Session).await;
     let (status, body) = post_json(&server.app, "/api/session", &follow_on).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+struct SyncedPasskey {
+    key: SigningKey,
+    credential_id: Vec<u8>,
+}
+
+impl SyncedPasskey {
+    fn new(credential_id: &[u8]) -> Self {
+        Self {
+            key: SigningKey::from_slice(&[9u8; 32]).expect("valid P-256 scalar"),
+            credential_id: credential_id.to_vec(),
+        }
+    }
+
+    async fn register(&self, app: &Router, display_handle: &str, flags: u8) {
+        let (status, body) = post_json(
+            app,
+            "/api/passkey/register/start",
+            &json!({ "display_handle": display_handle }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "register start: {body}");
+        let handle = body["handle"].as_str().expect("handle").to_owned();
+        let challenge = body["options"]["publicKey"]["challenge"]
+            .as_str()
+            .expect("challenge");
+        let client_data_json = format!(
+            "{{\"type\":\"webauthn.create\",\"challenge\":\"{challenge}\",\"origin\":\"{ORIGIN}\",\"crossOrigin\":false}}"
+        );
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&Sha256::digest(RP_ID.as_bytes()));
+        auth_data.push(flags);
+        auth_data.extend_from_slice(&0u32.to_be_bytes());
+        auth_data.extend_from_slice(&[0u8; 16]);
+        auth_data.extend_from_slice(
+            &u16::try_from(self.credential_id.len())
+                .expect("credential id fits")
+                .to_be_bytes(),
+        );
+        auth_data.extend_from_slice(&self.credential_id);
+        auth_data.extend_from_slice(&self.cose_key());
+        let (status, body) = post_json(
+            app,
+            "/api/passkey/register/finish",
+            &json!({
+                "handle": handle,
+                "credential": {
+                    "id": b64(&self.credential_id),
+                    "rawId": b64(&self.credential_id),
+                    "type": "public-key",
+                    "response": {
+                        "clientDataJSON": b64(client_data_json.as_bytes()),
+                        "attestationObject": b64(&attestation_object(&auth_data)),
+                    },
+                    "clientExtensionResults": {},
+                },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "register finish: {body}");
+    }
+
+    fn cose_key(&self) -> Vec<u8> {
+        let point = self.key.verifying_key().to_sec1_point(false);
+        let mut out = Vec::new();
+        cbor_map(&mut out, 5);
+        out.extend_from_slice(&[0x01, 0x02]);
+        out.extend_from_slice(&[0x03, 0x26]);
+        out.extend_from_slice(&[0x20, 0x01]);
+        out.push(0x21);
+        cbor_bytes(&mut out, point.x().expect("uncompressed P-256 point"));
+        out.push(0x22);
+        cbor_bytes(&mut out, point.y().expect("uncompressed P-256 point"));
+        out
+    }
+
+    fn assertion(&self, challenge: &Challenge, flags: u8) -> Value {
+        let client_data_json = format!(
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"{ORIGIN}\",\"crossOrigin\":false}}",
+            b64(challenge.as_bytes())
+        );
+        let mut authenticator_data = Vec::new();
+        authenticator_data.extend_from_slice(&Sha256::digest(RP_ID.as_bytes()));
+        authenticator_data.push(flags);
+        authenticator_data.extend_from_slice(&0u32.to_be_bytes());
+        let mut message = authenticator_data.clone();
+        message.extend_from_slice(&Sha256::digest(client_data_json.as_bytes()));
+        let signature: Signature = self.key.sign(&message);
+        json!({
+            "credential_id": b64(&self.credential_id),
+            "authenticator_data": b64(&authenticator_data),
+            "client_data_json": b64(client_data_json.as_bytes()),
+            "signature": b64(signature.to_der().as_bytes()),
+        })
+    }
+}
+
+fn cbor_map(out: &mut Vec<u8>, entries: u8) {
+    out.push(0xa0 | entries);
+}
+
+fn cbor_text(out: &mut Vec<u8>, text: &str) {
+    let len = u8::try_from(text.len()).expect("short CBOR text");
+    assert!(len < 24, "CBOR text uses the short form");
+    out.push(0x60 | len);
+    out.extend_from_slice(text.as_bytes());
+}
+
+fn cbor_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u8::try_from(bytes.len()).expect("short CBOR byte string");
+    if len < 24 {
+        out.push(0x40 | len);
+    } else {
+        out.push(0x58);
+        out.push(len);
+    }
+    out.extend_from_slice(bytes);
+}
+
+fn attestation_object(auth_data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    cbor_map(&mut out, 3);
+    cbor_text(&mut out, "fmt");
+    cbor_text(&mut out, "none");
+    cbor_text(&mut out, "attStmt");
+    cbor_map(&mut out, 0);
+    cbor_text(&mut out, "authData");
+    cbor_bytes(&mut out, auth_data);
+    out
+}
+
+fn synced_session_request(
+    nonce: &Nonce,
+    challenge: &Challenge,
+    assertion: Value,
+    pow: bool,
+) -> Value {
+    let mut body = assertion;
+    body["nonce"] = json!(b64(nonce.as_bytes()));
+    if pow {
+        body["pow"] = json!(
+            solve(challenge, 1, &pow_params(), 0)
+                .expect("pow")
+                .as_array()
+        );
+    }
+    body
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_synced_zero_counter_profile_completes_registration_and_session() {
+    let server = TestServer::start().await;
+    let passkey = SyncedPasskey::new(b"synced-profile");
+    passkey.register(&server.app, "Jake!", 0x5d).await;
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x1d),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["display_handle"], "Jake!");
+    assert_eq!(body["tier"], "new");
+    assert_eq!(body["roles"], json!([]));
+    let token = body["status_token"]
+        .as_str()
+        .expect("status token")
+        .to_owned();
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x1d),
+        false,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["display_handle"], "Jake!");
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::SessionRevoke, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x1d),
+        false,
+    );
+    let (status, body) = post_json(&server.app, "/api/session/revoke", &request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let restore = Request::builder()
+        .uri("/api/session")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("restore request");
+    let (status, _, body) = send(&server.app, restore).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let error: Value = serde_json::from_slice(&body).expect("error response");
+    assert_eq!(error["error"], "TOKEN_UNKNOWN");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assertion_without_user_verification_is_rejected() {
+    let server = TestServer::start().await;
+    let passkey = SyncedPasskey::new(b"unverified-profile");
+    passkey.register(&server.app, "Jake!", 0x5d).await;
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x19),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "SIGNATURE_INVALID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assertion_with_backup_state_but_no_eligibility_is_rejected() {
+    let server = TestServer::start().await;
+    let passkey = SyncedPasskey::new(b"device-bound-profile");
+    passkey.register(&server.app, "Jake!", 0x45).await;
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x15),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "SIGNATURE_INVALID");
 }
