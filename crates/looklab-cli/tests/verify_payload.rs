@@ -563,6 +563,7 @@ struct Site {
     extensions: Option<Vec<(String, i64)>>,
     challenge: Option<Challenge>,
     serial: Option<Vec<u8>>,
+    nonce: Nonce,
 }
 
 impl Site {
@@ -604,6 +605,7 @@ impl Site {
             extensions: None,
             challenge: None,
             serial: None,
+            nonce: Nonce::from_bytes([0x42; 32]),
         }
     }
 
@@ -633,6 +635,11 @@ impl Site {
 
     fn with_credential(mut self, credential: &[u8]) -> Self {
         self.credential_id = credential.to_vec();
+        self
+    }
+
+    fn with_nonce(mut self, nonce: Nonce) -> Self {
+        self.nonce = nonce;
         self
     }
 
@@ -714,7 +721,7 @@ impl Site {
     }
 
     fn body(&self) -> Vec<u8> {
-        let nonce = Nonce::from_bytes([0x42; 32]);
+        let nonce = self.nonce;
         let send =
             SendManifest::canonical(vec![manifest_hash(&self.manifest)]).expect("send manifest");
         let challenge = self
@@ -1906,7 +1913,12 @@ fn fails_when_the_credential_id_changes_between_two_hars() {
     let first = har_path("credential-a", &default_har(&Site::new()).json());
     let second = har_path(
         "credential-b",
-        &default_har(&Site::new().with_credential(OTHER_CREDENTIAL)).json(),
+        &default_har(
+            &Site::new()
+                .with_credential(OTHER_CREDENTIAL)
+                .with_nonce(Nonce::from_bytes([0x43; 32])),
+        )
+        .json(),
     );
     let (success, output) = run(
         fixture,
