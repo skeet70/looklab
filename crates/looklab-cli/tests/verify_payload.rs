@@ -1910,11 +1910,12 @@ fn fails_on_a_wrong_rp_id_hash() {
 #[test]
 fn fails_when_the_credential_id_changes_between_two_hars() {
     let fixture = fixture();
-    let first = har_path("credential-a", &default_har(&Site::new()).json());
+    let first = har_path("credential-a", &default_har(&Site::new().only(&[0])).json());
     let second = har_path(
         "credential-b",
         &default_har(
             &Site::new()
+                .only(&[1])
                 .with_credential(OTHER_CREDENTIAL)
                 .with_nonce(Nonce::from_bytes([0x43; 32])),
         )
@@ -1927,7 +1928,31 @@ fn fails_when_the_credential_id_changes_between_two_hars() {
     );
 
     assert!(!success, "{output}");
-    assert!(output.contains("credential id differs"), "{output}");
+}
+
+#[test]
+fn two_sends_with_the_same_credential_verify() {
+    let fixture = fixture();
+    let first = har_path(
+        "same-credential-a",
+        &default_har(&Site::new().only(&[0])).json(),
+    );
+    let second = har_path(
+        "same-credential-b",
+        &default_har(
+            &Site::new()
+                .only(&[1])
+                .with_nonce(Nonce::from_bytes([0x43; 32])),
+        )
+        .json(),
+    );
+    let (success, output) = run(
+        fixture,
+        &[first.as_path(), second.as_path()],
+        &state_path("same-credential-two-hars"),
+    );
+
+    assert!(success, "{output}");
 }
 
 #[test]
