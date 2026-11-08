@@ -618,8 +618,10 @@ impl HelpWay {
                 steps: &[
                     "Use a ColorChecker Classic 24, SG 140 or Passport chart.",
                     "Light the chart evenly without glare. Keep it still and fill 30 to 60% of the frame.",
-                    "Shoot RAW+JPEG at the lowest native ISO. Turn off lens corrections where possible.",
-                    "Take 3 shots at 0, −1 and −2 EV exposure compensation. Keep the original RAW+JPEG pairs.",
+                    "Shoot RAW+JPEG Fine at the lowest native ISO. Turn off lens corrections where possible.",
+                    "Use one built-in look for all 3 shots, such as Provia / Standard on Fujifilm, and set white balance to the light.",
+                    "Take 3 shots total: 0, −1 and −2 EV exposure compensation. Keep all 3 original RAW+JPEG pairs. You do not need to repeat the bracket for each look.",
+                    "Want to contribute more? Re-render just the 0 EV RAW in camera using other built-in looks, keeping the other settings unchanged. Add those JPEGs with the original files. No re-renders of the −1 and −2 EV RAWs are needed.",
                 ],
                 action: "Add the chart shots",
             },

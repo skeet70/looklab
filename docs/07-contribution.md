@@ -55,7 +55,9 @@ Shared tips (rung 1 and above): turn off in-camera lens corrections where possib
 
 ### 3.3 Color chart (rung 5)
 - v1: ColorChecker Classic 24, SG 140, Passport.
-- Even light, no glare, chart at 30–60% of the frame, bracket 0/−1/−2 EV.
+- Even light, no glare, chart at 30–60% of the frame.
+- Use one built-in look, such as Provia / Standard on Fujifilm, and WB set to the light. Take three RAW+JPEG Fine shots total at 0/−1/−2 EV; keep all three original pairs. No separate bracket per look is needed.
+- Optional extra coverage: re-render only the 0 EV RAW in camera using other built-in looks, keeping the other settings unchanged, and include those JPEGs with the originals. The −1 and −2 EV RAWs do not need re-renders. The donated-fixture protocol requests every film simulation ([fixture shot list §4](../fixtures/SHOT-LIST.md#4-color-chart-session)).
 - Assisted detection (click 4 corners, client refines); automatic later. Patch means from the central 50%, with glare rejected by std.
 - Reference values with source and edition in `data/charts/`.
 
