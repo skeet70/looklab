@@ -49,6 +49,7 @@ impl Fixture {
             db: self.db.clone(),
             blobs: self.blobs.clone(),
             data: self.data.clone(),
+            snapshot_dir: self.data.join("community"),
             transforms: self.transforms.clone(),
             out: self.site.clone(),
         };
@@ -73,6 +74,26 @@ fn photo(index: usize) -> Scene {
         source_sha256: ArtifactHash::of(format!("source-{index}").as_bytes()),
     });
     scene
+}
+
+fn write_community_snapshot(fixture: &Fixture, version: u64) {
+    let root = fixture.data.join(format!("community/v{version}"));
+    std::fs::create_dir_all(root.join("bodies")).expect("snapshot bodies");
+    let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies");
+    let body_text = std::fs::read_to_string(shipped.join("fujifilm-x-t5.body.yaml")).expect("body");
+    let schema_text = std::fs::read_to_string(shipped.join("fujifilm-x-t5.yaml")).expect("schema");
+    let body = looklab_schema::validate_body(&body_text).expect("body");
+    let schema = looklab_schema::validate_control_schema(&schema_text).expect("schema");
+    std::fs::write(
+        root.join(looklab_schema::body_export_path(&body.id)),
+        body_text,
+    )
+    .expect("snapshot body");
+    std::fs::write(
+        root.join(looklab_schema::schema_export_path(&schema.body)),
+        schema_text,
+    )
+    .expect("snapshot schema");
 }
 
 fn prepare(fixture: &Fixture, count: usize) -> Vec<Scene> {
@@ -131,6 +152,21 @@ async fn publication_lists_prepared_photo_scenes_with_their_provenance() {
             std::fs::read(fixture.site.join(summary.thumbnail.path.as_str())).expect("thumbnail");
         assert_eq!(summary.thumbnail.sha256, ArtifactHash::of(&thumbnail));
     }
+}
+
+#[tokio::test]
+async fn publication_uses_the_newest_approved_community_snapshot() {
+    let fixture = Fixture::new();
+    prepare(&fixture, 1);
+    write_community_snapshot(&fixture, 3);
+    fixture.publish().await.expect("publish");
+
+    let site: SiteIndex =
+        serde_json::from_slice(&index(&fixture, "index.json")).expect("site index");
+    assert_eq!(site.community_snapshot_version, 3);
+    assert!(site.looks.is_empty(), "no Look was fitted");
+    assert_eq!(site.bodies.len(), 1);
+    assert_eq!(site.bodies[0].id.as_str(), "fujifilm/x-t5");
 }
 
 #[tokio::test]

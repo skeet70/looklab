@@ -5,6 +5,7 @@
 //! The flow is [docs/06 §5](../../../docs/06-privacy-and-payload.md) steps 1-4.
 //! Nothing the site served beyond the HAR itself is consulted, and no keys.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -18,8 +19,9 @@ use looklab_prep_module::{
     PrepareRequest, PrepareResponse, PriorTransformSpec, Response, VersionResponse,
 };
 use looklab_schema::{
-    Epoch, MakernoteValues, MappingError, SettingSource, SimKey, monochrome_sim,
-    settings_from_makernote_partial, sim_from_makernote,
+    LookId, MakernoteValues, MappingError, MonoFilter, RenderClass as SchemaRenderClass,
+    SettingSource, SimKey, applicable_controls, classify_card_render, classify_render,
+    settings_from_makernote_for, sim_from_makernote,
 };
 use looklab_server::body_schema::{Bodies, BodyRecord, resolve_epoch, validate_settings};
 use looklab_server::{RequestDomain, StatusToken, request_digest};
@@ -27,10 +29,10 @@ use looklab_upload::{
     BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion,
     ContributionKind, ControlEntry, ControlKey, ControlSettings, Envelope, EnvelopeParts,
     ExpectedAssertion, FirmwareId, FirmwareVersion, FirmwareVersionString, Intent, Limits,
-    LookSlug, ManifestHash, ManifestImage, ManifestMetadata, Nonce, PowParams,
-    RawSerial as UploadSerial, SignatureAlgorithm, StepIndex, StructuralVerdict, TopOriginReview,
-    WebAuthnAssertion, check_structure, encode_envelope, parse_envelope_strict,
-    verify as verify_pow,
+    LookSlug, ManifestHash, ManifestImage, ManifestMetadata, MonochromeAuthorization, Nonce,
+    PowParams, RawSerial as UploadSerial, RenderClass, SignatureAlgorithm, StepIndex,
+    StructuralVerdict, TopOriginReview, WebAuthnAssertion, check_structure, encode_envelope,
+    parse_envelope_strict, verify as verify_pow,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -83,6 +85,21 @@ pub enum DeclaredIntent {
     Card,
 }
 
+/// The explicit contribution authorization the upload's monochrome batches carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DeclaredAuthorization {
+    #[value(name = "model-development-180-days")]
+    ModelDevelopment180Days,
+}
+
+impl From<DeclaredAuthorization> for MonochromeAuthorization {
+    fn from(value: DeclaredAuthorization) -> Self {
+        match value {
+            DeclaredAuthorization::ModelDevelopment180Days => Self::ModelDevelopment180Days,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct VerifyPayloadArgs {
     /// The local seed file exported by the client. SENSITIVE: it reveals sampling order.
@@ -119,6 +136,13 @@ pub struct VerifyPayloadArgs {
     /// A control value you entered by hand, as `key=step`. Repeat for each.
     #[arg(long = "declare-setting", value_name = "KEY=STEP")]
     pub declare_setting: Vec<String>,
+    /// The contributor's explicit monochrome model-development authorization; required for monochrome batches.
+    #[arg(
+        long = "monochrome-authorization",
+        value_enum,
+        value_name = "AUTHORIZATION"
+    )]
+    pub monochrome_authorization: Option<DeclaredAuthorization>,
     /// Where the credential id is recorded between runs. Defaults to
     /// `$XDG_STATE_HOME/looklab/verify.json`, else `~/.local/state/looklab/verify.json`.
     #[arg(long, value_name = "FILE")]
@@ -276,7 +300,7 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         .collect();
 
     let snapshot = manifest_snapshot_version(&hars, &origin, &mut findings);
-    let reproduced = reproduce(&groups, &seeds, &module, &bodies, snapshot, &mut findings);
+    let reproduced = reproduce(&groups, &seeds, &module, &mut findings);
     let card_firmware = args
         .firmware
         .as_deref()
@@ -296,11 +320,13 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         intent,
         card_firmware,
         declarations: &declarations,
+        declaration_use: RefCell::new(BTreeSet::new()),
+        monochrome_authorization: args.monochrome_authorization.map(Into::into),
     };
 
     let mut credentials: Vec<(String, Vec<u8>)> = Vec::new();
     let mut covered = vec![0usize; reproduced.len()];
-    let mut parsed = Vec::new();
+    let mut parsed: Vec<ParsedUpload> = Vec::new();
     for (path, har) in &hars {
         findings.note("");
         findings.note(format!(
@@ -350,6 +376,7 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
             }
         }
     }
+
     let mut sends: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
     for (index, upload) in parsed.iter().enumerate() {
         sends
@@ -370,6 +397,23 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
             &mut covered,
             &mut credentials,
         );
+    }
+
+    if service.monochrome_authorization.is_some()
+        && !parsed
+            .iter()
+            .any(|upload| upload.envelope.manifest.render_class == RenderClass::Monochrome)
+    {
+        findings.fail(
+            "--monochrome-authorization was declared, but no upload names a monochrome batch",
+        );
+    }
+    for key in service.declarations.keys() {
+        if !service.declaration_use.borrow().contains(key) {
+            findings.fail(format!(
+                "--declare-setting {key} is not applicable to any uploaded batch"
+            ));
+        }
     }
 
     if findings.failures.is_empty() {
@@ -582,6 +626,9 @@ struct BatchFields {
     body: BodyId,
     firmware: FirmwareVersionString,
     sim: SimKey,
+    render_class: RenderClass,
+    family: LookId,
+    mono_filter: Option<MonoFilter>,
     settings: ControlSettings,
     settings_sources: Vec<BatchSetting>,
 }
@@ -592,6 +639,9 @@ fn derive_batch(
     version: CommunitySnapshotVersion,
     declarations: &BTreeMap<ControlKey, StepIndex>,
     card: bool,
+    card_family: Option<&LookId>,
+    card_render_class: Option<RenderClass>,
+    used: &RefCell<BTreeSet<ControlKey>>,
     findings: &mut Findings,
 ) -> Option<BatchFields> {
     let records = match bodies.at(version) {
@@ -605,7 +655,16 @@ fn derive_batch(
         }
     };
     let first = images.first()?;
-    let fields = match derive_one(&first.metadata, records, version, declarations, card) {
+    let fields = match derive_one(
+        &first.metadata,
+        records,
+        version,
+        declarations,
+        card,
+        card_family,
+        card_render_class,
+        used,
+    ) {
         Ok(fields) => fields,
         Err(reason) => {
             findings.fail(format!(
@@ -615,7 +674,16 @@ fn derive_batch(
         }
     };
     for image in &images[1..] {
-        match derive_one(&image.metadata, records, version, declarations, card) {
+        match derive_one(
+            &image.metadata,
+            records,
+            version,
+            declarations,
+            card,
+            card_family,
+            card_render_class,
+            used,
+        ) {
             Ok(other) if other == fields => {}
             Ok(_) => {
                 findings.fail(
@@ -640,6 +708,9 @@ fn derive_one(
     version: CommunitySnapshotVersion,
     declarations: &BTreeMap<ControlKey, StepIndex>,
     card: bool,
+    card_family: Option<&LookId>,
+    card_render_class: Option<RenderClass>,
+    used: &RefCell<BTreeSet<ControlKey>>,
 ) -> Result<BatchFields, String> {
     let make = metadata
         .make
@@ -663,8 +734,44 @@ fn derive_one(
     let epoch = resolve_epoch(&record.schema, firmware_text)
         .ok_or_else(|| format!("no epoch covers firmware {firmware_text}"))?;
     let values = MakernoteValues::from(metadata);
-    let sim = sim_from_makernote(epoch, &values).map_err(|error| error.to_string())?;
-    let (derived, problems) = settings_from_makernote_partial(&record.schema, epoch.id, &values);
+    let native = classify_render(epoch, &values);
+    let native_sim = match &native {
+        Ok(classification) => classification.native_sim.clone(),
+        Err(_) => sim_from_makernote(epoch, &values)
+            .map_err(|error| format!("the files do not determine the film simulation: {error}"))?,
+    };
+    let (render_class, family, mono_filter) = match (card, card_family, card_render_class) {
+        (true, Some(family), Some(declared)) => {
+            let declared = match declared {
+                RenderClass::Colour => SchemaRenderClass::Colour,
+                RenderClass::Monochrome => SchemaRenderClass::Monochrome,
+            };
+            let classified = classify_card_render(epoch, family, declared, &values)
+                .map_err(|error| format!("the card render does not classify: {error}"))?;
+            (
+                schema_render_class(classified.render_class),
+                classified.family,
+                classified.mono_filter,
+            )
+        }
+        _ => {
+            let classification = native
+                .map_err(|error| format!("the files do not determine the render class: {error}"))?;
+            (
+                schema_render_class(classification.render_class),
+                classification.family,
+                classification.mono_filter,
+            )
+        }
+    };
+    if render_class == RenderClass::Monochrome && !epoch.supports_monochrome_intake(&family) {
+        return Err(format!(
+            "the schema does not accept monochrome intake for family {family}"
+        ));
+    }
+    let reach = applicable_controls(epoch, &family);
+    let (derived, problems) =
+        settings_from_makernote_for(&record.schema, epoch.id, &family, &values);
     let mut sources: Vec<BatchSetting> = derived
         .entries()
         .iter()
@@ -676,16 +783,16 @@ fn derive_one(
         })
         .collect();
     for (key, step) in declarations {
+        let applicable = reach.mapped.contains(key)
+            || reach.unmapped.contains(key)
+            || reach.spatial.contains(key);
+        if !applicable {
+            continue;
+        }
         if sources.iter().any(|setting| &setting.key == key) {
-            return Err(format!(
-                "{key} is reproduced from its makernote; it cannot also be declared"
-            ));
+            continue;
         }
-        if !epoch.controls.iter().any(|control| &control.key == key) {
-            return Err(format!(
-                "snapshot {version} has no control {key} for {body}"
-            ));
-        }
+        used.borrow_mut().insert(key.clone());
         sources.push(BatchSetting {
             key: key.clone(),
             step: *step,
@@ -694,13 +801,16 @@ fn derive_one(
         });
     }
     sources.sort_by(|left, right| left.key.cmp(&right.key));
-    if !card {
-        for missing in epoch
-            .controls
-            .iter()
-            .filter(|control| control.look_affecting)
-        {
-            if sources.iter().any(|setting| setting.key == missing.key) {
+    let deferred = render_class == RenderClass::Monochrome;
+    let mut required: Vec<&ControlKey> = reach.mapped.iter().chain(&reach.unmapped).collect();
+    if deferred {
+        required.extend(reach.spatial.iter());
+    }
+    required.sort_by(|left, right| left.cmp(right));
+    required.dedup();
+    if !card || deferred {
+        for missing in required {
+            if sources.iter().any(|setting| &setting.key == missing) {
                 continue;
             }
             let detail = problems.iter().find_map(|problem| match problem {
@@ -708,14 +818,16 @@ fn derive_one(
                 | MappingError::UnmappedValue { control, .. }
                 | MappingError::ScaleNotNumeric { control, .. }
                 | MappingError::NotOnStep { control, .. }
-                    if control.as_str() == missing.key.as_str() =>
+                    if control.as_str() == missing.as_str() =>
                 {
                     Some(problem.to_string())
                 }
                 _ => None,
             });
-            let reason = if missing.makernote.is_some() {
+            let reason = if reach.mapped.contains(missing) {
                 "the makernote did not determine it"
+            } else if reach.spatial.contains(missing) {
+                "a deferred batch keeps its spatial settings"
             } else {
                 "this snapshot maps no makernote tag for it"
             };
@@ -723,8 +835,7 @@ fn derive_one(
                 .map(|detail| format!(" ({detail})"))
                 .unwrap_or_default();
             return Err(format!(
-                "control {key} has no value: {reason}{detail}; declare it with --declare-setting {key}=<step>",
-                key = missing.key
+                "control {missing} has no value: {reason}{detail}; declare it with --declare-setting {missing}=<step>",
             ));
         }
     }
@@ -733,17 +844,40 @@ fn derive_one(
         .map(|setting| ControlEntry::new(setting.key.clone(), setting.step, setting.source))
         .collect();
     let settings = ControlSettings::new(entries).map_err(|error| error.to_string())?;
-    validate_settings(record, firmware_text, &sim, &settings, card)
-        .map_err(|problem| format!("the derived settings are not valid for {body}: {problem}"))?;
+    let validation_family = if card && card_family.is_none() {
+        None
+    } else {
+        Some(family.clone())
+    };
+    validate_settings(
+        record,
+        firmware_text,
+        &native_sim,
+        validation_family.as_ref(),
+        &settings,
+        card,
+        deferred,
+    )
+    .map_err(|problem| format!("the derived settings are not valid for {body}: {problem}"))?;
 
     Ok(BatchFields {
         version,
         body,
         firmware,
-        sim,
+        sim: native_sim,
+        render_class,
+        family,
+        mono_filter,
         settings,
         settings_sources: sources,
     })
+}
+
+fn schema_render_class(render_class: SchemaRenderClass) -> RenderClass {
+    match render_class {
+        SchemaRenderClass::Colour => RenderClass::Colour,
+        SchemaRenderClass::Monochrome => RenderClass::Monochrome,
+    }
 }
 
 fn match_body(
@@ -803,6 +937,14 @@ fn print_batch_fields(
                 "  sim: {} (reproduced from the {FILM_MODE_TAG} makernote)",
                 fields.sim
             ));
+            findings.note(format!(
+                "  render class: {:?} (reproduced from the schema and makernotes)",
+                fields.render_class
+            ));
+            findings.note(format!("  family: {} (schema family)", fields.family));
+            if let Some(filter) = fields.mono_filter {
+                findings.note(format!("  mono filter: {filter:?} (reproduced)"));
+            }
             let reproduced = fields
                 .settings_sources
                 .iter()
@@ -867,10 +1009,16 @@ fn expected_manifest(
     fields: &BatchFields,
     declared: &DeclaredFields,
     images: &[&ReproducedImage],
+    authorization: Option<MonochromeAuthorization>,
 ) -> BatchManifest {
     BatchManifest {
         kind: declared.kind,
         intent: declared.intent.clone(),
+        render_class: fields.render_class,
+        monochrome_authorization: match fields.render_class {
+            RenderClass::Colour => None,
+            RenderClass::Monochrome => authorization,
+        },
         body: fields.body.clone(),
         firmware_version: fields.firmware.clone(),
         sim_key: fields.sim.clone(),
@@ -904,6 +1052,9 @@ struct Service<'a> {
     intent: Option<Intent>,
     card_firmware: Option<(FirmwareId, FirmwareVersion)>,
     declarations: &'a BTreeMap<ControlKey, StepIndex>,
+    /// Declarations applicable to at least one uploaded batch.
+    declaration_use: RefCell<BTreeSet<ControlKey>>,
+    monochrome_authorization: Option<MonochromeAuthorization>,
 }
 
 #[derive(Debug)]
@@ -947,7 +1098,8 @@ fn parse_upload(request: &HarRequest, findings: &mut Findings) -> Option<ParsedU
         }
     };
     findings.note(format!(
-        "  envelope: canonical LLUPLD version 2, {} bytes, no trailing bytes",
+        "  envelope: canonical LLUPLD version {}, {} bytes, no trailing bytes",
+        looklab_upload::VERSION,
         body.len()
     ));
     findings.note(format!(
@@ -1064,17 +1216,39 @@ fn verify_upload(
         ));
         match upload_declared(service, images, findings) {
             Some(declared) => {
+                let card_family = match &declared.intent {
+                    Intent::Card(CardDeclaration::Tagged(tag)) => {
+                        LookId::new(tag.look_slug.as_str()).ok()
+                    }
+                    _ => None,
+                };
                 let derived = derive_batch(
                     images,
                     service.bodies,
                     service.snapshot,
                     service.declarations,
                     matches!(declared.intent, Intent::Card(_)),
+                    card_family.as_ref(),
+                    matches!(declared.intent, Intent::Card(_))
+                        .then_some(envelope.manifest.render_class),
+                    &service.declaration_use,
                     findings,
                 );
                 print_batch_fields(derived.as_ref(), &declared, service.bodies, findings);
                 if let Some(fields) = &derived {
-                    let expected = expected_manifest(fields, &declared, images);
+                    if fields.render_class == RenderClass::Monochrome
+                        && service.monochrome_authorization.is_none()
+                    {
+                        findings.fail(
+                            "the upload includes a monochrome batch, but --monochrome-authorization model-development-180-days was not declared",
+                        );
+                    }
+                    let expected = expected_manifest(
+                        fields,
+                        &declared,
+                        images,
+                        service.monochrome_authorization,
+                    );
                     check_images(envelope, &expected, images, service, findings);
                 } else {
                     findings.fail(
@@ -1175,6 +1349,8 @@ fn check_images(
     let request = BuildManifestRequest {
         kind: expected.kind,
         intent: expected.intent.clone(),
+        render_class: expected.render_class,
+        monochrome_authorization: expected.monochrome_authorization,
         body: expected.body.clone(),
         firmware: expected.firmware_version.clone(),
         sim: expected.sim_key.clone(),
@@ -1245,6 +1421,18 @@ fn manifest_differences(site: &BatchManifest, expected: &BatchManifest) -> Vec<S
         differences.push(format!(
             "intent is {:?}, declared {:?}",
             site.intent, expected.intent
+        ));
+    }
+    if site.render_class != expected.render_class {
+        differences.push(format!(
+            "render class is {:?}, reproduced {:?}",
+            site.render_class, expected.render_class
+        ));
+    }
+    if site.monochrome_authorization != expected.monochrome_authorization {
+        differences.push(format!(
+            "monochrome authorization is {:?}, expected {:?}",
+            site.monochrome_authorization, expected.monochrome_authorization
         ));
     }
     if site.body != expected.body {
@@ -1501,8 +1689,6 @@ fn reproduce(
     groups: &[Group],
     seeds: &SeedFile,
     module: &ModuleHost,
-    bodies: &Bodies,
-    snapshot: CommunitySnapshotVersion,
     findings: &mut Findings,
 ) -> Vec<ReproducedImage> {
     let version = seeds.prior_transform_version().get();
@@ -1518,29 +1704,9 @@ fn reproduce(
             findings.fail(format!("the seed file has no entry for {}", group.raw.name));
             continue;
         };
-        let monochrome = monochrome_renders(group, bodies, snapshot);
-        let refused: Vec<&str> = group
-            .jpegs
-            .iter()
-            .zip(&monochrome)
-            .filter(|(_, refused)| **refused)
-            .map(|(file, _)| file.name.as_str())
-            .collect();
-        if !refused.is_empty() {
-            findings.note(format!(
-                "  excluded known monochrome render(s): {}",
-                refused.join(", ")
-            ));
-        }
-        let jpegs: Vec<Vec<u8>> = group
-            .jpegs
-            .iter()
-            .zip(&monochrome)
-            .filter(|(_, refused)| !**refused)
-            .map(|(file, _)| file.bytes.clone())
-            .collect();
+        let jpegs: Vec<Vec<u8>> = group.jpegs.iter().map(|file| file.bytes.clone()).collect();
         if jpegs.is_empty() {
-            findings.note("  no colour render to prepare");
+            findings.note("  no render to prepare");
             continue;
         }
         let request = PrepareRequest {
@@ -1566,55 +1732,6 @@ fn reproduce(
         }
     }
     images
-}
-
-/// One flag per JPEG, in file order: whether the published schema calls its
-/// render a monochrome sim.
-fn monochrome_renders(
-    group: &Group,
-    bodies: &Bodies,
-    snapshot: CommunitySnapshotVersion,
-) -> Vec<bool> {
-    let none = vec![false; group.jpegs.len()];
-    let Ok(records) = bodies.at(snapshot) else {
-        return none;
-    };
-    let Some(epoch) = group_epoch(group, records) else {
-        return none;
-    };
-    group
-        .jpegs
-        .iter()
-        .map(|jpeg| {
-            jpeg.manifest_metadata().is_some_and(|metadata| {
-                monochrome_sim(epoch, &MakernoteValues::from(&metadata)).is_some()
-            })
-        })
-        .collect()
-}
-
-/// The epoch the contribution form classifies the group under: the first
-/// JPEG's body and firmware, else another file's.
-fn group_epoch<'a>(group: &Group, records: &'a BTreeMap<String, BodyRecord>) -> Option<&'a Epoch> {
-    let jpegs: Vec<ManifestMetadata> = group
-        .jpegs
-        .iter()
-        .filter_map(InputFile::manifest_metadata)
-        .collect();
-    let primary = jpegs
-        .first()
-        .cloned()
-        .or_else(|| group.files().find_map(InputFile::manifest_metadata))?;
-    let firmware = jpegs
-        .iter()
-        .find_map(|metadata| metadata.firmware.clone())
-        .or_else(|| {
-            group
-                .files()
-                .find_map(|file| file.manifest_metadata()?.firmware)
-        })?;
-    let body = match_body(records, primary.make.as_deref()?, primary.model.as_deref()?).ok()?;
-    resolve_epoch(&records.get(body.as_str())?.schema, &firmware)
 }
 
 fn undecodable(name: &str, failure: &ModuleFailure) -> String {
@@ -1895,12 +2012,6 @@ impl InputFile {
 
     fn serial(&self) -> Option<&RawSerial> {
         self.parsed.as_ref().and_then(ParsedMetadata::body_serial)
-    }
-
-    fn manifest_metadata(&self) -> Option<ManifestMetadata> {
-        self.parsed
-            .as_ref()
-            .map(|parsed| ManifestMetadata::from(&looklab_meta::sanitize(parsed).0))
     }
 }
 

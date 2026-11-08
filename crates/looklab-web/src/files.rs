@@ -2,7 +2,7 @@
 //! Local file reading and download ([docs/06 §7](../../../docs/06-privacy-and-payload.md)).
 
 use js_sys::Uint8Array;
-use looklab_prep::{FileKind, LocalImageKey};
+use looklab_prep::{FileKind, LocalImageKey, RawFormat};
 use looklab_wasm::MetadataFile;
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 use wasm_bindgen_futures::JsFuture;
@@ -57,6 +57,23 @@ impl LocalFile {
 
 pub(crate) fn selected_files(selected: Vec<File>) -> Vec<LocalFile> {
     selected.into_iter().map(LocalFile::from_file).collect()
+}
+
+pub(crate) fn camera_originals_accept_attribute() -> String {
+    const JPEG: &str = ".jpg,.jpeg";
+    let capacity = JPEG.len()
+        + RawFormat::ALL
+            .iter()
+            .map(|format| format.extension().len() + 2)
+            .sum::<usize>();
+    let mut accept = String::with_capacity(capacity);
+    for format in RawFormat::ALL {
+        accept.push('.');
+        accept.push_str(format.extension());
+        accept.push(',');
+    }
+    accept.push_str(JPEG);
+    accept
 }
 
 /// One file's bytes are live at a time.
@@ -127,11 +144,15 @@ export class ContributionDraftStore {
             });
         });
     }
-    schedule(text) {
+    schedule(text, retainPrepared) {
         const revision = ++this.revision;
-        this.pending = { text, revision };
+        this.pending = { text, revision, retainPrepared };
         clearTimeout(this.timer);
-        this.timer = setTimeout(() => this.flush(), 300);
+        if (retainPrepared) {
+            this.timer = setTimeout(() => this.flush(), 300);
+        } else {
+            this.flush();
+        }
     }
     flush() {
         clearTimeout(this.timer);
@@ -140,10 +161,14 @@ export class ContributionDraftStore {
         if (!pending) return;
         this.enqueue(() => {
             if (pending.revision !== this.revision) return;
-            return this.transaction("readwrite", store => store.put(pending.text, "draft"));
+            return this.transaction("readwrite", store => {
+                if (!pending.retainPrepared) store.delete("prepared");
+                store.put(pending.text, "draft");
+            });
         }).catch(() => {});
     }
     prepared(text) {
+        this.flush();
         return this.enqueue(() => this.transaction("readwrite", store => store.put(text, "prepared")));
     }
     read(key) {
@@ -165,7 +190,7 @@ extern "C" {
     #[wasm_bindgen(method, js_name = replaceFiles)]
     pub(crate) fn replace_files(this: &ContributionDraftStore, files: &JsValue) -> js_sys::Promise;
     #[wasm_bindgen(method)]
-    pub(crate) fn schedule(this: &ContributionDraftStore, text: &str);
+    pub(crate) fn schedule(this: &ContributionDraftStore, text: &str, retain_prepared: bool);
     #[wasm_bindgen(method)]
     pub(crate) fn flush(this: &ContributionDraftStore);
     #[wasm_bindgen(method)]

@@ -43,6 +43,7 @@ export LOOKLAB_SITE_DATA="$data"
   --db "$LOOKLAB_DB_PATH" \
   --blobs "$LOOKLAB_BLOB_DIR" \
   --data "$data_dir" \
+  --snapshot-dir "$LOOKLAB_SNAPSHOT_DIR" \
   --site "$state/site" \
   --transforms "$data_dir/transforms" \
   --lease-seconds 300 &

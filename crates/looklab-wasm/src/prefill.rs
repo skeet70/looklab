@@ -4,15 +4,14 @@
 use looklab_meta::ParsedMetadata;
 use looklab_prep::pair::{FileKind, LocalImageKey};
 use looklab_schema::{
-    Epoch, MakernoteValues, SimKey, monochrome_sim, settings_from_makernote_partial,
-    sim_from_makernote, unmapped_controls, validate_control_schema,
+    ApplicableControls, Epoch, LookId, MakernoteValues, MonoFilter, RenderClass, SimKey,
+    applicable_controls, classify_render, mapped_controls, settings_from_makernote_for,
+    settings_from_makernote_partial, sim_from_makernote, unmapped_controls,
+    validate_control_schema,
 };
 use serde::Serialize;
 
 use crate::error::FacadeError;
-
-/// Shown for a render the fit cannot use.
-pub const MONOCHROME_REFUSAL: &str = "B&W renders aren't supported yet";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct MonochromeRender {
@@ -21,19 +20,19 @@ pub struct MonochromeRender {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RenderClass {
+pub enum NativeRenderClass {
     Colour(SimKey),
     Monochrome(SimKey),
     Undetermined,
 }
 
-pub fn render_class(epoch: &Epoch, values: &MakernoteValues) -> RenderClass {
-    if let Some(sim) = monochrome_sim(epoch, values) {
-        return RenderClass::Monochrome(sim);
-    }
-    match sim_from_makernote(epoch, values) {
-        Ok(sim) => RenderClass::Colour(sim),
-        Err(_) => RenderClass::Undetermined,
+pub fn native_render_class(epoch: &Epoch, values: &MakernoteValues) -> NativeRenderClass {
+    match classify_render(epoch, values) {
+        Ok(classification) => match classification.render_class {
+            RenderClass::Colour => NativeRenderClass::Colour(classification.native_sim),
+            RenderClass::Monochrome => NativeRenderClass::Monochrome(classification.native_sim),
+        },
+        Err(_) => NativeRenderClass::Undetermined,
     }
 }
 
@@ -42,11 +41,14 @@ pub fn render_class(epoch: &Epoch, values: &MakernoteValues) -> RenderClass {
 pub struct SettingsPrefill {
     pub firmware: String,
     pub sim: Option<String>,
+    pub render_class: Option<RenderClass>,
+    pub family: Option<LookId>,
+    pub mono_filter: Option<MonoFilter>,
     /// `(control key, step)` in schema order.
     pub controls: Vec<(String, i64)>,
     /// Controls the tags did not determine, with the reason.
     pub unavailable: Vec<String>,
-    /// Look-affecting controls the schema maps from no tag.
+    /// Applicable controls without a reproduced value, which need a declaration.
     pub unmapped: Vec<String>,
     /// The batch's JPEGs that render a monochrome native sim.
     pub monochrome: Vec<MonochromeRender>,
@@ -100,33 +102,69 @@ pub fn prefill_settings_parsed(
         .epoch_for(&firmware)
         .ok_or_else(|| FacadeError::Input(format!("no epoch covers firmware {firmware}")))?;
     let values = values_of(metadata);
-    let (settings, problems) = settings_from_makernote_partial(&schema, epoch.id, &values);
+    let classification = classify_render(epoch, &values).ok();
+    let reach = match &classification {
+        Some(classification) => applicable_controls(epoch, &classification.family),
+        None => ApplicableControls {
+            mapped: mapped_controls(epoch),
+            unmapped: unmapped_controls(epoch),
+            spatial: epoch
+                .controls
+                .iter()
+                .filter(|control| control.spatial)
+                .map(|control| control.key.clone())
+                .collect(),
+        },
+    };
+    let (settings, problems) = match &classification {
+        Some(classification) => {
+            settings_from_makernote_for(&schema, epoch.id, &classification.family, &values)
+        }
+        None => settings_from_makernote_partial(&schema, epoch.id, &values),
+    };
+    let mut required: Vec<&looklab_schema::ControlKey> =
+        reach.mapped.iter().chain(&reach.unmapped).collect();
+    if classification
+        .as_ref()
+        .is_some_and(|classification| classification.render_class == RenderClass::Monochrome)
+    {
+        required.extend(reach.spatial.iter());
+    }
     let monochrome = parsed
         .iter()
         .filter(|(name, _)| is_jpeg(name))
         .filter_map(
-            |(name, metadata)| match render_class(epoch, &values_of(metadata)) {
-                RenderClass::Monochrome(sim) => Some(MonochromeRender {
+            |(name, metadata)| match native_render_class(epoch, &values_of(metadata)) {
+                NativeRenderClass::Monochrome(sim) => Some(MonochromeRender {
                     file: (*name).to_owned(),
                     sim: sim.to_string(),
                 }),
-                RenderClass::Colour(_) | RenderClass::Undetermined => None,
+                NativeRenderClass::Colour(_) | NativeRenderClass::Undetermined => None,
             },
         )
         .collect();
     Ok(SettingsPrefill {
         firmware,
-        sim: sim_from_makernote(epoch, &values)
-            .ok()
-            .map(|sim| sim.to_string()),
+        sim: classification
+            .as_ref()
+            .map(|classification| classification.native_sim.to_string())
+            .or_else(|| {
+                sim_from_makernote(epoch, &values)
+                    .ok()
+                    .map(|sim| sim.to_string())
+            }),
+        render_class: classification.as_ref().map(|c| c.render_class),
+        family: classification.as_ref().map(|c| c.family.clone()),
+        mono_filter: classification.as_ref().and_then(|c| c.mono_filter),
         controls: settings
             .entries()
             .iter()
             .map(|setting| (setting.key.to_string(), setting.step))
             .collect(),
         unavailable: problems.iter().map(ToString::to_string).collect(),
-        unmapped: unmapped_controls(epoch)
-            .iter()
+        unmapped: required
+            .into_iter()
+            .filter(|key| settings.get(*key).is_none())
             .map(ToString::to_string)
             .collect(),
         monochrome,
@@ -191,35 +229,35 @@ epochs:
         let mut acros = MakernoteValues::new();
         acros.insert(FujiTag::Saturation, vec![0x0500]);
         assert_eq!(
-            render_class(epoch, &acros),
-            RenderClass::Monochrome("acros".try_into().expect("sim key"))
+            native_render_class(epoch, &acros),
+            NativeRenderClass::Monochrome("acros".try_into().expect("sim key"))
         );
 
         let mut acros_ye = MakernoteValues::new();
         acros_ye.insert(FujiTag::Saturation, vec![0x0502]);
         assert_eq!(
-            render_class(epoch, &acros_ye),
-            RenderClass::Monochrome("acros_ye".try_into().expect("sim key"))
+            native_render_class(epoch, &acros_ye),
+            NativeRenderClass::Monochrome("acros_ye".try_into().expect("sim key"))
         );
 
         let mut both = MakernoteValues::new();
         both.insert(FujiTag::FilmMode, vec![0x0000]);
         both.insert(FujiTag::Saturation, vec![0x0500]);
         assert_eq!(
-            render_class(epoch, &both),
-            RenderClass::Monochrome("acros".try_into().expect("sim key"))
+            native_render_class(epoch, &both),
+            NativeRenderClass::Monochrome("acros".try_into().expect("sim key"))
         );
 
         let mut provia = MakernoteValues::new();
         provia.insert(FujiTag::FilmMode, vec![0x0000]);
         assert_eq!(
-            render_class(epoch, &provia),
-            RenderClass::Colour("provia".try_into().expect("sim key"))
+            native_render_class(epoch, &provia),
+            NativeRenderClass::Colour("provia".try_into().expect("sim key"))
         );
 
         assert_eq!(
-            render_class(epoch, &MakernoteValues::new()),
-            RenderClass::Undetermined
+            native_render_class(epoch, &MakernoteValues::new()),
+            NativeRenderClass::Undetermined
         );
     }
 
@@ -240,6 +278,11 @@ epochs:
         assert_eq!(prefill.firmware, "1.00");
         assert_eq!(prefill.sim.as_deref(), Some("provia"));
         assert!(prefill.unavailable.is_empty(), "{:?}", prefill.unavailable);
-        assert!(prefill.unmapped.is_empty(), "{:?}", prefill.unmapped);
+        for key in &prefill.unmapped {
+            assert!(
+                prefill.controls.iter().all(|(name, _)| name != key),
+                "{key} is both reproduced and required"
+            );
+        }
     }
 }

@@ -19,7 +19,8 @@ use webauthn_rs::prelude::Passkey;
 
 use crate::blob::{BlobHash, BlobStore};
 use crate::body_schema::{
-    SettingsProblem, SnapshotVersionError, validate_render_sims, validate_settings,
+    RenderClassProblem, SettingsProblem, SnapshotVersionError, classify_renders,
+    mono_filter_setting, validate_settings,
 };
 use crate::db::now_unix;
 use crate::error::{ApiError, ApiResult, ErrorCode};
@@ -35,6 +36,8 @@ use crate::trust::{CredentialStanding, NEW_CREDENTIAL_STANDING};
 use crate::verify::verify_assertion;
 
 const NONCE_END: usize = 40;
+
+const DEFERRED_RETENTION_DAYS: i64 = 180;
 
 #[derive(Serialize)]
 pub struct UploadResponse {
@@ -242,8 +245,8 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         return Err(ApiError::new(ErrorCode::MalformedEnvelope));
     }
 
-    let records = state
-        .bodies
+    let bodies = state.bodies.read().await;
+    let records = bodies
         .at(envelope.manifest.community_snapshot_version)
         .map_err(|error| match error {
             SnapshotVersionError::Unknown { .. } => ApiError::new(ErrorCode::SnapshotUnknown),
@@ -252,18 +255,35 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
     let body_record = records
         .get(envelope.manifest.body.as_str())
         .ok_or_else(|| ApiError::new(ErrorCode::BodyUnknown))?;
+    let card_family = match &envelope.manifest.intent {
+        looklab_upload::Intent::Card(looklab_upload::CardDeclaration::Tagged(tag)) => {
+            looklab_schema::LookId::new(tag.look_slug.as_str()).ok()
+        }
+        _ => None,
+    };
+    let classified = classify_renders(
+        body_record,
+        envelope.manifest.firmware_version.as_str(),
+        &envelope.manifest.sim_key,
+        envelope.manifest.render_class,
+        matches!(envelope.manifest.intent, looklab_upload::Intent::Card(_)),
+        card_family.as_ref(),
+        mono_filter_setting(
+            body_record,
+            envelope.manifest.firmware_version.as_str(),
+            &envelope.manifest.settings,
+        ),
+        envelope.manifest.images.iter().map(|image| &image.meta),
+    )
+    .map_err(render_class_error)?;
     validate_settings(
         body_record,
         envelope.manifest.firmware_version.as_str(),
         &envelope.manifest.sim_key,
+        card_family.as_ref(),
         &envelope.manifest.settings,
         matches!(envelope.manifest.intent, looklab_upload::Intent::Card(_)),
-    )
-    .map_err(settings_error)?;
-    validate_render_sims(
-        body_record,
-        envelope.manifest.firmware_version.as_str(),
-        envelope.manifest.images.iter().map(|image| &image.meta),
+        envelope.manifest.render_class == looklab_upload::RenderClass::Monochrome,
     )
     .map_err(settings_error)?;
 
@@ -278,6 +298,7 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         }
         None => None,
     };
+    drop(bodies);
 
     let Envelope {
         manifest,
@@ -299,7 +320,8 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         .images
         .iter()
         .zip(counts)
-        .map(|(image, n_samples)| -> ApiResult<NewImage> {
+        .zip(classified)
+        .map(|((image, n_samples), classified)| -> ApiResult<NewImage> {
             Ok(NewImage {
                 samples_hash: image.blob_sha256,
                 n_samples,
@@ -307,6 +329,10 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
                     .map_err(|_| ApiError::new(ErrorCode::Internal))?,
                 rerender_group: image.rerender_group.map(|group| hex(group.as_bytes())),
                 setting_source: setting_source.clone(),
+                render_class: classified.render_class,
+                native_sim: Some(classified.native_sim),
+                family: Some(classified.family),
+                mono_filter: classified.mono_filter,
             })
         })
         .collect::<ApiResult<Vec<_>>>()?;
@@ -325,6 +351,12 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         }
     };
 
+    let deferred_until = match manifest.render_class {
+        looklab_upload::RenderClass::Colour => None,
+        looklab_upload::RenderClass::Monochrome => {
+            Some(now_unix() + DEFERRED_RETENTION_DAYS * 86_400)
+        }
+    };
     let first_contribution = resolved.existing.is_none();
     let token = if first_contribution {
         Some(StatusToken::generate().map_err(|_| ApiError::new(ErrorCode::Internal))?)
@@ -349,7 +381,9 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         match resolved.existing.clone() {
             Some(id) => CredentialCompletion::Existing(id),
             None => CredentialCompletion::Pending(
-                promotion.ok_or_else(|| ApiError::new(ErrorCode::Internal))?,
+                promotion
+                    .take()
+                    .ok_or_else(|| ApiError::new(ErrorCode::Internal))?,
             ),
         },
         NewContribution {
@@ -369,6 +403,11 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
             sim_key: manifest.sim_key.as_str().to_owned(),
             settings_json: serde_json::to_string(&manifest.settings)
                 .map_err(|_| ApiError::new(ErrorCode::Internal))?,
+            normalized_settings: manifest.settings.clone(),
+            community_snapshot_version: manifest.community_snapshot_version,
+            render_class: manifest.render_class,
+            monochrome_authorization: manifest.monochrome_authorization,
+            deferred_until,
             images,
         },
         token.as_ref(),
@@ -502,7 +541,9 @@ async fn complete(
     if let Some(token) = token {
         store::insert_status_token(&mut tx, &credential_id, &token.hash()).await?;
     }
-    store::enqueue_consistency_score(&mut tx, &contribution.id).await?;
+    if contribution.render_class == looklab_upload::RenderClass::Colour {
+        store::enqueue_consistency_score(&mut tx, &contribution.id).await?;
+    }
     store::clear_staged(&mut tx, &staged.attempt).await?;
     match promotion {
         Some(promotion) => {
@@ -568,13 +609,11 @@ impl StagedUpload {
         }
     }
 
-    /// Verifies the reservation and writes under a transaction the blocking
-    /// task owns; a cancelled request cannot release the write lock early.
+    /// Verifies the reservation and writes under a transaction the blocking task owns.
     async fn acquire(
         &self,
-        tx: sqlx::Transaction<'static, sqlx::Sqlite>,
+        mut tx: sqlx::Transaction<'static, sqlx::Sqlite>,
     ) -> ApiResult<sqlx::Transaction<'static, sqlx::Sqlite>> {
-        let mut tx = tx;
         if !store::reservation_live(&mut tx, &self.attempt, self.distinct_hashes()).await? {
             return Err(ApiError::new(ErrorCode::Busy));
         }
@@ -599,10 +638,25 @@ impl StagedUpload {
     }
 }
 
-fn settings_error(problem: SettingsProblem) -> ApiError {
+fn settings_error(_problem: SettingsProblem) -> ApiError {
+    ApiError::new(ErrorCode::SchemaInvalid)
+}
+
+fn render_class_error(problem: RenderClassProblem) -> ApiError {
     match problem {
-        SettingsProblem::MonochromeSim(_) => ApiError::new(ErrorCode::MonochromeUnsupported),
-        _ => ApiError::new(ErrorCode::SchemaInvalid),
+        RenderClassProblem::ClassMismatch { .. }
+        | RenderClassProblem::SimMismatch { .. }
+        | RenderClassProblem::AmbiguousSim
+        | RenderClassProblem::CardFamilyUnknown
+        | RenderClassProblem::MonochromeUnsupported { .. } => {
+            ApiError::new(ErrorCode::RenderClassMismatch)
+        }
+        RenderClassProblem::Mapping(looklab_schema::MappingError::RenderClassConflict {
+            ..
+        }) => ApiError::new(ErrorCode::RenderClassMismatch),
+        RenderClassProblem::NoEpoch
+        | RenderClassProblem::UnknownSim(_)
+        | RenderClassProblem::Mapping(_) => ApiError::new(ErrorCode::SchemaInvalid),
     }
 }
 

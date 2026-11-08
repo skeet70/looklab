@@ -1327,18 +1327,39 @@ async fn update_reputation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use looklab_fit::synth::{self, SynthConfig};
-    use looklab_fit::{FitOptions, fit};
+    use looklab_fit::synth;
 
-    fn record(result: &FitResult, gauge: f64, convention: GaugeConvention) -> ReleaseRecord {
+    fn synthetic_look() -> Look {
+        synth::truth_look(21)
+    }
+
+    fn synthetic_release(look: &Look, gauge: f64, convention: GaugeConvention) -> ReleaseRecord {
+        let probes = looklab_model::probes::v1()
+            .probes
+            .iter()
+            .enumerate()
+            .map(|(index, probe)| StoredProbe {
+                id: probe.id.clone(),
+                sigma: 0.5 + 0.0001 * index as f64,
+                sigma_post: 0.6 + 0.0001 * index as f64,
+                bias_de: 0.05,
+                pre_clip_identified: true,
+                support: ProbeSupport {
+                    sigma: true,
+                    density: true,
+                    clusters: true,
+                    bias: true,
+                },
+            })
+            .collect();
         ReleaseRecord {
             version: 1,
             gauge,
             gauge_convention: convention,
             anchor: 1,
-            clip_k: result.realization.clip_k,
-            output_space: result.output_space,
-            probes: stored_probes(result),
+            clip_k: look.clip.k,
+            output_space: RgbSpace::Srgb,
+            probes,
             gated_since_anchor: GatedUnion::default(),
             converged: true,
             gate: gate_release(&TrustParams::default(), &GateInput::default()),
@@ -1360,58 +1381,159 @@ mod tests {
         )
     }
 
-    fn fitted() -> FitResult {
-        let dataset = synth::dataset(&SynthConfig {
-            seed: 7,
-            images: 3,
-            samples_per_image: 64,
-            ..SynthConfig::default()
-        });
-        let options = FitOptions {
-            max_sweeps: 8,
-            run_gcv: false,
-            ..FitOptions::default()
-        };
-        fit(&dataset.images, &options).expect("fit")
+    fn identity_estimates(look: &Look, record: &ReleaseRecord) -> VersionProbes {
+        let by_id: BTreeMap<&ProbeId, &StoredProbe> = record
+            .probes
+            .iter()
+            .map(|probe| (&probe.id, probe))
+            .collect();
+        VersionProbes {
+            probes: looklab_model::probes::v1()
+                .probes
+                .into_iter()
+                .map(|probe| {
+                    let stored = by_id.get(&probe.id).expect("stored probe");
+                    ProbeEstimate {
+                        pre_clip: look.eval(probe.xyz).to_array(),
+                        sigma_pre_clip: stored.sigma,
+                        post_clip: post_clip(look, probe.xyz, record.output_space, record.clip_k)
+                            .to_array(),
+                        sigma_post_clip: stored.sigma_post,
+                        bias_de: stored.bias_de,
+                        pre_clip_identified: stored.pre_clip_identified,
+                        support: stored.support,
+                        id: probe.id,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn assert_same_estimates(actual: &VersionProbes, expected: &VersionProbes) {
+        assert_eq!(actual.probes.len(), expected.probes.len());
+        for (actual, expected) in actual.probes.iter().zip(&expected.probes) {
+            assert_eq!(actual.id, expected.id);
+            for channel in 0..3 {
+                assert!(
+                    (actual.pre_clip[channel] - expected.pre_clip[channel]).abs() < 1e-9,
+                    "{} pre-clip channel {channel}: {} vs {}",
+                    actual.id.as_str(),
+                    actual.pre_clip[channel],
+                    expected.pre_clip[channel]
+                );
+                assert!(
+                    (actual.post_clip[channel] - expected.post_clip[channel]).abs() < 1e-9,
+                    "{} post-clip channel {channel}: {} vs {}",
+                    actual.id.as_str(),
+                    actual.post_clip[channel],
+                    expected.post_clip[channel]
+                );
+            }
+            assert_eq!(actual.sigma_pre_clip, expected.sigma_pre_clip);
+            assert_eq!(actual.sigma_post_clip, expected.sigma_post_clip);
+            assert_eq!(actual.bias_de, expected.bias_de);
+            assert_eq!(actual.pre_clip_identified, expected.pre_clip_identified);
+            assert_eq!(actual.support, expected.support);
+        }
     }
 
     #[test]
     fn a_relative_reference_gauge_is_converted_before_gating() {
-        let result = fitted();
-        let candidate = candidate_estimates(&result);
-        let previous = stored_estimates(
-            &result.look,
-            &record(&result, 0.0, GaugeConvention::Relative),
-            0.0,
-        )
-        .expect("relative probes");
+        let look = synthetic_look();
+        let record = synthetic_release(&look, 0.0, GaugeConvention::Relative);
+        let previous = stored_estimates(&look, &record, 0.0).expect("relative probes");
+        let candidate = identity_estimates(&look, &record);
+        assert_same_estimates(&previous, &candidate);
         let gate = gate_against(&candidate, previous);
         assert!(gate.passed, "{:?}", gate.violations);
     }
 
     #[test]
-    fn a_legacy_reference_frame_fails_closed() {
-        let result = fitted();
-        let relative = record(&result, 0.0, GaugeConvention::Relative);
-        assert!(stored_estimates(&result.look, &relative, 0.0).is_ok());
+    fn a_nonzero_reference_gauge_moves_probe_inputs() {
+        let look = synthetic_look();
+        let reference = -1.25;
+        let target = 0.0;
+        let release = synthetic_release(&look, reference, GaugeConvention::Relative);
+        let converted = stored_estimates(&look, &release, target).expect("relative probes");
+        let identity = identity_estimates(&look, &release);
 
-        let legacy = record(&result, 0.0, GaugeConvention::LegacyAbsoluteHeader);
+        let probe = looklab_model::probes::v1()
+            .probes
+            .into_iter()
+            .find(|probe| probe.id.as_str() == "gray-s+0.00")
+            .expect("v1 contains a mid gray probe");
+        let stored = converted
+            .probes
+            .iter()
+            .find(|estimate| estimate.id == probe.id)
+            .expect("stored probe");
+        let identity_probe = identity
+            .probes
+            .iter()
+            .find(|estimate| estimate.id == probe.id)
+            .expect("identity probe");
+        let expected = look
+            .eval(probe.xyz.scale(libm::pow(2.0, target - reference)))
+            .to_array();
+
+        assert!(
+            (stored.pre_clip[0] - identity_probe.pre_clip[0]).abs() > 1e-3,
+            "a nonzero reference gauge must move the probe input"
+        );
+        for channel in 0..3 {
+            assert!(
+                (stored.pre_clip[channel] - expected[channel]).abs() < 1e-9,
+                "{} channel {channel}: {} vs {}",
+                probe.id.as_str(),
+                stored.pre_clip[channel],
+                expected[channel]
+            );
+        }
+
+        let recorded = release
+            .probes
+            .iter()
+            .find(|stored| stored.id == probe.id)
+            .expect("recorded probe");
+        assert_eq!(stored.sigma_pre_clip, recorded.sigma);
+        assert_eq!(stored.sigma_post_clip, recorded.sigma_post);
+        assert_eq!(stored.bias_de, recorded.bias_de);
+        assert_eq!(stored.pre_clip_identified, recorded.pre_clip_identified);
+        assert_eq!(stored.support, recorded.support);
+    }
+
+    #[test]
+    fn a_legacy_reference_frame_fails_closed() {
+        let look = synthetic_look();
+        let relative = synthetic_release(&look, 0.0, GaugeConvention::Relative);
+        let estimates = stored_estimates(&look, &relative, 0.0).expect("relative probes");
+        assert_same_estimates(&estimates, &identity_estimates(&look, &relative));
+
+        let legacy = synthetic_release(&look, 0.0, GaugeConvention::LegacyAbsoluteHeader);
         assert!(matches!(
-            stored_estimates(&result.look, &legacy, 0.0),
+            stored_estimates(&look, &legacy, 0.0),
             Err(WorkerError::MigrationRequired { version: 1 })
         ));
     }
 
     #[test]
     fn a_persisted_header_median_does_not_convert_a_legacy_frame() {
-        let result = fitted();
-        let mut value =
-            serde_json::to_value(record(&result, 4.0, GaugeConvention::LegacyAbsoluteHeader))
-                .expect("release json");
+        let look = synthetic_look();
+        let mut value = serde_json::to_value(synthetic_release(
+            &look,
+            4.0,
+            GaugeConvention::LegacyAbsoluteHeader,
+        ))
+        .expect("release json");
         value["gauge_median_header_ev"] = serde_json::json!(10.0);
         let legacy: ReleaseRecord = serde_json::from_value(value).expect("legacy release");
+        assert_eq!(
+            legacy.gauge_convention,
+            GaugeConvention::LegacyAbsoluteHeader
+        );
+        assert_eq!(legacy.gauge, 4.0);
         assert!(matches!(
-            stored_estimates(&result.look, &legacy, 0.0),
+            stored_estimates(&look, &legacy, 0.0),
             Err(WorkerError::MigrationRequired { version: 1 })
         ));
     }

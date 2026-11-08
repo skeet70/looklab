@@ -27,7 +27,7 @@ const BUILD_ID_TABLE: &[u8] = concat!(
     env!("CARGO_PKG_VERSION"),
     "\0ll_alloc\0ll_free\0ll_call\0",
     "version\0prepare\0build_manifest\0build_send_manifest\0encode_envelope\0solve_pow\0parse_envelope\0",
-    "abi=1\0prep=1",
+    "abi=1\0prep=2",
 )
 .as_bytes();
 

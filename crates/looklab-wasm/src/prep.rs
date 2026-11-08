@@ -12,8 +12,8 @@ use looklab_prep_module::{
 };
 use looklab_upload::{
     BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion, ContributionKind,
-    ControlEntry, ControlKey, ControlSettings, Intent, Limits, LookSlug, ManifestHash, Nonce,
-    SettingSource, SimKey, StepIndex,
+    ControlEntry, ControlKey, ControlSettings, Intent, Limits, LookSlug, ManifestHash,
+    MonochromeAuthorization, Nonce, RenderClass, SettingSource, SimKey, StepIndex,
 };
 
 use crate::error::FacadeError;
@@ -31,6 +31,8 @@ pub struct ControlSetting {
 pub struct GroupSettings {
     pub kind: ContributionKind,
     pub intent: IntentChoice,
+    pub render_class: RenderClass,
+    pub monochrome_authorization: Option<MonochromeAuthorization>,
     pub body: String,
     pub firmware: String,
     pub sim: String,
@@ -164,6 +166,8 @@ pub fn build_manifest_request(
     let request = BuildManifestRequest {
         kind: settings.kind,
         intent: settings.intent.clone().into_intent()?,
+        render_class: settings.render_class,
+        monochrome_authorization: settings.monochrome_authorization,
         body: BodyId::new(&settings.body).map_err(|error| FacadeError::Id(error.to_string()))?,
         firmware: looklab_upload::FirmwareVersionString::new(&settings.firmware)
             .map_err(|error| FacadeError::Id(error.to_string()))?,

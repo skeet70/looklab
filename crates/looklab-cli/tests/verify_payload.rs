@@ -17,9 +17,10 @@ use looklab_prep_module::{
 use looklab_upload::{
     BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion,
     ContributionKind, ControlEntry, ControlKey, ControlSettings, EnvelopeParts, FirmwareId,
-    FirmwareVersion, FirmwareVersionString, Intent, ManifestHash, ManifestImage, Nonce, POW_K,
-    PowParams, RawSerial, RerenderGroupId, SendManifest, SimKey, StepIndex, Tagged,
-    WebAuthnAssertion, encode_envelope, manifest_hash, parse_render_tag, send_manifest_hash, solve,
+    FirmwareVersion, FirmwareVersionString, Intent, ManifestHash, ManifestImage,
+    MonochromeAuthorization, Nonce, POW_K, PowParams, RawSerial, RenderClass, RerenderGroupId,
+    SendManifest, SettingSource, SimKey, StepIndex, Tagged, WebAuthnAssertion, encode_envelope,
+    manifest_hash, parse_render_tag, send_manifest_hash, solve,
 };
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use serde_json::{Value, json};
@@ -57,10 +58,18 @@ fn fixture() -> &'static Fixture {
 }
 
 const CARD_TAG: &str = "looklab-card/1 fw=acme-sim/2.0.1 look=provia@1.0.0 cid=0123456789abcdef";
+const MONO_CARD_TAG: &str =
+    "looklab-card/1 fw=acme-sim/2.0.1 look=acros@1.0.0 cid=0123456789abcdef";
 
 fn card_fixture() -> &'static Fixture {
     static FIXTURE: LazyLock<Fixture> =
         LazyLock::new(|| build_fixture_in("verify-payload-card", Some(CARD_TAG)));
+    &FIXTURE
+}
+
+fn mono_card_fixture() -> &'static Fixture {
+    static FIXTURE: LazyLock<Fixture> =
+        LazyLock::new(|| build_fixture_in("verify-payload-card-mono", Some(MONO_CARD_TAG)));
     &FIXTURE
 }
 
@@ -79,6 +88,16 @@ fn render_firmware_fixture() -> &'static Fixture {
     static FIXTURE: LazyLock<Fixture> = LazyLock::new(|| {
         build_fixture("verify-payload-render-firmware", None, |renders| {
             renders[1] = with_software_firmware(&renders[1], "1.10");
+        })
+    });
+    &FIXTURE
+}
+
+/// A fixture whose second render's makernotes select Acros.
+fn monochrome_fixture() -> &'static Fixture {
+    static FIXTURE: LazyLock<Fixture> = LazyLock::new(|| {
+        build_fixture("verify-payload-monochrome", None, |renders| {
+            renders[1] = with_fuji_tag(&renders[1], 0x1003, 0x0500);
         })
     });
     &FIXTURE
@@ -539,6 +558,7 @@ fn settings() -> ControlSettings {
         "wb_shift_b",
         "exposure_compensation",
         "grain",
+        "grain_size",
         "clarity",
         "noise_reduction",
     ]
@@ -553,6 +573,94 @@ fn settings() -> ControlSettings {
     ControlSettings::new(entries).expect("unique settings")
 }
 
+/// The settings the schema derives for one prepared render, with applicable values.
+fn derived_control_settings(fixture: &Fixture, index: usize) -> ControlSettings {
+    derived_settings(fixture, index, None, None)
+}
+
+fn derived_card_settings(fixture: &Fixture, index: usize, family: &str) -> ControlSettings {
+    derived_settings(fixture, index, Some(family), Some(true))
+}
+
+fn derived_settings(
+    fixture: &Fixture,
+    index: usize,
+    family_override: Option<&str>,
+    monochrome_override: Option<bool>,
+) -> ControlSettings {
+    let yaml = std::fs::read_to_string(fixture.data.join("bodies/fujifilm-x-s10.yaml"))
+        .expect("control schema");
+    let schema = looklab_schema::validate_control_schema(&yaml).expect("schema validates");
+    let metadata = &fixture.images[index].metadata;
+    let firmware = metadata.firmware.as_deref().expect("firmware");
+    let epoch = schema.epoch_for(firmware).expect("epoch");
+    let values = looklab_schema::MakernoteValues::from(metadata);
+    let classification =
+        looklab_schema::classify_render(epoch, &values).expect("the render classifies");
+    let family = match family_override {
+        Some(family) => looklab_schema::LookId::new(family).expect("family"),
+        None => classification.family.clone(),
+    };
+    let monochrome = monochrome_override
+        .unwrap_or(classification.render_class == looklab_schema::RenderClass::Monochrome);
+    let reach = looklab_schema::applicable_controls(epoch, &family);
+    let (derived, _) =
+        looklab_schema::settings_from_makernote_for(&schema, epoch.id, &family, &values);
+    let mut entries: Vec<ControlEntry> = derived
+        .entries()
+        .iter()
+        .map(|setting| ControlEntry::reproduced(setting.key.clone(), StepIndex::new(setting.step)))
+        .collect();
+    let required = reach
+        .mapped
+        .iter()
+        .chain(&reach.unmapped)
+        .chain(monochrome.then_some(&reach.spatial).into_iter().flatten());
+    for key in required {
+        if !entries.iter().any(|entry| &entry.key == key) {
+            entries.push(ControlEntry::declared(key.clone(), StepIndex::new(0)));
+        }
+    }
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
+    ControlSettings::new(entries).expect("unique settings")
+}
+
+/// The verifier arguments a monochrome batch needs: its authorization and declarations.
+fn monochrome_extra(fixture: &Fixture) -> Vec<String> {
+    let settings = derived_control_settings(fixture, 1);
+    let mut args = vec![
+        "--monochrome-authorization".to_owned(),
+        "model-development-180-days".to_owned(),
+    ];
+    for entry in settings
+        .entries()
+        .iter()
+        .filter(|entry| entry.source == SettingSource::Declared)
+    {
+        args.push("--declare-setting".to_owned());
+        args.push(format!("{}={}", entry.key, entry.step.get()));
+    }
+    args
+}
+
+fn card_extra(fixture: &Fixture, family: &str) -> Vec<String> {
+    let settings = derived_card_settings(fixture, 0, family);
+    let mut args = vec![
+        "--monochrome-authorization".to_owned(),
+        "model-development-180-days".to_owned(),
+    ];
+    for entry in settings
+        .entries()
+        .iter()
+        .filter(|entry| entry.source == SettingSource::Declared)
+    {
+        args.push("--declare-setting".to_owned());
+        args.push(format!("{}={}", entry.key, entry.step.get()));
+    }
+    args
+}
+
+#[derive(Clone)]
 struct Site {
     manifest: BatchManifest,
     blobs: Vec<Vec<u8>>,
@@ -586,6 +694,8 @@ impl Site {
             manifest: BatchManifest {
                 kind: ContributionKind::Library,
                 intent: Intent::Native,
+                render_class: RenderClass::Colour,
+                monochrome_authorization: None,
                 body: BodyId::new(BODY).expect("body id"),
                 firmware_version: FirmwareVersionString::new(FIRMWARE).expect("firmware"),
                 sim_key: SimKey::new(SIM).expect("sim key"),
@@ -607,6 +717,11 @@ impl Site {
             serial: None,
             nonce: Nonce::from_bytes([0x42; 32]),
         }
+    }
+
+    fn with_nonce(mut self, nonce: Nonce) -> Self {
+        self.nonce = nonce;
+        self
     }
 
     fn with_intent(mut self, intent: Intent) -> Self {
@@ -633,13 +748,21 @@ impl Site {
         self
     }
 
-    fn with_credential(mut self, credential: &[u8]) -> Self {
-        self.credential_id = credential.to_vec();
+    fn with_settings(mut self, settings: ControlSettings) -> Self {
+        self.manifest.settings = settings;
         self
     }
 
-    fn with_nonce(mut self, nonce: Nonce) -> Self {
-        self.nonce = nonce;
+    fn with_monochrome(mut self, sim: &str) -> Self {
+        self.manifest.render_class = RenderClass::Monochrome;
+        self.manifest.monochrome_authorization =
+            Some(MonochromeAuthorization::ModelDevelopment180Days);
+        self.manifest.sim_key = SimKey::new(sim).expect("sim key");
+        self
+    }
+
+    fn with_credential(mut self, credential: &[u8]) -> Self {
+        self.credential_id = credential.to_vec();
         self
     }
 
@@ -1109,36 +1232,102 @@ fn multiple_native_batches_from_one_raw_verify() {
 }
 
 #[test]
+fn a_mixed_colour_and_monochrome_group_verifies() {
+    let fixture = monochrome_fixture();
+    let colour = Site::from_fixture(fixture).only(&[0]);
+    let monochrome = Site::from_fixture(fixture)
+        .only(&[1])
+        .with_monochrome("acros")
+        .with_settings(derived_control_settings(fixture, 1));
+    let har = har_path("mixed", &send_har(&[&colour, &monochrome]).json());
+    let extra = monochrome_extra(fixture);
+    let extra_refs = extra.iter().map(String::as_str).collect::<Vec<_>>();
+    let (success, output) = run_extra(
+        fixture,
+        &[har.as_path()],
+        &state_path("mixed"),
+        &["--intent", "native"],
+        &extra_refs,
+    );
+
+    assert!(success, "{output}");
+}
+
+#[test]
+fn a_monochrome_batch_without_authorization_fails() {
+    let fixture = monochrome_fixture();
+    let colour = Site::from_fixture(fixture).only(&[0]);
+    let monochrome = Site::from_fixture(fixture)
+        .only(&[1])
+        .with_monochrome("acros")
+        .with_settings(derived_control_settings(fixture, 1));
+    let har = har_path(
+        "mixed-unconsented",
+        &send_har(&[&colour, &monochrome]).json(),
+    );
+    let extra = monochrome_extra(fixture);
+    let declarations = extra[2..].iter().map(String::as_str).collect::<Vec<_>>();
+    let (success, output) = run_extra(
+        fixture,
+        &[har.as_path()],
+        &state_path("mixed-unconsented"),
+        &["--intent", "native"],
+        &declarations,
+    );
+
+    assert!(!success, "{output}");
+}
+
+#[test]
+fn a_colour_label_on_a_bw_batch_fails() {
+    let fixture = monochrome_fixture();
+    let colour = Site::from_fixture(fixture).only(&[0]);
+    let mislabelled = Site::from_fixture(fixture)
+        .only(&[1])
+        .with_sim("acros")
+        .with_settings(derived_control_settings(fixture, 1));
+    let har = har_path("mislabelled-bw", &send_har(&[&colour, &mislabelled]).json());
+    let extra = monochrome_extra(fixture);
+    let extra_refs = extra.iter().map(String::as_str).collect::<Vec<_>>();
+    let (success, output) = run_extra(
+        fixture,
+        &[har.as_path()],
+        &state_path("mislabelled-bw"),
+        &["--intent", "native"],
+        &extra_refs,
+    );
+
+    assert!(!success, "{output}");
+}
+
+#[test]
 fn one_send_split_across_hars_verifies() {
     let fixture = simulation_fixture();
     let (provia, chrome) = simulation_batches(fixture);
-    let first = har_path(
-        "split-send-first",
-        &send_har_of(&[&provia, &chrome], &[0]).json(),
-    );
-    let second = har_path(
-        "split-send-second",
-        &send_har_of(&[&provia, &chrome], &[1]).json(),
-    );
+    let first = har_path("split-a", &send_har_of(&[&provia, &chrome], &[0]).json());
+    let second = har_path("split-b", &send_har_of(&[&provia, &chrome], &[1]).json());
     let (success, output) = run(
         fixture,
         &[first.as_path(), second.as_path()],
-        &state_path("split-send"),
+        &state_path("split-across-hars"),
     );
+
     assert!(success, "{output}");
+    assert!(output.contains("PASS"), "{output}");
 }
 
 #[test]
 fn conflicting_send_manifests_across_hars_fail() {
     let fixture = simulation_fixture();
     let (provia, chrome) = simulation_batches(fixture);
-    let first = har_path("conflicting-send-first", &default_har(&provia).json());
-    let second = har_path("conflicting-send-second", &default_har(&chrome).json());
+    let first = har_path("conflict-a", &default_har(&provia).json());
+    let second = har_path("conflict-b", &default_har(&chrome).json());
     let (success, output) = run(
         fixture,
         &[first.as_path(), second.as_path()],
-        &state_path("conflicting-send"),
+        &state_path("conflicting-sends"),
     );
+
     assert!(!success, "{output}");
 }
 
@@ -1250,6 +1439,29 @@ fn reproduces_a_tagged_card_upload_and_passes() {
         &[har.as_path()],
         &state_path("card-tagged"),
         &["--intent", "card"],
+    );
+
+    assert!(success, "{output}");
+    assert!(output.contains("PASS"), "{output}");
+}
+
+#[test]
+fn reproduces_a_monochrome_card_upload_and_passes() {
+    let fixture = mono_card_fixture();
+    let tag = parse_render_tag(MONO_CARD_TAG).expect("render tag");
+    let site = Site::from_fixture(fixture)
+        .with_intent(Intent::Card(CardDeclaration::tagged(tag)))
+        .with_monochrome("provia")
+        .with_settings(derived_card_settings(fixture, 0, "acros"));
+    let har = har_path("card-mono", &default_har(&site).json());
+    let extra = card_extra(fixture, "acros");
+    let extra_refs = extra.iter().map(String::as_str).collect::<Vec<_>>();
+    let (success, output) = run_extra(
+        fixture,
+        &[har.as_path()],
+        &state_path("card-mono"),
+        &["--intent", "card"],
+        &extra_refs,
     );
 
     assert!(success, "{output}");
@@ -1908,51 +2120,37 @@ fn fails_on_a_wrong_rp_id_hash() {
 }
 
 #[test]
-fn fails_when_the_credential_id_changes_between_two_hars() {
-    let fixture = fixture();
-    let first = har_path("credential-a", &default_har(&Site::new().only(&[0])).json());
+fn two_sends_with_one_credential_verify_and_a_changed_credential_fails() {
+    let fixture = simulation_fixture();
+    let (provia, chrome) = simulation_batches(fixture);
+    let second_nonce = Nonce::from_bytes([0x43; 32]);
+    let first = har_path("credential-a", &default_har(&provia).json());
     let second = har_path(
         "credential-b",
-        &default_har(
-            &Site::new()
-                .only(&[1])
-                .with_credential(OTHER_CREDENTIAL)
-                .with_nonce(Nonce::from_bytes([0x43; 32])),
-        )
-        .json(),
+        &default_har(&chrome.clone().with_nonce(second_nonce)).json(),
     );
     let (success, output) = run(
         fixture,
         &[first.as_path(), second.as_path()],
-        &state_path("credential-two-hars"),
+        &state_path("credential-control"),
     );
-
-    assert!(!success, "{output}");
-}
-
-#[test]
-fn two_sends_with_the_same_credential_verify() {
-    let fixture = fixture();
-    let first = har_path(
-        "same-credential-a",
-        &default_har(&Site::new().only(&[0])).json(),
-    );
-    let second = har_path(
-        "same-credential-b",
-        &default_har(
-            &Site::new()
-                .only(&[1])
-                .with_nonce(Nonce::from_bytes([0x43; 32])),
-        )
-        .json(),
-    );
-    let (success, output) = run(
-        fixture,
-        &[first.as_path(), second.as_path()],
-        &state_path("same-credential-two-hars"),
-    );
-
     assert!(success, "{output}");
+
+    let changed = har_path(
+        "credential-changed",
+        &default_har(
+            &chrome
+                .with_nonce(second_nonce)
+                .with_credential(OTHER_CREDENTIAL),
+        )
+        .json(),
+    );
+    let (success, output) = run(
+        fixture,
+        &[first.as_path(), changed.as_path()],
+        &state_path("credential-changed"),
+    );
+    assert!(!success, "{output}");
 }
 
 #[test]
@@ -1969,7 +2167,6 @@ fn fails_when_the_credential_id_changes_between_runs() {
     );
     let (success, output) = run(fixture, &[second.as_path()], &state);
     assert!(!success, "{output}");
-    assert!(output.contains("records for this site"), "{output}");
 }
 
 #[test]

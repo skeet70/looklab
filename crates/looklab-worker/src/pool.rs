@@ -16,7 +16,7 @@ use looklab_upload::{BodyId, LookSlug};
 use looklab_upload::{ControlSettings, SettingSource};
 use sqlx::SqlitePool;
 
-use crate::body::{BodyResources, BodyTransforms, DataDir, TransformDir, epoch_for, resolve_look};
+use crate::body::{BodyResources, BodyTransforms, TransformDir, epoch_for, resolve_look};
 use crate::config::WorkerConfig;
 use crate::db::{self, ContributionRow, CredentialInfo, ImageId, ImageOutcome, ImageRow};
 use crate::error::{Result, WorkerError};
@@ -78,7 +78,7 @@ pub async fn build(
     body: &BodyId,
     look: &LookSlug,
 ) -> Result<LookPool> {
-    let resources = DataDir::new(&config.data).load(body)?;
+    let resources = crate::body::data_dir(config)?.load(body)?;
     let transforms = TransformDir::new(&config.transforms).load(body)?;
     let rows = db::body_pool(db_pool, body).await?;
     let exclusions = db::look_credential_exclusions(db_pool, look.as_str()).await?;
@@ -314,7 +314,7 @@ pub async fn looks_for_body(
     config: &WorkerConfig,
     body: &BodyId,
 ) -> Result<Vec<LookSlug>> {
-    let resources = DataDir::new(&config.data).load(body)?;
+    let resources = crate::body::data_dir(config)?.load(body)?;
     let rows = db::body_pool(db_pool, body).await?;
     let mut looks = Vec::new();
     for (contribution, images) in rows {

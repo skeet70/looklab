@@ -24,6 +24,42 @@ pub struct DataDir {
     root: PathBuf,
 }
 
+/// The newest approved community snapshot, or the shipped data at version 0.
+pub fn current_snapshot(
+    snapshot_dir: &std::path::Path,
+    shipped: &std::path::Path,
+) -> Result<(u64, PathBuf)> {
+    let entries = match std::fs::read_dir(snapshot_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((0, shipped.to_owned()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut newest: Option<(u64, PathBuf)> = None;
+    for entry in entries {
+        let path = entry?.path();
+        let Some(version) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix('v'))
+            .and_then(|digits| digits.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if path.is_dir() && newest.as_ref().is_none_or(|(known, _)| version > *known) {
+            newest = Some((version, path));
+        }
+    }
+    Ok(newest.unwrap_or_else(|| (0, shipped.to_owned())))
+}
+
+/// Body and schema data from the newest approved community snapshot.
+pub fn data_dir(config: &crate::config::WorkerConfig) -> Result<DataDir> {
+    let (_, root) = current_snapshot(&config.snapshot_dir, &config.data)?;
+    Ok(DataDir::new(root))
+}
+
 impl DataDir {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -36,8 +72,19 @@ impl DataDir {
     pub fn load(&self, body: &BodyId) -> Result<BodyResources> {
         let stem = Self::stem(body);
         let root = self.root.join("bodies");
-        let body_path = root.join(format!("{stem}.body.yaml"));
-        let schema_path = root.join(format!("{stem}.yaml"));
+        let exported = self.root.join(looklab_schema::body_export_path(body));
+        // Snapshot exports encode `/`; the shipped data names bodies with `-`.
+        let (body_path, schema_path) = if exported.is_file() {
+            (
+                exported,
+                self.root.join(looklab_schema::schema_export_path(body)),
+            )
+        } else {
+            (
+                root.join(format!("{stem}.body.yaml")),
+                root.join(format!("{stem}.yaml")),
+            )
+        };
         let body_text = std::fs::read_to_string(&body_path)
             .map_err(|error| WorkerError::Data(format!("{}: {error}", body_path.display())))?;
         let schema_text = std::fs::read_to_string(&schema_path)

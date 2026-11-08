@@ -2,9 +2,9 @@
 
 use looklab_prep::PREP_VERSION;
 use looklab_prep_module::{
-    AssertionFields, BuildManifestRequest, EncodeEnvelopeRequest, Function, ManifestImageInput,
-    ModuleError, ParseEnvelopeRequest, PowParamsSpec, Response, SolvePowRequest, VersionRequest,
-    VersionResponse, dispatch,
+    AssertionFields, BuildManifestRequest, BuildSendManifestRequest, EncodeEnvelopeRequest,
+    Function, ManifestImageInput, ModuleError, ParseEnvelopeRequest, PowParamsSpec, Response,
+    SolvePowRequest, VersionRequest, VersionResponse, dispatch,
 };
 use looklab_samples::{
     InputSpace, OutputSpace, PrepParamsHash, PrepVersion, PriorTransformVersion, SampleFlags,
@@ -12,8 +12,8 @@ use looklab_samples::{
 };
 use looklab_upload::{
     BlobKind, BodyId, Challenge, CommunitySnapshotVersion, ContributionKind, ControlSettings,
-    FirmwareVersionString, Intent, Limits, ManifestMetadata, Nonce, POW_K, SimKey, manifest_hash,
-    verify,
+    FirmwareVersionString, Intent, Limits, ManifestMetadata, MonochromeAuthorization, Nonce, POW_K,
+    RenderClass, SimKey, manifest_hash, verify,
 };
 
 fn call<T: serde::Serialize, U: serde::de::DeserializeOwned>(
@@ -76,6 +76,8 @@ fn manifest_request(nonce: Nonce, blob: Vec<u8>) -> BuildManifestRequest {
     BuildManifestRequest {
         kind: ContributionKind::Library,
         intent: Intent::Native,
+        render_class: RenderClass::Colour,
+        monochrome_authorization: None,
         body: BodyId::new("fujifilm/x-t5").expect("body id is valid"),
         firmware: FirmwareVersionString::new("2.10").expect("firmware is valid"),
         sim: SimKey::new("classic-chrome").expect("sim key is valid"),
@@ -133,9 +135,10 @@ fn envelope_round_trips_through_build_encode_and_parse() {
         built.challenge,
         Challenge::new(&nonce, &built.manifest_hash)
     );
+
     let send = call(
         Function::BuildSendManifest,
-        &looklab_prep_module::BuildSendManifestRequest {
+        &BuildSendManifestRequest {
             nonce,
             manifest_hashes: vec![built.manifest_hash],
         },
@@ -148,7 +151,7 @@ fn envelope_round_trips_through_build_encode_and_parse() {
 
     let encode = EncodeEnvelopeRequest {
         nonce,
-        send_manifest_bytes: send.send_manifest_bytes,
+        send_manifest_bytes: send.send_manifest_bytes.clone(),
         manifest_bytes: built.manifest_bytes.clone(),
         assertion: AssertionFields {
             credential_id: vec![1],
@@ -188,6 +191,8 @@ fn envelope_round_trips_through_build_encode_and_parse() {
     )
     .expect("envelope parses");
     assert_eq!(parsed.nonce, nonce);
+    assert_eq!(parsed.send_manifest_bytes, send.send_manifest_bytes);
+    assert_eq!(parsed.send_manifest_hash, send.send_manifest_hash);
     assert_eq!(parsed.manifest, manifest);
     assert_eq!(parsed.manifest_bytes, built.manifest_bytes);
     assert_eq!(parsed.assertion, encode.assertion);
@@ -204,6 +209,37 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     out
+}
+
+#[test]
+fn a_monochrome_manifest_carries_its_authorization() {
+    let mut request = manifest_request(Nonce::from_bytes([8; 32]), sample_blob());
+    request.render_class = RenderClass::Monochrome;
+    request.monochrome_authorization = Some(MonochromeAuthorization::ModelDevelopment180Days);
+    let built = call(
+        Function::BuildManifest,
+        &request,
+        |response| match response {
+            Response::BuildManifest(built) => built,
+            other => panic!("unexpected response {other:?}"),
+        },
+    )
+    .expect("monochrome manifest builds");
+    let manifest: looklab_upload::BatchManifest =
+        postcard::from_bytes(&built.manifest_bytes).expect("manifest bytes decode");
+    assert_eq!(manifest.render_class, RenderClass::Monochrome);
+    assert_eq!(
+        manifest.monochrome_authorization,
+        Some(MonochromeAuthorization::ModelDevelopment180Days)
+    );
+}
+
+#[test]
+fn a_monochrome_manifest_without_authorization_is_rejected() {
+    let mut request = manifest_request(Nonce::from_bytes([8; 32]), sample_blob());
+    request.render_class = RenderClass::Monochrome;
+    let result = call(Function::BuildManifest, &request, std::convert::identity);
+    assert!(matches!(result, Err(ModuleError::Manifest { .. })));
 }
 
 #[test]

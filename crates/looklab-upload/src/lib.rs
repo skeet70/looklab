@@ -33,14 +33,15 @@ pub use looklab_meta::{
 };
 pub use looklab_samples::RerenderGroupId;
 pub use manifest::{
-    BatchManifest, BlobKind, IntentError, ManifestImage, SettingReach, SettingsSourceError,
-    canonical_manifest_bytes, manifest_hash, validate_setting_sources,
+    BatchManifest, BlobKind, IntentError, ManifestImage, MonochromeAuthorization, RenderClass,
+    RenderClassError, SettingReach, SettingsSourceError, canonical_manifest_bytes, manifest_hash,
+    validate_setting_sources,
 };
 pub use metadata::{
     BadMonth, CaptureMonth, DynamicRange, DynamicRangeSetting, EffectStrength, FilmMode,
-    GrainRoughness, GrainSize, LookSettings, ManifestMetadata, MetadataError, MetadataField,
-    MonochromeFilter, NoiseReduction, Saturation, Sharpness, Tagged, WhiteBalanceFineTune,
-    WhiteBalanceMode, WhiteBalanceMultipliers, WhiteBalanceShift,
+    GrainRoughness, GrainSize, LookSettings, MagentaGreen, ManifestMetadata, MetadataError,
+    MetadataField, MonochromeFilter, NoiseReduction, Saturation, Sharpness, Tagged, WarmCool,
+    WhiteBalanceFineTune, WhiteBalanceMode, WhiteBalanceMultipliers, WhiteBalanceShift,
 };
 pub use nonce::{Challenge, ManifestHash, Nonce, SendManifestHash};
 pub use pow::{POW_K, PowError, PowParams, PowSolutions, solve, verify};

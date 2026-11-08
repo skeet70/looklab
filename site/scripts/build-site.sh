@@ -108,6 +108,7 @@ for css in "$root/site/styles.css" "$root"/site/styles/*.css; do
   [ -f "$css" ] || continue
   cp -- "$css" "$stage/$(basename -- "$css")"
 done
+cp -- "$root/site/favicon.ico" "$stage/favicon.ico"
 
 for name in data workers generated; do
   [ -d "$root/site/$name" ] || continue

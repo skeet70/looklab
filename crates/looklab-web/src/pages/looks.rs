@@ -93,9 +93,16 @@ struct GalleryReady {
     items: Vec<ui::LookCardItem>,
 }
 
+/// What the published catalog can show on the gallery page.
+#[derive(Clone, Debug)]
+enum Gallery {
+    Collecting,
+    Ready(GalleryReady),
+}
+
 #[component]
 pub fn LooksPage() -> impl IntoView {
-    let state = RwSignal::new(Load::<GalleryReady>::Loading);
+    let state = RwSignal::new(Load::<Gallery>::Loading);
     let filter = RwSignal::new(String::new());
     let camera = RwSignal::new(None::<looklab_schema::BodyId>);
     Effect::new(move |_| {
@@ -103,8 +110,11 @@ pub fn LooksPage() -> impl IntoView {
             state.set(
                 match async {
                     let index = data::index().await?;
-                    let scene = photo().await?;
                     let mut items = cards(&index);
+                    if items.is_empty() {
+                        return Ok(Gallery::Collecting);
+                    }
+                    let scene = photo().await?;
                     for item in &mut items {
                         let loaded =
                             data::version(item.slug.as_str(), item.version.as_str()).await?;
@@ -120,11 +130,11 @@ pub fn LooksPage() -> impl IntoView {
                             };
                         }
                     }
-                    Ok(GalleryReady {
+                    Ok(Gallery::Ready(GalleryReady {
                         index,
                         scene,
                         items,
-                    })
+                    }))
                 }
                 .await
                 {
@@ -137,12 +147,23 @@ pub fn LooksPage() -> impl IntoView {
     view! {
         <h1>"Find your next look"</h1>
         <p class="lede">"Explore color from other cameras. Find a look, then make it yours."</p>
-        <label for="look-filter">"Search looks"</label>
-        <input id="look-filter" type="search" placeholder="Search by name or character" on:input=move |event| filter.set(event_target_value(&event))/>
         {move || match state.get() {
             Load::Loading => ui::loading().into_any(), Load::Failed(error) => ui::failure(&error).into_any(),
-            Load::Ready(GalleryReady { index, scene, items }) => {
+            Load::Ready(Gallery::Collecting) => {
+                crate::prefetch::route_rendered();
                 view! {
+                    <ui::EmptyState title="No looks are published yet".to_owned() message="looklab measures a camera's color from RAW and JPEG pairs shared by the people who shoot it. Looks are published once a camera has enough checked photos.".to_owned()>
+                        <p class="field-row">
+                            <a class="button" href=crate::base::site_url("/contribute")>"Share photos you already have"</a>
+                            <a href=crate::base::site_url("/about/how-it-works")>"How looks are made →"</a>
+                        </p>
+                    </ui::EmptyState>
+                }.into_any()
+            },
+            Load::Ready(Gallery::Ready(GalleryReady { index, scene, items })) => {
+                view! {
+                    <label for="look-filter">"Search looks"</label>
+                    <input id="look-filter" type="search" placeholder="Search by name or character" on:input=move |event| filter.set(event_target_value(&event))/>
                     <ui::CameraPicker cameras=index.bodies.clone() selected=camera label="Filter by camera".to_owned()/>
                     <div class="look-gallery">{move || {
                         let needle = filter.get().to_lowercase();

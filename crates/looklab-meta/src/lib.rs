@@ -19,8 +19,8 @@ pub use exif::{ExifData, ImageUniqueId, ParsedMetadata};
 pub use fuji::{
     Clarity, ColorSaturation, DevelopmentDynamicRange, DynamicRange, DynamicRangeSetting,
     EffectStrength, FilmMode, FujiMakernote, FujiTag, GrainRoughness, GrainSize, ImageGeneration,
-    LookSettings, MonochromeFilter, NoiseReduction, ParsedPair, ParsedTag, Sharpness,
-    ToneAdjustment, WhiteBalanceFineTune, WhiteBalanceMode,
+    LookSettings, MagentaGreen, MonochromeFilter, NoiseReduction, ParsedPair, ParsedTag, Sharpness,
+    ToneAdjustment, WarmCool, WhiteBalanceFineTune, WhiteBalanceMode,
 };
 pub use render_tag::{
     CONTENT_ID_PREFIX_LEN, FirmwareId, FirmwareVersion, MAX_FIRMWARE_ID_LEN,

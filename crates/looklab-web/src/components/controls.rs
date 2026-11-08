@@ -361,7 +361,8 @@ pub fn CameraPicker(
                 let plan = looklab_wasm::inspect_files(&[(file.name(), bytes)]).map_err(|_| "Could not read camera information. Choose your camera by name.".to_owned())?;
                 let fact = plan.facts.first().ok_or_else(|| "No camera information found. Choose your camera by name.".to_owned())?;
                 let (Some(make), Some(model)) = (&fact.make, &fact.model) else { return Err("No camera information found. Choose your camera by name.".to_owned()); };
-                cameras.with_value(|cameras| cameras.iter().find(|camera| camera.make.eq_ignore_ascii_case(make.trim()) && camera.model.eq_ignore_ascii_case(model.trim())).map(|camera| (camera.id.clone(), format!("Detected {} {}. Nothing was uploaded.", camera.make, camera.model))))
+                let identity = looklab_prep::CameraIdentity::new(make, model);
+                cameras.with_value(|cameras| cameras.iter().find(|camera| identity.as_ref().is_some_and(|identity| identity.matches(&camera.make, &camera.model))).map(|camera| (camera.id.clone(), format!("Detected {} {}. Nothing was uploaded.", camera.make, camera.model))))
                     .ok_or_else(|| format!("Detected {make} {model}, which is not listed yet. Choose a supported camera."))
             }.await;
             match result {
@@ -482,6 +483,7 @@ pub struct WizardStep {
 pub fn Stepper(
     steps: Vec<WizardStep>,
     current: RwSignal<StepIndex>,
+    furthest: RwSignal<StepIndex>,
     #[prop(into, default = Signal::derive(|| true))] can_advance: Signal<bool>,
     #[prop(into, default = Signal::derive(|| false))] locked: Signal<bool>,
     #[prop(into, default = Signal::derive(|| false))] finished: Signal<bool>,
@@ -492,7 +494,6 @@ pub fn Stepper(
 ) -> impl IntoView {
     let count = steps.len();
     let instance = NEXT_STEPPER_ID.fetch_add(1, Ordering::Relaxed);
-    let furthest = RwSignal::new(current.get_untracked());
     let final_step = Signal::derive(move || current.get().0.saturating_add(1) >= count);
     Effect::new(move |_| {
         let step = current.get();
@@ -752,12 +753,14 @@ pub fn DropZone(
             <p>{prompt}</p>
             <input node_ref=files type="file" multiple accept=accept hidden disabled=move || disabled.get()
                 on:change=move |event| { if !disabled.get() { on_files.run(files_from_input(&event)); } }/>
-            <button type="button" disabled=move || disabled.get() on:click=move |_| { if let Some(input) = files.get() { input.click(); } }>"Choose files"</button>
-            {folders.then(|| view! {
-                <input node_ref=directory type="file" multiple prop:webkitdirectory=true hidden disabled=move || disabled.get()
-                    on:change=move |event| { if !disabled.get() { on_files.run(files_from_input(&event)); } }/>
-                <button type="button" disabled=move || disabled.get() on:click=move |_| { if let Some(input) = directory.get() { input.click(); } }>"Choose folder"</button>
-            })}
+            <div class="field-row">
+                <button type="button" disabled=move || disabled.get() on:click=move |_| { if let Some(input) = files.get() { input.click(); } }>"Choose files"</button>
+                {folders.then(|| view! {
+                    <input node_ref=directory type="file" multiple prop:webkitdirectory=true hidden disabled=move || disabled.get()
+                        on:change=move |event| { if !disabled.get() { on_files.run(files_from_input(&event)); } }/>
+                    <button type="button" disabled=move || disabled.get() on:click=move |_| { if let Some(input) = directory.get() { input.click(); } }>"Choose folder"</button>
+                })}
+            </div>
             {move || error.get().map(|error| view! { <p role="alert">{error}</p> })}
         </section>
     }

@@ -175,9 +175,10 @@ epochs:
   | `exposure` | effective exposure (ξ/mode or EC) |
 
 - `solve_plan` may only name declared controls.
-- A `native_sims` entry may set `monochrome: true` when the sim renders a monochrome image (Acros, Monochrome, Sepia and their filter variants). There is no B&W Look kind yet ([10 Q26](10-open-questions.md)), so a contribution that resolves to such a sim is refused at every entry point: the contribution client lists the file as "B&W renders aren't supported yet" and omits it from the batch; `looklab prep --raw` and `looklab fit` fail with an error naming the sim, and `looklab prep --dir` lists the file as refused; server intake answers `MONOCHROME_UNSUPPORTED`, checking the declared sim and every image's own makernotes. The makernotes are ambiguous when two sims match, and an ambiguous set that includes a monochrome sim counts as monochrome. `looklab fit` resolves the sim from the body schema the transform names and the Look slug, so the refusal applies to comparing a monochrome family.
+- A `native_sims` entry sets `monochrome: true` for Acros, Monochrome, Sepia and their filter variants. Schema and per-render metadata determine classification, never equality of RGB channels. An ambiguous match set containing a monochrome sim is treated as monochrome. Complete monochrome measurements enter an explicitly authorized deferred pool; the colour fitter still refuses them ([10 Q26](10-open-questions.md)).
+- Acros and Monochrome are separate base families. Filter variants retain their original native sim key and normalize to that family plus `mono_filter = none | yellow | red | green`, scoped to the body, epoch and family. WC/MG toning controls are separate; Sepia is a toned rendering, not a filter value. Applicable controls require reproduced values or explicit declarations; missing is not default.
 - `look_affecting: true` controls at `default` define the **reference setting** ([02 §4.2](02-color-pipeline.md)).
-- `spatial: true` controls must be in `tolerated` for an image to be used.
+- `spatial: true` controls must be in `tolerated` for an image to be used in a colour fit. Grain-on monochrome renders may enter the deferred pool with their grain settings retained; coordinate-free samples do not characterize spatial grain.
 - Validated by `looklab-schema` (native in CI, WASM in the browser form).
 
 ### Look and LookVersion
@@ -188,6 +189,7 @@ epochs:
 - `status` is `pinned` (published and fitted), `base_identified_unmeasured` (fully declared and consistent, not yet measured or published), `base_incomplete { missing }` (a declared field is absent), or `base_inconsistent { field }` (the declared setting does not exist on the declared body; `field` names it). Only `pinned` is matchable and gets a card file; the other three are stored and listed with an approximate preview at most.
 - `LookVersion`: `version`, `status` (`provisional` | `rooted` | `published` | `deprecated`), `artifact_hash`, `probe_predictions_hash`, `metrics`, `provenance` (§3), `gate_results`, `changelog`. Provenance records the pinned base; a new base version creates a candidate rebased version gated against the Look's anchor, and a base revert marks every pinned dependent ([05 §8](05-trust-and-integrity.md)). Each published `lut_defined` version stores its declared base in `lut_base_pins`; a pin that names its own Look or closes a Look dependency cycle is rejected. Publishing a newer version of a base Look, resolving a pending family base to a native `look@version`, or revoking a root admission the base used writes a `lut_rebase_pending` row, and the worker consumes those rows in a `lut_rebase` job independently of image pools. A candidate publishes only after its gate passes; a held candidate leaves the previous version's bytes and matchability unchanged, and a pin is never re-anchored automatically.
 - Same name ≠ same Look. Cross-body disagreement can propose a split.
+- Rendering classification is orthogonal to `Look.kind`: a native-family or LUT-defined Look may be monochrome. A future monochrome response retains the common J'a'b' interface, with lightness and potentially tone-dependent tint in both chroma channels. Its model is undecided; a camera-RGB mixer followed by a tone curve is only a candidate.
 
 ### InputTransform
 `body_id`, `version`, `A0_A`, `A0_D65`, `A0_source` (`ssf` | `dng` | `db` | `chart`), `delta`, `covariance` (6×6), `anchor_count`, `created_at`.
@@ -236,6 +238,9 @@ The model serializes as `crm.json`:
 ### Contribution and ContributionImage
 - `Contribution`: `id`, `credential_id`, `batch_manifest_hash`, `signature`, `pow`, `kind` (client-claimed: `library` | `rerender` | `pattern` | `gradient` | `chart`), `serial_hmac?` (server-computed; absent if the contributor opted out), (the effective contributor is **resolved at fit time** from current serial links, like epochs, and never stored on the contribution; [05 §2](05-trust-and-integrity.md)), `intent` (`native` | `recipe` | `card`), `target_look_id?`, `card?` (for intent `card`: firmware id and version, look version, content-id prefix, and whether the tag was present or user-declared; [04 §8.4](04-matching-and-export.md)), `body_id`, `firmware_version`, `sim_key`, `settings`, `status` (`pending` | `accepted` | `quarantined` | `withdrawn`), `created_at`.
 - `ContributionImage`: `id`, `contribution_id`, `samples_hash`, `n_samples`, `meta` (sanitized), `rerender_group?` (client-assigned id, see §2.1), `setting_source` (per control: `reproduced` from the makernote through the named snapshot's schema, or `declared` by the contributor; [06 §1](06-privacy-and-payload.md), [07 §4](07-contribution.md)), `duplicate_of?`, `fit_stats` (`rms_de`, `z`, `reason?`), `weight_components`.
+- Contributions made through signed sends store the send nonce. Status groups these records as one submission; records without a send nonce are grouped by UTC day and camera as earlier activity. Status responses contain `activities[]` with nested `contributions[]`. RSS identities are stable when a submission's members change and are scoped to the credential.
+- Every contribution signs `render_class` (`colour` | `monochrome`) independently of `kind` and `intent`. Deferred monochrome also signs its explicit model-development authorization. A monochrome card render has intent `card`.
+- Deferred pool records retain rendering firmware, schema snapshot, original native sim, normalized family and settings with their sources, authorization time and a fixed 180-day expiry. Their scientific weight is zero until monochrome analysis exists; they never enter colour fit, calibration, gauge, support, release scores or reputation.
 
 ### Proposal and ModerationDecision
 - `Proposal`: `id`, `credential_id`, `type` (`body` | `schema_change` | `mapping` | `interface_profile` | `lut_look` | `epoch_split` | `look_split` | `gate_override`), `payload` (validated YAML/JSON), `human_summary` (a menu-level description, e.g. "adds Reala Ace to X-T5 firmware 2.0+"), `evidence[]` (confirmations carrying parsed whitelisted tag values; fixture donations; worker evidence), `status`, `created_at`.
@@ -263,8 +268,8 @@ The model serializes as `crm.json`:
    - distortion `(k1, k2)`;
    - **radial gain** `g(r) = 1 + a1 r² + a2 r⁴ + a3 r⁶` applied to RAW luminance, which models in-camera vignetting/shading correction.
 
-   The gain is fitted jointly with a temporary monotone tone map (`Y_jpeg ≈ f(g(r)·Y_raw)`, f a 12-knot monotone spline) on luminance. Only the geometry and gain are kept.
-3. **Align.** Similarity + radial distortion via multi-scale phase correlation, then LM refinement on normalized cross-correlation. Reject if central correlation < 0.98.
+   Alignment fits a temporary bounded nonnegative RGB intensity projection and offset for each rendering. The radial gain and a temporary 12-knot monotone tone map are fitted on that intensity; geometry refinement and quality statistics use the same projection. Only geometry and gain are kept. The sample measurements retain all three RGB channels.
+3. **Align.** Similarity + radial distortion via multi-scale phase correlation, then LM refinement on normalized cross-correlation. Reject if central correlation of the projected intensity is < 0.98.
 4. **Downsample** to ~1.5 MP (area average).
 5. **Mask:** clipped RAW channels (≥ 0.98 of white), local gradient above the 90th percentile, 3% border, chart/pattern regions (handled separately).
 6. **Density sampling** in `(s, h_in, √C_in)` using the body's prior transform at the image's CCT, where `s = log2(Y/0.18)` clamped to [−12, +6] and `(h_in, √C_in)` come from CAM16-UCS of the chromaticity scaled to Y = 0.18 ([02 §3](02-color-pipeline.md)). Up to N = 50,000 samples, inclusion probability ∝ 1/bin_count (capped). Store `density_w`, the inverse inclusion probability of the actual selection (1.0 when every candidate is selected); the fit consumes it as a sample weight.
@@ -274,6 +279,8 @@ The model serializes as `crm.json`:
 **Sampling seed (privacy invariant).** Density sampling and the shuffle use a **fresh CSPRNG seed per image (or per re-render group)**. It's never derived from anything the server knows (batch nonce, ids, hashes), never uploaded and never stored server-side. Anyone who knew the seed could undo the shuffle and recover sampling order, which could be close to raster order. The client can export the seeds **locally** as a seed file, so users can reproduce the payload byte for byte ([06 §5](06-privacy-and-payload.md)). Seeds are **sensitive**: anyone holding a seed and the upload can recover the sampling order. The UI labels them as such and warns against pasting them into bug reports. Fixed seeds are allowed only in tests.
 
 **Reproducibility.** The payload depends on more than color math: RAW/JPEG decode, FFT and LM alignment, the gain fit, CCT estimation and downsampling. Native builds pick SIMD paths at runtime, so a native CLI can't reproduce the browser's bytes. The reference prep is therefore the **`looklab-wasm` prep module**. The CLI's `verify-payload` command runs that module, built by the user from source, under wasmtime. Identical inputs, seed file and prior-transform version give identical bytes by construction.
+
+Monochrome preparation keeps all three JPEG output channels, the declared output colour space, density weights, flags and shared re-render grouping. Mixed colour/Acros/Sepia groups reuse one RAW decode, input sample set and shuffle. Prep version 2 samples each JPEG through its own validated alignment at the shared RAW-selected points; version 1 reused the reference JPEG's mapping for every member. The sample container remains version 1. No source image or RAW hash is added to the payload.
 
 ### 2.2 Sample blob format (version 1)
 Little-endian. The body is zstd-compressed.
@@ -315,7 +322,7 @@ An upload is **one `application/octet-stream` body** in a single canonical encod
 
 ```
 magic            "LLUPLD"   6 bytes
-version          u16 = 2
+version          u16 = 3
 nonce            [u8; 32]                    // server-issued, one per send
 send_manifest    len:u32 + postcard(SendManifest)
 manifest         len:u32 + postcard(BatchManifest)
@@ -338,6 +345,8 @@ One nonce identifies one send instance. The WebAuthn challenge is `H(nonce ‖ s
 The server parses this strictly and rejects anything non-canonical. All of it is produced by the `looklab-wasm` module; the JavaScript layer only moves bytes ([AGENTS.md](../AGENTS.md)).
 
 `BatchManifest` carries `community_snapshot_version`, the snapshot whose control schema its settings were read against. The server keeps every snapshot it has published and resolves the batch body and settings against that version, not the current one; an unknown version fails with `SNAPSHOT_UNKNOWN` and one older than the retained snapshots with `SNAPSHOT_TOO_OLD`. Each settings entry also carries its source, `reproduced` or `declared` ([07 §4](07-contribution.md)).
+
+`BatchManifest` also carries the signed `render_class` and optional monochrome model-development authorization. The server checks classification against the named schema and every image's sanitized rendering metadata before accepting a batch; changing the batch's label cannot route known monochrome measurements into colour analysis. The sample-blob format remains version 1.
 
 ## 3. Look file format
 

@@ -9,7 +9,7 @@ use looklab_upload::LookSlug;
 use serde::Serialize;
 use sqlx::SqlitePool;
 
-use crate::body::{DataDir, epoch_for, resolve_look};
+use crate::body::{epoch_for, resolve_look};
 use crate::config::WorkerConfig;
 use crate::db::{
     self, ContributionIntent, ContributionOutcome, ImageId, ImageOutcome, ImageStatsWrite,
@@ -35,10 +35,11 @@ pub async fn run(
     let contribution = db::contribution(db_pool, contribution_id).await?;
     if contribution.status == db::ContributionStatus::Withdrawn
         || contribution.intent == ContributionIntent::Card
+        || contribution.render_class == looklab_upload::RenderClass::Monochrome
     {
         return Ok(());
     }
-    let resources = DataDir::new(&config.data).load(&contribution.body)?;
+    let resources = crate::body::data_dir(config)?.load(&contribution.body)?;
     let look: LookSlug = resolve_look(
         &resources,
         &contribution.firmware,

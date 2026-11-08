@@ -4,8 +4,8 @@ use looklab_color::linalg::Mat3;
 use looklab_prep::PrepParams;
 use looklab_upload::{
     BatchManifest, BlobKind, BodyId, Challenge, CommunitySnapshotVersion, ContributionKind,
-    ControlSettings, FirmwareVersionString, Intent, Limits, ManifestHash, ManifestMetadata, Nonce,
-    POW_K, SendManifest, SendManifestHash, SimKey,
+    ControlSettings, FirmwareVersionString, Intent, Limits, ManifestHash, ManifestMetadata,
+    MonochromeAuthorization, Nonce, POW_K, RenderClass, SendManifest, SendManifestHash, SimKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +33,7 @@ pub struct PrepareRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AlignmentSummary {
     pub correlation: f64,
+    /// Median block shift in original RAW pixels.
     pub residual_px: f64,
 }
 
@@ -62,6 +63,8 @@ pub struct ManifestImageInput {
 pub struct BuildManifestRequest {
     pub kind: ContributionKind,
     pub intent: Intent,
+    pub render_class: RenderClass,
+    pub monochrome_authorization: Option<MonochromeAuthorization>,
     pub body: BodyId,
     pub firmware: FirmwareVersionString,
     pub sim: SimKey,

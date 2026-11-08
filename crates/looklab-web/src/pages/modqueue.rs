@@ -373,62 +373,80 @@ pub fn ModQueuePage() -> impl IntoView {
         <h1>"Review queue"</h1>
         <p class="lede">"Check the evidence. Explain the decision. Help keep camera data useful."</p>
         {(!available).then(ui::preview_notice)}
-        <section aria-labelledby="session" hidden=move || !available || !can_moderate()>
+        <section class="review-session" aria-labelledby="session" hidden=move || !available || !can_moderate()>
             <h2 id="session">"Confirm it's you"</h2>
-            <p>"Use your passkey once to open a short-lived review session."</p>
-            {move || {
-                if session.get() {
-                    view! { <p class="muted" id="mod-session">"Session open."</p> }.into_any()
-                } else {
-                    view! {
-                        <button
-                            type="button"
-                            id="mod-open-session"
-                            disabled=move || busy.get() || !available
-                            on:click=open_session
-                        >
-                            "Confirm it's you"
-                        </button>
+            <p class="muted">"Use your passkey once to open a short-lived review session."</p>
+            <div class="field-row">
+                {move || {
+                    if session.get() {
+                        view! { <p class="muted" id="mod-session">"Session open."</p> }.into_any()
+                    } else {
+                        view! {
+                            <button
+                                type="button"
+                                id="mod-open-session"
+                                disabled=move || busy.get() || !available
+                                on:click=open_session
+                            >
+                                "Confirm it's you"
+                            </button>
+                        }
+                            .into_any()
                     }
-                        .into_any()
-                }
-            }}
+                }}
+            </div>
             {move || {
                 notice
                     .get()
                     .map(|text| view! { <p class="error" role="alert">{text}</p> })
             }}
         </section>
-        <section aria-labelledby="look-listing" hidden=move || !available || !can_moderate() || !session.get()>
-            <h2 id="look-listing">"Look listing"</h2>
-            <p class="muted">"Hide or remove a LUT Look that a native Look supersedes, or relist one."</p>
-            <label for="mod-look-slug">"Look slug"</label>
-            <input id="mod-look-slug" type="text" on:input=move |event| look_slug.set(event_target_value(&event))/>
-            <label for="mod-look-reason">"Reason"</label>
-            <input id="mod-look-reason" type="text" on:input=move |event| reason.set(event_target_value(&event))/>
-            <div class="field-row">
-                <button type="button" id="mod-look-hide" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Hide)>"Hide"</button>
-                <button type="button" id="mod-look-remove" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Remove)>"Remove"</button>
-                <button type="button" id="mod-look-relist" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Relist)>"Relist"</button>
-            </div>
-            {move || listing_notice.get().map(|text| view! { <p class="muted" role="status">{text}</p> })}
-        </section>
-        <section aria-labelledby="look-revert" hidden=move || !available || !can_moderate() || !session.get()>
-            <h2 id="look-revert">"Revert a Look"</h2>
-            <p class="muted">"Publish a released version's content as a new version, then refit without the excluded profiles."</p>
-            <label for="mod-revert-slug">"Look slug"</label>
-            <input id="mod-revert-slug" type="text" on:input=move |event| revert_slug.set(event_target_value(&event))/>
-            <label for="mod-revert-version">"Version to restore"</label>
-            <input id="mod-revert-version" type="number" min="1" on:input=move |event| revert_version.set(event_target_value(&event))/>
-            <label for="mod-revert-excluded">"Exclude profiles (comma separated internal IDs)"</label>
-            <input id="mod-revert-excluded" type="text" on:input=move |event| revert_excluded.set(event_target_value(&event))/>
-            <label for="mod-revert-reason">"Reason"</label>
-            <input id="mod-revert-reason" type="text" on:input=move |event| revert_reason.set(event_target_value(&event))/>
-            <div class="field-row">
-                <button type="button" id="mod-revert-submit" disabled=move || busy.get() on:click=revert_look>"Revert and exclude"</button>
-            </div>
-            {move || revert_notice.get().map(|text| view! { <p class="muted" role="status">{text}</p> })}
-        </section>
+        <div class="review-look-actions" hidden=move || !available || !can_moderate() || !session.get()>
+            <ui::Disclosure summary="Look actions".to_owned()>
+                <div class="review-maintenance">
+                    <section aria-labelledby="look-listing">
+                        <h2 id="look-listing">"Look listing"</h2>
+                        <p class="muted">"Hide or remove a LUT Look that a native Look supersedes, or relist one."</p>
+                        <div class="review-form-grid">
+                            <label for="mod-look-slug">"Look slug"
+                                <input id="mod-look-slug" type="text" on:input=move |event| look_slug.set(event_target_value(&event))/>
+                            </label>
+                            <label for="mod-look-reason">"Reason"
+                                <input id="mod-look-reason" type="text" on:input=move |event| reason.set(event_target_value(&event))/>
+                            </label>
+                        </div>
+                        <div class="field-row">
+                            <button type="button" id="mod-look-hide" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Hide)>"Hide"</button>
+                            <button type="button" id="mod-look-remove" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Remove)>"Remove"</button>
+                            <button type="button" id="mod-look-relist" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Relist)>"Relist"</button>
+                        </div>
+                        {move || listing_notice.get().map(|text| view! { <p class="muted" role="status">{text}</p> })}
+                    </section>
+                    <section aria-labelledby="look-revert">
+                        <h2 id="look-revert">"Revert a Look"</h2>
+                        <p class="muted">"Publish a released version's content as a new version, then refit without the excluded profiles."</p>
+                        <div class="review-form-grid">
+                            <label for="mod-revert-slug">"Look slug"
+                                <input id="mod-revert-slug" type="text" on:input=move |event| revert_slug.set(event_target_value(&event))/>
+                            </label>
+                            <label for="mod-revert-version">"Version to restore"
+                                <input id="mod-revert-version" type="number" min="1" on:input=move |event| revert_version.set(event_target_value(&event))/>
+                            </label>
+                            <label for="mod-revert-excluded">"Exclude profiles (comma separated internal IDs)"
+                                <input id="mod-revert-excluded" type="text" on:input=move |event| revert_excluded.set(event_target_value(&event))/>
+                            </label>
+                            <label for="mod-revert-reason">"Reason"
+                                <input id="mod-revert-reason" type="text" on:input=move |event| revert_reason.set(event_target_value(&event))/>
+                            </label>
+                        </div>
+                        <div class="field-row">
+                            <button type="button" id="mod-revert-submit" disabled=move || busy.get() on:click=revert_look>"Revert and exclude"</button>
+                        </div>
+                        {move || revert_notice.get().map(|text| view! { <p class="muted" role="status">{text}</p> })}
+                    </section>
+                </div>
+            </ui::Disclosure>
+        </div>
         <ui::Tabs tabs=tabs() selected=tab_ui>
         <div tabindex="0" aria-label="Proposal queue, use j and k to navigate" hidden=move || tab.get() != ReviewTab::Queue on:keydown=move |event| {
             if event.target().and_then(|target| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(target).ok()).is_some_and(|element| matches!(element.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT")) { return; }
@@ -443,7 +461,7 @@ pub fn ModQueuePage() -> impl IntoView {
                 activate(items[next].clone());
             }
         }>
-        <div class="review-filters">
+        <div class="field-row review-filters">
             <label for="review-filter">"Item type"</label>
             <select id="review-filter" on:change=move |event| filter.set(QueueFilter::parse(&event_target_value(&event)))>
                 <option value="">"All types"</option>

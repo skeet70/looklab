@@ -49,7 +49,7 @@ pub(crate) fn prepare(request: PrepareInput<'_>) -> Result<PrepareResponse, Modu
         .map_err(ModuleError::prep)?;
     let prior = prior_transform(&request.prior, &decoded)?;
     let seed = sampling_seed(request.seed, prior.version())?;
-    let (prepared, alignment) = prepare_group_with_decoded_raw(
+    let prepared = prepare_group_with_decoded_raw(
         request.raw,
         decoded,
         &request.jpegs,
@@ -58,13 +58,13 @@ pub(crate) fn prepare(request: PrepareInput<'_>) -> Result<PrepareResponse, Modu
         &request.params,
     )
     .map_err(ModuleError::prep)?;
-    let alignment = AlignmentSummary {
-        correlation: alignment.central_correlation,
-        residual_px: alignment.residual_px,
-    };
 
     let mut images = Vec::with_capacity(prepared.len());
     for image in prepared {
+        let alignment = AlignmentSummary {
+            correlation: image.alignment.correlation,
+            residual_px: image.alignment.residual_px,
+        };
         images.push(PreparedImageView {
             blob: encode(&image.samples).map_err(ModuleError::prep)?,
             metadata: (&image.sanitized).into(),
@@ -162,6 +162,8 @@ pub(crate) fn build_manifest(
     let manifest = looklab_upload::BatchManifest {
         kind: request.kind,
         intent: request.intent,
+        render_class: request.render_class,
+        monochrome_authorization: request.monochrome_authorization,
         body: request.body,
         firmware_version: request.firmware,
         sim_key: request.sim,
@@ -169,6 +171,11 @@ pub(crate) fn build_manifest(
         settings: request.settings,
         images,
     };
+    manifest
+        .validate_render_class()
+        .map_err(|error| ModuleError::Manifest {
+            message: error.to_string(),
+        })?;
     let manifest_bytes = canonical_manifest_bytes(&manifest);
     let hash = manifest_hash(&manifest);
     Ok(BuildManifestResponse {
@@ -235,6 +242,11 @@ pub(crate) fn encode_envelope(
             message: "the batch manifest is not listed in the send manifest".to_owned(),
         });
     }
+    manifest
+        .validate_render_class()
+        .map_err(|error| ModuleError::Manifest {
+            message: error.to_string(),
+        })?;
     let images = manifest.images.len();
     if request.blobs.len() != images {
         return Err(ModuleError::BlobCount {

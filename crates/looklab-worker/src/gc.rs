@@ -21,10 +21,9 @@ pub async fn run(
     let now = now_unix();
     for withdrawal in db::withdrawals_due(db_pool, contribution, now).await? {
         for image in db::images(db_pool, &withdrawal.contribution).await? {
-            db::release_blob_once(
+            db::release_image_blob_once(
                 db_pool,
                 &config.blobs,
-                &withdrawal.id,
                 &image.id,
                 &image.samples_hash,
                 now,
@@ -32,11 +31,27 @@ pub async fn run(
             .await?;
         }
         db::mark_withdrawal_deleted(db_pool, &withdrawal.contribution).await?;
+        db::mark_deferred_expiry_deleted(db_pool, &withdrawal.contribution).await?;
+    }
+    for expiry in db::deferred_expiries_due(db_pool, contribution, now).await? {
+        for image in db::images(db_pool, &expiry.contribution).await? {
+            db::release_image_blob_once(
+                db_pool,
+                &config.blobs,
+                &image.id,
+                &image.samples_hash,
+                now,
+            )
+            .await?;
+        }
+        db::expire_deferred_contribution(db_pool, &expiry.contribution).await?;
+        db::mark_deferred_expiry_deleted(db_pool, &expiry.contribution).await?;
+        db::mark_withdrawal_deleted(db_pool, &expiry.contribution).await?;
     }
     sweep_staged(db_pool, config, now).await
 }
 
-/// Removes expired blob reservations and files no other record names.
+/// Removes expired upload reservations and files no other record names.
 async fn sweep_staged(db_pool: &SqlitePool, config: &WorkerConfig, now: i64) -> Result<()> {
     let mut tx = db_pool.begin_with("BEGIN IMMEDIATE").await?;
     for hash in db::expired_staging_hashes(&mut *tx, now).await? {

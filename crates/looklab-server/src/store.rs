@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
-use looklab_upload::Nonce;
+use looklab_upload::{BodyId, LookSlug, MonochromeAuthorization, Nonce, RenderClass, SimKey};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::{SqliteConnection, SqlitePool};
 use webauthn_rs::prelude::Passkey;
 
 use crate::blob::{BlobHash, BlobStore};
 use crate::db::now_unix;
 use crate::ids::{
-    BlobAttemptId, ContributionId, ContributionImageId, CredentialId, JobId, TokenHash,
-    WithdrawalId,
+    BlobAttemptId, ContributionId, ContributionImageId, CredentialId, DeferredExpiryId, JobId,
+    TokenHash, WithdrawalId,
 };
 use crate::trust::{CredentialStanding, Tier};
 
@@ -117,7 +118,8 @@ impl JobKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IntentKind {
     Native,
     Recipe,
@@ -130,6 +132,15 @@ impl IntentKind {
             Self::Native => "native",
             Self::Recipe => "recipe",
             Self::Card => "card",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "native" => Some(Self::Native),
+            "recipe" => Some(Self::Recipe),
+            "card" => Some(Self::Card),
+            _ => None,
         }
     }
 }
@@ -569,6 +580,10 @@ pub struct NewImage {
     pub rerender_group: Option<String>,
     /// `(control key, source)` JSON ([docs/03 §1]).
     pub setting_source: String,
+    pub render_class: RenderClass,
+    pub native_sim: Option<looklab_upload::SimKey>,
+    pub family: Option<looklab_schema::LookId>,
+    pub mono_filter: Option<looklab_schema::MonoFilter>,
 }
 
 pub struct NewContribution {
@@ -587,6 +602,11 @@ pub struct NewContribution {
     pub firmware_version: String,
     pub sim_key: String,
     pub settings_json: String,
+    pub normalized_settings: looklab_upload::ControlSettings,
+    pub community_snapshot_version: looklab_upload::CommunitySnapshotVersion,
+    pub render_class: RenderClass,
+    pub monochrome_authorization: Option<MonochromeAuthorization>,
+    pub deferred_until: Option<i64>,
     pub images: Vec<NewImage>,
 }
 
@@ -598,8 +618,9 @@ pub async fn insert_contribution(
         "INSERT INTO contributions
          (id, credential_id, batch_manifest_hash, send_nonce, signature, pow, kind,
           serial_hmac, intent, target_look_id, card, body_id, firmware_version, sim_key, settings,
-          status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+          normalized_settings, community_snapshot_version, render_class,
+          monochrome_authorization, deferred_until, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
     )
     .bind(contribution.id.as_str())
     .bind(contribution.credential_id.as_str())
@@ -616,6 +637,14 @@ pub async fn insert_contribution(
     .bind(&contribution.firmware_version)
     .bind(&contribution.sim_key)
     .bind(&contribution.settings_json)
+    .bind(
+        serde_json::to_string(&contribution.normalized_settings)
+            .map_err(|_| sqlx::Error::Protocol("settings do not serialize".to_owned()))?,
+    )
+    .bind(i64::try_from(contribution.community_snapshot_version.get()).unwrap_or(i64::MAX))
+    .bind(render_class_str(contribution.render_class))
+    .bind(contribution.monochrome_authorization.map(authorization_str))
+    .bind(contribution.deferred_until)
     .bind(now_unix())
     .execute(&mut **tx)
     .await?;
@@ -632,8 +661,8 @@ pub async fn insert_contribution(
         sqlx::query(
             "INSERT INTO contribution_images
              (id, contribution_id, samples_hash, n_samples, meta, rerender_group, setting_source,
-              status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+              render_class, native_sim, family, mono_filter, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
         )
         .bind(id.as_str())
         .bind(contribution.id.as_str())
@@ -642,13 +671,76 @@ pub async fn insert_contribution(
         .bind(&image.meta_json)
         .bind(image.rerender_group.as_deref())
         .bind(&image.setting_source)
+        .bind(render_class_str(image.render_class))
+        .bind(
+            image
+                .native_sim
+                .as_ref()
+                .map(looklab_upload::SimKey::as_str),
+        )
+        .bind(image.family.as_ref().map(looklab_schema::LookId::as_str))
+        .bind(image.mono_filter.map(mono_filter_str))
         .execute(&mut **tx)
         .await?;
+    }
+    if let Some(due_at) = contribution.deferred_until {
+        schedule_deferred_expiry(tx, &contribution.id, due_at).await?;
     }
     Ok(())
 }
 
-/// Blob reservations past this age are rejected and swept instead of published.
+async fn schedule_deferred_expiry(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    contribution_id: &ContributionId,
+    due_at: i64,
+) -> Result<(), sqlx::Error> {
+    let expiry_id = DeferredExpiryId::new();
+    sqlx::query(
+        "INSERT INTO deferred_expiries (id, contribution_id, due_at, status)
+         VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(expiry_id.as_str())
+    .bind(contribution_id.as_str())
+    .bind(due_at)
+    .execute(&mut **tx)
+    .await?;
+    let payload = serde_json::to_string(&BlobDeletionPayload { contribution_id })
+        .map_err(|_| sqlx::Error::Protocol("job payload does not serialize".to_owned()))?;
+    enqueue_job(tx, JobKind::HardDeleteBlobs, &payload, due_at).await?;
+    Ok(())
+}
+
+pub(crate) fn render_class_from_db(value: &str) -> Option<RenderClass> {
+    match value {
+        "colour" => Some(RenderClass::Colour),
+        "monochrome" => Some(RenderClass::Monochrome),
+        _ => None,
+    }
+}
+
+fn render_class_str(class: RenderClass) -> &'static str {
+    match class {
+        RenderClass::Colour => "colour",
+        RenderClass::Monochrome => "monochrome",
+    }
+}
+
+fn authorization_str(authorization: MonochromeAuthorization) -> &'static str {
+    match authorization {
+        MonochromeAuthorization::ModelDevelopment180Days => "model_development_180_days",
+    }
+}
+
+fn mono_filter_str(filter: looklab_schema::MonoFilter) -> &'static str {
+    match filter {
+        looklab_schema::MonoFilter::None => "none",
+        looklab_schema::MonoFilter::Yellow => "yellow",
+        looklab_schema::MonoFilter::Red => "red",
+        looklab_schema::MonoFilter::Green => "green",
+    }
+}
+
+/// Uploads past this age are rejected and swept instead of published.
 pub const STAGED_TTL_SECONDS: i64 = 600;
 
 /// Commits the hashes this attempt will write, before any file is created.
@@ -802,26 +894,92 @@ pub struct ImageFeed {
 pub struct ContributionFeed {
     pub id: ContributionId,
     pub status: ContributionStatus,
+    pub render_class: RenderClass,
+    pub deferred_until: Option<i64>,
     pub created_at: i64,
+    pub body_id: BodyId,
+    pub intent: IntentKind,
+    pub target_look: Option<LookSlug>,
+    pub sim_key: SimKey,
     pub images: Vec<ImageFeed>,
+    #[serde(skip)]
+    send_nonce: Option<Nonce>,
 }
 
-type FeedRow = (
-    String,
-    String,
-    i64,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<f64>,
-);
+/// A send groups by its signed nonce; records received before sends were
+/// grouped have none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivitySource {
+    Send,
+    Activity,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActivityFeed {
+    pub source: ActivitySource,
+    pub created_at: i64,
+    pub contributions: Vec<ContributionFeed>,
+    #[serde(skip)]
+    pub(crate) identity: ActivityIdentity,
+}
+
+#[derive(Debug)]
+pub(crate) struct ActivityIdentity(sha2::digest::Output<Sha256>);
+
+impl std::fmt::Display for ActivityIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::LowerHex::fmt(&self.0, formatter)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum ActivityKey {
+    Send(Nonce),
+    Activity { day: i64, body: BodyId },
+}
+
+fn stored_send_nonce(value: &str) -> Result<Nonce, sqlx::Error> {
+    let invalid = || sqlx::Error::Protocol("stored send nonce is invalid".to_owned());
+    if value.len() != 64 {
+        return Err(invalid());
+    }
+    let mut bytes = [0; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let pair = value.get(index * 2..index * 2 + 2).ok_or_else(invalid)?;
+        *byte = u8::from_str_radix(pair, 16).map_err(|_| invalid())?;
+    }
+    Ok(Nonce::from_bytes(bytes))
+}
+
+#[derive(sqlx::FromRow)]
+struct FeedRow {
+    contribution_id: String,
+    contribution_status: String,
+    render_class: String,
+    deferred_until: Option<i64>,
+    created_at: i64,
+    send_nonce: Option<String>,
+    body_id: String,
+    intent: String,
+    target_look_id: Option<String>,
+    sim_key: String,
+    image_id: Option<String>,
+    image_status: Option<String>,
+    reason: Option<String>,
+    rms_de: Option<f64>,
+}
 
 pub async fn status_feed(
     db: &SqlitePool,
     credential_id: &CredentialId,
-) -> Result<Vec<ContributionFeed>, sqlx::Error> {
+) -> Result<Vec<ActivityFeed>, sqlx::Error> {
     let rows: Vec<FeedRow> = sqlx::query_as(
-        "SELECT c.id, c.status, c.created_at, i.id, i.status, i.status_reason, i.rms_de
+        "SELECT c.id AS contribution_id, c.status AS contribution_status,
+                c.render_class, c.deferred_until, c.created_at, c.send_nonce,
+                c.body_id, c.intent, c.target_look_id, c.sim_key,
+                i.id AS image_id, i.status AS image_status, i.status_reason AS reason,
+                i.rms_de
          FROM contributions c
          LEFT JOIN contribution_images i ON i.contribution_id = c.id
          WHERE c.credential_id = ?
@@ -831,91 +989,177 @@ pub async fn status_feed(
     .fetch_all(db)
     .await?;
 
-    let mut feed: Vec<ContributionFeed> = Vec::new();
-    for (contribution_id, status, created_at, image_id, image_status, reason, rms_de) in rows {
-        let id = ContributionId::try_from(contribution_id)
+    let mut contributions: Vec<ContributionFeed> = Vec::new();
+    for row in rows {
+        let id = ContributionId::try_from(row.contribution_id)
             .map_err(|_| sqlx::Error::Protocol("contribution id is not a UUID".to_owned()))?;
-        let status = ContributionStatus::from_db(&status)
-            .ok_or_else(|| sqlx::Error::Protocol("unknown contribution status".to_owned()))?;
-        let entry = match feed.last_mut() {
+        let entry = match contributions.last_mut() {
             Some(entry) if entry.id == id => entry,
             _ => {
-                feed.push(ContributionFeed {
+                contributions.push(ContributionFeed {
                     id,
-                    status,
-                    created_at,
+                    status: ContributionStatus::from_db(&row.contribution_status).ok_or_else(
+                        || sqlx::Error::Protocol("unknown contribution status".to_owned()),
+                    )?,
+                    render_class: render_class_from_db(&row.render_class)
+                        .ok_or_else(|| sqlx::Error::Protocol("unknown render class".to_owned()))?,
+                    deferred_until: row.deferred_until,
+                    created_at: row.created_at,
+                    body_id: BodyId::try_from(row.body_id).map_err(|_| {
+                        sqlx::Error::Protocol("contribution body id is invalid".to_owned())
+                    })?,
+                    intent: IntentKind::from_db(&row.intent).ok_or_else(|| {
+                        sqlx::Error::Protocol("unknown contribution intent".to_owned())
+                    })?,
+                    target_look: row
+                        .target_look_id
+                        .map(LookSlug::try_from)
+                        .transpose()
+                        .map_err(|_| {
+                            sqlx::Error::Protocol("contribution target look is invalid".to_owned())
+                        })?,
+                    sim_key: SimKey::try_from(row.sim_key).map_err(|_| {
+                        sqlx::Error::Protocol("contribution sim key is invalid".to_owned())
+                    })?,
                     images: Vec::new(),
+                    send_nonce: row
+                        .send_nonce
+                        .as_deref()
+                        .map(stored_send_nonce)
+                        .transpose()?,
                 });
-                feed.last_mut().expect("just pushed")
+                contributions.last_mut().expect("just pushed")
             }
         };
-        if let (Some(image_id), Some(image_status)) = (image_id, image_status) {
+        if let (Some(image_id), Some(image_status)) = (row.image_id, row.image_status) {
             entry.images.push(ImageFeed {
                 id: ContributionImageId::try_from(image_id).map_err(|_| {
                     sqlx::Error::Protocol("contribution image id is not a UUID".to_owned())
                 })?,
                 status: ImageStatus::from_db(&image_status)
                     .ok_or_else(|| sqlx::Error::Protocol("unknown image status".to_owned()))?,
-                reason,
-                rms_de,
+                reason: row.reason,
+                rms_de: row.rms_de,
             });
         }
     }
-    Ok(feed)
+
+    let mut groups: HashMap<ActivityKey, ActivityFeed> = HashMap::new();
+    for contribution in contributions {
+        let key = match contribution.send_nonce {
+            Some(nonce) => ActivityKey::Send(nonce),
+            None => ActivityKey::Activity {
+                day: contribution.created_at.div_euclid(86_400),
+                body: contribution.body_id.clone(),
+            },
+        };
+        let source = match &key {
+            ActivityKey::Send(_) => ActivitySource::Send,
+            ActivityKey::Activity { .. } => ActivitySource::Activity,
+        };
+        let created_at = contribution.created_at;
+        let activity = groups.entry(key).or_insert_with_key(|key| ActivityFeed {
+            source,
+            created_at,
+            contributions: Vec::new(),
+            identity: activity_identity(credential_id, key),
+        });
+        activity.created_at = activity.created_at.min(created_at);
+        activity.contributions.push(contribution);
+    }
+    let mut activities: Vec<(ActivityKey, ActivityFeed)> = groups.into_iter().collect();
+    activities.sort_by(|(left_key, left), (right_key, right)| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| left_key.cmp(right_key))
+    });
+    Ok(activities
+        .into_iter()
+        .map(|(_, activity)| activity)
+        .collect())
+}
+
+fn activity_identity(credential_id: &CredentialId, key: &ActivityKey) -> ActivityIdentity {
+    let mut hasher = Sha256::new();
+    hasher.update(b"looklab-activity-v1:");
+    hasher.update(credential_id.as_str().as_bytes());
+    hasher.update(b":");
+    match key {
+        ActivityKey::Send(nonce) => {
+            hasher.update(b"send:");
+            hasher.update(nonce.as_bytes());
+        }
+        ActivityKey::Activity { day, body } => {
+            hasher.update(b"activity:");
+            hasher.update(day.to_be_bytes());
+            hasher.update(b":");
+            hasher.update(body.as_str().as_bytes());
+        }
+    }
+    ActivityIdentity(hasher.finalize())
 }
 
 pub async fn withdraw(
     db: &SqlitePool,
-    contribution_id: &ContributionId,
+    contribution_ids: &[ContributionId],
     credential_id: &CredentialId,
     delete_after: i64,
 ) -> Result<Option<i64>, sqlx::Error> {
     let mut tx = db.begin().await?;
-    let row: Option<(String, String)> =
-        sqlx::query_as("SELECT credential_id, status FROM contributions WHERE id = ?")
-            .bind(contribution_id.as_str())
-            .fetch_optional(&mut *tx)
-            .await?;
-    let Some((owner, status)) = row else {
-        return Ok(None);
-    };
-    if owner != credential_id.as_str() {
-        return Ok(None);
-    }
-    let status = ContributionStatus::from_db(&status)
-        .ok_or_else(|| sqlx::Error::Protocol("unknown contribution status".to_owned()))?;
-    if status == ContributionStatus::Withdrawn {
-        let existing: Option<(i64,)> =
-            sqlx::query_as("SELECT delete_after FROM withdrawals WHERE contribution_id = ?")
+    let mut delete_afters = Vec::with_capacity(contribution_ids.len());
+    for contribution_id in contribution_ids {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT credential_id, status FROM contributions WHERE id = ?")
                 .bind(contribution_id.as_str())
                 .fetch_optional(&mut *tx)
                 .await?;
-        return Ok(existing.map(|(delete_after,)| delete_after));
-    }
+        let Some((owner, status)) = row else {
+            return Ok(None);
+        };
+        if owner != credential_id.as_str() {
+            return Ok(None);
+        }
+        let status = ContributionStatus::from_db(&status)
+            .ok_or_else(|| sqlx::Error::Protocol("unknown contribution status".to_owned()))?;
+        if status == ContributionStatus::Withdrawn {
+            let existing: Option<(i64,)> =
+                sqlx::query_as("SELECT delete_after FROM withdrawals WHERE contribution_id = ?")
+                    .bind(contribution_id.as_str())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            match existing {
+                Some((existing,)) => delete_afters.push(existing),
+                None => delete_afters.push(now_unix()),
+            }
+            continue;
+        }
 
-    sqlx::query(
-        "UPDATE contributions SET status = 'withdrawn' WHERE id = ? AND status != 'withdrawn'",
-    )
-    .bind(contribution_id.as_str())
-    .execute(&mut *tx)
-    .await?;
-    let withdrawal_id = WithdrawalId::new();
-    sqlx::query(
-        "INSERT INTO withdrawals (id, contribution_id, credential_id, requested_at, delete_after, status)
-         VALUES (?, ?, ?, ?, ?, 'pending')",
-    )
-    .bind(withdrawal_id.as_str())
-    .bind(contribution_id.as_str())
-    .bind(credential_id.as_str())
-    .bind(now_unix())
-    .bind(delete_after)
-    .execute(&mut *tx)
-    .await?;
-    let payload = serde_json::to_string(&BlobDeletionPayload { contribution_id })
-        .map_err(|_| sqlx::Error::Protocol("job payload does not serialize".to_owned()))?;
-    enqueue_job(&mut tx, JobKind::HardDeleteBlobs, &payload, delete_after).await?;
+        sqlx::query(
+            "UPDATE contributions SET status = 'withdrawn' WHERE id = ? AND status != 'withdrawn'",
+        )
+        .bind(contribution_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        let withdrawal_id = WithdrawalId::new();
+        sqlx::query(
+            "INSERT INTO withdrawals (id, contribution_id, credential_id, requested_at, delete_after, status)
+             VALUES (?, ?, ?, ?, ?, 'pending')",
+        )
+        .bind(withdrawal_id.as_str())
+        .bind(contribution_id.as_str())
+        .bind(credential_id.as_str())
+        .bind(now_unix())
+        .bind(delete_after)
+        .execute(&mut *tx)
+        .await?;
+        let payload = serde_json::to_string(&BlobDeletionPayload { contribution_id })
+            .map_err(|_| sqlx::Error::Protocol("job payload does not serialize".to_owned()))?;
+        enqueue_job(&mut tx, JobKind::HardDeleteBlobs, &payload, delete_after).await?;
+        delete_afters.push(delete_after);
+    }
     tx.commit().await?;
-    Ok(Some(delete_after))
+    Ok(delete_afters.into_iter().max())
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -242,6 +242,7 @@ impl Worker {
             }
             JobPayload::HonestDuplicateMerge => duplicates::run(&self.pool).await,
             JobPayload::NightlyRefit { bodies } => {
+                gc::run(&self.pool, &self.config, None).await?;
                 self.refit_bodies(&bodies, &job.ownership()).await
             }
             JobPayload::RevertRefit => {

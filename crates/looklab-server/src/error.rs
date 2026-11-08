@@ -26,7 +26,7 @@ pub enum ErrorCode {
     SendExpired,
     BodyUnknown,
     SchemaInvalid,
-    MonochromeUnsupported,
+    RenderClassMismatch,
     SnapshotUnknown,
     SnapshotTooOld,
     CredentialUnknown,
@@ -60,7 +60,7 @@ impl ErrorCode {
             Self::PowInvalid => StatusCode::BAD_REQUEST,
             Self::BodyUnknown
             | Self::SchemaInvalid
-            | Self::MonochromeUnsupported
+            | Self::RenderClassMismatch
             | Self::SnapshotUnknown
             | Self::SnapshotTooOld => StatusCode::BAD_REQUEST,
             Self::CredentialUnknown => StatusCode::UNAUTHORIZED,
@@ -96,7 +96,7 @@ impl ErrorCode {
             Self::PowInvalid => "POW_INVALID",
             Self::BodyUnknown => "BODY_UNKNOWN",
             Self::SchemaInvalid => "SCHEMA_INVALID",
-            Self::MonochromeUnsupported => "MONOCHROME_UNSUPPORTED",
+            Self::RenderClassMismatch => "RENDER_CLASS_MISMATCH",
             Self::SnapshotUnknown => "SNAPSHOT_UNKNOWN",
             Self::SnapshotTooOld => "SNAPSHOT_TOO_OLD",
             Self::CredentialUnknown => "CREDENTIAL_UNKNOWN",

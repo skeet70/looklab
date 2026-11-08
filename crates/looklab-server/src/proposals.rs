@@ -11,17 +11,19 @@ use looklab_model::Look;
 use looklab_model::probes;
 use looklab_schema::{
     AcceptedArtifact, Evidence, FIXTURE_MANIFEST, FixtureDonation, FixtureFileName, LabeledTag,
-    Placement, ProposalKind, ProposalStatus, ProposalView, SNAPSHOT_MANIFEST, SnapshotManifest,
-    ValidatedPayload, apply_sim_mapping, body_export_path, content_hash, fixture_manifest_toml,
-    interface_export_path, mapping_status_supported, schema_export_path, validate_confirmation,
-    validate_proposal,
+    Placement, ProposalKind, ProposalStatus, ProposalView, SNAPSHOT_MANIFEST, Sha256Hex,
+    SnapshotManifest, ValidatedPayload, apply_sim_mapping, body_export_path, content_hash,
+    fixture_manifest_toml, interface_export_path, mapping_status_supported, schema_export_path,
+    validate_confirmation, validate_proposal,
 };
+use looklab_upload::CommunitySnapshotVersion;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use tokio::sync::Mutex;
 
 use crate::admin::{self, AdminError, ModDecision};
 use crate::blob::BlobHash;
+use crate::body_schema::Bodies;
 use crate::db::now_unix;
 use crate::ids::{CredentialId, ProposalId, ProposalMessageId};
 use crate::state::AppState;
@@ -658,17 +660,58 @@ async fn publish_pending_locked(state: &AppState) -> Result<(), ProposalError> {
         .bind(proposal.as_str())
         .fetch_one(&state.db)
         .await?;
+        let version = CommunitySnapshotVersion::new(
+            u64::try_from(version).map_err(|_| ProposalError::Corrupt)?,
+        );
+        let hash = Sha256Hex::parse(&hash).map_err(|_| ProposalError::Corrupt)?;
         let evidence: Vec<Evidence> =
             serde_json::from_str(&evidence).map_err(|_| ProposalError::Corrupt)?;
-        let prepared =
-            prepare_snapshot(state, kind, &payload, &evidence_donations(&evidence)).await?;
-        if i64::try_from(prepared.version).ok() != Some(version) || prepared.content_hash != hash {
-            return Err(ProposalError::Snapshot(
-                "a pending publication cannot be reproduced".to_owned(),
-            ));
-        }
+        let prepared = match recover_prepared(state, version, hash)? {
+            Some(prepared) => prepared,
+            None => {
+                let prepared =
+                    prepare_snapshot(state, kind, &payload, &evidence_donations(&evidence)).await?;
+                if prepared.version != version.get()
+                    || Sha256Hex::parse(&prepared.content_hash)
+                        .map_err(|_| ProposalError::Corrupt)?
+                        != hash
+                {
+                    return Err(ProposalError::Snapshot(
+                        "a pending publication cannot be reproduced".to_owned(),
+                    ));
+                }
+                prepared
+            }
+        };
         publish_prepared(state, &proposal, &prepared).await?;
     }
+}
+
+fn recover_prepared(
+    state: &AppState,
+    version: CommunitySnapshotVersion,
+    hash: Sha256Hex,
+) -> Result<Option<PreparedSnapshot>, ProposalError> {
+    let target = state.config.snapshot_dir.join(version.to_string());
+    if !target.is_dir() {
+        return Ok(None);
+    }
+    let (found, documents) = previous_snapshot(&state.config.snapshot_dir)?;
+    if found != version.get() {
+        return Ok(None);
+    }
+    let files: Vec<(String, Vec<u8>)> = documents.into_iter().collect();
+    let computed_hash = content_hash(&files);
+    if Sha256Hex::parse(&computed_hash).map_err(|_| ProposalError::Corrupt)? != hash {
+        return Ok(None);
+    }
+    Ok(Some(PreparedSnapshot {
+        version: found,
+        content_hash: computed_hash,
+        files: files.len(),
+        staging: target.clone(),
+        target,
+    }))
 }
 
 async fn publish_prepared(
@@ -676,12 +719,26 @@ async fn publish_prepared(
     proposal: &ProposalId,
     prepared: &PreparedSnapshot,
 ) -> Result<(), ProposalError> {
-    std::fs::rename(&prepared.staging, &prepared.target)
-        .map_err(|error| ProposalError::Snapshot(error.to_string()))?;
+    if prepared.staging != prepared.target {
+        std::fs::rename(&prepared.staging, &prepared.target)
+            .map_err(|error| ProposalError::Snapshot(error.to_string()))?;
+    }
+    let reloaded = Bodies::load(&state.config.bodies_dir, &state.config.snapshot_dir);
+    let bodies = match reloaded {
+        Ok(bodies) => bodies,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&prepared.target);
+            return Err(ProposalError::Snapshot(error.to_string()));
+        }
+    };
+    *state.bodies.write().await = bodies;
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query("UPDATE proposals SET publication = 'published' WHERE id = ?")
         .bind(proposal.as_str())
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    crate::store::request_publication(&mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -702,6 +759,9 @@ async fn prepare_snapshot(
     }
     let dir = &state.config.snapshot_dir;
     let (previous_version, mut documents) = previous_snapshot(dir)?;
+    if previous_version == 0 && documents.is_empty() {
+        documents = baseline_documents(state)?;
+    }
     for (path, bytes) in documents_for(state, &validated, payload, &documents)? {
         documents.insert(path, bytes);
     }
@@ -812,6 +872,49 @@ async fn prepare_snapshot(
         staging,
         target,
     })
+}
+
+fn baseline_documents(state: &AppState) -> Result<BTreeMap<String, Vec<u8>>, ProposalError> {
+    let root = state
+        .config
+        .bodies_dir
+        .parent()
+        .ok_or_else(|| ProposalError::Snapshot("bodies directory has no parent".to_owned()))?;
+    let mut shipped = BTreeMap::new();
+    for sub in ["bodies", "interfaces"] {
+        collect_documents(&root.join(sub), sub, &mut shipped)?;
+    }
+    let mut documents = BTreeMap::new();
+    for (path, bytes) in shipped {
+        let text = std::str::from_utf8(&bytes).map_err(|_| ProposalError::Corrupt)?;
+        let export = if path.starts_with("bodies/") && path.ends_with(".body.yaml") {
+            let body = looklab_schema::validate_body(text).map_err(|errors| {
+                ProposalError::Snapshot(format!(
+                    "the shipped body {path} is invalid: {}",
+                    join_errors(&errors)
+                ))
+            })?;
+            body_export_path(&body.id)
+        } else if path.starts_with("bodies/") {
+            let schema = looklab_schema::validate_control_schema(text).map_err(|errors| {
+                ProposalError::Snapshot(format!(
+                    "the shipped schema {path} is invalid: {}",
+                    join_errors(&errors)
+                ))
+            })?;
+            schema_export_path(&schema.body)
+        } else {
+            let profile = looklab_schema::validate_interface_profile(text).map_err(|errors| {
+                ProposalError::Snapshot(format!(
+                    "the shipped interface {path} is invalid: {}",
+                    join_errors(&errors)
+                ))
+            })?;
+            interface_export_path(&profile.id)
+        };
+        documents.insert(export, bytes);
+    }
+    Ok(documents)
 }
 
 fn dedupe_donations(donations: &mut Vec<FixtureDonation>) {

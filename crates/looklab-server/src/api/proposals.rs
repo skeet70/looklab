@@ -351,6 +351,7 @@ pub async fn donate_fixture(
             return Err(ApiError::new(ErrorCode::Busy));
         }
         let store = state.blobs.clone();
+        let payload = payload.clone();
         let (mut tx, ()) = crate::blob::write_guarded(tx, move || ((), store.put(hash, &payload)))
             .await
             .map_err(|_| ApiError::new(ErrorCode::Internal))?;

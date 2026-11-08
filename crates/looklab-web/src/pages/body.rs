@@ -82,6 +82,16 @@ fn BodyDetailView(body: BodyPage) -> impl IntoView {
         <h2>"Built-in looks"</h2>
         {move || match gallery.get() { Load::Ready((index,scene)) => {
             let items=super::looks::cards(&index);
+            if items.is_empty() {
+                crate::prefetch::route_rendered();
+                return view! {
+                    <p class="muted">"No looks are published yet. Look previews and settings for this camera appear here once looks are published."</p>
+                    <p class="field-row">
+                        <a href=crate::base::site_url("/contribute")>"Share photos from this camera"</a>
+                        <a href=crate::base::site_url("/about/how-it-works")>"How looks are made →"</a>
+                    </p>
+                }.into_any();
+            }
             let built_in=items.iter().filter(|item|index.bodies.iter().any(|body|body.id==camera_id && body.looks.contains(&item.slug))).cloned().collect::<Vec<_>>();
             let on_select = {
                 let camera = match_camera.clone();

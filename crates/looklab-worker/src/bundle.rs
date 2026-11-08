@@ -14,7 +14,7 @@ use looklab_upload::LookSlug;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 
-use crate::body::{BodyResources, DataDir, TransformDir};
+use crate::body::{BodyResources, TransformDir};
 use crate::config::WorkerConfig;
 use crate::db;
 use crate::error::{Result, WorkerError};
@@ -44,7 +44,7 @@ pub(crate) async fn for_release(
     candidate: &Candidate<'_>,
 ) -> Result<Vec<ArtifactBlob>> {
     let listings = load_listings(pool).await?;
-    let data = DataDir::new(&config.data);
+    let data = crate::body::data_dir(config)?;
     let mut blobs = Vec::new();
     for use_ in &provenance.bodies {
         let body_id = BodyId::new(&use_.body)

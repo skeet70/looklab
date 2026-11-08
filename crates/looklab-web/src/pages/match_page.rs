@@ -61,6 +61,7 @@ pub fn MatchPage() -> impl IntoView {
     let epoch = RwSignal::new(None::<u32>);
     let emphasis = RwSignal::new(looklab_match::Emphasis::Balanced);
     let step = RwSignal::new(ui::StepIndex(0));
+    let furthest = RwSignal::new(ui::StepIndex(0));
     let application = RwSignal::new(Application::Camera);
     let scene = RwSignal::new(None::<Arc<looklab_publish::PreparedScene>>);
     let scene_error = RwSignal::new(None::<String>);
@@ -239,6 +240,16 @@ pub fn MatchPage() -> impl IntoView {
                     origin: ui::LookOrigin::BuiltIn { cameras: index.bodies.iter().filter(|body| body.looks.contains(&look.slug)).map(|body| format!("{} {}", body.make, body.model)).collect() },
                     character: String::new(), status: version.status, lut: None,
                 })).collect::<Vec<_>>();
+                if items.is_empty() {
+                    return view! {
+                        <ui::EmptyState title="No looks are ready for matching yet".to_owned() message="Matching becomes available when a look has enough supported data. Share RAW and JPEG pairs to help build it.".to_owned()>
+                            <p class="field-row">
+                                <a class="button" href=crate::base::site_url("/contribute")>"Share photos you already have"</a>
+                                <a href=crate::base::site_url("/about/how-it-works")>"How looks are made →"</a>
+                            </p>
+                        </ui::EmptyState>
+                    }.into_any();
+                }
                 let items = StoredValue::new(items);
                 view! {
                     <fieldset class="match-wizard" aria-label="Look choices" disabled=move || running.get()>
@@ -249,6 +260,7 @@ pub fn MatchPage() -> impl IntoView {
                             ui::WizardStep { title: "How to apply it".into(), summary: None },
                         ]
                         current=step
+                        furthest
                         can_advance=Signal::derive(move || choices_ready.get() && !running.get())
                         locked=running
                         on_finish=run
@@ -837,7 +849,7 @@ fn InlineVerification(permalink: String) -> impl IntoView {
                 <p>"Shoot two to four photos at these settings. Drop the JPEGs and their original RAW files here to measure the match and get an improved suggestion. Your photos stay on this device."</p>
                 <ui::DropZone
                     on_files=receive
-                    accept=".jpg,.jpeg,.raf,.dng,.arw,.cr2,.nef,.orf,.rw2".to_owned()
+                    accept=crate::files::camera_originals_accept_attribute()
                     folders=false
                     prompt="Drop your JPEGs and original RAW files here. Nothing is uploaded.".to_owned()
                     disabled=busy

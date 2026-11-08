@@ -57,6 +57,7 @@
   - Decay toward 0.5 with a 1-year half-life.
 - **Reputation raises weight only within a tier.** It never moves a credential out of the new tier and never bypasses the group cap. Farming it with synthetic data is therefore bounded.
 - **Reputation nominates; people decide.** High-reputation new-tier contributors appear in seeders' endorsement queue.
+- Deferred monochrome measurements earn no reputation, consistency bonus or endorsement evidence. Their status is "received, awaiting monochrome analysis", not accepted as consistent.
 - Display: a coarse tier/badge plus accepted-contribution counts.
 
 ## 5. Weighting
@@ -78,6 +79,8 @@ w_img = base(kind) × evidence × tier × reputation        → then caps (§6)
 - Per-image consistency checks quarantine or down-weight images regardless of tier.
 - **Duplicates (honest):** images from the same effective contributor with the same capture-metadata tuple are merged into one weight. Shuffling makes uploads byte-different, so there's no byte-level comparison.
 - **Chart anchoring of input transforms:** only chart sessions from `endorsed` or `seeder` credentials enter as gauge anchors with tight priors ([02 §2](02-color-pipeline.md)). New-tier chart sessions count as ordinary data, subject to the body-level cap (§6).
+- **Deferred monochrome:** scientific fit weight is zero. These records are excluded from colour Look parameters, input transforms, shared body exposure/WB parameters, gauge estimates, colour uncertainty, supported-image counts, cap denominators and release scores. The worker enforces this on every analysis entry point, including stale jobs; intake rejects a signed colour classification that conflicts with the schema or rendering metadata.
+- A shared RAW establishes correspondence, not an exposure reference. Monochrome re-renders remain correlated captures, even with different filters. Future monochrome analysis may consume a frozen, versioned colour calibration; feedback into shared calibration requires separate evidence.
 
 ## 6. Caps
 
@@ -88,6 +91,7 @@ w_img = base(kind) × evidence × tier × reputation        → then caps (§6)
   In regions or bodies with no endorsed or root data, new-tier data defines the value, and the region/body stays **provisional**.
 - **Per effective contributor:** with `n` effective contributors in the pool, at most `max(0.05, 2/n)` of a Look version's weight and `max(0.20, 2/n)` of a body input transform's weight, applied by water-filling against the final total alongside the group cap. Diminishing returns `1/sqrt(1 + n/20)` also apply on the n-th image of one contributor. The floors and the factor 2 are tentative ([10 Q12](10-open-questions.md)).
 - **Minimum pool (provisional label only):** a Look or body is labeled provisional when its pool has fewer than 20 (Look) or 5 (body) effective contributors and it is not rooted (§7). The threshold does not switch the per-contributor caps off.
+- Colour and deferred monochrome use the same credential, effective-contributor merging, signatures, per-batch proof of work and intake/storage limits. Changing render classification does not reset a quota. Once monochrome measurements influence a model, the existing tier and cap policy applies to that model's evidence; a shared body fit must cap the combined evidence entering it.
 - **Fake serials** let an attacker take a larger share of the new-tier pool from honest new contributors, but never more than the group cap.
 
 ## 7. Root set

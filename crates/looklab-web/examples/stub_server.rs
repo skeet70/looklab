@@ -25,7 +25,6 @@ const POW_DIFFICULTY: f64 = 0.0;
 
 struct Stub {
     dist: PathBuf,
-    origin: String,
     server: Arc<AppState>,
     server_routes: Router,
 }
@@ -102,7 +101,6 @@ async fn main() -> anyhow::Result<()> {
     println!("stub listening on {origin}");
     let stub = Arc::new(Stub {
         dist,
-        origin,
         server,
         server_routes,
     });

@@ -63,6 +63,7 @@ impl Fixture {
     async fn worker(&self, site: &Path) -> Worker {
         let mut config = WorkerConfig::new(self.root.join("looklab.sqlite3"), self.blobs.clone());
         config.data = self.data.clone();
+        config.snapshot_dir = self.data.join("community");
         config.transforms = self.root.join("transforms");
         config.site = site.to_owned();
         Worker::open(config).await.expect("worker")
@@ -179,6 +180,7 @@ async fn publish(fixture: &Fixture, name: &str) -> (SiteIndex, PathBuf) {
         db: fixture.root.join("unused.sqlite3"),
         blobs: fixture.blobs.clone(),
         data: fixture.data.clone(),
+        snapshot_dir: fixture.data.join("community"),
         transforms: fixture.root.join("transforms"),
         out: out.clone(),
     };
@@ -528,6 +530,7 @@ async fn a_second_publisher_waits_for_the_output_lock() {
         db: fixture.root.join("looklab.sqlite3"),
         blobs: fixture.blobs.clone(),
         data: fixture.data.clone(),
+        snapshot_dir: fixture.data.join("community"),
         transforms: fixture.root.join("transforms"),
         out: out.clone(),
     };
@@ -597,6 +600,7 @@ async fn a_waiting_publisher_leaves_the_current_thread_runtime_free() {
         db: fixture.root.join("unused.sqlite3"),
         blobs: fixture.blobs.clone(),
         data: fixture.data.clone(),
+        snapshot_dir: fixture.data.join("community"),
         transforms: fixture.root.join("transforms"),
         out: out.clone(),
     };

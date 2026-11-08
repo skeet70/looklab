@@ -95,6 +95,8 @@ let
     "${cfg.stateDir}/blobs"
     "--data"
     cfg.dataDir
+    "--snapshot-dir"
+    "${cfg.stateDir}/community"
     "--transforms"
     "${cfg.dataDir}/transforms"
     "--site"

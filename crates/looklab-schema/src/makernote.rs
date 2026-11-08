@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use looklab_meta::{FujiTag, LookSettings, ParsedTag};
 
 use crate::control::{Control, ControlType, ScalarValue};
-use crate::ids::{ControlKey, SimKey};
+use crate::ids::{ControlKey, LookId, SimKey};
 use crate::mapping::MappingError;
 use crate::rational::Rational;
 use crate::schema::{ControlSchema, Epoch, NativeSim};
@@ -102,6 +102,10 @@ impl MakernoteValues {
         }
     }
 
+    pub fn tag_value(&self, tag: FujiTag) -> Option<i64> {
+        self.raw(MakernoteSource::Fuji(tag), None)
+    }
+
     fn raw(&self, source: MakernoteSource, component: Option<u8>) -> Option<i64> {
         match source {
             MakernoteSource::Fuji(tag) => {
@@ -129,6 +133,8 @@ impl From<&LookSettings> for MakernoteValues {
         push(&mut values, look.clarity.as_ref());
         push(&mut values, look.grain_roughness.as_ref());
         push(&mut values, look.grain_size.as_ref());
+        push(&mut values, look.bw_adjustment.as_ref());
+        push(&mut values, look.bw_magenta_green.as_ref());
         push(&mut values, look.color_chrome_effect.as_ref());
         push(&mut values, look.color_chrome_fx_blue.as_ref());
         if let Some(pair) = look.white_balance_fine_tune.as_ref() {
@@ -194,12 +200,38 @@ pub fn settings_from_makernote_partial(
     epoch: u32,
     values: &MakernoteValues,
 ) -> (Settings, Vec<MappingError>) {
+    settings_scoped(schema, epoch, None, values)
+}
+
+pub fn settings_from_makernote_for(
+    schema: &ControlSchema,
+    epoch: u32,
+    family: &LookId,
+    values: &MakernoteValues,
+) -> (Settings, Vec<MappingError>) {
+    settings_scoped(schema, epoch, Some(family), values)
+}
+
+fn settings_scoped(
+    schema: &ControlSchema,
+    epoch: u32,
+    family: Option<&LookId>,
+    values: &MakernoteValues,
+) -> (Settings, Vec<MappingError>) {
     let mut settings = Settings::default();
     let Some(epoch) = schema.epochs.iter().find(|candidate| candidate.id == epoch) else {
         return (settings, vec![MappingError::UnknownEpoch { epoch }]);
     };
+    let classification = family
+        .is_none()
+        .then(|| crate::render::classify_render(epoch, values).ok())
+        .flatten();
+    let family = family.or(classification.as_ref().map(|classified| &classified.family));
     let mut problems = Vec::new();
     for control in &epoch.controls {
+        if family.is_some_and(|family| !control.scope.includes(family)) {
+            continue;
+        }
         match control.makernote_step(values) {
             Some(Ok((step, source))) => settings.entries.push(Setting {
                 key: control.key.clone(),
@@ -234,7 +266,7 @@ pub fn monochrome_sim(epoch: &Epoch, values: &MakernoteValues) -> Option<SimKey>
         .map(|sim| sim.key.clone())
 }
 
-fn matching_sims<'a>(epoch: &'a Epoch, values: &MakernoteValues) -> Vec<&'a NativeSim> {
+pub(crate) fn matching_sims<'a>(epoch: &'a Epoch, values: &MakernoteValues) -> Vec<&'a NativeSim> {
     let mut matches = Vec::new();
     for sim in &epoch.native_sims {
         let Some(source) = MakernoteSource::from_name(sim.makernote.tag.as_str()) else {

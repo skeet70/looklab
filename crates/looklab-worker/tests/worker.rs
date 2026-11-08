@@ -17,7 +17,7 @@ use looklab_samples::{SampleSet, encode};
 use looklab_server::{ContributionId, CredentialId};
 #[cfg(feature = "integration")]
 use looklab_upload::CardDeclaration;
-use looklab_upload::{ContributionKind, ManifestMetadata, RenderTag};
+use looklab_upload::{BodyId, ContributionKind, LookSlug, ManifestMetadata, RenderTag};
 use looklab_worker::db::ContributionIntent;
 #[cfg(feature = "integration")]
 use looklab_worker::db::{ContributionStatus, ImageOutcome};
@@ -69,6 +69,7 @@ async fn fixture_with(write_transform: bool, configure: impl FnOnce(&mut WorkerC
     }
     let mut config = WorkerConfig::new(&db, &blobs);
     config.data = data;
+    config.snapshot_dir = dir.path().join("community");
     config.site = dir.path().join("site/data");
     config.transforms = transforms;
     configure(&mut config);
@@ -1081,6 +1082,34 @@ async fn withdraw(worker: &Worker, contribution: &ContributionId, credential: &C
     .expect("withdrawal");
 }
 
+async fn defer(worker: &Worker, contribution: &ContributionId, due_at: i64) {
+    sqlx::query(
+        "UPDATE contributions SET render_class = 'monochrome', deferred_until = ? WHERE id = ?",
+    )
+    .bind(due_at)
+    .bind(contribution.as_str())
+    .execute(worker.pool())
+    .await
+    .expect("deferred contribution");
+    sqlx::query(
+        "UPDATE contribution_images SET render_class = 'monochrome' WHERE contribution_id = ?",
+    )
+    .bind(contribution.as_str())
+    .execute(worker.pool())
+    .await
+    .expect("deferred images");
+    sqlx::query(
+        "INSERT INTO deferred_expiries (id, contribution_id, due_at, status)
+         VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(contribution.as_str())
+    .bind(due_at)
+    .execute(worker.pool())
+    .await
+    .expect("expiry");
+}
+
 #[cfg(feature = "integration")]
 fn read_release(fixture: &Fixture, version: u32) -> looklab_worker::ReleaseRecord {
     let path = fixture
@@ -1778,6 +1807,247 @@ async fn withdrawal_gc_releases_a_shared_blob_once() {
 }
 
 #[tokio::test]
+#[cfg(feature = "integration")]
+async fn a_consistency_retry_preserves_a_quarantine() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let config = SynthConfig {
+        seed: 21,
+        images: 8,
+        samples_per_image: 400,
+        ..SynthConfig::default()
+    };
+    let truth = looklab_fit::synth::truth_look(config.seed);
+    let other = mislabelled_look(&truth);
+    let dataset = looklab_fit::synth::dataset_with(
+        &config,
+        &truth,
+        &LookSelector::Replace {
+            image: 3,
+            look: &other,
+        },
+    );
+    let credential = add_credential(worker, "new", 0.5).await;
+    let (contribution, images) = add_contribution(
+        worker,
+        &credential,
+        &dataset,
+        &(0..8).collect::<Vec<_>>(),
+        100,
+    )
+    .await;
+    for _ in 0..2 {
+        worker
+            .enqueue(
+                &JobPayload::ConsistencyScore {
+                    contribution_id: contribution.clone(),
+                },
+                0,
+            )
+            .await
+            .expect("enqueue");
+        worker
+            .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+            .await
+            .expect("consistency");
+        assert_eq!(
+            image_field(worker, &images[3], "status").await.as_deref(),
+            Some("quarantined")
+        );
+    }
+}
+
+#[tokio::test]
+async fn deferred_monochrome_stays_out_of_the_pool_and_never_scores() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 2,
+        samples_per_image: 200,
+        ..SynthConfig::default()
+    });
+    let credential = add_credential(worker, "new", 0.5).await;
+    let (colour, _) = add_contribution(worker, &credential, &dataset, &[0], 100).await;
+    let (deferred, deferred_images) =
+        add_contribution(worker, &credential, &dataset, &[1], 200).await;
+    defer(worker, &deferred, 1_000).await;
+
+    let pool = looklab_worker::pool::build(
+        worker.pool(),
+        worker.config(),
+        &BodyId::new(BODY).expect("body"),
+        &LookSlug::try_from(LOOK).expect("look"),
+    )
+    .await
+    .expect("pool");
+    assert_eq!(pool.images.len(), 1);
+    assert_eq!(pool.images[0].contribution.id, colour);
+
+    worker
+        .enqueue(
+            &JobPayload::ConsistencyScore {
+                contribution_id: deferred.clone(),
+            },
+            0,
+        )
+        .await
+        .expect("enqueue");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("consistency");
+
+    let status: String = sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
+        .bind(deferred.as_str())
+        .fetch_one(worker.pool())
+        .await
+        .expect("status");
+    assert_eq!(status, "pending");
+    for image in &deferred_images {
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM contribution_images WHERE id = ?")
+                .bind(image)
+                .fetch_one(worker.pool())
+                .await
+                .expect("image status");
+        assert_eq!(status, "pending");
+    }
+    let reputation: f64 = sqlx::query_scalar("SELECT reputation FROM credentials WHERE id = ?")
+        .bind(credential.as_str())
+        .fetch_one(worker.pool())
+        .await
+        .expect("reputation");
+    assert_eq!(reputation, 0.5);
+}
+
+#[tokio::test]
+async fn deferred_serial_links_still_merge_colour_identity() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 2,
+        samples_per_image: 200,
+        ..SynthConfig::default()
+    });
+    let colour_credential = add_credential(worker, "new", 0.5).await;
+    let deferred_credential = add_credential(worker, "new", 0.5).await;
+    let (colour, _) = add_contribution(worker, &colour_credential, &dataset, &[0], 100).await;
+    let (deferred, _) = add_contribution(worker, &deferred_credential, &dataset, &[1], 200).await;
+    defer(worker, &deferred, 1_000).await;
+    let hmac = vec![7_u8; 32];
+    for contribution in [&colour, &deferred] {
+        sqlx::query("UPDATE contributions SET serial_hmac = ? WHERE id = ?")
+            .bind(hmac.as_slice())
+            .bind(contribution.as_str())
+            .execute(worker.pool())
+            .await
+            .expect("serial link");
+    }
+
+    let pool = looklab_worker::pool::build(
+        worker.pool(),
+        worker.config(),
+        &BodyId::new(BODY).expect("body"),
+        &LookSlug::try_from(LOOK).expect("look"),
+    )
+    .await
+    .expect("pool");
+    assert_eq!(pool.images.len(), 1);
+    assert_eq!(pool.images[0].contribution.id, colour);
+    let a = looklab_server::admin::trust_id(&colour_credential).expect("colour credential");
+    let b = looklab_server::admin::trust_id(&deferred_credential).expect("deferred credential");
+    let expected = looklab_trust::EffectiveContributorId::from(std::cmp::min(a, b));
+    assert_eq!(pool.images[0].contributor, expected);
+}
+
+#[tokio::test]
+async fn deferred_expiry_releases_one_reference_and_keeps_a_shared_blob() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 1,
+        samples_per_image: 200,
+        ..SynthConfig::default()
+    });
+    let credential = add_credential(worker, "new", 0.5).await;
+    let (colour, _) = add_contribution(worker, &credential, &dataset, &[0], 100).await;
+    let (deferred, _) = add_contribution(worker, &credential, &dataset, &[0], 200).await;
+    defer(worker, &deferred, 0).await;
+    let hash: Vec<u8> = sqlx::query_scalar(
+        "SELECT samples_hash FROM contribution_images WHERE contribution_id = ?",
+    )
+    .bind(deferred.as_str())
+    .fetch_one(worker.pool())
+    .await
+    .expect("hash");
+    let path = worker.config().blobs.join(hex(&hash));
+    assert!(path.exists());
+    assert_eq!(
+        count(worker, "SELECT ref_count FROM blobs LIMIT 1").await,
+        2
+    );
+
+    worker
+        .enqueue(
+            &JobPayload::BlobGc {
+                contribution_id: Some(deferred.clone()),
+            },
+            0,
+        )
+        .await
+        .expect("enqueue");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("expiry");
+
+    assert!(path.exists());
+    assert_eq!(
+        count(worker, "SELECT ref_count FROM blobs LIMIT 1").await,
+        1
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
+        .bind(deferred.as_str())
+        .fetch_one(worker.pool())
+        .await
+        .expect("deferred status");
+    assert_eq!(status, "withdrawn");
+    let expiry: String =
+        sqlx::query_scalar("SELECT status FROM deferred_expiries WHERE contribution_id = ?")
+            .bind(deferred.as_str())
+            .fetch_one(worker.pool())
+            .await
+            .expect("expiry status");
+    assert_eq!(expiry, "deleted");
+    let colour_status: String = sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
+        .bind(colour.as_str())
+        .fetch_one(worker.pool())
+        .await
+        .expect("colour status");
+    assert_eq!(colour_status, "pending");
+
+    withdraw(worker, &colour, &credential).await;
+    worker
+        .enqueue(
+            &JobPayload::BlobGc {
+                contribution_id: Some(colour.clone()),
+            },
+            0,
+        )
+        .await
+        .expect("enqueue");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("withdrawal");
+    assert!(!path.exists());
+    assert_eq!(count(worker, "SELECT COUNT(*) FROM blobs").await, 0);
+}
+
+#[tokio::test]
 async fn blob_gc_keeps_a_live_reservation_and_sweeps_it_after_expiry() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
@@ -1993,53 +2263,215 @@ async fn blob_gc_removes_interrupted_temporary_writes() {
 }
 
 #[tokio::test]
-#[cfg(feature = "integration")]
-async fn a_consistency_retry_preserves_a_quarantine() {
+async fn a_released_image_is_not_released_again_by_expiry() {
     let fixture = fixture().await;
     let worker = &fixture.worker;
-    let config = SynthConfig {
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
         seed: 21,
-        images: 8,
-        samples_per_image: 400,
+        images: 1,
+        samples_per_image: 200,
         ..SynthConfig::default()
-    };
-    let truth = looklab_fit::synth::truth_look(config.seed);
-    let other = mislabelled_look(&truth);
-    let dataset = looklab_fit::synth::dataset_with(
-        &config,
-        &truth,
-        &LookSelector::Replace {
-            image: 3,
-            look: &other,
-        },
-    );
+    });
     let credential = add_credential(worker, "new", 0.5).await;
-    let (contribution, images) = add_contribution(
+    let (colour, _) = add_contribution(worker, &credential, &dataset, &[0], 100).await;
+    let (deferred, _) = add_contribution(worker, &credential, &dataset, &[0], 200).await;
+    defer(worker, &deferred, 0).await;
+    sqlx::query("DELETE FROM deferred_expiries WHERE contribution_id = ?")
+        .bind(deferred.as_str())
+        .execute(worker.pool())
+        .await
+        .expect("clear expiry");
+    let hash: Vec<u8> = sqlx::query_scalar(
+        "SELECT samples_hash FROM contribution_images WHERE contribution_id = ?",
+    )
+    .bind(deferred.as_str())
+    .fetch_one(worker.pool())
+    .await
+    .expect("hash");
+    let path = worker.config().blobs.join(hex(&hash));
+
+    withdraw(worker, &deferred, &credential).await;
+    worker
+        .enqueue(
+            &JobPayload::BlobGc {
+                contribution_id: Some(deferred.clone()),
+            },
+            0,
+        )
+        .await
+        .expect("enqueue");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("withdrawal");
+    assert_eq!(
+        count(worker, "SELECT ref_count FROM blobs LIMIT 1").await,
+        1
+    );
+
+    sqlx::query(
+        "INSERT INTO deferred_expiries (id, contribution_id, due_at, status)
+         VALUES (?, ?, 0, 'pending')",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(deferred.as_str())
+    .execute(worker.pool())
+    .await
+    .expect("expiry");
+    worker
+        .enqueue(
+            &JobPayload::BlobGc {
+                contribution_id: Some(deferred.clone()),
+            },
+            0,
+        )
+        .await
+        .expect("enqueue");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("expiry retry");
+
+    assert!(path.exists());
+    assert_eq!(
+        count(worker, "SELECT ref_count FROM blobs LIMIT 1").await,
+        1
+    );
+    let colour_status: String = sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
+        .bind(colour.as_str())
+        .fetch_one(worker.pool())
+        .await
+        .expect("colour status");
+    assert_eq!(colour_status, "pending");
+}
+
+#[tokio::test]
+async fn withdrawing_a_deferred_contribution_cancels_its_expiry() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 1,
+        samples_per_image: 200,
+        ..SynthConfig::default()
+    });
+    let credential = add_credential(worker, "new", 0.5).await;
+    let (colour, _) = add_contribution(worker, &credential, &dataset, &[0], 100).await;
+    let (deferred, _) = add_contribution(worker, &credential, &dataset, &[0], 200).await;
+    defer(worker, &deferred, 1_000).await;
+    let hash: Vec<u8> = sqlx::query_scalar(
+        "SELECT samples_hash FROM contribution_images WHERE contribution_id = ?",
+    )
+    .bind(deferred.as_str())
+    .fetch_one(worker.pool())
+    .await
+    .expect("hash");
+    let path = worker.config().blobs.join(hex(&hash));
+
+    withdraw(worker, &deferred, &credential).await;
+    worker
+        .enqueue(
+            &JobPayload::BlobGc {
+                contribution_id: Some(deferred.clone()),
+            },
+            0,
+        )
+        .await
+        .expect("enqueue");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("withdrawal");
+
+    assert!(path.exists());
+    assert_eq!(
+        count(worker, "SELECT ref_count FROM blobs LIMIT 1").await,
+        1
+    );
+    let expiry: String =
+        sqlx::query_scalar("SELECT status FROM deferred_expiries WHERE contribution_id = ?")
+            .bind(deferred.as_str())
+            .fetch_one(worker.pool())
+            .await
+            .expect("expiry status");
+    assert_eq!(expiry, "deleted");
+    let colour_status: String = sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
+        .bind(colour.as_str())
+        .fetch_one(worker.pool())
+        .await
+        .expect("colour status");
+    assert_eq!(colour_status, "pending");
+}
+
+#[tokio::test]
+async fn deferred_recipe_and_card_rows_are_not_scored_or_verified() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 1,
+        samples_per_image: 200,
+        ..SynthConfig::default()
+    });
+    let credential = add_credential(worker, "new", 0.5).await;
+    let (recipe, _) = add_contribution_with(
         worker,
         &credential,
         &dataset,
-        &(0..8).collect::<Vec<_>>(),
+        &[0],
         100,
+        ContributionKind::Library,
+        ContributionIntent::Recipe,
+        Some(LOOK),
+        "[]",
     )
     .await;
-    for _ in 0..2 {
-        worker
-            .enqueue(
-                &JobPayload::ConsistencyScore {
-                    contribution_id: contribution.clone(),
-                },
-                0,
-            )
+    defer(worker, &recipe, 1_000).await;
+    let (card, _) = insert_contribution(
+        worker,
+        &credential,
+        &dataset,
+        &[0],
+        200,
+        ContributionKind::Rerender,
+        ContributionIntent::Card,
+        None,
+        "[]",
+        None,
+        None,
+    )
+    .await;
+    defer(worker, &card, 1_000).await;
+
+    worker
+        .enqueue(&JobPayload::Bounties, 0)
+        .await
+        .expect("enqueue bounties");
+    worker
+        .enqueue(&JobPayload::CardVerification, 0)
+        .await
+        .expect("enqueue cards");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("jobs");
+
+    assert_eq!(
+        count(worker, "SELECT COUNT(*) FROM recipe_observations").await,
+        0
+    );
+    assert_eq!(count(worker, "SELECT COUNT(*) FROM bounties").await, 0);
+    assert_eq!(
+        count(worker, "SELECT COUNT(*) FROM card_verifications").await,
+        0
+    );
+    for contribution in [&recipe, &card] {
+        let status: String = sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
+            .bind(contribution.as_str())
+            .fetch_one(worker.pool())
             .await
-            .expect("enqueue");
-        worker
-            .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
-            .await
-            .expect("consistency");
-        assert_eq!(
-            image_field(worker, &images[3], "status").await.as_deref(),
-            Some("quarantined")
-        );
+            .expect("status");
+        assert_eq!(status, "pending");
     }
 }
 

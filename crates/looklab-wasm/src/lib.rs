@@ -37,8 +37,8 @@ pub use pairing::{
 };
 pub use pattern::{PatternImage, render_pattern};
 pub use prefill::{
-    MONOCHROME_REFUSAL, MonochromeRender, RenderClass, SettingsPrefill, prefill_settings,
-    prefill_settings_parsed, render_class,
+    MonochromeRender, NativeRenderClass, SettingsPrefill, native_render_class, prefill_settings,
+    prefill_settings_parsed,
 };
 pub use prep::{
     ControlSetting, GroupSettings, IntentChoice, PrepSummary, build_manifest_request,

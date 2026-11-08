@@ -22,7 +22,7 @@ use crate::verify::{RequestDomain, SignedRequestPayload, request_digest, verify_
 pub struct WithdrawRequest {
     #[serde(flatten)]
     signed: SignedRequestPayload,
-    contribution_id: String,
+    contribution_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -43,8 +43,18 @@ pub async fn withdraw(
 ) -> ApiResult<Response> {
     let Json(payload) = payload.map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
     let (assertion, nonce) = payload.signed.decode()?;
-    let contribution_id = ContributionId::try_from(payload.contribution_id)
-        .map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
+    let mut contribution_ids = payload
+        .contribution_ids
+        .into_iter()
+        .map(|id| {
+            ContributionId::try_from(id).map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    contribution_ids.sort_unstable();
+    contribution_ids.dedup();
+    if contribution_ids.is_empty() {
+        return Err(ApiError::new(ErrorCode::MalformedEnvelope));
+    }
     let raw_id = RawCredentialId::new(assertion.credential_id.clone());
     consume_nonce(&state, &nonce).await?;
     if !state.rate_limiter.check(&RateKey::GlobalSigned) {
@@ -55,7 +65,19 @@ pub async fn withdraw(
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?
         .ok_or_else(|| ApiError::new(ErrorCode::CredentialUnknown))?;
-    let digest = request_digest(RequestDomain::Withdraw, contribution_id.as_str().as_bytes());
+    let capacity = contribution_ids
+        .iter()
+        .map(|id| id.as_str().len())
+        .sum::<usize>()
+        + contribution_ids.len().saturating_sub(1);
+    let mut canonical = String::with_capacity(capacity);
+    for id in &contribution_ids {
+        if !canonical.is_empty() {
+            canonical.push('\n');
+        }
+        canonical.push_str(id.as_str());
+    }
+    let digest = request_digest(RequestDomain::Withdraw, canonical.as_bytes());
     let challenge = Challenge::new(&nonce, &digest);
     let passkey = verify_assertion(
         &credential.passkey,
@@ -87,7 +109,7 @@ pub async fn withdraw(
     }
 
     let delete_after = now_unix() + i64::from(state.config.blob_retention_days) * 86_400;
-    let delete_after = store::withdraw(&state.db, &contribution_id, &credential.id, delete_after)
+    let delete_after = store::withdraw(&state.db, &contribution_ids, &credential.id, delete_after)
         .await?
         .ok_or_else(|| ApiError::new(ErrorCode::ContributionUnknown))?;
 

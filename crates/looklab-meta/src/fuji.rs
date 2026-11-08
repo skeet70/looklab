@@ -21,6 +21,8 @@ pub enum FujiTag {
     HighlightTone,
     GrainEffectRoughness,
     ColorChromeEffect,
+    BwAdjustment,
+    BwMagentaGreen,
     GrainEffectSize,
     ColorChromeFxBlue,
     DynamicRange,
@@ -33,7 +35,7 @@ pub enum FujiTag {
 }
 
 impl FujiTag {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 24] = [
         Self::Version,
         Self::InternalSerialNumber,
         Self::Sharpness,
@@ -47,6 +49,8 @@ impl FujiTag {
         Self::HighlightTone,
         Self::GrainEffectRoughness,
         Self::ColorChromeEffect,
+        Self::BwAdjustment,
+        Self::BwMagentaGreen,
         Self::GrainEffectSize,
         Self::ColorChromeFxBlue,
         Self::DynamicRange,
@@ -81,6 +85,8 @@ impl FujiTag {
             Self::HighlightTone => 0x1041,
             Self::GrainEffectRoughness => 0x1047,
             Self::ColorChromeEffect => 0x1048,
+            Self::BwAdjustment => 0x1049,
+            Self::BwMagentaGreen => 0x104b,
             Self::GrainEffectSize => 0x104c,
             Self::ColorChromeFxBlue => 0x104e,
             Self::SequenceNumber => 0x1101,
@@ -108,6 +114,8 @@ impl FujiTag {
             Self::HighlightTone => "HighlightTone",
             Self::GrainEffectRoughness => "GrainEffectRoughness",
             Self::ColorChromeEffect => "ColorChromeEffect",
+            Self::BwAdjustment => "BWAdjustment",
+            Self::BwMagentaGreen => "BWMagentaGreen",
             Self::GrainEffectSize => "GrainEffectSize",
             Self::ColorChromeFxBlue => "ColorChromeFXBlue",
             Self::DynamicRange => "DynamicRange",
@@ -194,6 +202,10 @@ pub struct LookSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grain_size: Option<ParsedTag<GrainSize>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub bw_adjustment: Option<ParsedTag<WarmCool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bw_magenta_green: Option<ParsedTag<MagentaGreen>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub color_chrome_effect: Option<ParsedTag<EffectStrength>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color_chrome_fx_blue: Option<ParsedTag<EffectStrength>>,
@@ -261,6 +273,13 @@ pub enum ColorSaturation {
     Monochrome(MonochromeFilter),
     Acros(MonochromeFilter),
     FilmSimulation,
+}
+
+impl ColorSaturation {
+    /// Decodes the `Saturation` tag's raw value.
+    pub fn from_raw(raw: u16) -> Option<Self> {
+        decode_saturation(raw)
+    }
 }
 
 impl Serialize for ColorSaturation {
@@ -407,6 +426,28 @@ pub enum GrainSize {
     Large,
 }
 
+/// `BWAdjustment`: positive is warm, negative is cool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct WarmCool(i8);
+
+impl WarmCool {
+    pub const fn steps(self) -> i8 {
+        self.0
+    }
+}
+
+/// `BWMagentaGreen`: positive is green, negative is magenta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct MagentaGreen(i8);
+
+impl MagentaGreen {
+    pub const fn steps(self) -> i8 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectStrength {
@@ -458,6 +499,21 @@ impl FujiEntry<'_> {
         Some(i32::from_le_bytes(
             self.bytes().get(start..end)?.try_into().ok()?,
         ))
+    }
+
+    fn i8_at(&self, index: usize) -> Option<i8> {
+        if index >= self.count as usize {
+            return None;
+        }
+        match self.typ {
+            1 | 6 | 7 => self.bytes().get(index).map(|byte| *byte as i8),
+            3 => {
+                let start = index.checked_mul(2)?;
+                let raw = u16::from_le_bytes(self.bytes().get(start..start + 2)?.try_into().ok()?);
+                u8::try_from(raw).ok().map(|byte| byte as i8)
+            }
+            _ => None,
+        }
     }
 
     fn ascii(&self) -> Option<&str> {
@@ -570,6 +626,8 @@ pub(crate) fn parse(bytes: &[u8]) -> Option<FujiMakernote> {
             decode_grain_roughness,
         ),
         grain_size: tagged_u16(find(0x104c), FujiTag::GrainEffectSize, decode_grain_size),
+        bw_adjustment: tagged_i8(find(0x1049), FujiTag::BwAdjustment, WarmCool),
+        bw_magenta_green: tagged_i8(find(0x104b), FujiTag::BwMagentaGreen, MagentaGreen),
         color_chrome_effect: tagged_i32(
             find(0x1048),
             FujiTag::ColorChromeEffect,
@@ -629,6 +687,19 @@ fn tagged_i32<T>(
         tag,
         raw: i64::from(raw),
         value: decode(raw),
+    })
+}
+
+fn tagged_i8<T>(
+    entry: Option<&FujiEntry>,
+    tag: FujiTag,
+    wrap: fn(i8) -> T,
+) -> Option<ParsedTag<T>> {
+    let raw = entry?.i8_at(0)?;
+    Some(ParsedTag {
+        tag,
+        raw: i64::from(raw),
+        value: Some(wrap(raw)),
     })
 }
 

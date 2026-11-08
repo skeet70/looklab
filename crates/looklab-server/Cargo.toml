@@ -19,6 +19,7 @@ getrandom.workspace = true
 http-body-util.workspace = true
 looklab-color.workspace = true
 looklab-export.workspace = true
+looklab-meta.workspace = true
 looklab-model.workspace = true
 looklab-publish.workspace = true
 looklab-samples.workspace = true

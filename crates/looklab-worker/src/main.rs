@@ -22,6 +22,9 @@ struct Args {
     /// Body and control-schema snapshots.
     #[arg(long, default_value = "data")]
     data: PathBuf,
+    /// Approved community snapshots; the newest `v<version>` directory wins.
+    #[arg(long, default_value = "data/community")]
+    snapshot_dir: PathBuf,
     /// Publication root; receives data/ and site-root.txt.
     #[arg(long, default_value = "site")]
     site: PathBuf,
@@ -47,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let mut config = WorkerConfig::new(args.db, args.blobs);
     config.data = args.data;
+    config.snapshot_dir = args.snapshot_dir;
     config.site = args.site;
     config.transforms = args.transforms;
     config.seed = args.seed;
@@ -65,8 +69,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Publishes a missing catalog, re-queues a requested publication, sweeps staged
-/// blob leftovers, and keeps pending jobs in the table.
+/// Publishes a missing catalog, re-queues a requested publication, and keeps pending jobs in the table.
 async fn schedule_startup(worker: &Worker) -> anyhow::Result<()> {
     let now = clock::now_unix();
     jobs::enqueue_pending_publication(worker.pool(), now).await?;

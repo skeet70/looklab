@@ -29,8 +29,8 @@ use crate::audit::{self, AuditKind};
 use crate::blob::{BlobHash, BlobStore, FsBlobStore};
 use crate::db::now_unix;
 use crate::ids::{
-    ContributionId, CredentialId, EndorsementId, GrantId, LookVersionId, ModerationDecisionId,
-    ProposalId, RootAdmissionId,
+    ContributionId, ContributionImageId, CredentialId, EndorsementId, GrantId, LookVersionId,
+    ModerationDecisionId, ProposalId, RootAdmissionId,
 };
 use crate::store::ContributionStatus;
 use crate::trust::Tier;
@@ -165,6 +165,86 @@ fn normalize_evidence(evidence: Vec<String>) -> Result<Vec<EvidenceRef>, AdminEr
         }
     }
     Ok(refs)
+}
+
+enum EvidenceTarget {
+    Contribution(ContributionId),
+    Image(ContributionImageId),
+    Bare(String),
+}
+
+fn parse_evidence_target(reference: &str) -> Result<Option<EvidenceTarget>, AdminError> {
+    if let Some(id) = reference.strip_prefix("contribution:") {
+        return ContributionId::try_from(id)
+            .map(|id| Some(EvidenceTarget::Contribution(id)))
+            .map_err(|_| AdminError::InvalidEvidence);
+    }
+    if let Some(id) = reference.strip_prefix("image:") {
+        return ContributionImageId::try_from(id)
+            .map(|id| Some(EvidenceTarget::Image(id)))
+            .map_err(|_| AdminError::InvalidEvidence);
+    }
+    Ok(uuid::Uuid::parse_str(reference)
+        .ok()
+        .map(|id| EvidenceTarget::Bare(id.hyphenated().to_string())))
+}
+
+async fn reject_deferred_evidence(
+    conn: &mut SqliteConnection,
+    evidence: &[EvidenceRef],
+) -> Result<(), AdminError> {
+    for reference in evidence {
+        let Some(target) = parse_evidence_target(reference.as_str())? else {
+            continue;
+        };
+        let class: Option<String> = match target {
+            EvidenceTarget::Contribution(id) => {
+                sqlx::query_scalar("SELECT render_class FROM contributions WHERE id = ?")
+                    .bind(id.as_str())
+                    .fetch_optional(&mut *conn)
+                    .await?
+            }
+            EvidenceTarget::Image(id) => {
+                sqlx::query_scalar(
+                    "SELECT c.render_class FROM contribution_images i
+                     JOIN contributions c ON c.id = i.contribution_id
+                     WHERE i.id = ?",
+                )
+                .bind(id.as_str())
+                .fetch_optional(&mut *conn)
+                .await?
+            }
+            EvidenceTarget::Bare(id) => {
+                let contribution: Option<String> =
+                    sqlx::query_scalar("SELECT render_class FROM contributions WHERE id = ?")
+                        .bind(&id)
+                        .fetch_optional(&mut *conn)
+                        .await?;
+                match contribution {
+                    Some(class) => Some(class),
+                    None => {
+                        sqlx::query_scalar(
+                            "SELECT c.render_class FROM contribution_images i
+                             JOIN contributions c ON c.id = i.contribution_id
+                             WHERE i.id = ?",
+                        )
+                        .bind(&id)
+                        .fetch_optional(&mut *conn)
+                        .await?
+                    }
+                }
+            }
+        };
+        let Some(class) = class else {
+            return Err(AdminError::InvalidEvidence);
+        };
+        if crate::store::render_class_from_db(&class)
+            == Some(looklab_upload::RenderClass::Monochrome)
+        {
+            return Err(AdminError::IneligibleContribution);
+        }
+    }
+    Ok(())
 }
 
 fn parse_tier(value: &str) -> Result<TrustTier, AdminError> {
@@ -696,6 +776,7 @@ pub async fn endorse(
             .map_err(|_| AdminError::Corrupt)?;
     let mut conn = begin_write(db).await?;
     let result = async {
+        reject_deferred_evidence(&mut *conn, &evidence).await?;
         let state = trust_state(&mut conn).await?;
         let (applied, event) = state.apply_endorsement(
             actor,
@@ -914,16 +995,30 @@ pub async fn admit_root(
         if actor_record.tier != TrustTier::Seeder {
             return Err(AdminError::NotAuthorized);
         }
-        let row: Option<(String, String, String, String, Option<String>, String)> = sqlx::query_as(
-            "SELECT credential_id, kind, status, body_id, target_look_id, intent
-             FROM contributions WHERE id = ?",
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+        )> = sqlx::query_as(
+            "SELECT credential_id, kind, status, body_id, target_look_id, intent, render_class
+                 FROM contributions WHERE id = ?",
         )
         .bind(contribution_id.as_str())
         .fetch_optional(&mut *conn)
         .await?;
-        let Some((credential, kind, status, body_id, target_look_id, intent)) = row else {
+        let Some((credential, kind, status, body_id, target_look_id, intent, render_class)) = row
+        else {
             return Err(AdminError::UnknownContribution);
         };
+        if crate::store::render_class_from_db(&render_class)
+            != Some(looklab_upload::RenderClass::Colour)
+        {
+            return Err(AdminError::IneligibleContribution);
+        }
         let kind = parse_contribution_kind(&kind)?;
         match ContributionStatus::from_db(&status).ok_or(AdminError::Corrupt)? {
             ContributionStatus::Pending | ContributionStatus::Accepted => {}
@@ -2940,7 +3035,8 @@ pub async fn mod_queue(db: &SqlitePool, tier: Tier) -> Result<ModQueue, AdminErr
     let mut serial_reuse = Vec::with_capacity(groups.len());
     for (hmac, _) in groups {
         let rows = sqlx::query(
-            "SELECT id, credential_id FROM contributions WHERE serial_hmac = ? ORDER BY created_at, id",
+            "SELECT id, credential_id FROM contributions
+             WHERE serial_hmac = ? ORDER BY created_at, id",
         )
         .bind(&hmac)
         .fetch_all(db)
@@ -2981,7 +3077,8 @@ pub async fn mod_queue(db: &SqlitePool, tier: Tier) -> Result<ModQueue, AdminErr
                 continue;
             };
             let accepted: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM contributions WHERE credential_id = ? AND status = 'accepted'",
+                "SELECT COUNT(*) FROM contributions
+                 WHERE credential_id = ? AND status = 'accepted' AND render_class = 'colour'",
             )
             .bind(credential.as_str())
             .fetch_one(db)

@@ -113,8 +113,7 @@ fn write_temporary(path: &std::path::Path, bytes: &[u8]) -> Result<(), BlobError
     Ok(())
 }
 
-/// Writes under a transaction the blocking task owns, so cancelling the caller
-/// cannot release the write lock while `write` runs.
+/// Writes under a transaction the blocking task owns.
 pub async fn write_guarded<T, F>(
     tx: sqlx::Transaction<'static, sqlx::Sqlite>,
     write: F,

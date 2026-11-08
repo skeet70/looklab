@@ -33,6 +33,8 @@ pub struct PublishConfig {
     pub db: PathBuf,
     pub blobs: PathBuf,
     pub data: PathBuf,
+    /// Approved community snapshots; the newest `v<version>` directory wins.
+    pub snapshot_dir: PathBuf,
     /// Body input transforms, one `<make>-<model>.yaml` per body.
     pub transforms: PathBuf,
     pub out: PathBuf,
@@ -67,6 +69,7 @@ impl PublishConfig {
             db: config.db.clone(),
             blobs: config.blobs.clone(),
             data: config.data.clone(),
+            snapshot_dir: config.snapshot_dir.clone(),
             transforms: config.transforms.clone(),
             out: config.site.clone(),
         }
@@ -260,7 +263,9 @@ async fn supersede_looks(
 }
 
 async fn site_data(pool: &SqlitePool, config: &PublishConfig) -> Result<SiteData> {
-    let resources = DataDir::new(&config.data).bodies()?;
+    let (snapshot_version, root) =
+        crate::body::current_snapshot(&config.snapshot_dir, &config.data)?;
+    let resources = DataDir::new(root).bodies()?;
     let mut bodies = Vec::new();
     for entry in &resources {
         bodies.push(BodyPage::from_schema(
@@ -388,7 +393,7 @@ async fn site_data(pool: &SqlitePool, config: &PublishConfig) -> Result<SiteData
         .collect::<Result<Vec<_>>>()?;
 
     Ok(SiteData {
-        community_snapshot_version: 0,
+        community_snapshot_version: snapshot_version,
         bodies,
         looks,
         audit_log: audit_log(pool).await?,
@@ -717,6 +722,7 @@ async fn root_contribution(
         "SELECT a.contribution_id FROM root_admissions a
          JOIN contributions c ON c.id = a.contribution_id
          WHERE a.admitted_by = ? AND c.credential_id = ? AND a.admitted_at <= ?
+           AND c.render_class = 'colour'
          ORDER BY a.admitted_at DESC, a.id DESC LIMIT 1",
     )
     .bind(admitted_by)

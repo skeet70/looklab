@@ -244,12 +244,15 @@ pub(crate) fn menu_words(slug: &str) -> String {
 
 /// Known control keys, in the camera's own menu wording.
 pub(crate) fn menu_label(key: &ControlKey) -> String {
-    const KNOWN: [(&str, &str); 12] = [
+    const KNOWN: [(&str, &str); 15] = [
         ("highlight_tone", "Highlight tone"),
         ("shadow_tone", "Shadow tone"),
         ("color", "Color"),
         ("color_chrome_effect", "Color Chrome effect"),
         ("color_chrome_fx_blue", "Color Chrome FX Blue"),
+        ("mono_filter", "Monochrome filter"),
+        ("bw_adjustment", "BW adjustment"),
+        ("bw_magenta_green", "BW magenta green"),
         ("dynamic_range", "Dynamic range"),
         ("wb_shift_r", "White balance shift R"),
         ("wb_shift_b", "White balance shift B"),

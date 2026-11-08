@@ -79,7 +79,7 @@ pub(crate) async fn authenticate_with_pow(
         None => return Err(ApiError::new(ErrorCode::CredentialUnknown)),
     };
     let challenge = Challenge::new(&nonce, &request_digest(domain, payload));
-    let verified = verify_assertion(
+    let passkey = verify_assertion(
         &original,
         &assertion,
         challenge,
@@ -95,7 +95,7 @@ pub(crate) async fn authenticate_with_pow(
     }
     if let Some(credential) = existing {
         let revision = revision.ok_or_else(|| ApiError::new(ErrorCode::Internal))?;
-        match store::update_credential_passkey(&state.db, &credential, &verified, &revision).await {
+        match store::update_credential_passkey(&state.db, &credential, &passkey, &revision).await {
             Ok(store::CredentialUpdate::Applied) => {}
             Ok(store::CredentialUpdate::Stale) => {
                 return Err(ApiError::new(ErrorCode::SignatureInvalid));
@@ -106,7 +106,7 @@ pub(crate) async fn authenticate_with_pow(
     } else {
         let solutions = pow.ok_or_else(|| ApiError::new(ErrorCode::PowInvalid))?;
         let promotion = state
-            .begin_promotion(&original, &verified)
+            .begin_promotion(&original, &passkey)
             .map_err(super::upload::promotion_error)?;
         let params = state
             .trust

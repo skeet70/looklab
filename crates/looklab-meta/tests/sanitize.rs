@@ -41,6 +41,22 @@ fn sanitizes_only_documented_fields() {
         look.color_chrome_effect.expect("color chrome").value,
         Some(EffectStrength::Strong)
     );
+    assert_eq!(
+        look.bw_adjustment
+            .expect("warm/cool")
+            .value
+            .expect("warm/cool value")
+            .steps(),
+        7
+    );
+    assert_eq!(
+        look.bw_magenta_green
+            .expect("magenta/green")
+            .value
+            .expect("magenta/green value")
+            .steps(),
+        -3
+    );
 }
 
 #[test]

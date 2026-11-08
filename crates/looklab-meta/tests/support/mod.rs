@@ -17,6 +17,7 @@ pub enum Value {
     Long(u32),
     Rational(u32, u32),
     SLong(i32),
+    SByte(i8),
     SRational(i32, i32),
     Undefined(Vec<u8>),
 }
@@ -29,6 +30,7 @@ impl Value {
             Self::Shorts(_) => 3,
             Self::Long(_) => 4,
             Self::Rational(_, _) => 5,
+            Self::SByte(_) => 6,
             Self::SLong(_) => 9,
             Self::SRational(_, _) => 10,
             Self::Undefined(_) => 7,
@@ -38,7 +40,7 @@ impl Value {
     fn count(&self) -> u32 {
         match self {
             Self::Ascii(text) => text.len() as u32 + 1,
-            Self::Short(_) | Self::Long(_) | Self::SLong(_) => 1,
+            Self::Short(_) | Self::Long(_) | Self::SLong(_) | Self::SByte(_) => 1,
             Self::Shorts(values) => values.len() as u32,
             Self::Rational(_, _) | Self::SRational(_, _) => 1,
             Self::Undefined(bytes) => bytes.len() as u32,
@@ -71,6 +73,7 @@ impl Value {
                 [u32_bytes(*numerator), u32_bytes(*denominator)].concat()
             }
             Self::SLong(value) => i32_bytes(*value).to_vec(),
+            Self::SByte(value) => vec![*value as u8],
             Self::SRational(numerator, denominator) => {
                 [i32_bytes(*numerator), i32_bytes(*denominator)].concat()
             }
@@ -230,8 +233,10 @@ fn put_u32(out: &mut [u8], at: usize, value: u32, endian: Endian) {
 #[derive(Clone, Debug)]
 pub enum FujiValue {
     Ascii(String),
+    Byte(u8),
     Short(u16),
     SLong(i32),
+    SByte(i8),
     SLongPair(i32, i32),
     Undefined(Vec<u8>),
 }
@@ -240,7 +245,9 @@ impl FujiValue {
     fn typ(&self) -> u16 {
         match self {
             Self::Ascii(_) => 2,
+            Self::Byte(_) => 1,
             Self::Short(_) => 3,
+            Self::SByte(_) => 6,
             Self::SLong(_) | Self::SLongPair(_, _) => 9,
             Self::Undefined(_) => 7,
         }
@@ -249,7 +256,7 @@ impl FujiValue {
     fn count(&self) -> u32 {
         match self {
             Self::Ascii(text) => text.len() as u32 + 1,
-            Self::Short(_) | Self::SLong(_) => 1,
+            Self::Byte(_) | Self::Short(_) | Self::SLong(_) | Self::SByte(_) => 1,
             Self::SLongPair(_, _) => 2,
             Self::Undefined(bytes) => bytes.len() as u32,
         }
@@ -262,8 +269,10 @@ impl FujiValue {
                 bytes.push(0);
                 bytes
             }
+            Self::Byte(value) => vec![*value],
             Self::Short(value) => value.to_le_bytes().to_vec(),
             Self::SLong(value) => value.to_le_bytes().to_vec(),
+            Self::SByte(value) => vec![*value as u8],
             Self::SLongPair(first, second) => [first.to_le_bytes(), second.to_le_bytes()].concat(),
             Self::Undefined(bytes) => bytes.clone(),
         }
@@ -330,6 +339,8 @@ pub fn fuji_makernote() -> Vec<u8> {
         (0x1041, FujiValue::SLong(32)),
         (0x1047, FujiValue::SLong(32)),
         (0x1048, FujiValue::SLong(64)),
+        (0x1049, FujiValue::SByte(7)),
+        (0x104b, FujiValue::SByte(-3)),
         (0x104c, FujiValue::Short(16)),
         (0x104e, FujiValue::SLong(32)),
         (0x1101, FujiValue::Short(77)),
@@ -450,6 +461,8 @@ pub const NESTED_KEYS: &[&str] = &[
     "clarity",
     "grain_roughness",
     "grain_size",
+    "bw_adjustment",
+    "bw_magenta_green",
     "color_chrome_effect",
     "color_chrome_fx_blue",
     "firmware_id",

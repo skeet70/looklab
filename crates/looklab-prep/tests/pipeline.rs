@@ -178,6 +178,31 @@ fn group_members_share_input_pixels_and_shuffle() {
 }
 
 #[test]
+fn a_group_member_that_does_not_align_with_the_raw_is_rejected() {
+    let scene = scene();
+    let raw = raw_from(&scene, [2.0, 1.0, 1.5]);
+    let reference = jpeg_from(scene);
+    let flat = Image3::new(
+        WIDTH,
+        HEIGHT,
+        vec![[0.3, 0.3, 0.3]; (WIDTH * HEIGHT) as usize],
+    )
+    .expect("dimensions match");
+    let error = prepare_decoded(
+        &raw,
+        &[&reference, &jpeg_from(flat)],
+        &prior(),
+        fixed_seed(0x33),
+        &params(),
+    )
+    .expect_err("a render with no structure cannot be aligned");
+    assert!(matches!(
+        error,
+        looklab_prep::PrepError::MemberAlignment { index: 2, .. }
+    ));
+}
+
+#[test]
 fn same_seed_reproduces_blobs_and_a_different_seed_reorders() {
     let scene = scene();
     let raw = raw_from(&scene, [2.0, 1.0, 1.5]);
@@ -476,6 +501,85 @@ fn samples_average_the_jpeg_over_the_raw_footprint() {
         for (a, b) in in_rgb.iter().zip(out_rgb) {
             assert!((a - b).abs() < 0.08, "{in_rgb:?} vs {out_rgb:?}");
         }
+    }
+}
+
+/// A ramp constant within each `factor` by `factor` block.
+fn block_ramp_raw(width: u32, height: u32, factor: u32) -> DecodedRaw {
+    let down_width = width / factor;
+    let down_height = height / factor;
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            rgb.extend_from_slice(&[
+                0.05 + 0.9 * (x / factor) as f32 / (down_width - 1) as f32,
+                0.05 + 0.9 * (y / factor) as f32 / (down_height - 1) as f32,
+                0.5,
+            ]);
+        }
+    }
+    DecodedRaw {
+        width: width as usize,
+        height: height as usize,
+        rgb,
+        as_shot_wb: [1.0, 1.0, 1.0],
+        orientation: Orientation::Normal,
+        make: "FUJIFILM".to_owned(),
+        model: "X-S10".to_owned(),
+        color_matrices: None,
+    }
+}
+
+fn down_ramp_jpeg(width: u32, height: u32) -> DecodedJpeg {
+    let mut data = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            data.push([
+                0.05 + 0.9 * x as f32 / (width - 1) as f32,
+                0.05 + 0.9 * y as f32 / (height - 1) as f32,
+                0.5,
+            ]);
+        }
+    }
+    jpeg_from(Image3::new(width, height, data).expect("dimensions match"))
+}
+
+#[test]
+fn secondary_members_sample_in_the_downsampled_frame() {
+    const WIDTH: u32 = 320;
+    const HEIGHT: u32 = 240;
+    const FACTOR: u32 = 8;
+    const DOWN_WIDTH: u32 = WIDTH / FACTOR;
+    const DOWN_HEIGHT: u32 = HEIGHT / FACTOR;
+
+    let raw = block_ramp_raw(WIDTH, HEIGHT, FACTOR);
+    let reference = jpeg_from(wb_image(&raw));
+    let secondary = down_ramp_jpeg(DOWN_WIDTH, DOWN_HEIGHT);
+    let params = PrepParams {
+        downsample_max_pixels: DOWN_WIDTH * DOWN_HEIGHT,
+        ..params()
+    };
+    let sets = prepare_decoded(
+        &raw,
+        &[&reference, &secondary],
+        &prior(),
+        fixed_seed(0x40),
+        &params,
+    )
+    .expect("prepares");
+    assert_eq!(sets.len(), 2);
+
+    // A secondary fit is in the downsampled frame; its samples land on the
+    // down-ramp lattice.
+    let step = 0.9 / f64::from(DOWN_WIDTH - 1);
+    for (index, rgb) in sets[1].out_rgb().iter().enumerate() {
+        let lattice = (f64::from(rgb[0]) - 0.05) / step;
+        let error = (lattice - lattice.round()).abs();
+        assert!(
+            error < 0.1,
+            "sample {index} channel 0 = {} is {error} off the downsampled ramp lattice",
+            rgb[0]
+        );
     }
 }
 

@@ -14,7 +14,6 @@ use looklab_prep::{
 };
 use looklab_raw::{DecodedRaw, RawDecoder, RawlerDecoder};
 use looklab_samples::{PrepVersion, PriorTransformVersion};
-use looklab_schema::{MakernoteValues, SimKey, validate_control_schema};
 use serde::Serialize;
 
 use crate::body_transform::TransformFile;
@@ -40,14 +39,11 @@ pub struct PrepArgs {
     /// SENSITIVE: the seed file reveals sampling order. Reusing one reproduces a previous run byte for byte; never upload or paste it. Defaults to `<out>/seeds.json`.
     #[arg(long)]
     pub seed_file: Option<PathBuf>,
-    /// Directory of body YAML files used to resolve each render's film simulation.
-    #[arg(long, default_value = "data/bodies")]
-    pub bodies_dir: PathBuf,
 }
 
 pub fn run(args: &PrepArgs) -> Result<()> {
     if let Some(dir) = &args.dir {
-        return report_folder(dir, &args.bodies_dir);
+        return report_folder(dir);
     }
     prepare_one(args)
 }
@@ -72,16 +68,6 @@ fn prepare_one(args: &PrepArgs) -> Result<()> {
         .iter()
         .map(|path| std::fs::read(path).with_context(|| format!("reading {}", path.display())))
         .collect::<Result<Vec<_>>>()?;
-    for (path, bytes) in args.jpeg.iter().zip(&jpeg_bytes) {
-        if let Ok(metadata) = parse_jpeg(bytes)
-            && let Some(sim) = monochrome_sim(&args.bodies_dir, &metadata)
-        {
-            bail!(
-                "{} is a {sim} render: B&W renders aren't supported yet",
-                path.display()
-            );
-        }
-    }
     let jpeg_refs: Vec<&[u8]> = jpeg_bytes.iter().map(Vec::as_slice).collect();
 
     let prior_version = if args.body_prior == "from-raw" {
@@ -116,8 +102,7 @@ fn prepare_one(args: &PrepArgs) -> Result<()> {
         let prepared = match decoded {
             Some(decoded) => prepare_group_with_decoded_raw(
                 &raw_bytes, decoded, &jpeg_refs, &prior, seed, &params,
-            )
-            .map(|(images, _alignment)| images),
+            ),
             None => prepare_group(&raw_bytes, &jpeg_refs, &prior, seed, &params),
         }
         .context("preparing the RAW/JPEG group")?;
@@ -252,23 +237,10 @@ fn body_id(make: &str, model: &str) -> Option<String> {
         }
         out.trim_end_matches('-').to_owned()
     };
-    let make = slug(make);
-    let model = slug(model);
+    let identity = looklab_prep::CameraIdentity::new(make, model)?;
+    let make = slug(identity.make());
+    let model = slug(identity.model());
     (!make.is_empty() && !model.is_empty()).then(|| format!("{make}/{model}"))
-}
-
-/// The monochrome sim a render's makernotes select, through the body's schema.
-fn monochrome_sim(bodies_dir: &Path, metadata: &looklab_meta::ParsedMetadata) -> Option<SimKey> {
-    let make = metadata.exif.make.as_deref()?;
-    let model = metadata.exif.model.as_deref()?;
-    let firmware = metadata.firmware.as_deref()?;
-    let slug = body_id(make, model)?;
-    let file = format!("{}.yaml", slug.replace('/', "-"));
-    let text = std::fs::read_to_string(bodies_dir.join(file)).ok()?;
-    let schema = validate_control_schema(&text).ok()?;
-    let epoch = schema.epoch_for(firmware)?;
-    let values = MakernoteValues::from(&metadata.fuji.as_ref()?.look);
-    looklab_schema::monochrome_sim(epoch, &values)
 }
 
 #[derive(Serialize)]
@@ -323,7 +295,7 @@ impl SummaryImage {
     }
 }
 
-fn report_folder(dir: &Path, bodies_dir: &Path) -> Result<()> {
+fn report_folder(dir: &Path) -> Result<()> {
     let entries = std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))?;
     let mut names = Vec::new();
     for entry in entries {
@@ -375,11 +347,6 @@ fn report_folder(dir: &Path, bodies_dir: &Path) -> Result<()> {
         };
         match metadata {
             Ok(metadata) => {
-                if key.kind() == looklab_prep::FileKind::Jpeg
-                    && let Some(sim) = monochrome_sim(bodies_dir, &metadata)
-                {
-                    println!("refused {name} ({sim}: B&W renders aren't supported yet)");
-                }
                 files.push(PairingFile::new(key, &metadata));
             }
             Err(_) if matches!(key.kind(), looklab_prep::FileKind::Jpeg) => bare_jpegs.push(key),
@@ -511,103 +478,5 @@ fn unpaired_label(reason: UnpairedReason) -> &'static str {
         UnpairedReason::NoCounterpart => "no RAW/JPEG counterpart",
         UnpairedReason::BodyMismatch => "counterpart is from another body",
         UnpairedReason::AmbiguousCounterpart => "ambiguous counterpart",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use looklab_meta::{
-        ExifData, FujiMakernote, FujiTag, LookSettings, ParsedTag, RenderTagOutcome,
-    };
-
-    const SCHEMA: &str = "\
-body: fujifilm/x-t4
-epochs:
-  - id: 1
-    firmware: { from: \"1.00\", to: \"1.99\" }
-    native_sims:
-      - key: acros
-        look: acros
-        makernote: { tag: Saturation, value: 0x0500 }
-        monochrome: true
-      - key: provia
-        look: provia
-        makernote: { tag: FilmMode, value: 0x0000 }
-    exposure_modes: []
-    controls: []
-    solve_plan: []
-";
-
-    fn tagged<T>(tag: FujiTag, raw: i64) -> ParsedTag<T> {
-        ParsedTag {
-            tag,
-            raw,
-            value: None,
-        }
-    }
-
-    fn render(
-        film_mode_raw: Option<i64>,
-        saturation_raw: Option<i64>,
-    ) -> looklab_meta::ParsedMetadata {
-        looklab_meta::ParsedMetadata {
-            exif: ExifData {
-                make: Some("FUJIFILM".to_owned()),
-                model: Some("X-T4".to_owned()),
-                software: None,
-                lens_model: None,
-                orientation: None,
-                focal_length: None,
-                iso: None,
-                exposure_time: None,
-                f_number: None,
-                exposure_compensation: None,
-                capture_time: None,
-                body_serial: None,
-                image_unique_id: None,
-                has_maker_note: true,
-                gps_present: false,
-                image_description_present: false,
-                artist_present: false,
-                copyright_present: false,
-                user_comment_present: false,
-                owner_name_present: false,
-                lens_serial_present: false,
-            },
-            fuji: Some(FujiMakernote {
-                maker_note_version: None,
-                internal_serial: None,
-                look: LookSettings {
-                    film_mode: film_mode_raw.map(|raw| tagged(FujiTag::FilmMode, raw)),
-                    saturation: saturation_raw.map(|raw| tagged(FujiTag::Saturation, raw)),
-                    ..LookSettings::default()
-                },
-                image_generation: None,
-                image_count: None,
-                sequence_number: None,
-            }),
-            firmware: Some("1.00".to_owned()),
-            render_tag: RenderTagOutcome::Absent,
-        }
-    }
-
-    #[test]
-    fn only_a_monochrome_sim_resolves_as_refused() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("fujifilm-x-t4.yaml"), SCHEMA).expect("schema");
-
-        let acros = monochrome_sim(dir.path(), &render(None, Some(0x0500)));
-        assert_eq!(acros.map(|sim| sim.to_string()).as_deref(), Some("acros"));
-
-        let ambiguous = render(Some(0x0000), Some(0x0500));
-        assert_eq!(
-            monochrome_sim(dir.path(), &ambiguous).map(|sim| sim.to_string()),
-            Some("acros".to_owned())
-        );
-
-        assert!(monochrome_sim(dir.path(), &render(Some(0x0000), None)).is_none());
-        let elsewhere = tempfile::tempdir().expect("tempdir");
-        assert!(monochrome_sim(elsewhere.path(), &render(None, Some(0x0500))).is_none());
     }
 }

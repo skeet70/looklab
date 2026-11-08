@@ -44,6 +44,7 @@ async fn targets(db_pool: &SqlitePool) -> Result<Vec<(BodyId, LookSlug)>> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT DISTINCT body_id, target_look_id FROM contributions
          WHERE intent = 'recipe' AND status = 'accepted' AND target_look_id IS NOT NULL
+           AND render_class = 'colour'
          ORDER BY body_id, target_look_id",
     )
     .fetch_all(db_pool)
@@ -64,7 +65,8 @@ async fn prune_stale(db_pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "DELETE FROM recipe_observations
          WHERE contribution_id IN (
-             SELECT id FROM contributions WHERE status IN ('withdrawn', 'quarantined')
+             SELECT id FROM contributions
+             WHERE status IN ('withdrawn', 'quarantined') OR render_class = 'monochrome'
          ) OR image_id IN (
              SELECT id FROM contribution_images WHERE status = 'quarantined'
          )",

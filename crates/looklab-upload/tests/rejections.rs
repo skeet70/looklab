@@ -340,7 +340,14 @@ fn rejects_too_many_images_before_decoding() {
 fn rejects_oversized_manifest_string_before_decoding() {
     let fixture = Fixture::new();
     let offsets = fixture.offsets();
-    let length_at = offsets.manifest + 2;
+    let prefix = postcard::to_allocvec(&(
+        fixture.manifest.kind,
+        &fixture.manifest.intent,
+        fixture.manifest.render_class,
+        fixture.manifest.monochrome_authorization,
+    ))
+    .expect("manifest prefix serializes");
+    let length_at = offsets.manifest + prefix.len();
     let mut bytes = fixture.bytes();
     bytes[length_at] = 0x81;
     bytes[length_at + 1] = 0x01;

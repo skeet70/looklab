@@ -60,6 +60,7 @@ async fn fixture() -> Fixture {
     std::fs::write(transforms.join("fujifilm-x-t5.yaml"), TRANSFORM).expect("transform file");
     let mut config = WorkerConfig::new(&db, &blobs);
     config.data = data;
+    config.snapshot_dir = config.data.join("community");
     config.site = site.clone();
     config.transforms = transforms;
     config.sweep_budget = Some(8_000_000.0);

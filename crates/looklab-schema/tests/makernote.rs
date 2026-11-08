@@ -34,6 +34,7 @@ fn key(name: &str) -> ControlKey {
 
 fn fixture_values() -> MakernoteValues {
     let mut values = MakernoteValues::new();
+    values.insert(FujiTag::FilmMode, vec![0x0600]);
     values.insert(FujiTag::DevelopmentDynamicRange, vec![100]);
     values.insert(FujiTag::HighlightTone, vec![0]);
     values.insert(FujiTag::ShadowTone, vec![0]);
@@ -42,6 +43,7 @@ fn fixture_values() -> MakernoteValues {
     values.insert(FujiTag::ColorChromeFxBlue, vec![64]);
     values.insert(FujiTag::WhiteBalanceFineTune, vec![20, -40]);
     values.insert(FujiTag::GrainEffectRoughness, vec![48]);
+    values.insert(FujiTag::GrainEffectSize, vec![0]);
     values.insert(FujiTag::Clarity, vec![-2000]);
     values.insert(FujiTag::NoiseReduction, vec![0x2c0]);
     values.set_exposure_compensation_ev(1.0 / 3.0);
@@ -77,6 +79,7 @@ fn the_shipped_schema_maps_every_control() {
             ("wb_shift_b", -2),
             ("exposure_compensation", 1),
             ("grain", 2),
+            ("grain_size", 0),
             ("clarity", -2),
             ("noise_reduction", -3),
         ]

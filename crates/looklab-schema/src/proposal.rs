@@ -28,7 +28,7 @@ pub const FIXTURE_UPLOAD_MAGIC: &[u8] = b"looklab-fixture-1";
 pub const FIXTURE_UPLOAD_HEADER_MAX: usize = 16 * 1024;
 
 /// Makernote tags a confirmation may carry.
-pub const CONFIRMATION_TAGS: [&str; 13] = [
+pub const CONFIRMATION_TAGS: [&str; 15] = [
     "FilmMode",
     "DynamicRange",
     "DynamicRangeSetting",
@@ -37,6 +37,8 @@ pub const CONFIRMATION_TAGS: [&str; 13] = [
     "GrainRoughness",
     "ColorChromeEffect",
     "ColorChromeFxBlue",
+    "BWAdjustment",
+    "BWMagentaGreen",
     "WhiteBalance",
     "WhiteBalanceFineTune",
     "HighlightTone",

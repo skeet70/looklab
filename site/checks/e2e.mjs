@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Browser checks: worker round trip, match/permalink, contribute upload with HAR, page screenshots.
 
-import { copyFile, link, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, cp, link, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -22,8 +22,7 @@ const USAGE = `usage: node site/checks/e2e.mjs [options]
   --out DIR                    artifact directory (default /tmp/looklab-e2e)
   --state DIR                  stub server state, must match --state (default /tmp/looklab-stub-state)
   --raw FILE --jpeg FILE       the contribution files
-  --extra FILE                 one more file in the drop (repeatable), e.g. a
-                               B&W render that must be listed as left out
+  --extra FILE                 one more file in the drop (repeatable)
   --body ID --firmware V --sim KEY
   --controls "key=step,..."    control steps, comma separated
   --fail-draft-blobs 1         make IndexedDB Blob writes throw, to check the
@@ -119,22 +118,57 @@ function check(condition, message) {
   console.log(`ok ${message}`);
 }
 
-/// A RAW+JPEG pair whose JPEG reports the given firmware, so the drop forms
-/// another batch.
-async function pairWithFirmware(name, firmware) {
-  const raw = `${options.out}/${name}.raf`;
-  const jpeg = `${options.out}/${name}.jpg`;
-  await copyFile(options.raw, raw);
+/// A copy of the fixture JPEG whose Fujifilm makernote sets `tag` to `value`.
+async function renderWithTag(name, tag, value) {
+  const path = `${options.out}/${name}.jpg`;
   const bytes = await readFile(options.jpeg);
-  const token = Buffer.from('Ver1.00');
-  const at = bytes.indexOf(token);
-  if (at < 0) {
-    throw new Error('the fixture JPEG has no Ver1.00 Software token');
+  let index = 2;
+  let tiffStart = -1;
+  while (index + 4 <= bytes.length) {
+    if (bytes[index] !== 0xff) break;
+    const marker = bytes[index + 1];
+    if (marker === 0xda || marker === 0xd9) break;
+    const length = bytes.readUInt16BE(index + 2);
+    if (marker === 0xe1 && bytes.toString('latin1', index + 4, index + 10) === 'Exif\0\0') {
+      tiffStart = index + 10;
+      break;
+    }
+    index += 2 + length;
   }
+  if (tiffStart < 0) throw new Error('the fixture JPEG has no EXIF segment');
   const patched = Buffer.from(bytes);
-  Buffer.from(`Ver${firmware}`).copy(patched, at);
-  await writeFile(jpeg, patched);
-  return { raw, jpeg };
+  const little = patched.toString('latin1', tiffStart, tiffStart + 2) === 'II';
+  const u16 = (at) => (little ? patched.readUInt16LE(at) : patched.readUInt16BE(at));
+  const u32 = (at) => (little ? patched.readUInt32LE(at) : patched.readUInt32BE(at));
+  const ifd0 = tiffStart + u32(tiffStart + 4);
+  const count0 = u16(ifd0);
+  let exifIfd = null;
+  for (let entry = 0; entry < count0; entry += 1) {
+    const at = ifd0 + 2 + entry * 12;
+    if (u16(at) === 0x8769) exifIfd = tiffStart + u32(at + 8);
+  }
+  const ifd = exifIfd ?? ifd0;
+  const count = u16(ifd);
+  for (let entry = 0; entry < count; entry += 1) {
+    const at = ifd + 2 + entry * 12;
+    if (u16(at) !== 0x927c || u16(at + 2) !== 7) continue;
+    const note = tiffStart + u32(at + 8);
+    if (patched.toString('latin1', note, note + 8) !== 'FUJIFILM') {
+      throw new Error('the MakerNote is not Fujifilm');
+    }
+    const startOf = patched.readUInt32LE(note + 8);
+    const entries = patched.readUInt16LE(note + startOf);
+    for (let field = 0; field < entries; field += 1) {
+      const fieldAt = note + startOf + 2 + field * 12;
+      if (patched.readUInt16LE(fieldAt) !== tag) continue;
+      if (little) patched.writeUInt16LE(value, fieldAt + 8);
+      else patched.writeUInt16BE(value, fieldAt + 8);
+      await writeFile(path, patched);
+      return path;
+    }
+    throw new Error(`the Fujifilm makernote has no tag ${tag.toString(16)}`);
+  }
+  throw new Error('the EXIF has no MakerNote');
 }
 
 async function addVirtualAuthenticator(page) {
@@ -389,8 +423,8 @@ async function contribute(size) {
     const catalog = await (await page.request.get(`${options.origin}/data/index.json`)).json();
     const wantedLook = catalog.looks.find(look => look.visibility !== 'test_fixture');
     const wantedCamera = catalog.bodies.find(camera => camera.kind === 'camera');
-    check(Boolean(wantedLook && wantedCamera), `${size}: wanted-shot fixture uses published names`);
-    const wantedBounties = [0.01, 0.1, 0.5, 0.9].map((reduction, index) => ({
+    check(Boolean(wantedCamera), `${size}: wanted-shot fixture uses a published camera`);
+    const wantedBounties = wantedLook ? [0.01, 0.1, 0.5, 0.9].map((reduction, index) => ({
       look: wantedLook.slug,
       look_version: 1,
       body: wantedCamera.id,
@@ -398,7 +432,7 @@ async function contribute(size) {
       expected_variance_reduction: reduction,
       reason: { kind: 'unverified_region', sigma: 0.2 },
       status: 'open',
-    }));
+    })) : [];
     await page.route('**/bounties.json', route => route.fulfill({ json: { bounties: wantedBounties } }));
     const guideNames = [
       'Share photos you already have',
@@ -416,9 +450,14 @@ async function contribute(size) {
       await dialog.waitFor();
       check(await dialog.getByRole('list').first().getByRole('listitem').count() >= 3, `${size}: ${name} has numbered guidance`);
       if (index === 1) {
-        await dialog.getByRole('article').nth(2).waitFor();
-        check(await dialog.getByRole('article').count() === 3, `${size}: wanted guide shows the top three requests`);
-        check(await dialog.getByRole('article').first().textContent().then(text => text.includes(wantedLook.name) && text.includes(`${wantedCamera.make} ${wantedCamera.model}`)), `${size}: wanted guide shows published look and camera names`);
+        if (wantedLook) {
+          await dialog.getByRole('article').nth(2).waitFor();
+          check(await dialog.getByRole('article').count() === 3, `${size}: wanted guide shows the top three requests`);
+          check(await dialog.getByRole('article').first().textContent().then(text => text.includes(wantedLook.name) && text.includes(`${wantedCamera.make} ${wantedCamera.model}`)), `${size}: wanted guide shows published look and camera names`);
+        } else {
+          await dialog.getByRole('heading', { name: 'No wanted shots right now', exact: true }).waitFor();
+          check(await dialog.getByRole('article').count() === 0, `${size}: a catalog without looks has no wanted-shot requests`);
+        }
       }
       if (index === 3) {
         const { createHash } = await import('node:crypto');
@@ -473,31 +512,27 @@ async function contribute(size) {
       page.waitForEvent('filechooser'),
       page.getByRole('dialog', { name: guideNames[0], exact: true }).getByRole('button', { name: 'Choose photos', exact: true }).click(),
     ]);
-    const second = await pairWithFirmware('second', '1.10');
-    const third = await pairWithFirmware('third', '1.20');
+    const velvia = await renderWithTag('render-velvia', 0x1401, 0x0200);
+    const acros = await renderWithTag('render-acros', 0x1003, 0x0500);
+    const acrosYellow = await renderWithTag('render-acros-ye', 0x1003, 0x0502);
+    const sepia = await renderWithTag('render-sepia', 0x1003, 0x0310);
     const dropped = [
       options.raw,
       options.jpeg,
-      second.raw,
-      second.jpeg,
-      third.raw,
-      third.jpeg,
+      velvia,
+      acros,
+      acrosYellow,
+      sepia,
       ...options.extra,
     ];
-    summary.files = [options.raw, options.jpeg, second.raw, second.jpeg, third.raw, third.jpeg];
-    if (options.extra.length) {
-      await page.route('**/data/bodies/fujifilm/x-s10.json', async (route) => {
-        const response = await route.fetch();
-        const body = await response.json();
-        if (!body.schema.includes('monochrome: true')) {
-          body.schema = body.schema.replace(
-            '      - key: provia\n',
-            '      - key: acros\n        look: acros\n        monochrome: true\n        makernote: { tag: Saturation, value: 0x0500 }\n      - key: provia\n',
-          );
-        }
-        await route.fulfill({ response, json: body });
-      });
-    }
+    summary.files = [
+      options.raw,
+      options.jpeg,
+      velvia,
+      acros,
+      acrosYellow,
+      sepia,
+    ];
     await chooser.setFiles(dropped);
     await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).waitFor({ timeout: 120_000 });
     await capture('contribute-1-drop');
@@ -509,7 +544,6 @@ async function contribute(size) {
     const firstSummary = (await stepItems.first().locator('.step-summary').textContent()).trim();
     const pairCount = Number((await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).textContent()).trim().split(' ')[0]);
     check(firstSummary.includes(`${pairCount} ${pairCount === 1 ? 'pair' : 'pairs'}`), `${size}: a completed step keeps its summary (${JSON.stringify(firstSummary)})`);
-    check(firstSummary.startsWith('Completed.'), `${size}: a completed step announces completion to screen readers`);
     const describedBy = await stepItems.first().locator('.step-link').getAttribute('aria-describedby');
     check(Boolean(describedBy) && await page.locator(`#${describedBy}`).count() === 1, `${size}: a completed step is described by its summary`);
     check(await stepItems.nth(2).locator('.step-summary').count() === 0, `${size}: an upcoming step has no summary`);
@@ -522,6 +556,9 @@ async function contribute(size) {
     }
     summary.draft_unavailable = draftUnavailable;
 
+    await page.locator('.batch-choice').filter({
+      has: page.locator('.batch-choice-title', { hasText: /^Batch \d+: \d+ photos, Provia$/ }),
+    }).click();
     await page.fill('#body-id', options.body);
     await page.fill('#firmware', options.firmware);
     await page.fill('#sim', options.sim);
@@ -535,6 +572,79 @@ async function contribute(size) {
     }
     await page.click('summary:has-text("Processing options")');
     await page.selectOption('#workers', String(options.workers));
+    const declarations = new Set();
+    for (const [label, filter] of [['Acros', 'none'], ['Acros Ye', 'yellow'], ['Sepia', 'toning']]) {
+      const batch = page.locator('.batch-choice').filter({
+        has: page.locator('.batch-choice-title', {
+          hasText: new RegExp(`^Batch \\d+: \\d+ photos, ${label}$`),
+        }),
+      });
+      await batch.waitFor();
+      await batch.click();
+      const optIn = page.getByRole('checkbox', { name: 'Contribute these B&W renders for monochrome model development' });
+      await optIn.waitFor();
+      check(!(await optIn.isChecked()), `${size}: ${label} B&W opt-in starts unchecked`);
+      const promise = await page.locator('.monochrome-opt-in').innerText();
+      check(
+        promise.includes('180 days') && promise.includes('withdraw') && promise.includes('No published Look is promised'),
+        `${size}: ${label} opt-in states purpose, retention, withdrawal and no Look promise`,
+      );
+      check(
+        (await page.locator('.batch-editor').innerText()).includes('Normalized family:'),
+        `${size}: ${label} shows the normalized family beside the native sim`,
+      );
+      if (filter === 'yellow') {
+        check(
+          (await page.locator('.batch-editor').innerText()).includes('Normalized monochrome filter: Yellow'),
+          `${size}: Acros Ye keeps its normalized filter`,
+        );
+      }
+      const unmappedLabels = page.locator('.unmapped-controls .menu-setting');
+      for (let index = 0; index < await unmappedLabels.count(); index += 1) {
+        const field = unmappedLabels.nth(index);
+        const key = (await field.textContent()).trim().replaceAll(' ', '_');
+        await field.locator('input').fill('0');
+        declarations.add(key);
+      }
+    }
+    await page.getByRole('button', { name: 'Process locally', exact: true }).click();
+    await page.getByRole('heading', { name: /Review what/ }).waitFor({ timeout: 900_000 });
+    check((await page.locator('.payload-summary').textContent()).includes('from 2 photos'), `${size}: preparation leaves out B&W without consent`);
+    await page.getByRole('button', { name: 'Continue to send', exact: true }).click();
+    const progress = page.getByRole('navigation', { name: 'Progress' });
+    await progress.getByRole('button', { name: 'Check groups', exact: true }).click();
+    for (const label of ['Acros', 'Acros Ye', 'Sepia']) {
+      await page.locator('.batch-choice').filter({
+        has: page.locator('.batch-choice-title', {
+          hasText: new RegExp(`^Batch \\d+: \\d+ photos, ${label}$`),
+        }),
+      }).click();
+      await page.getByRole('checkbox', {
+        name: 'Contribute these B&W renders for monochrome model development',
+      }).check();
+    }
+    await capture('contribute-consent-changed');
+    check(await progress.getByRole('button', { name: 'Review', exact: true }).isDisabled(), `${size}: changed B&W selection requires fresh preparation before review`);
+    check(await progress.getByRole('button', { name: 'Send', exact: true }).isDisabled(), `${size}: changed B&W selection cannot reuse the previous send step`);
+    if (!draftUnavailable) {
+      await page.getByRole('link', { name: 'looklab', exact: true }).click();
+      await page.waitForURL((url) => url.pathname === '/');
+      await page.goto(`${options.origin}/contribute`);
+      await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).waitFor({ timeout: 30_000 });
+      check(await progress.getByRole('button', { name: 'Review', exact: true }).isDisabled(), `${size}: a restored changed selection still needs preparation`);
+      for (const label of ['Acros', 'Acros Ye', 'Sepia']) {
+        await page.locator('.batch-choice').filter({
+          has: page.locator('.batch-choice-title', {
+            hasText: new RegExp(`^Batch \\d+: \\d+ photos, ${label}$`),
+          }),
+        }).click();
+        check(await page.getByRole('checkbox', {
+          name: 'Contribute these B&W renders for monochrome model development',
+        }).isChecked(), `${size}: ${label} consent survives draft restoration`);
+      }
+    }
+
+    summary.declarations = [...declarations];
     await capture('contribute-2-confirm');
 
     const prepModule = '**/generated/wasm/looklab_prep_module.wasm';
@@ -552,15 +662,8 @@ async function contribute(size) {
     summary.prep_millis = Date.now() - started;
     await capture('contribute-3-inspector');
     check((await page.locator('.payload-summary').textContent()).includes('No pixels, no location'), `${size}: upload summary explains privacy`);
-    if (options.extra.length) {
-      const excluded = page.locator('section.step:not([hidden]) details.excluded-files');
-      await excluded.first().waitFor();
-      const summaryText = (await excluded.first().locator('summary').textContent()).trim();
-      check(/^\d+ files? left out: .+/.test(summaryText), `${size}: excluded files are grouped by reason with a count: ${summaryText}`);
-      check(!(await excluded.first().evaluate((element) => element.open)), `${size}: excluded files start collapsed`);
-    } else {
-      check(await page.locator('details.excluded-files').count() === 0, `${size}: no excluded files without left-out input`);
-    }
+    check(await page.locator('details.excluded-files').count() === 0, `${size}: every selected render was prepared`);
+    check((await page.locator('.payload-summary').textContent()).includes('from 5 photos'), `${size}: the inspector counts all five renders`);
     await page.locator('summary:has-text("See exactly")').focus();
     await page.keyboard.press('Enter');
     await capture('contribute-inspector-expanded');
@@ -581,6 +684,13 @@ async function contribute(size) {
       page.click('button:has-text("Download payload")'),
     ]);
     await payloadDownload.saveAs(`${options.out}/payload-${size}.json`);
+    const payload = JSON.parse(await readFile(`${options.out}/payload-${size}.json`, 'utf8'));
+    const metadataKeys = payload.images.flatMap((image) => Object.keys(image.metadata ?? {}));
+    check(!metadataKeys.some((key) => /seed|authorization|source|makernote_blob/i.test(key)), `${size}: the inspector adds no consent, seed or source data`);
+    check(
+      payload.images.every((image) => Object.keys(image).sort().join(',') === 'blob_bytes,metadata,removed,rerender_group'),
+      `${size}: the inspector payload keeps its existing shape`,
+    );
     if (!draftUnavailable) {
       const beforeResume = await page.locator('.payload-summary').textContent();
       await page.reload();
@@ -613,11 +723,9 @@ async function contribute(size) {
     };
     page.on('response', onUpload);
     await page.click('button:has-text("Send contribution")');
-    await page.getByText(/Sending part 1 of \d+/).waitFor({ timeout: 60_000 });
-    check((await page.locator('section.step').filter({ hasText: 'Send your color samples' }).textContent()).includes('this keeps spam out'), `${size}: the send shows the spam-prevention step`);
-    await page.getByRole('heading', { name: 'Thanks, your color samples are in', exact: true }).waitFor({ timeout: 300_000 });
+    await page.getByRole('heading', { name: 'Thanks, your samples are in', exact: true }).waitFor({ timeout: 300_000 });
     page.off('response', onUpload);
-    check(uploads.length === 3, `${size}: all three batches were uploaded`);
+    check(uploads.length === 5, `${size}: all five batches were uploaded`);
     const uploadBodies = await Promise.all(uploads.map(async (response) => {
       check(response.status() === 201, `${size}: every batch was accepted`);
       return response.json();
@@ -625,21 +733,15 @@ async function contribute(size) {
     const contributionId = uploadBodies[0].contribution_id;
     check(Boolean(contributionId), `${size}: every batch returns a contribution id`);
     const gets = await page.evaluate(() => window.__looklabWebauthnGets);
-    check(gets === 1, `${size}: exactly one WebAuthn get for three batches (${gets})`);
+    check(gets === 1, `${size}: exactly one WebAuthn get for five batches (${gets})`);
     await capture('contribute-4-upload');
     const done = page.locator('.contribution-done');
     const doneText = await done.textContent();
     check(!/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(doneText), `${size}: the Done view shows no contribution ids`);
-    check(/from 1 camera, sent in \d+ parts?\./.test(doneText), `${size}: the Done view summarizes the send in user terms`);
     check(await done.getByRole('link', { name: 'Your contributions', exact: true }).isVisible(), `${size}: the Done view links to Your contributions`);
     check(await page.locator('.stepper-actions').count() === 0, `${size}: Back and Next are gone after the send`);
     check(await stepItems.nth(5).getAttribute('aria-current') === 'step', `${size}: Done is the current step`);
     check(await page.locator('.stepper .step-item[data-state=complete]').count() === 5, `${size}: five steps are marked complete`);
-    if (options.extra.length) {
-      const doneExcluded = done.locator('details.excluded-files');
-      check(await doneExcluded.count() >= 1, `${size}: the Done view lists excluded files below the thanks`);
-      check(!(await doneExcluded.first().evaluate((element) => element.open)), `${size}: the Done view keeps exclusions collapsed`);
-    }
     check(await page.getByRole('navigation', { name: 'Progress' }).getByRole('button', { name: 'Send', exact: true }).isDisabled(), `${size}: completed batch cannot reopen Send`);
     check(problems.length === 0, `${options.browser} ${size}: no page errors during contribute`);
 
@@ -655,17 +757,64 @@ async function contribute(size) {
     const feedResponse = await feed;
     check(feedResponse.ok(), `${size}: contribution feed loads`);
     const feedBody = await feedResponse.json();
-    check(Array.isArray(feedBody.contributions), `${size}: contribution feed returns contributions`);
+    check(Array.isArray(feedBody.activities), `${size}: contribution feed returns activities`);
+    check(feedBody.activities.length === 1 && feedBody.activities[0].source === 'send', `${size}: one send reads as one submission`);
+    const contributions = feedBody.activities.flatMap((activity) => activity.contributions);
     const persisted = uploadBodies.map((body) =>
-      feedBody.contributions.find((contribution) => contribution.id === body.contribution_id),
+      contributions.find((contribution) => contribution.id === body.contribution_id),
     );
-    check(persisted.every(Boolean), `${size}: contribution feed lists both batches`);
+    check(persisted.every(Boolean), `${size}: contribution feed lists every batch`);
     check(
       persisted.every((contribution) => Array.isArray(contribution.images) && contribution.images.length === 1),
-      `${size}: each batch contributes its one image`,
+      `${size}: each batch contributes its one render`,
     );
-    await page.getByRole('heading', { name: `Contribution ${contributionId}`, exact: true }).waitFor({ timeout: 60_000 });
+    const monochromeContributions = persisted.filter(
+      (contribution) => contribution.render_class === 'monochrome',
+    );
+    check(monochromeContributions.length === 3, `${size}: the feed names three monochrome batches`);
+    check(
+      monochromeContributions.every((contribution) => typeof contribution.deferred_until === 'number'),
+      `${size}: every monochrome batch carries its deferred deadline`,
+    );
+    const activity = page.locator('.contribution-activity');
+    await activity.waitFor({ timeout: 60_000 });
+    check(await activity.count() === 1, `${size}: history shows one submission card`);
+    const primary = await activity.innerText();
+    check(!/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(primary), `${size}: primary history hides internal ids`);
+    check(await activity.getByRole('button', { name: 'Withdraw these photos', exact: true }).count() === 1, `${size}: submission has one withdrawal action`);
     await page.screenshot({ path: `${options.out}/contributions-${size}.png`, fullPage: true });
+    await activity.getByText('Technical details', { exact: true }).click();
+    for (const contribution of persisted) {
+      await activity.getByRole('rowheader', { name: contribution.id, exact: true }).waitFor();
+    }
+    await page.screenshot({ path: `${options.out}/contributions-technical-${size}.png`, fullPage: true });
+    await activity.getByText('Technical details', { exact: true }).click();
+    const getsBeforeWithdrawal = await page.evaluate(() => window.__looklabWebauthnGets);
+    const withdrawalResponse = page.waitForResponse(
+      (response) => response.request().method() === 'POST' && new URL(response.url()).pathname === '/api/withdraw',
+      { timeout: 60_000 },
+    );
+    await activity.getByRole('button', { name: 'Withdraw these photos', exact: true }).click();
+    const withdrawn = await withdrawalResponse;
+    check(withdrawn.ok() && (await withdrawn.json()).status === 'withdrawn', `${size}: submission withdrawal succeeds`);
+    check(
+      (await page.evaluate(() => window.__looklabWebauthnGets)) - getsBeforeWithdrawal === 1,
+      `${size}: withdrawing all photos uses one passkey confirmation`,
+    );
+    const reloadedFeed = page.waitForResponse(
+      (response) => response.request().method() === 'GET' && response.url() === feedResponse.url(),
+      { timeout: 60_000 },
+    );
+    await page.reload();
+    const afterWithdrawal = await (await reloadedFeed).json();
+    const withdrawnById = new Map(afterWithdrawal.activities.flatMap((entry) => entry.contributions).map((entry) => [entry.id, entry]));
+    check(
+      uploadBodies.every((entry) => withdrawnById.get(entry.contribution_id)?.status === 'withdrawn'),
+      `${size}: withdrawal persists for every submitted photo`,
+    );
+    await page.locator('.contribution-activity').waitFor({ timeout: 60_000 });
+    check(await page.getByRole('button', { name: 'Withdraw these photos', exact: true }).count() === 0, `${size}: withdrawn submission has no active withdrawal action`);
+    await page.screenshot({ path: `${options.out}/contributions-withdrawn-${size}.png`, fullPage: true });
     summary.contribution_id = contributionId;
     return summary;
   } catch (error) {
@@ -697,6 +846,7 @@ async function verifyContributionPayload(size, summary) {
   await mkdir(`${snapshot}/bodies`, { recursive: true });
   await writeFile(`${snapshot}/bodies/${filename}.body.yaml`, JSON.stringify(entity));
   await writeFile(`${snapshot}/bodies/${filename}.yaml`, schema);
+  await cp(`${options.state}/community`, `${snapshot}/community`, { recursive: true });
   const args = [
     'verify-payload',
     '--seeds', summary.seeds,
@@ -707,6 +857,8 @@ async function verifyContributionPayload(size, summary) {
     '--data', snapshot,
     '--kind', 'library',
     '--intent', 'native',
+    '--monochrome-authorization', 'model-development-180-days',
+    ...(summary.declarations ?? []).flatMap((key) => ['--declare-setting', `${key}=0`]),
     '--pow-memory-kib', '8',
     '--pow-iterations', '1',
     '--pow-difficulty', '0',

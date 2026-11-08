@@ -21,7 +21,7 @@ The GitHub Pages workflow stays a serverless preview by default. Set the reposit
 |---|---|---|
 | `/var/lib/looklab/looklab.sqlite3` (+ `-wal`, `-shm`) | credentials, grants, contributions, jobs, audit log | private, never served |
 | `/var/lib/looklab/blobs` | uploaded sample blobs and artifact bytes | private, never served |
-| `/var/lib/looklab/community` | community snapshot staging | private, never served |
+| `/var/lib/looklab/community` | approved versioned community snapshots and private publication staging | private, never served directly |
 | `/var/lib/looklab/server-secret` | 32 random HMAC bytes, mode 0600 | private, never served |
 | `/var/lib/looklab/data` | seeded `data/` tree: bodies, transforms, interfaces, probes, card conformance vectors | read-only to the worker |
 | `/var/lib/looklab/data/scenes` | prepared CC0 photo scene PNGs and their provenance index | read-only to the worker |
@@ -36,6 +36,8 @@ Both units set `StateDirectoryMode=0700` and `UMask=0077`; `deploy/run-local.sh`
 Every worker publication writes `data/developers/conformance-v1.zip` and its SHA-256 metadata alongside the catalog, from the `data/card/conformance-v1` tree, so the live developer download works without the sample-site generator. A publication fails rather than omitting the download when that source tree is absent.
 
 The module writes `/etc/looklab/looklab.toml` from the options (`bind`, `origin`, `rpId`, `corsOrigins`, `stateDir`, `dataDir`, `site.distDir`), seeds `data/` from the flake on first start, and creates `site/data`. `init` runs before the server starts: it creates the missing state directories, generates the server secret once and runs every SQLite migration. A fresh database has no published catalog; the worker's startup publishes one from `data/` even when there are no Looks yet, so the SPA can render an explicit empty state. `/readyz` returns 503 until that first `data/index.json` exists.
+
+The worker receives `--snapshot-dir /var/lib/looklab/community`, the same root as the server's `snapshot_dir`. Schema publication starts from the full authoritative baseline, applies the approved proposal and publishes a new snapshot version; server intake refreshes its snapshot view without a restart. The proposal's publication transition and catalog-publication request commit in one transaction. Worker publication names that version in the site index and publishes body pages even when no Look fit succeeds. Interrupted publication resumes from its recorded version and content hash. A binary switch does not approve new camera mappings or replace the seeded body files.
 
 The seeded data tree is a copy, not a store link: add a camera transform by writing `${dataDir}/transforms/<make>-<model>.yaml` as the `looklab` user. A re-install of the module does not overwrite it, and `rm ${dataDir}/.seeded` re-seeds from the flake on the next start.
 
@@ -54,7 +56,8 @@ On a host that already published a catalog, seeding scenes does not trigger a ne
 
 ```sh
 sudo -u looklab looklab publish --db /var/lib/looklab/looklab.sqlite3 --blobs /var/lib/looklab/blobs \
-  --data /var/lib/looklab/data --transforms /var/lib/looklab/data/transforms --out /var/lib/looklab/site
+  --data /var/lib/looklab/data --snapshot-dir /var/lib/looklab/community \
+  --transforms /var/lib/looklab/data/transforms --out /var/lib/looklab/site
 ```
 
 Camera processing also requires `data/transforms/<make>-<model>.yaml`. The shipped X-S10 and X-T4 files contain DNG ColorMatrix endpoints extracted from the licensed or authorized local sources; they are input priors, not native Look measurements or root admissions. Body/schema YAML alone does not supply that calibration.

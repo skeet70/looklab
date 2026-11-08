@@ -8,8 +8,8 @@ use looklab_samples::{
 use looklab_upload::{
     BatchManifest, BlobKind, BodyId, CommunitySnapshotVersion, ContributionKind, ControlEntry,
     ControlKey, ControlSettings, EnvelopeParts, FirmwareVersionString, Intent, Limits,
-    ManifestImage, ManifestMetadata, Nonce, PowSolutions, RawSerial, SendManifest, SimKey,
-    StepIndex, WebAuthnAssertion, encode_envelope, manifest_hash,
+    ManifestImage, ManifestMetadata, Nonce, PowSolutions, RawSerial, RenderClass, SendManifest,
+    SimKey, StepIndex, WebAuthnAssertion, encode_envelope, manifest_hash,
 };
 use sha2::{Digest, Sha256};
 
@@ -91,6 +91,8 @@ pub fn manifest(images: Vec<ManifestImage>) -> BatchManifest {
     BatchManifest {
         kind: ContributionKind::Library,
         intent: Intent::Native,
+        render_class: RenderClass::Colour,
+        monochrome_authorization: None,
         body: BodyId::new("fujifilm/x-t5").expect("fixture body id"),
         firmware_version: FirmwareVersionString::new("2.10").expect("fixture firmware"),
         sim_key: SimKey::new("classic_chrome").expect("fixture sim key"),
@@ -240,6 +242,9 @@ pub fn images_count_offset(manifest: &BatchManifest) -> usize {
     let parts = [
         postcard::to_allocvec(&manifest.kind).expect("kind serializes"),
         postcard::to_allocvec(&manifest.intent).expect("intent serializes"),
+        postcard::to_allocvec(&manifest.render_class).expect("render class serializes"),
+        postcard::to_allocvec(&manifest.monochrome_authorization)
+            .expect("authorization serializes"),
         postcard::to_allocvec(&manifest.body).expect("body serializes"),
         postcard::to_allocvec(&manifest.firmware_version).expect("firmware serializes"),
         postcard::to_allocvec(&manifest.sim_key).expect("sim key serializes"),

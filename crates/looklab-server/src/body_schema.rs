@@ -6,13 +6,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use looklab_schema::{
-    Control, ControlSchema, ControlType, Epoch, FirmwareVersion, MakernoteValues, ScalarValue,
-    Tolerated, mapped_controls, monochrome_sim, unmapped_controls, validate_body,
-    validate_control_schema,
+    Control, ControlSchema, ControlType, Epoch, FirmwareVersion, LookId, MakernoteValues,
+    MappingError, MonoFilter, ScalarValue, Tolerated, applicable_controls, classify_card_render,
+    classify_render, validate_body, validate_control_schema,
 };
 use looklab_upload::{
-    BodyId, CommunitySnapshotVersion, ControlKey, ControlSettings, ManifestMetadata, SettingReach,
-    SettingsSourceError, SimKey, validate_setting_sources,
+    BodyId, CommunitySnapshotVersion, ControlKey, ControlSettings, ManifestMetadata, RenderClass,
+    SettingReach, SettingsSourceError, SimKey, validate_setting_sources,
 };
 
 #[derive(Debug)]
@@ -247,8 +247,6 @@ pub enum SettingsProblem {
     NoEpoch,
     #[error("the epoch has no native simulation `{0}`")]
     UnknownSim(SimKey),
-    #[error("`{0}` is a monochrome film simulation; B&W renders aren't supported yet")]
-    MonochromeSim(SimKey),
     #[error("control `{0}` is not in the schema")]
     UnknownControl(ControlKey),
     #[error("control `{0}` is outside its steps")]
@@ -263,16 +261,15 @@ pub fn validate_settings(
     record: &BodyRecord,
     firmware: &str,
     sim_key: &SimKey,
+    family: Option<&LookId>,
     settings: &ControlSettings,
     card: bool,
+    deferred: bool,
 ) -> Result<(), SettingsProblem> {
     let epoch = resolve_epoch(&record.schema, firmware).ok_or(SettingsProblem::NoEpoch)?;
     let sim = epoch
         .native_sim(sim_key)
         .ok_or_else(|| SettingsProblem::UnknownSim(sim_key.clone()))?;
-    if sim.monochrome {
-        return Err(SettingsProblem::MonochromeSim(sim_key.clone()));
-    }
 
     for entry in settings.entries() {
         let control = epoch
@@ -283,7 +280,8 @@ pub fn validate_settings(
         if !step_in_range(control, entry.step.get()) {
             return Err(SettingsProblem::StepOutOfRange(entry.key.clone()));
         }
-        if control.spatial
+        if !deferred
+            && control.spatial
             && let Some(Tolerated::Values(allowed)) = control.tolerated.as_ref()
         {
             let value = scalar_at(control, entry.step.get())
@@ -294,31 +292,240 @@ pub fn validate_settings(
         }
     }
 
+    let controls = applicable_controls(epoch, family.unwrap_or(&sim.look));
     validate_setting_sources(
         settings,
-        card,
+        card && !deferred,
+        if deferred {
+            RenderClass::Monochrome
+        } else {
+            RenderClass::Colour
+        },
         &SettingReach {
-            mapped: mapped_controls(epoch),
-            unmapped: unmapped_controls(epoch),
+            mapped: controls.mapped,
+            unmapped: controls.unmapped,
+            spatial: controls.spatial,
         },
     )?;
     Ok(())
 }
 
-/// # Errors
-/// An image's makernotes select a monochrome sim, whatever `sim_key` claims.
-pub fn validate_render_sims<'a>(
+/// The normalized `mono_filter` value of a monochrome settings map.
+pub fn mono_filter_setting(
     record: &BodyRecord,
     firmware: &str,
+    settings: &ControlSettings,
+) -> Option<MonoFilter> {
+    let epoch = resolve_epoch(&record.schema, firmware)?;
+    let control = epoch
+        .controls
+        .iter()
+        .find(|control| control.key.as_str() == "mono_filter")?;
+    let entry = settings.get(&control.key)?;
+    let value = control
+        .values
+        .as_ref()?
+        .get(usize::try_from(entry.step.get()).ok()?)?;
+    match value.as_str() {
+        "none" => Some(MonoFilter::None),
+        "yellow" => Some(MonoFilter::Yellow),
+        "red" => Some(MonoFilter::Red),
+        "green" => Some(MonoFilter::Green),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RenderClassProblem {
+    #[error("no epoch covers the firmware version")]
+    NoEpoch,
+    #[error("the epoch has no native simulation `{0}`")]
+    UnknownSim(SimKey),
+    #[error("the render metadata does not select one native simulation")]
+    AmbiguousSim,
+    #[error("a monochrome card render needs a declared Look family")]
+    CardFamilyUnknown,
+    #[error("the snapshot does not admit monochrome `{family}`")]
+    MonochromeUnsupported { family: LookId },
+    #[error("the render metadata classifies `{metadata:?}` but the batch signed `{signed:?}`")]
+    ClassMismatch {
+        signed: RenderClass,
+        metadata: RenderClass,
+    },
+    #[error("the render metadata selects `{metadata}` but the batch signed `{signed}`")]
+    SimMismatch { signed: SimKey, metadata: SimKey },
+    #[error(transparent)]
+    Mapping(#[from] MappingError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedRender {
+    pub render_class: RenderClass,
+    pub native_sim: SimKey,
+    pub family: LookId,
+    pub mono_filter: Option<MonoFilter>,
+}
+
+/// Rejects signed render classes and sim keys that the snapshot schema and an
+/// image's metadata contradict.
+fn metadata_monochrome(metadata: &ManifestMetadata) -> bool {
+    let Some(raw) = metadata
+        .look
+        .as_ref()
+        .and_then(|look| look.saturation.as_ref())
+        .map(|tag| tag.raw)
+    else {
+        return false;
+    };
+    let Ok(raw) = u16::try_from(raw) else {
+        return false;
+    };
+    matches!(
+        looklab_meta::ColorSaturation::from_raw(raw),
+        Some(
+            looklab_meta::ColorSaturation::Monochrome(_) | looklab_meta::ColorSaturation::Acros(_)
+        )
+    )
+}
+
+pub fn classify_renders<'a>(
+    record: &BodyRecord,
+    firmware: &str,
+    sim_key: &SimKey,
+    signed_class: RenderClass,
+    card: bool,
+    card_family: Option<&LookId>,
+    setting_filter: Option<MonoFilter>,
     images: impl IntoIterator<Item = &'a ManifestMetadata>,
-) -> Result<(), SettingsProblem> {
-    let epoch = resolve_epoch(&record.schema, firmware).ok_or(SettingsProblem::NoEpoch)?;
-    for metadata in images {
-        if let Some(sim) = monochrome_sim(epoch, &MakernoteValues::from(metadata)) {
-            return Err(SettingsProblem::MonochromeSim(sim));
+) -> Result<Vec<ClassifiedRender>, RenderClassProblem> {
+    let epoch = resolve_epoch(&record.schema, firmware).ok_or(RenderClassProblem::NoEpoch)?;
+    let signed = epoch
+        .native_sim(sim_key)
+        .ok_or_else(|| RenderClassProblem::UnknownSim(sim_key.clone()))?;
+    let schema_class = if signed.monochrome {
+        RenderClass::Monochrome
+    } else {
+        RenderClass::Colour
+    };
+    if !card && schema_class != signed_class {
+        return Err(RenderClassProblem::ClassMismatch {
+            signed: signed_class,
+            metadata: schema_class,
+        });
+    }
+    let fallback = || ClassifiedRender {
+        render_class: signed_class,
+        native_sim: signed.key.clone(),
+        family: signed.look.clone(),
+        mono_filter: (signed_class == RenderClass::Monochrome)
+            .then_some(setting_filter)
+            .flatten(),
+    };
+    if signed_class == RenderClass::Monochrome {
+        let family = match (card, card_family) {
+            (true, Some(family)) => family,
+            (true, None) => return Err(RenderClassProblem::CardFamilyUnknown),
+            (false, _) => &signed.look,
+        };
+        if !epoch.supports_monochrome_intake(family) {
+            return Err(RenderClassProblem::MonochromeUnsupported {
+                family: family.clone(),
+            });
         }
     }
-    Ok(())
+    let mut out = Vec::new();
+    for metadata in images {
+        if !card && signed_class == RenderClass::Colour && metadata_monochrome(metadata) {
+            return Err(RenderClassProblem::ClassMismatch {
+                signed: RenderClass::Colour,
+                metadata: RenderClass::Monochrome,
+            });
+        }
+        let values = MakernoteValues::from(metadata);
+        if let Some(family) = card_family {
+            let declared = match signed_class {
+                RenderClass::Colour => looklab_schema::RenderClass::Colour,
+                RenderClass::Monochrome => looklab_schema::RenderClass::Monochrome,
+            };
+            let classification = classify_card_render(epoch, family, declared, &values)?;
+            out.push(ClassifiedRender {
+                render_class: signed_class,
+                native_sim: signed.key.clone(),
+                family: classification.family,
+                mono_filter: (signed_class == RenderClass::Monochrome)
+                    .then(|| setting_filter.or(classification.mono_filter))
+                    .flatten(),
+            });
+            continue;
+        }
+        match classify_render(epoch, &values) {
+            Ok(classification) => {
+                let render_class = match classification.render_class {
+                    looklab_schema::RenderClass::Colour => RenderClass::Colour,
+                    looklab_schema::RenderClass::Monochrome => RenderClass::Monochrome,
+                };
+                if render_class == RenderClass::Colour {
+                    if signed_class == RenderClass::Monochrome {
+                        if card {
+                            out.push(fallback());
+                            continue;
+                        }
+                        return Err(RenderClassProblem::ClassMismatch {
+                            signed: signed_class,
+                            metadata: render_class,
+                        });
+                    }
+                    if !card && classification.native_sim != *sim_key {
+                        return Err(RenderClassProblem::SimMismatch {
+                            signed: sim_key.clone(),
+                            metadata: classification.native_sim,
+                        });
+                    }
+                    out.push(ClassifiedRender {
+                        render_class,
+                        native_sim: classification.native_sim,
+                        family: classification.family,
+                        mono_filter: None,
+                    });
+                } else {
+                    if signed_class == RenderClass::Colour {
+                        return Err(RenderClassProblem::ClassMismatch {
+                            signed: signed_class,
+                            metadata: render_class,
+                        });
+                    }
+                    if !card && classification.native_sim != *sim_key {
+                        return Err(RenderClassProblem::SimMismatch {
+                            signed: sim_key.clone(),
+                            metadata: classification.native_sim,
+                        });
+                    }
+                    out.push(ClassifiedRender {
+                        render_class,
+                        native_sim: classification.native_sim,
+                        family: classification.family,
+                        mono_filter: classification.mono_filter.or(setting_filter),
+                    });
+                }
+            }
+            Err(MappingError::UnknownSim) => {
+                if signed_class == RenderClass::Colour || card {
+                    out.push(fallback());
+                } else {
+                    return Err(RenderClassProblem::UnknownSim(sim_key.clone()));
+                }
+            }
+            Err(MappingError::AmbiguousSim) => {
+                if signed_class == RenderClass::Colour || card {
+                    out.push(fallback());
+                } else {
+                    return Err(RenderClassProblem::AmbiguousSim);
+                }
+            }
+            Err(error) => return Err(RenderClassProblem::Mapping(error)),
+        }
+    }
+    Ok(out)
 }
 
 fn step_in_range(control: &Control, step: i64) -> bool {
@@ -487,7 +694,30 @@ epochs:
             ),
         );
         assert_eq!(
-            validate_settings(&record, "1.50", &sim, &complete, false),
+            validate_settings(&record, "1.50", &sim, None, &complete, false, false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_settings(&record, "1.50", &sim, None, &complete, false, true),
+            Err(SettingsProblem::Source(
+                SettingsSourceError::MissingLookAffectingControl {
+                    key: ControlKey::new("grain").expect("control key"),
+                }
+            ))
+        );
+        assert_eq!(
+            validate_settings(
+                &record,
+                "1.50",
+                &sim,
+                None,
+                &with(
+                    complete.clone(),
+                    entry("grain", 1, looklab_upload::SettingSource::Reproduced)
+                ),
+                false,
+                true
+            ),
             Ok(())
         );
         assert_eq!(
@@ -495,7 +725,9 @@ epochs:
                 &record,
                 "1.50",
                 &sim,
+                None,
                 &settings(vec![("highlight_tone", 2)]),
+                false,
                 false
             ),
             Err(SettingsProblem::Source(
@@ -509,8 +741,10 @@ epochs:
                 &record,
                 "1.50",
                 &sim,
+                None,
                 &settings(vec![("highlight_tone", 2)]),
-                true
+                true,
+                false
             ),
             Ok(())
         );
@@ -519,7 +753,9 @@ epochs:
                 &record,
                 "1.50",
                 &sim,
+                None,
                 &settings(vec![("highlight_tone", 2), ("color_chrome_effect", 1)]),
+                false,
                 false
             ),
             Err(SettingsProblem::Source(
@@ -533,6 +769,7 @@ epochs:
                 &record,
                 "1.50",
                 &sim,
+                None,
                 &with(
                     complete.clone(),
                     entry(
@@ -541,6 +778,7 @@ epochs:
                         looklab_upload::SettingSource::Reproduced
                     )
                 ),
+                false,
                 false
             ),
             Err(SettingsProblem::StepOutOfRange(
@@ -552,10 +790,12 @@ epochs:
                 &record,
                 "1.50",
                 &sim,
+                None,
                 &with(
                     complete.clone(),
                     entry("grain", 1, looklab_upload::SettingSource::Reproduced)
                 ),
+                false,
                 false
             ),
             Err(SettingsProblem::SpatialNotTolerated(
@@ -567,10 +807,12 @@ epochs:
                 &record,
                 "1.50",
                 &sim,
+                None,
                 &with(
                     complete.clone(),
                     entry("color", 0, looklab_upload::SettingSource::Reproduced)
                 ),
+                false,
                 false
             ),
             Err(SettingsProblem::UnknownControl(
@@ -582,10 +824,12 @@ epochs:
                 &record,
                 "1.50",
                 &sim,
+                None,
                 &with(
                     complete,
                     entry("paused", 7, looklab_upload::SettingSource::Reproduced)
                 ),
+                false,
                 false
             ),
             Err(SettingsProblem::StepOutOfRange(

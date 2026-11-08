@@ -36,6 +36,24 @@ pub enum ErrorKind {
     AffectsRequired,
     #[error("duplicate key `{key}`")]
     DuplicateKey { key: String },
+    #[error("`{family}` is not a look family of this epoch")]
+    UnknownFamily { family: String },
+    #[error("look family `{family}` mixes monochrome and colour native sims")]
+    FamilyRenderClassConflict { family: String },
+    #[error("`{family}` is not a monochrome family of this epoch")]
+    MonochromeFamilyNotDeclared { family: String },
+    #[error("monochrome capability lists `{control}` but the control is absent")]
+    MonochromeControlMissing { control: &'static str },
+    #[error("control `{control}` is present but the monochrome capability does not list it")]
+    MonochromeControlNotDeclared { control: &'static str },
+    #[error("control `{control}` scope does not match the monochrome capability")]
+    MonochromeControlMismatch { control: &'static str },
+    #[error("monochrome capability retains grain size but no `grain_size` control exists")]
+    MonochromeGrainSizeMissing,
+    #[error("a `grain_size` control exists but the monochrome capability does not retain it")]
+    MonochromeGrainSizeNotDeclared,
+    #[error("`grain_size` must be a spatial, mapped, family-independent control")]
+    MonochromeGrainSizeMismatch,
     #[error("solve plan names undeclared control `{key}`")]
     SolvePlanUnknownControl { key: String },
     #[error("solve plan repeats control `{key}`")]

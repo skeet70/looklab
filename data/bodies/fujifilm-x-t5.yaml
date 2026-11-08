@@ -45,6 +45,14 @@ epochs:
         look: sepia
         monochrome: true
         makernote: { tag: Saturation, value: 0x0310 }
+    # https://fujifilm-dsc.com/en/manual/x-t5/menu_shooting/image_quality_setting/#monochromatic
+    # MONOCHROMATIC COLOR tints ACROS and MONOCHROME only; the 37-position UI grid
+    # is -18..+18 on both axes.
+    monochrome:
+      families: [acros, monochrome, sepia]
+      filter: [acros, monochrome]
+      toning: [acros, monochrome]
+      grain_size: true
     exposure_modes:
       - key: dr100
       - key: dr200
@@ -86,6 +94,7 @@ epochs:
         default: 0
         look_affecting: true
         affects: [chroma]
+        applies_to: [provia, classic-chrome]
         makernote:
           tag: Saturation
           values: { -4: 0x4e0, -3: 0x4c0, -2: 0x400, -1: 0x180, 0: 0, 1: 0x80, 2: 0x100, 3: 0xc0, 4: 0xe0 }
@@ -95,6 +104,7 @@ epochs:
         default: off
         look_affecting: true
         affects: [chroma, lightness]
+        applies_to: [provia, classic-chrome]
         makernote: { tag: ColorChromeEffect, values: { off: 0, weak: 32, strong: 64 } }
       - key: color_chrome_fx_blue
         type: enum
@@ -102,7 +112,40 @@ epochs:
         default: off
         look_affecting: true
         affects: [chroma, lightness]
+        applies_to: [provia, classic-chrome]
         makernote: { tag: ColorChromeFXBlue, values: { off: 0, weak: 32, strong: 64 } }
+      - key: mono_filter
+        type: enum
+        values: [none, yellow, red, green]
+        default: none
+        look_affecting: true
+        affects: [tint]
+        applies_to: [acros, monochrome]
+        makernote:
+          tag: Saturation
+          values:
+            none: [0x0500, 0x0300]
+            yellow: [0x0502, 0x0302]
+            red: [0x0501, 0x0301]
+            green: [0x0503, 0x0303]
+      - key: bw_adjustment
+        type: int
+        range: [-18, 18]
+        step: 1
+        default: 0
+        look_affecting: true
+        affects: [tint]
+        applies_to: [acros, monochrome]
+        makernote: { tag: BWAdjustment, encoding: { scale: 1 } }
+      - key: bw_magenta_green
+        type: int
+        range: [-18, 18]
+        step: 1
+        default: 0
+        look_affecting: true
+        affects: [tint]
+        applies_to: [acros, monochrome]
+        makernote: { tag: BWMagentaGreen, encoding: { scale: 1 } }
       - key: wb_shift_r
         type: int
         range: [-9, 9]
@@ -135,6 +178,14 @@ epochs:
         spatial: true
         tolerated: [off]
         makernote: { tag: GrainEffectRoughness, values: { off: 0, weak: [16, 32], strong: [48, 64] } }
+      - key: grain_size
+        type: enum
+        values: [off, small, large]
+        default: off
+        look_affecting: false
+        spatial: true
+        tolerated: [off]
+        makernote: { tag: GrainEffectSize, values: { off: 0, small: 16, large: 32 } }
       - key: clarity
         type: int
         range: [-5, 5]

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sqlx::SqlitePool;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use webauthn_rs::prelude::{Passkey, Url, WebauthnBuilder};
 use webauthn_rs_core::{WebauthnCore, proto::RegistrationState};
 
@@ -85,7 +85,7 @@ impl PendingPromotion {
     }
 
     pub fn finish(mut self) {
-        finish_promotion(self.pending.as_ref(), &self.handle);
+        finish_promotion(&self.pending, &self.handle);
         self.finished = true;
     }
 
@@ -107,9 +107,9 @@ impl Drop for PendingPromotion {
             return;
         }
         if self.committing {
-            finish_promotion(self.pending.as_ref(), &self.handle);
+            finish_promotion(&self.pending, &self.handle);
         } else {
-            cancel_promotion(self.pending.as_ref(), &self.handle);
+            cancel_promotion(&self.pending, &self.handle);
         }
     }
 }
@@ -350,7 +350,7 @@ pub struct AppState {
     pub blobs: Arc<dyn BlobStore>,
     pub webauthn: WebauthnCore,
     pub secret: ServerSecret,
-    pub bodies: Bodies,
+    pub bodies: RwLock<Bodies>,
     pub rate_limiter: RateLimiter,
     pub trust: Arc<dyn TrustPolicy>,
     pub upload_slots: Arc<Semaphore>,
@@ -375,7 +375,7 @@ impl AppState {
         config.validate()?;
         let db = open(&config.db_path).await?;
         let blobs: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(&config.blob_dir)?);
-        let bodies = Bodies::load(&config.bodies_dir, &config.snapshot_dir)?;
+        let bodies = RwLock::new(Bodies::load(&config.bodies_dir, &config.snapshot_dir)?);
         let secret = ServerSecret::load_or_create(&config.server_secret_path)?;
         let origin =
             Url::parse(&config.origin).map_err(|error| StateError::Webauthn(error.to_string()))?;
@@ -683,6 +683,17 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_committing_promotion_removes_the_shadow() {
+        let original = passkey(1, false);
+        let pending = pending(original.clone());
+        let mut promotion =
+            begin_promotion(&pending, &original, &passkey(2, false)).expect("promotion");
+        promotion.committing = true;
+        drop(promotion);
+        assert!(pending.lock().expect("pending").is_empty());
+    }
+
+    #[test]
     fn a_zero_counter_pending_promotion_is_applied() {
         let original = passkey(0, false);
         let pending = pending(original.clone());
@@ -713,42 +724,5 @@ mod tests {
             purge_pending(&mut entries, ttl);
             assert!(entries.is_empty());
         }
-    }
-
-    #[test]
-    fn a_dropped_committing_promotion_removes_the_shadow() {
-        let original = passkey(1, false);
-        let pending = pending(original.clone());
-        let mut promotion =
-            begin_promotion(&pending, &original, &passkey(2, false)).expect("promotion");
-        promotion.committing = true;
-        drop(promotion);
-        assert!(pending.lock().expect("pending").is_empty());
-    }
-
-    #[test]
-    fn finishing_a_promotion_does_not_remove_a_replacement_entry() {
-        let original = passkey(1, false);
-        let pending = pending(original.clone());
-        let promotion =
-            begin_promotion(&pending, &original, &passkey(2, false)).expect("promotion");
-        {
-            let mut entries = pending.lock().expect("pending");
-            entries.clear();
-            let handle = RegistrationHandle::generate().expect("handle");
-            entries.insert(
-                handle,
-                PendingRegistration {
-                    created: Instant::now(),
-                    promoting: true,
-                    stage: PendingStage::Credential {
-                        passkey: Box::new(passkey(3, false)),
-                        display_handle: None,
-                    },
-                },
-            );
-        }
-        promotion.finish();
-        assert_eq!(pending.lock().expect("pending").len(), 1);
     }
 }

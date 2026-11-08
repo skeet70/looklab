@@ -34,7 +34,7 @@ struct VerdictKey {
 pub async fn run(db_pool: &SqlitePool, config: &WorkerConfig) -> Result<()> {
     let rows = sqlx::query(
         "SELECT id, card, body_id FROM contributions
-         WHERE intent = 'card' AND status = 'accepted' ORDER BY id",
+         WHERE intent = 'card' AND status = 'accepted' AND render_class = 'colour' ORDER BY id",
     )
     .fetch_all(db_pool)
     .await?;
@@ -139,7 +139,9 @@ pub async fn validate(
     contribution_id: &looklab_server::ContributionId,
 ) -> Result<()> {
     let contribution = db::contribution(db_pool, contribution_id).await?;
-    if contribution.status == db::ContributionStatus::Withdrawn {
+    if contribution.status == db::ContributionStatus::Withdrawn
+        || contribution.render_class == looklab_upload::RenderClass::Monochrome
+    {
         return Ok(());
     }
     let declaration = card_declaration(db_pool, contribution_id).await?;

@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ids::{MAX_BODY_ID_LEN, MAX_FIRMWARE_LEN, MAX_SLUG_LEN};
 use crate::manifest::{
-    BatchManifest, BlobKind, IntentError, canonical_manifest_bytes, manifest_hash,
+    BatchManifest, BlobKind, IntentError, RenderClassError, canonical_manifest_bytes, manifest_hash,
 };
 use crate::metadata::MetadataError;
 use crate::nonce::{Challenge, ManifestHash, Nonce, SendManifestHash};
@@ -27,7 +27,7 @@ use crate::webauthn::{
 };
 
 pub const MAGIC: [u8; 6] = *b"LLUPLD";
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 const NONCE_OFFSET: usize = MAGIC.len() + 2;
 
@@ -171,6 +171,11 @@ pub enum EnvelopeError {
         #[source]
         source: IntentError,
     },
+    #[error("batch render classification is invalid: {source}")]
+    RenderClassInvalid {
+        #[source]
+        source: RenderClassError,
+    },
     #[error("credential id is empty")]
     CredentialIdEmpty,
     #[error("authenticator data of {len} bytes exceeds the {max}-byte limit")]
@@ -226,6 +231,10 @@ pub fn encode_envelope(parts: &EnvelopeParts<'_>) -> Vec<u8> {
     assert!(
         parts.blobs.len() == parts.manifest.images.len(),
         "blob count must match the manifest image count"
+    );
+    assert!(
+        parts.manifest.validate_render_class().is_ok(),
+        "batch render classification is invalid"
     );
     assert!(
         parts.assertion.credential_id.len() <= MAX_CREDENTIAL_ID,
@@ -411,6 +420,9 @@ pub fn parse_envelope_strict(bytes: &[u8], limits: &Limits) -> Result<Envelope, 
     manifest
         .validate_intent()
         .map_err(|source| EnvelopeError::IntentInvalid { source })?;
+    manifest
+        .validate_render_class()
+        .map_err(|source| EnvelopeError::RenderClassInvalid { source })?;
 
     let credential_len = usize::from(reader.u8()?);
     if credential_len == 0 {
@@ -553,6 +565,16 @@ fn scan_manifest_images(bytes: &[u8]) -> Result<Option<usize>, EnvelopeError> {
         if variant == 0 && !scan.skip(8) {
             return Ok(None);
         }
+    }
+    // render_class, then the monochrome_authorization option tag and payload
+    if scan.varint().is_none() {
+        return Ok(None);
+    }
+    let Some(authorization) = scan.varint() else {
+        return Ok(None);
+    };
+    if authorization == 1 && scan.varint().is_none() {
+        return Ok(None);
     }
     for (field, max) in [
         (ManifestField::Body, MAX_BODY_ID_LEN),

@@ -51,6 +51,7 @@ async fn fixture() -> Fixture {
     let mut config =
         WorkerConfig::new(dir.path().join("looklab.sqlite3"), dir.path().join("blobs"));
     config.data = data;
+    config.snapshot_dir = config.data.join("community");
     config.site = dir.path().join("site");
     config.transforms = dir.path().join("transforms");
     std::fs::create_dir_all(&config.transforms).expect("transform dir");
