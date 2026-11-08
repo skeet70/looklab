@@ -23,6 +23,9 @@
   --text-title: clamp(1.8rem, 4vw, 3rem);
   --radius: .6rem;
   --focus-ring: 3px solid var(--accent);
+  --shell-max: 78rem;
+  --shell-gutter: clamp(1rem, 3vw, 2.5rem);
+  --shell-inline: max(var(--shell-gutter), calc((100% - var(--shell-max)) / 2 + var(--shell-gutter)));
 }
 @media (prefers-color-scheme: dark) {
   :root {

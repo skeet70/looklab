@@ -37,21 +37,28 @@ pub fn BodiesPage() -> impl IntoView {
                         {index.bodies.iter()
                             .filter(|body| body.kind == looklab_publish::BodyKind::Camera)
                             .filter(|body| body.make.to_lowercase().contains(&needle) || body.model.to_lowercase().contains(&needle))
-                            .map(|body| view! {
-                                <article class="camera-card">
-                                    <div class="camera-look-strip">
-                                        {items.iter().filter(|item| body.looks.contains(&item.slug))
-                                            .take(2).cloned().map(|item| view! {
-                                                <ui::LookCard item scene=scene.clone()/>
-                                            }).collect_view()}
-                                    </div>
-                                    <h2>
-                                        <a href=crate::base::site_url(&format!("/cameras/{}", body.id))>
-                                            {format!("{} {}", body.make, body.model)}
-                                        </a>
-                                    </h2>
-                                    <p>{format!("{} {} to explore", body.looks.len(), if body.looks.len() == 1 { "look" } else { "looks" })}</p>
-                                </article>
+                            .map(|body| {
+                                let published = items.iter().filter(|item| body.looks.contains(&item.slug));
+                                let published_count = published.clone().count();
+                                view! {
+                                    <article class="camera-card">
+                                        <div class="camera-look-strip">
+                                            {published.take(2).cloned().map(|item| view! {
+                                                    <ui::LookCard item scene=scene.clone()/>
+                                                }).collect_view()}
+                                        </div>
+                                        <h2>
+                                            <a href=crate::base::site_url(&format!("/cameras/{}", body.id))>
+                                                {format!("{} {}", body.make, body.model)}
+                                            </a>
+                                        </h2>
+                                        <p>{if published_count == 0 {
+                                            "No measured looks published yet".to_owned()
+                                        } else {
+                                            format!("{published_count} {} to explore", if published_count == 1 { "look" } else { "looks" })
+                                        }}</p>
+                                    </article>
+                                }
                             }).collect_view()}
                     </div>
                 }.into_any()

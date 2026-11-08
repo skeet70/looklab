@@ -6,9 +6,21 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_params_map;
 use serde::Deserialize;
+use wasm_bindgen_futures::JsFuture;
 
 use crate::data::Load;
 use crate::ui;
+
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export function copyStatusLink(text) {
+    if (!navigator.clipboard) return Promise.reject(new Error('clipboard unavailable'));
+    return navigator.clipboard.writeText(text);
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = copyStatusLink)]
+    fn copy_status_link(text: &str) -> js_sys::Promise;
+}
 
 #[derive(Clone, Debug, Deserialize)]
 struct StatusResponse {
@@ -183,6 +195,9 @@ pub fn StatusPage(#[prop(optional)] token_override: Option<String>) -> impl Into
     let session = crate::session::use_session();
     let navigate = leptos_router::hooks::use_navigate();
     let from_link = token_override.is_none();
+    let link_token = token_override
+        .as_deref()
+        .and_then(|token| crate::webauthn::StatusToken::try_from(token.to_owned()).ok());
     let token = Signal::derive(move || {
         token_override
             .clone()
@@ -246,21 +261,7 @@ pub fn StatusPage(#[prop(optional)] token_override: Option<String>) -> impl Into
     view! {
         <h1>"Your contributions"</h1>
         {(!available).then(ui::preview_notice)}
-        <p class="lede" hidden=move || !available>
-            "Keep your status link private. Anyone with the link can read your contributions. "
-            <a href=crate::base::site_url("/help/passkeys")>"How sign-in works"</a> "."
-        </p>
-        {move || available.then(|| {
-            let token = token.get();
-            let feed = crate::base::api_url(&format!("/status/{token}.rss"));
-            let href = feed.clone();
-            view! {
-                <p class="status-links">
-                    <a href=crate::base::site_url(&format!("/status/{token}"))>"Private status link to bookmark"</a>
-                    <a href=href>"Subscribe to updates with RSS"</a>
-                </p>
-            }
-        })}
+        {move || link_token.clone().filter(|_| available).map(|token| view! { <PrivateStatusLinks token/> })}
         {move || {
             if !available {
                 return ().into_any();
@@ -273,6 +274,82 @@ pub fn StatusPage(#[prop(optional)] token_override: Option<String>) -> impl Into
                 }.into_any(),
             }
         }}
+    }
+}
+
+fn absolute_url(path: &str) -> Option<String> {
+    let base = web_sys::window()?.location().href().ok()?;
+    web_sys::Url::new_with_base(path, &base)
+        .ok()
+        .map(|url| url.href())
+}
+
+#[component]
+fn PrivateStatusLinks(token: crate::webauthn::StatusToken) -> impl IntoView {
+    let open = RwSignal::new(false);
+    let message = RwSignal::new(None::<String>);
+    let field = NodeRef::<leptos::html::Input>::new();
+    let link = absolute_url(&crate::base::site_url(&format!(
+        "/status/{}",
+        token.as_str()
+    )));
+    let feed = absolute_url(&crate::base::api_url(&format!(
+        "/status/{}.rss",
+        token.as_str()
+    )));
+    view! {
+        <p class="status-links">
+            <button type="button" on:click=move |_| {
+                message.set(None);
+                open.set(true);
+            }>"Private status link"</button>
+            {match feed {
+                Some(href) => view! {
+                    <a href=href rel="external" type="application/rss+xml">"Subscribe with RSS"</a>
+                }.into_any(),
+                None => ().into_any(),
+            }}
+        </p>
+        <ui::Dialog title="Private status link".to_owned() open=open>
+            <ui::Notice
+                message="Anyone you give this link to can read your contributions. Share it only with people you choose.".to_owned()
+                kind=ui::NoticeKind::Warning
+            />
+            {match link {
+                Some(address) => {
+                    let copied = address.clone();
+                    let copy = move |_| {
+                        let address = copied.clone();
+                        spawn_local(async move {
+                            match JsFuture::from(copy_status_link(&address)).await {
+                                Ok(_) => message.set(Some("Link copied.".to_owned())),
+                                Err(_) => {
+                                    if let Some(input) = field.get_untracked() {
+                                        input.select();
+                                    }
+                                    message.set(Some(
+                                        "Could not access the clipboard. The link is selected for copying."
+                                            .to_owned(),
+                                    ));
+                                }
+                            }
+                        });
+                    };
+                    view! {
+                        <label>"Private status link"
+                            <input node_ref=field type="text" readonly prop:value=address/>
+                        </label>
+                        <div class="field-row">
+                            <button type="button" on:click=copy>"Copy link"</button>
+                        </div>
+                    }.into_any()
+                },
+                None => view! {
+                    <p role="alert">"This browser could not prepare the link."</p>
+                }.into_any(),
+            }}
+            {move || message.get().map(|message| view! { <p role="status">{message}</p> })}
+        </ui::Dialog>
     }
 }
 

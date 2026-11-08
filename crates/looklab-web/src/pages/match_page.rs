@@ -50,6 +50,35 @@ impl Application {
     }
 }
 
+/// What the published catalog can offer the match wizard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatchAvailability {
+    /// At least one public look has a matchable version.
+    Matchable,
+    /// Public looks are published, but none has a matchable version.
+    PreviewOnly,
+    /// No public look has a published version.
+    NoPublishedLooks,
+}
+
+impl MatchAvailability {
+    fn of(index: &looklab_publish::SiteIndex) -> Self {
+        if super::looks::CatalogAvailability::of(index)
+            == super::looks::CatalogAvailability::NoPublishedLooks
+        {
+            return Self::NoPublishedLooks;
+        }
+        if index.looks.iter().any(|look| {
+            look.visibility == looklab_publish::LookVisibility::Public
+                && look.latest().is_some_and(|version| version.matchable)
+        }) {
+            Self::Matchable
+        } else {
+            Self::PreviewOnly
+        }
+    }
+}
+
 #[component]
 pub fn MatchPage() -> impl IntoView {
     let query = use_query_map();
@@ -222,9 +251,9 @@ pub fn MatchPage() -> impl IntoView {
     view! {
         <div class="match-page">
         <header class="match-heading">
-            <p class="eyebrow">"Made for your camera"</p>
+            <p class="eyebrow">"Tuned for your camera"</p>
             <h1>"Get the look"</h1>
-            <p class="lede">"Choose a look. Get a recipe you can take out shooting."</p>
+            <p class="lede">"Dial it in. Take it out into the world."</p>
         </header>
         {move || if let Some(value) = reply.get() { view! {
             <button class="secondary" on:click=move |_| reply.set(None)>
@@ -235,12 +264,11 @@ pub fn MatchPage() -> impl IntoView {
             Load::Loading => ui::loading().into_any(), Load::Failed(error) => ui::failure(&error).into_any(),
             Load::Ready(index) => {
                 crate::prefetch::route_rendered();
-                let items = index.looks.iter().filter(|look| look.visibility == looklab_publish::LookVisibility::Public).filter_map(|look| look.latest().filter(|version| version.matchable).map(|version| ui::LookCardItem {
-                    slug: look.slug.clone(), version: version.version.clone(), name: look.name.clone(),
-                    origin: ui::LookOrigin::BuiltIn { cameras: index.bodies.iter().filter(|body| body.looks.contains(&look.slug)).map(|body| format!("{} {}", body.make, body.model)).collect() },
-                    character: String::new(), status: version.status, lut: None,
-                })).collect::<Vec<_>>();
-                if items.is_empty() {
+                let availability = MatchAvailability::of(&index);
+                if availability == MatchAvailability::NoPublishedLooks {
+                    return ui::no_published_looks().into_any();
+                }
+                if availability == MatchAvailability::PreviewOnly {
                     return view! {
                         <ui::EmptyState title="No looks are ready for matching yet".to_owned() message="Matching becomes available when a look has enough supported data. Share RAW and JPEG pairs to help build it.".to_owned()>
                             <p class="field-row">
@@ -250,6 +278,11 @@ pub fn MatchPage() -> impl IntoView {
                         </ui::EmptyState>
                     }.into_any();
                 }
+                let items = index.looks.iter().filter(|look| look.visibility == looklab_publish::LookVisibility::Public).filter_map(|look| look.latest().filter(|version| version.matchable).map(|version| ui::LookCardItem {
+                    slug: look.slug.clone(), version: version.version.clone(), name: look.name.clone(),
+                    origin: ui::LookOrigin::BuiltIn { cameras: index.bodies.iter().filter(|body| body.looks.contains(&look.slug)).map(|body| format!("{} {}", body.make, body.model)).collect() },
+                    character: String::new(), status: version.status, lut: None,
+                })).collect::<Vec<_>>();
                 let items = StoredValue::new(items);
                 view! {
                     <fieldset class="match-wizard" aria-label="Look choices" disabled=move || running.get()>

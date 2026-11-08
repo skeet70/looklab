@@ -60,6 +60,21 @@ pub fn preview_notice() -> impl IntoView + use<> {
     }
 }
 
+/// The notice shown wherever the whole public catalog has no published look.
+pub fn no_published_looks() -> impl IntoView + use<> {
+    view! {
+        <EmptyState
+            title="No looks are published yet".to_owned()
+            message="looklab measures a camera's color from RAW and JPEG pairs shared by the people who shoot it. Looks are published once a camera has enough checked photos.".to_owned()
+        >
+            <p class="field-row">
+                <a class="button" href=crate::base::site_url("/contribute")>"Share photos you already have"</a>
+                <a href=crate::base::site_url("/about/how-it-works")>"How looks are made →"</a>
+            </p>
+        </EmptyState>
+    }
+}
+
 pub fn timestamp(seconds: i64) -> String {
     let millis = seconds as f64 * 1000.0;
     let date = js_sys::Date::new(&millis.into());

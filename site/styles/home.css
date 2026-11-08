@@ -12,9 +12,5 @@
 .section-heading { display: flex; justify-content: space-between; gap: 1rem; align-items: baseline; }
 .home-help { display: flex; justify-content: space-between; gap: 2rem; align-items: center; margin-block: 3rem; padding: 2rem; background: var(--panel); border-radius: 1rem; }
 .home-help p { max-width: 45rem; }
-.home-collecting { display: grid; gap: .75rem; margin-block: 2rem 3rem; padding: 2rem; background: var(--panel); border-radius: 1rem; }
-.home-collecting h2, .home-collecting p { margin: 0; }
-.home-collecting p { max-width: 45rem; }
-.home-collecting .field-row { margin-block-start: .5rem; }
 .home-developers { display: flex; justify-content: space-between; gap: 1rem; padding-block: 1.5rem; border-top: 1px solid var(--line); }
-@media (max-width: 650px) { .home-heading { padding-top: 1rem; } .home-picker-grid { grid-template-columns: 1fr; } .home-help, .home-developers, .section-heading { flex-direction: column; align-items: start; } .home-help { padding: 1.25rem; } .home-collecting { padding: 1.25rem; } }
+@media (max-width: 650px) { .home-heading { padding-top: 1rem; } .home-picker-grid { grid-template-columns: 1fr; } .home-help, .home-developers, .section-heading { flex-direction: column; align-items: start; } .home-help { padding: 1.25rem; } }

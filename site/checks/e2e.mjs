@@ -250,14 +250,17 @@ async function open(viewport, harPath) {
     }
   });
   const problems = [];
+  const expectedMissingResources = new Set();
   page.on('pageerror', (error) => problems.push(String(error)));
   page.on('console', (message) => {
-    if (message.type() === 'error') {
-      problems.push(message.text());
+    const expectedNetworkFailure = expectedMissingResources.has(message.location().url) && message.args().length === 0;
+    if (message.type() === 'error' && !expectedNetworkFailure) {
+      const detail = `${message.text()} (${message.location().url})`;
+      problems.push(detail.replace(/(\/status\/)[A-Za-z0-9_-]+(?:\.rss)?/g, '$1[private]'));
     }
   });
   const authenticator = await addVirtualAuthenticator(page);
-  return { browser, context, page, problems, bodies, authenticator };
+  return { browser, context, page, problems, bodies, authenticator, expectedMissingResources };
 }
 
 async function close(session) {
@@ -1544,17 +1547,20 @@ async function account() {
     throw new Error('the account flow needs the Chromium CDP authenticator; use --browser chromium');
   }
   const session = await open(VIEWPORTS.desktop);
-  const { page, context, browser: engineBrowser, problems } = session;
+  const { page, context, browser: engineBrowser, problems, expectedMissingResources } = session;
   const { cdp, authenticatorId } = session.authenticator;
+  const signInDialog = page.getByRole('dialog', { name: 'Sign in to looklab', exact: true });
+  const accountMenu = page.getByRole('button', { name: 'River Photographer', exact: true });
   await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
   let second;
   try {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: options.origin });
     await page.goto(`${options.origin}/me`);
     await page.getByRole('button', { name: 'Sign in', exact: true }).first().focus();
     await page.keyboard.press('Enter');
-    await page.getByRole('dialog').waitFor();
+    await signInDialog.waitFor();
     await page.keyboard.press('Escape');
-    check(await page.getByRole('dialog').count() === 0, 'Escape closes sign-in dialog');
+    check(await signInDialog.count() === 0, 'Escape closes sign-in dialog');
     await page.getByRole('button', { name: 'Sign in', exact: true }).first().click();
     for (const [size, viewport] of Object.entries(VIEWPORTS)) {
       await page.setViewportSize(viewport);
@@ -1583,32 +1589,68 @@ async function account() {
     const firstProfile = await (await created).json();
     const activationRequest = (await activation).postDataJSON();
     check(Array.isArray(activationRequest.pow) && activationRequest.pow.length === 16, 'New profile activation sends the server-required work proof');
-    await page.locator('dialog').waitFor({ state: 'hidden' });
-    check(await page.locator('.account-menu summary').getAttribute('aria-label') === 'River Photographer', 'Optional display name reaches account menu');
-    await page.locator('.account-menu summary').focus();
+    await signInDialog.waitFor({ state: 'hidden' });
+    check(await accountMenu.isVisible(), 'Optional display name reaches account menu');
+    await accountMenu.focus();
     await page.keyboard.press('Enter');
-    check(await page.locator('.account-menu summary').getAttribute('aria-expanded') === 'true', 'Enter opens the account menu');
+    check(await accountMenu.getAttribute('aria-expanded') === 'true', 'Enter opens the account menu');
     await page.getByRole('link', { name: 'Your contributions', exact: true }).focus();
     await page.keyboard.press('Escape');
-    check(await page.locator('.account-menu summary').getAttribute('aria-expanded') === 'false', 'Escape closes the account menu');
-    check(await page.locator('.account-menu summary').evaluate((element) => element === document.activeElement), 'Escape returns focus to the account menu button');
+    check(await accountMenu.getAttribute('aria-expanded') === 'false', 'Escape closes the account menu');
+    check(await accountMenu.evaluate((element) => element === document.activeElement), 'Escape returns focus to the account menu button');
     await page.keyboard.press('Space');
-    check(await page.locator('.account-menu summary').getAttribute('aria-expanded') === 'true', 'Space opens the account menu');
+    check(await accountMenu.getAttribute('aria-expanded') === 'true', 'Space opens the account menu');
     await page.keyboard.press('Escape');
-    await page.locator('.account-menu summary').click();
+    await accountMenu.click();
     check(await page.getByRole('link', { name: 'Review', exact: true }).count() === 0, 'Ordinary profile has no Review link');
     await page.getByRole('button', { name: 'Sign out', exact: true }).click();
     await page.goto(`${options.origin}/status/${firstProfile.status_token}`);
     await page.waitForURL(`${options.origin}/me`);
-    await page.getByRole('link', { name: 'Private status link to bookmark' }).waitFor();
-    check(await page.locator('.account-menu summary').isVisible(), 'Private status link signs this browser in and opens /me');
-    await page.locator('.account-menu summary').click();
+    await page.getByRole('button', { name: 'Private status link', exact: true }).waitFor();
+    check(await accountMenu.isVisible(), 'Private status link signs this browser in and opens /me');
+    check(await page.getByRole('dialog', { name: 'Private status link', exact: true }).count() === 0, 'Private link details stay closed until requested');
+    check(await page.locator('main a[href$="/help/passkeys"]').count() === 0, 'Signed-in /me does not repeat sign-in help');
+    await page.getByRole('button', { name: 'Private status link', exact: true }).click();
+    const linkDialog = page.getByRole('dialog', { name: 'Private status link', exact: true });
+    await linkDialog.waitFor();
+    check(page.url() === `${options.origin}/me`, 'Private link dialog opens without leaving /me');
+    const privateLink = await linkDialog.getByLabel('Private status link').inputValue();
+    check(privateLink === `${options.origin}/status/${firstProfile.status_token}`, 'Private link dialog shows the full capability URL');
+    await linkDialog.getByRole('button', { name: 'Copy link', exact: true }).click();
+    const copied = await page.waitForFunction((expected) => navigator.clipboard.readText().then((text) => text === expected), privateLink).then(() => true, () => false);
+    check(copied, 'Copy link puts the private URL on the clipboard');
+    await page.keyboard.press('Escape');
+    await linkDialog.waitFor({ state: 'hidden' });
+    check(page.url() === `${options.origin}/me`, 'Closing the private link dialog leaves /me open');
+    check(await page.getByRole('heading', { name: 'Your contributions', exact: true }).isVisible(), 'Closing the private link dialog leaves /me usable');
+    const rssLink = page.getByRole('link', { name: 'Subscribe with RSS', exact: true });
+    const rssHref = await rssLink.getAttribute('href');
+    const rssResponse = page.waitForResponse((response) => new URL(response.url()).pathname === `/status/${firstProfile.status_token}.rss`).catch(() => null);
+    const rssDownload = page.waitForEvent('download').catch(() => null);
+    await rssLink.evaluate((anchor) => anchor.click());
+    check((await Promise.race([rssResponse, rssDownload])) !== null, 'RSS link navigates to the feed instead of the SPA status route');
+    const feed = await page.request.get(new URL(rssHref, options.origin).href);
+    check(feed.status() === 200, 'RSS feed responds');
+    check((feed.headers()['content-type'] ?? '').startsWith('application/rss+xml'), 'RSS feed uses the feed media type');
+    check((await feed.text()).includes('<rss version="2.0">'), 'RSS feed returns feed data');
+    await page.goto(`${options.origin}/me`);
+    await page.getByRole('button', { name: 'Private status link', exact: true }).waitFor();
+    const independent = await engineBrowser.newContext({ viewport: VIEWPORTS.mobile });
+    const independentPage = await independent.newPage();
+    const independentFeed = independentPage.waitForResponse((response) => new URL(response.url()).pathname === `/status/${firstProfile.status_token}` && (response.headers()['content-type'] ?? '').startsWith('application/json'));
+    await independentPage.goto(privateLink);
+    await independentPage.waitForURL(`${options.origin}/me`);
+    await independentPage.getByRole('heading', { name: 'Your contributions', exact: true }).waitFor();
+    check(await independentPage.locator('.account-menu summary').isVisible(), 'Copied private link signs in a separate browser');
+    check((await independentFeed).ok(), 'Copied private link loads the contribution feed in a separate browser');
+    await independent.close();
+    await accountMenu.click();
     await page.getByRole('button', { name: 'Sign out', exact: true }).click();
     await page.getByRole('button', { name: 'Sign in', exact: true }).first().click();
     const resumed = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/session');
     await page.getByRole('button', { name: 'Continue with passkey', exact: true }).click();
     const resumedProfile = await (await resumed).json();
-    await page.locator('dialog').waitFor({ state: 'hidden' });
+    await signInDialog.waitFor({ state: 'hidden' });
     check((await page.request.get(`${options.origin}/status/${firstProfile.status_token}`)).ok(), 'Local sign-out preserves existing status link');
     const credentials = await cdp.send('WebAuthn.getCredentials', { authenticatorId });
     const credential = credentials.credentials[0];
@@ -1626,7 +1668,7 @@ async function account() {
     const otherResponse = other.waitForResponse((response) => new URL(response.url()).pathname === '/api/session');
     await other.getByRole('button', { name: 'Continue with passkey', exact: true }).click();
     const otherProfile = await (await otherResponse).json();
-    await other.locator('dialog').waitFor({ state: 'hidden' });
+    await other.getByRole('dialog', { name: 'Sign in to looklab', exact: true }).waitFor({ state: 'hidden' });
     check((await page.request.get(`${options.origin}/status/${resumedProfile.status_token}`)).ok(), 'Second browser leaves first session signed in');
     check((await other.request.get(`${options.origin}/status/${otherProfile.status_token}`)).ok(), 'Second browser has its own valid session');
     // Virtual authenticators do not share signature counters.
@@ -1636,16 +1678,16 @@ async function account() {
     const credentialId = Buffer.from(credential.credentialId, 'base64').toString('base64url');
     check((await page.request.post(`${options.origin}/api/__stub/moderator/${credentialId}`)).ok(), 'Stub moderator grant succeeds');
     await page.reload();
-    await page.locator('.account-menu summary').waitFor();
-    await page.locator('.account-menu summary').click();
+    await accountMenu.waitFor();
+    await accountMenu.click();
     check(await page.getByRole('link', { name: 'Review', exact: true }).isVisible(), 'Reload refreshes newly granted roles without another passkey prompt');
-    await page.locator('.account-menu summary').click();
-    await page.locator('.account-menu summary').click();
+    await accountMenu.click();
+    await accountMenu.click();
     await page.getByRole('button', { name: 'Sign out', exact: true }).click();
     await page.getByRole('button', { name: 'Sign in', exact: true }).first().click();
     await page.getByRole('button', { name: 'Continue with passkey', exact: true }).click();
-    await page.locator('dialog').waitFor({ state: 'hidden' });
-    await page.locator('.account-menu summary').click();
+    await signInDialog.waitFor({ state: 'hidden' });
+    await accountMenu.click();
     check(await page.getByRole('link', { name: 'Review', exact: true }).isVisible(), 'Moderator sees Review in account menu');
     for (const [size, viewport] of Object.entries(VIEWPORTS)) {
       await page.setViewportSize(viewport);
@@ -1659,13 +1701,22 @@ async function account() {
         }
       }
     }
-    await page.locator('.account-menu summary').click();
+    await accountMenu.click();
     await page.getByRole('button', { name: 'Sign out everywhere', exact: true }).click();
-    await page.locator('.header-account').waitFor();
-    check(!(await other.request.get(`${options.origin}/status/${otherProfile.status_token}`)).ok(), 'Sign out everywhere revokes second browser');
-    check(!(await page.request.get(`${options.origin}/status/${resumedProfile.status_token}`)).ok(), 'Sign out everywhere revokes first browser');
+    await page.getByRole('button', { name: 'Sign in', exact: true }).first().waitFor();
+    check((await other.request.get(`${options.origin}/status/${otherProfile.status_token}`)).status() === 404, 'Sign out everywhere revokes second browser');
+    check((await page.request.get(`${options.origin}/status/${resumedProfile.status_token}`)).status() === 404, 'Sign out everywhere revokes first browser');
+    const revokedLink = `${options.origin}/status/${firstProfile.status_token}`;
+    const restoreUrl = `${options.origin}/api/session`;
+    expectedMissingResources.add(restoreUrl);
+    const revokedRestore = page.waitForResponse((response) => response.url() === restoreUrl && response.request().method() === 'GET');
+    await page.goto(revokedLink);
+    check((await revokedRestore).status() === 404, 'Revoked capability cannot restore a session');
+    await page.getByRole('alert').waitFor();
+    check(page.url() === `${options.origin}/status/${firstProfile.status_token}`, 'Revoked status link does not sign the browser in');
+    check(await page.getByRole('button', { name: 'Sign in', exact: true }).first().isVisible(), 'Revoked status link leaves the browser signed out');
     await other.reload();
-    await other.locator('.header-account').waitFor();
+    await other.getByRole('button', { name: 'Sign in', exact: true }).first().waitFor();
     check(problems.length === 0, `Account browser console: ${problems.join('; ')}`);
     return { created: true, signedInAgain: true, independentSessions: true, revokedEverywhere: true, moderatorMenu: true };
   } finally {

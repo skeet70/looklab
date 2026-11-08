@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use super::looks::{cards, photo};
+use super::looks::{CatalogAvailability, cards, photo};
 use crate::data::{self, Load};
 use crate::ui;
 use leptos::prelude::*;
@@ -14,7 +14,7 @@ enum HomeReady {
         index: SiteIndex,
         scene: Arc<PreparedScene>,
     },
-    Collecting,
+    NoPublishedLooks,
 }
 
 #[component]
@@ -24,8 +24,8 @@ pub fn Landing() -> impl IntoView {
         wasm_bindgen_futures::spawn_local(async move {
             let loaded = async {
                 let index = data::index().await?;
-                if cards(&index).is_empty() {
-                    return Ok(HomeReady::Collecting);
+                if CatalogAvailability::of(&index) == CatalogAvailability::NoPublishedLooks {
+                    return Ok(HomeReady::NoPublishedLooks);
                 }
                 Ok(HomeReady::Choices {
                     index,
@@ -41,37 +41,25 @@ pub fn Landing() -> impl IntoView {
     });
     view! {
         <section class="home-heading">
-            <p class="eyebrow">"A world of color. Your camera."</p>
+            <p class="eyebrow">"A spectrum of styles. Your camera."</p>
             <h1>{move || match state.get() {
-                Load::Ready(HomeReady::Collecting) => "Camera looks, measured from photos shared by the people who shoot them.",
+                Load::Ready(HomeReady::NoPublishedLooks) => "Camera looks, measured from photos shared by the people who shoot them.",
                 _ => "See any camera's look on your photos, then get it on your camera.",
             }}</h1>
         </section>
         {move || match state.get() {
             Load::Loading => ui::loading().into_any(),
             Load::Failed(error) => ui::failure(&error).into_any(),
-            Load::Ready(HomeReady::Collecting) => view! { <Collecting/> }.into_any(),
+            Load::Ready(HomeReady::NoPublishedLooks) => {
+                crate::prefetch::route_rendered();
+                ui::no_published_looks().into_any()
+            }
             Load::Ready(HomeReady::Choices { index, scene }) => view! { <HomeChoices index scene/> }.into_any(),
         }}
-        <Show when=move || state.with(|state| !matches!(state, Load::Ready(HomeReady::Collecting)))>
+        <Show when=move || state.with(|state| !matches!(state, Load::Ready(HomeReady::NoPublishedLooks)))>
             <section class="home-help"><div><h2>"Built together, photo by photo"</h2><p>"Shared photos help us understand each camera's color. About a minute with photos you already have."</p></div><a class="button" href=crate::base::site_url("/contribute")>"Help build looks"</a></section>
         </Show>
         <section class="home-developers"><p>"Building camera firmware? Give your users a new world of looks."</p><a href=crate::base::site_url("/developers")>"For developers →"</a></section>
-    }
-}
-
-#[component]
-fn Collecting() -> impl IntoView {
-    crate::prefetch::route_rendered();
-    view! {
-        <section class="home-collecting">
-            <h2>"No looks are published yet"</h2>
-            <p>"looklab measures a camera's color from RAW and JPEG pairs shared by the people who shoot it. Looks are published once a camera has enough checked photos."</p>
-            <p class="field-row">
-                <a class="button" href=crate::base::site_url("/contribute")>"Share photos you already have"</a>
-                <a href=crate::base::site_url("/about/how-it-works")>"How looks are made →"</a>
-            </p>
-        </section>
     }
 }
 

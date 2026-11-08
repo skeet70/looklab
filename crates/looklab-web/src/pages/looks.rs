@@ -37,6 +37,25 @@ pub(crate) fn cards(index: &SiteIndex) -> Vec<ui::LookCardItem> {
         .collect()
 }
 
+/// Whether the public catalog has any look with a published version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CatalogAvailability {
+    Published,
+    NoPublishedLooks,
+}
+
+impl CatalogAvailability {
+    pub(crate) fn of(index: &SiteIndex) -> Self {
+        if index.looks.iter().any(|look| {
+            look.visibility == looklab_publish::LookVisibility::Public && look.latest().is_some()
+        }) {
+            Self::Published
+        } else {
+            Self::NoPublishedLooks
+        }
+    }
+}
+
 pub(crate) async fn photo() -> Result<Arc<PreparedScene>, String> {
     let scenes = data::scenes().await?;
     let first = scenes
@@ -110,10 +129,10 @@ pub fn LooksPage() -> impl IntoView {
             state.set(
                 match async {
                     let index = data::index().await?;
-                    let mut items = cards(&index);
-                    if items.is_empty() {
+                    if CatalogAvailability::of(&index) == CatalogAvailability::NoPublishedLooks {
                         return Ok(Gallery::Collecting);
                     }
+                    let mut items = cards(&index);
                     let scene = photo().await?;
                     for item in &mut items {
                         let loaded =
@@ -146,19 +165,12 @@ pub fn LooksPage() -> impl IntoView {
     });
     view! {
         <h1>"Find your next look"</h1>
-        <p class="lede">"Explore color from other cameras. Find a look, then make it yours."</p>
+        <p class="lede">"Discover what makes other cameras special. Bring it to yours."</p>
         {move || match state.get() {
             Load::Loading => ui::loading().into_any(), Load::Failed(error) => ui::failure(&error).into_any(),
             Load::Ready(Gallery::Collecting) => {
                 crate::prefetch::route_rendered();
-                view! {
-                    <ui::EmptyState title="No looks are published yet".to_owned() message="looklab measures a camera's color from RAW and JPEG pairs shared by the people who shoot it. Looks are published once a camera has enough checked photos.".to_owned()>
-                        <p class="field-row">
-                            <a class="button" href=crate::base::site_url("/contribute")>"Share photos you already have"</a>
-                            <a href=crate::base::site_url("/about/how-it-works")>"How looks are made →"</a>
-                        </p>
-                    </ui::EmptyState>
-                }.into_any()
+                ui::no_published_looks().into_any()
             },
             Load::Ready(Gallery::Ready(GalleryReady { index, scene, items })) => {
                 view! {

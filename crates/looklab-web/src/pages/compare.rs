@@ -406,16 +406,9 @@ fn compare_href(a: &LookSelection, b: &LookSelection) -> String {
 }
 
 impl Unavailable {
-    fn content(&self) -> (String, String, Vec<RecoveryAction>) {
-        match self {
-            Self::NoLooks => (
-                "No looks are published yet".to_owned(),
-                "We measure a camera's color from RAW and JPEG pairs shared by the people who shoot it. Looks appear here once a camera has enough checked photos.".to_owned(),
-                vec![
-                    link("Share photos you already have", "/contribute"),
-                    link("How looks are made", "/about/how-it-works"),
-                ],
-            ),
+    fn content(&self) -> Option<(String, String, Vec<RecoveryAction>)> {
+        let content = match self {
+            Self::NoLooks => return None,
             Self::UnknownLook(slug) => (
                 "That look isn't available".to_owned(),
                 format!(
@@ -478,7 +471,8 @@ impl Unavailable {
                     link("Browse looks", "/looks"),
                 ],
             ),
-        }
+        };
+        Some(content)
     }
 }
 
@@ -488,7 +482,9 @@ fn look_href(slug: &Slug) -> String {
 
 fn unavailable_view(unavailable: Unavailable) -> impl IntoView {
     crate::prefetch::route_rendered();
-    let (title, message, actions) = unavailable.content();
+    let Some((title, message, actions)) = unavailable.content() else {
+        return ui::no_published_looks().into_any();
+    };
     view! {
         <ui::EmptyState title message>
             <p class="field-row">
@@ -498,6 +494,7 @@ fn unavailable_view(unavailable: Unavailable) -> impl IntoView {
             </p>
         </ui::EmptyState>
     }
+    .into_any()
 }
 
 #[component]
@@ -1217,7 +1214,7 @@ mod tests {
             ),
             CompareResolution::Unavailable(unavailable.clone())
         );
-        let (_, _, actions) = unavailable.content();
+        let (_, _, actions) = unavailable.content().expect("recovery content");
         assert!(
             actions
                 .iter()

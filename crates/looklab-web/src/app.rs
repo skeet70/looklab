@@ -328,14 +328,12 @@ pub(crate) fn MePage() -> impl IntoView {
                 <StatusPage token_override=profile.status_token.as_str().to_owned()/>
                 <crate::pages::match_page::SavedRecipes/>
             }.into_any(),
+            crate::session::SessionState::SignedOut if !session.ready.get() => ui::loading().into_any(),
             crate::session::SessionState::SignedOut => view! {
                 <section class="account-intro">
                     <h1>"Your contributions"</h1>
-                    <p class="lede">"See which photos counted and how they helped build looks. Sign in with your profile, or open your private status link."</p>
+                    <p>"Sign in to see which photos counted and how they helped build looks."</p>
                     <button hidden=!base::server_available() on:click=move |_| session.dialog_open.set(true)>"Sign in"</button>
-                    <p>
-                        <a href=base::site_url("/help/passkeys")>"How sign-in works"</a>
-                    </p>
                 </section>
             }.into_any(),
         }}
