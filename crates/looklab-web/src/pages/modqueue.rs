@@ -763,9 +763,23 @@ pub fn ModQueuePage() -> impl IntoView {
             <label for="mod-template">"Common reasons"</label>
             <select id="mod-template" on:change=move |event| reason.set(event_target_value(&event))>
                 <option value="">"Choose a reason or write your own"</option>
-                <option>"The sample files confirm this camera menu."</option>
-                <option>"Please share a sample file showing this menu."</option>
-                <option>"The proposed change does not match the supplied evidence."</option>
+                {move || {
+                    let presets = match pending_decision.get() {
+                        Decision::Approve => [
+                            "The supplied evidence supports this change.",
+                            "The schema matches the documented camera controls.",
+                        ],
+                        Decision::Reject => [
+                            "The proposed change does not match the supplied evidence.",
+                            "The proposed change is outside the supported scope.",
+                        ],
+                        Decision::RequestInfo => [
+                            "Please provide evidence supporting the proposed change.",
+                            "Please clarify the controls and firmware this change applies to.",
+                        ],
+                    };
+                    presets.into_iter().map(|text| view! { <option>{text}</option> }).collect_view()
+                }}
             </select>
             <label for="mod-reason">"Reason (required)"</label>
             <textarea id="mod-reason" rows="3" prop:value=move || reason.get()

@@ -308,7 +308,7 @@ fn SignInDialog(open: RwSignal<bool>) -> impl IntoView {
                 <p id="profile-name-error" class="error" role="alert" hidden=move || name_error.get().is_none()>{move || name_error.get().unwrap_or_default()}</p>
                 <button disabled=move || busy.get() on:click=move |_| authenticate(SignInAction::Create)>"Create a profile"</button>
             </section>
-            <a href=base::site_url("/help/passkeys")>"How this works"</a>
+            <a href=base::site_url("/help/passkeys") on:click=move |_| open.set(false)>"How this works"</a>
             {move || busy.get().then(|| view! {
                 <p role="status">"Follow your browser's passkey prompt."</p>
             })}
