@@ -3327,6 +3327,7 @@ dependencies = [
  "looklab-schema",
  "looklab-trust",
  "looklab-upload",
+ "p256",
  "postcard",
  "serde",
  "serde_json",

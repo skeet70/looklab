@@ -206,7 +206,7 @@ pub async fn sign_batch(
     set(
         &public_key,
         "userVerification",
-        &JsValue::from_str("preferred"),
+        &JsValue::from_str("required"),
     )?;
     set(&public_key, "timeout", &JsValue::from_f64(60_000.0))?;
     if let Some(credential_id) = credential_id {
