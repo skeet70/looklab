@@ -10,12 +10,12 @@ What a donated fixture session needs, per body. Every file is RAW + JPEG (Fine) 
 - Tripod not needed, but avoid motion blur.
 
 ## 1. Library set (20+ pairs)
-- At least 3 film simulations, with every other setting at default. Use whichever the body has; older bodies like the X-M1 have Provia, Velvia, and Astia but no Classic Chrome or Pro Neg, so a newer second body that shares Provia or Velvia is the overlap to aim for.
+- Across the set, include at least 3 film simulations, with every other setting at default. You do not need to photograph every scene in every simulation. Use whichever the body has; older bodies like the X-M1 have Provia, Velvia, and Astia but no Classic Chrome or Pro Neg, so a newer second body that shares Provia or Velvia is the overlap to aim for.
 - Mixed scenes: skin (several people (can keep faces out for privacy) or lighting), foliage, blue sky, saturated objects (red, yellow, cyan, magenta), neutral interiors, one high-dynamic-range scene, one night scene.
 - Leave WB on Auto for most shots; a few on Daylight and on a Kelvin preset.
 
 ## 2. In-camera re-renders (the most valuable part)
-Pick 3 of the RAWs above (one with skin, one landscape, one saturated). Using in-camera RAW conversion, save a JPEG of each:
+Pick only 3 of the RAWs above (one with skin, one landscape, one saturated). Using in-camera RAW conversion, save a JPEG of each:
 - through every film simulation, all settings at default;
 - on one sim (Provia), sweep each look control the body's menu has, one at a time, others at default: highlight tone and shadow tone at their extremes and one step either side of default; color at its extremes and ±2; color chrome effect and FX blue at weak and strong (newer bodies only); WB shift R ±4 and B ±4; dynamic range DR200 and DR400 (if the conversion menu offers it).
 
@@ -25,8 +25,12 @@ A few library shots at DR200 (ISO ≥ 320) and DR400 (ISO ≥ 640), same scene a
 ## 4. Color chart session
 - X-Rite/Calibrite ColorChecker Classic 24 or Passport; note the edition/year.
 - Even daylight or flash, no glare, chart at 30–60% of the frame, square to the camera.
-- Bracket 0, −1, −2 EV. WB set to the light (custom WB on the chart's neutral patch is ideal).
-- Re-render the 0 EV chart RAW in camera through every film simulation.
+
+1. Choose one film simulation for the initial shots, such as Provia / Standard on Fujifilm. Set WB to the light (custom WB on the chart's neutral patch is ideal).
+2. Take **three RAW+JPEG Fine shots total**: 0, −1, and −2 EV. Keep all three original pairs.
+3. Using in-camera RAW conversion, render **only the 0 EV RAW** through every film simulation, keeping the other settings unchanged.
+
+You do not need a separate bracket for each simulation, or re-renders of the −1 and −2 EV RAWs.
 
 ### No chart?
 Shoot these instead. They help with tone, white balance and saturated coverage, but they can't calibrate the camera's colour transform. That still needs a real chart.
