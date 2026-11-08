@@ -2211,6 +2211,15 @@ fn contains_ipv6(text: &str) -> bool {
             index += 1;
         }
         let token = &text[start..index];
+        let identifier_before = start > 0
+            && (bytes[start - 1].is_ascii_alphanumeric()
+                || bytes[start - 1] == b'_'
+                || bytes[start - 1] == b':');
+        let identifier_after =
+            index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_');
+        if identifier_before || identifier_after {
+            continue;
+        }
         if (token.matches(':').count() >= 3 || token.contains("::")) && valid_ipv6(token) {
             return true;
         }
