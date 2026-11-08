@@ -388,6 +388,7 @@ fn metadata_monochrome(metadata: &ManifestMetadata) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn classify_renders<'a>(
     record: &BodyRecord,
     firmware: &str,

@@ -239,7 +239,8 @@ pub struct StoredSend {
 }
 
 pub async fn find_send(db: &SqlitePool, nonce: &Nonce) -> Result<Option<StoredSend>, sqlx::Error> {
-    let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, i64, Option<i64>)> = sqlx::query_as(
+    type SendRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, Option<i64>);
+    let row: Option<SendRow> = sqlx::query_as(
         "SELECT manifest_hash, credential_id, assertion_hash, expires_at, completed_at
          FROM send_manifests WHERE nonce = ?",
     )

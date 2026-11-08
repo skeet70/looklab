@@ -164,7 +164,7 @@ pub fn prefill_settings_parsed(
         unavailable: problems.iter().map(ToString::to_string).collect(),
         unmapped: required
             .into_iter()
-            .filter(|key| settings.get(*key).is_none())
+            .filter(|key| settings.get(key).is_none())
             .map(ToString::to_string)
             .collect(),
         monochrome,

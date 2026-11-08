@@ -54,9 +54,9 @@ pub async fn run(
 /// Removes expired upload reservations and files no other record names.
 async fn sweep_staged(db_pool: &SqlitePool, config: &WorkerConfig, now: i64) -> Result<()> {
     let mut tx = db_pool.begin_with("BEGIN IMMEDIATE").await?;
-    for hash in db::expired_staging_hashes(&mut *tx, now).await? {
-        db::delete_expired_staging(&mut *tx, &hash, now).await?;
-        if !db::blob_referenced(&mut *tx, &hash).await? {
+    for hash in db::expired_staging_hashes(&mut tx, now).await? {
+        db::delete_expired_staging(&mut tx, &hash, now).await?;
+        if !db::blob_referenced(&mut tx, &hash).await? {
             db::remove_blob_file(&config.blobs, &hash)?;
         }
     }

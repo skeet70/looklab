@@ -380,11 +380,11 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         &state,
         match resolved.existing.clone() {
             Some(id) => CredentialCompletion::Existing(id),
-            None => CredentialCompletion::Pending(
+            None => CredentialCompletion::Pending(Box::new(
                 promotion
                     .take()
                     .ok_or_else(|| ApiError::new(ErrorCode::Internal))?,
-            ),
+            )),
         },
         NewContribution {
             id: contribution_id.clone(),
@@ -448,7 +448,7 @@ struct ResolvedCredential {
 
 enum CredentialCompletion {
     Existing(CredentialId),
-    Pending(PendingPromotion),
+    Pending(Box<PendingPromotion>),
 }
 
 fn check_send_binding(

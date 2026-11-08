@@ -76,7 +76,7 @@ fn prefill_for<'a>(
     prefill_settings_parsed(schema, &[raw, render]).expect("prefill")
 }
 
-fn control<'a>(prefill: &'a looklab_wasm::SettingsPrefill, key: &str) -> Option<i64> {
+fn control(prefill: &looklab_wasm::SettingsPrefill, key: &str) -> Option<i64> {
     prefill
         .controls
         .iter()

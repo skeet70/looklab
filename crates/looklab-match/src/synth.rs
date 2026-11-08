@@ -86,9 +86,22 @@ pub fn body_for_sim(seed: u64, sim: &SimKey) -> Result<SyntheticBody> {
     let mut crm = ControlResponseModel::zeroed(&schema, 1, sim, 1)
         .map_err(|error| MatchError::Schema(error.to_string()))?;
     let mut settings = plan.default.clone();
+    let family = schema
+        .epochs
+        .iter()
+        .find(|epoch| epoch.id == 1)
+        .and_then(|epoch| epoch.native_sim(sim))
+        .map(|native| native.look.clone());
+    let applies = |key: &looklab_schema::ControlKey| match &family {
+        Some(family) => plan
+            .by_key
+            .get(key)
+            .is_some_and(|index| plan.controls[*index].scope.includes(family)),
+        None => true,
+    };
 
     for control in &mut crm.controls {
-        if !plan.by_key.contains_key(&control.key) || control.values.is_empty() {
+        if !applies(&control.key) || control.values.is_empty() {
             continue;
         }
         let pick = 1 + (rng.next_u32() as usize % control.values.len());
@@ -125,7 +138,7 @@ pub fn body_for_sim(seed: u64, sim: &SimKey) -> Result<SyntheticBody> {
     }
 
     for control in &mut crm.wb.controls {
-        if !plan.by_key.contains_key(&control.key) {
+        if !applies(&control.key) {
             continue;
         }
         if control.values.is_empty() {

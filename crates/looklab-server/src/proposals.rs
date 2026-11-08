@@ -737,7 +737,7 @@ async fn publish_prepared(
         .bind(proposal.as_str())
         .execute(&mut *tx)
         .await?;
-    crate::store::request_publication(&mut *tx).await?;
+    crate::store::request_publication(&mut tx).await?;
     tx.commit().await?;
     Ok(())
 }

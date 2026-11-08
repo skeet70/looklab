@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#![allow(clippy::disallowed_methods)]
 //! Patch-table blob round trip, determinism and rejections.
 
 mod common;

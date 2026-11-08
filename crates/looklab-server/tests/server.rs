@@ -1434,7 +1434,8 @@ async fn a_monochrome_batch_is_stored_deferred_with_its_authorization() {
     assert_eq!(deadline - row.4, 180 * 86_400);
     assert_eq!(row.3, "pending");
 
-    let images: Vec<(String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+    type ImageRow = (String, Option<String>, Option<String>, Option<String>);
+    let images: Vec<ImageRow> = sqlx::query_as(
         "SELECT render_class, native_sim, family, mono_filter FROM contribution_images",
     )
     .fetch_all(&server.db)

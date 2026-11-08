@@ -111,6 +111,8 @@ impl JpegPlane {
     }
 }
 
+// The stored plane keeps its un-oriented size; the trait reports the displayed size.
+#[allow(clippy::misnamed_getters)]
 impl LinearPixels for JpegPlane {
     fn width(&self) -> u32 {
         self.oriented_width
@@ -219,7 +221,7 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<DecodedJpeg, PrepError> {
         .ok_or(PrepError::ImageTooLarge)?;
     let mut data = Vec::with_capacity(count);
     let mut code_values_near_clip = Vec::with_capacity(count);
-    for codes in plane.data.chunks_exact(3) {
+    for codes in plane.data.as_chunks::<3>().0 {
         code_values_near_clip.push(codes.iter().any(|&value| value >= 250 || value <= 2));
         data.push([
             plane.lut[usize::from(codes[0])],

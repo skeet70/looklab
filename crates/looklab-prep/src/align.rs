@@ -844,9 +844,9 @@ impl ProjectionStats {
                     continue;
                 }
                 let mut partial = 0.0;
-                for other in 0..4 {
+                for (other, weight) in beta.iter().enumerate() {
                     if other != channel {
-                        partial += self.gram[channel][other] * beta[other];
+                        partial += self.gram[channel][other] * weight;
                     }
                 }
                 let value = (self.rhs[channel] - partial) / denominator;

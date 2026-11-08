@@ -776,7 +776,7 @@ pub async fn endorse(
             .map_err(|_| AdminError::Corrupt)?;
     let mut conn = begin_write(db).await?;
     let result = async {
-        reject_deferred_evidence(&mut *conn, &evidence).await?;
+        reject_deferred_evidence(&mut conn, &evidence).await?;
         let state = trust_state(&mut conn).await?;
         let (applied, event) = state.apply_endorsement(
             actor,
@@ -995,7 +995,7 @@ pub async fn admit_root(
         if actor_record.tier != TrustTier::Seeder {
             return Err(AdminError::NotAuthorized);
         }
-        let row: Option<(
+        type ClassificationRow = (
             String,
             String,
             String,
@@ -1003,7 +1003,8 @@ pub async fn admit_root(
             Option<String>,
             String,
             String,
-        )> = sqlx::query_as(
+        );
+        let row: Option<ClassificationRow> = sqlx::query_as(
             "SELECT credential_id, kind, status, body_id, target_look_id, intent, render_class
                  FROM contributions WHERE id = ?",
         )
@@ -1602,8 +1603,8 @@ pub async fn revert(
         let now = now_unix();
         let version = next_version(&mut conn, look).await?;
         let target_artifacts = artifacts;
-        let latest_release = latest_release_value(&mut *conn, blob_dir, look).await?;
-        let anchor = current_anchor(&mut *conn, look)
+        let latest_release = latest_release_value(&mut conn, blob_dir, look).await?;
+        let anchor = current_anchor(&mut conn, look)
             .await?
             .or_else(|| {
                 latest_release
@@ -1659,7 +1660,7 @@ pub async fn revert(
             "version": version.get(),
             "manifest_sha256": new_manifest_sha256,
         });
-        audit::insert(&mut *conn, AuditKind::ReleaseManifest, &manifest_payload).await?;
+        audit::insert(&mut conn, AuditKind::ReleaseManifest, &manifest_payload).await?;
         sqlx::query(
             "INSERT INTO version_depends_on_root (look_version_id, root_admission_id)
              SELECT ?, root_admission_id FROM version_depends_on_root
@@ -1725,8 +1726,8 @@ pub async fn revert(
             .await?;
         }
 
-        let lut_dependents = mark_lut_dependents_conn(&mut *conn, now).await?;
-        enqueue_lut_rebase(&mut *conn, now).await?;
+        let lut_dependents = mark_lut_dependents_conn(&mut conn, now).await?;
+        enqueue_lut_rebase(&mut conn, now).await?;
 
         let target_contributors: Vec<(String,)> = sqlx::query_as(
             "SELECT credential_id FROM release_reputation_applied
@@ -1776,8 +1777,8 @@ pub async fn revert(
         .execute(&mut *conn)
         .await?;
 
-        crate::store::request_publication(&mut *conn).await?;
-        let refit_queued = enqueue_revert_refit(&mut *conn, now).await?;
+        crate::store::request_publication(&mut conn).await?;
+        let refit_queued = enqueue_revert_refit(&mut conn, now).await?;
 
         Ok(RevertRecord {
             look: look.clone(),

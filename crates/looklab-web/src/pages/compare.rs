@@ -38,17 +38,12 @@ enum CompareOutcome {
 }
 
 /// One identifier from the query: absent, parsed, or present but not valid.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum QueryValue<T> {
+    #[default]
     Absent,
     Named(T),
     Invalid,
-}
-
-impl<T> Default for QueryValue<T> {
-    fn default() -> Self {
-        Self::Absent
-    }
 }
 
 /// The query, with identifiers parsed into the domain types that validate them.
@@ -362,7 +357,7 @@ fn other_version(look: CatalogLook<'_>, taken: &LookVersion) -> Result<LookVersi
         .iter()
         .map(|summary| summary.version.clone())
         .filter(|version| version != taken)
-        .max_by(|left, right| looklab_publish::compare_versions(left, right))
+        .max_by(looklab_publish::compare_versions)
         .ok_or_else(|| Unavailable::NoSecondVersion {
             slug: look.summary.slug.clone(),
             name: look.summary.name.clone(),

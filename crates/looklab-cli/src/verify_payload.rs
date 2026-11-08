@@ -633,6 +633,7 @@ struct BatchFields {
     settings_sources: Vec<BatchSetting>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_batch(
     images: &[&ReproducedImage],
     bodies: &Bodies,
@@ -702,6 +703,7 @@ fn derive_batch(
     Some(fields)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_one(
     metadata: &ManifestMetadata,
     records: &BTreeMap<String, BodyRecord>,
@@ -806,7 +808,7 @@ fn derive_one(
     if deferred {
         required.extend(reach.spatial.iter());
     }
-    required.sort_by(|left, right| left.cmp(right));
+    required.sort();
     required.dedup();
     if !card || deferred {
         for missing in required {

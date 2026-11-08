@@ -2327,8 +2327,8 @@ mod tests {
                         evaluated.prediction,
                     )
                 };
-                let (forward, gradient_plus, prediction_plus) = evaluate(&plus);
-                let (backward, gradient_minus, prediction_minus) = evaluate(&minus);
+                let (forward, _gradient_plus, _prediction_plus) = evaluate(&plus);
+                let (backward, _gradient_minus, _prediction_minus) = evaluate(&minus);
                 let mut analytic = vec![[0.0_f64; 3]; layout.total];
                 for (index, (column, _)) in jac.cols.iter().zip(jac.derivs.iter()).enumerate() {
                     for channel in 0..3 {
@@ -2350,8 +2350,8 @@ mod tests {
                         );
                         println!(
                             "   T[1,0] {:?} T[1,4] {:?} grad1 {:?}",
-                            order.prediction[0][1 * 9],
-                            order.prediction[0][1 * 9 + 4],
+                            order.prediction[0][9],
+                            order.prediction[0][9 + 4],
                             order.gradient[1]
                         );
                     }

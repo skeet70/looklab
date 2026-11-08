@@ -337,9 +337,9 @@ async fn spa_navigation(
         && path.starts_with("/status/")
         && !path.ends_with(".rss")
         && accepts_html(request.headers())
-        && assets.dist.is_some()
+        && let Some(dist) = assets.dist.as_ref()
     {
-        return index_html(assets.dist.as_ref().expect("checked above")).await;
+        return index_html(dist).await;
     }
     next.run(request).await
 }

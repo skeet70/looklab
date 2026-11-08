@@ -1480,13 +1480,14 @@ mod tests {
             (stored.pre_clip[0] - identity_probe.pre_clip[0]).abs() > 1e-3,
             "a nonzero reference gauge must move the probe input"
         );
-        for channel in 0..3 {
+        for (channel, (value, expected)) in stored.pre_clip.iter().zip(expected.iter()).enumerate()
+        {
             assert!(
-                (stored.pre_clip[channel] - expected[channel]).abs() < 1e-9,
+                (value - expected).abs() < 1e-9,
                 "{} channel {channel}: {} vs {}",
                 probe.id.as_str(),
-                stored.pre_clip[channel],
-                expected[channel]
+                value,
+                expected
             );
         }
 

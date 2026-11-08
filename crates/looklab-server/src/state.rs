@@ -137,7 +137,7 @@ fn begin_promotion(
             if serde_json::to_string(&**stored).ok().as_deref() != Some(original.as_str()) {
                 return Err(PromotionError::Stale);
             }
-            *stored = Box::new(verified.clone());
+            **stored = verified.clone();
             entry.promoting = true;
             return Ok(PendingPromotion {
                 pending: Arc::clone(pending),
@@ -182,9 +182,11 @@ fn cancel_promotion(
     }
 }
 
+type BatchKey = ([u8; 32], [u8; 32]);
+
 #[derive(Debug, Default)]
 pub struct BatchAdmission {
-    entries: Mutex<HashMap<([u8; 32], [u8; 32]), BatchEntry>>,
+    entries: Mutex<HashMap<BatchKey, BatchEntry>>,
 }
 
 #[derive(Debug)]

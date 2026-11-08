@@ -888,7 +888,7 @@ pub async fn release_image_blob_once(
                 .bind(hash.as_slice())
                 .execute(&mut *tx)
                 .await?;
-            if !blob_referenced(&mut *tx, hash).await? {
+            if !blob_referenced(&mut tx, hash).await? {
                 remove_blob_file(blobs, hash)?;
             }
         }
