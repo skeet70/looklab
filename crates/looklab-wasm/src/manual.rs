@@ -180,35 +180,20 @@ struct ModerationEvidenceRequest<'a> {
 }
 
 /// Builds the payload a moderator signs for one documented control.
-///
-/// # Errors
-/// A malformed URL.
 pub fn build_manual_moderation(
     camera: BodyId,
     key: CapabilityKey,
     definition_digest: Sha256Hex,
     confirmed: bool,
-    firmware_scope: ModeratorFirmwareScope,
-    kind: ModeratorEvidenceKind,
-    url: Option<&str>,
-    description: &str,
-) -> Result<ManualModerationEnvelope, FacadeError> {
-    let url = url
-        .map(ManualUrl::new)
-        .transpose()
-        .map_err(|error| FacadeError::Input(error.to_string()))?;
-    Ok(ManualModerationEnvelope {
+    evidence: ModeratorEvidence,
+) -> ManualModerationEnvelope {
+    ManualModerationEnvelope {
         moderation: looklab_upload::ManualModeration {
             camera,
             key,
             definition_digest,
             confirmed,
-            evidence: ModeratorEvidence {
-                kind,
-                url,
-                description: description.to_owned(),
-                firmware_scope,
-            },
+            evidence,
         },
-    })
+    }
 }

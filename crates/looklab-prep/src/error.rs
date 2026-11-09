@@ -7,6 +7,8 @@ pub enum PrepError {
     DecodeJpeg(String),
     #[error("JPEG structure is invalid: {0}")]
     JpegStructure(&'static str),
+    #[error("JPEG colour profile is neither sRGB nor Adobe RGB")]
+    UnsupportedColorProfile,
     #[error("image has no pixels")]
     ImageEmpty,
     #[error("image dimensions overflow")]

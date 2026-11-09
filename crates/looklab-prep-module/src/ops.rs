@@ -225,7 +225,10 @@ pub(crate) fn encode_envelope(
         });
     }
     send_manifest
-        .validate(DEFAULT_MAX_BATCHES, looklab_upload::DEFAULT_MAX_ATTESTATIONS)
+        .validate(
+            DEFAULT_MAX_BATCHES,
+            looklab_upload::DEFAULT_MAX_ATTESTATIONS,
+        )
         .map_err(|error| ModuleError::SendManifest {
             message: error.to_string(),
         })?;

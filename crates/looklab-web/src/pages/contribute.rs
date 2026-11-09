@@ -33,8 +33,8 @@ use super::bounties::{Impact, WantedCards};
 use super::manual_confirm::ManualConfirmationPanel;
 use crate::data;
 use crate::files::{
-    ContributionDraftStore, DraftFile, LocalFile, download, draft_file_entries, read_draft_file,
-    scan_metadata, selected_files,
+    ConsentGuard, ContributionDraftStore, DraftFile, LocalFile, download, draft_file_entries,
+    read_draft_file, scan_metadata, selected_files,
 };
 use crate::ui::{Dialog, Disclosure, DropZone, StepIndex, Stepper, WizardStep};
 use crate::worker::{PrepWorker, default_worker_count, max_worker_count};
@@ -149,6 +149,33 @@ fn active_bodies(set: &BatchSet) -> BTreeSet<String> {
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MonochromeConsent {
+    None,
+    Partial,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MonochromeTally {
+    total: usize,
+    included: usize,
+}
+
+impl MonochromeTally {
+    fn excluded(self) -> usize {
+        self.total - self.included
+    }
+
+    fn consent(self) -> MonochromeConsent {
+        match self.included {
+            0 => MonochromeConsent::None,
+            included if included == self.total => MonochromeConsent::All,
+            _ => MonochromeConsent::Partial,
+        }
+    }
+}
+
 impl BatchSet {
     fn from_groups(groups: Vec<ContributionGroup>) -> Self {
         let next = groups.iter().map(|group| group.id.0).max().unwrap_or(0);
@@ -245,6 +272,30 @@ impl BatchSet {
             group.monochrome.clear();
             group.notes.clear();
         });
+    }
+
+    fn monochrome_tally(&self) -> MonochromeTally {
+        self.groups
+            .iter()
+            .filter(|group| group.is_monochrome())
+            .fold(MonochromeTally::default(), |tally, group| {
+                let renders = group.monochrome_renders();
+                MonochromeTally {
+                    total: tally.total + renders,
+                    included: tally.included
+                        + if group.fields.monochrome_opt_in {
+                            renders
+                        } else {
+                            0
+                        },
+                }
+            })
+    }
+
+    fn set_monochrome_consent(&mut self, selected: bool) {
+        for group in &mut self.groups {
+            group.fields.monochrome_opt_in = selected && group.is_monochrome();
+        }
     }
 
     /// Ends the upload so the next drop starts over, with serial sending off.
@@ -715,8 +766,10 @@ impl HelpWay {
                 steps: &[
                     "Use a ColorChecker Classic 24, SG 140 or Passport chart.",
                     "Light the chart evenly without glare. Keep it still and fill 30 to 60% of the frame.",
-                    "Shoot RAW+JPEG at the lowest native ISO. Turn off lens corrections where possible.",
-                    "Take 3 shots at 0, −1 and −2 EV exposure compensation. Keep the original RAW+JPEG pairs.",
+                    "Shoot RAW+JPEG Fine at the lowest native ISO. Turn off lens corrections where possible.",
+                    "Use one built-in look for all 3 shots, such as Provia / Standard on Fujifilm, and set white balance to the light.",
+                    "Take 3 shots total: 0, −1 and −2 EV exposure compensation. Keep all 3 original RAW+JPEG pairs. You do not need to repeat the bracket for each look.",
+                    "Want to contribute more? Re-render just the 0 EV RAW in camera using other built-in looks, keeping the other settings unchanged. Add those JPEGs with the original files. No re-renders of the −1 and −2 EV RAWs are needed.",
                 ],
                 action: "Add the chart shots",
             },
@@ -1045,8 +1098,10 @@ pub fn ContributePage() -> impl IntoView {
     let draft_loaded = RwSignal::new(false);
     let draft_complete = RwSignal::new(false);
     let draft_unavailable = RwSignal::new(false);
+    let consent_guard_warning = RwSignal::new(None::<&'static str>);
     let draft_files = RwSignal::new(Vec::<DraftFile>::new());
     let draft_store = StoredValue::new_local(ContributionDraftStore::new());
+    let guard_consent = move || draft_store.with_value(ContributionDraftStore::guard_consent);
     let replace_batches = move |readings: Vec<PairReading>| {
         let set = BatchSet::from_readings(&readings);
         let first = set.groups().first().map(|group| group.id);
@@ -1057,6 +1112,9 @@ pub fn ContributePage() -> impl IntoView {
     };
     on_cleanup(move || draft_store.with_value(ContributionDraftStore::flush));
     spawn_local(async move {
+        let status = draft_store.with_value(ContributionDraftStore::guard_status);
+        let guard = ConsentGuard::of(&status);
+        let deny_monochrome = matches!(guard, ConsentGuard::Pending | ConsentGuard::Unavailable);
         let _ = idb::remove(idb::StorageKey::DRAFT).await;
         let stored = wasm_bindgen_futures::JsFuture::from(
             draft_store.with_value(ContributionDraftStore::settings),
@@ -1094,7 +1152,7 @@ pub fn ContributePage() -> impl IntoView {
             if let Ok(pairing) = pairing
                 && !pairing.groups.is_empty()
             {
-                let set = if draft.batches.is_empty()
+                let mut set = if draft.batches.is_empty()
                     || draft.batches.iter().any(|group| group.renders.is_empty())
                 {
                     let Some(epoch) = prefill_ledger.try_update_value(PrefillLedger::reset) else {
@@ -1107,6 +1165,15 @@ pub fn ContributePage() -> impl IntoView {
                 } else {
                     BatchSet::from_groups(draft.batches)
                 };
+                if deny_monochrome {
+                    set.set_monochrome_consent(false);
+                }
+                let drop_prepared = deny_monochrome && set.monochrome_tally().total > 0;
+                if matches!(guard, ConsentGuard::Unavailable) && drop_prepared {
+                    consent_guard_warning.set(Some(
+                        "This browser can't check your saved B&W choice, so B&W renders are left out. Select them again to include them.",
+                    ));
+                }
                 let routing = set.clone();
                 let first = set.groups().first().map(|group| group.id);
                 camera_check_generation.update(|generation| *generation += 1);
@@ -1117,13 +1184,17 @@ pub fn ContributePage() -> impl IntoView {
                 parsed_metadata.set_value(parsed);
                 draft_files.set(draft.files);
                 plan.set(Some(pairing));
-                let prepared = wasm_bindgen_futures::JsFuture::from(
-                    draft_store.with_value(ContributionDraftStore::samples),
-                )
-                .await
-                .ok()
-                .and_then(|value| value.as_string())
-                .and_then(|text| serde_json::from_str::<PreparedDraft>(&text).ok());
+                let prepared = if drop_prepared {
+                    None
+                } else {
+                    wasm_bindgen_futures::JsFuture::from(
+                        draft_store.with_value(ContributionDraftStore::samples),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|value| value.as_string())
+                    .and_then(|text| serde_json::from_str::<PreparedDraft>(&text).ok())
+                };
                 let PreparedDraft {
                     groups,
                     seeds: restored_seeds,
@@ -1143,6 +1214,10 @@ pub fn ContributePage() -> impl IntoView {
                                 .iter()
                                 .any(|render| routing.batch_of(render) != Some(batch))
                         {
+                            return None;
+                        }
+                        let batch_group = routing.get(batch)?;
+                        if batch_group.is_monochrome() && !batch_group.fields.monochrome_opt_in {
                             return None;
                         }
                         Some(ProcessedGroup {
@@ -1715,9 +1790,9 @@ pub fn ContributePage() -> impl IntoView {
                 vec![
                     Some(format!("{pairs} {}", if pairs == 1 { "pair" } else { "pairs" })),
                     Some(format!("{pairs} {}", if pairs == 1 { "group" } else { "groups" })),
-                    coverage.with(|map| map.as_ref().map(|map| format!("{} {} processed", map.images, if map.images == 1 { "photo" } else { "photos" }))),
-                    (samples > 0).then(|| format!("{samples} color samples")),
-                    sent_summary.get().map(|sent| format!("{} {}", sent.renders, if sent.renders == 1 { "photo" } else { "photos" })),
+                    coverage.with(|map| map.as_ref().map(|map| format!("{} {} processed", map.images, if map.images == 1 { "render" } else { "renders" }))),
+                    (samples > 0).then(|| format!("{samples} samples")),
+                    sent_summary.get().map(|sent| format!("{} {}", sent.renders, if sent.renders == 1 { "render" } else { "renders" })),
                     None,
                 ]
             })
@@ -1729,6 +1804,7 @@ pub fn ContributePage() -> impl IntoView {
         {move || draft_unavailable.get().then(|| view! {
             <p class="notice">"This browser couldn't keep a local draft, so these photos won't be restored after a reload. Processing and sending still work."</p>
         })}
+        {move || consent_guard_warning.get().map(|text| view! { <p class="notice" role="status">{text}</p> })}
 
         <section class="step" hidden=move || stage.get() != Stage::Drop>
             <h2>"Drop files or a folder"</h2>
@@ -1747,7 +1823,45 @@ pub fn ContributePage() -> impl IntoView {
             {move || plan.get().map(|pairing| view! {
                 <Pairing plan=pairing batches=batches catalog=catalog/>
             })}
-            <p>"Each group of photos that share a camera, built-in look and settings is sent as one batch. Check every batch below. If a batch uses a recipe to match another look, choose that option and name the target."</p>
+            <p>"Photos with matching camera model, firmware, built-in look and readable rendering settings form a batch. All batches are sent together as one contribution. Select a batch to check its settings. If it uses a recipe to match another look, choose that option and name the target."</p>
+            <Show when=move || batches.with(|set| set.monochrome_tally().total > 0)>
+                    <div class="monochrome-consent">
+                        <p class="warn" role="status">{move || {
+                            let tally = batches.with(BatchSet::monochrome_tally);
+                            format!(
+                                "This selection has {} B&W {}: {} included for monochrome model development, {} left out.",
+                                tally.total,
+                                if tally.total == 1 { "render" } else { "renders" },
+                                tally.included,
+                                tally.excluded(),
+                            )
+                        }}</p>
+                        <label>
+                            <input type="checkbox"
+                                prop:checked=move || batches.with(BatchSet::monochrome_tally).consent() == MonochromeConsent::All
+                                prop:indeterminate=move || batches.with(BatchSet::monochrome_tally).consent() == MonochromeConsent::Partial
+                                on:change=move |event| {
+                                    let selected = event_target_checked(&event);
+                                    if !selected && !guard_consent() {
+                                        consent_guard_warning.set(Some(
+                                            "This browser couldn't save your B&W choice. Reloading may not keep it.",
+                                        ));
+                                    }
+                                    batches.update(|set| set.set_monochrome_consent(selected));
+                                    invalidate_preparation.run(());
+                                }/>
+                            " Contribute all B&W renders in this selection for monochrome model development"
+                        </label>
+                        {move || (batches.with(BatchSet::monochrome_tally).consent() == MonochromeConsent::Partial).then(|| view! {
+                            <p class="muted">
+                                "This draft was saved with only some B&W renders selected, so the box shows a partial state. Nothing changes until you click it."
+                            </p>
+                        })}
+                        <p class="muted">
+                            "Applies to every B&W batch in this selection; colour photos are unaffected. looklab keeps included B&W renders for up to 180 days to develop and validate monochrome response, toning and uncertainty. It deletes them after that unless they enter monochrome analysis. You can withdraw them at any time. No published Look is promised, and they never affect colour fits."
+                        </p>
+                    </div>
+            </Show>
             <h3>"Batches"</h3>
             <ul class="batch-list">
                 {move || {
@@ -1758,7 +1872,8 @@ pub fn ContributePage() -> impl IntoView {
                         let title = move || {
                             batches.with(|set| {
                                 set.get(id).map_or_else(String::new, |group| {
-                                    format!("Batch {}: {} photos, {}", id.0, group.raws.len(), if group.fields.sim.is_empty() { "no look set".to_owned() } else { title_case_words(&group.fields.sim) })
+                                    let photos = group.raws.len();
+                                    format!("Batch {}: {photos} {}, {}", id.0, if photos == 1 { "photo" } else { "photos" }, if group.fields.sim.is_empty() { "no look set".to_owned() } else { title_case_words(&group.fields.sim) })
                                 })
                             })
                         };
@@ -1803,8 +1918,27 @@ pub fn ContributePage() -> impl IntoView {
                     }
                     ids
                 });
+                let heading = move || {
+                    batches.with(|set| {
+                        set.get(id).map_or_else(String::new, |group| {
+                            let look = if group.fields.sim.is_empty() {
+                                "no look set".to_owned()
+                            } else {
+                                title_case_words(&group.fields.sim)
+                            };
+                            let renders = group.renders.len();
+                            format!("Batch {}: {look}, {renders} {}", id.0, if renders == 1 { "render" } else { "renders" })
+                        })
+                    })
+                };
                 view! {
-                    <BatchEditor id=id first=first batches=batches firmware_ids=firmware_ids on_preparation_change=invalidate_preparation on_camera_change=revalidate_camera/>
+                    <div class="batch-detail">
+                        <h3>{heading}</h3>
+                        <p class="muted">
+                            "Settings entered here apply to every render in this batch, not to other batches. Only enter a missing value if it was used for all of them."
+                        </p>
+                        <BatchEditor id=id first=first batches=batches firmware_ids=firmware_ids on_camera_change=revalidate_camera/>
+                    </div>
                 }.into_any()
             }}
             {move || {
@@ -1839,14 +1973,29 @@ pub fn ContributePage() -> impl IntoView {
                     <progress aria-label="Processing photos" value=done.to_string() max=total.to_string()></progress>
                 }
             }}
-            <p>"Extracting color samples locally. Your photos stay on this device."</p>
+            <p>"Extracting samples locally. Your photos stay on this device."</p>
             {move || coverage.get().map(|map| view! { <CoverageMapView map/> })}
         </section>
         <section class="step" hidden=move || stage.get() != Stage::Inspector>
             <h2>"Review what's sent"</h2>
-            {move || coverage.get().map(|map| view! {
-                <p class="payload-summary">{format!("{} color samples from {} {}, {:.0} KB. No pixels, no location.", points.with(Vec::len), map.images, if map.images == 1 { "photo" } else { "photos" }, processed.with(|groups| groups.iter().flat_map(|group| &group.images).map(|image| image.blob_len).sum::<usize>()) as f64 / 1024.0)}</p>
-            })}
+            {move || {
+                let groups = processed.get();
+                (!groups.is_empty()).then(|| {
+                    let counts = prepared_render_counts(&groups, &batches.get());
+                    let bytes: usize = groups.iter().flat_map(|group| &group.images).map(|image| image.blob_len).sum();
+                    view! {
+                        <p class="payload-summary">{format!(
+                            "{} samples from {}, {:.0} KB. No pixels, no location.",
+                            points.with(Vec::len),
+                            counts.describe(),
+                            bytes as f64 / 1024.0,
+                        )}</p>
+                        {(counts.monochrome > 0).then(|| view! {
+                            <p class="muted">"Included B&W renders are for monochrome model development for up to 180 days, not colour fitting."</p>
+                        })}
+                    }
+                })
+            }}
             {move || coverage.get().map(|map| view! { <CoverageMapView map/> })}
             {move || {
                 let rows = failures.get();
@@ -1862,7 +2011,7 @@ pub fn ContributePage() -> impl IntoView {
             <p>
                 "Samples cannot be turned back into a photo, but someone who has the original could match them. No account or IP address is stored."
             </p>
-            <p>"The views below show color samples without their positions in your photo."</p>
+            <p>"The views below show samples without their positions in your photo."</p>
             <div class="inspector-canvases">
                 <ColourCloud points=points/>
                 <SamplesImage points=points/>
@@ -1963,8 +2112,7 @@ pub fn ContributePage() -> impl IntoView {
                     return ().into_any();
                 }
                 view! {
-                    <section class="manual-confirmation" aria-labelledby="camera-confirmation">
-                        <h3 id="camera-confirmation">"Confirm your camera settings (optional)"</h3>
+                    <Disclosure summary="Confirm your camera settings (optional)".to_owned()>
                         <p class="muted">
                             "Documented settings are not confirmed by camera owners yet. Check only the options you can see on your camera. Unchecked options are not counted. This uses the same passkey approval as your photos."
                         </p>
@@ -2003,7 +2151,7 @@ pub fn ContributePage() -> impl IntoView {
                                 />
                             }
                         }).collect_view()}
-                    </section>
+                    </Disclosure>
                 }.into_any()
             }}
             {move || manual_error.get().map(|error| view! {
@@ -2134,7 +2282,6 @@ impl TextField {
 enum FlagField {
     Recipe,
     Card,
-    MonochromeOptIn,
 }
 
 impl FlagField {
@@ -2142,7 +2289,6 @@ impl FlagField {
         match self {
             Self::Recipe => fields.recipe,
             Self::Card => fields.card,
-            Self::MonochromeOptIn => fields.monochrome_opt_in,
         }
     }
 
@@ -2150,7 +2296,6 @@ impl FlagField {
         match self {
             Self::Recipe => &mut fields.recipe,
             Self::Card => &mut fields.card,
-            Self::MonochromeOptIn => &mut fields.monochrome_opt_in,
         }
     }
 }
@@ -2161,7 +2306,6 @@ fn BatchEditor(
     first: bool,
     batches: RwSignal<BatchSet>,
     firmware_ids: Vec<String>,
-    on_preparation_change: Callback<()>,
     on_camera_change: Callback<(BatchId, String)>,
 ) -> impl IntoView {
     let suffix = if first {
@@ -2215,24 +2359,62 @@ fn BatchEditor(
     let write_controls = write(TextField::Controls);
     let recipe = flag(FlagField::Recipe);
     let card = flag(FlagField::Card);
-    let monochrome_opt_in = flag(FlagField::MonochromeOptIn);
     let write_recipe = write_flag(FlagField::Recipe);
     let write_card = write_flag(FlagField::Card);
-    let write_monochrome_opt_in = write_flag(FlagField::MonochromeOptIn);
     let malformed = move || batches.with(|set| set.get(id).is_some_and(|group| group.malformed));
-    let menu = menu_settings(&snapshot.fields.controls);
+    // Control keys, not steps.
+    let menu = Memo::new(move |_| {
+        batches.with(|set| {
+            set.get(id).map_or_else(Vec::new, |group| {
+                menu_settings(&group.fields.controls)
+                    .into_iter()
+                    .map(|setting| setting.key)
+                    .filter(|key| {
+                        !group
+                            .unmapped
+                            .iter()
+                            .any(|raw| raw.as_str() == key.as_str())
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+    });
     let raws = snapshot.raws.join(", ");
-    let blocked = snapshot.blocked.clone();
-    let unavailable = snapshot.unavailable.clone();
-    let unmapped = snapshot.unmapped.clone();
-    let notes = snapshot.notes.clone();
+    let family =
+        Memo::new(move |_| batches.with(|set| set.get(id).and_then(|group| group.family.clone())));
+    let mono_filter =
+        Memo::new(move |_| batches.with(|set| set.get(id).and_then(|group| group.mono_filter)));
+    let blocked =
+        Memo::new(move |_| batches.with(|set| set.get(id).and_then(|group| group.blocked.clone())));
+    let camera_ready =
+        move || batches.with(|set| set.get(id).is_some_and(|group| group.camera_ready));
+    let unavailable = Memo::new(move |_| {
+        batches.with(|set| {
+            set.get(id)
+                .map(|group| group.unavailable.clone())
+                .unwrap_or_default()
+        })
+    });
+    let unmapped = Memo::new(move |_| {
+        batches.with(|set| {
+            set.get(id)
+                .map(|group| group.unmapped.clone())
+                .unwrap_or_default()
+        })
+    });
+    let notes = Memo::new(move |_| {
+        batches.with(|set| {
+            set.get(id)
+                .map(|group| group.notes.clone())
+                .unwrap_or_default()
+        })
+    });
     let renders = snapshot
         .renders
         .iter()
         .map(RenderFile::as_str)
         .collect::<Vec<_>>()
         .join(", ");
-    let monochrome = snapshot.monochrome.clone();
     let body_id = format!("body-id{suffix}");
     let firmware_id = format!("firmware{suffix}");
     let sim_id = format!("sim{suffix}");
@@ -2246,24 +2428,6 @@ fn BatchEditor(
         <div class="batch-editor">
             <p class="muted">{raws}</p>
             <p class="muted">{renders}</p>
-            {(!monochrome.is_empty()).then(|| view! {
-                <div class="monochrome-opt-in">
-                    <p class="warn" role="status">
-                        "These are B&W renders. They are left out unless you select monochrome model development below."
-                    </p>
-                    <label>
-                        <input type="checkbox" prop:checked=monochrome_opt_in
-                            on:change=move |event| {
-                                write_monochrome_opt_in(event_target_checked(&event));
-                                on_preparation_change.run(());
-                            }/>
-                        " Contribute these B&W renders for monochrome model development"
-                    </label>
-                    <p class="muted">
-                        "looklab keeps them for up to 180 days to develop and validate monochrome response, toning and uncertainty. It deletes them after that unless they enter monochrome analysis. You can withdraw them at any time. No published Look is promised, and they never affect colour fits."
-                    </p>
-                </div>
-            })}
             <label for=body_id.clone()>"Camera"</label>
             <input id=body_id type="text" prop:value=body
                 on:input=move |event| write_body(event_target_value(&event))
@@ -2274,10 +2438,10 @@ fn BatchEditor(
             <label for=sim_id.clone()>"Film simulation"</label>
             <input id=sim_id type="text" prop:value=sim
                 on:input=move |event| write_sim(event_target_value(&event))/>
-            {snapshot.family.clone().map(|family| view! {
+            {move || family.get().map(|family| view! {
                 <p class="muted">{format!("Normalized family: {family}")}</p>
             })}
-            {snapshot.mono_filter.map(|filter| view! {
+            {move || mono_filter.get().map(|filter| view! {
                 <p class="muted">{format!("Normalized monochrome filter: {filter:?}")}</p>
             })}
             <label>
@@ -2315,8 +2479,7 @@ fn BatchEditor(
                 </p>
             })}
             <h3>"Camera settings"</h3>
-            {menu.into_iter().map(|setting| {
-                let key = setting.key;
+            {move || menu.get().into_iter().map(|key| {
                 let read_key = key.clone();
                 let label = key.as_str().replace('_', " ");
                 let text = controls;
@@ -2335,12 +2498,14 @@ fn BatchEditor(
                     </label>
                 }
             }).collect_view()}
-            {(!unmapped.is_empty()).then(|| view! {
+            {move || {
+                let rows = unmapped.get();
+                (!rows.is_empty()).then(|| view! {
                 <p class="warn" role="alert">
                     "These settings were not readable from your files. Enter the values you used: a batch cannot be sent until each one has a value."
                 </p>
                 <div class="unmapped-controls">
-                    {unmapped.into_iter().filter_map(|raw| looklab_schema::ControlKey::new(&raw).ok()).map(|key| {
+                    {rows.into_iter().filter_map(|raw| looklab_schema::ControlKey::new(&raw).ok()).map(|key| {
                         let read_key = key.clone();
                         let label = key.as_str().replace('_', " ");
                         let text = controls;
@@ -2360,7 +2525,8 @@ fn BatchEditor(
                         }
                     }).collect_view()}
                 </div>
-            })}
+                })
+            }}
             <Disclosure summary="Setting sources".to_owned()>
                 <ul class="setting-sources">
                     {move || {
@@ -2388,27 +2554,33 @@ fn BatchEditor(
             <textarea id=controls_id rows="3" prop:value=controls
                 on:input=move |event| write_controls(event_target_value(&event))></textarea>
             </Disclosure>
-            {blocked.map(|reason| view! {
+            {move || blocked.get().map(|reason| view! {
                 <p class="warn" role="alert">{reason}</p>
             })}
-            {(!snapshot.camera_ready).then(|| view! {
+            <Show when=move || !camera_ready()>
                 <button type="button" on:click=move |_| {
                     let current = batches.with_untracked(|set| {
                         set.get(id).map(|group| group.fields.body.clone()).unwrap_or_default()
                     });
                     revalidate_body(current);
                 }>"Check camera again"</button>
-            })}
-            {(!unavailable.is_empty()).then(|| view! {
-                <p class="muted" role="status">
-                    "Please check these settings, which could not be read: " {unavailable.join("; ")}
-                </p>
-            })}
-            {(!notes.is_empty()).then(|| view! {
-                <ul class="muted">
-                    {notes.into_iter().map(|note| view! { <li>{note}</li> }).collect_view()}
-                </ul>
-            })}
+            </Show>
+            {move || {
+                let unavailable = unavailable.get();
+                (!unavailable.is_empty()).then(|| view! {
+                    <p class="muted" role="status">
+                        "Please check these settings, which could not be read: " {unavailable.join("; ")}
+                    </p>
+                })
+            }}
+            {move || {
+                let notes = notes.get();
+                (!notes.is_empty()).then(|| view! {
+                    <ul class="muted">
+                        {notes.into_iter().map(|note| view! { <li>{note}</li> }).collect_view()}
+                    </ul>
+                })
+            }}
         </div>
     }
 }
@@ -2603,7 +2775,7 @@ fn CoverageMapView(map: CoverageMap) -> impl IntoView {
     view! {
         <figure class="plot">
             <canvas node_ref=canvas role="img" aria-label="Coverage of processed samples"></canvas>
-            <figcaption>{format!("What your photos add: {} color samples from {} {}. Brighter areas contain more samples.", map.samples, map.images, if map.images == 1 { "photo" } else { "photos" })}</figcaption>
+            <figcaption>{format!("What your renders add: {} samples from {} {}. Brighter areas contain more samples.", map.samples, map.images, if map.images == 1 { "render" } else { "renders" })}</figcaption>
         </figure>
     }
 }
@@ -3694,6 +3866,54 @@ fn confirmations_to_send<T>(
         .collect::<Vec<_>>();
     entries.sort_by_key(|(id, _)| (!sending.contains(id), id.clone()));
     entries
+}
+
+/// Prepared renders by batch class, counting B&W only with its per-batch consent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PreparedRenderCounts {
+    colour: usize,
+    monochrome: usize,
+}
+
+impl PreparedRenderCounts {
+    fn describe(self) -> String {
+        let colour_unit = if self.colour == 1 {
+            "render"
+        } else {
+            "renders"
+        };
+        let monochrome_unit = if self.monochrome == 1 {
+            "render"
+        } else {
+            "renders"
+        };
+        match (self.colour, self.monochrome) {
+            (0, 0) => "0 renders".to_owned(),
+            (0, monochrome) => format!("{monochrome} B&W {monochrome_unit}"),
+            (colour, 0) => format!("{colour} colour {colour_unit}"),
+            (colour, monochrome) => {
+                format!("{colour} colour {colour_unit} and {monochrome} B&W {monochrome_unit}")
+            }
+        }
+    }
+}
+
+fn prepared_render_counts(
+    processed: &[ProcessedGroup],
+    batches: &BatchSet,
+) -> PreparedRenderCounts {
+    let mut counts = PreparedRenderCounts::default();
+    for group in processed {
+        let Some(batch) = batches.get(group.batch) else {
+            continue;
+        };
+        if !batch.is_monochrome() {
+            counts.colour += group.images.len();
+        } else if batch.fields.monochrome_opt_in {
+            counts.monochrome += group.images.len();
+        }
+    }
+    counts
 }
 
 fn sent_summary_of(pending: &[PendingBatch]) -> SentSummary {

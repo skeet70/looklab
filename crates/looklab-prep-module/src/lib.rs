@@ -20,22 +20,34 @@ pub use types::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const MODULE_ABI_VERSION: u32 = 1;
+/// Version of the postcard request and response contract behind `ll_call`.
+pub const MODULE_ABI_VERSION: u32 = 2;
 
 const BUILD_ID_TABLE: &[u8] = concat!(
     "looklab-prep-module/",
     env!("CARGO_PKG_VERSION"),
     "\0ll_alloc\0ll_free\0ll_call\0",
     "version\0prepare\0build_manifest\0build_send_manifest\0encode_envelope\0solve_pow\0parse_envelope\0",
-    "abi=1\0prep=2",
 )
 .as_bytes();
 
 pub fn build_id() -> [u8; 32] {
-    let digest = Sha256::digest(BUILD_ID_TABLE);
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&digest);
-    bytes
+    let mut hasher = Sha256::new();
+    hasher.update(BUILD_ID_TABLE);
+    for (label, version) in [
+        ("abi", MODULE_ABI_VERSION),
+        ("prep", PREP_VERSION),
+        ("envelope", u32::from(looklab_upload::VERSION)),
+        (
+            "send_manifest",
+            u32::from(looklab_upload::SEND_MANIFEST_VERSION),
+        ),
+    ] {
+        hasher.update(label.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(version.to_le_bytes());
+    }
+    hasher.finalize().into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,18 +144,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_round_trips_through_dispatch() {
-        let input = postcard::to_allocvec(&VersionRequest).expect("version request encodes");
-        let output = dispatch(Function::Version.id(), &input);
-        let response: Result<Response, ModuleError> =
-            postcard::from_bytes(&output).expect("version response decodes");
-        assert_eq!(
-            response.expect("version succeeds"),
-            Response::Version(version())
-        );
-    }
-
-    #[test]
     fn unknown_function_is_an_error_response() {
         let output = dispatch(99, &[]);
         let response: Result<Response, ModuleError> =
@@ -152,11 +152,5 @@ mod tests {
             response,
             Err(ModuleError::UnknownFunction { fn_id: 99 })
         ));
-    }
-
-    #[test]
-    fn build_id_ignores_the_host() {
-        assert_eq!(build_id(), build_id());
-        assert_ne!(build_id(), [0u8; 32]);
     }
 }

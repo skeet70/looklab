@@ -128,7 +128,11 @@ impl Rational {
         let den = (self.den as u128).checked_mul(other.den as u128)?;
         let divisor = gcd(num.unsigned_abs(), den);
         let magnitude = i64::try_from(num.unsigned_abs() / divisor).ok()?;
-        let num = if num.is_negative() { -magnitude } else { magnitude };
+        let num = if num.is_negative() {
+            -magnitude
+        } else {
+            magnitude
+        };
         Self::new(num, u64::try_from(den / divisor).ok()?).ok()
     }
 

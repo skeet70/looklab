@@ -421,8 +421,8 @@ pub async fn record(
         });
         audit::insert(&mut tx, AuditKind::ManualConfirmation, &payload).await?;
     }
-    let summary = summary_with(&mut *tx, camera).await?;
-    promotion_audit_with(&mut *tx, camera, &summary).await?;
+    let summary = summary_with(&mut tx, camera).await?;
+    promotion_audit_with(&mut tx, camera, &summary).await?;
     store::request_publication(&mut tx).await?;
     tx.commit().await?;
     Ok(())
@@ -476,8 +476,8 @@ pub async fn withdraw(
         });
         audit::insert(&mut tx, AuditKind::ManualConfirmationWithdrawal, &payload).await?;
     }
-    let summary = summary_with(&mut *tx, camera).await?;
-    promotion_audit_with(&mut *tx, camera, &summary).await?;
+    let summary = summary_with(&mut tx, camera).await?;
+    promotion_audit_with(&mut tx, camera, &summary).await?;
     store::request_publication(&mut tx).await?;
     tx.commit().await?;
     Ok(affected)

@@ -293,6 +293,8 @@ The model serializes as `crm.json`:
 
 Monochrome preparation keeps all three JPEG output channels, the declared output colour space, density weights, flags and shared re-render grouping. Mixed colour/Acros/Sepia groups reuse one RAW decode, input sample set and shuffle. Prep version 2 samples each JPEG through its own validated alignment at the shared RAW-selected points; version 1 reused the reference JPEG's mapping for every member. The sample container remains version 1. No source image or RAW hash is added to the payload.
 
+Prep version 3 rejects explicit JPEG ICC profiles that bounded profile-name identification cannot recognize as sRGB or Adobe RGB. Numbered ICC chunks must form one complete profile; its declared size, `acsp` signature and RGB header must agree, and every nonempty description must identify the same supported space. This is not general ICC validation or colour-space conversion. With no ICC profile, the existing EXIF and missing-profile policy applies. The preparation version and module identity change; historical payload verification requires the matching historical CLI and prep module.
+
 ### 2.2 Sample blob format (version 1)
 Little-endian. The body is zstd-compressed.
 
@@ -333,7 +335,7 @@ An upload is **one `application/octet-stream` body** in a single canonical encod
 
 ```
 magic            "LLUPLD"   6 bytes
-version          u16 = 3
+version          u16 = 4
 nonce            [u8; 32]                    // server-issued, one per send
 send_manifest    len:u32 + postcard(SendManifest)
 manifest         len:u32 + postcard(BatchManifest)
@@ -356,6 +358,8 @@ Envelope version 4 carries this send-manifest layout. Version 3 bytes are reject
 One nonce identifies one send instance. The WebAuthn challenge is `H(nonce ‖ send manifest hash)`, signed once for the whole send; every batch and confirmation request carries the same send manifest and assertion. Proof of work stays per photo batch, bound to `H(nonce ‖ batch manifest hash)` ([05 §9](05-trust-and-integrity.md)). A confirmation may reserve the send before its photo batches arrive. The server binds the first accepted request's credential, manifest and assertion, tracks both collections, and rejects mismatched, duplicate, completed, expired or withdrawn sends. Accepted photo batches are retained if a later optional confirmation fails. The same content approved under a fresh nonce is a new send.
 
 The server parses this strictly and rejects anything non-canonical. All of it is produced by the `looklab-wasm` module; the JavaScript layer only moves bytes ([AGENTS.md](../AGENTS.md)).
+
+The prep module advertises postcard ABI 2 and a build identity derived from that ABI, the preparation version, and the envelope and send-manifest versions. The page checks the module's version reply before its first operation and does not send that operation when the identities differ, asking the owner to reload and prepare again. The `ll_alloc`, `ll_free` and `ll_call` exports are unchanged.
 
 `BatchManifest` carries `community_snapshot_version`, the snapshot whose control schema its settings were read against. The server keeps every snapshot it has published and resolves the batch body and settings against that version, not the current one; an unknown version fails with `SNAPSHOT_UNKNOWN` and one older than the retained snapshots with `SNAPSHOT_TOO_OLD`. Each settings entry also carries its source, `reproduced` or `declared` ([07 §4](07-contribution.md)).
 

@@ -41,10 +41,7 @@ impl ReportedFirmware {
     /// # Errors
     /// Empty, over-long or control-character text.
     pub fn new(value: &str) -> Result<Self, ReportedFirmwareError> {
-        if value.trim().is_empty()
-            || value.len() > 200
-            || value.chars().any(char::is_control)
-        {
+        if value.trim().is_empty() || value.len() > 200 || value.chars().any(char::is_control) {
             return Err(ReportedFirmwareError);
         }
         Ok(Self(value.trim().to_owned()))
@@ -102,7 +99,9 @@ impl ManualConfirmation {
         if self.version != MANUAL_CONFIRMATION_VERSION {
             errors.push(ValidationError::new(
                 "version",
-                ErrorKind::UnsupportedConfirmationVersion { found: self.version },
+                ErrorKind::UnsupportedConfirmationVersion {
+                    found: self.version,
+                },
             ));
         }
         if self.observations.is_empty() {
@@ -251,10 +250,7 @@ impl ConfirmationScope {
         }
         for key in observed {
             if !listed.contains(key) {
-                errors.push(ValidationError::new(
-                    "scope.keys",
-                    ErrorKind::ScopeMismatch,
-                ));
+                errors.push(ValidationError::new("scope.keys", ErrorKind::ScopeMismatch));
             }
         }
     }
@@ -306,9 +302,7 @@ impl ControlObservation {
                 ErrorKind::CorrectionNotDocumented,
             ));
         }
-        if *availability == Availability::Unavailable
-            && *domain != CapabilityDomain::Unspecified
-        {
+        if *availability == Availability::Unavailable && *domain != CapabilityDomain::Unspecified {
             errors.push(ValidationError::new(
                 format!("{path}.finding.domain"),
                 ErrorKind::ManualDomainNotUnspecified {

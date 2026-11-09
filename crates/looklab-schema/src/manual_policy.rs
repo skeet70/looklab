@@ -95,8 +95,13 @@ impl core::str::FromStr for ModeratorEvidenceKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModeratorFirmwareScope {
     Unspecified {},
-    Exact { firmware: FirmwareScope },
-    Range { from: FirmwareScope, to: FirmwareScope },
+    Exact {
+        firmware: FirmwareScope,
+    },
+    Range {
+        from: FirmwareScope,
+        to: FirmwareScope,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -163,15 +168,21 @@ impl<'de> Deserialize<'de> for ModeratorFirmwareScope {
         #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
         enum Raw {
             Unspecified {},
-            Exact { firmware: FirmwareScope },
-            Range { from: FirmwareScope, to: FirmwareScope },
+            Exact {
+                firmware: FirmwareScope,
+            },
+            Range {
+                from: FirmwareScope,
+                to: FirmwareScope,
+            },
         }
         Ok(match Raw::deserialize(deserializer)? {
             Raw::Unspecified {} => Self::Unspecified {},
-            Raw::Exact { firmware } => Self::exact(firmware.as_str())
-                .map_err(|error| <D::Error as serde::de::Error>::custom(error))?,
+            Raw::Exact { firmware } => {
+                Self::exact(firmware.as_str()).map_err(<D::Error as serde::de::Error>::custom)?
+            }
             Raw::Range { from, to } => Self::range(from.as_str(), to.as_str())
-                .map_err(|error| <D::Error as serde::de::Error>::custom(error))?,
+                .map_err(<D::Error as serde::de::Error>::custom)?,
         })
     }
 }
@@ -391,7 +402,8 @@ pub fn evaluate_control(
     moderators: &[ModeratorRecord],
 ) -> ControlConfirmation {
     let definition = capability.definition_digest(camera);
-    let mut latest: BTreeMap<(&IdentityGroupId, &ReportedFirmware), &ManualEvidence> = BTreeMap::new();
+    let mut latest: BTreeMap<(&IdentityGroupId, &ReportedFirmware), &ManualEvidence> =
+        BTreeMap::new();
     for entry in evidence {
         if entry.definition_digest != definition
             || !firmware_scope_accepts(camera, capability, &entry.firmware)
@@ -412,7 +424,9 @@ pub fn evaluate_control(
     }
     let mut firmware = by_firmware
         .into_iter()
-        .map(|(reported, entries)| evaluate_firmware(capability, &definition, reported.clone(), &entries))
+        .map(|(reported, entries)| {
+            evaluate_firmware(capability, &definition, reported.clone(), &entries)
+        })
         .collect::<Vec<_>>();
     let moderator = moderators.first().map(|record| record.evidence.clone());
     let mut known = firmware
@@ -564,7 +578,7 @@ fn evaluate_firmware(
             }),
         }
     }
-    groups.sort_by(|left, right| right.evidence.len().cmp(&left.evidence.len()));
+    groups.sort_by_key(|group| std::cmp::Reverse(group.evidence.len()));
     let Some(leading) = groups.first() else {
         return FirmwareConfirmation {
             firmware,
@@ -614,7 +628,7 @@ fn evaluate_firmware(
             availability: leading.claim.availability,
             domain: leading.claim.domain.clone(),
             agreeing_groups,
-            definition_digest: definition.clone(),
+            definition_digest: *definition,
             firmware_scopes: FirmwareScope::new(firmware.as_str())
                 .ok()
                 .into_iter()
@@ -689,9 +703,7 @@ pub fn firmware_scope_accepts(
         return true;
     }
     let reported = firmware.as_str().trim();
-    scopes
-        .iter()
-        .any(|scope| scope_accepts(scope, reported))
+    scopes.iter().any(|scope| scope_accepts(scope, reported))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

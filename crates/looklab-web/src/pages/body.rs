@@ -51,6 +51,7 @@ pub fn BodyDetail() -> impl IntoView {
     });
 
     view! {
+        <article class="camera-page">
         {move || match state.get() {
             Load::Loading => ui::loading().into_any(),
             Load::Failed(error) => ui::failure(&error).into_any(),
@@ -58,6 +59,7 @@ pub fn BodyDetail() -> impl IntoView {
             Load::Ready((None, Some(manual))) => view! { <ManualOnlyView manual/> }.into_any(),
             Load::Ready((None, None)) => ui::failure("This camera has no published data.").into_any(),
         }}
+        </article>
     }
 }
 
@@ -360,13 +362,7 @@ fn ManualSection(manual: ManualPage) -> impl IntoView {
                 let control_actual = control_actual_text(&confirmation);
                 let control_basis = confirmation_text(&confirmation);
                 let moderator = moderator_evidence_text(&confirmation);
-                let manual_note = if confirmation.firmware.iter().any(|result| {
-                    matches!(result.basis.as_ref(), Some(ConfirmationBasis::Corrected))
-                }) {
-                    "Documentation-derived; some firmware values are corrected by owners"
-                } else {
-                    "Documentation-derived"
-                };
+                let manual_note = documentation_note(documented.availability, &confirmation);
                 let citations = documented.citations.iter().map(|citation| {
                     match table_sources.iter().find(|source| source.id == citation.source) {
                         Some(source) => {
@@ -394,7 +390,7 @@ fn ManualSection(manual: ManualPage) -> impl IntoView {
                         </td>
                         <td>
                             {manual_value}
-                            <div class="muted">{manual_note}</div>
+                            {manual_note.map(|text| view! { <div class="muted">{text}</div> })}
                         </td>
                         <td>
                             <div class="muted">{control_basis}</div>
@@ -473,6 +469,26 @@ fn ManualSection(manual: ManualPage) -> impl IntoView {
             })}
         </section>
     }
+}
+
+pub(crate) fn documentation_note(
+    availability: looklab_schema::Availability,
+    confirmation: &looklab_schema::ControlConfirmation,
+) -> Option<&'static str> {
+    if availability == looklab_schema::Availability::NotDocumented {
+        return None;
+    }
+    Some(
+        if confirmation
+            .firmware
+            .iter()
+            .any(|result| matches!(result.basis.as_ref(), Some(ConfirmationBasis::Corrected)))
+        {
+            "Documentation-derived; some firmware values are corrected by owners"
+        } else {
+            "Documentation-derived"
+        },
+    )
 }
 
 pub(crate) fn category_text(category: looklab_schema::CapabilityCategory) -> &'static str {
@@ -588,7 +604,7 @@ pub(crate) fn confirmation_text(confirmation: &looklab_schema::ControlConfirmati
             "{} independent owner group(s); 3 needed",
             confirmation.agreeing_groups
         ),
-        ConfirmationState::Documented => "Documented only".to_owned(),
+        ConfirmationState::Documented => "No owner or moderator evidence".to_owned(),
         ConfirmationState::ModeratorConfirmed => match confirmation.moderator.as_ref() {
             Some(evidence) => match &evidence.firmware_scope {
                 ModeratorFirmwareScope::Exact { firmware } => {
@@ -638,7 +654,7 @@ pub(crate) fn firmware_basis_text(result: &FirmwareConfirmation) -> String {
             ConfirmationState::Unconfirmed => {
                 format!("{} group(s); 3 needed", result.agreeing_groups)
             }
-            ConfirmationState::Documented => "documented only".to_owned(),
+            ConfirmationState::Documented => "no owner or moderator evidence".to_owned(),
             ConfirmationState::Confirmed => {
                 format!("confirmed by {} group(s)", result.agreeing_groups)
             }

@@ -1131,6 +1131,20 @@ fn run_extra(
     intent_args: &[&str],
     extra: &[&str],
 ) -> (bool, String) {
+    let files = std::iter::once(fixture.raw.as_path())
+        .chain(fixture.jpegs.iter().map(PathBuf::as_path))
+        .collect::<Vec<_>>();
+    run_files(fixture, hars, state, intent_args, extra, &files)
+}
+
+fn run_files(
+    fixture: &Fixture,
+    hars: &[&Path],
+    state: &Path,
+    intent_args: &[&str],
+    extra: &[&str],
+    files: &[&Path],
+) -> (bool, String) {
     let mut command = Command::cargo_bin("looklab").expect("built binary");
     command
         .args(["verify-payload", "--seeds"])
@@ -1156,8 +1170,7 @@ fn run_extra(
             "--pow-difficulty",
             "0",
         ])
-        .arg(&fixture.raw)
-        .args(&fixture.jpegs);
+        .args(files);
     let output = command.output().expect("command runs");
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -1302,6 +1315,28 @@ fn reproduces_an_upload_and_passes() {
     let recorded: Value =
         serde_json::from_str(&std::fs::read_to_string(&state).expect("state file")).expect("json");
     assert_eq!(recorded["credentials"][0]["credential_id"], hex(CREDENTIAL));
+}
+
+#[test]
+fn the_file_order_within_a_group_does_not_change_the_reproduction() {
+    let fixture = fixture();
+    let site = Site::new();
+    let har = har_path("file-order", &default_har(&site).json());
+    let state = state_path("file-order");
+    let files = std::iter::once(fixture.raw.as_path())
+        .chain(fixture.jpegs.iter().rev().map(PathBuf::as_path))
+        .collect::<Vec<_>>();
+    let (success, output) = run_files(
+        fixture,
+        &[har.as_path()],
+        &state,
+        &["--intent", "native"],
+        &[],
+        &files,
+    );
+
+    assert!(success, "{output}");
+    assert!(output.contains("PASS"), "{output}");
 }
 
 #[test]

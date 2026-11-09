@@ -1297,8 +1297,8 @@ pub async fn withdraw(
         let Some(camera) = manuals.camera(&camera_id) else {
             continue;
         };
-        let summary = crate::manual_confirm::summary_with(&mut *tx, camera).await?;
-        crate::manual_confirm::promotion_audit_with(&mut *tx, camera, &summary).await?;
+        let summary = crate::manual_confirm::summary_with(&mut tx, camera).await?;
+        crate::manual_confirm::promotion_audit_with(&mut tx, camera, &summary).await?;
     }
     request_publication(&mut tx).await?;
     tx.commit().await?;

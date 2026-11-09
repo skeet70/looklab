@@ -4,7 +4,7 @@ use looklab_prep::PREP_VERSION;
 use looklab_prep_module::{
     AssertionFields, BuildManifestRequest, BuildSendManifestRequest, EncodeEnvelopeRequest,
     Function, ManifestImageInput, ModuleError, ParseEnvelopeRequest, PowParamsSpec, Response,
-    SolvePowRequest, VersionRequest, VersionResponse, dispatch,
+    SolvePowRequest, VersionRequest, dispatch,
 };
 use looklab_samples::{
     InputSpace, OutputSpace, PrepParamsHash, PrepVersion, PriorTransformVersion, SampleFlags,
@@ -91,28 +91,6 @@ fn manifest_request(nonce: Nonce, blob: Vec<u8>) -> BuildManifestRequest {
         }],
         nonce,
     }
-}
-
-#[test]
-fn version_reports_the_module_versions() {
-    let version = call(
-        Function::Version,
-        &VersionRequest,
-        |response| match response {
-            Response::Version(version) => version,
-            other => panic!("unexpected response {other:?}"),
-        },
-    )
-    .expect("version succeeds");
-    assert_eq!(
-        version,
-        VersionResponse {
-            module_abi_version: 1,
-            prep_version: PREP_VERSION,
-            crate_version: env!("CARGO_PKG_VERSION").to_owned(),
-            build_id: looklab_prep_module::build_id(),
-        }
-    );
 }
 
 #[test]

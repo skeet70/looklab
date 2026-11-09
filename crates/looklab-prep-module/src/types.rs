@@ -186,6 +186,15 @@ pub struct VersionResponse {
     pub build_id: [u8; 32],
 }
 
+impl VersionResponse {
+    /// Whether this reply describes the module this build produces.
+    pub fn matches_current(&self) -> bool {
+        self.module_abi_version == crate::MODULE_ABI_VERSION
+            && self.prep_version == crate::PREP_VERSION
+            && self.build_id == crate::build_id()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Response {
     Version(VersionResponse),

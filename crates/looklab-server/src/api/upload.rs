@@ -563,10 +563,10 @@ async fn complete(
     if let Ok(camera_id) = looklab_schema::BodyId::new(&contribution.body_id)
         && let Some(camera) = state.manuals.camera(&camera_id)
     {
-        let summary = crate::manual_confirm::summary_with(&mut *tx, camera)
+        let summary = crate::manual_confirm::summary_with(&mut tx, camera)
             .await
             .map_err(database_error)?;
-        crate::manual_confirm::promotion_audit_with(&mut *tx, camera, &summary)
+        crate::manual_confirm::promotion_audit_with(&mut tx, camera, &summary)
             .await
             .map_err(database_error)?;
     }

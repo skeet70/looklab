@@ -145,10 +145,12 @@ pub async fn body(make: &str, model: &str) -> Result<BodyPage, String> {
 }
 
 pub async fn body_optional(make: &str, model: &str) -> Result<Option<BodyPage>, String> {
-    get_optional_json(&publication_url(&format!(
-        "/data/bodies/{make}/{model}.json"
-    )))
-    .await
+    let id = looklab_schema::BodyId::new(&format!("{make}/{model}"))
+        .map_err(|error| error.to_string())?;
+    if !index().await?.bodies.iter().any(|body| body.id == id) {
+        return Ok(None);
+    }
+    body(make, model).await.map(Some)
 }
 
 pub async fn manual(
@@ -178,26 +180,6 @@ pub async fn manual(
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|error| format!("/{path}: {error}"))
-}
-
-async fn get_optional_json<T: DeserializeOwned>(path: &str) -> Result<Option<T>, String> {
-    let response = Request::get(path)
-        .send()
-        .await
-        .map_err(|error| format!("{path}: {error}"))?;
-    if response.status() == 404 {
-        return Ok(None);
-    }
-    if !response.ok() {
-        return Err(format!("{path}: HTTP {}", response.status()));
-    }
-    let bytes = response
-        .binary()
-        .await
-        .map_err(|error| format!("{path}: {error}"))?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| format!("{path}: {error}"))
 }
 
 pub async fn look(slug: &str) -> Result<LookPage, String> {

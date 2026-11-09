@@ -11,12 +11,18 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{MessageEvent, Worker, WorkerOptions, WorkerType};
 
 use crate::base::site_url;
+use looklab_wasm::prep::ModuleFunction;
 use looklab_wasm::{
     RECYCLE_AFTER_FILES, RECYCLE_MEMORY_FRACTION, WORKER_BUDGET_BYTES, WORKER_FN_MATCH,
-    WORKER_FN_VERIFY,
+    WORKER_FN_VERIFY, check_module_version, module_fn_id, version_request,
 };
 
 pub const FILE_TIMEOUT_MS: i32 = 60_000;
+
+const MODULE_MISMATCH: &str = concat!(
+    "This page and its preparation module are different versions. ",
+    "Reload the page, then prepare your files again.",
+);
 
 const TIMEOUT_MARKER: &str = "__looklab_timeout__";
 const TYPE: &str = "type";
@@ -181,6 +187,7 @@ pub struct PrepWorker {
     files: u64,
     memory: u64,
     dead: bool,
+    verified: bool,
 }
 
 impl PrepWorker {
@@ -196,30 +203,68 @@ impl PrepWorker {
             files: 0,
             memory: 0,
             dead: false,
+            verified: false,
         })
     }
 
     /// # Errors
-    /// Reports a worker that trapped, timed out or answered with an error.
+    /// Reports a trap, timeout, error or a module built from different versions.
     pub async fn call(
         &mut self,
         function: u32,
         bytes: Vec<u8>,
     ) -> Result<WorkerReply, WorkerFailure> {
+        if !self.verified {
+            self.check_version().await?;
+        }
+        self.send(function, bytes).await
+    }
+
+    async fn check_version(&mut self) -> Result<(), WorkerFailure> {
+        let request = version_request();
+        let reply = match self
+            .link
+            .call(
+                module_fn_id(ModuleFunction::Version),
+                &request,
+                FILE_TIMEOUT_MS,
+            )
+            .await
+        {
+            Ok(reply) => reply,
+            Err(failure) => return Err(self.stop(failure)),
+        };
+        if check_module_version(&reply.bytes).is_err() {
+            return Err(self.module_mismatch());
+        }
+        self.verified = true;
+        self.memory = reply.memory;
+        Ok(())
+    }
+
+    fn module_mismatch(&mut self) -> WorkerFailure {
+        self.dead = true;
+        self.link.terminate();
+        WorkerFailure::Module(MODULE_MISMATCH.to_owned())
+    }
+
+    async fn send(&mut self, function: u32, bytes: Vec<u8>) -> Result<WorkerReply, WorkerFailure> {
         match self.link.call(function, &bytes, FILE_TIMEOUT_MS).await {
             Ok(reply) => {
                 self.files += 1;
                 self.memory = reply.memory;
                 Ok(reply)
             }
-            Err(failure) => {
-                if failure.kills_worker() {
-                    self.dead = true;
-                    self.link.terminate();
-                }
-                Err(failure)
-            }
+            Err(failure) => Err(self.stop(failure)),
         }
+    }
+
+    fn stop(&mut self, failure: WorkerFailure) -> WorkerFailure {
+        if failure.kills_worker() {
+            self.dead = true;
+            self.link.terminate();
+        }
+        failure
     }
 
     pub fn should_recycle(&self) -> bool {

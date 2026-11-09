@@ -26,7 +26,7 @@ use crate::sample::{PixelSelection, SampleParams, select_pixels};
 use crate::seed::SamplingSeed;
 
 /// Registered preparation version id, [docs/03 §2.2](../../../docs/03-data-model.md).
-pub const PREP_VERSION: u32 = 2;
+pub const PREP_VERSION: u32 = 3;
 
 const DEFAULT_DOWNSAMPLE_MAX_PIXELS: u32 = 1_500_000;
 

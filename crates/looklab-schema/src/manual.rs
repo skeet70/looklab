@@ -124,9 +124,7 @@ impl ManualCamera {
         if self.sources.is_empty() {
             errors.push(ValidationError::new(
                 format!("{path}.sources"),
-                ErrorKind::EmptyText {
-                    field: "sources",
-                },
+                ErrorKind::EmptyText { field: "sources" },
             ));
         }
         let mut source_ids = HashSet::new();
@@ -507,7 +505,7 @@ impl core::str::FromStr for CapabilityKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CapabilityDomain {
     Boolean {
@@ -542,6 +540,7 @@ pub enum CapabilityDomain {
     Axes {
         axes: Vec<Axis>,
     },
+    #[default]
     Unspecified,
 }
 
@@ -645,12 +644,6 @@ pub enum DomainKind {
     Unspecified,
 }
 
-impl Default for CapabilityDomain {
-    fn default() -> Self {
-        Self::Unspecified
-    }
-}
-
 impl CapabilityDomain {
     pub const fn kind(&self) -> DomainKind {
         match self {
@@ -684,9 +677,7 @@ impl CapabilityDomain {
                     if !seen.insert(value.as_str()) {
                         errors.push(ValidationError::new(
                             format!("{path}.values[{index}]"),
-                            ErrorKind::DuplicateKey {
-                                key: value.clone(),
-                            },
+                            ErrorKind::DuplicateKey { key: value.clone() },
                         ));
                     }
                 }
@@ -756,9 +747,9 @@ impl CapabilityDomain {
                                 ErrorKind::DefaultOutOfRange,
                             ));
                         } else if steps_are_positive
-                            && default.checked_sub(*min).is_none_or(|delta| {
-                                !steps.iter().any(|step| delta % *step == 0)
-                            })
+                            && default
+                                .checked_sub(*min)
+                                .is_none_or(|delta| !steps.iter().any(|step| delta % *step == 0))
                         {
                             errors.push(ValidationError::new(
                                 format!("{path}.default"),
@@ -848,7 +839,12 @@ impl CapabilityDomain {
                 let mut labels = HashSet::new();
                 for (index, axis) in axes.iter().enumerate() {
                     let axis_path = format!("{path}.axes[{index}]");
-                    check_text(&axis.label, &format!("{axis_path}.label"), "axis label", errors);
+                    check_text(
+                        &axis.label,
+                        &format!("{axis_path}.label"),
+                        "axis label",
+                        errors,
+                    );
                     if !labels.insert(axis.label.as_str()) {
                         errors.push(ValidationError::new(
                             format!("{axis_path}.label"),
@@ -886,11 +882,7 @@ impl CapabilityDomain {
     }
 }
 
-fn parse_rational(
-    value: &str,
-    path: &str,
-    errors: &mut Vec<ValidationError>,
-) -> Option<Rational> {
+fn parse_rational(value: &str, path: &str, errors: &mut Vec<ValidationError>) -> Option<Rational> {
     match Rational::parse(value) {
         Ok(parsed) => Some(parsed),
         Err(_) => {
@@ -920,12 +912,7 @@ fn parse_step(value: &str, path: &str, errors: &mut Vec<ValidationError>) -> Opt
     }
 }
 
-fn check_text(
-    value: &str,
-    path: &str,
-    field: &'static str,
-    errors: &mut Vec<ValidationError>,
-) {
+fn check_text(value: &str, path: &str, field: &'static str, errors: &mut Vec<ValidationError>) {
     if value.trim().is_empty() {
         errors.push(ValidationError::new(path, ErrorKind::EmptyText { field }));
     }
@@ -1036,8 +1023,7 @@ impl From<FirmwareScope> for String {
 /// A catalog that fails a cross-record rule.
 pub fn validate_manual_catalog(yaml: &str) -> Result<ManualCatalog, Vec<ValidationError>> {
     crate::yaml::check(yaml)?;
-    let catalog: ManualCatalog =
-        serde_norway::from_str(yaml).map_err(ValidationError::syntax)?;
+    let catalog: ManualCatalog = serde_norway::from_str(yaml).map_err(ValidationError::syntax)?;
     catalog.validate()?;
     Ok(catalog)
 }
@@ -1100,4 +1086,3 @@ pub fn merge_manual_catalogs(
         Err(errors)
     }
 }
-

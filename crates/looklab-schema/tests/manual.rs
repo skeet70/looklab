@@ -7,9 +7,9 @@ use serde_json::{Value, json};
 
 use looklab_schema::{
     AGREEMENT_GROUPS, Availability, CapabilityDomain, CapabilityKey, ConfirmationBasis,
-    ConfirmationScope, ConfirmationState, ControlObservation, ErrorKind, FirmwareScope, Finding,
-    IdentityGroupId, ManualCamera, ManualCatalog, ManualConfirmation, ManualEvidence, ManualUrl,
-    MAX_CONFIRMATION_BYTES, ModeratorEvidence, ModeratorEvidenceKind, ModeratorFirmwareScope,
+    ConfirmationScope, ConfirmationState, ControlObservation, ErrorKind, Finding, FirmwareScope,
+    IdentityGroupId, MAX_CONFIRMATION_BYTES, ManualCamera, ManualCatalog, ManualConfirmation,
+    ManualEvidence, ManualUrl, ModeratorEvidence, ModeratorEvidenceKind, ModeratorFirmwareScope,
     ModeratorRecord, ReportedFirmware, SourceId, SourceKind, ValidationError, evaluate_camera,
     evaluate_control, firmware_scope_accepts, validate_manual_catalog,
     validate_manual_confirmation,
@@ -242,7 +242,10 @@ fn rational_defaults_stay_in_range_and_on_a_step() {
     assert!(has_kind(&errors, &ErrorKind::NotOnStep), "{errors:?}");
 
     let errors = validate(&format!("{NATIVE}{}", exposure_compensation("2"))).unwrap_err();
-    assert!(has_kind(&errors, &ErrorKind::DefaultOutOfRange), "{errors:?}");
+    assert!(
+        has_kind(&errors, &ErrorKind::DefaultOutOfRange),
+        "{errors:?}"
+    );
 
     let errors = validate(&format!("{NATIVE}{}", exposure_compensation("-1/3"))).unwrap();
     assert_eq!(errors.cameras[0].capabilities.len(), 2);
@@ -585,10 +588,7 @@ fn confirmation_structure_checks_reject_without_a_catalog() {
         vec![native],
     );
     let errors = unlisted.validate_structure().unwrap_err();
-    assert!(has_kind(
-        &errors,
-        &ErrorKind::EmptyText { field: "keys" }
-    ));
+    assert!(has_kind(&errors, &ErrorKind::EmptyText { field: "keys" }));
     assert!(has_kind(&errors, &ErrorKind::ScopeMismatch));
 }
 
@@ -873,8 +873,8 @@ fn a_differing_active_claim_blocks_corrected_confirmation() {
 
 #[test]
 fn corrected_quorum_respects_firmware_scope() {
-    let catalog = validate_manual_catalog(&camera_yaml("Ver.2.00-2.99", NATIVE))
-        .expect("a valid catalog");
+    let catalog =
+        validate_manual_catalog(&camera_yaml("Ver.2.00-2.99", NATIVE)).expect("a valid catalog");
     let camera = &catalog.cameras[0];
     let target = capability(camera, CapabilityKey::NativeSimulations);
     let corrected = enum_domain(&["PROVIA", "REALA ACE"]);
@@ -959,19 +959,11 @@ fn different_firmware_options_are_not_contradictions() {
     assert_eq!(first.state, ConfirmationState::Confirmed);
     assert_eq!(second.state, ConfirmationState::Confirmed);
     assert_eq!(
-        first
-            .confirmed_actual
-            .as_ref()
-            .expect("an actual")
-            .domain,
+        first.confirmed_actual.as_ref().expect("an actual").domain,
         enum_domain(&["PROVIA"])
     );
     assert_eq!(
-        second
-            .confirmed_actual
-            .as_ref()
-            .expect("an actual")
-            .domain,
+        second.confirmed_actual.as_ref().expect("an actual").domain,
         enum_domain(&["REALA ACE"])
     );
     assert_eq!(
@@ -1056,9 +1048,12 @@ fn camera_human_confirmation_requires_one_common_firmware() {
         .enumerate()
         .map(|(index, group)| evidence(camera, native, group, "1.00", index as i64))
         .collect::<Vec<_>>();
-    entries.extend(groups(["a", "b", "c"]).iter().enumerate().map(|(index, group)| {
-        evidence(camera, exposure, group, "1.00", index as i64)
-    }));
+    entries.extend(
+        groups(["a", "b", "c"])
+            .iter()
+            .enumerate()
+            .map(|(index, group)| evidence(camera, exposure, group, "1.00", index as i64)),
+    );
 
     let summary = evaluate_camera(camera, &entries, &BTreeMap::new());
     assert!(summary.human_confirmed());
@@ -1369,7 +1364,10 @@ fn evidence_for_another_control_does_not_confirm_this_one() {
     assert!(control.moderator.is_some());
     assert_eq!(control.firmware.len(), 1);
     assert_eq!(control.firmware[0].firmware.as_str(), "1.00");
-    assert_eq!(control.firmware[0].state, ConfirmationState::ModeratorConfirmed);
+    assert_eq!(
+        control.firmware[0].state,
+        ConfirmationState::ModeratorConfirmed
+    );
 }
 
 #[test]
@@ -1418,7 +1416,8 @@ fn nested_unknown_confirmation_fields_are_rejected() {
         value["scope"] = json!({"kind": "complete", "extra": true});
     });
     assert_unknown_field_rejected(&catalog, &value, "unit domain", |value| {
-        value["observations"][0]["finding"]["domain"] = json!({"type": "unspecified", "extra": true});
+        value["observations"][0]["finding"]["domain"] =
+            json!({"type": "unspecified", "extra": true});
     });
 }
 
@@ -1491,8 +1490,8 @@ fn zero_selectable_step_is_rejected_before_remainder_arithmetic() {
 
 #[test]
 fn lower_bound_firmware_scope_accepts_matching_owner_evidence() {
-    let catalog = validate_manual_catalog(&camera_yaml("2.2.0 or later", NATIVE))
-        .expect("a valid catalog");
+    let catalog =
+        validate_manual_catalog(&camera_yaml("2.2.0 or later", NATIVE)).expect("a valid catalog");
     let camera = &catalog.cameras[0];
     let native = capability(camera, CapabilityKey::NativeSimulations);
     for (firmware, expected) in [("2.2.0", true), ("2.3.1", true), ("2.1.9", false)] {
@@ -1560,10 +1559,7 @@ fn newest_overlapping_moderator_scope_wins_per_firmware() {
 
 #[test]
 fn every_moderator_confirmed_firmware_participates_in_camera_confirmation() {
-    let catalog = catalog(&format!(
-        "{NATIVE}{}",
-        exposure_compensation("-1/3")
-    ));
+    let catalog = catalog(&format!("{NATIVE}{}", exposure_compensation("-1/3")));
     let camera = &catalog.cameras[0];
     let exposure = capability(camera, CapabilityKey::ExposureCompensation);
     let entries = groups(["a", "b", "c"])
@@ -1593,8 +1589,8 @@ fn every_moderator_confirmed_firmware_participates_in_camera_confirmation() {
 
 #[test]
 fn textual_firmware_scope_matches_only_the_reported_text() {
-    let catalog = validate_manual_catalog(&camera_yaml("release-A", NATIVE))
-        .expect("a valid catalog");
+    let catalog =
+        validate_manual_catalog(&camera_yaml("release-A", NATIVE)).expect("a valid catalog");
     let camera = &catalog.cameras[0];
     let native = capability(camera, CapabilityKey::NativeSimulations);
     assert!(firmware_scope_accepts(
@@ -1608,4 +1604,3 @@ fn textual_firmware_scope_matches_only_the_reported_text() {
         &ReportedFirmware::new("2.00").expect("firmware")
     ));
 }
-

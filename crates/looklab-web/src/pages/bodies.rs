@@ -97,10 +97,12 @@ pub fn BodiesPage() -> impl IntoView {
             Load::Ready(BodiesReady { index, scene, preview_error }) => {
                 let items = cards(&index);
                 let needle = filter.get().to_lowercase();
-                let entries = camera_entries(&index)
+                let mut matching = camera_entries(&index)
                     .into_iter()
                     .filter(|entry| entry.make.to_lowercase().contains(&needle) || entry.model.to_lowercase().contains(&needle))
-                    .map(|entry| {
+                    .peekable();
+                let no_matches = matching.peek().is_none();
+                let entries = matching.map(|entry| {
                         let scene = scene.clone();
                         let published = items.iter().filter(|item| entry.looks.contains(&item.slug)).cloned().collect::<Vec<_>>();
                         let published_count = published.len();
@@ -143,6 +145,11 @@ pub fn BodiesPage() -> impl IntoView {
                         <p class="muted" role="status">"Look previews could not load. Camera details are still available."</p>
                         <ui::Disclosure summary="Preview details".to_owned()><p>{error}</p></ui::Disclosure>
                     })}
+                    <div role="status">
+                        {no_matches.then(|| view! {
+                            <p>"No cameras match this filter. Try another make or model."</p>
+                        })}
+                    </div>
                     <div class="camera-gallery">{entries}</div>
                 }.into_any()
             }

@@ -124,6 +124,28 @@ pub fn version_request() -> Vec<u8> {
     postcard::to_allocvec(&looklab_prep_module::VersionRequest).expect("unit request is encodable")
 }
 
+/// Rejects a malformed reply or a module built from different wire versions.
+pub fn check_module_version(bytes: &[u8]) -> Result<(), FacadeError> {
+    let version = match decode_reply(bytes)? {
+        Response::Version(version) => version,
+        other => {
+            return Err(FacadeError::Reply(format!(
+                "version reply came back as {}",
+                response_name(&other)
+            )));
+        }
+    };
+    if version.matches_current() {
+        return Ok(());
+    }
+    Err(FacadeError::ModuleVersion {
+        found_abi: version.module_abi_version,
+        found_prep: version.prep_version,
+        expected_abi: looklab_prep_module::MODULE_ABI_VERSION,
+        expected_prep: looklab_prep_module::PREP_VERSION,
+    })
+}
+
 pub fn prepare_request(
     raw: Vec<u8>,
     jpegs: Vec<Vec<u8>>,
@@ -358,4 +380,49 @@ pub fn serial_ascii_for_file(bytes: &[u8]) -> Option<Vec<u8>> {
 /// For the envelope only.
 pub fn serial_ascii_from_metadata(metadata: &looklab_meta::ParsedMetadata) -> Option<Vec<u8>> {
     metadata.body_serial().map(serial_ascii)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn version_reply(version: looklab_prep_module::VersionResponse) -> Vec<u8> {
+        postcard::to_allocvec(&Ok::<Response, ModuleError>(Response::Version(version)))
+            .expect("version reply encodes")
+    }
+
+    #[test]
+    fn accepts_the_module_this_build_encodes() {
+        assert!(check_module_version(&version_reply(looklab_prep_module::version())).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_different_module_abi() {
+        let mut version = looklab_prep_module::version();
+        version.module_abi_version += 1;
+        assert!(matches!(
+            check_module_version(&version_reply(version)),
+            Err(FacadeError::ModuleVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_different_prep_version() {
+        let mut version = looklab_prep_module::version();
+        version.prep_version += 1;
+        assert!(matches!(
+            check_module_version(&version_reply(version)),
+            Err(FacadeError::ModuleVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_different_build_id() {
+        let mut version = looklab_prep_module::version();
+        version.build_id[0] ^= 1;
+        assert!(matches!(
+            check_module_version(&version_reply(version)),
+            Err(FacadeError::ModuleVersion { .. })
+        ));
+    }
 }

@@ -17,7 +17,7 @@ const USAGE = `usage: node site/checks/e2e.mjs [options]
                                __EGL_VENDOR_LIBRARY_FILENAMES for Mesa's
                                libEGL_mesa, EGL_PLATFORM=surfaceless and
                                MESA_LOADER_DRIVER_OVERRIDE=swrast
-  --flow all|match|contribute|pages|flatness|propose|developers|compare|account|lazy
+  --flow all|match|contribute|all-bw|pages|flatness|propose|developers|compare|account|lazy
   --origin URL                 stub server origin (default http://localhost:8099)
   --out DIR                    artifact directory (default /tmp/looklab-e2e)
   --state DIR                  stub server state, must match --state (default /tmp/looklab-stub-state)
@@ -25,6 +25,7 @@ const USAGE = `usage: node site/checks/e2e.mjs [options]
   --extra FILE                 one more file in the drop (repeatable)
   --body ID --firmware V --sim KEY
   --controls "key=step,..."    control steps, comma separated
+  --bw-all 1                   drop only the eight monochrome X-S10 renders
   --fail-draft-blobs 1         make IndexedDB Blob writes throw, to check the
                                draft-unavailable note and that the flow continues
   --workers N                  worker count for the contribute run
@@ -70,6 +71,7 @@ const options = {
   status: '',
   permalink: '',
   'fail-draft-blobs': false,
+  'bw-all': false,
 };
 
 for (let index = 2; index < process.argv.length; index += 1) {
@@ -86,7 +88,7 @@ for (let index = 2; index < process.argv.length; index += 1) {
   const value = process.argv[index];
   options[key] = ['workers', 'count'].includes(key)
     ? Number(value)
-    : key === 'fail-draft-blobs'
+    : ['fail-draft-blobs', 'bw-all'].includes(key)
       ? value === '1' || value === 'true'
       : key === 'extra'
         ? [...options.extra, value]
@@ -117,6 +119,17 @@ function check(condition, message) {
   }
   console.log(`ok ${message}`);
 }
+
+const BW_MAKERNOTE_VARIANTS = [
+  ['acros', 0x0500],
+  ['acros-r', 0x0501],
+  ['acros-ye', 0x0502],
+  ['acros-g', 0x0503],
+  ['monochrome', 0x0300],
+  ['monochrome-r', 0x0301],
+  ['monochrome-ye', 0x0302],
+  ['monochrome-g', 0x0303],
+];
 
 /// A copy of the fixture JPEG whose Fujifilm makernote sets `tag` to `value`.
 async function renderWithTag(name, tag, value) {
@@ -403,6 +416,7 @@ async function match(size) {
 }
 
 async function contribute(size) {
+  const allBw = options['bw-all'];
   const harPath = `${options.out}/session-${size}.har`;
   const session = await open(VIEWPORTS[size], harPath);
   const { page, problems } = session;
@@ -515,27 +529,35 @@ async function contribute(size) {
       page.waitForEvent('filechooser'),
       page.getByRole('dialog', { name: guideNames[0], exact: true }).getByRole('button', { name: 'Choose photos', exact: true }).click(),
     ]);
-    const velvia = await renderWithTag('render-velvia', 0x1401, 0x0200);
-    const acros = await renderWithTag('render-acros', 0x1003, 0x0500);
-    const acrosYellow = await renderWithTag('render-acros-ye', 0x1003, 0x0502);
-    const sepia = await renderWithTag('render-sepia', 0x1003, 0x0310);
-    const dropped = [
-      options.raw,
-      options.jpeg,
-      velvia,
-      acros,
-      acrosYellow,
-      sepia,
-      ...options.extra,
-    ];
-    summary.files = [
-      options.raw,
-      options.jpeg,
-      velvia,
-      acros,
-      acrosYellow,
-      sepia,
-    ];
+    const bwRenders = allBw
+      ? await Promise.all(BW_MAKERNOTE_VARIANTS.map(([name, value]) =>
+          renderWithTag(`render-${name}`, 0x1003, value)))
+      : [];
+    const toneVariant = allBw ? null : await renderWithTag('render-provia-highlight', 0x1041, 0x0010);
+    const acros = allBw ? null : await renderWithTag('render-acros', 0x1003, 0x0500);
+    const acrosYellow = allBw ? null : await renderWithTag('render-acros-ye', 0x1003, 0x0502);
+    const sepia = allBw ? null : await renderWithTag('render-sepia', 0x1003, 0x0310);
+    const dropped = allBw
+      ? [options.raw, ...bwRenders]
+      : [
+          options.raw,
+          options.jpeg,
+          toneVariant,
+          acros,
+          acrosYellow,
+          sepia,
+          ...options.extra,
+        ];
+    summary.files = allBw
+      ? [options.raw, ...bwRenders]
+      : [
+          options.raw,
+          options.jpeg,
+          toneVariant,
+          acros,
+          acrosYellow,
+          sepia,
+        ];
     await chooser.setFiles(dropped);
     await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).waitFor({ timeout: 120_000 });
     await capture('contribute-1-drop');
@@ -559,44 +581,64 @@ async function contribute(size) {
     }
     summary.draft_unavailable = draftUnavailable;
 
+    if (!allBw) {
+      const colourBatches = page.locator('.batch-choice').filter({
+        has: page.locator('.batch-choice-title', { hasText: /^Batch \d+: \d+ photos?, Provia$/ }),
+      });
+      check(await colourBatches.count() === 2, `${size}: matching camera, firmware and sim with different settings form separate groups`);
+      const highlightSteps = [];
+      for (const batch of await colourBatches.all()) {
+        await batch.click();
+        highlightSteps.push(await page.getByRole('spinbutton', { name: /^highlight tone$/i }).inputValue());
+      }
+      check(highlightSteps.includes('0') && highlightSteps.includes('-2'), `${size}: each group retains its own recorded highlight setting`);
+    }
     await page.locator('.batch-choice').filter({
-      has: page.locator('.batch-choice-title', { hasText: /^Batch \d+: \d+ photos, Provia$/ }),
-    }).click();
-    await page.fill('#body-id', options.body);
-    await page.fill('#firmware', options.firmware);
-    await page.fill('#sim', options.sim);
-    await page.getByRole('checkbox', { name: 'Settings contribution' }).check();
-    await page.fill('#recipe-target', 'cold-steel');
-    await page.fill('#recipe-target', 'sunlit-negative');
-    await page.getByRole('checkbox', { name: 'Settings contribution' }).uncheck();
+      has: page.locator('.batch-choice-title', { hasText: new RegExp(`^Batch \\d+: \\d+ photos?, ${allBw ? 'Acros' : 'Provia'}$`) }),
+    }).first().click();
+    await page.getByRole('textbox', { name: 'Camera', exact: true }).fill(options.body);
+    await page.getByRole('textbox', { name: 'Firmware', exact: true }).fill(options.firmware);
+    if (!allBw) {
+      await page.getByRole('textbox', { name: 'Film simulation', exact: true }).fill(options.sim);
+      await page.getByRole('checkbox', { name: 'Settings contribution' }).check();
+      await page.getByLabel('Look these settings are trying to match', { exact: true }).fill('cold-steel');
+      await page.getByLabel('Look these settings are trying to match', { exact: true }).fill('sunlit-negative');
+      await page.getByRole('checkbox', { name: 'Settings contribution' }).uncheck();
+    }
     await page.click('summary:has-text("Technical settings editor")');
     if (options.controls) {
-      await page.fill('#controls', options.controls.split(',').join('\n'));
+      await page.getByLabel('Settings (key=step, one per line)', { exact: true }).fill(options.controls.split(',').join('\n'));
     }
     await page.click('summary:has-text("Processing options")');
     await page.selectOption('#workers', String(options.workers));
+    const consent = page.locator('.monochrome-consent');
+    await consent.waitFor();
+    const consentBox = consent.getByRole('checkbox', {
+      name: 'Contribute all B&W renders in this selection for monochrome model development',
+    });
+    check(!(await consentBox.isChecked()), `${size}: drop-level B&W consent starts unchecked`);
+    const promise = await consent.innerText();
+    check(
+      promise.includes('180 days') && promise.includes('withdraw') && promise.includes('No published Look is promised'),
+      `${size}: B&W consent states purpose, retention, withdrawal and no Look promise`,
+    );
+    const bwLabels = allBw
+      ? ['Acros', 'Acros R', 'Acros Ye', 'Acros G', 'Monochrome', 'Monochrome R', 'Monochrome Ye', 'Monochrome G']
+      : ['Acros', 'Acros Ye', 'Sepia'];
     const declarations = new Set();
-    for (const [label, filter] of [['Acros', 'none'], ['Acros Ye', 'yellow'], ['Sepia', 'toning']]) {
+    for (const label of bwLabels) {
       const batch = page.locator('.batch-choice').filter({
         has: page.locator('.batch-choice-title', {
-          hasText: new RegExp(`^Batch \\d+: \\d+ photos, ${label}$`),
+          hasText: new RegExp(`^Batch \\d+: \\d+ photos?, ${label}$`),
         }),
       });
       await batch.waitFor();
       await batch.click();
-      const optIn = page.getByRole('checkbox', { name: 'Contribute these B&W renders for monochrome model development' });
-      await optIn.waitFor();
-      check(!(await optIn.isChecked()), `${size}: ${label} B&W opt-in starts unchecked`);
-      const promise = await page.locator('.monochrome-opt-in').innerText();
-      check(
-        promise.includes('180 days') && promise.includes('withdraw') && promise.includes('No published Look is promised'),
-        `${size}: ${label} opt-in states purpose, retention, withdrawal and no Look promise`,
-      );
       check(
         (await page.locator('.batch-editor').innerText()).includes('Normalized family:'),
         `${size}: ${label} shows the normalized family beside the native sim`,
       );
-      if (filter === 'yellow') {
+      if (!allBw && label === 'Acros Ye') {
         check(
           (await page.locator('.batch-editor').innerText()).includes('Normalized monochrome filter: Yellow'),
           `${size}: Acros Ye keeps its normalized filter`,
@@ -610,22 +652,20 @@ async function contribute(size) {
         declarations.add(key);
       }
     }
-    await page.getByRole('button', { name: 'Process locally', exact: true }).click();
-    await page.getByRole('heading', { name: /Review what/ }).waitFor({ timeout: 900_000 });
-    check((await page.locator('.payload-summary').textContent()).includes('from 2 photos'), `${size}: preparation leaves out B&W without consent`);
-    await page.getByRole('button', { name: 'Continue to send', exact: true }).click();
     const progress = page.getByRole('navigation', { name: 'Progress' });
-    await progress.getByRole('button', { name: 'Check groups', exact: true }).click();
-    for (const label of ['Acros', 'Acros Ye', 'Sepia']) {
-      await page.locator('.batch-choice').filter({
-        has: page.locator('.batch-choice-title', {
-          hasText: new RegExp(`^Batch \\d+: \\d+ photos, ${label}$`),
-        }),
-      }).click();
-      await page.getByRole('checkbox', {
-        name: 'Contribute these B&W renders for monochrome model development',
-      }).check();
+    if (!allBw) {
+      await page.getByRole('button', { name: 'Process locally', exact: true }).click();
+      await page.getByRole('heading', { name: /Review what/ }).waitFor({ timeout: 900_000 });
+      const withoutConsent = await page.locator('.payload-summary').textContent();
+      check(withoutConsent.includes('2 colour renders') && !withoutConsent.includes('B&W'), `${size}: preparation leaves out B&W without consent`);
+      check(await page.locator('.step:not([hidden]) .excluded .excluded-files li').count() === 3, `${size}: the review lists the three B&W renders left out`);
+      await page.getByRole('button', { name: 'Continue to send', exact: true }).click();
+      await progress.getByRole('button', { name: 'Check groups', exact: true }).click();
     }
+    await consent.waitFor();
+    check(!(await consentBox.isChecked()), `${size}: B&W consent stays unchecked until an explicit click`);
+    await consentBox.check();
+    check(await consentBox.isChecked(), `${size}: one click selects every B&W render in the drop`);
     await capture('contribute-consent-changed');
     check(await progress.getByRole('button', { name: 'Review', exact: true }).isDisabled(), `${size}: changed B&W selection requires fresh preparation before review`);
     check(await progress.getByRole('button', { name: 'Send', exact: true }).isDisabled(), `${size}: changed B&W selection cannot reuse the previous send step`);
@@ -635,16 +675,8 @@ async function contribute(size) {
       await page.goto(`${options.origin}/contribute`);
       await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).waitFor({ timeout: 30_000 });
       check(await progress.getByRole('button', { name: 'Review', exact: true }).isDisabled(), `${size}: a restored changed selection still needs preparation`);
-      for (const label of ['Acros', 'Acros Ye', 'Sepia']) {
-        await page.locator('.batch-choice').filter({
-          has: page.locator('.batch-choice-title', {
-            hasText: new RegExp(`^Batch \\d+: \\d+ photos, ${label}$`),
-          }),
-        }).click();
-        check(await page.getByRole('checkbox', {
-          name: 'Contribute these B&W renders for monochrome model development',
-        }).isChecked(), `${size}: ${label} consent survives draft restoration`);
-      }
+      await consent.waitFor();
+      check(await consentBox.isChecked(), `${size}: B&W consent survives draft restoration`);
     }
 
     summary.declarations = [...declarations];
@@ -666,7 +698,12 @@ async function contribute(size) {
     await capture('contribute-3-inspector');
     check((await page.locator('.payload-summary').textContent()).includes('No pixels, no location'), `${size}: upload summary explains privacy`);
     check(await page.locator('details.excluded-files').count() === 0, `${size}: every selected render was prepared`);
-    check((await page.locator('.payload-summary').textContent()).includes('from 5 photos'), `${size}: the inspector counts all five renders`);
+    const withConsent = await page.locator('.payload-summary').textContent();
+    if (allBw) {
+      check(withConsent.includes('8 B&W renders') && !withConsent.includes('colour renders'), `${size}: the inspector counts eight B&W renders and no colour renders`);
+    } else {
+      check(withConsent.includes('2 colour renders and 3 B&W renders'), `${size}: the inspector counts colour and B&W renders separately`);
+    }
     await page.locator('summary:has-text("See exactly")').focus();
     await page.keyboard.press('Enter');
     await capture('contribute-inspector-expanded');
@@ -699,7 +736,14 @@ async function contribute(size) {
       await page.reload();
       await page.waitForSelector('h2:has-text("Review what")');
       check(await page.locator('.payload-summary').textContent() === beforeResume, `${size}: local draft resumes prepared samples`);
-      check(await page.locator('#recipe-target').inputValue() === 'sunlit-negative', `${size}: latest settings survive draft resume`);
+      if (!allBw) {
+        await progress.getByRole('button', { name: 'Check groups', exact: true }).click();
+        await page.locator('.batch-choice').filter({
+          has: page.locator('.batch-choice-title', { hasText: /^Batch \d+: \d+ photos?, Provia$/ }),
+        }).first().click();
+        check(await page.getByLabel('Look these settings are trying to match', { exact: true }).inputValue() === 'sunlit-negative', `${size}: latest settings survive draft resume`);
+        await progress.getByRole('button', { name: 'Review', exact: true }).click();
+      }
     }
 
     await page.bringToFront();
@@ -728,7 +772,8 @@ async function contribute(size) {
     await page.click('button:has-text("Send contribution")');
     await page.getByRole('heading', { name: 'Thanks, your samples are in', exact: true }).waitFor({ timeout: 300_000 });
     page.off('response', onUpload);
-    check(uploads.length === 5, `${size}: all five batches were uploaded`);
+    const expectedBatches = allBw ? 8 : 5;
+    check(uploads.length === expectedBatches, `${size}: all ${expectedBatches} batches were uploaded`);
     const uploadBodies = await Promise.all(uploads.map(async (response) => {
       check(response.status() === 201, `${size}: every batch was accepted`);
       return response.json();
@@ -736,7 +781,7 @@ async function contribute(size) {
     const contributionId = uploadBodies[0].contribution_id;
     check(Boolean(contributionId), `${size}: every batch returns a contribution id`);
     const gets = await page.evaluate(() => window.__looklabWebauthnGets);
-    check(gets === 1, `${size}: exactly one WebAuthn get for five batches (${gets})`);
+    check(gets === 1, `${size}: exactly one WebAuthn get for ${expectedBatches} batches (${gets})`);
     await capture('contribute-4-upload');
     const done = page.locator('.contribution-done');
     const doneText = await done.textContent();
@@ -774,7 +819,8 @@ async function contribute(size) {
     const monochromeContributions = persisted.filter(
       (contribution) => contribution.render_class === 'monochrome',
     );
-    check(monochromeContributions.length === 3, `${size}: the feed names three monochrome batches`);
+    const expectedMonochrome = allBw ? 8 : 3;
+    check(monochromeContributions.length === expectedMonochrome, `${size}: the feed names ${expectedMonochrome} monochrome batches`);
     check(
       monochromeContributions.every((contribution) => typeof contribution.deferred_until === 'number'),
       `${size}: every monochrome batch carries its deferred deadline`,
@@ -1739,6 +1785,13 @@ if (options.flow === 'all' || options.flow === 'match') {
   await match('mobile');
 }
 if (options.flow === 'all' || options.flow === 'contribute') {
+  result.contribute = await contribute('desktop');
+  await verifyContributionPayload('desktop', result.contribute);
+  result.contribute_mobile = await contribute('mobile');
+  await verifyContributionPayload('mobile', result.contribute_mobile);
+}
+if (options.flow === 'all-bw') {
+  options['bw-all'] = true;
   result.contribute = await contribute('desktop');
   await verifyContributionPayload('desktop', result.contribute);
   result.contribute_mobile = await contribute('mobile');

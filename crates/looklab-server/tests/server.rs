@@ -4900,10 +4900,17 @@ async fn insert_confirmation(
         key,
         &ReportedFirmware::new("2.10").expect("firmware"),
         finding,
-        payload,
-        created_at,
+        ConfirmationOccurrence {
+            payload,
+            created_at,
+        },
     )
     .await;
+}
+
+struct ConfirmationOccurrence {
+    payload: u8,
+    created_at: i64,
 }
 
 async fn insert_confirmation_with_firmware(
@@ -4913,9 +4920,12 @@ async fn insert_confirmation_with_firmware(
     key: &str,
     firmware: &ReportedFirmware,
     finding: &str,
-    payload: u8,
-    created_at: i64,
+    occurrence: ConfirmationOccurrence,
 ) {
+    let ConfirmationOccurrence {
+        payload,
+        created_at,
+    } = occurrence;
     let capability = camera
         .capabilities
         .iter()
@@ -5743,8 +5753,10 @@ async fn latest_claims_keep_each_reported_firmware_version() {
                 "native_simulations",
                 &ReportedFirmware::new(version).expect("firmware"),
                 r#"{"kind":"matches"}"#,
-                30 + 2 * index + offset as u8,
-                offset as i64,
+                ConfirmationOccurrence {
+                    payload: 30 + 2 * index + offset as u8,
+                    created_at: offset as i64,
+                },
             )
             .await;
         }
@@ -6106,7 +6118,7 @@ async fn withdrawal_reconciles_a_new_promotion() {
     );
 
     let mut withdraw = server
-        .signed_fields("withdraw", contribution.as_str().as_bytes())
+        .signed_fields("withdraw", contribution.as_bytes())
         .await;
     withdraw["contribution_ids"] = json!([contribution.as_str()]);
     let (status, response) = post_json(&server.app, "/api/withdraw", &withdraw).await;

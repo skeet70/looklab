@@ -10,8 +10,9 @@ use leptos::task::spawn_local;
 use looklab_publish::{ManualCapabilityPage, ManualPage};
 use looklab_schema::{
     Availability, Axis, BodyId, CapabilityDomain, CapabilityKey, ConfirmationBasis,
-    ConfirmationScope, ControlObservation, Finding, ManualConfirmationSummary,
-    ModeratorEvidenceKind, ModeratorFirmwareScope, Rational, ReportedFirmware, Sha256Hex,
+    ConfirmationScope, ControlObservation, Finding, ManualConfirmationSummary, ManualUrl,
+    ModeratorEvidence, ModeratorEvidenceKind, ModeratorFirmwareScope, Rational, ReportedFirmware,
+    Sha256Hex,
 };
 use looklab_upload::AttestationHash;
 use looklab_wasm::prep::ModuleFunction;
@@ -21,9 +22,9 @@ use looklab_wasm::{
 };
 
 use super::body::{
-    availability_text, category_text, confirmation_text, control_actual_text, domain_text,
-    finding_text, firmware_actual_text, firmware_basis_text, firmware_definition_digest,
-    firmware_detail, moderator_evidence_text,
+    availability_text, category_text, confirmation_text, control_actual_text, documentation_note,
+    domain_text, finding_text, firmware_actual_text, firmware_basis_text,
+    firmware_definition_digest, firmware_detail, moderator_evidence_text,
 };
 use crate::session::SessionContext;
 use crate::worker::PrepWorker;
@@ -512,7 +513,7 @@ fn envelope(
         };
         observations.push(ControlObservation {
             key: capability.documented.key,
-            definition_digest: capability.definition_digest.clone(),
+            definition_digest: capability.definition_digest,
             finding: control_finding(capability, *answer, drafts)?,
         });
     }
@@ -525,7 +526,7 @@ fn envelope(
         .collect::<Vec<CapabilityKey>>();
     build_manual_confirmation(
         camera.clone(),
-        camera_digest.clone(),
+        *camera_digest,
         firmware,
         ConfirmationScope::Controls { keys },
         observations,
@@ -845,7 +846,7 @@ pub fn ManualConfirmationPanel(
     #[prop(optional)] summary: Option<RwSignal<ManualConfirmationSummary>>,
 ) -> impl IntoView {
     let camera = manual.id.clone();
-    let camera_digest = manual.camera_digest.clone();
+    let camera_digest = manual.camera_digest;
     let id_slug = manual.id.as_str().replace('/', "-");
     let sources = manual.sources.clone();
     let capabilities = manual.capabilities.clone();
@@ -869,7 +870,6 @@ pub fn ManualConfirmationPanel(
     let status = RwSignal::new(None::<String>);
     {
         let camera = camera.clone();
-        let camera_digest = camera_digest.clone();
         let capabilities = capabilities.clone();
         Effect::new(move |_| {
             let built = envelope(
@@ -952,13 +952,8 @@ pub fn ManualConfirmationPanel(
                 let control_actual = control_actual_text(&confirmation);
                 let control_basis = confirmation_text(&confirmation);
                 let moderator = moderator_evidence_text(&confirmation);
-                let manual_note = if confirmation.firmware.iter().any(|result| {
-                    matches!(result.basis.as_ref(), Some(ConfirmationBasis::Corrected))
-                }) {
-                    "Documentation-derived; some firmware values are corrected by owners"
-                } else {
-                    "Documentation-derived"
-                };
+                let manual_note =
+                    documentation_note(capability.documented.availability, &confirmation);
                 let documented_for_change = capability.documented.clone();
                 let confirmation_for_change = confirmation.clone();
                 let documented_for_editor = capability.documented.clone();
@@ -982,7 +977,7 @@ pub fn ManualConfirmationPanel(
                     </td>
                     <td>
                         {manual_value}
-                        <div class="muted">{manual_note}</div>
+                        {manual_note.map(|text| view! { <div class="muted">{text}</div> })}
                     </td>
                     <td>
                         <div class="muted">{control_basis}</div>
@@ -1209,6 +1204,12 @@ pub fn ManualModerationPanel(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModeratorDecision {
+    Confirm,
+    Reject,
+}
+
 #[component]
 fn ModerationRow(
     camera: BodyId,
@@ -1217,13 +1218,13 @@ fn ModerationRow(
 ) -> impl IntoView {
     let session = crate::session::use_session();
     let key = capability.documented.key;
-    let definition_digest = capability.definition_digest.clone();
+    let definition_digest = capability.definition_digest;
     let label = capability.documented.label.clone();
-    let decision = RwSignal::new("confirm".to_owned());
+    let decision = RwSignal::new(ModeratorDecision::Confirm);
     let scope_kind = RwSignal::new(ScopeKindDraft::Unspecified);
     let scope_from = RwSignal::new(String::new());
     let scope_to = RwSignal::new(String::new());
-    let kind = RwSignal::new("physical".to_owned());
+    let kind = RwSignal::new(ModeratorEvidenceKind::Physical);
     let url = RwSignal::new(String::new());
     let description = RwSignal::new(String::new());
     let busy = RwSignal::new(false);
@@ -1232,12 +1233,11 @@ fn ModerationRow(
         if busy.get_untracked() {
             return;
         }
-        let confirmed = decision.get_untracked() == "confirm";
+        let confirmed = decision.get_untracked() == ModeratorDecision::Confirm;
         let scope_kind = scope_kind.get_untracked();
         let scope_from = scope_from.get_untracked();
         let scope_to = scope_to.get_untracked();
-        let kind = ModeratorEvidenceKind::from_str(&kind.get_untracked())
-            .unwrap_or(ModeratorEvidenceKind::Physical);
+        let kind = kind.get_untracked();
         let url = url.get_untracked();
         let url = (!url.trim().is_empty()).then(|| url.trim().to_owned());
         let description = description.get_untracked().trim().to_owned();
@@ -1254,17 +1254,23 @@ fn ModerationRow(
                     ScopeKindDraft::Unspecified => Ok(ModeratorFirmwareScope::unspecified()),
                 }
                 .map_err(|error| error.to_string())?;
+                let url = url
+                    .as_deref()
+                    .map(ManualUrl::new)
+                    .transpose()
+                    .map_err(|error| error.to_string())?;
                 let envelope = build_manual_moderation(
                     camera.clone(),
                     key,
                     definition_digest,
                     confirmed,
-                    scope,
-                    kind,
-                    url.as_deref(),
-                    &description,
-                )
-                .map_err(|error| error.to_string())?;
+                    ModeratorEvidence {
+                        kind,
+                        url,
+                        description,
+                        firmware_scope: scope,
+                    },
+                );
                 let credential = webauthn::profile_credential(session).await?;
                 let signed = webauthn::sign_request(
                     crate::request_digest::RequestDomain::ModerateManualConfirmation,
@@ -1298,12 +1304,20 @@ fn ModerationRow(
         <div class="manual-moderation-row">
             <strong>{label}</strong>
             <div class="field-row">
-                <label>"Decision"</label>
-                <select on:change=move |event| decision.set(event_target_value(&event))>
+                <label>"Decision"
+                <select on:change=move |event| {
+                    let choice = match event_target_value(&event).as_str() {
+                        "confirm" => ModeratorDecision::Confirm,
+                        "reject" => ModeratorDecision::Reject,
+                        _ => return,
+                    };
+                    decision.set(choice);
+                }>
                     <option value="confirm" selected=true>"Confirm"</option>
                     <option value="reject">"Reject"</option>
                 </select>
-                <label>"Firmware scope"</label>
+                </label>
+                <label>"Firmware scope"
                 <select on:change=move |event| {
                     scope_kind.set(
                         ScopeKindDraft::from_str(&event_target_value(&event))
@@ -1319,24 +1333,34 @@ fn ModerationRow(
                             selected=move || scope_kind.get() == candidate>{label}</option>
                     }).collect_view()}
                 </select>
-                <label>"From"</label>
+                </label>
+                <label>"From"
                 <input type="text" prop:value=move || scope_from.get()
                     on:input=move |event| scope_from.set(event_target_value(&event)) />
-                <label>"To"</label>
+                </label>
+                <label>"To"
                 <input type="text" prop:value=move || scope_to.get()
                     on:input=move |event| scope_to.set(event_target_value(&event)) />
-                <label>"Evidence"</label>
-                <select on:change=move |event| kind.set(event_target_value(&event))>
+                </label>
+                <label>"Evidence"
+                <select on:change=move |event| {
+                    if let Ok(value) = ModeratorEvidenceKind::from_str(&event_target_value(&event)) {
+                        kind.set(value);
+                    }
+                }>
                     <option value="physical" selected=true>"Physical inspection"</option>
                     <option value="video">"Video"</option>
                 </select>
+                </label>
             </div>
-            <label>"Evidence URL"</label>
+            <label>"Evidence URL"
             <input type="url" prop:value=move || url.get()
                 on:input=move |event| url.set(event_target_value(&event)) />
-            <label>"Evidence description"</label>
+            </label>
+            <label>"Evidence description"
             <textarea rows="2" prop:value=move || description.get()
                 on:input=move |event| description.set(event_target_value(&event))></textarea>
+            </label>
             <button type="button" on:click=submit disabled=move || busy.get()>
                 "Record moderator decision"
             </button>
@@ -1394,7 +1418,7 @@ pub fn StandaloneConfirmation(
             <p>{lede}</p>
             <ManualConfirmationPanel
                 manual=form_manual
-                initial_firmware=Signal::derive(|| String::new())
+                initial_firmware=Signal::derive(String::new)
                 on_change=on_change
                 show_context=false
                 summary=summary

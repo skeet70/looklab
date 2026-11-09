@@ -3,7 +3,7 @@
 use crate::data::{self, Load};
 use crate::ui;
 use leptos::prelude::*;
-use looklab_publish::{PreparedScene, SiteIndex};
+use looklab_publish::{BodySummary, PreparedScene, SiteIndex};
 use std::sync::Arc;
 
 pub(crate) fn cards(index: &SiteIndex) -> Vec<ui::LookCardItem> {
@@ -107,7 +107,7 @@ pub(crate) fn CharacterCard(item: ui::LookCardItem, scene: Arc<PreparedScene>) -
 
 #[derive(Clone, Debug)]
 struct GalleryReady {
-    index: SiteIndex,
+    bodies: Vec<BodySummary>,
     scene: Arc<PreparedScene>,
     items: Vec<ui::LookCardItem>,
 }
@@ -150,7 +150,7 @@ pub fn LooksPage() -> impl IntoView {
                         }
                     }
                     Ok(Gallery::Ready(GalleryReady {
-                        index,
+                        bodies: index.bodies,
                         scene,
                         items,
                     }))
@@ -172,11 +172,11 @@ pub fn LooksPage() -> impl IntoView {
                 crate::prefetch::route_rendered();
                 ui::no_published_looks().into_any()
             },
-            Load::Ready(Gallery::Ready(GalleryReady { index, scene, items })) => {
+            Load::Ready(Gallery::Ready(GalleryReady { bodies, scene, items })) => {
                 view! {
                     <label for="look-filter">"Search looks"</label>
                     <input id="look-filter" type="search" placeholder="Search by name or character" on:input=move |event| filter.set(event_target_value(&event))/>
-                    <ui::CameraPicker cameras=index.bodies.clone() selected=camera label="Filter by camera".to_owned()/>
+                    <ui::CameraPicker cameras=bodies.clone() selected=camera label="Filter by camera".to_owned()/>
                     <div class="look-gallery">{move || {
                         let needle = filter.get().to_lowercase();
                         let selected = camera.get();
@@ -186,7 +186,7 @@ pub fn LooksPage() -> impl IntoView {
                                     || item.name.to_lowercase().contains(&needle)
                                     || item.character.to_lowercase().contains(&needle);
                                 let matches_camera = selected.as_ref().is_none_or(|id| {
-                                    index.bodies.iter().any(|body| &body.id == id && body.looks.contains(&item.slug))
+                                    bodies.iter().any(|body| &body.id == id && body.looks.contains(&item.slug))
                                 });
                                 matches_text && matches_camera
                             })
