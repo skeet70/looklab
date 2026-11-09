@@ -201,7 +201,7 @@ The two gauge rows (a body joining a component; two components merging) are asse
 
 | Validation tier | Execution policy |
 |---|---|
-| Targeted policy and numerical regression tests | Required on pushes and pull requests; use public policy inputs and compact synthetic fixtures |
+| Targeted policy and numerical regression tests | Required on main pushes and pull requests; use public policy inputs and compact synthetic fixtures |
 | Compact real fitter-to-trust integration | Required before releases through **Pre-release integration**, not ordinary CI; measured job wall time exceeded the approximately two-minute budget |
 | Worker fitter/publication integration | Required before releases through **Pre-release integration**; native/consistency fits, LUT rebasing and match-bundle publication require `looklab-worker/integration` |
 | Full-scale simulations, numerical studies and benchmarks | Explicit maintainer request only; no automatic push, pull-request, scheduled or release execution |
