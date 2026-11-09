@@ -249,6 +249,7 @@ jobs:
           fixtures: "false"
       - name: Browser error capture and privacy
         run: |
+          nix build --no-link nixpkgs#playwright-driver nixpkgs#playwright-driver.browsers
           PLAYWRIGHT_MODULE="$(nix eval --raw nixpkgs#playwright-driver)/index.mjs"
           PLAYWRIGHT_BROWSERS_PATH="$(nix eval --raw nixpkgs#playwright-driver.browsers)"
           export PLAYWRIGHT_MODULE PLAYWRIGHT_BROWSERS_PATH

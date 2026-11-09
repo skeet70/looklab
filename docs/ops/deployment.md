@@ -275,6 +275,7 @@ The private `client_errors` table holds at most 10,000 reports. Inserts delete r
 Run the browser boundary check without a running application or photo fixtures:
 
 ```sh
+nix build --no-link nixpkgs#playwright-driver nixpkgs#playwright-driver.browsers
 nix develop -c env \
   PLAYWRIGHT_MODULE="$(nix eval --raw nixpkgs#playwright-driver)/index.mjs" \
   PLAYWRIGHT_BROWSERS_PATH="$(nix eval --raw nixpkgs#playwright-driver.browsers)" \
