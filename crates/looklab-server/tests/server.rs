@@ -6312,9 +6312,7 @@ async fn client_error_reports_require_json_media_type() {
         Some("json"),
         Some("application/json, text/plain"),
     ] {
-        let mut builder = Request::builder()
-            .method("POST")
-            .uri("/api/client-errors");
+        let mut builder = Request::builder().method("POST").uri("/api/client-errors");
         if let Some(content_type) = content_type {
             builder = builder.header(header::CONTENT_TYPE, content_type);
         }
@@ -6344,7 +6342,11 @@ async fn client_error_reports_require_json_media_type() {
             .body(Body::from(body.clone()))
             .expect("request");
         let (status, _, _) = send(&server.app, request).await;
-        assert_eq!(status, StatusCode::NO_CONTENT, "content type {content_type}");
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "content type {content_type}"
+        );
     }
     let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM client_errors")
         .fetch_one(&server.db)
@@ -6370,7 +6372,8 @@ async fn client_error_reports_accept_every_allowed_asset() {
     ] {
         let mut value = client_error_report(&release);
         value["frames"] = json!([{"asset": asset, "line": 0, "column": 0}]);
-        let status = post_client_error(&server.app, serde_json::to_vec(&value).expect("json")).await;
+        let status =
+            post_client_error(&server.app, serde_json::to_vec(&value).expect("json")).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "asset {asset}");
     }
     let mut twelve = client_error_report(&release);
@@ -6498,7 +6501,8 @@ async fn client_error_reports_never_reach_the_logs() {
     let server = TestServer::start().await;
     let release = "f".repeat(64);
     let mut value = client_error_report(&release);
-    value["frames"] = json!([{"asset": "generated/wasm/looklab_match.wasm", "line": 7, "column": 9}]);
+    value["frames"] =
+        json!([{"asset": "generated/wasm/looklab_match.wasm", "line": 7, "column": 9}]);
     assert_eq!(
         post_client_error(&server.app, serde_json::to_vec(&value).expect("json")).await,
         StatusCode::NO_CONTENT
