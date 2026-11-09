@@ -97,12 +97,45 @@ pub(crate) struct DraftFile {
 }
 
 #[wasm_bindgen(inline_js = r#"
+const GUARD_PREFIX = "looklab-contribution-consent-guard-";
+
+function guardToken() {
+    return globalThis.crypto.randomUUID();
+}
+
+function isGuardToken(value) {
+    return /^[0-9a-z-]{8,}$/i.test(value);
+}
+
 export class ContributionDraftStore {
     constructor() {
         this.queue = Promise.resolve();
         this.revision = 0;
         this.pending = null;
         this.timer = null;
+        this.guardKeys = new Set();
+        this.guardBroken = false;
+        this.guardMalformed = false;
+        try {
+            for (let index = 0; index < localStorage.length; index += 1) {
+                const key = localStorage.key(index);
+                if (key !== null && key.startsWith(GUARD_PREFIX)) {
+                    this.guardKeys.add(key);
+                    if (!isGuardToken(key.slice(GUARD_PREFIX.length))) {
+                        this.guardMalformed = true;
+                    }
+                }
+            }
+        } catch {
+            this.guardBroken = true;
+        }
+        try {
+            const probe = GUARD_PREFIX + guardToken();
+            localStorage.setItem(probe, "1");
+            localStorage.removeItem(probe);
+        } catch {
+            this.guardBroken = true;
+        }
         this.database = new Promise((resolve, reject) => {
             const request = indexedDB.open("looklab-contribution-drafts", 1);
             request.onupgradeneeded = () => request.result.createObjectStore("entries");
@@ -110,6 +143,42 @@ export class ContributionDraftStore {
             request.onerror = () => reject(request.error);
         });
         this.database.catch(() => {});
+    }
+    guardStatus() {
+        if (this.guardBroken || this.guardMalformed) return "unavailable";
+        return this.guardKeys.size > 0 ? "pending" : "clear";
+    }
+    guardConsent() {
+        try {
+            const key = GUARD_PREFIX + guardToken();
+            localStorage.setItem(key, "1");
+            this.guardKeys.add(key);
+            this.guardBroken = false;
+            this.guardMalformed = false;
+            return true;
+        } catch {
+            this.guardBroken = true;
+            return false;
+        }
+    }
+    settleGuard(keys) {
+        for (const key of keys) {
+            try {
+                localStorage.removeItem(key);
+            } catch {
+                this.guardBroken = true;
+                return;
+            }
+            this.guardKeys.delete(key);
+        }
+        this.guardBroken = false;
+        this.guardMalformed = false;
+        for (const key of this.guardKeys) {
+            if (!isGuardToken(key.slice(GUARD_PREFIX.length))) {
+                this.guardMalformed = true;
+                break;
+            }
+        }
     }
     enqueue(operation) {
         const result = this.queue.then(operation);
@@ -159,11 +228,15 @@ export class ContributionDraftStore {
         const pending = this.pending;
         this.pending = null;
         if (!pending) return;
+        const keys = this.guardBroken ? [] : [...this.guardKeys];
+        const settles = !pending.retainPrepared && keys.length > 0;
         this.enqueue(() => {
             if (pending.revision !== this.revision) return;
             return this.transaction("readwrite", store => {
                 if (!pending.retainPrepared) store.delete("prepared");
                 store.put(pending.text, "draft");
+            }).then(() => {
+                if (settles) this.settleGuard(keys);
             });
         }).catch(() => {});
     }
@@ -187,6 +260,10 @@ extern "C" {
     pub(crate) type ContributionDraftStore;
     #[wasm_bindgen(constructor)]
     pub(crate) fn new() -> ContributionDraftStore;
+    #[wasm_bindgen(method, js_name = guardStatus)]
+    pub(crate) fn guard_status(this: &ContributionDraftStore) -> String;
+    #[wasm_bindgen(method, js_name = guardConsent)]
+    pub(crate) fn guard_consent(this: &ContributionDraftStore) -> bool;
     #[wasm_bindgen(method, js_name = replaceFiles)]
     pub(crate) fn replace_files(this: &ContributionDraftStore, files: &JsValue) -> js_sys::Promise;
     #[wasm_bindgen(method)]
@@ -208,6 +285,24 @@ extern "C" {
 impl ContributionDraftStore {
     pub(crate) fn stored_file(&self, file: &DraftFile) -> js_sys::Promise {
         self.file(file.key.0)
+    }
+}
+
+/// Synchronous state of a withdrawn B&W consent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConsentGuard {
+    Clear,
+    Pending,
+    Unavailable,
+}
+
+impl ConsentGuard {
+    pub(crate) fn of(status: &str) -> Self {
+        match status {
+            "clear" => Self::Clear,
+            "pending" => Self::Pending,
+            _ => Self::Unavailable,
+        }
     }
 }
 

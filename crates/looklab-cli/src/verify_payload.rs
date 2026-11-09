@@ -2039,10 +2039,14 @@ fn load_groups(files: &[PathBuf]) -> Result<Vec<Group>> {
     if groups.is_empty() {
         bail!("no RAW file was given");
     }
-    for group in &groups {
+    for group in &mut groups {
         if group.jpegs.is_empty() {
             bail!("{} has no JPEG in its group", group.raw.name);
         }
+        // The site pairs a RAW's JPEGs by file name; prep samples the first as the reference.
+        group
+            .jpegs
+            .sort_by(|left, right| left.name.trim().cmp(right.name.trim()));
     }
     Ok(groups)
 }

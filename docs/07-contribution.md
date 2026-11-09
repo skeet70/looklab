@@ -34,7 +34,7 @@ After each step, show the impact (server-computed, via the status link) and offe
 
 The browser retains File/Blob handles and scans metadata one file at a time. It reads bytes for active worker groups, decodes each shared RAW once, and decodes and samples the group's JPEGs sequentially. Each JPEG keeps its own rendering metadata.
 
-**Monochrome model development.** A separate, unchecked selection authorizes contributing complete B&W measurements for developing and validating monochrome response, toning and uncertainty, with a 180-day deferred-retention limit ([06 §4](06-privacy-and-payload.md)). It is covered by the same send approval as colour contributions. The contributor may select the RAW with just its B&W JPEGs, or a mixed colour/B&W re-render group. Without authorization, B&W renders stay local. The client retains RGB measurements, original native sim, normalized family and filter, WC/MG toning, grain and each setting's source; no source photos or RAW hashes are sent. There is no promise of a published Look.
+**Monochrome model development.** A separate selection, unchecked by default, authorizes contributing complete B&W measurements for developing and validating monochrome response, toning and uncertainty, with a 180-day deferred-retention limit ([06 §4](06-privacy-and-payload.md)). It is covered by the same send approval as colour contributions. One selection covers every B&W batch in the drop and sets each batch's own authorization, which stays the manifest's source of truth; colour batches are unaffected, and a restored draft with a partial selection stays partial until the contributor clicks the control. The contributor may select the RAW with just its B&W JPEGs, or a mixed colour/B&W re-render group. Without authorization, B&W renders stay local. The client retains RGB measurements, original native sim, normalized family and filter, WC/MG toning, grain and each setting's source; no source photos or RAW hashes are sent. There is no promise of a published Look.
 
 ## 3. Capture protocols (shown only when a rung needs them)
 
@@ -57,7 +57,9 @@ Shared tips (rung 1 and above): turn off in-camera lens corrections where possib
 
 ### 3.3 Color chart (rung 5)
 - v1: ColorChecker Classic 24, SG 140, Passport.
-- Even light, no glare, chart at 30–60% of the frame, bracket 0/−1/−2 EV.
+- Even light, no glare, chart at 30–60% of the frame.
+- Use one built-in look, such as Provia / Standard on Fujifilm, and WB set to the light. Take three RAW+JPEG Fine shots total at 0/−1/−2 EV; keep all three original pairs. No separate bracket per look is needed.
+- Optional extra coverage: re-render only the 0 EV RAW in camera using other built-in looks, keeping the other settings unchanged, and include those JPEGs with the originals. The −1 and −2 EV RAWs do not need re-renders. The donated-fixture protocol requests every film simulation ([fixture shot list §4](../fixtures/SHOT-LIST.md#4-color-chart-session)).
 - Assisted detection (click 4 corners, client refines); automatic later. Patch means from the central 50%, with glare rejected by std.
 - Reference values with source and edition in `data/charts/`.
 
