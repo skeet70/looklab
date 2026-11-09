@@ -238,10 +238,28 @@ jobs:
             target/release/build
             target/release/.fingerprint
 
+  browser_errors:
+    name: browser error reporting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          fixtures: "false"
+      - name: Browser error capture and privacy
+        run: |
+          PLAYWRIGHT_MODULE="$(nix eval --raw nixpkgs#playwright-driver)/index.mjs"
+          PLAYWRIGHT_BROWSERS_PATH="$(nix eval --raw nixpkgs#playwright-driver.browsers)"
+          export PLAYWRIGHT_MODULE PLAYWRIGHT_BROWSERS_PATH
+          for browser in chromium firefox; do
+            nix develop -c node site/checks/client-errors.mjs --browser "$browser"
+          done
+
   ci:
     name: ci
     if: always()
-    needs: [lint, native, wasm_release, trust_targeted]
+    needs: [lint, native, wasm_release, trust_targeted, browser_errors]
     runs-on: ubuntu-latest
     steps:
       - name: Require every lane to succeed
@@ -250,9 +268,10 @@ jobs:
           NATIVE: ${{ needs.native.result }}
           WASM_RELEASE: ${{ needs.wasm_release.result }}
           TRUST_TARGETED: ${{ needs.trust_targeted.result }}
+          BROWSER_ERRORS: ${{ needs.browser_errors.result }}
         run: |
           failed=0
-          for lane in "lint=$LINT" "native=$NATIVE" "wasm release=$WASM_RELEASE" "trust targeted=$TRUST_TARGETED"; do
+          for lane in "lint=$LINT" "native=$NATIVE" "wasm release=$WASM_RELEASE" "trust targeted=$TRUST_TARGETED" "browser errors=$BROWSER_ERRORS"; do
             result=${lane#*=}
             if [ "$result" != success ]; then
               echo "::error::${lane%%=*} lane result: $result"

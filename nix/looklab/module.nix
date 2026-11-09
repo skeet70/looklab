@@ -324,6 +324,7 @@ in
 
     environment.systemPackages = [
       cfg.cli.package
+      cfg.server.package
       pkgs.curl
       pkgs.sqlite
       pkgs.litestream

@@ -22,7 +22,7 @@ UI build directories can contain `stub-state/`, including a local database and s
 
 ## Build pipelines
 
-CI has independent `lint`, `native`, `wasm release` and targeted trust-policy lanes. The required `ci` check succeeds only when every required lane succeeds. Compact real fitter-to-trust integration runs in the **Pre-release integration** workflow on `v*` tags or manual dispatch, not on ordinary pushes and pull requests. Native tests explicitly enable `looklab-fit/synth`. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
+CI has independent `lint`, `native`, `wasm release`, targeted trust-policy and browser error-reporting lanes. The required `ci` check succeeds only when every required lane succeeds. Compact real fitter-to-trust integration runs in the **Pre-release integration** workflow on `v*` tags or manual dispatch, not on ordinary pushes and pull requests. Native tests explicitly enable `looklab-fit/synth`. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
 
 Native CI sets `CARGO_PROFILE_TEST_OPT_LEVEL=3` for the workspace test command and its compiler-cache restore/save steps. Debug assertions and overflow checks remain enabled. The override does not affect Pages, WASM product builds or the local default test profile. Local numerical tests can use the same override through `nix develop -c env CARGO_PROFILE_TEST_OPT_LEVEL=3 cargo test -p looklab-fit --features synth`.
 
@@ -200,6 +200,12 @@ The Pages workflow remains a serverless preview by default; repository variable 
 After the first person registers a passkey, grant the first admin with the packaged operator CLI: `looklab admin grant --db <path> --subject <internal-id> --role admin --reason "first admin bootstrap"` (the server binary also offers `bootstrap-admin --config <path> --credential <internal-id>`, or `--display-handle <name>` when exactly one active credential matches). The command writes the grant and its audit entry atomically; there is no unauthenticated grant endpoint. Set `origin` and `rp_id` to the final public hostname before inviting anyone, because passkeys are bound to the RP ID. DNS, TLS and host provisioning are operator steps, not repository actions.
 
 Full volumes, environment variables, domain steps, sizing, smoke commands and restart checks are in [docs/ops/deployment.md](docs/ops/deployment.md). Litestream replication is in [docs/ops/litestream.md](docs/ops/litestream.md).
+
+## Web-app error visibility
+
+Server-backed builds automatically report browser console errors, uncaught exceptions, unhandled promise rejections and worker failures to a private, bounded diagnostic store. Reports identify the client build, route category and application code locations, without sending error messages, console arguments, photo data or private URLs. Serverless previews send nothing.
+
+Read recent failures with `looklab-server client-errors --config /etc/looklab/looklab.toml --limit 50`, adding `--json` or `--release <build-id>` for agent use. Host database access is required; there is no public read API. See [operator commands and limits](docs/ops/deployment.md#browser-error-diagnostics) and the [privacy contract](docs/06-privacy-and-payload.md#11-automatic-error-diagnostics).
 
 ## Design docs
 

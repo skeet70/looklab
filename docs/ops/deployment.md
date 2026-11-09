@@ -160,7 +160,9 @@ ssh root@<ip> 'nix-env --rollback -p /nix/var/nix/profiles/system \
   && /nix/var/nix/profiles/system/bin/switch-to-configuration switch'
 ```
 
-GRUB keeps the previous generations on the ESP; `boot.loader.timeout = 5` gives five seconds at boot to pick an older entry. A rollback restores binaries, the unit files and the generated config, but not the state directory, so a migration that already ran stays applied. Trigger a VPS backup in the OVH panel before a release that changes the schema.
+GRUB keeps the previous generations on the ESP; `boot.loader.timeout = 5` gives five seconds at boot to pick an older entry. A rollback restores binaries, the unit files and the generated config, but not the state directory, so a migration that already ran stays applied. Check database migration compatibility before starting an older binary.
+
+Routine deployments do not require a new provider snapshot or a manual SQLite backup. Recovery relies on the automatic daily VPS backups, retained NixOS generations and rebuilding derived data. Restoring a daily snapshot can lose changes since that snapshot; that recovery point is accepted for routine deployments.
 
 ## Secrets
 
@@ -250,6 +252,34 @@ It stores state under `${XDG_STATE_HOME:-$HOME/.local/state}/looklab`, increment
 On a local debug build the server idles near 22 MB RSS and peaked at 174 MB after page loads and uploads; an idle worker uses about 15 MB. Worker memory scales with refit batch size: a synthetic 1,000-image Look refit in one batch reached about 2 GB RSS, so a 1 GB host suits small batches and larger refits need more memory. Both share one SQLite file; run exactly one worker process. The worker polls every 5 s, renews its job lease every third of `--lease-seconds`, and reclaims interrupted jobs after the lease expires. Queued jobs live in SQLite and survive restarts; the startup path re-queues requested publications and publishes a missing catalog.
 
 The default worker solve uses the fitter's sweep limit. An explicit `WorkerConfig::sweep_budget` limits total sample evaluations and produces a resumable checkpoint on exhaustion. A fixed 2M-evaluation budget cannot reach final refinement for the 1,000-image fixture after warm-up.
+
+## Browser error diagnostics
+
+For a reported web-app failure, read the private recent reports on the host:
+
+```sh
+sudo -u looklab looklab-server client-errors \
+  --config /etc/looklab/looklab.toml --limit 50
+sudo -u looklab looklab-server client-errors \
+  --config /etc/looklab/looklab.toml --limit 100 --json --release <64-lowercase-hex-build-id>
+```
+
+The command opens the existing database read-only, without migrations. Default limit is 50, accepted range is 1 to 1000, newest first. Output includes UTC receipt time, build SHA-256, route category, error category/type and application asset locations. For WASM, the displayed line and column are function index and byte offset. No error text is collected: use the location and the matching build to find the failing code. Multiple incidents at one location can be deduplicated within a page; report counts are not visitor counts.
+
+The page's `script[src$="errors.js"]` carries `data-release`, a SHA-256 over the page template and emitted application JS/WASM. Preserve the distribution for a deployed build when investigating it. A rebuild with different emitted bytes has a different identifier; the identifier is not a Git revision or an integrity signature.
+
+Intake is `POST /api/client-errors`, 204 on acceptance, 400 on invalid schema, 408 when the configured `body_timeout_seconds` expires, 413 over 16 KiB, 415 without JSON media type and 429 when its global bucket is exhausted. No public GET exists. Requests carry no session token, cookies or referrer; reports contain no exception messages or console arguments. Do not add request-body, IP or authorization logging to troubleshoot this channel.
+
+The private `client_errors` table holds at most 10,000 reports. Inserts delete rows older than 14 days and enforce the count cap atomically; read-only retrieval filters the same time window. On an idle service, expired rows are physically removed by the next insert, not by the CLI. Backups follow their own expiry policy. Serverless previews disable reporting; split-origin builds use `LOOKLAB_API_BASE` and the configured CORS origins.
+
+Run the browser boundary check without a running application or photo fixtures:
+
+```sh
+nix develop -c env \
+  PLAYWRIGHT_MODULE="$(nix eval --raw nixpkgs#playwright-driver)/index.mjs" \
+  PLAYWRIGHT_BROWSERS_PATH="$(nix eval --raw nixpkgs#playwright-driver.browsers)" \
+  node site/checks/client-errors.mjs
+```
 
 ## Readiness and smoke checks
 

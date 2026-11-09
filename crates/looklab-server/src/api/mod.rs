@@ -4,6 +4,7 @@ pub mod admin;
 pub mod auth;
 pub mod bounties;
 pub mod cards;
+pub mod client_errors;
 pub mod manual;
 pub mod moderation;
 pub mod passkey;
