@@ -282,6 +282,8 @@ The model serializes as `crm.json`:
 
 Monochrome preparation keeps all three JPEG output channels, the declared output colour space, density weights, flags and shared re-render grouping. Mixed colour/Acros/Sepia groups reuse one RAW decode, input sample set and shuffle. Prep version 2 samples each JPEG through its own validated alignment at the shared RAW-selected points; version 1 reused the reference JPEG's mapping for every member. The sample container remains version 1. No source image or RAW hash is added to the payload.
 
+Prep version 3 rejects explicit JPEG ICC profiles that bounded profile-name identification cannot recognize as sRGB or Adobe RGB. Numbered ICC chunks must form one complete profile; its declared size, `acsp` signature and RGB header must agree, and every nonempty description must identify the same supported space. This is not general ICC validation or colour-space conversion. With no ICC profile, the existing EXIF and missing-profile policy applies. The preparation version and module identity change; historical payload verification uses the matching historical module.
+
 ### 2.2 Sample blob format (version 1)
 Little-endian. The body is zstd-compressed.
 

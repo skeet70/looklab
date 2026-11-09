@@ -27,12 +27,15 @@ const BUILD_ID_TABLE: &[u8] = concat!(
     env!("CARGO_PKG_VERSION"),
     "\0ll_alloc\0ll_free\0ll_call\0",
     "version\0prepare\0build_manifest\0build_send_manifest\0encode_envelope\0solve_pow\0parse_envelope\0",
-    "abi=1\0prep=2",
+    "abi=1",
 )
 .as_bytes();
 
 pub fn build_id() -> [u8; 32] {
-    let digest = Sha256::digest(BUILD_ID_TABLE);
+    let mut hasher = Sha256::new();
+    hasher.update(BUILD_ID_TABLE);
+    hasher.update(PREP_VERSION.to_le_bytes());
+    let digest = hasher.finalize();
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&digest);
     bytes
