@@ -3171,18 +3171,6 @@ async fn site_body(make: &str, model: &str) -> Result<SiteBody, SiteBodyError> {
         .ok_or_else(|| {
             SiteBodyError::Unavailable(format!("the site data has no camera for {make} {model}"))
         })?;
-    if !summary.preparation.is_ready() {
-        let detail = match summary.preparation.blocker {
-            Some(looklab_publish::PreparationBlocker::InputTransformMissing) => {
-                "its input transform is not published, so its photos cannot be measured yet"
-            }
-            None => "it is not ready for measured contributions yet",
-        };
-        return Err(SiteBodyError::Unavailable(format!(
-            "{} {} is in the camera catalog, but {detail}. See the camera page for status.",
-            summary.make, summary.model
-        )));
-    }
     let page = data::body(summary.id.make(), summary.id.model())
         .await
         .map_err(SiteBodyError::Transient)?;
@@ -4441,20 +4429,6 @@ mod tests {
         let settings = group_settings_for(&restored, &[], 0).expect("settings");
         assert_eq!(settings.controls[0].source, SettingSource::Reproduced);
         assert_eq!(settings.controls[1].source, SettingSource::Reproduced);
-    }
-
-    #[test]
-    fn an_unavailable_camera_blocks_the_batch() {
-        let mut reading = reading("a.raf", "fujifilm", "x-s10", "provia", 0);
-        apply_site_error(
-            &mut reading,
-            &SiteBodyError::Unavailable("its input transform is not published".to_owned()),
-        );
-        assert!(!reading.ready);
-        assert_eq!(
-            reading.blocked.as_deref(),
-            Some("its input transform is not published")
-        );
     }
 
     #[test]

@@ -67,14 +67,9 @@ pub fn BodyDetail() -> impl IntoView {
 fn ManualOnlyView(manual: ManualPage) -> impl IntoView {
     let make = manual.make.clone();
     let model = manual.model.clone();
-    let ready = manual.preparation.is_ready();
     view! {
         <h1>{format!("{make} {model}")}</h1>
-        <p class="lede">{if ready {
-            "This camera has documented guidance from its official manual."
-        } else {
-            "This camera has documented guidance from its official manual, but no contribution support yet."
-        }}</p>
+        <p class="lede">"This camera has documented guidance from its official manual. Contributions require a published camera control schema."</p>
         <ManualSection manual/>
     }
 }
@@ -142,9 +137,7 @@ fn BodyDetailView(body: BodyPage, manual: Option<ManualPage>) -> impl IntoView {
                 return view! {
                     <p class="muted">"No looks are published yet. Look previews and settings for this camera appear here once looks are published."</p>
                     <p class="field-row">
-                        {ready.then(|| view! {
-                            <a href=crate::base::site_url("/contribute")>"Share photos from this camera"</a>
-                        })}
+                        <a href=crate::base::site_url("/contribute")>"Share photos from this camera"</a>
                         <a href=crate::base::site_url("/about/how-it-works")>"How looks are made →"</a>
                     </p>
                 }.into_any();
@@ -279,16 +272,18 @@ fn BodyDetailView(body: BodyPage, manual: Option<ManualPage>) -> impl IntoView {
             <EpochDifferences epochs=body.epochs.clone()/>
         </section>
         </ui::Disclosure>
-        {manual.map(|manual| view! { <ManualSection manual/> })}
+        {manual.map(|manual| view! { <ManualSection manual contribution_supported=true/> })}
     }
 }
 
 #[component]
-fn ManualSection(manual: ManualPage) -> impl IntoView {
+fn ManualSection(
+    manual: ManualPage,
+    #[prop(default = false)] contribution_supported: bool,
+) -> impl IntoView {
     let sources = manual.sources.clone();
     let capabilities = manual.capabilities.clone();
-    let upload_support = manual.preparation.is_ready();
-    let standalone = !upload_support;
+    let standalone = !contribution_supported;
     let form_manual = manual.clone();
     let ready_manual = manual.clone();
     let moderation_manual = manual.clone();
@@ -420,11 +415,11 @@ fn ManualSection(manual: ManualPage) -> impl IntoView {
             }}
             <p class="muted">"From official manuals and firmware notes. Owner-confirmed corrections are shown separately from the manual claim. Documentation does not imply RAW decoding, contribution support or fit eligibility."</p>
             <p class="muted">"Owner agreement counts profiles linked to this camera by contribution metadata. Unlinked checks are saved but do not count toward confirmation."</p>
-            {if upload_support {
+            {if contribution_supported {
                 ().into_any()
             } else {
                 view! {
-                    <p class="notice">"Contribution support is not available for this camera yet. You can still check the documented settings below."</p>
+                    <p class="notice">"Contributions require a published camera control schema. You can still check the documented settings below."</p>
                 }.into_any()
             }}
             <h3>"Sources"</h3>
@@ -461,7 +456,7 @@ fn ManualSection(manual: ManualPage) -> impl IntoView {
             {crate::data::moderation_session_open().then(|| view! {
                 <ManualModerationPanel manual=moderation_manual summary=summary/>
             })}
-            {upload_support.then(|| view! {
+            {contribution_supported.then(|| view! {
                 <StandaloneConfirmation manual=ready_manual summary=summary measured_contributions=true/>
             })}
             {standalone.then(|| view! {

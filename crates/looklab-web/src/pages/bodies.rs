@@ -119,7 +119,6 @@ pub fn BodiesPage() -> impl IntoView {
                                 manual.confirmed_controls,
                                 manual.contradicted_controls,
                             )}</p>
-                            <p class="muted">{if manual.preparation.is_ready() { "Contribution support available" } else { "Contribution support not available yet" }}</p>
                         });
                         view! {
                             <article class="camera-card">

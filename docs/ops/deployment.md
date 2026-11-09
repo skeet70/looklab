@@ -60,7 +60,7 @@ sudo -u looklab looklab publish --db /var/lib/looklab/looklab.sqlite3 --blobs /v
   --transforms /var/lib/looklab/data/transforms --out /var/lib/looklab/site
 ```
 
-Camera processing also requires `data/transforms/<make>-<model>.yaml`. The shipped X-S10 and X-T4 files contain DNG ColorMatrix endpoints extracted from the licensed or authorized local sources; they are input priors, not native Look measurements or root admissions. Body/schema YAML alone does not supply that calibration.
+Server-side colour fitting requires `data/transforms/<make>-<model>.yaml`. Browser preparation uses the RAW's local camera matrices, so a missing server prior does not block camera discovery or contribution admission. Local decoder, matrix and published control-schema checks still apply. The shipped X-S10 and X-T4 files contain DNG ColorMatrix endpoints extracted from the licensed or authorized local sources; they are input priors, not native Look measurements or root admissions.
 
 For another camera, `looklab prep --raw <RAW> --jpeg <JPEG> --out <private-directory>` emits a `transform.yaml` from the RAW's DNG profile. Review its body and version, then install that file under the worker's transform directory with the body's filename. Keep the photographs, samples and sensitive seed file private. Scoring fails when a required camera prior is absent; it does not substitute an identity matrix.
 
