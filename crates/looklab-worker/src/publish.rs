@@ -482,10 +482,7 @@ async fn load_manuals(
         }
         let catalog = looklab_schema::merge_manual_catalogs(catalogs)
             .map_err(|errors| WorkerError::Data(format!("{path:?}: {errors:?}")))?;
-        (
-            catalog,
-            looklab_schema::manual_catalog_files_digest(&files),
-        )
+        (catalog, looklab_schema::manual_catalog_files_digest(&files))
     } else if path.is_file() {
         let source = std::fs::read_to_string(path)?;
         let catalog = looklab_schema::validate_manual_catalog(&source)
@@ -708,10 +705,10 @@ fn manual_audit_event(kind: &str, payload: &serde_json::Value) -> Result<Option<
             let Some(scope) = payload.get("firmware_scope") else {
                 return Ok(None);
             };
-            let firmware_scope =
-                serde_json::from_value::<ModeratorFirmwareScope>(scope.clone()).map_err(
-                    |error| WorkerError::Data(format!("manual moderator firmware scope: {error}")),
-                )?;
+            let firmware_scope = serde_json::from_value::<ModeratorFirmwareScope>(scope.clone())
+                .map_err(|error| {
+                    WorkerError::Data(format!("manual moderator firmware scope: {error}"))
+                })?;
             let evidence = text(payload, "evidence_kind")
                 .and_then(|value| value.parse::<ModeratorEvidenceKind>().ok())
                 .ok_or_else(|| {

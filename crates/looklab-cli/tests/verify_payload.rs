@@ -2393,8 +2393,7 @@ fn manual_confirmation(fixture: &Fixture) -> looklab_schema::ManualConfirmation 
         version: looklab_schema::MANUAL_CONFIRMATION_VERSION,
         camera: camera.id.clone(),
         camera_digest: camera.definition_digest(),
-        firmware: looklab_schema::ReportedFirmware::new(CONFIRMATION_FIRMWARE)
-            .expect("firmware"),
+        firmware: looklab_schema::ReportedFirmware::new(CONFIRMATION_FIRMWARE).expect("firmware"),
         scope: looklab_schema::ConfirmationScope::Controls { keys: vec![key] },
         observations: vec![looklab_schema::ControlObservation {
             key,
@@ -2411,7 +2410,9 @@ fn confirmation_send(
     let digest = confirmation.digest();
     let send = SendManifest::canonical_with_attestations(
         vec![manifest_hash(&site.manifest)],
-        vec![looklab_upload::AttestationHash::from_bytes(*digest.as_bytes())],
+        vec![looklab_upload::AttestationHash::from_bytes(
+            *digest.as_bytes(),
+        )],
     )
     .expect("send manifest");
     let challenge = Challenge::for_send(&site.nonce, &send_manifest_hash(&send));
@@ -2485,7 +2486,11 @@ fn manual_confirmation_request_is_bound_to_the_send() {
             .get("https://looklab.test/status/abc123")
             .json(),
     );
-    let (success, output) = run(fixture, &[har.as_path()], &state_path("manual-confirmation"));
+    let (success, output) = run(
+        fixture,
+        &[har.as_path()],
+        &state_path("manual-confirmation"),
+    );
     assert!(success, "the bound confirmation does not verify: {output}");
     assert!(output.contains("REVIEW NEEDED"), "{output}");
     assert!(output.contains(CONFIRMATION_FIRMWARE), "{output}");
@@ -2494,7 +2499,9 @@ fn manual_confirmation_request_is_bound_to_the_send() {
         "the camera definition digest is not printed: {output}"
     );
     assert!(
-        output.contains(&hex(confirmation.observations[0].definition_digest.as_bytes())),
+        output.contains(&hex(confirmation.observations[0]
+            .definition_digest
+            .as_bytes())),
         "the observation definition digest is not printed: {output}"
     );
     assert!(
@@ -2520,7 +2527,10 @@ fn manual_confirmation_request_is_bound_to_the_send() {
         &[har.as_path()],
         &state_path("manual-confirmation-altered"),
     );
-    assert!(!success, "an altered confirmation must not verify: {output}");
+    assert!(
+        !success,
+        "an altered confirmation must not verify: {output}"
+    );
 
     let mut extra: Value = serde_json::from_slice(&body).expect("confirmation body");
     extra["unbound"] = json!(true);
@@ -2621,7 +2631,10 @@ fn declared_confirmation_payload_is_printed_for_review() {
             .json(),
     );
     let (success, output) = run_minimal(fixture, har.as_path(), &state_path("declared-payload"));
-    assert!(success, "the declared confirmation does not verify: {output}");
+    assert!(
+        success,
+        "the declared confirmation does not verify: {output}"
+    );
     assert!(output.contains("REVIEW NEEDED"), "{output}");
     assert!(output.contains(encoded_firmware), "{output}");
     assert!(output.contains(encoded_value), "{output}");
@@ -2707,7 +2720,9 @@ fn attestation_only_har_verifies_without_a_photo_upload() {
     let digest = confirmation.digest();
     let send = SendManifest::canonical_with_attestations(
         Vec::new(),
-        vec![looklab_upload::AttestationHash::from_bytes(*digest.as_bytes())],
+        vec![looklab_upload::AttestationHash::from_bytes(
+            *digest.as_bytes(),
+        )],
     )
     .expect("send manifest");
     let challenge = Challenge::for_send(&site.nonce, &send_manifest_hash(&send));
@@ -2737,7 +2752,9 @@ fn attestation_only_har_verifies_without_a_photo_upload() {
 
     let batch_declared = SendManifest::canonical_with_attestations(
         vec![manifest_hash(&site.manifest)],
-        vec![looklab_upload::AttestationHash::from_bytes(*digest.as_bytes())],
+        vec![looklab_upload::AttestationHash::from_bytes(
+            *digest.as_bytes(),
+        )],
     )
     .expect("send manifest");
     let challenge = Challenge::for_send(&site.nonce, &send_manifest_hash(&batch_declared));
@@ -2777,7 +2794,9 @@ fn supplied_photos_without_an_upload_are_rejected() {
     let digest = confirmation.digest();
     let send = SendManifest::canonical_with_attestations(
         Vec::new(),
-        vec![looklab_upload::AttestationHash::from_bytes(*digest.as_bytes())],
+        vec![looklab_upload::AttestationHash::from_bytes(
+            *digest.as_bytes(),
+        )],
     )
     .expect("send manifest");
     let challenge = Challenge::for_send(&site.nonce, &send_manifest_hash(&send));
@@ -2908,10 +2927,7 @@ fn withdrawal_har_is_recognized_and_bound_to_the_camera() {
             .json(),
     );
     let (success, output) = run_minimal(fixture, har.as_path(), &state_path("withdrawal-escaped"));
-    assert!(
-        !success,
-        "an escaped withdrawal must not verify: {output}"
-    );
+    assert!(!success, "an escaped withdrawal must not verify: {output}");
 
     let data = fixture.dir.join("data-without-manuals");
     let _ = std::fs::remove_dir_all(&data);

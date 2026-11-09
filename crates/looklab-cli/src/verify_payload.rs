@@ -28,16 +28,14 @@ use looklab_schema::{
 use looklab_server::body_schema::{Bodies, BodyRecord, resolve_epoch, validate_settings};
 use looklab_server::{RequestDomain, StatusToken, request_digest};
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge,
-    CommunitySnapshotVersion, ContributionKind, ControlEntry, ControlKey, ControlSettings,
-    DEFAULT_MAX_ATTESTATIONS, DEFAULT_MAX_BATCHES, Envelope, EnvelopeParts, ExpectedAssertion,
-    FirmwareId, FirmwareVersion, FirmwareVersionString, Intent, Limits, LookSlug,
-    ManualWithdrawalRequest, ManifestHash, ManifestImage, ManifestMetadata,
-    MonochromeAuthorization, Nonce, PowParams,
-    RawSerial as UploadSerial, RenderClass, SendManifest, SignatureAlgorithm, StepIndex,
-    StructuralVerdict, TopOriginReview, WebAuthnAssertion, canonical_send_manifest_bytes,
-    check_structure, encode_envelope, parse_envelope_strict, send_manifest_hash,
-    verify as verify_pow,
+    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion,
+    ContributionKind, ControlEntry, ControlKey, ControlSettings, DEFAULT_MAX_ATTESTATIONS,
+    DEFAULT_MAX_BATCHES, Envelope, EnvelopeParts, ExpectedAssertion, FirmwareId, FirmwareVersion,
+    FirmwareVersionString, Intent, Limits, LookSlug, ManifestHash, ManifestImage, ManifestMetadata,
+    ManualWithdrawalRequest, MonochromeAuthorization, Nonce, PowParams, RawSerial as UploadSerial,
+    RenderClass, SendManifest, SignatureAlgorithm, StepIndex, StructuralVerdict, TopOriginReview,
+    WebAuthnAssertion, canonical_send_manifest_bytes, check_structure, encode_envelope,
+    parse_envelope_strict, send_manifest_hash, verify as verify_pow,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -548,9 +546,7 @@ fn load_manual_catalog(data: &Path) -> Result<ManualCatalog> {
         );
     }
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(&root)
-        .with_context(|| format!("reading {}", root.display()))?
-    {
+    for entry in std::fs::read_dir(&root).with_context(|| format!("reading {}", root.display()))? {
         let entry = entry.with_context(|| format!("reading {}", root.display()))?;
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("yaml") {
@@ -1383,7 +1379,10 @@ fn print_manual_confirmation(
             SchemaFinding::Matches => {
                 findings.note("        finding: matches the documented options".to_owned());
             }
-            SchemaFinding::Corrected { availability, domain } => {
+            SchemaFinding::Corrected {
+                availability,
+                domain,
+            } => {
                 findings.note(format!(
                     "        finding: corrected, availability {availability}"
                 ));
@@ -1458,9 +1457,8 @@ fn parse_confirmation(request: &HarRequest, findings: &mut Findings) -> Option<P
         return None;
     };
     let Some(authenticator_data) = decode_confirmation_field(&body.authenticator_data, 512) else {
-        findings.fail(
-            "the manual confirmation's authenticator data is not base64url within 512 bytes",
-        );
+        findings
+            .fail("the manual confirmation's authenticator data is not base64url within 512 bytes");
         return None;
     };
     let Some(client_data_json) = decode_confirmation_field(&body.client_data_json, 1024) else {
@@ -1488,9 +1486,7 @@ fn parse_confirmation(request: &HarRequest, findings: &mut Findings) -> Option<P
         findings.fail("the manual confirmation's send manifest is not canonical");
         return None;
     }
-    if let Err(error) =
-        send_manifest.validate(DEFAULT_MAX_BATCHES, DEFAULT_MAX_ATTESTATIONS)
-    {
+    if let Err(error) = send_manifest.validate(DEFAULT_MAX_BATCHES, DEFAULT_MAX_ATTESTATIONS) {
         findings.fail(format!(
             "the manual confirmation's send manifest is invalid: {error}"
         ));
@@ -1578,15 +1574,13 @@ fn audit_withdrawal(
         );
         return;
     };
-    let Some(authenticator_data) = decode_confirmation_field(&body.authenticator_data, 512)
-    else {
+    let Some(authenticator_data) = decode_confirmation_field(&body.authenticator_data, 512) else {
         findings.fail(
             "the manual confirmation withdrawal's authenticator data is not base64url within 512 bytes",
         );
         return;
     };
-    let Some(client_data_json) = decode_confirmation_field(&body.client_data_json, 1024)
-    else {
+    let Some(client_data_json) = decode_confirmation_field(&body.client_data_json, 1024) else {
         findings.fail(
             "the manual confirmation withdrawal's client data is not base64url within 1024 bytes",
         );
