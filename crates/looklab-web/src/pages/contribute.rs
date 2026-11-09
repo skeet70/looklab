@@ -957,6 +957,8 @@ pub fn ContributePage() -> impl IntoView {
     let prefill_ledger = StoredValue::new_local(PrefillLedger::default());
     let worker_count = RwSignal::new(default_worker_count());
     let processed = RwSignal::new(Vec::<ProcessedGroup>::new());
+    let preparation_ready =
+        move || furthest.get().0 >= 3 && processed.with(|groups| !groups.is_empty());
     let completed = RwSignal::new(Vec::<BatchId>::new());
     let seeds = RwSignal::new(Vec::<SeedRow>::new());
     let coverage = RwSignal::new(None::<CoverageMap>);
@@ -1798,7 +1800,11 @@ pub fn ContributePage() -> impl IntoView {
             })
             locked=Signal::derive(move || busy.get() || draft_complete.get())
             finished=Signal::derive(move || draft_complete.get())
-            can_advance=Signal::derive(move || !busy.get() && matches!(stage.get(), Stage::Inspector))
+            can_advance=Signal::derive(move || {
+                !busy.get()
+                    && (matches!(stage.get(), Stage::Inspector)
+                        || (stage.get() == Stage::Processing && preparation_ready()))
+            })
         />
         {move || (stage.get() != Stage::Send).then(|| message.get()).flatten().map(|text| view! { <p class="notice" role="status">{text}</p> })}
         {move || draft_unavailable.get().then(|| view! {
@@ -1964,16 +1970,26 @@ pub fn ContributePage() -> impl IntoView {
         </section>
 
         <section class="step" hidden=move || stage.get() != Stage::Processing>
-            <h2>"Processing on this device"</h2>
+            <h2>"Local preparation"</h2>
             {move || {
-                let done = processed.get().len();
-                let total = plan.with(|plan| plan.as_ref().map(|plan| plan.groups.len()).unwrap_or(0)).max(1);
-                view! {
-                    <p role="status">{format!("Processing photo {} of {total}", (done + 1).min(total))}</p>
-                    <progress aria-label="Processing photos" value=done.to_string() max=total.to_string()></progress>
+                if busy.get() {
+                    let done = processed.with(Vec::len);
+                    let total = plan.with(|plan| plan.as_ref().map(|plan| plan.groups.len()).unwrap_or(0)).max(1);
+                    view! {
+                        <p role="status">{format!("Processing photo {} of {total}", (done + 1).min(total))}</p>
+                        <progress aria-label="Processing photos" value=done.to_string() max=total.to_string()></progress>
+                        <p>"Extracting samples locally. Your photos stay on this device."</p>
+                    }.into_any()
+                } else if preparation_ready() {
+                    view! {
+                        <p role="status">"Local preparation is complete."</p>
+                    }.into_any()
+                } else {
+                    view! {
+                        <p role="status">"Preparation is incomplete. Return to Check groups to try again."</p>
+                    }.into_any()
                 }
             }}
-            <p>"Extracting samples locally. Your photos stay on this device."</p>
             {move || coverage.get().map(|map| view! { <CoverageMapView map/> })}
         </section>
         <section class="step" hidden=move || stage.get() != Stage::Inspector>
