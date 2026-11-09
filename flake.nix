@@ -64,7 +64,7 @@
           fi
           export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$looklab_build_root/target}"
           export LOOKLAB_UI_TARGET_DIR="''${LOOKLAB_UI_TARGET_DIR:-$looklab_build_root/target-ui}"
-          unset looklab_git_dir looklab_build_root
+          unset looklab_git_dir looklab_build_root looklab_checkout looklab_cache looklab_local looklab_cargo_root looklab_ui_root
         '';
       in
       {
@@ -79,6 +79,29 @@
         # cargo-fuzz needs a nightly compiler for sanitizer instrumentation.
         devShells.fuzz = pkgs.mkShell {
           buildInputs = [ nightly pkgs.cargo-fuzz pkgs.git ];
+          looklab_build_root=$(realpath -m -- "$looklab_build_root")
+          if [ -z "''${LOOKLAB_ISOLATED_BUILD_OWNER:-}" ]; then
+            looklab_cargo_root=$(realpath -m -- "''${CARGO_TARGET_DIR:-$looklab_build_root/target}")
+            looklab_ui_root=$(realpath -m -- "''${LOOKLAB_UI_TARGET_DIR:-$looklab_build_root/target-ui}")
+            if { [ "$looklab_cargo_root" != "$looklab_build_root/target" ] &&
+                 [ "$looklab_cargo_root" != "$looklab_build_root/target-ui" ]; } ||
+               [ "$looklab_ui_root" != "$looklab_build_root/target-ui" ]; then
+              printf '%s\n' 'looklab: inherited build roots differ from the shared checkout. Unset CARGO_TARGET_DIR and LOOKLAB_UI_TARGET_DIR; exceptional isolated builds require LOOKLAB_ISOLATED_BUILD_OWNER.' >&2
+              exit 75
+            fi
+            looklab_checkout=$(git rev-parse --show-toplevel 2>/dev/null || printf '%s\n' "$PWD")
+            if [ "$(realpath -m -- "$looklab_checkout")" != "$looklab_build_root" ]; then
+              for looklab_cache in target target-ui; do
+                looklab_local="$looklab_checkout/$looklab_cache"
+                if [ -d "$looklab_local" ] &&
+                   [ "$(realpath -m -- "$looklab_local")" != "$looklab_build_root/$looklab_cache" ] &&
+                   [ "$(find -H "$looklab_local" -mindepth 1 -maxdepth 1 -printf x -quit)" = x ]; then
+                  printf 'looklab: linked checkout contains local build storage at %s. Preserve databases, source and unmerged work; review its retirement or name an exceptional LOOKLAB_ISOLATED_BUILD_OWNER before building.\n' "$looklab_local" >&2
+                  exit 75
+                fi
+              done
+            fi
+          fi
           shellHook = buildShellHook;
         };
       });

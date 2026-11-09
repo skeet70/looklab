@@ -13,6 +13,7 @@ For anyone (human or agent) implementing looklab. Read [README](README.md) and t
 - Every delegated task must include this storage policy and cleanup ownership in its instructions. The integration owner is responsible for cleanup after merging or abandoning the task.
 - After integration, stop the task's builds and services, remove every isolated build/cache directory the task created, and remove its clean worktree with `git worktree remove <path>`. Check for uncommitted and untracked work first; never force-remove a worktree or delete unmerged work.
 - An exceptional isolated build directory must have a named owner and be removed when its command finishes, including on failure. Do not leave it until the next session.
+- Do not copy build roots into a worktree. Current `nix develop` rejects unowned inherited targets and copied local target storage; name any exceptional owner with `LOOKLAB_ISOLATED_BUILD_OWNER`. In older topic checkouts use the current main checkout's shell explicitly: `nix develop /absolute/main/checkout#default -c COMMAND`.
 - Never delete shared build roots while another task uses them. UI target roots can contain `stub-state/`, including a database and server secret; preserve that state before retiring a UI root.
 
 ## Rust conventions
