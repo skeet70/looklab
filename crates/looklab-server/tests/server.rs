@@ -6247,3 +6247,264 @@ async fn startup_requests_metadata_publication_without_looks() {
         .expect("publication row");
     assert!(generation >= 1);
 }
+
+fn client_error_report(release: &str) -> Value {
+    json!({
+        "version": 1,
+        "kind": "console_error",
+        "error_type": "TypeError",
+        "page": "home",
+        "release": release,
+        "frames": [{"asset": "pkg/looklab-site.js", "line": 123, "column": 45}],
+    })
+}
+
+async fn post_client_error(app: &Router, body: Vec<u8>) -> StatusCode {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/client-errors")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("request");
+    send(app, request).await.0
+}
+
+#[tokio::test]
+async fn client_error_reports_are_accepted_without_a_public_read() {
+    let server = TestServer::start().await;
+    let release = "a".repeat(64);
+    let status = post_client_error(
+        &server.app,
+        serde_json::to_vec(&client_error_report(&release)).expect("json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let rows: Vec<(String, String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT release, kind, error_type, page, frames, received_at FROM client_errors",
+    )
+    .fetch_all(&server.db)
+    .await
+    .expect("client error rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, release);
+    assert_eq!(rows[0].1, "console_error");
+    assert_eq!(rows[0].2, "TypeError");
+    assert_eq!(rows[0].3, "home");
+    assert_eq!(
+        rows[0].4,
+        r#"[{"asset":"pkg/looklab-site.js","line":123,"column":45}]"#
+    );
+    assert!(rows[0].5 > 0);
+    let (status, _, _) = server.get("/api/client-errors").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn client_error_reports_require_json_media_type() {
+    let server = TestServer::start().await;
+    let release = "9".repeat(64);
+    let body = serde_json::to_vec(&client_error_report(&release)).expect("json");
+    for content_type in [
+        None,
+        Some("text/plain"),
+        Some("application/x-www-form-urlencoded"),
+        Some("application/jsonx"),
+        Some("json"),
+        Some("application/json, text/plain"),
+    ] {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/client-errors");
+        if let Some(content_type) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, content_type);
+        }
+        let request = builder.body(Body::from(body.clone())).expect("request");
+        let (status, _, _) = send(&server.app, request).await;
+        assert_eq!(
+            status,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "content type {content_type:?}"
+        );
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM client_errors")
+        .fetch_one(&server.db)
+        .await
+        .expect("client error rows");
+    assert_eq!(stored, 0);
+    for content_type in [
+        "application/json",
+        "application/json; charset=utf-8",
+        "Application/JSON;charset=UTF-8",
+        "application/json ; charset=\"utf-8\"",
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/client-errors")
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body.clone()))
+            .expect("request");
+        let (status, _, _) = send(&server.app, request).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "content type {content_type}");
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM client_errors")
+        .fetch_one(&server.db)
+        .await
+        .expect("client error rows");
+    assert_eq!(stored, 4);
+}
+
+#[tokio::test]
+async fn client_error_reports_accept_every_allowed_asset() {
+    let server = TestServer::start().await;
+    let release = "b".repeat(64);
+    for asset in [
+        "errors.js",
+        "pkg/looklab-site.js",
+        "pkg/looklab-site-0123abcd.wasm",
+        "workers/prep-worker.js",
+        "workers/match-worker.js",
+        "workers/scene-worker.js",
+        "generated/wasm/looklab_prep_module.wasm",
+        "generated/wasm/looklab_scene_module.wasm",
+        "generated/wasm/looklab_match.wasm",
+    ] {
+        let mut value = client_error_report(&release);
+        value["frames"] = json!([{"asset": asset, "line": 0, "column": 0}]);
+        let status = post_client_error(&server.app, serde_json::to_vec(&value).expect("json")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "asset {asset}");
+    }
+    let mut twelve = client_error_report(&release);
+    twelve["frames"] = Value::Array(
+        (0..12)
+            .map(|_| json!({"asset": "pkg/looklab-site.js", "line": 1, "column": 2}))
+            .collect(),
+    );
+    assert_eq!(
+        post_client_error(&server.app, serde_json::to_vec(&twelve).expect("json")).await,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn client_error_reports_reject_invalid_fields_and_assets() {
+    let server = TestServer::start().await;
+    let release = "c".repeat(64);
+    let mut invalid = Vec::new();
+    let mut unknown_field = client_error_report(&release);
+    unknown_field["message"] = json!("private text");
+    invalid.push(unknown_field);
+    let mut unknown_frame_field = client_error_report(&release);
+    unknown_frame_field["frames"][0]["message"] = json!("private text");
+    invalid.push(unknown_frame_field);
+    let mut version = client_error_report(&release);
+    version["version"] = json!(2);
+    invalid.push(version);
+    let mut kind = client_error_report(&release);
+    kind["kind"] = json!("panic");
+    invalid.push(kind);
+    let mut error_type = client_error_report(&release);
+    error_type["error_type"] = json!("UriError");
+    invalid.push(error_type);
+    let mut page = client_error_report(&release);
+    page["page"] = json!("admin");
+    invalid.push(page);
+    let mut uppercase_release = client_error_report(&release);
+    uppercase_release["release"] = json!("A".repeat(64));
+    invalid.push(uppercase_release);
+    let mut short_release = client_error_report(&release);
+    short_release["release"] = json!("a".repeat(63));
+    invalid.push(short_release);
+    let mut too_many_frames = client_error_report(&release);
+    too_many_frames["frames"] = Value::Array(
+        (0..13)
+            .map(|_| json!({"asset": "pkg/looklab-site.js", "line": 1, "column": 2}))
+            .collect(),
+    );
+    invalid.push(too_many_frames);
+    for asset in [
+        "pkg/../errors.js",
+        "pkg/sub/looklab-site.js",
+        "pkg/looklab-site.css",
+        "pkg/",
+        "workers/other-worker.js",
+        "https://looklab.example/pkg/looklab-site.js",
+        "pkg/looklab-site.js?cache=1",
+    ] {
+        let mut value = client_error_report(&release);
+        value["frames"] = json!([{"asset": asset, "line": 1, "column": 2}]);
+        invalid.push(value);
+    }
+    let mut negative_line = client_error_report(&release);
+    negative_line["frames"][0]["line"] = json!(-1);
+    invalid.push(negative_line);
+    let mut overflowing_line = client_error_report(&release);
+    overflowing_line["frames"][0]["line"] = json!(4_294_967_296u64);
+    invalid.push(overflowing_line);
+    for value in invalid {
+        let status =
+            post_client_error(&server.app, serde_json::to_vec(&value).expect("json")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "value {value}");
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM client_errors")
+        .fetch_one(&server.db)
+        .await
+        .expect("client error rows");
+    assert_eq!(stored, 0);
+    assert!(!contains(&log_bytes(), b"private text"));
+}
+
+#[tokio::test]
+async fn oversized_client_error_reports_are_rejected() {
+    let server = TestServer::start().await;
+    let mut body = serde_json::to_vec(&client_error_report(&"d".repeat(64))).expect("json");
+    body.resize(16 * 1024 + 1, b' ');
+    let status = post_client_error(&server.app, body).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM client_errors")
+        .fetch_one(&server.db)
+        .await
+        .expect("client error rows");
+    assert_eq!(stored, 0);
+}
+
+#[tokio::test]
+async fn client_error_reports_share_one_global_quota() {
+    let server = TestServer::start().await;
+    let release = "e".repeat(64);
+    let body = serde_json::to_vec(&client_error_report(&release)).expect("json");
+    let mut accepted = 0i64;
+    let mut rejected = false;
+    for _ in 0..70 {
+        match post_client_error(&server.app, body.clone()).await {
+            StatusCode::NO_CONTENT => accepted += 1,
+            StatusCode::TOO_MANY_REQUESTS => {
+                rejected = true;
+                break;
+            }
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert!(rejected, "the global quota never rejected a report");
+    assert!(accepted >= 60, "only {accepted} reports were admitted");
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM client_errors")
+        .fetch_one(&server.db)
+        .await
+        .expect("client error rows");
+    assert_eq!(stored, accepted);
+}
+
+#[tokio::test]
+async fn client_error_reports_never_reach_the_logs() {
+    let server = TestServer::start().await;
+    let release = "f".repeat(64);
+    let mut value = client_error_report(&release);
+    value["frames"] = json!([{"asset": "generated/wasm/looklab_match.wasm", "line": 7, "column": 9}]);
+    assert_eq!(
+        post_client_error(&server.app, serde_json::to_vec(&value).expect("json")).await,
+        StatusCode::NO_CONTENT
+    );
+    let logs = log_bytes();
+    assert!(!contains(&logs, release.as_bytes()));
+    assert!(!contains(&logs, b"generated/wasm/looklab_match.wasm"));
+    assert!(!contains(&logs, b"console_error"));
+}

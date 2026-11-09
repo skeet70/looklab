@@ -27,6 +27,16 @@
 - RAW or content hashes.
 - File names or paths.
 
+### 1.1 Automatic error diagnostics
+
+Production and local server-backed builds report `console.error`, uncaught exceptions, unhandled promise rejections and failures loading application scripts. The hooks run before WASM boot; prep, match and scene worker failures use the same channel. Serverless preview builds do not send reports.
+
+`POST /api/client-errors` receives a version, closed error category and built-in error type, route category, deterministic client build SHA-256, and at most 12 application script/WASM locations. A location contains an allowlisted asset path and line/column; WASM uses function index and byte offset in those two fields. No free-form messages, console arguments, raw stacks, function names, page URLs, query strings, fragments, private status links, photo metadata, filenames, seeds or identity fields are included. The request omits credentials, cookies and referrer. The server stores its receipt time, not the client's clock or IP.
+
+Diagnostics are JavaScript-generated failure locations, separate from the WASM-produced contribution envelope. They do not pass through the contribution inspector. The HAR verifier continues to flag diagnostic requests as unexpected; it does not certify this channel or silently allow its bytes as a contribution.
+
+Each page attempts at most 20 reports, deduplicates repeated locations and makes no retry or persistent queue. Intake requires JSON, caps bodies at 16 KiB and shares a global in-memory bucket of 60 reports with one token replenished per second. Reports are untrusted client assertions. Private SQLite storage keeps at most 10,000 reports; inserts prune reports older than 14 days. Operator reads exclude expired reports without modifying the database. Expired rows on an idle service and database backups can remain until the next insert or backup expiry. There is no public read endpoint; [operator retrieval](ops/deployment.md#browser-error-diagnostics) requires host database access.
+
 ## 2. What is never uploaded
 
 - Pixels: no thumbnails, previews or crops. RAW files embed full-size preview JPEGs; the client may use them **locally** (e.g. for coverage preselection, [07 §1](07-contribution.md)), and they're never sent.

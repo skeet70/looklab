@@ -29,6 +29,14 @@ const TYPE: &str = "type";
 const MESSAGE: &str = "message";
 const TRAP: &str = "trap";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerMessageKind {
+    Result,
+    Error,
+    ClientError,
+    Other,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkerReply {
     pub bytes: Vec<u8>,
@@ -79,7 +87,11 @@ impl WorkerLink {
         let pending: Rc<RefCell<Option<Function>>> = Rc::new(RefCell::new(None));
         let message_slot = Rc::clone(&pending);
         let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            if let Some(reply) = reply_from(&event.data()) {
+            let data = event.data();
+            let kind = message_kind(&data);
+            if kind == WorkerMessageKind::ClientError {
+                forward_client_error(&data);
+            } else if let Some(reply) = reply_from(kind, &data) {
                 settle(&message_slot, reply);
             }
         });
@@ -197,7 +209,7 @@ impl PrepWorker {
         let script = site_url("/workers/prep-worker.js");
         let module = site_url("/generated/wasm/looklab_prep_module.wasm");
         let link = WorkerLink::spawn(&script)?;
-        link.post(&[("type", "init"), ("url", &module)])?;
+        link.post(&[("type", "init"), ("url", &module), ("diagnostics", "1")])?;
         Ok(Self {
             link,
             files: 0,
@@ -293,7 +305,7 @@ impl MatchWorker {
         let script = site_url("/workers/match-worker.js");
         let module = site_url("/generated/wasm/looklab_match.wasm");
         let link = WorkerLink::spawn(&script)?;
-        link.post(&[("type", "init"), ("url", &module)])?;
+        link.post(&[("type", "init"), ("url", &module), ("diagnostics", "1")])?;
         Ok(Self { link })
     }
 
@@ -334,6 +346,7 @@ pub(crate) async fn prepare_scene(
             "url",
             &site_url("/generated/wasm/looklab_scene_module.wasm"),
         ),
+        ("diagnostics", "1"),
     ])?;
     let reply = link
         .call(SceneOperation::Prepare as u32, png, FILE_TIMEOUT_MS)
@@ -391,14 +404,23 @@ fn settle(slot: &Rc<RefCell<Option<Function>>>, reply: JsValue) {
     }
 }
 
-fn reply_from(data: &JsValue) -> Option<JsValue> {
-    match field_string(data, TYPE).as_deref() {
-        Some("result") => read_reply(data),
-        Some("error") => failure_reply(
+fn message_kind(value: &JsValue) -> WorkerMessageKind {
+    match field_string(value, TYPE).as_deref() {
+        Some("result") => WorkerMessageKind::Result,
+        Some("error") => WorkerMessageKind::Error,
+        Some("client-error") => WorkerMessageKind::ClientError,
+        _ => WorkerMessageKind::Other,
+    }
+}
+
+fn reply_from(kind: WorkerMessageKind, data: &JsValue) -> Option<JsValue> {
+    match kind {
+        WorkerMessageKind::Result => read_reply(data),
+        WorkerMessageKind::Error => failure_reply(
             &field_string(data, MESSAGE).unwrap_or_else(|| "worker error".to_owned()),
             field_bool(data, TRAP),
         ),
-        _ => None,
+        WorkerMessageKind::ClientError | WorkerMessageKind::Other => None,
     }
 }
 
@@ -413,6 +435,20 @@ fn field_bool(value: &JsValue, key: &str) -> bool {
         .ok()
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+}
+
+fn forward_client_error(data: &JsValue) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(handler) = Reflect::get(&window, &JsValue::from_str("__looklabWorkerClientError"))
+    else {
+        return;
+    };
+    let Some(handler) = handler.dyn_ref::<Function>() else {
+        return;
+    };
+    let _ = handler.call1(&JsValue::NULL, data);
 }
 
 fn read_reply(value: &JsValue) -> Option<JsValue> {

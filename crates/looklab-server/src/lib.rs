@@ -6,6 +6,7 @@ mod api;
 mod audit;
 mod blob;
 pub mod body_schema;
+pub mod client_errors;
 mod config;
 mod db;
 mod error;
@@ -63,6 +64,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(api::passkey::register_finish),
         )
         .route("/api/upload", post(api::upload::upload))
+        .route("/api/client-errors", post(api::client_errors::report))
         .route("/api/manuals/{make}/{model}", get(api::manual::page))
         .route(
             "/api/manual-confirmations/{make}/{model}",

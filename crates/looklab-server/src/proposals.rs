@@ -1100,7 +1100,7 @@ fn collect_documents(
     Ok(())
 }
 
-fn rfc3339(seconds: i64) -> String {
+pub(crate) fn rfc3339(seconds: i64) -> String {
     let days = seconds.div_euclid(86_400);
     let time = seconds.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
