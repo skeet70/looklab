@@ -26,10 +26,10 @@ use looklab_publish::{
     BodyPage, BodyUse, CARD_ARTIFACT, ConformanceEntry, CredentialRef, CredentialTier,
     DOCUMENT_ARTIFACT, Decision, ExcludedSim, GateCheck, GateSummary, InputTransformPage,
     LicensePage, LookListing, LookPage, LookRef, LookStatus, LookVersionPage, MatchBundle,
-    MatchSim, PREVIEW_LUT_ARTIFACT, ProposalRef, ProvenanceSummary, RealizationNote, Role, Scene,
-    SimExclusion, SiteData, SitePath, Timestamp, TransformSource, VersionNotes, VersionRef,
-    WeakSpot, bake_lut, bake_preview_lut, body_artifact, bundle_artifact, sim_artifacts,
-    transform_artifact, write_conformance_pack, write_site,
+    MatchSim, PREVIEW_LUT_ARTIFACT, PreparationPage, ProposalRef, ProvenanceSummary,
+    RealizationNote, Role, Scene, SimExclusion, SiteData, SitePath, Timestamp, TransformSource,
+    VersionNotes, VersionRef, WeakSpot, bake_lut, bake_preview_lut, body_artifact, bundle_artifact,
+    sim_artifacts, transform_artifact, write_conformance_pack, write_site,
 };
 use looklab_report::compare::{ComparisonInput, FunctionName, compare};
 use looklab_schema::{BodyId, SimKey, validate_body, validate_control_schema};
@@ -141,6 +141,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let site = SiteData {
         community_snapshot_version: 0,
         bodies,
+        manuals: Vec::new(),
         looks,
         audit_log: AuditLog::new(audit),
         scenes: canonical_scenes()?,
@@ -215,6 +216,7 @@ fn source_body() -> Result<BodyPage, Box<dyn Error>> {
     let schema = validate_control_schema(include_str!("../../../data/bodies/fujifilm-x-t5.yaml"))
         .map_err(|errors| format!("schema: {errors:?}"))?;
     let extras = BodyExtras {
+        preparation: PreparationPage::ready(),
         input_transform: Some(InputTransformPage {
             version: 7,
             source: TransformSource::Chart,
@@ -246,6 +248,7 @@ fn fixture_body() -> Result<BodyPage, Box<dyn Error>> {
     let schema = validate_control_schema(&controls)
         .map_err(|errors| format!("fixture schema: {errors:?}"))?;
     let extras = BodyExtras {
+        preparation: PreparationPage::ready(),
         input_transform: None,
         realization_notes: vec![RealizationNote {
             epoch: None,

@@ -49,6 +49,7 @@ impl Fixture {
             db: self.db.clone(),
             blobs: self.blobs.clone(),
             data: self.data.clone(),
+            manuals: self.data.join("manuals"),
             snapshot_dir: self.data.join("community"),
             transforms: self.transforms.clone(),
             out: self.site.clone(),

@@ -8,15 +8,18 @@
 //! [docs/05 §9](../../docs/05-trust-and-integrity.md),
 //! [docs/06 §5](../../docs/06-privacy-and-payload.md)).
 
+mod confirmation;
 mod envelope;
 pub mod ids;
 mod manifest;
 mod metadata;
+mod moderation;
 mod nonce;
 mod pow;
 mod send;
 pub mod webauthn;
 
+pub use confirmation::{ManualConfirmationRequest, ManualWithdrawalRequest};
 pub use envelope::{
     DEFAULT_MAX_BLOB_BYTES, DEFAULT_MAX_BODY_BYTES, DEFAULT_MAX_IMAGES, DEFAULT_MAX_MANIFEST_BYTES,
     Envelope, EnvelopeError, EnvelopeParts, Limits, MAGIC, ManifestField, VERSION, encode_envelope,
@@ -43,11 +46,12 @@ pub use metadata::{
     MetadataField, MonochromeFilter, NoiseReduction, Saturation, Sharpness, Tagged, WarmCool,
     WhiteBalanceFineTune, WhiteBalanceMode, WhiteBalanceMultipliers, WhiteBalanceShift,
 };
-pub use nonce::{Challenge, ManifestHash, Nonce, SendManifestHash};
+pub use moderation::ManualModeration;
+pub use nonce::{AttestationHash, Challenge, ManifestHash, Nonce, SendManifestHash};
 pub use pow::{POW_K, PowError, PowParams, PowSolutions, solve, verify};
 pub use send::{
-    DEFAULT_MAX_BATCHES, SendManifest, SendManifestError, canonical_send_manifest_bytes,
-    send_manifest_hash,
+    DEFAULT_MAX_ATTESTATIONS, DEFAULT_MAX_BATCHES, SEND_MANIFEST_VERSION, SendManifest,
+    SendManifestError, canonical_send_manifest_bytes, send_manifest_hash,
 };
 pub use webauthn::{
     ClientDataExtra, ExpectedAssertion, ExtensionEntry, Extensions, ReviewValue,

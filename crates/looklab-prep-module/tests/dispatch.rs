@@ -141,6 +141,7 @@ fn envelope_round_trips_through_build_encode_and_parse() {
         &BuildSendManifestRequest {
             nonce,
             manifest_hashes: vec![built.manifest_hash],
+            attestation_hashes: Vec::new(),
         },
         |response| match response {
             Response::BuildSendManifest(send) => send,

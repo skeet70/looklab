@@ -26,6 +26,10 @@ pub(crate) enum AuditKind {
     LookHidden,
     LookRemoved,
     LookRelisted,
+    ManualConfirmation,
+    ManualConfirmationPromotion,
+    ManualConfirmationWithdrawal,
+    ManualModeratorConfirmation,
 }
 
 impl AuditKind {
@@ -47,6 +51,10 @@ impl AuditKind {
             Self::LookHidden => "look_hidden",
             Self::LookRemoved => "look_removed",
             Self::LookRelisted => "look_relisted",
+            Self::ManualConfirmation => "manual_confirmation",
+            Self::ManualConfirmationPromotion => "manual_confirmation_promotion",
+            Self::ManualConfirmationWithdrawal => "manual_confirmation_withdrawal",
+            Self::ManualModeratorConfirmation => "manual_moderator_confirmation",
         }
     }
 }

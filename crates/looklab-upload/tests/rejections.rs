@@ -37,12 +37,14 @@ fn rejects_bad_magic() {
 #[test]
 fn rejects_unsupported_version() {
     let fixture = Fixture::new();
-    let mut bytes = fixture.bytes();
-    write_u16(&mut bytes, fixture.offsets().version, 1);
-    assert!(matches!(
-        parse_error(&bytes, &compact_limits()),
-        EnvelopeError::UnsupportedVersion(1)
-    ));
+    for version in [1, 3] {
+        let mut bytes = fixture.bytes();
+        write_u16(&mut bytes, fixture.offsets().version, version);
+        assert!(matches!(
+            parse_error(&bytes, &compact_limits()),
+            EnvelopeError::UnsupportedVersion(found) if found == version
+        ));
+    }
 }
 
 #[test]

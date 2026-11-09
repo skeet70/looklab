@@ -19,17 +19,21 @@ use looklab_samples::{
     PrepVersion, PriorTransformVersion, RerenderGroupId, SampleFlags, SampleHeader, SampleSet,
 };
 use looklab_schema::{
-    Date, FixtureDonation, FixtureLicense, FixtureUpload, LabeledTag, MakernoteValue, Placement,
-    Sha256Hex, frame_fixture_upload,
+    CapabilityKey, ConfirmationScope, ControlObservation, Date, Finding, FixtureDonation,
+    FixtureLicense, FixtureUpload, LabeledTag, MakernoteValue, ManualCamera, ManualConfirmation,
+    ManualUrl, ModeratorEvidence, ModeratorEvidenceKind, ModeratorFirmwareScope, Placement,
+    ReportedFirmware, Sha256Hex, frame_fixture_upload, validate_manual_catalog,
 };
 use looklab_server::{AppState, Config, PowConfig, router};
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion,
-    ContributionKind, ControlEntry, ControlKey, ControlSettings, EnvelopeParts,
-    FirmwareVersionString, Intent, Limits, ManifestHash, ManifestImage, ManifestMetadata,
-    MonochromeAuthorization, Nonce, PowParams, PowSolutions, RawSerial, RenderClass, SendManifest,
-    SerialHmacKey, SettingSource, SimKey, StepIndex, WebAuthnAssertion, encode_envelope,
-    manifest_hash, parse_render_tag, send_manifest_hash, solve,
+    AttestationHash, BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge,
+    CommunitySnapshotVersion, ContributionKind, ControlEntry, ControlKey, ControlSettings,
+    EnvelopeParts, FirmwareVersionString, Intent, Limits, ManifestHash, ManifestImage,
+    ManifestMetadata, ManualConfirmationRequest, ManualModeration, ManualWithdrawalRequest,
+    MonochromeAuthorization, Nonce, PowParams, PowSolutions, RawSerial, RenderClass,
+    SEND_MANIFEST_VERSION, SendManifest, SerialHmacKey, SettingSource, SimKey, StepIndex,
+    WebAuthnAssertion, canonical_send_manifest_bytes, encode_envelope, manifest_hash,
+    parse_render_tag, send_manifest_hash, solve,
 };
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use serde_json::{Value, json};
@@ -118,6 +122,7 @@ impl TestServer {
             origin: ORIGIN.to_owned(),
             server_secret_path: secret,
             bodies_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies"),
+            manuals_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/manuals"),
             snapshot_dir: community,
             nonce_ttl: Duration::from_secs(300),
             registration_ttl: Duration::from_secs(300),
@@ -136,6 +141,7 @@ impl TestServer {
                 max_images: 8,
                 max_blob_bytes: 1 << 16,
                 max_batches: 8,
+                max_attestations: 8,
             },
         };
         let db_path = config.db_path.clone();
@@ -274,6 +280,14 @@ impl TestServer {
         })
     }
 
+    async fn withdrawal_request(&mut self, camera: &BodyId) -> ManualWithdrawalRequest {
+        let mut signed = self
+            .signed_fields("withdraw-manual-confirmation", camera.as_str().as_bytes())
+            .await;
+        signed["camera"] = json!(camera.as_str());
+        serde_json::from_value(signed).expect("withdrawal request")
+    }
+
     async fn post_signed(
         &mut self,
         path: &str,
@@ -354,6 +368,7 @@ async fn nonce_advertises_the_configured_parent_rp_id() {
         origin: "https://photos.looklab.example".to_owned(),
         server_secret_path: secret,
         bodies_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies"),
+        manuals_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/manuals"),
         snapshot_dir: dir.path().join("community"),
         nonce_ttl: Duration::from_secs(300),
         registration_ttl: Duration::from_secs(300),
@@ -372,6 +387,7 @@ async fn nonce_advertises_the_configured_parent_rp_id() {
             max_images: 8,
             max_blob_bytes: 1 << 16,
             max_batches: 8,
+            max_attestations: 8,
         },
     };
     let state = Arc::new(AppState::new(config).await.expect("state"));
@@ -468,6 +484,33 @@ async fn post_json(app: &Router, path: &str, value: &Value) -> (StatusCode, Valu
         .uri(path)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_vec(value).expect("json")))
+        .expect("request");
+    let (status, _, body) = send(app, request).await;
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+async fn post_confirmation(
+    app: &Router,
+    request: &ManualConfirmationRequest,
+) -> (StatusCode, Value) {
+    post_canonical(app, "/api/manual-confirmations", request.canonical_bytes()).await
+}
+
+async fn post_withdrawal(app: &Router, request: &ManualWithdrawalRequest) -> (StatusCode, Value) {
+    post_canonical(
+        app,
+        "/api/manual-confirmations/withdraw",
+        request.canonical_bytes(),
+    )
+    .await
+}
+
+async fn post_canonical(app: &Router, path: &str, body: Vec<u8>) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
         .expect("request");
     let (status, _, body) = send(app, request).await;
     (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
@@ -1013,12 +1056,12 @@ async fn happy_path_and_status_feed() {
         .await
         .expect("credentials");
     assert_eq!(credentials, 1);
-    let jobs: (String, i64) = sqlx::query_as("SELECT kind, COUNT(*) FROM jobs GROUP BY kind")
-        .fetch_one(&server.db)
-        .await
-        .expect("jobs");
-    assert_eq!(jobs.0, "consistency_score");
-    assert_eq!(jobs.1, 1);
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'consistency_score'")
+            .fetch_one(&server.db)
+            .await
+            .expect("jobs");
+    assert_eq!(jobs, 1);
     let blobs = std::fs::read_dir(&server.blob_dir)
         .expect("blob dir")
         .count();
@@ -1450,11 +1493,12 @@ async fn a_monochrome_batch_is_stored_deferred_with_its_authorization() {
         assert_eq!(filter.as_deref(), Some("yellow"));
     }
 
-    let jobs: Vec<(String,)> = sqlx::query_as("SELECT kind FROM jobs")
-        .fetch_all(&server.db)
-        .await
-        .expect("jobs");
-    assert!(jobs.iter().all(|(kind,)| kind == "hard_delete_blobs"));
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'consistency_score'")
+            .fetch_one(&server.db)
+            .await
+            .expect("jobs");
+    assert_eq!(jobs, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3920,6 +3964,10 @@ async fn proposal_decision_writes_a_validated_snapshot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn approval_requests_a_catalog_publication_without_a_fit() {
     let mut server = TestServer::start().await;
+    let before: i64 = sqlx::query_scalar("SELECT generation FROM publication WHERE id = 1")
+        .fetch_one(&server.db)
+        .await
+        .expect("publication generation");
     let (status, body) = server.upload_valid(None).await;
     assert_eq!(status, StatusCode::CREATED, "upload: {body}");
 
@@ -3942,7 +3990,11 @@ async fn approval_requests_a_catalog_publication_without_a_fit() {
         .fetch_one(&server.db)
         .await
         .expect("publication generation");
-    assert_eq!(generation, 1, "approval records a publication request");
+    assert_eq!(
+        generation,
+        before + 1,
+        "approval records a publication request"
+    );
     let queued: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM jobs WHERE kind = 'publish_site' AND status = 'queued'",
     )
@@ -4710,4 +4762,1376 @@ async fn an_assertion_with_backup_state_but_no_eligibility_is_rejected() {
     let (status, body) = post_json(&server.app, "/api/session", &request).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     assert_eq!(body["error"], "SIGNATURE_INVALID");
+}
+
+fn documented_camera(id: &str) -> ManualCamera {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../data/manuals")
+        .join(format!("{}.yaml", id.replace('/', "-")));
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let catalog = validate_manual_catalog(&source).expect("manual catalog");
+    catalog
+        .camera(&BodyId::new(id).expect("body id"))
+        .cloned()
+        .expect("documented camera")
+}
+
+fn confirmation_for(camera: &ManualCamera, key: &str, firmware: &str) -> ManualConfirmation {
+    confirmation_with(camera, key, firmware, Finding::Matches)
+}
+
+fn confirmation_with(
+    camera: &ManualCamera,
+    key: &str,
+    firmware: &str,
+    finding: Finding,
+) -> ManualConfirmation {
+    let capability = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key.as_str() == key)
+        .unwrap_or_else(|| panic!("control {key}"));
+    ManualConfirmation {
+        version: looklab_schema::MANUAL_CONFIRMATION_VERSION,
+        camera: camera.id.clone(),
+        camera_digest: camera.definition_digest(),
+        firmware: ReportedFirmware::new(firmware).expect("firmware"),
+        scope: ConfirmationScope::Controls {
+            keys: vec![capability.key],
+        },
+        observations: vec![ControlObservation {
+            key: capability.key,
+            definition_digest: capability.definition_digest(camera),
+            finding,
+        }],
+    }
+}
+
+fn confirmation_request(
+    nonce: &Nonce,
+    send: &SendManifest,
+    assertion: &WebAuthnAssertion,
+    confirmation: &ManualConfirmation,
+) -> ManualConfirmationRequest {
+    ManualConfirmationRequest {
+        nonce: b64(nonce.as_bytes()),
+        credential_id: b64(&assertion.credential_id),
+        authenticator_data: b64(&assertion.authenticator_data),
+        client_data_json: b64(&assertion.client_data_json),
+        signature: b64(&assertion.signature),
+        send_manifest: b64(&canonical_send_manifest_bytes(send)),
+        confirmation: confirmation.clone(),
+    }
+}
+
+fn envelope_with_send(
+    nonce: Nonce,
+    send: &SendManifest,
+    manifest: &BatchManifest,
+    blobs: &[Vec<u8>],
+    serial: Option<&RawSerial>,
+    assertion: &WebAuthnAssertion,
+) -> Vec<u8> {
+    let pow = solve(
+        &Challenge::new(&nonce, &manifest_hash(manifest)),
+        u32::try_from(manifest.images.len()).expect("image count"),
+        &pow_params(),
+        0,
+    )
+    .expect("proof-of-work");
+    encode_envelope(&EnvelopeParts {
+        nonce,
+        send_manifest: send,
+        manifest,
+        assertion,
+        pow: &pow,
+        serial,
+        blobs,
+    })
+}
+
+async fn post_standalone_confirmation(
+    server: &mut TestServer,
+    confirmation: &ManualConfirmation,
+) -> StatusCode {
+    let nonce = server.nonce().await;
+    let digest = confirmation.digest();
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let request = confirmation_request(&nonce, &send, &assertion, confirmation);
+    post_confirmation(&server.app, &request).await.0
+}
+
+async fn insert_serial_contribution(db: &SqlitePool, id: &str, credential: &str, hmac: [u8; 32]) {
+    sqlx::query(
+        "INSERT INTO contributions
+         (id, credential_id, batch_manifest_hash, signature, pow, kind, serial_hmac, intent,
+          body_id, firmware_version, sim_key, settings, status, created_at)
+         VALUES (?, ?, x'00', x'00', 'pow', 'chart', ?, 'native',
+                 'fujifilm/x-t5', '2.10', 'classic-chrome', '{}', 'pending', 0)",
+    )
+    .bind(id)
+    .bind(credential)
+    .bind(hmac.to_vec())
+    .execute(db)
+    .await
+    .expect("contribution");
+}
+
+async fn insert_confirmation(
+    db: &SqlitePool,
+    credential: &str,
+    camera: &ManualCamera,
+    key: &str,
+    finding: &str,
+    payload: u8,
+    created_at: i64,
+) {
+    insert_confirmation_with_firmware(
+        db,
+        credential,
+        camera,
+        key,
+        &ReportedFirmware::new("2.10").expect("firmware"),
+        finding,
+        payload,
+        created_at,
+    )
+    .await;
+}
+
+async fn insert_confirmation_with_firmware(
+    db: &SqlitePool,
+    credential: &str,
+    camera: &ManualCamera,
+    key: &str,
+    firmware: &ReportedFirmware,
+    finding: &str,
+    payload: u8,
+    created_at: i64,
+) {
+    let capability = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key.as_str() == key)
+        .expect("control");
+    let result = sqlx::query(
+        "INSERT INTO manual_confirmations
+         (credential_id, camera_id, camera_digest, firmware, scope_kind, scope_json,
+          payload_digest, assertion_hash, send_nonce, created_at)
+         VALUES (?, ?, ?, ?, 'controls', '{}', ?, x'00', NULL, ?)",
+    )
+    .bind(credential)
+    .bind(camera.id.as_str())
+    .bind(camera.definition_digest().as_bytes().as_slice())
+    .bind(firmware.as_str())
+    .bind([payload; 32].to_vec())
+    .bind(created_at)
+    .execute(db)
+    .await
+    .expect("confirmation");
+    sqlx::query(
+        "INSERT INTO manual_observations
+         (confirmation_id, capability_key, definition_digest, finding_json)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(result.last_insert_rowid())
+    .bind(key)
+    .bind(capability.definition_digest(camera).as_bytes().as_slice())
+    .bind(finding)
+    .execute(db)
+    .await
+    .expect("observation");
+    sqlx::query(
+        "INSERT INTO manual_confirmation_occurrences (confirmation_id, send_nonce, received_at)
+         VALUES (?, ?, ?)",
+    )
+    .bind(result.last_insert_rowid())
+    .bind(format!("seed-{payload:02x}"))
+    .bind(created_at)
+    .execute(db)
+    .await
+    .expect("occurrence");
+}
+
+fn summary_control<'a>(summary: &'a Value, key: &str) -> &'a Value {
+    summary["controls"]
+        .as_array()
+        .expect("controls")
+        .iter()
+        .find(|control| control["key"] == key)
+        .unwrap_or_else(|| panic!("control {key}"))
+}
+
+async fn manual_summary(server: &TestServer, make: &str, model: &str) -> Value {
+    let camera = BodyId::new(&format!(
+        "{}/{}",
+        make.to_ascii_lowercase(),
+        model.to_ascii_lowercase().replace(' ', "-")
+    ))
+    .expect("camera id");
+    let (status, _, body) = server
+        .get(&format!("/api/manual-confirmations/{}", camera.as_str()))
+        .await;
+    assert_eq!(status, StatusCode::OK, "summary: {body:?}");
+    serde_json::from_slice(&body).expect("summary json")
+}
+
+async fn post_json_with_token(
+    app: &Router,
+    path: &str,
+    token: &str,
+    value: &Value,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(value).expect("json")))
+        .expect("request");
+    let (status, _, body) = send(app, request).await;
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+async fn post_signed_with_token(
+    server: &mut TestServer,
+    path: &str,
+    token: &str,
+    domain: &str,
+    payload: &[u8],
+    mut body: Value,
+) -> (StatusCode, Value) {
+    let signed = server.signed_fields(domain, payload).await;
+    for (key, value) in signed.as_object().expect("signed object") {
+        body[key.as_str()] = value.clone();
+    }
+    post_json_with_token(&server.app, path, token, &body).await
+}
+
+#[tokio::test]
+async fn manual_routes_lookup_catalog_camera_ids() {
+    let server = TestServer::start().await;
+    let (status, _, bytes) = server.get("/api/manuals/canon/eos-r5").await;
+    assert_eq!(status, StatusCode::OK);
+    let page: looklab_publish::ManualPage = serde_json::from_slice(&bytes).expect("manual page");
+    assert_eq!(page.id.as_str(), "canon/eos-r5");
+    assert!(!page.preparation.is_ready());
+    let (status, _, bytes) = server.get("/api/manual-confirmations/canon/eos-r5").await;
+    assert_eq!(status, StatusCode::OK);
+    let summary: looklab_schema::ManualConfirmationSummary =
+        serde_json::from_slice(&bytes).expect("manual summary");
+    assert!(!summary.human_confirmed());
+}
+
+#[tokio::test]
+async fn manual_confirmation_after_photos_reuses_the_send_assertion() {
+    let mut server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        vec![manifest_hash(&manifest)],
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let serial = RawSerial::from_envelope_ascii(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server
+        .upload_bytes(envelope_with_send(
+            nonce,
+            &send,
+            &manifest,
+            &blobs,
+            Some(&serial),
+            &assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, summary) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {summary}");
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "unconfirmed");
+    assert_eq!(control["agreeing_groups"], 1);
+
+    let hmac = serial.hmac(&server.state.secret.hmac_key(), "Fujifilm", "X-T5");
+    let summary_text = serde_json::to_string(&summary).expect("summary text");
+    assert!(!summary_text.contains(SERIAL));
+    assert!(!summary_text.contains(&hex(hmac.as_bytes())));
+
+    let (status, _) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let contribution = body["contribution_id"]
+        .as_str()
+        .expect("contribution id")
+        .to_owned();
+    let mut withdraw = server
+        .signed_fields("withdraw", contribution.as_bytes())
+        .await;
+    withdraw["contribution_ids"] = json!([contribution]);
+    let (status, response) = post_json(&server.app, "/api/withdraw", &withdraw).await;
+    assert_eq!(status, StatusCode::OK, "withdraw: {response}");
+    let withdrawn: Option<i64> =
+        sqlx::query_scalar("SELECT withdrawn_at FROM manual_confirmations LIMIT 1")
+            .fetch_one(&server.db)
+            .await
+            .expect("withdrawn");
+    assert!(withdrawn.is_some());
+}
+
+#[tokio::test]
+async fn withdrawn_send_rejects_a_late_confirmation() {
+    let mut server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        vec![manifest_hash(&manifest)],
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let serial = RawSerial::from_envelope_ascii(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server
+        .upload_bytes(envelope_with_send(
+            nonce,
+            &send,
+            &manifest,
+            &blobs,
+            Some(&serial),
+            &assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let contribution = body["contribution_id"]
+        .as_str()
+        .expect("contribution id")
+        .to_owned();
+    let mut withdraw = server
+        .signed_fields("withdraw", contribution.as_bytes())
+        .await;
+    withdraw["contribution_ids"] = json!([contribution]);
+    let (status, response) = post_json(&server.app, "/api/withdraw", &withdraw).await;
+    assert_eq!(status, StatusCode::OK, "withdraw: {response}");
+
+    let (status, _) = post_confirmation(
+        &server.app,
+        &confirmation_request(&nonce, &send, &assertion, &confirmation),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn standalone_attestation_only_send_is_valid_and_replays_rejected() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, summary) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {summary}");
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        0
+    );
+
+    let (status, _) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn owner_withdraws_standalone_confirmation() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, _) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let credential = server.credential_uuid().await;
+    insert_serial_contribution(&server.db, "contrib-owner", &credential, [7; 32]).await;
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        1
+    );
+
+    let request = server.withdrawal_request(&camera.id).await;
+    let (status, _) = post_withdrawal(&server.app, &request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let audit: String = sqlx::query_scalar(
+        "SELECT payload FROM audit_log WHERE type = 'manual_confirmation_withdrawal'
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("withdrawal audit");
+    let audit: Value = serde_json::from_str(&audit).expect("audit json");
+    assert_eq!(audit["camera"], camera.id.as_str());
+    assert_eq!(audit["withdrawn"], 1);
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        0
+    );
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, _) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK);
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn owner_withdrawal_fences_a_mixed_send_without_dropping_photos() {
+    let mut server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        vec![manifest_hash(&manifest)],
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let serial = RawSerial::from_envelope_ascii(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server
+        .upload_bytes(envelope_with_send(
+            nonce,
+            &send,
+            &manifest,
+            &blobs,
+            Some(&serial),
+            &assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let contribution = body["contribution_id"]
+        .as_str()
+        .expect("contribution id")
+        .to_owned();
+
+    let withdraw = server.withdrawal_request(&camera.id).await;
+    let (status, body) = post_withdrawal(&server.app, &withdraw).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "withdraw: {body}");
+
+    let delayed = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, body) = post_confirmation(&server.app, &delayed).await;
+    assert_eq!(status, StatusCode::CONFLICT, "delayed: {body}");
+
+    let contribution_status: String =
+        sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
+            .bind(&contribution)
+            .fetch_one(&server.db)
+            .await
+            .expect("contribution");
+    assert_ne!(contribution_status, "withdrawn");
+    let send_withdrawn: Option<i64> =
+        sqlx::query_scalar("SELECT withdrawn_at FROM send_manifests WHERE nonce = ?")
+            .bind(hex(nonce.as_bytes()))
+            .fetch_one(&server.db)
+            .await
+            .expect("send");
+    assert_eq!(send_withdrawn, None);
+
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let fresh = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, summary) = post_confirmation(&server.app, &fresh).await;
+    assert_eq!(status, StatusCode::OK, "fresh: {summary}");
+}
+
+#[tokio::test]
+async fn manual_withdrawal_rejects_noncanonical_bytes_and_undocumented_cameras() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &confirmation).await,
+        StatusCode::OK
+    );
+    let credential = server.credential_uuid().await;
+    insert_serial_contribution(&server.db, "contrib-owner", &credential, [7; 32]).await;
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        1
+    );
+
+    let request = server.withdrawal_request(&camera.id).await;
+    let mut noncanonical = request.canonical_bytes();
+    noncanonical.insert(1, b' ');
+    let (status, _) = post_canonical(
+        &server.app,
+        "/api/manual-confirmations/withdraw",
+        noncanonical,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let unknown_camera = BodyId::new("unknown/camera").expect("body id");
+    let unknown = server.withdrawal_request(&unknown_camera).await;
+    let (status, _) = post_withdrawal(&server.app, &unknown).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        1
+    );
+    let withdrawals: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE type = 'manual_confirmation_withdrawal'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("withdrawal audits");
+    assert_eq!(withdrawals, 0);
+}
+
+#[tokio::test]
+async fn manual_confirmation_rejects_invalid_structure_before_persistence() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let valid = confirmation_for(&camera, "native_simulations", "2.10");
+
+    let mut version = valid.clone();
+    version.version += 1;
+    let mut empty = valid.clone();
+    empty.observations.clear();
+    let mut duplicate = valid.clone();
+    let first = duplicate.observations[0].clone();
+    duplicate.observations.push(first);
+    let mut mismatched = valid;
+    mismatched.scope = ConfirmationScope::Controls {
+        keys: vec![CapabilityKey::ExposureCompensation],
+    };
+
+    for confirmation in [version, empty, duplicate, mismatched] {
+        assert_eq!(
+            post_standalone_confirmation(&mut server, &confirmation).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let nonce = server.nonce().await;
+    let digest = confirmation.digest();
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let mut noncanonical = request.canonical_bytes();
+    noncanonical.insert(1, b' ');
+    let (status, _) = post_canonical(&server.app, "/api/manual-confirmations", noncanonical).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manual_confirmations")
+        .fetch_one(&server.db)
+        .await
+        .expect("manual confirmations");
+    assert_eq!(stored, 0);
+    let sends: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM send_manifests")
+        .fetch_one(&server.db)
+        .await
+        .expect("send manifests");
+    assert_eq!(sends, 0);
+}
+
+#[tokio::test]
+async fn confirmation_before_photos_reserves_the_declared_batches() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        vec![manifest_hash(&manifest)],
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, summary) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {summary}");
+
+    let serial = RawSerial::from_envelope_ascii(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server
+        .upload_bytes(envelope_with_send(
+            nonce,
+            &send,
+            &manifest,
+            &blobs,
+            Some(&serial),
+            &assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+}
+
+#[tokio::test]
+async fn manual_confirmation_rejects_unbound_manifests_and_content() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+
+    let nonce = server.nonce().await;
+    let batch_only = SendManifest::canonical(vec![ManifestHash::from_bytes(*digest.as_bytes())])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&batch_only));
+    let assertion = server.assertion(&challenge).await;
+    let (status, _) = post_confirmation(
+        &server.app,
+        &confirmation_request(&nonce, &batch_only, &assertion, &confirmation),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let nonce = server.nonce().await;
+    let same = ManifestHash::from_bytes([9u8; 32]);
+    let overlapping = SendManifest {
+        version: SEND_MANIFEST_VERSION,
+        batches: vec![same],
+        attestations: vec![AttestationHash::from_bytes(*same.as_bytes())],
+    };
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&overlapping));
+    let assertion = server.assertion(&challenge).await;
+    let (status, _) = post_confirmation(
+        &server.app,
+        &confirmation_request(&nonce, &overlapping, &assertion, &confirmation),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+
+    let mut altered = serde_json::to_value(confirmation_request(
+        &nonce,
+        &send,
+        &assertion,
+        &confirmation,
+    ))
+    .expect("confirmation json");
+    altered["confirmation"]["firmware"] = json!("9.99");
+    let (status, _) = post_json(&server.app, "/api/manual-confirmations", &altered).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let mut extra = serde_json::to_value(confirmation_request(
+        &nonce,
+        &send,
+        &assertion,
+        &confirmation,
+    ))
+    .expect("confirmation json");
+    extra["unbound"] = json!(true);
+    let (status, _) = post_json(&server.app, "/api/manual-confirmations", &extra).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn manual_confirmation_policy_counts_identity_groups() {
+    let server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    for index in 0..3u8 {
+        let credential = server.add_credential().await;
+        insert_serial_contribution(
+            &server.db,
+            &format!("contrib-{index}"),
+            &credential,
+            [index + 1; 32],
+        )
+        .await;
+        insert_confirmation(
+            &server.db,
+            &credential,
+            &camera,
+            "native_simulations",
+            r#"{"kind":"matches"}"#,
+            index,
+            i64::from(index),
+        )
+        .await;
+    }
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "confirmed");
+    assert_eq!(control["agreeing_groups"], 3);
+
+    let shared = server.add_credential().await;
+    insert_serial_contribution(&server.db, "contrib-shared", &shared, [1; 32]).await;
+    insert_confirmation(
+        &server.db,
+        &shared,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"matches"}"#,
+        10,
+        10,
+    )
+    .await;
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        3
+    );
+
+    let contradicting = server.add_credential().await;
+    insert_serial_contribution(&server.db, "contrib-contra", &contradicting, [4; 32]).await;
+    insert_confirmation(
+        &server.db,
+        &contradicting,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"corrected","availability":"unavailable","domain":{"type":"unspecified"}}"#,
+        11,
+        11,
+    )
+    .await;
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "contradicted");
+    assert_eq!(control["agreeing_groups"], 3);
+    assert!(
+        !control["contradictions"]
+            .as_array()
+            .expect("contradictions")
+            .is_empty()
+    );
+
+    insert_confirmation(
+        &server.db,
+        &contradicting,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"matches"}"#,
+        12,
+        12,
+    )
+    .await;
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "confirmed"
+    );
+}
+
+#[tokio::test]
+async fn repeated_payload_after_a_correction_uses_the_new_occurrence() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let credential = server.credential_uuid().await;
+    insert_serial_contribution(&server.db, "contrib-occ", &credential, [9; 32]).await;
+    for index in 0..2u8 {
+        let other = server.add_credential().await;
+        insert_serial_contribution(
+            &server.db,
+            &format!("contrib-occ-{index}"),
+            &other,
+            [index + 1; 32],
+        )
+        .await;
+        insert_confirmation(
+            &server.db,
+            &other,
+            &camera,
+            "native_simulations",
+            r#"{"kind":"matches"}"#,
+            index,
+            i64::from(index),
+        )
+        .await;
+    }
+    let matches = confirmation_for(&camera, "native_simulations", "2.10");
+    let corrected = confirmation_with(
+        &camera,
+        "native_simulations",
+        "2.10",
+        Finding::Corrected {
+            availability: looklab_schema::Availability::Unavailable,
+            domain: looklab_schema::CapabilityDomain::Unspecified,
+        },
+    );
+
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &matches).await,
+        StatusCode::OK
+    );
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "confirmed"
+    );
+
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &corrected).await,
+        StatusCode::OK
+    );
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "contradicted"
+    );
+
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &matches).await,
+        StatusCode::OK
+    );
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "confirmed"
+    );
+}
+
+#[tokio::test]
+async fn same_second_linked_claims_order_by_occurrence_and_tombstone() {
+    let server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    for index in 0..2u8 {
+        let other = server.add_credential().await;
+        insert_serial_contribution(
+            &server.db,
+            &format!("contrib-same-{index}"),
+            &other,
+            [index + 1; 32],
+        )
+        .await;
+        insert_confirmation(
+            &server.db,
+            &other,
+            &camera,
+            "native_simulations",
+            r#"{"kind":"matches"}"#,
+            index,
+            i64::from(index),
+        )
+        .await;
+    }
+    let first = server.add_credential().await;
+    let second = server.add_credential().await;
+    insert_serial_contribution(&server.db, "contrib-link-a", &first, [7; 32]).await;
+    insert_serial_contribution(&server.db, "contrib-link-b", &second, [7; 32]).await;
+    insert_confirmation(
+        &server.db,
+        &first,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"matches"}"#,
+        21,
+        5,
+    )
+    .await;
+    insert_confirmation(
+        &server.db,
+        &second,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"corrected","availability":"unavailable","domain":{"type":"unspecified"}}"#,
+        22,
+        5,
+    )
+    .await;
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "contradicted"
+    );
+
+    sqlx::query(
+        "UPDATE manual_confirmation_occurrences SET withdrawn_at = 1 WHERE send_nonce = 'seed-16'",
+    )
+    .execute(&server.db)
+    .await
+    .expect("withdraw occurrence");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "unconfirmed");
+    assert_eq!(control["agreeing_groups"], 2);
+}
+
+#[tokio::test]
+async fn latest_claims_keep_each_reported_firmware_version() {
+    let server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    for index in 0..3u8 {
+        let credential = server.add_credential().await;
+        insert_serial_contribution(
+            &server.db,
+            &format!("contrib-fw-{index}"),
+            &credential,
+            [5 + index; 32],
+        )
+        .await;
+        for (offset, version) in ["2.10", "3.00"].into_iter().enumerate() {
+            insert_confirmation_with_firmware(
+                &server.db,
+                &credential,
+                &camera,
+                "native_simulations",
+                &ReportedFirmware::new(version).expect("firmware"),
+                r#"{"kind":"matches"}"#,
+                30 + 2 * index + offset as u8,
+                offset as i64,
+            )
+            .await;
+        }
+    }
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    let firmware = control["firmware"].as_array().expect("firmware");
+    assert_eq!(firmware.len(), 2);
+    assert_eq!(firmware[0]["firmware"], "2.10");
+    assert_eq!(firmware[1]["firmware"], "3.00");
+    assert_eq!(firmware[0]["agreeing_groups"], 3);
+    assert_eq!(firmware[1]["agreeing_groups"], 3);
+    assert_eq!(control["state"], "confirmed");
+}
+
+#[tokio::test]
+async fn fresh_credentials_without_serial_evidence_cannot_form_a_quorum() {
+    let server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    for index in 0..3u8 {
+        let credential = server.add_credential().await;
+        insert_confirmation(
+            &server.db,
+            &credential,
+            &camera,
+            "native_simulations",
+            r#"{"kind":"matches"}"#,
+            index,
+            i64::from(index),
+        )
+        .await;
+    }
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "unconfirmed");
+    assert_eq!(control["agreeing_groups"], 0);
+}
+
+#[tokio::test]
+async fn moderator_evidence_is_role_gated_and_audited() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    server
+        .set_credential_tier_roles(&server.credential_id, "new", "[\"moderator\"]")
+        .await;
+    let signed = server.signed_fields("mod-session", &[]).await;
+    let (status, session) = post_json(&server.app, "/api/mod/session", &signed).await;
+    assert_eq!(status, StatusCode::OK, "session: {session}");
+    let token = session["session_token"]
+        .as_str()
+        .expect("session token")
+        .to_owned();
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
+    let camera = documented_camera("fujifilm/x-t5");
+    let key = CapabilityKey::NativeSimulations;
+    let definition_digest = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control")
+        .definition_digest(&camera);
+    let firmware = ModeratorFirmwareScope::exact("2.10").expect("firmware scope");
+
+    let missing_url_evidence = ModeratorEvidence {
+        kind: ModeratorEvidenceKind::Video,
+        url: None,
+        description: "menu walkthrough".to_owned(),
+        firmware_scope: firmware.clone(),
+    };
+    let missing_url = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest,
+        confirmed: true,
+        evidence: missing_url_evidence,
+    };
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": true,
+        "evidence": {
+            "kind": "video",
+            "description": "menu walkthrough",
+            "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        },
+    });
+    let (status, _) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &missing_url.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let decision_evidence = ModeratorEvidence {
+        kind: ModeratorEvidenceKind::Video,
+        url: Some(ManualUrl::new("https://example.com/review").expect("evidence url")),
+        description: "menu walkthrough".to_owned(),
+        firmware_scope: firmware,
+    };
+    let decision = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest,
+        confirmed: true,
+        evidence: decision_evidence,
+    };
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": true,
+        "evidence": {
+            "kind": "video",
+            "url": "https://example.com/review",
+            "description": "menu walkthrough",
+            "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        },
+    });
+    let (status, summary) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &decision.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "moderate: {summary}");
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "moderator_confirmed"
+    );
+    let audit: String = sqlx::query_scalar(
+        "SELECT payload FROM audit_log WHERE type = 'manual_moderator_confirmation'
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("moderator audit");
+    let audit: Value = serde_json::from_str(&audit).expect("audit json");
+    assert_eq!(audit["firmware_scope"]["kind"], "exact");
+    assert_eq!(audit["firmware_scope"]["firmware"], "2.10");
+
+    let standing: (String, String) =
+        sqlx::query_as("SELECT tier, roles FROM credentials WHERE credential_id = ?")
+            .bind(&server.credential_id)
+            .fetch_one(&server.db)
+            .await
+            .expect("standing");
+    assert_eq!(standing, ("new".to_owned(), "[\"moderator\"]".to_owned()));
+
+    server
+        .set_credential_tier_roles(&server.credential_id, "new", "[]")
+        .await;
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": true,
+        "evidence": {
+            "kind": "video",
+            "url": "https://example.com/review",
+            "description": "menu walkthrough",
+            "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        },
+    });
+    let (status, _) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &decision.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn moderator_decision_rejects_a_changed_control_definition() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    server
+        .set_credential_tier_roles(&server.credential_id, "new", "[\"moderator\"]")
+        .await;
+    let signed = server.signed_fields("mod-session", &[]).await;
+    let (status, session) = post_json(&server.app, "/api/mod/session", &signed).await;
+    assert_eq!(status, StatusCode::OK, "session: {session}");
+    let token = session["session_token"]
+        .as_str()
+        .expect("session token")
+        .to_owned();
+    let camera = documented_camera("fujifilm/x-t5");
+    let key = CapabilityKey::NativeSimulations;
+    let stale = Sha256Hex::from_bytes([0; 32]);
+    let moderation = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest: stale,
+        confirmed: true,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Physical,
+            url: None,
+            description: "body review".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::unspecified(),
+        },
+    };
+    let body = json!({
+        "definition_digest": stale,
+        "confirmed": true,
+        "evidence": {
+            "kind": "physical",
+            "description": "body review",
+            "firmware_scope": {"kind": "unspecified"},
+        },
+    });
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
+    let (status, _) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &moderation.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manual_moderator_confirmations")
+        .fetch_one(&server.db)
+        .await
+        .expect("moderator rows");
+    assert_eq!(stored, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_envelope_version_requests_a_reload() {
+    let mut server = TestServer::start().await;
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let challenge = send_challenge(&nonce, &manifest);
+    let assertion = server.assertion(&challenge).await;
+    let pow = solve(
+        &Challenge::new(&nonce, &manifest_hash(&manifest)),
+        u32::try_from(manifest.images.len()).expect("image count"),
+        &pow_params(),
+        0,
+    )
+    .expect("proof-of-work");
+    let mut bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
+    bytes[6..8].copy_from_slice(&3u16.to_le_bytes());
+    let (status, body) = server.upload_bytes(bytes).await;
+    assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "upload: {body}");
+    assert_eq!(body["error"], "ENVELOPE_VERSION_UNSUPPORTED");
+    assert_eq!(body["action"], "reload_and_prepare");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_arrival_audits_a_manual_promotion() {
+    let mut server = TestServer::start().await;
+    let owner = server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    for index in 0..2usize {
+        let credential = server.add_credential().await;
+        insert_serial_contribution(
+            &server.db,
+            &format!("promotion-{index}"),
+            &credential,
+            [u8::try_from(index + 1).expect("small index"); 32],
+        )
+        .await;
+        insert_confirmation(
+            &server.db,
+            &credential,
+            &camera,
+            "native_simulations",
+            r#"{"kind":"matches"}"#,
+            u8::try_from(index + 1).expect("small index"),
+            i64::try_from(index).expect("small index"),
+        )
+        .await;
+    }
+    insert_confirmation(
+        &server.db,
+        &owner,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"matches"}"#,
+        9,
+        10,
+    )
+    .await;
+    let before = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&before, "native_simulations")["agreeing_groups"],
+        2
+    );
+
+    let serial = RawSerial::new(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server.upload_valid(Some(&serial)).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let after = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&after, "native_simulations");
+    assert_eq!(control["state"], "confirmed");
+    assert_eq!(control["agreeing_groups"], 3);
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE type = 'manual_confirmation_promotion'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("promotion audits");
+    assert_eq!(audits, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawal_reconciles_a_new_promotion() {
+    let mut server = TestServer::start().await;
+    let owner = server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let contribution = uuid::Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0001).to_string();
+    insert_serial_contribution(&server.db, contribution.as_str(), &owner, [1; 32]).await;
+    insert_confirmation(
+        &server.db,
+        &owner,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"corrected","availability":"unavailable","domain":{"type":"unspecified"}}"#,
+        1,
+        1,
+    )
+    .await;
+    for index in 0..3usize {
+        let credential = server.add_credential().await;
+        let matching =
+            uuid::Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0002 + index as u128)
+                .to_string();
+        insert_serial_contribution(
+            &server.db,
+            matching.as_str(),
+            &credential,
+            [u8::try_from(index + 2).expect("small index"); 32],
+        )
+        .await;
+        insert_confirmation(
+            &server.db,
+            &credential,
+            &camera,
+            "native_simulations",
+            r#"{"kind":"matches"}"#,
+            u8::try_from(index + 2).expect("small index"),
+            i64::try_from(index + 2).expect("small index"),
+        )
+        .await;
+    }
+    let before = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&before, "native_simulations")["state"],
+        "contradicted"
+    );
+
+    let mut withdraw = server
+        .signed_fields("withdraw", contribution.as_str().as_bytes())
+        .await;
+    withdraw["contribution_ids"] = json!([contribution.as_str()]);
+    let (status, response) = post_json(&server.app, "/api/withdraw", &withdraw).await;
+    assert_eq!(status, StatusCode::OK, "withdraw: {response}");
+
+    let after = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&after, "native_simulations")["state"],
+        "confirmed"
+    );
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE type = 'manual_confirmation_promotion'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("promotion audits");
+    assert_eq!(audits, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_requests_metadata_publication_without_looks() {
+    let server = TestServer::start().await;
+    let generation: i64 = sqlx::query_scalar("SELECT generation FROM publication WHERE id = 1")
+        .fetch_one(&server.db)
+        .await
+        .expect("publication row");
+    assert!(generation >= 1);
 }

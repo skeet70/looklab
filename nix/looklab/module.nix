@@ -27,6 +27,7 @@ let
     blob_dir = "${cfg.stateDir}/blobs";
     server_secret_path = "${cfg.stateDir}/server-secret";
     bodies_dir = "${cfg.dataDir}/bodies";
+    manuals_dir = "${cfg.dataDir}/manuals";
     snapshot_dir = "${cfg.stateDir}/community";
     inherit (cfg) origin;
     rp_id = cfg.rpId;
@@ -95,6 +96,8 @@ let
     "${cfg.stateDir}/blobs"
     "--data"
     cfg.dataDir
+    "--manuals"
+    "${cfg.dataDir}/manuals"
     "--snapshot-dir"
     "${cfg.stateDir}/community"
     "--transforms"
@@ -361,7 +364,7 @@ in
         PrivateTmp = true;
         ProtectHome = true;
         ProtectSystem = "strict";
-        ReadWritePaths = [ cfg.stateDir ];
+        ReadWritePaths = [ cfg.stateDir cfg.dataDir ];
       };
       script = ''
         set -eu
@@ -369,6 +372,21 @@ in
           mkdir -p ${cfg.dataDir}
           cp -R ${hostPackages.looklab-data}/. ${cfg.dataDir}/
           touch ${cfg.dataDir}/.seeded
+        fi
+        if [ -d ${hostPackages.looklab-data}/manuals ]; then
+          staging=${cfg.dataDir}/.manuals.new
+          if [ -e "$staging" ]; then
+            chmod -R u+rwX "$staging"
+            rm -rf "$staging"
+          fi
+          mkdir -p "$staging"
+          cp -R ${hostPackages.looklab-data}/manuals/. "$staging"/
+          chmod -R u+rwX "$staging"
+          if [ -d ${cfg.dataDir}/manuals ]; then
+            chmod -R u+rwX ${cfg.dataDir}/manuals
+            rm -rf ${cfg.dataDir}/manuals
+          fi
+          mv "$staging" ${cfg.dataDir}/manuals
         fi
         ${
           optionalString (cfg.scenesDir != null) ''
@@ -384,6 +402,7 @@ in
     systemd.services.looklab-server = {
       description = "looklab API and site server";
       wantedBy = [ "multi-user.target" ];
+      restartTriggers = [ hostPackages.looklab-data ];
       after = [
         "network.target"
         "looklab-seed-data.service"
@@ -406,6 +425,7 @@ in
     systemd.services.looklab-worker = {
       description = "looklab job runner and site publisher";
       wantedBy = [ "multi-user.target" ];
+      restartTriggers = [ hostPackages.looklab-data ];
       after = [
         "network.target"
         "looklab-server.service"

@@ -13,6 +13,7 @@ use crate::body_schema::{Bodies, BodiesError};
 use crate::config::{Config, ConfigError, ServerSecret};
 use crate::db::{DbError, now_unix, open};
 use crate::ids::{CredentialId, RandomError, RegistrationHandle, StatusToken, TokenHash};
+use crate::manuals::{Manuals, ManualsError};
 use crate::rate_limit::RateLimiter;
 use crate::trust::{DefaultTrustPolicy, TrustPolicy};
 
@@ -26,6 +27,10 @@ pub enum StateError {
     Blob(#[from] BlobError),
     #[error(transparent)]
     Bodies(#[from] BodiesError),
+    #[error(transparent)]
+    Manuals(#[from] ManualsError),
+    #[error("publication request: {0}")]
+    Publication(#[from] sqlx::Error),
     #[error("WebAuthn configuration: {0}")]
     Webauthn(String),
 }
@@ -353,6 +358,7 @@ pub struct AppState {
     pub webauthn: WebauthnCore,
     pub secret: ServerSecret,
     pub bodies: RwLock<Bodies>,
+    pub manuals: Arc<Manuals>,
     pub rate_limiter: RateLimiter,
     pub trust: Arc<dyn TrustPolicy>,
     pub upload_slots: Arc<Semaphore>,
@@ -378,6 +384,11 @@ impl AppState {
         let db = open(&config.db_path).await?;
         let blobs: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(&config.blob_dir)?);
         let bodies = RwLock::new(Bodies::load(&config.bodies_dir, &config.snapshot_dir)?);
+        let manuals = Arc::new(Manuals::load(&config.manuals_dir)?);
+        {
+            let mut conn = db.acquire().await?;
+            crate::store::request_publication(&mut conn).await?;
+        }
         let secret = ServerSecret::load_or_create(&config.server_secret_path)?;
         let origin =
             Url::parse(&config.origin).map_err(|error| StateError::Webauthn(error.to_string()))?;
@@ -400,6 +411,7 @@ impl AppState {
             webauthn,
             secret,
             bodies,
+            manuals,
             rate_limiter: RateLimiter::default(),
             trust,
             upload_slots: Arc::new(Semaphore::new(slots)),

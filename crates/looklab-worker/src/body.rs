@@ -212,6 +212,14 @@ impl TransformDir {
         Self::parse(&text, &path, body)
     }
 
+    pub fn load_optional(&self, body: &BodyId) -> Result<Option<BodyTransforms>> {
+        match self.load(body) {
+            Ok(transforms) => Ok(Some(transforms)),
+            Err(WorkerError::Data(_)) if !self.path(body).is_file() => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// The body's transform file, validated for publication with its match bundles.
     pub fn snapshot(&self, body: &BodyId) -> Result<Vec<u8>> {
         self.load(body)?;

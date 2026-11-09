@@ -127,16 +127,16 @@ fn the_classification_and_authorization_are_signed() {
 }
 
 #[test]
-fn envelope_version_three_rejects_two() {
-    assert_eq!(looklab_upload::VERSION, 3);
+fn envelope_version_four_rejects_three() {
+    assert_eq!(looklab_upload::VERSION, 4);
     let fixture = Fixture::new();
     let mut bytes = fixture.bytes();
     let offsets = fixture.offsets();
-    bytes[offsets.version..offsets.version + 2].copy_from_slice(&2u16.to_le_bytes());
+    bytes[offsets.version..offsets.version + 2].copy_from_slice(&3u16.to_le_bytes());
     let error = parse_envelope_strict(&bytes, &compact_limits())
         .err()
-        .expect("a version 2 envelope is rejected");
-    assert!(matches!(error, EnvelopeError::UnsupportedVersion(2)));
+        .expect("a version 3 envelope is rejected");
+    assert!(matches!(error, EnvelopeError::UnsupportedVersion(3)));
 }
 
 #[test]

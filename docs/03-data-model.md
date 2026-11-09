@@ -181,6 +181,17 @@ epochs:
 - `spatial: true` controls must be in `tolerated` for an image to be used in a colour fit. Grain-on monochrome renders may enter the deferred pool with their grain settings retained; coordinate-free samples do not characterize spatial grain.
 - Validated by `looklab-schema` (native in CI, WASM in the browser form).
 
+### Documentation-derived camera capabilities
+
+`data/manuals/` holds a separately validated `ManualCatalog`. Each camera record names its technical-documentation sources, firmware scope, documented capabilities and control domains. Documentation-derived availability is human-unconfirmed.
+
+- This catalog is guidance, not the server-authoritative `ControlSchema`. A confirmation changes neither upload eligibility nor fixture-backed makernote mappings; those require the proposal and approval flow.
+- `ManualConfirmation` version 1 carries the camera id and definition digest, reported firmware, complete or selected-control scope, and up to 64 observations. Each observation binds a control definition digest and either matches the documented options or supplies corrected availability and a typed domain.
+- Agreement uses the latest claim per independent contributor identity group, control definition and reported firmware. Three eligible groups agreeing on the same actual options confirm that firmware's control. Conflicting claims require review; different firmware versions are evaluated separately.
+- A camera-level confirmation requires confirmed controls with a common explicit firmware scope. Unspecified or range-scoped moderator evidence is displayed with its scope, not as an all-firmware confirmation.
+- Audited moderator decisions bind the current control definition and physical or video evidence. Confirmations grant no contributor tier, reputation, calibration support or scientific weight.
+- Withdrawal excludes the owner's claims from agreement and requests publication. Existing sends are fenced against restoring those camera claims; a new approval can submit a new claim. Signed records and audit history are retained.
+
 ### Look and LookVersion
 - `Look`: `id`, `slug`, `name`, `kind` (`native_family` | `lut_defined`), `wb_policy`, `description`, `aliases[]`, `license` (for `lut_defined`: the submitter's declaration + attribution).
 - A `lut_defined` Look's identity is the LUT bytes, its declared encoding and its base. It also stores the grid, license and attribution, and a layered approximation fitted to the composition (§3, [02 §3.8](02-color-pipeline.md)).
@@ -338,15 +349,19 @@ blobs            count:u16, then count × (len:u32 + sample blob)   // order = m
 (end)            no trailing bytes
 ```
 
-`SendManifest { batches: Vec<ManifestHash> }` is the one manifest a single passkey approval covers. It lists the batch manifest hashes in **strictly increasing lexicographic order**; a duplicate or a reordering is rejected, and a batch whose manifest hash is not listed is rejected. A send carries at most `max_batches` (default 64) batches.
+`SendManifest { version: 1, batches: Vec<ManifestHash>, attestations: Vec<AttestationHash> }` is the manifest one passkey approval covers. Each collection is independently sorted in strictly increasing lexicographic order; duplicates, reordered hashes and undeclared content are rejected. Defaults allow at most 64 batches and 8 attestations, with at least one item across both collections. An attestation-only send needs no photo batch.
 
-One nonce identifies one send instance. The WebAuthn challenge is `H(nonce ‖ send manifest hash)`, signed once for the whole send; every batch request carries the same send manifest and the same assertion. Proof of work stays per batch, bound to `H(nonce ‖ batch manifest hash)` ([05 §9](05-trust-and-integrity.md)), so one batch's solutions cannot pay for a sibling. The server binds the first accepted batch's assertion to the send instance and rejects a later batch whose send manifest, credential or assertion differs, a completed or expired send, and a batch that already arrived. The same prepared batches resent under a fresh nonce are a new send.
+Envelope version 4 carries this send-manifest layout. Version 3 bytes are rejected before nonce consumption with `426 Upgrade Required` and `{"error":"ENVELOPE_VERSION_UNSUPPORTED","action":"reload_and_prepare"}`; clients reload and prepare a fresh send rather than reusing the old assertion. The previous live client ignores response bodies and can only show `upload: HTTP 426`; it cannot display the reload guidance. Deployment must tell owners to reload the tab and prepare the send again. No compatibility shim or automatic retry exists.
+
+One nonce identifies one send instance. The WebAuthn challenge is `H(nonce ‖ send manifest hash)`, signed once for the whole send; every batch and confirmation request carries the same send manifest and assertion. Proof of work stays per photo batch, bound to `H(nonce ‖ batch manifest hash)` ([05 §9](05-trust-and-integrity.md)). A confirmation may reserve the send before its photo batches arrive. The server binds the first accepted request's credential, manifest and assertion, tracks both collections, and rejects mismatched, duplicate, completed, expired or withdrawn sends. Accepted photo batches are retained if a later optional confirmation fails. The same content approved under a fresh nonce is a new send.
 
 The server parses this strictly and rejects anything non-canonical. All of it is produced by the `looklab-wasm` module; the JavaScript layer only moves bytes ([AGENTS.md](../AGENTS.md)).
 
 `BatchManifest` carries `community_snapshot_version`, the snapshot whose control schema its settings were read against. The server keeps every snapshot it has published and resolves the batch body and settings against that version, not the current one; an unknown version fails with `SNAPSHOT_UNKNOWN` and one older than the retained snapshots with `SNAPSHOT_TOO_OLD`. Each settings entry also carries its source, `reproduced` or `declared` ([07 §4](07-contribution.md)).
 
 `BatchManifest` also carries the signed `render_class` and optional monochrome model-development authorization. The server checks classification against the named schema and every image's sanitized rendering metadata before accepting a batch; changing the batch's label cannot route known monochrome measurements into colour analysis. The sample-blob format remains version 1.
+
+Manual confirmations use canonical JSON request bytes from `looklab-wasm`; whitespace, alternate escapes, field-order changes and unknown fields are rejected. Their attestation hashes bind the canonical confirmation payloads. A standalone send follows the same credential and anti-abuse rules; it grants no photo contribution or scientific credit.
 
 ## 3. Look file format
 

@@ -1,0 +1,209 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: fujifilm/x-pro1
+  make: Fujifilm
+  model: X-Pro1
+  sources:
+  - id: xpro1-manual
+    kind: owner_manual
+    url: https://dl.fujifilm-x.com/support/manual/x/fujifilm_xpro1_manual_en.pdf
+    title: FUJIFILM X-Pro1 Owner's Manual
+    edition: BL01619-204 EN
+    firmware_scope: unspecified
+  - id: xpro1-firmware
+    kind: firmware_notes
+    url: https://fujifilm-x.com/en-us/support/download/firmware/cameras/x-pro1/
+    title: X-Pro1 Firmware update
+    edition: web edition, accessed 2026-11-08
+    firmware_scope: '3.82'
+  capabilities:
+  - key: native_simulations
+    label: FILM SIMULATION
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - PROVIA/STANDARD
+      - Velvia/VIVID
+      - ASTIA/SOFT
+      - PRO Neg. Hi
+      - PRO Neg. Std
+      - MONOCHROME
+      - MONOCHROME+Ye
+      - MONOCHROME+R
+      - MONOCHROME+G
+      - SEPIA
+      default: PROVIA/STANDARD
+    citations:
+    - source: xpro1-manual
+      locator: p. 51 (PDF 67), Film Simulation
+  - key: jpeg_quality
+    label: IMAGE QUALITY
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - FINE
+      - NORMAL
+      - RAW
+      - FINE+RAW
+      - NORMAL+RAW
+    citations:
+    - source: xpro1-manual
+      locator: p. 67 (PDF 83), IMAGE QUALITY
+  - key: raw_capture
+    label: RAW RECORDING
+    category: capture
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xpro1-manual
+      locator: p. 67 (PDF 83), IMAGE QUALITY documents RAW, FINE+RAW and NORMAL+RAW
+    notes: RAW compression choices are not documented.
+  - key: heif_capture
+    label: HEIF
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: xpro1-manual
+      locator: p. 67 (PDF 83), IMAGE QUALITY
+    notes: No HEIF option appears in the documented image-quality formats.
+  - key: in_camera_raw_conversion
+    label: RAW CONVERSION
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: xpro1-manual
+      locator: p. 66 (PDF 82), Creating JPEG Copies of RAW Pictures
+  - key: jpeg_color_spaces
+    label: COLOR SPACE
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - Adobe RGB
+      default: sRGB
+    citations:
+    - source: xpro1-manual
+      locator: p. 83 (PDF 99), COLOR SPACE
+  - key: white_balance_presets
+    label: WHITE BALANCE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - CUSTOM
+      - COLOR TEMPERATURE
+      - DAYLIGHT
+      - SHADE
+      - FLUORESCENT LIGHT-1
+      - FLUORESCENT LIGHT-2
+      - FLUORESCENT LIGHT-3
+      - INCANDESCENT
+      - UNDERWATER
+    citations:
+    - source: xpro1-manual
+      locator: p. 32 (PDF 48), White Balance
+  - key: white_balance_shift
+    label: WB SHIFT
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: R
+      - label: B
+    citations:
+    - source: xpro1-manual
+      locator: p. 32 (PDF 48), WB SHIFT fine-tuning dialog
+    notes: Two-axis fine-tuning dialog; the rendered dialog figure shows the grid and current R/B values without numeric limits.
+  - key: dynamic_range
+    label: DYNAMIC RANGE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - 100%
+      - 200%
+      - 400%
+      default: AUTO
+    citations:
+    - source: xpro1-manual
+      locator: p. 68 (PDF 84), DYNAMIC RANGE
+    notes: 200% requires ISO 400 or above; 400% requires ISO 800 or above. AUTO selects 100% or 200%.
+  - key: highlight_tone
+    label: HIGHLIGHT TONE
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xpro1-manual
+      locator: pp. 68-69 (PDF 84-85), HIGHLIGHT TONE and SHADOW TONE
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: shadow_tone
+    label: SHADOW TONE
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xpro1-manual
+      locator: pp. 68-69 (PDF 84-85), HIGHLIGHT TONE and SHADOW TONE
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: saturation
+    label: COLOR
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xpro1-manual
+      locator: p. 68 (PDF 84), COLOR
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: sharpening
+    label: SHARPNESS
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xpro1-manual
+      locator: p. 69 (PDF 85), SHARPNESS
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: noise_reduction
+    label: NOISE REDUCTION
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xpro1-manual
+      locator: p. 69 (PDF 85), NOISE REDUCTION
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: film_simulation_bracket
+    label: FILM SIMULATION BKT
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: xpro1-manual
+      locator: p. 35 (PDF 51), Bracketing
+  notes:
+  - Firmware notes through Ver. 3.82 list no film-simulation additions.

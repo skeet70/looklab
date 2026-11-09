@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::PublishError;
 use crate::audit::AuditLog;
-use crate::body::{BodyKind, BodyPage, BodyStatus, MappingStatus};
+use crate::body::{BodyKind, BodyPage, BodyStatus, MappingStatus, PreparationPage};
 use crate::hash::{ArtifactHash, ArtifactName, SitePath};
+use crate::manual::{ManualArtifact, ManualPage, ManualSummary};
 use crate::manifest::{
     ArtifactBlob, ArtifactEntry, GateSummary, LookStatus, ProvenanceSummary, VersionManifest,
     verify_artifact,
@@ -200,6 +201,8 @@ pub struct BodySummary {
     pub kind: BodyKind,
     pub status: BodyStatus,
     pub mapping_status: MappingStatus,
+    #[serde(default)]
+    pub preparation: PreparationPage,
     pub epochs: usize,
     pub looks: Vec<Slug>,
 }
@@ -218,6 +221,8 @@ pub struct SiteIndex {
     #[serde(default)]
     pub community_snapshot_version: u64,
     pub bodies: Vec<BodySummary>,
+    #[serde(default)]
+    pub manuals: Vec<ManualSummary>,
     pub looks: Vec<LookSummary>,
     pub scenes: Vec<SceneSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,6 +234,7 @@ pub struct SiteData {
     /// The community data snapshot the site is built from.
     pub community_snapshot_version: u64,
     pub bodies: Vec<BodyPage>,
+    pub manuals: Vec<ManualPage>,
     pub looks: Vec<LookPage>,
     pub audit_log: AuditLog,
     pub scenes: Vec<Scene>,
@@ -265,6 +271,12 @@ pub fn scene_index_path() -> SitePath {
 /// Rejects a body id whose segments are not safe path components.
 pub fn body_path(id: &BodyId) -> Result<SitePath, PublishError> {
     SitePath::new(format!("data/bodies/{}/{}.json", id.make(), id.model()))
+}
+
+/// # Errors
+/// Rejects a body id whose segments are not safe path components.
+pub fn manual_path(id: &BodyId) -> Result<SitePath, PublishError> {
+    SitePath::new(format!("data/manuals/{}/{}.json", id.make(), id.model()))
 }
 
 /// # Errors
@@ -311,6 +323,13 @@ pub fn write_site<S: SiteSink + ?Sized>(
     site: &SiteData,
 ) -> Result<ArtifactHash, PublishError> {
     validate(site)?;
+
+    let mut manuals = Vec::with_capacity(site.manuals.len());
+    for manual in &site.manuals {
+        let encoded = EncodedManual::new(manual)?;
+        sink.put(&encoded.summary.artifact.path, &encoded.bytes)?;
+        manuals.push(encoded.summary);
+    }
 
     for body in &site.bodies {
         let mut page = body.clone();
@@ -366,7 +385,7 @@ pub fn write_site<S: SiteSink + ?Sized>(
     };
     sink.put(&scene_index_path(), &json(&scene_index)?)?;
     sink.put(&audit_log_path(), &json(&site.audit_log)?)?;
-    let index = json(&site_index(site, scene_index.scenes)?)?;
+    let index = json(&site_index(site, scene_index.scenes, manuals)?)?;
     sink.put(&index_path(), &index)?;
     Ok(ArtifactHash::of(&index))
 }
@@ -412,11 +431,33 @@ impl EncodedScene {
     }
 }
 
+struct EncodedManual {
+    summary: ManualSummary,
+    bytes: Vec<u8>,
+}
+
+impl EncodedManual {
+    fn new(manual: &ManualPage) -> Result<Self, PublishError> {
+        let bytes = json(manual)?;
+        let path = manual_path(&manual.id)?;
+        let summary = manual.summary(ManualArtifact {
+            path,
+            sha256: ArtifactHash::of(&bytes),
+            bytes: bytes.len() as u64,
+        });
+        Ok(Self { summary, bytes })
+    }
+}
+
 fn reference_preview_path(name: &ArtifactName) -> Result<SitePath, PublishError> {
     SitePath::new(format!("data/reference/{}", name.as_str()))
 }
 
-fn site_index(site: &SiteData, scenes: Vec<SceneSummary>) -> Result<SiteIndex, PublishError> {
+fn site_index(
+    site: &SiteData,
+    scenes: Vec<SceneSummary>,
+    manuals: Vec<ManualSummary>,
+) -> Result<SiteIndex, PublishError> {
     let bodies = site
         .bodies
         .iter()
@@ -440,6 +481,7 @@ fn site_index(site: &SiteData, scenes: Vec<SceneSummary>) -> Result<SiteIndex, P
                 kind: body.kind,
                 status: body.status,
                 mapping_status: body.mapping_status,
+                preparation: body.preparation.clone(),
                 epochs: body.epochs.len(),
                 looks,
             }
@@ -488,6 +530,7 @@ fn site_index(site: &SiteData, scenes: Vec<SceneSummary>) -> Result<SiteIndex, P
         format: SITE_FORMAT.to_owned(),
         community_snapshot_version: site.community_snapshot_version,
         bodies,
+        manuals,
         looks,
         scenes,
         reference_preview: site
@@ -512,6 +555,15 @@ fn validate(site: &SiteData) -> Result<(), PublishError> {
         }
         body_ids.push(body.id.clone());
         body_path(&body.id)?;
+    }
+
+    let mut manual_ids = Vec::with_capacity(site.manuals.len());
+    for manual in &site.manuals {
+        if manual_ids.contains(&manual.id) {
+            return Err(PublishError::DuplicateBody(manual.id.to_string()));
+        }
+        manual_ids.push(manual.id.clone());
+        manual_path(&manual.id)?;
     }
 
     let mut look_slugs = Vec::with_capacity(site.looks.len());
@@ -642,6 +694,7 @@ mod tests {
         let site = SiteData {
             community_snapshot_version: 0,
             bodies: vec![body()],
+            manuals: Vec::new(),
             looks: vec![look()],
             audit_log: AuditLog::default(),
             scenes: vec![scene()],
@@ -669,6 +722,7 @@ mod tests {
         let site = SiteData {
             community_snapshot_version: 3,
             bodies: vec![body()],
+            manuals: Vec::new(),
             looks: vec![look()],
             audit_log: AuditLog::default(),
             scenes: vec![scene()],
@@ -754,6 +808,7 @@ mod tests {
         let site = SiteData {
             community_snapshot_version: 0,
             bodies: Vec::new(),
+            manuals: Vec::new(),
             looks: vec![look(), look()],
             audit_log: AuditLog::default(),
             scenes: Vec::new(),

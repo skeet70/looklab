@@ -140,8 +140,8 @@ fn envelope_construction_is_deterministic_and_round_trips() {
     let (_, _, manifest_reply) = built(RenderClass::Monochrome);
     let manifest = decode_build_manifest_reply(&manifest_reply).expect("manifest builds");
 
-    let send_request =
-        build_send_manifest_request(nonce, vec![manifest.manifest_hash]).expect("request builds");
+    let send_request = build_send_manifest_request(nonce, vec![manifest.manifest_hash], Vec::new())
+        .expect("request builds");
     let send_reply = call(ModuleFunction::BuildSendManifest, &send_request);
     let send = decode_build_send_manifest_reply(&send_reply).expect("send manifest builds");
     assert_eq!(

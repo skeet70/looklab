@@ -13,6 +13,7 @@ pub enum ErrorCode {
     LengthRequired,
     RequestTimeout,
     Busy,
+    EnvelopeVersionUnsupported,
     MalformedEnvelope,
     NonceUnknown,
     NonceExpired,
@@ -49,6 +50,7 @@ impl ErrorCode {
             Self::LengthRequired => StatusCode::LENGTH_REQUIRED,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::Busy => StatusCode::SERVICE_UNAVAILABLE,
+            Self::EnvelopeVersionUnsupported => StatusCode::UPGRADE_REQUIRED,
             Self::MalformedEnvelope => StatusCode::BAD_REQUEST,
             Self::NonceUnknown | Self::NonceExpired => StatusCode::BAD_REQUEST,
             Self::NonceReplayed => StatusCode::CONFLICT,
@@ -83,6 +85,7 @@ impl ErrorCode {
             Self::LengthRequired => "LENGTH_REQUIRED",
             Self::RequestTimeout => "REQUEST_TIMEOUT",
             Self::Busy => "BUSY",
+            Self::EnvelopeVersionUnsupported => "ENVELOPE_VERSION_UNSUPPORTED",
             Self::MalformedEnvelope => "MALFORMED_ENVELOPE",
             Self::NonceUnknown => "NONCE_UNKNOWN",
             Self::NonceExpired => "NONCE_EXPIRED",
@@ -117,11 +120,19 @@ impl ErrorCode {
 #[derive(Debug, Clone, Copy)]
 pub struct ApiError {
     code: ErrorCode,
+    action: Option<&'static str>,
 }
 
 impl ApiError {
     pub const fn new(code: ErrorCode) -> Self {
-        Self { code }
+        Self { code, action: None }
+    }
+
+    pub const fn with_action(code: ErrorCode, action: &'static str) -> Self {
+        Self {
+            code,
+            action: Some(action),
+        }
     }
 }
 
@@ -141,6 +152,8 @@ impl From<sqlx::Error> for ApiError {
 #[derive(Serialize)]
 struct ErrorBody {
     error: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<&'static str>,
 }
 
 impl IntoResponse for ApiError {
@@ -154,6 +167,7 @@ impl IntoResponse for ApiError {
             self.code.status(),
             Json(ErrorBody {
                 error: self.code.as_str(),
+                action: self.action,
             }),
         )
             .into_response()

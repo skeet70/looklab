@@ -963,6 +963,7 @@ mod tests {
             format: SITE_FORMAT.to_owned(),
             community_snapshot_version: 0,
             bodies: Vec::new(),
+            manuals: Vec::new(),
             looks,
             scenes,
             reference_preview: None,

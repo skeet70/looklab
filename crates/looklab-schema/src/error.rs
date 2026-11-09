@@ -2,6 +2,7 @@
 //! Validation errors for the data files.
 
 use crate::control::ControlType;
+use crate::ids::SourceId;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ErrorKind {
@@ -102,6 +103,42 @@ pub enum ErrorKind {
     FixtureEvidenceMissing { entity: String },
     #[error("the fixture manifest is invalid: {0}")]
     FixtureManifest(String),
+    #[error("manual catalog version {found} is not supported")]
+    UnsupportedCatalogVersion { found: u32 },
+    #[error("citation source `{source_id}` is not defined on this camera")]
+    UnknownCitationSource { source_id: SourceId },
+    #[error("`{field}` must not be empty")]
+    EmptyText { field: &'static str },
+    #[error("`{value}` is not an HTTPS URL")]
+    InvalidUrl { value: String },
+    #[error("`{value}` is not an exact rational")]
+    InvalidRational { value: String },
+    #[error("`{key}` needs at least one citation")]
+    CitationRequired { key: String },
+    #[error("`{key}` must carry an enum domain")]
+    ManualKeyNotEnum { key: String },
+    #[error("`{key}` has no documented value and needs an unspecified domain")]
+    ManualDomainNotUnspecified { key: String },
+    #[error("year {year} is outside the catalog's 2011-onward scope")]
+    YearOutOfScope { year: u16 },
+    #[error("a correction cannot set availability `not_documented`")]
+    CorrectionNotDocumented,
+    #[error("a `matches` finding needs an available documented control")]
+    MatchesNeedsAvailable,
+    #[error("confirmation scope names `{key}`, which is not documented for this camera")]
+    UnknownDocumentedControl { key: String },
+    #[error("complete confirmation omits available control `{key}`")]
+    CompleteConfirmationMissing { key: String },
+    #[error("confirmation scope and observations disagree")]
+    ScopeMismatch,
+    #[error("the confirmation payload is larger than allowed")]
+    ConfirmationTooLarge,
+    #[error("confirmation version {found} is not supported")]
+    UnsupportedConfirmationVersion { found: u32 },
+    #[error("the camera definition changed since this confirmation was prepared")]
+    CameraDefinitionChanged,
+    #[error("`{key}` changed since this confirmation was prepared")]
+    ControlDefinitionChanged { key: String },
 }
 
 /// A rule violation at a YAML path such as `epochs[0].controls[3].default`.

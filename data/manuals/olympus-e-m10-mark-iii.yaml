@@ -1,0 +1,296 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: olympus/e-m10-mark-iii
+  make: Olympus
+  model: OM-D E-M10 Mark III
+  sources:
+  - id: olympus-e-m10-mark-iii-manual
+    kind: owner_manual
+    url: https://download.omsystem.com/pages/inst/em10m3/manual_em10m3_ENU.pdf
+    title: OM-D E-M10 Mark III Instruction Manual
+    edition: ENU
+    firmware_scope: '1.1'
+  capabilities:
+  - key: clarity
+    label: Clarity
+    category: spatial
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: color_chrome
+    label: Color Chrome
+    category: unknown
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: color_temperature
+    label: CWB
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: 2000
+      max: 14000
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 70
+  - key: contrast
+    label: Contrast
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 81
+  - key: creative_filters
+    label: Art Filter
+    category: mixed
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Pop Art I/II
+      - Soft Focus
+      - Pale&Light Color I/II
+      - Light Tone
+      - Grainy Film I/II
+      - Pin Hole I/II/III
+      - Diorama I/II
+      - Cross Process I/II
+      - Gentle Sepia
+      - Dramatic Tone I/II
+      - Key Line I/II
+      - Watercolor I/II
+      - Vintage I/II/III
+      - Partial Color I/II/III
+      - Bleach Bypass I/II
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 43
+  - key: dynamic_range
+    label: Gradation
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - 'AUTO: Auto'
+      - 'NORM: Normal'
+      - 'HIGH: High Key'
+      - 'LOW: Low Key'
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 82
+  - key: exposure_compensation
+    label: Exposure compensation
+    category: rendering
+    availability: available
+    domain:
+      type: rational
+      min: '-5.0'
+      max: '+5.0'
+      steps:
+      - 1/3
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 60
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 152
+  - key: grain
+    label: Grain
+    category: spatial
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: grain_size
+    label: Grain Size
+    category: spatial
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: heif_capture
+    label: HEIF
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: highlight_tone
+    label: Highlight&Shadow Control
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 84
+  - key: in_camera_raw_conversion
+    label: RAW Data Edit
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 103
+  - key: jpeg_capture
+    label: JPEG
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 73
+  - key: jpeg_color_spaces
+    label: Color Space
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - AdobeRGB
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 84
+  - key: jpeg_quality
+    label: Compression ratio
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - SF
+      - F
+      - N
+      - B
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 73
+  - key: monochrome_toning
+    label: Monochrome Color
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - N:None
+      - S:Sepia
+      - B:Blue
+      - P:Purple
+      - G:Green
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 83
+  - key: native_simulations
+    label: Picture Mode
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - i-Enhance
+      - Vivid
+      - Natural
+      - Muted
+      - Portrait
+      - Monochrome
+      - Custom
+      - e-Portrait
+      - Color Creator
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 69
+  - key: noise_reduction
+    label: Noise Filter
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 111
+  - key: raw_capture
+    label: RAW
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 73
+  - key: raw_jpeg_simultaneous
+    label: RAW+JPEG
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 73
+  - key: saturation
+    label: Saturation
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 81
+  - key: shadow_tone
+    label: Highlight&Shadow Control
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 84
+  - key: sharpening
+    label: Sharpness
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 80
+  - key: white_balance_presets
+    label: White Balance
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - '5'
+      - N
+      - O
+      - '1'
+      - '>'
+      - n
+      - P
+      - Q
+      - W
+      - X
+      - CWB
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 70
+  - key: white_balance_shift
+    label: WB Compensation
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: A (Red-Blue)
+      - label: G (Green-Magenta)
+    citations:
+    - source: olympus-e-m10-mark-iii-manual
+      locator: p. 79
+  notes:
+  - 'Simplified menu structure: Color Creator and the art filters appear in the same Picture Mode list as the picture modes (p. 69). Highlight&Shadow Control, Sharpness, Contrast, and Saturation are presented as adjustment scales without printed numeric ranges; Noise Filter levels are not enumerated in the text. Firmware version 1.1 adds RC mode information display and wireless remote control flash photography (p. 165).'

@@ -76,8 +76,12 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         .await
         .map_err(|_| ApiError::new(ErrorCode::RequestTimeout))??;
 
-    let header = parse_header(&body, &state.config.limits)
-        .map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
+    let header = parse_header(&body, &state.config.limits).map_err(|error| match error {
+        crate::preparse::HeaderError::UnsupportedVersion(_) => {
+            ApiError::with_action(ErrorCode::EnvelopeVersionUnsupported, "reload_and_prepare")
+        }
+        _ => ApiError::new(ErrorCode::MalformedEnvelope),
+    })?;
     if !state.rate_limiter.check(&RateKey::GlobalUpload) {
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
@@ -116,7 +120,12 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
     let mut promotion: Option<PendingPromotion> = None;
     match send {
         Some(send) => {
-            check_send_binding(&send, &header, &assertion_hash)?;
+            check_send_binding(
+                &send,
+                header.send_manifest_hash.as_bytes(),
+                &header.assertion.credential_id,
+                &assertion_hash,
+            )?;
             check_send_open(&send)?;
             check_batch_pending(&state, &header).await?;
             if resolved.existing.is_none() {
@@ -162,12 +171,19 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
                 .iter()
                 .map(|hash| *hash.as_bytes())
                 .collect::<Vec<_>>();
+            let attestation_hashes = header
+                .send_manifest
+                .attestations
+                .iter()
+                .map(|hash| *hash.as_bytes())
+                .collect::<Vec<_>>();
             let new_send = NewSend {
                 manifest_hash: header.send_manifest_hash.as_bytes(),
                 nonce: &header.nonce,
                 credential_id: &header.assertion.credential_id,
                 assertion_hash: &assertion_hash,
                 batch_hashes: &batch_hashes,
+                attestation_hashes: &attestation_hashes,
             };
             match store::establish_send(&state.db, &new_send)
                 .await
@@ -184,7 +200,12 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
                 }
                 EstablishSend::Existing(send) => {
                     send_expires_at = Some(send.expires_at);
-                    check_send_binding(&send, &header, &assertion_hash)?;
+                    check_send_binding(
+                        &send,
+                        header.send_manifest_hash.as_bytes(),
+                        &header.assertion.credential_id,
+                        &assertion_hash,
+                    )?;
                     check_send_open(&send)?;
                     check_batch_pending(&state, &header).await?;
                 }
@@ -230,8 +251,14 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
     let body_for_parse = body.clone();
     let (mut envelope, counts) =
         task::spawn_blocking(move || -> Result<(Envelope, Vec<i64>), ApiError> {
-            let envelope = parse_envelope_strict(&body_for_parse, &limits)
-                .map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
+            let envelope =
+                parse_envelope_strict(&body_for_parse, &limits).map_err(|error| match error {
+                    looklab_upload::EnvelopeError::UnsupportedVersion(_) => ApiError::with_action(
+                        ErrorCode::EnvelopeVersionUnsupported,
+                        "reload_and_prepare",
+                    ),
+                    _ => ApiError::new(ErrorCode::MalformedEnvelope),
+                })?;
             let counts = blob_counts(&envelope)?;
             Ok((envelope, counts))
         })
@@ -451,24 +478,23 @@ enum CredentialCompletion {
     Pending(Box<PendingPromotion>),
 }
 
-fn check_send_binding(
+pub(crate) fn check_send_binding(
     send: &StoredSend,
-    header: &EnvelopeHeader,
+    manifest_hash: &[u8; 32],
+    credential_id: &[u8],
     assertion_hash: &[u8; 32],
 ) -> ApiResult<()> {
-    if send.manifest_hash != *header.send_manifest_hash.as_bytes() {
+    if send.manifest_hash != *manifest_hash {
         return Err(ApiError::new(ErrorCode::SendManifestInvalid));
     }
-    if send.credential_id != header.assertion.credential_id
-        || send.assertion_hash != *assertion_hash
-    {
+    if send.credential_id != credential_id || send.assertion_hash != *assertion_hash {
         return Err(ApiError::new(ErrorCode::SendCredentialMismatch));
     }
     Ok(())
 }
 
-fn check_send_open(send: &StoredSend) -> ApiResult<()> {
-    if send.completed_at.is_some() {
+pub(crate) fn check_send_open(send: &StoredSend) -> ApiResult<()> {
+    if send.completed_at.is_some() || send.withdrawn_at.is_some() {
         return Err(ApiError::new(ErrorCode::SendReplayed));
     }
     if now_unix() > send.expires_at {
@@ -488,7 +514,7 @@ async fn check_batch_pending(state: &AppState, header: &EnvelopeHeader) -> ApiRe
     }
 }
 
-fn assertion_digest(assertion: &WebAuthnAssertion) -> [u8; 32] {
+pub(crate) fn assertion_digest(assertion: &WebAuthnAssertion) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for field in [
         &assertion.credential_id,
@@ -534,6 +560,16 @@ async fn complete(
     };
     contribution.credential_id = credential_id.clone();
     store::insert_contribution(&mut tx, &contribution).await?;
+    if let Ok(camera_id) = looklab_schema::BodyId::new(&contribution.body_id)
+        && let Some(camera) = state.manuals.camera(&camera_id)
+    {
+        let summary = crate::manual_confirm::summary_with(&mut *tx, camera)
+            .await
+            .map_err(database_error)?;
+        crate::manual_confirm::promotion_audit_with(&mut *tx, camera, &summary)
+            .await
+            .map_err(database_error)?;
+    }
     if !store::mark_send_batch_received(&mut tx, nonce, batch_hash, &contribution.id).await? {
         return Err(ApiError::new(ErrorCode::BatchReplayed));
     }

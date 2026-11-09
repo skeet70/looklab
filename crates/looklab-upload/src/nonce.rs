@@ -54,6 +54,10 @@ bytes32_type!(
     SendManifestHash
 );
 bytes32_type!(
+    /// SHA-256 of a canonical confirmation payload.
+    AttestationHash
+);
+bytes32_type!(
     /// SHA-256 of `nonce ‖ manifest_hash`, signed through WebAuthn.
     Challenge
 );

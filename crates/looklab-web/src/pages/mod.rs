@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 mod bodies;
-mod body;
+pub(crate) mod body;
 mod bounties;
 mod compare;
 pub(crate) mod contribute;
@@ -11,6 +11,7 @@ mod landing;
 mod log;
 mod look;
 mod looks;
+pub(crate) mod manual_confirm;
 pub(crate) mod match_page;
 mod misc;
 mod modqueue;

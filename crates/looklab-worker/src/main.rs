@@ -22,6 +22,9 @@ struct Args {
     /// Body and control-schema snapshots.
     #[arg(long, default_value = "data")]
     data: PathBuf,
+    /// Documentation-derived camera catalog directory.
+    #[arg(long, default_value = "data/manuals")]
+    manuals: PathBuf,
     /// Approved community snapshots; the newest `v<version>` directory wins.
     #[arg(long, default_value = "data/community")]
     snapshot_dir: PathBuf,
@@ -50,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let mut config = WorkerConfig::new(args.db, args.blobs);
     config.data = args.data;
+    config.manuals = args.manuals;
     config.snapshot_dir = args.snapshot_dir;
     config.site = args.site;
     config.transforms = args.transforms;
@@ -69,7 +73,8 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Publishes a missing catalog, re-queues a requested publication, and keeps pending jobs in the table.
+/// Publishes a missing catalog, a catalog without manuals, a requested publication,
+/// and keeps pending jobs in the table.
 async fn schedule_startup(worker: &Worker) -> anyhow::Result<()> {
     let now = clock::now_unix();
     jobs::enqueue_pending_publication(worker.pool(), now).await?;
@@ -81,10 +86,20 @@ async fn schedule_startup(worker: &Worker) -> anyhow::Result<()> {
         now,
     )
     .await?;
-    if !worker.config().site.join("data/index.json").is_file() {
+    let index = worker.config().site.join("data/index.json");
+    let catalog = &worker.config().manuals;
+    let catalog_present = catalog.is_dir() || catalog.is_file();
+    if !index.is_file() || (catalog_present && !published_index_has_manuals(&index)) {
         jobs::request_publish(worker.pool(), now).await?;
     }
     Ok(())
+}
+
+fn published_index_has_manuals(path: &std::path::Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<looklab_publish::SiteIndex>(&bytes).ok())
+        .is_some_and(|index| !index.manuals.is_empty())
 }
 
 async fn shutdown_signal() {

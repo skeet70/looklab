@@ -144,6 +144,62 @@ pub async fn body(make: &str, model: &str) -> Result<BodyPage, String> {
     .await
 }
 
+pub async fn body_optional(make: &str, model: &str) -> Result<Option<BodyPage>, String> {
+    get_optional_json(&publication_url(&format!(
+        "/data/bodies/{make}/{model}.json"
+    )))
+    .await
+}
+
+pub async fn manual(
+    make: &str,
+    model: &str,
+) -> Result<Option<looklab_publish::ManualPage>, String> {
+    let id = looklab_schema::BodyId::new(&format!("{make}/{model}"))
+        .map_err(|error| error.to_string())?;
+    let Some(summary) = index()
+        .await?
+        .manuals
+        .iter()
+        .find(|manual| manual.id == id)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let path = summary.artifact.path.as_str();
+    let bytes = get(&publication_url(&format!("/{path}"))).await?;
+    let digest = ArtifactHash::of(&bytes);
+    if digest != summary.artifact.sha256 || bytes.len() as u64 != summary.artifact.bytes {
+        return Err(format!(
+            "{make}/{model}: manual page does not match the site index: expected {}, got {digest}",
+            summary.artifact.sha256
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("/{path}: {error}"))
+}
+
+async fn get_optional_json<T: DeserializeOwned>(path: &str) -> Result<Option<T>, String> {
+    let response = Request::get(path)
+        .send()
+        .await
+        .map_err(|error| format!("{path}: {error}"))?;
+    if response.status() == 404 {
+        return Ok(None);
+    }
+    if !response.ok() {
+        return Err(format!("{path}: HTTP {}", response.status()));
+    }
+    let bytes = response
+        .binary()
+        .await
+        .map_err(|error| format!("{path}: {error}"))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("{path}: {error}"))
+}
+
 pub async fn look(slug: &str) -> Result<LookPage, String> {
     get_json(&publication_url(&format!("/data/looks/{slug}.json"))).await
 }
@@ -1172,6 +1228,124 @@ fn json_body<T: Serialize>(value: &T) -> Result<JsValue, String> {
     serde_json::to_string(value)
         .map(|text| JsValue::from_str(&text))
         .map_err(|error| error.to_string())
+}
+
+/// Posts the canonical confirmation request bytes from `looklab-wasm`.
+///
+/// # Errors
+/// Reports a server rejection or a malformed request.
+pub async fn submit_manual_confirmation(
+    body: &[u8],
+) -> Result<looklab_schema::ManualConfirmationSummary, String> {
+    let path = api_url("/api/manual-confirmations");
+    let request = Request::post(&path)
+        .header("Content-Type", "application/json")
+        .body(Some(JsValue::from(js_sys::Uint8Array::from(body))))
+        .map_err(|error| error.to_string())?;
+    api_send(&path, request).await
+}
+
+/// Posts the canonical withdraw request bytes from `looklab-wasm`.
+///
+/// # Errors
+/// Reports a server rejection or a malformed request.
+pub async fn withdraw_manual_confirmation(
+    camera: &looklab_schema::BodyId,
+    signed: &SignedFields,
+) -> Result<(), String> {
+    let body = looklab_wasm::manual_withdraw_request(
+        camera,
+        &signed.nonce,
+        &signed.credential_id,
+        &signed.authenticator_data,
+        &signed.client_data_json,
+        &signed.signature,
+    )
+    .map_err(|error| error.to_string())?;
+    let path = api_url("/api/manual-confirmations/withdraw");
+    let request = Request::post(&path)
+        .header("Content-Type", "application/json")
+        .body(Some(JsValue::from(js_sys::Uint8Array::from(
+            body.as_slice(),
+        ))))
+        .map_err(|error| error.to_string())?;
+    api_send_empty(&path, request).await
+}
+
+pub async fn manual_summary(
+    make: &str,
+    model: &str,
+) -> Result<looklab_schema::ManualConfirmationSummary, String> {
+    get_json(&api_url(&format!(
+        "/api/manual-confirmations/{make}/{model}"
+    )))
+    .await
+}
+
+/// # Errors
+/// Reports a closed moderation session, a server rejection or a malformed response.
+pub async fn moderate_manual_confirmation(
+    camera: &looklab_schema::BodyId,
+    key: looklab_schema::CapabilityKey,
+    body: &[u8],
+) -> Result<looklab_schema::ManualConfirmationSummary, String> {
+    let token = moderation_token()?;
+    let path = api_url(&format!(
+        "/api/manual-confirmations/{}/{}/moderate",
+        camera.as_str(),
+        key.as_str()
+    ));
+    let request = Request::post(&path)
+        .header("Content-Type", "application/json")
+        .header("Authorization", &format!("Bearer {}", token.0))
+        .body(Some(JsValue::from(js_sys::Uint8Array::from(body))))
+        .map_err(|error| error.to_string())?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("{path}: {error}"))?;
+    if response.status() == 401 {
+        close_moderation_session();
+        return Err("Your review session ended. Confirm it's you to continue.".to_owned());
+    }
+    if response.status() == 409 {
+        let text = response.text().await.unwrap_or_default();
+        let conflict = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .or_else(|| value.get("code"))
+                    .and_then(|code| code.as_str())
+                    .map(|code| code == "CONFLICT")
+            })
+            .unwrap_or(false);
+        if conflict {
+            return Err(
+                "This control definition changed. Reload the camera page before recording a decision."
+                    .to_owned(),
+            );
+        }
+        return Err(format!("{path}: HTTP 409"));
+    }
+    if !response.ok() {
+        return Err(format!("{path}: HTTP {}", response.status()));
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| format!("{path}: {error}"))
+}
+
+async fn api_send_empty(path: &str, request: Request) -> Result<(), String> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("{path}: {error}"))?;
+    if !response.ok() {
+        return Err(format!("{path}: HTTP {}", response.status()));
+    }
+    Ok(())
 }
 
 async fn api_send<T: DeserializeOwned>(path: &str, request: Request) -> Result<T, String> {

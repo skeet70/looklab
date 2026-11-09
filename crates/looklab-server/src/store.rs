@@ -13,6 +13,7 @@ use crate::ids::{
     BlobAttemptId, ContributionId, ContributionImageId, CredentialId, DeferredExpiryId, JobId,
     TokenHash, WithdrawalId,
 };
+use crate::manuals::Manuals;
 use crate::trust::{CredentialStanding, Tier};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -236,12 +237,14 @@ pub struct StoredSend {
     pub assertion_hash: [u8; 32],
     pub expires_at: i64,
     pub completed_at: Option<i64>,
+    pub withdrawn_at: Option<i64>,
 }
 
 pub async fn find_send(db: &SqlitePool, nonce: &Nonce) -> Result<Option<StoredSend>, sqlx::Error> {
-    type SendRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, Option<i64>);
+    type SendRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, Option<i64>, Option<i64>);
     let row: Option<SendRow> = sqlx::query_as(
-        "SELECT manifest_hash, credential_id, assertion_hash, expires_at, completed_at
+        "SELECT manifest_hash, credential_id, assertion_hash, expires_at, completed_at,
+                withdrawn_at
          FROM send_manifests WHERE nonce = ?",
     )
     .bind(hex(nonce.as_bytes()))
@@ -258,6 +261,7 @@ pub async fn find_send(db: &SqlitePool, nonce: &Nonce) -> Result<Option<StoredSe
             assertion_hash,
             expires_at: row.3,
             completed_at: row.4,
+            withdrawn_at: row.5,
         })
     })
     .transpose()
@@ -281,12 +285,74 @@ pub async fn find_send_batch(
     Ok(row.map(|row| row.0))
 }
 
+/// `None` when the send does not list the attestation, otherwise whether it
+/// already arrived.
+pub async fn find_send_attestation(
+    db: &SqlitePool,
+    nonce: &Nonce,
+    attestation: &[u8; 32],
+) -> Result<Option<Option<i64>>, sqlx::Error> {
+    let row: Option<(Option<i64>,)> = sqlx::query_as(
+        "SELECT received_at FROM send_manifest_attestations
+         WHERE send_nonce = ? AND attestation_hash = ?",
+    )
+    .bind(hex(nonce.as_bytes()))
+    .bind(attestation.as_slice())
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|row| row.0))
+}
+
+/// Moves one attestation from pending to received and completes the send once
+/// every declared batch and attestation has arrived. Exactly one caller can win.
+pub async fn mark_send_attestation_received(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    nonce: &Nonce,
+    attestation: &[u8; 32],
+    confirmation: i64,
+) -> Result<bool, sqlx::Error> {
+    let key = hex(nonce.as_bytes());
+    let now = now_unix();
+    let affected = sqlx::query(
+        "UPDATE send_manifest_attestations SET received_at = ?, confirmation_id = ?
+         WHERE send_nonce = ? AND attestation_hash = ? AND received_at IS NULL
+           AND EXISTS (SELECT 1 FROM send_manifests
+                       WHERE nonce = ? AND withdrawn_at IS NULL AND expires_at >= ?)",
+    )
+    .bind(now)
+    .bind(confirmation)
+    .bind(&key)
+    .bind(attestation.as_slice())
+    .bind(&key)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if affected != 1 {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE send_manifests SET completed_at = ?
+         WHERE nonce = ? AND completed_at IS NULL
+           AND received_count >= batch_count
+           AND NOT EXISTS (SELECT 1 FROM send_manifest_attestations
+                           WHERE send_nonce = ? AND received_at IS NULL)",
+    )
+    .bind(now)
+    .bind(&key)
+    .bind(&key)
+    .execute(&mut **tx)
+    .await?;
+    Ok(true)
+}
+
 pub struct NewSend<'a> {
     pub manifest_hash: &'a [u8; 32],
     pub nonce: &'a Nonce,
     pub credential_id: &'a [u8],
     pub assertion_hash: &'a [u8; 32],
     pub batch_hashes: &'a [[u8; 32]],
+    pub attestation_hashes: &'a [[u8; 32]],
 }
 
 pub enum EstablishSend {
@@ -345,6 +411,16 @@ pub async fn establish_send(
             .execute(&mut *tx)
             .await?;
         }
+        for hash in send.attestation_hashes {
+            sqlx::query(
+                "INSERT INTO send_manifest_attestations (send_nonce, attestation_hash)
+                 VALUES (?, ?)",
+            )
+            .bind(&key)
+            .bind(hash.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         return Ok(EstablishSend::Established);
     }
@@ -379,7 +455,8 @@ pub async fn mark_send_batch_received(
         "UPDATE send_manifest_batches SET received_at = ?, contribution_id = ?
          WHERE send_nonce = ? AND batch_manifest_hash = ? AND received_at IS NULL
            AND EXISTS (SELECT 1 FROM send_manifests
-                       WHERE nonce = ? AND completed_at IS NULL AND expires_at >= ?)",
+                       WHERE nonce = ? AND completed_at IS NULL AND withdrawn_at IS NULL
+                         AND expires_at >= ?)",
     )
     .bind(now)
     .bind(contribution.as_str())
@@ -397,14 +474,19 @@ pub async fn increment_send_received(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     nonce: &Nonce,
 ) -> Result<(), sqlx::Error> {
+    let key = hex(nonce.as_bytes());
     sqlx::query(
         "UPDATE send_manifests
          SET received_count = received_count + 1,
-             completed_at = CASE WHEN received_count + 1 >= batch_count THEN ? ELSE completed_at END
+             completed_at = CASE WHEN received_count + 1 >= batch_count
+                                  AND NOT EXISTS (SELECT 1 FROM send_manifest_attestations
+                                                  WHERE send_nonce = ? AND received_at IS NULL)
+                                 THEN ? ELSE completed_at END
          WHERE nonce = ?",
     )
+    .bind(&key)
     .bind(now_unix())
-    .bind(hex(nonce.as_bytes()))
+    .bind(&key)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -1106,20 +1188,29 @@ pub async fn withdraw(
     contribution_ids: &[ContributionId],
     credential_id: &CredentialId,
     delete_after: i64,
+    manuals: &Manuals,
 ) -> Result<Option<i64>, sqlx::Error> {
     let mut tx = db.begin().await?;
     let mut delete_afters = Vec::with_capacity(contribution_ids.len());
+    let mut send_nonces = BTreeSet::new();
+    let mut camera_ids = BTreeSet::new();
     for contribution_id in contribution_ids {
-        let row: Option<(String, String)> =
-            sqlx::query_as("SELECT credential_id, status FROM contributions WHERE id = ?")
-                .bind(contribution_id.as_str())
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some((owner, status)) = row else {
+        let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT credential_id, status, send_nonce, body_id
+                 FROM contributions WHERE id = ?",
+        )
+        .bind(contribution_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((owner, status, send_nonce, body_id)) = row else {
             return Ok(None);
         };
+        camera_ids.insert(body_id);
         if owner != credential_id.as_str() {
             return Ok(None);
+        }
+        if let Some(nonce) = send_nonce {
+            send_nonces.insert(nonce);
         }
         let status = ContributionStatus::from_db(&status)
             .ok_or_else(|| sqlx::Error::Protocol("unknown contribution status".to_owned()))?;
@@ -1159,6 +1250,57 @@ pub async fn withdraw(
         enqueue_job(&mut tx, JobKind::HardDeleteBlobs, &payload, delete_after).await?;
         delete_afters.push(delete_after);
     }
+    for nonce in send_nonces {
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM contributions WHERE send_nonce = ? AND status != 'withdrawn'",
+        )
+        .bind(&nonce)
+        .fetch_one(&mut *tx)
+        .await?;
+        if remaining == 0 {
+            let now = now_unix();
+            sqlx::query(
+                "UPDATE send_manifests SET withdrawn_at = ?
+                 WHERE nonce = ? AND withdrawn_at IS NULL",
+            )
+            .bind(now)
+            .bind(&nonce)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE manual_confirmation_occurrences SET withdrawn_at = ?
+                 WHERE send_nonce = ? AND withdrawn_at IS NULL",
+            )
+            .bind(now)
+            .bind(&nonce)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE manual_confirmations SET withdrawn_at = ?
+                 WHERE id IN (SELECT confirmation_id FROM manual_confirmation_occurrences
+                              WHERE send_nonce = ?)
+                   AND withdrawn_at IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM manual_confirmation_occurrences
+                                   WHERE confirmation_id = manual_confirmations.id
+                                     AND withdrawn_at IS NULL)",
+            )
+            .bind(now)
+            .bind(&nonce)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    for camera_id in camera_ids {
+        let Ok(camera_id) = BodyId::new(&camera_id) else {
+            continue;
+        };
+        let Some(camera) = manuals.camera(&camera_id) else {
+            continue;
+        };
+        let summary = crate::manual_confirm::summary_with(&mut *tx, camera).await?;
+        crate::manual_confirm::promotion_audit_with(&mut *tx, camera, &summary).await?;
+    }
+    request_publication(&mut tx).await?;
     tx.commit().await?;
     Ok(delete_afters.into_iter().max())
 }

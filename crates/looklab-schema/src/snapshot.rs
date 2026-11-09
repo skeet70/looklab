@@ -173,6 +173,7 @@ mod dir {
                 Some(Kind::Interface) => validate_interface_profile(&text)
                     .ok()
                     .map(|profile| interface_export_path(&profile.id)),
+                Some(Kind::Manual) => None,
                 None => None,
             };
             let Some(expected) = declared else {

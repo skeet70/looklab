@@ -262,5 +262,6 @@ pub fn compact_limits() -> Limits {
         max_images: 8,
         max_blob_bytes: 1 << 16,
         max_batches: 8,
+        max_attestations: 8,
     }
 }

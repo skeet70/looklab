@@ -18,8 +18,8 @@ use crate::metadata::MetadataError;
 use crate::nonce::{Challenge, ManifestHash, Nonce, SendManifestHash};
 use crate::pow::{POW_K, PowSolutions};
 use crate::send::{
-    DEFAULT_MAX_BATCHES, SendManifest, SendManifestError, canonical_send_manifest_bytes,
-    send_manifest_hash,
+    DEFAULT_MAX_ATTESTATIONS, DEFAULT_MAX_BATCHES, SendManifest, SendManifestError,
+    canonical_send_manifest_bytes, send_manifest_hash,
 };
 use crate::webauthn::{
     MAX_AUTHENTICATOR_DATA, MAX_CLIENT_DATA_JSON, MAX_CREDENTIAL_ID, MAX_SIGNATURE,
@@ -27,7 +27,7 @@ use crate::webauthn::{
 };
 
 pub const MAGIC: [u8; 6] = *b"LLUPLD";
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 
 const NONCE_OFFSET: usize = MAGIC.len() + 2;
 
@@ -43,6 +43,12 @@ pub struct Limits {
     pub max_images: usize,
     pub max_blob_bytes: usize,
     pub max_batches: usize,
+    #[serde(default = "default_max_attestations")]
+    pub max_attestations: usize,
+}
+
+fn default_max_attestations() -> usize {
+    crate::send::DEFAULT_MAX_ATTESTATIONS
 }
 
 impl Default for Limits {
@@ -53,6 +59,7 @@ impl Default for Limits {
             max_images: DEFAULT_MAX_IMAGES,
             max_blob_bytes: DEFAULT_MAX_BLOB_BYTES,
             max_batches: DEFAULT_MAX_BATCHES,
+            max_attestations: DEFAULT_MAX_ATTESTATIONS,
         }
     }
 }
@@ -150,6 +157,16 @@ pub enum EnvelopeError {
     SendManifestDuplicate { index: usize },
     #[error("send manifest entry {index} is not in canonical order")]
     SendManifestOrder { index: usize },
+    #[error("send manifest has {count} attestations, outside 0..={max}")]
+    SendManifestAttestationCountOutOfRange { count: usize, max: usize },
+    #[error("send manifest attestation {index} repeats an earlier hash")]
+    SendManifestAttestationDuplicate { index: usize },
+    #[error("send manifest attestation {index} is not in canonical order")]
+    SendManifestAttestationOrder { index: usize },
+    #[error("send manifest attestation {index} is also a batch hash")]
+    SendManifestAttestationIsBatch { index: usize },
+    #[error("send manifest version {0} is not supported")]
+    SendManifestVersion(u8),
     #[error("the batch manifest hash is not listed in the send manifest")]
     BatchNotInSendManifest,
     #[error("batch has {count} images, outside 1..={max}")]
@@ -221,7 +238,10 @@ pub fn encode_envelope(parts: &EnvelopeParts<'_>) -> Vec<u8> {
     let send_manifest_bytes = canonical_send_manifest_bytes(parts.send_manifest);
     let manifest_bytes = canonical_manifest_bytes(parts.manifest);
     assert!(
-        parts.send_manifest.validate(DEFAULT_MAX_BATCHES).is_ok(),
+        parts
+            .send_manifest
+            .validate(DEFAULT_MAX_BATCHES, crate::send::DEFAULT_MAX_ATTESTATIONS)
+            .is_ok(),
         "send manifest is not canonical"
     );
     assert!(
@@ -363,19 +383,34 @@ pub fn parse_envelope_strict(bytes: &[u8], limits: &Limits) -> Result<Envelope, 
         return Err(EnvelopeError::SendManifestNotCanonical);
     }
     send_manifest
-        .validate(limits.max_batches)
+        .validate(limits.max_batches, limits.max_attestations)
         .map_err(|error| match error {
+            SendManifestError::UnsupportedVersion { found, .. } => {
+                EnvelopeError::SendManifestVersion(found)
+            }
             SendManifestError::Empty => EnvelopeError::SendManifestCountOutOfRange {
                 count: 0,
                 max: limits.max_batches,
             },
+            SendManifestError::AttestationIsBatch { index } => {
+                EnvelopeError::SendManifestAttestationIsBatch { index }
+            }
             SendManifestError::TooMany { count, max } => {
                 EnvelopeError::SendManifestCountOutOfRange { count, max }
+            }
+            SendManifestError::TooManyAttestations { count, max } => {
+                EnvelopeError::SendManifestAttestationCountOutOfRange { count, max }
             }
             SendManifestError::Duplicate { index } => {
                 EnvelopeError::SendManifestDuplicate { index }
             }
             SendManifestError::NotSorted { index } => EnvelopeError::SendManifestOrder { index },
+            SendManifestError::DuplicateAttestation { index } => {
+                EnvelopeError::SendManifestAttestationDuplicate { index }
+            }
+            SendManifestError::AttestationNotSorted { index } => {
+                EnvelopeError::SendManifestAttestationOrder { index }
+            }
         })?;
 
     let manifest_len = reader.u32()? as usize;

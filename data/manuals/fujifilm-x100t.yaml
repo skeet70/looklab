@@ -1,0 +1,205 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: fujifilm/x100t
+  make: Fujifilm
+  model: X100T
+  sources:
+  - id: x100t-manual
+    kind: owner_manual
+    url: https://fujifilm-dsc.com/en/manual/x100t/
+    title: FUJIFILM X100T Owner's Manual
+    edition: om-full_en_01 (full owner manual)
+    firmware_scope: unspecified
+  - id: x100t-firmware
+    kind: firmware_notes
+    url: https://fujifilm-x.com/en-us/support/download/firmware/cameras/x100t/
+    title: X100T Firmware update
+    edition: web edition, accessed 2026-11-08
+    firmware_scope: '1.11'
+  capabilities:
+  - key: native_simulations
+    label: FILM SIMULATION
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - PROVIA/STANDARD
+      - Velvia/VIVID
+      - ASTIA/SOFT
+      - CLASSIC CHROME
+      - PRO Neg. Hi
+      - PRO Neg. Std
+      - MONOCHROME
+      - MONOCHROME+Ye
+      - MONOCHROME+R
+      - MONOCHROME+G
+      - SEPIA
+    citations:
+    - source: x100t-manual
+      locator: The Shooting Menu > FILM SIMULATION (menu_shooting/film_simulation)
+  - key: jpeg_quality
+    label: IMAGE QUALITY
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - FINE
+      - NORMAL
+      - RAW
+      - FINE+RAW
+      - NORMAL+RAW
+    citations:
+    - source: x100t-manual
+      locator: The Shooting Menu > IMAGE QUALITY (menu_shooting/image_quality)
+  - key: raw_capture
+    label: RAW RECORDING
+    category: capture
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: x100t-manual
+      locator: The Shooting Menu > IMAGE QUALITY (menu_shooting/image_quality) documents RAW, FINE+RAW and NORMAL+RAW
+    notes: RAW compression choices are not documented.
+  - key: heif_capture
+    label: HEIF
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: x100t-manual
+      locator: The Shooting Menu > IMAGE QUALITY (menu_shooting/image_quality)
+    notes: No HEIF option appears in the documented image-quality formats.
+  - key: in_camera_raw_conversion
+    label: RAW CONVERSION
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: x100t-manual
+      locator: The Playback Menu > RAW CONVERSION (menu_playback/raw_conversion)
+  - key: jpeg_color_spaces
+    label: COLOR SPACE
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - Adobe RGB
+    citations:
+    - source: x100t-manual
+      locator: The Setup Menu > COLOR SPACE (menu_setup/color_space)
+  - key: white_balance_presets
+    label: WHITE BALANCE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - CUSTOM
+      - COLOR TEMPERATURE
+      - DAYLIGHT
+      - SHADE
+      - FLUORESCENT LIGHT-1
+      - FLUORESCENT LIGHT-2
+      - FLUORESCENT LIGHT-3
+      - INCANDESCENT
+      - UNDERWATER
+    citations:
+    - source: x100t-manual
+      locator: The Shooting Menu > WHITE BALANCE (menu_shooting/white_balance)
+  - key: white_balance_shift
+    label: WB SHIFT
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: R
+      - label: B
+    citations:
+    - source: x100t-manual
+      locator: The Shooting Menu > WHITE BALANCE (menu_shooting/white_balance) fine-tuning dialog
+    notes: Two-axis fine-tuning dialog; the rendered dialog figure shows the grid and current R/B values without numeric limits.
+  - key: dynamic_range
+    label: DYNAMIC RANGE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - 100%
+      - 200%
+      - 400%
+    citations:
+    - source: x100t-manual
+      locator: The Shooting Menu > DYNAMIC RANGE (menu_shooting/dynamic_range)
+    notes: 200% requires ISO 400 or above; 400% requires ISO 800 or above. AUTO selects 100% or 200%.
+  - key: highlight_tone
+    label: HIGHLIGHT TONE
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: x100t-manual
+      locator: The Shooting Menu > HIGHLIGHT TONE and SHADOW TONE (menu_shooting/highlight_tone, menu_shooting/shadow_tone)
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: shadow_tone
+    label: SHADOW TONE
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: x100t-manual
+      locator: The Shooting Menu > HIGHLIGHT TONE and SHADOW TONE (menu_shooting/highlight_tone, menu_shooting/shadow_tone)
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: saturation
+    label: COLOR
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: x100t-manual
+      locator: The Shooting Menu > COLOR (menu_shooting/color)
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: sharpening
+    label: SHARPNESS
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: x100t-manual
+      locator: The Shooting Menu > SHARPNESS (menu_shooting/sharpness)
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: noise_reduction
+    label: NOISE REDUCTION
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: x100t-manual
+      locator: The Shooting Menu > NOISE REDUCTION (menu_shooting/noise_reduction)
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: film_simulation_bracket
+    label: FILM SIMULATION BKT
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: x100t-manual
+      locator: Shooting menu list, FILM SIMULATION BKT (shooting/bracketing)

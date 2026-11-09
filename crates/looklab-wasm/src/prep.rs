@@ -198,11 +198,13 @@ pub fn build_manifest_request(
 pub fn build_send_manifest_request(
     nonce: [u8; 32],
     manifest_hashes: Vec<ManifestHash>,
+    attestation_hashes: Vec<looklab_upload::AttestationHash>,
 ) -> Result<Vec<u8>, FacadeError> {
     let request = BuildSendManifestRequest {
         nonce: Nonce::from_slice(&nonce)
             .ok_or_else(|| FacadeError::Input("nonce is not 32 bytes".to_owned()))?,
         manifest_hashes,
+        attestation_hashes,
     };
     Ok(postcard::to_allocvec(&request).expect("send manifest request is encodable"))
 }

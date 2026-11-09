@@ -10,6 +10,8 @@ mod config;
 mod db;
 mod error;
 mod ids;
+mod manual_confirm;
+mod manuals;
 pub mod operator;
 mod preparse;
 mod proposals;
@@ -38,6 +40,15 @@ pub use ids::{
 pub use state::{AppState, ModSessions};
 pub use store::request_publication;
 pub use trust::{CredentialStanding, DefaultTrustPolicy, Tier, TrustPolicy};
+
+/// # Errors
+/// A stored confirmation row is unreadable.
+pub async fn manual_summary(
+    db: &sqlx::SqlitePool,
+    camera: &looklab_schema::ManualCamera,
+) -> Result<looklab_schema::ManualConfirmationSummary, sqlx::Error> {
+    manual_confirm::summary(db, camera).await
+}
 pub use verify::{RequestDomain, request_digest};
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -52,6 +63,25 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(api::passkey::register_finish),
         )
         .route("/api/upload", post(api::upload::upload))
+        .route("/api/manuals/{make}/{model}", get(api::manual::page))
+        .route(
+            "/api/manual-confirmations/{make}/{model}",
+            get(api::manual::summary),
+        )
+        .route(
+            "/api/manual-confirmations",
+            post(api::manual::confirm).layer(DefaultBodyLimit::max(
+                looklab_schema::MAX_CONFIRMATION_BYTES + 128 * 1024,
+            )),
+        )
+        .route(
+            "/api/manual-confirmations/withdraw",
+            post(api::manual::withdraw_confirmation),
+        )
+        .route(
+            "/api/manual-confirmations/{make}/{model}/{key}/moderate",
+            post(api::manual::moderate),
+        )
         .route(
             "/api/session",
             post(api::status::session).get(api::status::restore_session),

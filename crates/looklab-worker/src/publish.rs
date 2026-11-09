@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,16 +12,21 @@ use looklab_model::{LookDocument, emulation_matches_camera_rendering};
 use looklab_publish::{
     ArtifactBlob, ArtifactHash, ArtifactName, AuditEntry, AuditEvent, AuditLog, BodyExtras,
     BodyPage, ConformanceEntry, Decision, LookListing, LookPage, LookRef, LookStatus,
-    LookVersionPage, ProposalRef, Role, SCENE_SOURCE_INDEX, Scene, SiteData, SitePath, SiteSink,
-    SplitKind, Timestamp, VersionNotes, VersionRef, compare_versions, read_scene_sources,
-    test_chart_scenes, write_conformance_pack, write_site,
+    LookVersionPage, ManualPage, PreparationBlocker, PreparationPage, ProposalRef, Role,
+    SCENE_SOURCE_INDEX, Scene, SiteData, SitePath, SiteSink, SplitKind, Timestamp, VersionNotes,
+    VersionRef, compare_versions, manual_path, read_scene_sources, test_chart_scenes,
+    write_conformance_pack, write_site,
+};
+use looklab_schema::{
+    BodyId, CapabilityKey, ConfirmationBasis, ManualUrl, ModeratorEvidenceKind,
+    ModeratorFirmwareScope,
 };
 use looklab_server::admin::{self, ListingState, LookListingRecord, ManifestArtifact};
 use looklab_upload::LookSlug;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 
-use crate::body::DataDir;
+use crate::body::{DataDir, TransformDir};
 use crate::clock::rfc3339;
 use crate::config::WorkerConfig;
 use crate::db::{self, LookVersionStatus};
@@ -33,6 +38,8 @@ pub struct PublishConfig {
     pub db: PathBuf,
     pub blobs: PathBuf,
     pub data: PathBuf,
+    /// Documentation catalog, outside the community snapshot.
+    pub manuals: PathBuf,
     /// Approved community snapshots; the newest `v<version>` directory wins.
     pub snapshot_dir: PathBuf,
     /// Body input transforms, one `<make>-<model>.yaml` per body.
@@ -69,6 +76,7 @@ impl PublishConfig {
             db: config.db.clone(),
             blobs: config.blobs.clone(),
             data: config.data.clone(),
+            manuals: config.manuals.clone(),
             snapshot_dir: config.snapshot_dir.clone(),
             transforms: config.transforms.clone(),
             out: config.site.clone(),
@@ -214,6 +222,39 @@ fn prune_unlisted(root: &Path, site: &SiteData) -> Result<()> {
             std::fs::remove_file(&page)?;
         }
     }
+    prune_manuals(root, &site.manuals)
+}
+
+fn prune_manuals(root: &Path, manuals: &[ManualPage]) -> Result<()> {
+    let expected = manuals
+        .iter()
+        .map(|manual| manual_path(&manual.id).map(|path| path.as_str().to_owned()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let dir = root.join("data/manuals");
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for make in std::fs::read_dir(&dir)? {
+        let make = make?;
+        if !make.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(make.path())? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let relative = format!(
+                "data/manuals/{}/{}",
+                make.file_name().to_string_lossy(),
+                entry.file_name().to_string_lossy()
+            );
+            if !expected.contains(&relative) {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -266,12 +307,21 @@ async fn site_data(pool: &SqlitePool, config: &PublishConfig) -> Result<SiteData
     let (snapshot_version, root) =
         crate::body::current_snapshot(&config.snapshot_dir, &config.data)?;
     let resources = DataDir::new(root).bodies()?;
+    let transforms = TransformDir::new(&config.transforms);
     let mut bodies = Vec::new();
     for entry in &resources {
+        let preparation = if transforms.load_optional(&entry.body.id)?.is_some() {
+            PreparationPage::ready()
+        } else {
+            PreparationPage::unavailable(PreparationBlocker::InputTransformMissing)
+        };
         bodies.push(BodyPage::from_schema(
             &entry.body,
             &entry.schema,
-            &BodyExtras::default(),
+            &BodyExtras {
+                preparation,
+                ..BodyExtras::default()
+            },
         )?);
     }
 
@@ -392,14 +442,75 @@ async fn site_data(pool: &SqlitePool, config: &PublishConfig) -> Result<SiteData
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let manuals = load_manuals(&config.manuals, &bodies, pool).await?;
+
     Ok(SiteData {
         community_snapshot_version: snapshot_version,
         bodies,
+        manuals,
         looks,
         audit_log: audit_log(pool).await?,
         scenes: canonical_scenes(config)?,
         reference_preview: None,
     })
+}
+
+async fn load_manuals(
+    path: &Path,
+    bodies: &[BodyPage],
+    pool: &sqlx::SqlitePool,
+) -> Result<Vec<ManualPage>> {
+    let (catalog, digest) = if path.is_dir() {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let file = entry.path();
+            if file.extension().and_then(|value| value.to_str()) != Some("yaml") {
+                continue;
+            }
+            files.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read_to_string(&file)?,
+            ));
+        }
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut catalogs = Vec::with_capacity(files.len());
+        for (name, source) in &files {
+            let catalog = looklab_schema::validate_manual_catalog(source)
+                .map_err(|errors| WorkerError::Data(format!("{name}: {errors:?}")))?;
+            catalogs.push(catalog);
+        }
+        let catalog = looklab_schema::merge_manual_catalogs(catalogs)
+            .map_err(|errors| WorkerError::Data(format!("{path:?}: {errors:?}")))?;
+        (
+            catalog,
+            looklab_schema::manual_catalog_files_digest(&files),
+        )
+    } else if path.is_file() {
+        let source = std::fs::read_to_string(path)?;
+        let catalog = looklab_schema::validate_manual_catalog(&source)
+            .map_err(|errors| WorkerError::Data(format!("{path:?}: {errors:?}")))?;
+        (catalog, looklab_schema::manual_catalog_digest(&source))
+    } else {
+        return Ok(Vec::new());
+    };
+    let preparations = bodies
+        .iter()
+        .map(|body| (body.id.clone(), body.preparation.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut pages = Vec::with_capacity(catalog.cameras.len());
+    for camera in &catalog.cameras {
+        let summary = looklab_server::manual_summary(pool, camera).await?;
+        let preparation = preparations.get(&camera.id).cloned().unwrap_or_default();
+        pages.push(ManualPage::from_camera(
+            camera,
+            catalog.catalog_version,
+            digest,
+            preparation,
+            summary,
+        ));
+    }
+    Ok(pages)
 }
 
 const SCENE_SIZE: u32 = 128;
@@ -520,12 +631,119 @@ fn credential_ref(value: &str) -> Result<looklab_publish::CredentialRef> {
     looklab_publish::CredentialRef::new(value).map_err(|error| WorkerError::Data(error.to_owned()))
 }
 
+fn body_id(value: &str) -> Result<BodyId> {
+    BodyId::new(value).map_err(|error| WorkerError::Data(error.to_string()))
+}
+
+fn capability_key(value: &str) -> Result<CapabilityKey> {
+    value
+        .parse::<CapabilityKey>()
+        .map_err(|()| WorkerError::Data(format!("unknown documented control `{value}`")))
+}
+
+fn confirmation_basis(value: &serde_json::Value) -> Option<ConfirmationBasis> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+/// The public projection of a manual audit row: display fields only, never the
+/// moderator's internal credential id or a control definition digest.
+fn manual_audit_event(kind: &str, payload: &serde_json::Value) -> Result<Option<AuditEvent>> {
+    let event = match kind {
+        "manual_confirmation" => {
+            let (Some(camera), Some(firmware), Some(controls)) = (
+                text(payload, "camera"),
+                text(payload, "firmware"),
+                number(payload, "controls"),
+            ) else {
+                return Ok(None);
+            };
+            AuditEvent::ManualConfirmation {
+                camera: body_id(camera)?,
+                firmware: firmware.to_owned(),
+                controls: usize::try_from(controls).map_err(|_| {
+                    WorkerError::Data("manual confirmation control count does not fit".to_owned())
+                })?,
+            }
+        }
+        "manual_confirmation_promotion" => {
+            let (Some(camera), Some(control), Some(firmware)) = (
+                text(payload, "camera"),
+                text(payload, "control"),
+                text(payload, "firmware"),
+            ) else {
+                return Ok(None);
+            };
+            AuditEvent::ManualConfirmationPromotion {
+                camera: body_id(camera)?,
+                control: capability_key(control)?,
+                firmware: firmware.to_owned(),
+                groups: u32::try_from(number(payload, "groups").unwrap_or(0)).unwrap_or(u32::MAX),
+                basis: payload.get("basis").and_then(confirmation_basis),
+            }
+        }
+        "manual_confirmation_withdrawal" => {
+            let (Some(camera), Some(withdrawn)) =
+                (text(payload, "camera"), number(payload, "withdrawn"))
+            else {
+                return Ok(None);
+            };
+            AuditEvent::ManualConfirmationWithdrawal {
+                camera: body_id(camera)?,
+                withdrawn,
+            }
+        }
+        "manual_moderator_confirmation" => {
+            let (Some(camera), Some(control), Some(decision)) = (
+                text(payload, "camera"),
+                text(payload, "control"),
+                text(payload, "decision"),
+            ) else {
+                return Ok(None);
+            };
+            let confirmed = match decision {
+                "confirm" => true,
+                "reject" => false,
+                _ => return Ok(None),
+            };
+            let Some(scope) = payload.get("firmware_scope") else {
+                return Ok(None);
+            };
+            let firmware_scope =
+                serde_json::from_value::<ModeratorFirmwareScope>(scope.clone()).map_err(
+                    |error| WorkerError::Data(format!("manual moderator firmware scope: {error}")),
+                )?;
+            let evidence = text(payload, "evidence_kind")
+                .and_then(|value| value.parse::<ModeratorEvidenceKind>().ok())
+                .ok_or_else(|| {
+                    WorkerError::Data("manual moderator evidence kind is missing".to_owned())
+                })?;
+            let evidence_url = text(payload, "evidence_url")
+                .map(ManualUrl::new)
+                .transpose()
+                .map_err(|error| WorkerError::Data(error.to_string()))?;
+            AuditEvent::ManualModeratorConfirmation {
+                camera: body_id(camera)?,
+                control: capability_key(control)?,
+                confirmed,
+                firmware_scope,
+                evidence,
+                evidence_url,
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(event))
+}
+
 async fn audit_event(
     pool: &SqlitePool,
     kind: &str,
     payload: &serde_json::Value,
     ts: i64,
 ) -> Result<Option<AuditEvent>> {
+    if let Some(event) = manual_audit_event(kind, payload)? {
+        return Ok(Some(event));
+    }
     let event = match kind {
         "grant_created" | "grant_revoked" => {
             let (Some(actor), Some(subject), Some(role)) = (
@@ -731,4 +949,82 @@ async fn root_contribution(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(id,)| id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MODERATOR: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    const DIGEST: &str = "aa2c1f4e6d8b0a3c5e7f90112233445566778899aabbccddeeff001122334455";
+
+    #[test]
+    fn manual_audit_rows_publish_display_fields_only() {
+        let payload = serde_json::json!({
+            "camera": "fujifilm/x-t5",
+            "control": "native_simulations",
+            "definition_digest": DIGEST,
+            "decision": "confirm",
+            "firmware_scope": {"kind": "exact", "firmware": "1.00"},
+            "moderator": MODERATOR,
+            "evidence_kind": "video",
+            "evidence_url": "https://example.com/manual",
+        });
+        let event = manual_audit_event("manual_moderator_confirmation", &payload)
+            .expect("valid row")
+            .expect("mapped event");
+        assert_eq!(event.kind(), "manual_moderator_confirmation");
+        let published = serde_json::to_string(&event).expect("serialize");
+        assert!(!published.contains(MODERATOR), "{published}");
+        assert!(!published.contains(DIGEST), "{published}");
+        assert!(published.contains("fujifilm/x-t5"), "{published}");
+        assert!(published.contains("native_simulations"), "{published}");
+        assert!(published.contains("1.00"), "{published}");
+    }
+
+    #[test]
+    fn every_manual_audit_kind_has_a_public_event() {
+        let rows = [
+            (
+                "manual_confirmation",
+                serde_json::json!({
+                    "confirmation": 3,
+                    "camera": "fujifilm/x-t5",
+                    "firmware": "1.00",
+                    "controls": 4,
+                }),
+            ),
+            (
+                "manual_confirmation_promotion",
+                serde_json::json!({
+                    "camera": "fujifilm/x-t5",
+                    "control": "native_simulations",
+                    "groups": 3,
+                    "firmware": "1.00",
+                    "basis": "corrected",
+                    "confirmed_actual": {"definition_digest": DIGEST},
+                }),
+            ),
+            (
+                "manual_confirmation_withdrawal",
+                serde_json::json!({
+                    "camera": "fujifilm/x-t5",
+                    "withdrawn": 2,
+                }),
+            ),
+        ];
+        for (kind, payload) in rows {
+            let event = manual_audit_event(kind, &payload)
+                .expect("valid row")
+                .expect("mapped event");
+            assert_eq!(event.kind(), kind);
+            let published = serde_json::to_string(&event).expect("serialize");
+            assert!(!published.contains(DIGEST), "{published}");
+        }
+        assert!(
+            manual_audit_event("grant_created", &serde_json::json!({}))
+                .expect("not a manual row")
+                .is_none()
+        );
+    }
 }

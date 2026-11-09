@@ -18,6 +18,7 @@ worker = []
 fixtures = []
 
 [dependencies]
+base64.workspace = true
 looklab-color.workspace = true
 looklab-export.workspace = true
 looklab-match.workspace = true

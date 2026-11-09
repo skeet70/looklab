@@ -100,6 +100,7 @@ fn limits_are_overridable() {
         max_images: 100,
         max_blob_bytes: 1 << 20,
         max_batches: 8,
+        max_attestations: 8,
     };
     assert!(parse_envelope_strict(&bytes, &limits).is_ok());
 }

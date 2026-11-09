@@ -10,7 +10,7 @@ use looklab_model::probes::{V1_PROBE_COUNT, validate_yaml};
 
 #[derive(Debug, Args)]
 pub struct ValidateArgs {
-    /// Data directory, laid out as `data/` (bodies/, interfaces/, probes/).
+    /// Data directory, laid out as `data/` (bodies/, interfaces/, manuals/, probes/).
     pub dir: PathBuf,
 }
 

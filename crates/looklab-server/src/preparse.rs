@@ -39,6 +39,8 @@ pub enum HeaderError {
     Truncated,
     #[error("the envelope is not an upload envelope")]
     NotAnEnvelope,
+    #[error("unsupported envelope version {0}")]
+    UnsupportedVersion(u16),
     #[error("the manifest exceeds the configured limit")]
     ManifestTooLong,
     #[error("the manifest is not a valid batch manifest")]
@@ -60,7 +62,7 @@ pub fn parse_header(bytes: &[u8], limits: &Limits) -> Result<EnvelopeHeader, Hea
     }
     let version = u16::from_le_bytes([bytes[6], bytes[7]]);
     if version != VERSION {
-        return Err(HeaderError::NotAnEnvelope);
+        return Err(HeaderError::UnsupportedVersion(version));
     }
     let nonce_bytes = take(bytes, 8, 32)?;
     let nonce = Nonce::from_slice(nonce_bytes).ok_or(HeaderError::Truncated)?;
@@ -77,7 +79,7 @@ pub fn parse_header(bytes: &[u8], limits: &Limits) -> Result<EnvelopeHeader, Hea
         return Err(HeaderError::ManifestInvalid);
     }
     send_manifest
-        .validate(limits.max_batches)
+        .validate(limits.max_batches, limits.max_attestations)
         .map_err(|_| HeaderError::ManifestInvalid)?;
     let send_hash = send_manifest_hash(&send_manifest);
 

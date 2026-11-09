@@ -195,10 +195,12 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 pub(crate) fn build_send_manifest(
     request: BuildSendManifestRequest,
 ) -> Result<BuildSendManifestResponse, ModuleError> {
-    let send_manifest = SendManifest::canonical(request.manifest_hashes).map_err(|error| {
-        ModuleError::SendManifest {
-            message: error.to_string(),
-        }
+    let send_manifest = SendManifest::canonical_with_attestations(
+        request.manifest_hashes,
+        request.attestation_hashes,
+    )
+    .map_err(|error| ModuleError::SendManifest {
+        message: error.to_string(),
     })?;
     let hash = send_manifest_hash(&send_manifest);
     Ok(BuildSendManifestResponse {
@@ -223,7 +225,7 @@ pub(crate) fn encode_envelope(
         });
     }
     send_manifest
-        .validate(DEFAULT_MAX_BATCHES)
+        .validate(DEFAULT_MAX_BATCHES, looklab_upload::DEFAULT_MAX_ATTESTATIONS)
         .map_err(|error| ModuleError::SendManifest {
             message: error.to_string(),
         })?;

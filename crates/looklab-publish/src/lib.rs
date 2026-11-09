@@ -7,6 +7,7 @@ mod body;
 mod conformance;
 mod hash;
 mod manifest;
+mod manual;
 mod match_bundle;
 #[cfg(feature = "photo-scenes")]
 pub mod photo;
@@ -23,8 +24,9 @@ pub use audit::{
 pub use body::{
     Affect, BodyExtras, BodyKind, BodyPage, BodyStatus, CapabilitiesPage, ControlConstraint,
     ControlDefaultPage, ControlPage, ControlRangePage, CredentialTier, EpochPage,
-    InputTransformPage, MappingStatus, NativeLookCard, NativeSimPage, RealizationNote,
-    SolvePlanStepPage, ToleratedPage, TransformSource,
+    InputTransformPage, MappingStatus, NativeLookCard, NativeSimPage, PreparationBlocker,
+    PreparationPage, PreparationReadiness, RealizationNote, SolvePlanStepPage, ToleratedPage,
+    TransformSource,
 };
 pub use conformance::{
     CONFORMANCE_ARCHIVE_PATH, CONFORMANCE_METADATA_PATH, ConformanceArchive, ConformanceEntry,
@@ -36,6 +38,7 @@ pub use manifest::{
     HashMismatch, LookArtifact, LookStatus, PREVIEW_LUT_ARTIFACT, ProvenanceSummary,
     VersionManifest, verify_artifact,
 };
+pub use manual::{ManualArtifact, ManualCapabilityPage, ManualPage, ManualSummary};
 pub use match_bundle::{
     ExcludedSim, MATCH_BUNDLE_FORMAT, MatchBundle, MatchBundleFormat, MatchSim, SimArtifacts,
     SimExclusion, body_artifact, bundle_artifact, sim_artifacts, transform_artifact,
@@ -58,7 +61,7 @@ pub use site::{
     LookVersionPage, LookVisibility, MANIFEST_NAME, ReferencePreview, SCENE_INDEX_PATH,
     SITE_FORMAT, SiteData, SiteIndex, SiteSink, VersionNotes, VersionSummary, WeakSpot,
     audit_log_path, body_path, compare_versions, index_path, look_path, manifest_path,
-    scene_index_path, scene_path, scene_thumbnail_path, version_dir, write_site,
+    manual_path, scene_index_path, scene_path, scene_thumbnail_path, version_dir, write_site,
 };
 
 #[derive(Debug, thiserror::Error)]

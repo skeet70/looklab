@@ -35,6 +35,7 @@ const CREDENTIAL: &[u8] = b"credential-alpha";
 const OTHER_CREDENTIAL: &[u8] = b"credential-beta";
 const BODY: &str = "fujifilm/x-s10";
 const FIRMWARE: &str = "1.00";
+const CONFIRMATION_FIRMWARE: &str = "owner-reported-1.00";
 const SIM: &str = "provia";
 const POW: PowParams = PowParams {
     memory_kib: 8,
@@ -199,6 +200,13 @@ fn build_fixture(
         .expect("control schema")
         .replace("body: fujifilm/x-t5", "body: fujifilm/x-s10");
     std::fs::write(data.join("bodies/fujifilm-x-s10.yaml"), schema).expect("schema copy");
+
+    std::fs::create_dir_all(data.join("manuals")).expect("manuals directory");
+    let manual = std::fs::read_to_string(workspace.join("data/manuals/fujifilm-x-t5.yaml"))
+        .expect("manual catalog")
+        .replace("id: fujifilm/x-t5", "id: fujifilm/x-s10")
+        .replace("model: X-T5", "model: X-S10");
+    std::fs::write(data.join("manuals/fujifilm-x-s10.yaml"), manual).expect("manual copy");
 
     let seeds = dir.join("seeds.json");
     let seed_text = format!(
@@ -1024,6 +1032,42 @@ impl HarBuilder {
         self
     }
 
+    fn confirmation(mut self, body: &[u8]) -> Self {
+        let mut value = entry(
+            "POST",
+            "https://looklab.test/api/manual-confirmations",
+            Some(body),
+        );
+        value["request"]["postData"]["mimeType"] = json!("application/json");
+        self.entries.push(value);
+        self
+    }
+
+    fn withdrawal(mut self, body: &[u8]) -> Self {
+        let mut value = entry(
+            "POST",
+            "https://looklab.test/api/manual-confirmations/withdraw",
+            Some(body),
+        );
+        value["request"]["postData"]["mimeType"] = json!("application/json");
+        self.entries.push(value);
+        self
+    }
+
+    fn manual_summary(mut self, camera: &str) -> Self {
+        self.entries.push(entry(
+            "GET",
+            &format!("https://looklab.test/api/manual-confirmations/{camera}"),
+            None,
+        ));
+        self
+    }
+
+    fn get_body(mut self, url: &str, body: &[u8]) -> Self {
+        self.entries.push(entry("GET", url, Some(body)));
+        self
+    }
+
     fn header(mut self, name: &str, value: &str) -> Self {
         let Some(last) = self.entries.last_mut() else {
             panic!("a header needs a request");
@@ -1120,6 +1164,33 @@ fn run_extra(
     (output.status.success(), text)
 }
 
+fn run_minimal(fixture: &Fixture, har: &Path, state: &Path) -> (bool, String) {
+    run_minimal_with_data(fixture, har, state, &fixture.data)
+}
+
+fn run_minimal_with_data(
+    fixture: &Fixture,
+    har: &Path,
+    state: &Path,
+    data: &Path,
+) -> (bool, String) {
+    let mut command = Command::cargo_bin("looklab").expect("built binary");
+    command
+        .args(["verify-payload", "--module"])
+        .arg(&fixture.module)
+        .args(["--origin", ORIGIN, "--rp-id", RP_ID, "--data"])
+        .arg(data)
+        .args(["--kind", "library", "--intent", "native"])
+        .arg("--har")
+        .arg(har)
+        .arg("--state")
+        .arg(state);
+    let output = command.output().expect("command runs");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    (output.status.success(), text)
+}
+
 fn har_path(name: &str, json: &str) -> PathBuf {
     let path = fixture().dir.join(format!("har-{name}.json"));
     std::fs::write(&path, json).expect("HAR writes");
@@ -1130,6 +1201,19 @@ fn state_path(name: &str) -> PathBuf {
     let path = fixture().dir.join(format!("state-{name}.json"));
     let _ = std::fs::remove_file(&path);
     path
+}
+
+fn copy_dir(source: &Path, target: &Path) {
+    std::fs::create_dir_all(target).expect("target directory");
+    for entry in std::fs::read_dir(source).expect("source directory") {
+        let entry = entry.expect("directory entry");
+        let path = entry.path();
+        if path.is_dir() {
+            copy_dir(&path, &target.join(entry.file_name()));
+        } else {
+            std::fs::copy(&path, target.join(entry.file_name())).expect("file copy");
+        }
+    }
 }
 
 fn batch_manifest_start(body: &[u8]) -> usize {
@@ -2250,4 +2334,634 @@ fn marks_authenticator_extensions_for_review() {
     assert!(success, "{output}");
     assert!(output.contains("REVIEW NEEDED"), "{output}");
     assert!(output.contains("credProtect"), "{output}");
+}
+
+fn manual_camera(fixture: &Fixture) -> looklab_schema::ManualCamera {
+    let source = std::fs::read_to_string(fixture.data.join("manuals/fujifilm-x-s10.yaml"))
+        .expect("fixture manual catalog");
+    let catalog = looklab_schema::validate_manual_catalog(&source).expect("valid manual catalog");
+    catalog
+        .camera(&BodyId::new(BODY).expect("body id"))
+        .expect("documented fixture camera")
+        .clone()
+}
+
+fn manual_confirmation(fixture: &Fixture) -> looklab_schema::ManualConfirmation {
+    let camera = manual_camera(fixture);
+    let key = looklab_schema::CapabilityKey::NativeSimulations;
+    let capability = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("documented native simulations");
+    looklab_schema::ManualConfirmation {
+        version: looklab_schema::MANUAL_CONFIRMATION_VERSION,
+        camera: camera.id.clone(),
+        camera_digest: camera.definition_digest(),
+        firmware: looklab_schema::ReportedFirmware::new(CONFIRMATION_FIRMWARE)
+            .expect("firmware"),
+        scope: looklab_schema::ConfirmationScope::Controls { keys: vec![key] },
+        observations: vec![looklab_schema::ControlObservation {
+            key,
+            definition_digest: capability.definition_digest(&camera),
+            finding: looklab_schema::Finding::Matches,
+        }],
+    }
+}
+
+fn confirmation_send(
+    site: &Site,
+    confirmation: &looklab_schema::ManualConfirmation,
+) -> (SendManifest, WebAuthnAssertion) {
+    let digest = confirmation.digest();
+    let send = SendManifest::canonical_with_attestations(
+        vec![manifest_hash(&site.manifest)],
+        vec![looklab_upload::AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&site.nonce, &send_manifest_hash(&send));
+    let assertion = assertion(
+        &challenge,
+        &site.origin,
+        &site.rp_id,
+        &site.credential_id,
+        None,
+        None,
+    );
+    (send, assertion)
+}
+
+fn confirmation_body(
+    nonce: &Nonce,
+    send: &SendManifest,
+    assertion: &WebAuthnAssertion,
+    confirmation: &looklab_schema::ManualConfirmation,
+) -> Vec<u8> {
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    looklab_upload::ManualConfirmationRequest {
+        nonce: engine.encode(nonce.as_bytes()),
+        credential_id: engine.encode(&assertion.credential_id),
+        authenticator_data: engine.encode(&assertion.authenticator_data),
+        client_data_json: engine.encode(&assertion.client_data_json),
+        signature: engine.encode(&assertion.signature),
+        send_manifest: engine.encode(looklab_upload::canonical_send_manifest_bytes(send)),
+        confirmation: confirmation.clone(),
+    }
+    .canonical_bytes()
+}
+
+fn attestation_only_confirmation(
+    site: &Site,
+    confirmation: &looklab_schema::ManualConfirmation,
+) -> (SendManifest, WebAuthnAssertion) {
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![looklab_upload::AttestationHash::from_bytes(
+            *confirmation.digest().as_bytes(),
+        )],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&site.nonce, &send_manifest_hash(&send));
+    let assertion = assertion(
+        &challenge,
+        &site.origin,
+        &site.rp_id,
+        &site.credential_id,
+        None,
+        None,
+    );
+    (send, assertion)
+}
+
+#[test]
+fn manual_confirmation_request_is_bound_to_the_send() {
+    let fixture = fixture();
+    let site = Site::from_fixture(fixture);
+    let confirmation = manual_confirmation(fixture);
+    let (send, assertion) = confirmation_send(&site, &confirmation);
+    let body = confirmation_body(&site.nonce, &send, &assertion, &confirmation);
+
+    let har = har_path(
+        "manual-confirmation",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .upload(site.body_with(&site.nonce, &send, &assertion))
+            .confirmation(&body)
+            .get("https://looklab.test/status/abc123")
+            .json(),
+    );
+    let (success, output) = run(fixture, &[har.as_path()], &state_path("manual-confirmation"));
+    assert!(success, "the bound confirmation does not verify: {output}");
+    assert!(output.contains("REVIEW NEEDED"), "{output}");
+    assert!(output.contains(CONFIRMATION_FIRMWARE), "{output}");
+    assert!(
+        output.contains(&hex(confirmation.camera_digest.as_bytes())),
+        "the camera definition digest is not printed: {output}"
+    );
+    assert!(
+        output.contains(&hex(confirmation.observations[0].definition_digest.as_bytes())),
+        "the observation definition digest is not printed: {output}"
+    );
+    assert!(
+        output.contains(&hex(confirmation.digest().as_bytes())),
+        "the confirmation digest is not printed: {output}"
+    );
+
+    let mut altered: looklab_upload::ManualConfirmationRequest =
+        serde_json::from_slice(&body).expect("confirmation body");
+    altered.confirmation.firmware =
+        looklab_schema::ReportedFirmware::new("9.99").expect("firmware");
+    let har = har_path(
+        "manual-confirmation-altered",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .upload(site.body_with(&site.nonce, &send, &assertion))
+            .confirmation(&altered.canonical_bytes())
+            .get("https://looklab.test/status/abc123")
+            .json(),
+    );
+    let (success, output) = run(
+        fixture,
+        &[har.as_path()],
+        &state_path("manual-confirmation-altered"),
+    );
+    assert!(!success, "an altered confirmation must not verify: {output}");
+
+    let mut extra: Value = serde_json::from_slice(&body).expect("confirmation body");
+    extra["unbound"] = json!(true);
+    let har = har_path(
+        "manual-confirmation-extra",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .upload(site.body_with(&site.nonce, &send, &assertion))
+            .confirmation(&serde_json::to_vec(&extra).expect("extra body"))
+            .get("https://looklab.test/status/abc123")
+            .json(),
+    );
+    let (success, output) = run(
+        fixture,
+        &[har.as_path()],
+        &state_path("manual-confirmation-extra"),
+    );
+    assert!(!success, "unbound content must not verify: {output}");
+
+    let other_challenge =
+        Challenge::for_send(&Nonce::from_bytes([0x56; 32]), &send_manifest_hash(&send));
+    let other = self::assertion(
+        &other_challenge,
+        &site.origin,
+        &site.rp_id,
+        &site.credential_id,
+        None,
+        None,
+    );
+    let swapped = confirmation_body(&site.nonce, &send, &other, &confirmation);
+    let har = har_path(
+        "manual-confirmation-assertion",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .upload(site.body_with(&site.nonce, &send, &assertion))
+            .confirmation(&swapped)
+            .get("https://looklab.test/status/abc123")
+            .json(),
+    );
+    let (success, output) = run(
+        fixture,
+        &[har.as_path()],
+        &state_path("manual-confirmation-assertion"),
+    );
+    assert!(
+        !success,
+        "a confirmation with a different assertion must not verify: {output}"
+    );
+
+    let canonical: Value = serde_json::from_slice(&body).expect("confirmation body");
+    let mut non_canonical = serde_json::to_string_pretty(&canonical).expect("pretty json");
+    non_canonical = non_canonical.replace("\"fujifilm/x-s10\"", "\"fujifilm\\/x-s10\"");
+    let har = har_path(
+        "manual-confirmation-non-canonical",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .upload(site.body_with(&site.nonce, &send, &assertion))
+            .confirmation(non_canonical.as_bytes())
+            .get("https://looklab.test/status/abc123")
+            .json(),
+    );
+    let (success, output) = run(
+        fixture,
+        &[har.as_path()],
+        &state_path("manual-confirmation-non-canonical"),
+    );
+    assert!(
+        !success,
+        "non-canonical request bytes must not verify: {output}"
+    );
+}
+
+#[test]
+fn declared_confirmation_payload_is_printed_for_review() {
+    let fixture = fixture();
+    let site = Site::from_fixture(fixture);
+    let mut confirmation = manual_confirmation(fixture);
+    let encoded_firmware = "cHJpdmF0ZS1ieXRlcy1pbi1maXJtd2FyZQ";
+    let encoded_value = "cHJpdmF0ZS1ieXRlcy1pbi1hLWNvcnJlY3RlZC1kb21haW4";
+    confirmation.firmware =
+        looklab_schema::ReportedFirmware::new(encoded_firmware).expect("firmware");
+    confirmation.observations[0].finding = looklab_schema::Finding::Corrected {
+        availability: looklab_schema::Availability::Available,
+        domain: looklab_schema::CapabilityDomain::Enum {
+            values: vec![encoded_value.to_owned()],
+            default: None,
+        },
+    };
+
+    let (send, assertion) = attestation_only_confirmation(&site, &confirmation);
+    let body = confirmation_body(&site.nonce, &send, &assertion, &confirmation);
+    let har = har_path(
+        "declared-payload",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .confirmation(&body)
+            .get("https://looklab.test/status/abc123")
+            .json(),
+    );
+    let (success, output) = run_minimal(fixture, har.as_path(), &state_path("declared-payload"));
+    assert!(success, "the declared confirmation does not verify: {output}");
+    assert!(output.contains("REVIEW NEEDED"), "{output}");
+    assert!(output.contains(encoded_firmware), "{output}");
+    assert!(output.contains(encoded_value), "{output}");
+}
+
+#[test]
+fn structurally_invalid_confirmations_fail() {
+    let fixture = fixture();
+    let site = Site::from_fixture(fixture);
+    let base = manual_confirmation(fixture);
+    let key = looklab_schema::CapabilityKey::NativeSimulations;
+
+    let mut unsupported = base.clone();
+    unsupported.version += 1;
+
+    let mut empty = base.clone();
+    empty.observations.clear();
+    empty.scope = looklab_schema::ConfirmationScope::Complete;
+
+    let mut duplicate = base.clone();
+    let repeated = duplicate.observations[0].clone();
+    duplicate.observations.push(repeated);
+    duplicate.scope = looklab_schema::ConfirmationScope::Controls {
+        keys: vec![key, key],
+    };
+
+    let mut mismatched = base.clone();
+    mismatched.scope = looklab_schema::ConfirmationScope::Controls {
+        keys: vec![looklab_schema::CapabilityKey::WhiteBalancePresets],
+    };
+
+    let mut too_many = base.clone();
+    let observation = too_many.observations[0].clone();
+    too_many.observations = (0..=looklab_schema::MAX_CONFIRMATION_OBSERVATIONS)
+        .map(|_| observation.clone())
+        .collect();
+
+    let mut oversized = base.clone();
+    oversized.observations[0].finding = looklab_schema::Finding::Corrected {
+        availability: looklab_schema::Availability::Available,
+        domain: looklab_schema::CapabilityDomain::Enum {
+            values: vec!["x".repeat(looklab_schema::MAX_CONFIRMATION_BYTES)],
+            default: None,
+        },
+    };
+
+    let cases = [
+        ("unsupported-version", unsupported),
+        ("empty-observations", empty),
+        ("duplicate-observations", duplicate),
+        ("scope-mismatch", mismatched),
+        ("too-many-observations", too_many),
+        ("oversized-confirmation", oversized),
+    ];
+    for (name, confirmation) in cases {
+        let (send, assertion) = attestation_only_confirmation(&site, &confirmation);
+        let body = confirmation_body(&site.nonce, &send, &assertion, &confirmation);
+        let har = har_path(
+            &format!("invalid-{name}"),
+            &HarBuilder::new()
+                .post("https://looklab.test/api/nonce")
+                .confirmation(&body)
+                .get("https://looklab.test/status/abc123")
+                .json(),
+        );
+        let (success, output) = run_minimal(
+            fixture,
+            har.as_path(),
+            &state_path(&format!("invalid-{name}")),
+        );
+        assert!(
+            !success,
+            "a structurally invalid confirmation ({name}) must not verify: {output}"
+        );
+    }
+}
+
+#[test]
+fn attestation_only_har_verifies_without_a_photo_upload() {
+    let fixture = fixture();
+    let site = Site::from_fixture(fixture);
+    let confirmation = manual_confirmation(fixture);
+    let digest = confirmation.digest();
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![looklab_upload::AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&site.nonce, &send_manifest_hash(&send));
+    let assertion = assertion(
+        &challenge,
+        &site.origin,
+        &site.rp_id,
+        &site.credential_id,
+        None,
+        None,
+    );
+    let body = confirmation_body(&site.nonce, &send, &assertion, &confirmation);
+    let har = har_path(
+        "attestation-only",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .confirmation(&body)
+            .get("https://looklab.test/status/abc123")
+            .json(),
+    );
+    let (success, output) = run_minimal(fixture, har.as_path(), &state_path("attestation-only"));
+    assert!(
+        success,
+        "an attestation-only confirmation does not verify: {output}"
+    );
+    assert!(output.contains("REVIEW NEEDED"), "{output}");
+
+    let batch_declared = SendManifest::canonical_with_attestations(
+        vec![manifest_hash(&site.manifest)],
+        vec![looklab_upload::AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&site.nonce, &send_manifest_hash(&batch_declared));
+    let assertion = self::assertion(
+        &challenge,
+        &site.origin,
+        &site.rp_id,
+        &site.credential_id,
+        None,
+        None,
+    );
+    let body = confirmation_body(&site.nonce, &batch_declared, &assertion, &confirmation);
+    let har = har_path(
+        "attestation-only-batch",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .confirmation(&body)
+            .get("https://looklab.test/status/abc123")
+            .json(),
+    );
+    let (success, output) = run_minimal(
+        fixture,
+        har.as_path(),
+        &state_path("attestation-only-batch"),
+    );
+    assert!(
+        !success,
+        "a declaration without its upload must not verify: {output}"
+    );
+}
+
+#[test]
+fn supplied_photos_without_an_upload_are_rejected() {
+    let fixture = fixture();
+    let site = Site::from_fixture(fixture);
+    let confirmation = manual_confirmation(fixture);
+    let digest = confirmation.digest();
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![looklab_upload::AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&site.nonce, &send_manifest_hash(&send));
+    let assertion = assertion(
+        &challenge,
+        &site.origin,
+        &site.rp_id,
+        &site.credential_id,
+        None,
+        None,
+    );
+    let body = confirmation_body(&site.nonce, &send, &assertion, &confirmation);
+    let har = har_path(
+        "attestation-only-with-files",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .confirmation(&body)
+            .get("https://looklab.test/status/abc123")
+            .json(),
+    );
+    let (success, output) = run(
+        fixture,
+        &[har.as_path()],
+        &state_path("attestation-only-with-files"),
+    );
+    assert!(
+        !success,
+        "supplied photos with no upload must not verify: {output}"
+    );
+}
+
+fn withdrawal_body(site: &Site, nonce: &Nonce, camera: &str) -> Vec<u8> {
+    let digest = looklab_server::request_digest(
+        looklab_server::RequestDomain::WithdrawManualConfirmation,
+        camera.as_bytes(),
+    );
+    let challenge = Challenge::new(nonce, &digest);
+    let assertion = assertion(
+        &challenge,
+        &site.origin,
+        &site.rp_id,
+        &site.credential_id,
+        None,
+        None,
+    );
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    looklab_upload::ManualWithdrawalRequest {
+        nonce: engine.encode(nonce.as_bytes()),
+        credential_id: engine.encode(&assertion.credential_id),
+        authenticator_data: engine.encode(&assertion.authenticator_data),
+        client_data_json: engine.encode(&assertion.client_data_json),
+        signature: engine.encode(&assertion.signature),
+        camera: BodyId::new(camera).expect("camera id"),
+    }
+    .canonical_bytes()
+}
+
+#[test]
+fn withdrawal_har_is_recognized_and_bound_to_the_camera() {
+    let fixture = fixture();
+    let site = Site::from_fixture(fixture);
+    let nonce = Nonce::from_bytes([0x57; 32]);
+    let camera = site.manifest.body.as_str();
+    let body = withdrawal_body(&site, &nonce, camera);
+    let har = har_path(
+        "withdrawal",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .withdrawal(&body)
+            .manual_summary(camera)
+            .json(),
+    );
+    let (success, output) = run_minimal(fixture, har.as_path(), &state_path("withdrawal"));
+    assert!(success, "a bound withdrawal does not verify: {output}");
+    assert!(
+        output.contains(camera),
+        "the withdrawal target is not printed: {output}"
+    );
+    assert!(
+        output.contains("camera summary target"),
+        "the browser's summary refresh is not audited: {output}"
+    );
+
+    let unknown = "leak/00112233445566778899aabbccddeeff";
+    let body = withdrawal_body(&site, &nonce, unknown);
+    let har = har_path(
+        "withdrawal-unknown-camera",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .withdrawal(&body)
+            .json(),
+    );
+    let (success, output) = run_minimal(
+        fixture,
+        har.as_path(),
+        &state_path("withdrawal-unknown-camera"),
+    );
+    assert!(
+        !success,
+        "a matched challenge for an undocumented camera must not verify: {output}"
+    );
+
+    let body = withdrawal_body(&site, &nonce, camera);
+    let spaced = String::from_utf8(body.clone())
+        .expect("utf-8 body")
+        .replacen(":\"", ": \"", 1);
+    let har = har_path(
+        "withdrawal-spaced",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .withdrawal(spaced.as_bytes())
+            .json(),
+    );
+    let (success, output) = run_minimal(fixture, har.as_path(), &state_path("withdrawal-spaced"));
+    assert!(
+        !success,
+        "a whitespace-encoded withdrawal must not verify: {output}"
+    );
+
+    let escaped = String::from_utf8(body)
+        .expect("utf-8 body")
+        .replace(camera, &camera.replace('/', "\\/"));
+    let har = har_path(
+        "withdrawal-escaped",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .withdrawal(escaped.as_bytes())
+            .json(),
+    );
+    let (success, output) = run_minimal(fixture, har.as_path(), &state_path("withdrawal-escaped"));
+    assert!(
+        !success,
+        "an escaped withdrawal must not verify: {output}"
+    );
+
+    let data = fixture.dir.join("data-without-manuals");
+    let _ = std::fs::remove_dir_all(&data);
+    copy_dir(&fixture.data.join("bodies"), &data.join("bodies"));
+    let body = withdrawal_body(&site, &nonce, camera);
+    let har = har_path(
+        "withdrawal-no-catalog",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .withdrawal(&body)
+            .json(),
+    );
+    let (success, output) = run_minimal_with_data(
+        fixture,
+        har.as_path(),
+        &state_path("withdrawal-no-catalog"),
+        &data,
+    );
+    assert!(
+        !success,
+        "a withdrawal without a local manual catalog must not verify: {output}"
+    );
+}
+
+#[test]
+fn the_camera_summary_request_is_checked() {
+    let fixture = fixture();
+    let site = Site::from_fixture(fixture);
+    let nonce = Nonce::from_bytes([0x58; 32]);
+    let camera = site.manifest.body.as_str();
+    let body = withdrawal_body(&site, &nonce, camera);
+    let url = format!("https://looklab.test/api/manual-confirmations/{camera}");
+
+    let query = format!("{url}?after=1");
+    let har = har_path(
+        "withdrawal-summary-query",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .withdrawal(&body)
+            .get(&query)
+            .json(),
+    );
+    let (success, output) = run_minimal(
+        fixture,
+        har.as_path(),
+        &state_path("withdrawal-summary-query"),
+    );
+    assert!(
+        !success,
+        "a camera summary with a query string must not verify: {output}"
+    );
+
+    let har = har_path(
+        "withdrawal-summary-body",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .withdrawal(&body)
+            .get_body(&url, b"{}")
+            .json(),
+    );
+    let (success, output) = run_minimal(
+        fixture,
+        har.as_path(),
+        &state_path("withdrawal-summary-body"),
+    );
+    assert!(
+        !success,
+        "a camera summary with a body must not verify: {output}"
+    );
+
+    let har = har_path(
+        "withdrawal-summary-unknown-camera",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .withdrawal(&body)
+            .manual_summary("leak/00112233445566778899aabbccddeeff")
+            .json(),
+    );
+    let (success, output) = run_minimal(
+        fixture,
+        har.as_path(),
+        &state_path("withdrawal-summary-unknown-camera"),
+    );
+    assert!(
+        !success,
+        "a camera summary for an undocumented camera must not verify: {output}"
+    );
 }

@@ -7,20 +7,20 @@ use leptos::task::spawn_local;
 use looklab_meta::ParsedMetadata;
 use looklab_prep::LocalImageKey;
 use looklab_upload::{
-    CardDeclaration, ContributionKind, FirmwareId, FirmwareVersion, MonochromeAuthorization,
-    RenderClass, RenderTag, SettingSource,
+    AttestationHash, CardDeclaration, ContributionKind, FirmwareId, FirmwareVersion,
+    MonochromeAuthorization, RenderClass, RenderTag, SettingSource,
 };
 use looklab_wasm::coverage::{CoverageMap, coverage_map, sample_points};
 use looklab_wasm::prep::{ModuleFunction, default_pow};
 use looklab_wasm::{
-    CardCheckError, ControlSetting, GroupSettings, IntentChoice, PairingPlan, PowParamsSpec,
-    PrepSummary, PreparedImageView, build_manifest_request, build_send_manifest_request,
-    check_card, decode_build_manifest_reply, decode_build_send_manifest_reply, decode_encode_reply,
-    decode_pow_reply, decode_prepare_reply, encode_envelope_request, inspect_metadata,
-    module_fn_id, prefill_settings_parsed, prepare_request, serial_ascii_from_metadata,
-    solve_pow_request,
+    CardCheckError, ControlSetting, GroupSettings, IntentChoice, ManualConfirmationEnvelope,
+    PairingPlan, PowParamsSpec, PrepSummary, PreparedImageView, build_manifest_request,
+    build_send_manifest_request, check_card, decode_build_manifest_reply,
+    decode_build_send_manifest_reply, decode_encode_reply, decode_pow_reply, decode_prepare_reply,
+    encode_envelope_request, inspect_metadata, module_fn_id, prefill_settings_parsed,
+    prepare_request, serial_ascii_from_metadata, solve_pow_request,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::future::Future;
 use std::pin::Pin;
@@ -30,6 +30,7 @@ use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
 use super::bounties::{Impact, WantedCards};
+use super::manual_confirm::ManualConfirmationPanel;
 use crate::data;
 use crate::files::{
     ContributionDraftStore, DraftFile, LocalFile, download, draft_file_entries, read_draft_file,
@@ -115,6 +116,9 @@ pub(crate) struct ContributionGroup {
     pub(crate) fields: GroupFields,
     pub(crate) serial_opt_in: bool,
     pub(crate) malformed: bool,
+    #[serde(default)]
+    pub(crate) camera_ready: bool,
+    pub(crate) blocked: Option<String>,
     pub(crate) unavailable: Vec<String>,
     pub(crate) notes: Vec<String>,
     /// Controls the makernotes reproduced; every other control in the settings is declared.
@@ -134,6 +138,15 @@ pub(crate) struct ContributionGroup {
 pub(crate) struct BatchSet {
     groups: Vec<ContributionGroup>,
     next: u64,
+}
+
+fn active_bodies(set: &BatchSet) -> BTreeSet<String> {
+    set.groups()
+        .iter()
+        .filter(|group| !(group.is_monochrome() && !group.fields.monochrome_opt_in))
+        .map(|group| group.fields.body.clone())
+        .filter(|body| !body.is_empty())
+        .collect()
 }
 
 impl BatchSet {
@@ -213,6 +226,27 @@ impl BatchSet {
         self.update(id, |group| group.serial_opt_in = opt_in);
     }
 
+    fn set_body_draft(&mut self, id: BatchId, body: String) {
+        self.update(id, |group| group.fields.body = body);
+    }
+
+    fn set_body(&mut self, id: BatchId, body: String) {
+        self.update(id, |group| {
+            group.fields.body = body;
+            group.camera_ready = false;
+            group.blocked = None;
+            group.fields.sim.clear();
+            group.fields.controls.clear();
+            group.reproduced.clear();
+            group.unmapped.clear();
+            group.unavailable.clear();
+            group.family = None;
+            group.mono_filter = None;
+            group.monochrome.clear();
+            group.notes.clear();
+        });
+    }
+
     /// Ends the upload so the next drop starts over, with serial sending off.
     fn finish(&mut self) {
         self.groups.clear();
@@ -248,6 +282,8 @@ impl ContributionGroup {
             },
             serial_opt_in: false,
             malformed: reading.malformed,
+            camera_ready: reading.ready,
+            blocked: reading.blocked.clone(),
             unavailable: Vec::new(),
             notes: Vec::new(),
             reproduced: reading.controls.clone(),
@@ -267,6 +303,10 @@ impl ContributionGroup {
 
     fn absorb(&mut self, reading: &PairReading) {
         self.malformed |= reading.malformed;
+        self.camera_ready |= reading.ready;
+        if self.blocked.is_none() {
+            self.blocked = reading.blocked.clone();
+        }
         if self.family.is_none() {
             self.family = reading.family.clone();
         }
@@ -351,6 +391,8 @@ pub(crate) struct PairReading {
     pub(crate) unmapped: Vec<String>,
     pub(crate) card: Option<RenderTag>,
     pub(crate) malformed: bool,
+    pub(crate) ready: bool,
+    pub(crate) blocked: Option<String>,
     pub(crate) render_class: looklab_upload::RenderClass,
     pub(crate) family: Option<looklab_schema::LookId>,
     pub(crate) mono_filter: Option<looklab_schema::MonoFilter>,
@@ -820,6 +862,42 @@ pub fn ContributePage() -> impl IntoView {
     let parsed_metadata = StoredValue::new_local(Vec::<(String, ParsedMetadata)>::new());
     let batches = RwSignal::new(BatchSet::default());
     let batch_epoch = RwSignal::new(0_u64);
+    let manuals = RwSignal::new(BTreeMap::<String, looklab_publish::ManualPage>::new());
+    let manual_envelopes = RwSignal::new(BTreeMap::<String, ManualConfirmationEnvelope>::new());
+    let manual_error = RwSignal::new(None::<String>);
+    let confirmation_notice = RwSignal::new(None::<String>);
+    let requested_manuals = StoredValue::new_local(BTreeSet::<String>::new());
+    Effect::new(move |_| {
+        let _ = batch_epoch.get();
+        let active = batches.with(active_bodies);
+        manual_envelopes.update(|envelopes| envelopes.retain(|id, _| active.contains(id)));
+        for id in active {
+            if manuals.with(|manuals| manuals.contains_key(&id))
+                || requested_manuals.with_value(|requested| requested.contains(&id))
+            {
+                continue;
+            }
+            let Ok(body) = looklab_schema::BodyId::new(&id) else {
+                continue;
+            };
+            requested_manuals.update_value(|requested| {
+                requested.insert(id.clone());
+            });
+            let make = body.make().to_owned();
+            let model = body.model().to_owned();
+            spawn_local(async move {
+                match data::manual(&make, &model).await {
+                    Ok(Some(page)) => {
+                        manuals.update(|manuals| {
+                            manuals.insert(id, page);
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => manual_error.set(Some(error)),
+                }
+            });
+        }
+    });
     let selected_batch = RwSignal::new(None::<BatchId>);
     let catalog = RwSignal::new(None::<GroupCatalog>);
     let snapshot_version = RwSignal::new(0_u64);
@@ -834,7 +912,110 @@ pub fn ContributePage() -> impl IntoView {
     let send_parts = RwSignal::new(None::<(usize, usize)>);
     let sent_summary = RwSignal::new(None::<SentSummary>);
     let busy = RwSignal::new(false);
+    let reload_required = RwSignal::new(false);
     let message = RwSignal::new(None::<String>);
+    let camera_check_generation = RwSignal::new(0_u64);
+    let revalidate_camera = Callback::new(move |(id, body): (BatchId, String)| {
+        let generation = camera_check_generation.get_untracked() + 1;
+        camera_check_generation.set(generation);
+        let requested = body.clone();
+        processed.set(Vec::new());
+        seeds.set(Vec::new());
+        failures.set(Vec::new());
+        coverage.set(None);
+        points.set(Vec::new());
+        furthest.set(StepIndex(1));
+        current.set(StepIndex(1));
+        busy.set(true);
+        message.set(Some(
+            "Checking the camera and its published settings.".to_owned(),
+        ));
+        let (raws, renders) = batches.with(|set| {
+            set.get(id)
+                .map(|group| (group.raws.clone(), group.renders.clone()))
+                .unwrap_or_default()
+        });
+        let names = raws
+            .iter()
+            .cloned()
+            .chain(renders.iter().map(|render| render.as_str().to_owned()))
+            .collect::<Vec<_>>();
+        spawn_local(async move {
+            let site = match looklab_schema::BodyId::new(&body) {
+                Ok(camera) => site_body(camera.make(), camera.model()).await,
+                Err(error) => Err(SiteBodyError::Unavailable(format!(
+                    "Enter the camera as make/model: {error}"
+                ))),
+            };
+            if camera_check_generation.get_untracked() != generation {
+                return;
+            }
+            let still_current = batches.with_untracked(|set| {
+                set.get(id)
+                    .is_some_and(|group| group.fields.body == requested)
+            });
+            if !still_current {
+                busy.set(false);
+                return;
+            }
+            let site = match site {
+                Ok(site) => site,
+                Err(error) => {
+                    let reason = error.message().to_owned();
+                    let blocks = error.blocks();
+                    batches.update(|set| {
+                        set.update(id, |group| {
+                            group.camera_ready = false;
+                            group.blocked = blocks.then(|| reason.clone());
+                        });
+                    });
+                    message.set(Some(reason));
+                    busy.set(false);
+                    return;
+                }
+            };
+            let prefill = parsed_metadata.with_value(|parsed| {
+                let pair_files = parsed
+                    .iter()
+                    .filter(|(name, _)| names.iter().any(|wanted| wanted == name))
+                    .map(|(name, metadata)| (name.as_str(), metadata))
+                    .collect::<Vec<_>>();
+                prefill_settings_parsed(&site.yaml, &pair_files)
+            });
+            match prefill {
+                Ok(prefill) => {
+                    batches.update(|set| {
+                        set.update(id, |group| apply_site_prefill(group, &site.body, prefill));
+                    });
+                    message.set(Some(
+                        "Camera settings loaded. Process these photos again before sending."
+                            .to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    batches.update(|set| {
+                        set.update(id, |group| {
+                            group.fields.body = site.body.clone();
+                            group.camera_ready = true;
+                            group.blocked = None;
+                            group.fields.sim.clear();
+                            group.fields.controls.clear();
+                            group.reproduced.clear();
+                            group.unmapped.clear();
+                            group.unavailable.clear();
+                            group.family = None;
+                            group.mono_filter = None;
+                            group.monochrome.clear();
+                        });
+                    });
+                    message.set(Some(format!(
+                        "Camera found, but these files do not give its settings: {error}"
+                    )));
+                }
+            }
+            busy.set(false);
+        });
+    });
     let invalidate_preparation = Callback::new(move |()| {
         processed.set(Vec::new());
         seeds.set(Vec::new());
@@ -869,6 +1050,7 @@ pub fn ContributePage() -> impl IntoView {
     let replace_batches = move |readings: Vec<PairReading>| {
         let set = BatchSet::from_readings(&readings);
         let first = set.groups().first().map(|group| group.id);
+        camera_check_generation.update(|generation| *generation += 1);
         batches.set(set);
         selected_batch.set(first);
         batch_epoch.update(|epoch| *epoch += 1);
@@ -927,6 +1109,7 @@ pub fn ContributePage() -> impl IntoView {
                 };
                 let routing = set.clone();
                 let first = set.groups().first().map(|group| group.id);
+                camera_check_generation.update(|generation| *generation += 1);
                 batches.set(set);
                 selected_batch.set(first);
                 batch_epoch.update(|epoch| *epoch += 1);
@@ -1252,6 +1435,37 @@ pub fn ContributePage() -> impl IntoView {
         }
         let photos = pending.iter().map(|batch| batch.images.len()).sum();
         let sent = sent_summary_of(&pending);
+        let sending_bodies = pending
+            .iter()
+            .map(|batch| batch.settings.body.clone())
+            .collect::<BTreeSet<_>>();
+        let completed_bodies = set
+            .groups()
+            .iter()
+            .filter(|group| completed.with(|done| done.contains(&group.id)))
+            .map(|group| group.fields.body.clone())
+            .collect::<BTreeSet<_>>();
+        let mut confirmations = confirmations_to_send(
+            manual_envelopes.get_untracked(),
+            &sending_bodies,
+            &completed_bodies,
+        )
+        .into_iter()
+        .map(|(id, envelope)| {
+            let label = manuals
+                .with(|manuals| {
+                    manuals
+                        .get(&id)
+                        .map(|manual| format!("{} {}", manual.make, manual.model))
+                })
+                .unwrap_or(id);
+            (label, envelope)
+        })
+        .collect::<Vec<_>>();
+        let skipped_confirmations = confirmations
+            .len()
+            .saturating_sub(looklab_upload::DEFAULT_MAX_ATTESTATIONS);
+        confirmations.truncate(looklab_upload::DEFAULT_MAX_ATTESTATIONS);
         busy.set(true);
         spawn_local(async move {
             if let Err(error) = validate_batch_sims(&set).await {
@@ -1264,7 +1478,10 @@ pub fn ContributePage() -> impl IntoView {
                 "Confirm once on your device. Preparing your photos (this keeps spam out)."
                     .to_owned(),
             ));
-            let outcome = upload_send(session_context, pending, send_parts).await;
+            let outcome = upload_send(session_context, pending, confirmations, send_parts).await;
+            if outcome.reload_required {
+                reload_required.set(true);
+            }
             for (id, reply) in outcome.accepted {
                 if let Some(token) = reply.status_token.as_ref()
                     && let Ok(token) = webauthn::StatusToken::try_from(token.clone())
@@ -1292,6 +1509,46 @@ pub fn ContributePage() -> impl IntoView {
                 busy.set(false);
                 return;
             }
+            let failed = outcome
+                .confirmations
+                .iter()
+                .filter_map(|(label, result)| {
+                    result
+                        .as_ref()
+                        .err()
+                        .map(|error| format!("{label}: {error}"))
+                })
+                .collect::<Vec<_>>();
+            let recorded = outcome
+                .confirmations
+                .iter()
+                .filter(|(_, result)| result.is_ok())
+                .count();
+            let mut notes = Vec::new();
+            if skipped_confirmations > 0 {
+                notes.push(format!(
+                    "{skipped_confirmations} camera confirmation(s) were not included because one send holds at most {}.",
+                    looklab_upload::DEFAULT_MAX_ATTESTATIONS
+                ));
+            }
+            if failed.is_empty() {
+                if recorded > 0 {
+                    notes.push(format!(
+                        "Camera confirmation recorded for {recorded} {}.",
+                        if recorded == 1 { "camera" } else { "cameras" }
+                    ));
+                }
+            } else {
+                notes.push(format!(
+                    "Your photos were sent. The camera confirmation could not be recorded: {}. You can try again from the camera page.",
+                    failed.join("; ")
+                ));
+            }
+            confirmation_notice.set(if notes.is_empty() {
+                None
+            } else {
+                Some(notes.join(" "))
+            });
             sent_summary.set(Some(sent));
             message.set(None);
             draft_complete.set(true);
@@ -1547,7 +1804,7 @@ pub fn ContributePage() -> impl IntoView {
                     ids
                 });
                 view! {
-                    <BatchEditor id=id first=first batches=batches firmware_ids=firmware_ids on_preparation_change=invalidate_preparation/>
+                    <BatchEditor id=id first=first batches=batches firmware_ids=firmware_ids on_preparation_change=invalidate_preparation on_camera_change=revalidate_camera/>
                 }.into_any()
             }}
             {move || {
@@ -1693,8 +1950,72 @@ pub fn ContributePage() -> impl IntoView {
         <section class="step" hidden=move || stage.get() != Stage::Send>
             <h2>"Send your samples"</h2>
             <p>"Sign in or create a profile, then confirm once on your device. One confirmation covers every batch in this send. You can follow its progress in Your contributions."</p>
+            {move || {
+                let active = batches.with(active_bodies);
+                let loaded = manuals.with(|manuals| {
+                    manuals
+                        .iter()
+                        .filter(|(id, _)| active.contains(*id))
+                        .map(|(id, manual)| (id.clone(), manual.clone()))
+                        .collect::<Vec<_>>()
+                });
+                if loaded.is_empty() {
+                    return ().into_any();
+                }
+                view! {
+                    <section class="manual-confirmation" aria-labelledby="camera-confirmation">
+                        <h3 id="camera-confirmation">"Confirm your camera settings (optional)"</h3>
+                        <p class="muted">
+                            "Documented settings are not confirmed by camera owners yet. Check only the options you can see on your camera. Unchecked options are not counted. This uses the same passkey approval as your photos."
+                        </p>
+                        {loaded.into_iter().map(|(id, manual)| {
+                            let firmware_body = id.clone();
+                            let initial_firmware = Signal::derive(move || {
+                                batches.with(|set| {
+                                    set.groups()
+                                        .iter()
+                                        .find(|group| {
+                                            group.fields.body == firmware_body
+                                                && !group.fields.firmware.is_empty()
+                                        })
+                                        .map(|group| group.fields.firmware.clone())
+                                        .unwrap_or_default()
+                                })
+                            });
+                            let key = id;
+                            let on_change = Callback::new(
+                                move |value: Option<ManualConfirmationEnvelope>| {
+                                    manual_envelopes.update(|envelopes| match value {
+                                        Some(value) => {
+                                            envelopes.insert(key.clone(), value);
+                                        }
+                                        None => {
+                                            envelopes.remove(&key);
+                                        }
+                                    });
+                                },
+                            );
+                            view! {
+                                <ManualConfirmationPanel
+                                    manual=manual
+                                    initial_firmware=initial_firmware
+                                    on_change=on_change
+                                />
+                            }
+                        }).collect_view()}
+                    </section>
+                }.into_any()
+            }}
+            {move || manual_error.get().map(|error| view! {
+                <p class="muted">{format!("Documented camera settings could not be loaded: {error}")}</p>
+            })}
             {(!available).then(crate::ui::preview_notice)}
-            <button class="button-primary" on:click=upload disabled=move || busy.get() || !available>"Send contribution"</button>
+            <button class="button-primary" on:click=upload disabled=move || busy.get() || !available || reload_required.get()>"Send contribution"</button>
+            {move || reload_required.get().then(|| view! {
+                <p class="warn" role="alert">
+                    "This page is out of date. Reload it, then prepare and send your photos again."
+                </p>
+            })}
             <button on:click=download_seeds>"Export seed file (SENSITIVE)"</button>
             <p class="warn">
                 "The seed file reveals sampling order. It is never uploaded; keep it local."
@@ -1721,6 +2042,9 @@ pub fn ContributePage() -> impl IntoView {
                     "{} B&W {} received, awaiting monochrome analysis. They never count as colour samples and are kept for up to 180 days for monochrome model development.",
                     sent.deferred, if sent.deferred == 1 { "render is" } else { "renders are" },
                 )}</p>
+            })}
+            {move || confirmation_notice.get().map(|text| view! {
+                <p class="notice" role="status">{text}</p>
             })}
             <p>"Feedback arrives in Your contributions after processing."</p>
             <a class="button button-primary" href=crate::base::site_url("/me")>"Your contributions"</a>
@@ -1838,6 +2162,7 @@ fn BatchEditor(
     batches: RwSignal<BatchSet>,
     firmware_ids: Vec<String>,
     on_preparation_change: Callback<()>,
+    on_camera_change: Callback<(BatchId, String)>,
 ) -> impl IntoView {
     let suffix = if first {
         String::new()
@@ -1877,7 +2202,11 @@ fn BatchEditor(
     let card_firmware_version = text(TextField::CardVersion);
     let controls = text(TextField::Controls);
     let source_controls = controls;
-    let write_body = write(TextField::Body);
+    let write_body = move |value: String| batches.update(|set| set.set_body_draft(id, value));
+    let revalidate_body = move |value: String| {
+        batches.update(|set| set.set_body(id, value.clone()));
+        on_camera_change.run((id, value));
+    };
     let write_firmware = write(TextField::Firmware);
     let write_sim = write(TextField::Sim);
     let write_target = write(TextField::Target);
@@ -1893,6 +2222,7 @@ fn BatchEditor(
     let malformed = move || batches.with(|set| set.get(id).is_some_and(|group| group.malformed));
     let menu = menu_settings(&snapshot.fields.controls);
     let raws = snapshot.raws.join(", ");
+    let blocked = snapshot.blocked.clone();
     let unavailable = snapshot.unavailable.clone();
     let unmapped = snapshot.unmapped.clone();
     let notes = snapshot.notes.clone();
@@ -1936,7 +2266,8 @@ fn BatchEditor(
             })}
             <label for=body_id.clone()>"Camera"</label>
             <input id=body_id type="text" prop:value=body
-                on:input=move |event| write_body(event_target_value(&event))/>
+                on:input=move |event| write_body(event_target_value(&event))
+                on:change=move |event| revalidate_body(event_target_value(&event))/>
             <label for=firmware_id.clone()>"Firmware"</label>
             <input id=firmware_id type="text" prop:value=firmware
                 on:input=move |event| write_firmware(event_target_value(&event))/>
@@ -2057,6 +2388,17 @@ fn BatchEditor(
             <textarea id=controls_id rows="3" prop:value=controls
                 on:input=move |event| write_controls(event_target_value(&event))></textarea>
             </Disclosure>
+            {blocked.map(|reason| view! {
+                <p class="warn" role="alert">{reason}</p>
+            })}
+            {(!snapshot.camera_ready).then(|| view! {
+                <button type="button" on:click=move |_| {
+                    let current = batches.with_untracked(|set| {
+                        set.get(id).map(|group| group.fields.body.clone()).unwrap_or_default()
+                    });
+                    revalidate_body(current);
+                }>"Check camera again"</button>
+            })}
             {(!unavailable.is_empty()).then(|| view! {
                 <p class="muted" role="status">
                     "Please check these settings, which could not be read: " {unavailable.join("; ")}
@@ -2381,6 +2723,33 @@ struct SiteBody {
     schema: looklab_schema::ControlSchema,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SiteBodyError {
+    Transient(String),
+    /// The published catalog cannot admit this camera as it stands.
+    Unavailable(String),
+}
+
+impl SiteBodyError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Transient(message) | Self::Unavailable(message) => message,
+        }
+    }
+
+    fn blocks(&self) -> bool {
+        matches!(self, Self::Unavailable(_))
+    }
+}
+
+fn apply_site_error(reading: &mut PairReading, error: &SiteBodyError) {
+    reading.ready = false;
+    reading.note = Some(error.message().to_owned());
+    if error.blocks() {
+        reading.blocked = Some(error.message().to_owned());
+    }
+}
+
 /// Reads each pair's settings from its makernotes, keeping only the latest answer per file and drop.
 async fn read_pairs(
     pairing: &PairingPlan,
@@ -2389,7 +2758,7 @@ async fn read_pairs(
     ledger: StoredValue<PrefillLedger, leptos::prelude::LocalStorage>,
     epoch: u64,
 ) -> Vec<PairReading> {
-    let mut bodies: HashMap<(String, String), Result<SiteBody, String>> = HashMap::new();
+    let mut bodies: HashMap<(String, String), Result<SiteBody, SiteBodyError>> = HashMap::new();
     let mut readings = Vec::new();
     for pair in &pairing.groups {
         for name in &pair.jpegs {
@@ -2417,7 +2786,7 @@ async fn reading_for_render(
     render: &RenderFile,
     files: &[LocalFile],
     parsed: &[(String, ParsedMetadata)],
-    bodies: &mut HashMap<(String, String), Result<SiteBody, String>>,
+    bodies: &mut HashMap<(String, String), Result<SiteBody, SiteBodyError>>,
 ) -> PairReading {
     let facts = [pair.raw.as_str(), render.as_str()]
         .into_iter()
@@ -2449,6 +2818,8 @@ async fn reading_for_render(
         malformed: facts
             .iter()
             .any(|fact| fact.name == render.as_str() && fact.render_tag_malformed),
+        ready: false,
+        blocked: None,
         render_class: RenderClass::Colour,
         family: None,
         mono_filter: None,
@@ -2474,12 +2845,13 @@ async fn reading_for_render(
     let site = match bodies.get(&key) {
         Some(Ok(site)) => site,
         Some(Err(error)) => {
-            reading.note = Some(error.clone());
+            apply_site_error(&mut reading, error);
             return reading;
         }
         None => return reading,
     };
     reading.body = site.body.clone();
+    reading.ready = true;
     if find_file(files, render.as_str()).is_none() {
         reading.note = Some("the JPEG is no longer available".to_owned());
         return reading;
@@ -2597,8 +2969,8 @@ async fn reading_for_render(
     reading
 }
 
-async fn site_body(make: &str, model: &str) -> Result<SiteBody, String> {
-    let index = data::index().await?;
+async fn site_body(make: &str, model: &str) -> Result<SiteBody, SiteBodyError> {
+    let index = data::index().await.map_err(SiteBodyError::Transient)?;
     let identity = looklab_prep::CameraIdentity::new(make, model);
     let summary = index
         .bodies
@@ -2608,20 +2980,63 @@ async fn site_body(make: &str, model: &str) -> Result<SiteBody, String> {
                 .as_ref()
                 .is_some_and(|identity| identity.matches(&body.make, &body.model))
         })
-        .ok_or_else(|| format!("the site data has no camera for {make} {model}"))?;
-    let page = data::body(summary.id.make(), summary.id.model()).await?;
+        .ok_or_else(|| {
+            SiteBodyError::Unavailable(format!("the site data has no camera for {make} {model}"))
+        })?;
+    if !summary.preparation.is_ready() {
+        let detail = match summary.preparation.blocker {
+            Some(looklab_publish::PreparationBlocker::InputTransformMissing) => {
+                "its input transform is not published, so its photos cannot be measured yet"
+            }
+            None => "it is not ready for measured contributions yet",
+        };
+        return Err(SiteBodyError::Unavailable(format!(
+            "{} {} is in the camera catalog, but {detail}. See the camera page for status.",
+            summary.make, summary.model
+        )));
+    }
+    let page = data::body(summary.id.make(), summary.id.model())
+        .await
+        .map_err(SiteBodyError::Transient)?;
     let schema = looklab_schema::validate_control_schema(&page.schema).map_err(|errors| {
-        errors
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("; ")
+        SiteBodyError::Unavailable(
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
     })?;
     Ok(SiteBody {
         body: page.id.to_string(),
         yaml: page.schema,
         schema,
     })
+}
+
+fn apply_site_prefill(
+    group: &mut ContributionGroup,
+    body: &str,
+    prefill: looklab_wasm::SettingsPrefill,
+) {
+    group.fields.body = body.to_owned();
+    group.fields.firmware = prefill.firmware;
+    group.fields.sim = prefill.sim.unwrap_or_default();
+    group.fields.controls = prefill
+        .controls
+        .iter()
+        .map(|(key, step)| format!("{key}={step}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    group.reproduced = prefill.controls;
+    group.unavailable = prefill.unavailable;
+    group.unmapped = prefill.unmapped;
+    group.family = prefill.family;
+    group.mono_filter = prefill.mono_filter;
+    group.monochrome = prefill.monochrome;
+    group.blocked = None;
+    group.camera_ready = true;
+    group.notes.clear();
 }
 
 struct DraftGroup<'a> {
@@ -2973,7 +3388,7 @@ fn lane_indices(count: usize, lanes: usize) -> Vec<Vec<usize>> {
 }
 
 async fn validate_batch_sims(batches: &BatchSet) -> Result<(), String> {
-    let mut schemas = HashMap::new();
+    let mut sites = HashMap::new();
     for group in batches.groups() {
         if group.renders.is_empty() {
             continue;
@@ -2986,21 +3401,16 @@ async fn validate_batch_sims(batches: &BatchSet) -> Result<(), String> {
             looklab_upload::BodyId::new(&group.fields.body).map_err(|error| error.to_string())?;
         let sim =
             looklab_schema::SimKey::new(&group.fields.sim).map_err(|error| error.to_string())?;
-        let schema = match schemas.entry(body) {
+        let site = match sites.entry(body) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
-                let page = data::body(entry.key().make(), entry.key().model()).await?;
-                let schema =
-                    looklab_schema::validate_control_schema(&page.schema).map_err(|errors| {
-                        errors
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    })?;
-                entry.insert(schema)
+                let site = site_body(entry.key().make(), entry.key().model())
+                    .await
+                    .map_err(|error| error.message().to_owned())?;
+                entry.insert(site)
             }
         };
+        let schema = &site.schema;
         let epoch = schema.epoch_for(&group.fields.firmware).ok_or_else(|| {
             "This firmware isn't listed in the camera's published schema.".to_owned()
         })?;
@@ -3272,6 +3682,20 @@ fn excluded_files(rows: Vec<FailureRow>, on_donate: Callback<String>) -> impl In
         .collect_view()
 }
 
+/// Pending cameras come first; the caller truncates to the attestation limit.
+fn confirmations_to_send<T>(
+    envelopes: BTreeMap<String, T>,
+    sending: &BTreeSet<String>,
+    completed: &BTreeSet<String>,
+) -> Vec<(String, T)> {
+    let mut entries = envelopes
+        .into_iter()
+        .filter(|(id, _)| sending.contains(id) || completed.contains(id))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(id, _)| (!sending.contains(id), id.clone()));
+    entries
+}
+
 fn sent_summary_of(pending: &[PendingBatch]) -> SentSummary {
     let mut cameras = pending
         .iter()
@@ -3300,11 +3724,14 @@ struct PendingBatch {
 struct SendOutcome {
     accepted: Vec<(BatchId, webauthn::UploadReply)>,
     error: Option<(usize, String)>,
+    confirmations: Vec<(String, Result<(), String>)>,
+    reload_required: bool,
 }
 
 async fn upload_send(
     session: crate::session::SessionContext,
     pending: Vec<PendingBatch>,
+    confirmations: Vec<(String, ManualConfirmationEnvelope)>,
     send_parts: RwSignal<Option<(usize, usize)>>,
 ) -> SendOutcome {
     let total = pending.len();
@@ -3317,6 +3744,8 @@ async fn upload_send(
     let error = |position: usize, message: String| SendOutcome {
         accepted: Vec::new(),
         error: Some((position, message)),
+        confirmations: Vec::new(),
+        reload_required: false,
     };
     // Once a batch is uploaded, a later failure must keep it; a retry skips accepted batches.
     macro_rules! fail {
@@ -3324,6 +3753,8 @@ async fn upload_send(
             return SendOutcome {
                 accepted,
                 error: Some(($position, $message)),
+                confirmations: Vec::new(),
+                reload_required: false,
             }
         };
     }
@@ -3371,7 +3802,11 @@ async fn upload_send(
         .iter()
         .map(|manifest| manifest.manifest_hash)
         .collect::<Vec<_>>();
-    let send_request = match build_send_manifest_request(nonce.nonce, hashes) {
+    let attestations = confirmations
+        .iter()
+        .map(|(_, envelope)| AttestationHash::from_bytes(envelope.digest()))
+        .collect::<Vec<_>>();
+    let send_request = match build_send_manifest_request(nonce.nonce, hashes, attestations) {
         Ok(request) => request,
         Err(failure) => return error(0, failure.to_string()),
     };
@@ -3472,19 +3907,37 @@ async fn upload_send(
                 photos_sent += batch.images.len();
                 send_parts.set(Some((photos_sent, total_photos)));
             }
-            Err(message) => {
+            Err(error) => {
                 worker.terminate();
+                let reload_required = error.requires_reload();
                 return SendOutcome {
                     accepted,
-                    error: Some((position, message)),
+                    error: Some((position, error.message())),
+                    confirmations: Vec::new(),
+                    reload_required,
                 };
             }
         }
     }
     worker.terminate();
+    let mut results = Vec::new();
+    if !accepted.is_empty() {
+        for (label, envelope) in &confirmations {
+            let result =
+                match envelope.request_body(&nonce.nonce, &assertion, &send.send_manifest_bytes) {
+                    Ok(body) => crate::data::submit_manual_confirmation(&body)
+                        .await
+                        .map(|_| ()),
+                    Err(error) => Err(error.to_string()),
+                };
+            results.push((label.clone(), result));
+        }
+    }
     SendOutcome {
         accepted,
         error: None,
+        confirmations: results,
+        reload_required: false,
     }
 }
 
@@ -3603,6 +4056,8 @@ mod tests {
             unmapped: Vec::new(),
             card: None,
             malformed: false,
+            ready: true,
+            blocked: None,
             render_class: RenderClass::Colour,
             family: None,
             mono_filter: None,
@@ -3750,6 +4205,102 @@ mod tests {
         let settings = group_settings_for(&restored, &[], 0).expect("settings");
         assert_eq!(settings.controls[0].source, SettingSource::Reproduced);
         assert_eq!(settings.controls[1].source, SettingSource::Reproduced);
+    }
+
+    #[test]
+    fn an_unavailable_camera_blocks_the_batch() {
+        let mut reading = reading("a.raf", "fujifilm", "x-s10", "provia", 0);
+        apply_site_error(
+            &mut reading,
+            &SiteBodyError::Unavailable("its input transform is not published".to_owned()),
+        );
+        assert!(!reading.ready);
+        assert_eq!(
+            reading.blocked.as_deref(),
+            Some("its input transform is not published")
+        );
+    }
+
+    #[test]
+    fn changing_the_camera_discards_the_previous_camera_settings() {
+        let mut set = BatchSet::from_groups(vec![ContributionGroup {
+            camera_ready: true,
+            blocked: Some("the site data could not be loaded".to_owned()),
+            fields: GroupFields {
+                body: "fujifilm/x-s10".to_owned(),
+                sim: "provia".to_owned(),
+                controls: "color=0".to_owned(),
+                ..GroupFields::default()
+            },
+            reproduced: vec![("color".to_owned(), 0)],
+            unmapped: vec!["grain".to_owned()],
+            ..ContributionGroup::default()
+        }]);
+        let id = set.groups()[0].id;
+        set.set_body(id, "fujifilm/x-t5".to_owned());
+        let group = &set.groups()[0];
+        assert_eq!(group.fields.body, "fujifilm/x-t5");
+        assert!(!group.camera_ready);
+        assert!(group.blocked.is_none());
+        assert!(group.fields.sim.is_empty());
+        assert!(group.fields.controls.is_empty());
+        assert!(group.reproduced.is_empty());
+        assert!(group.unmapped.is_empty());
+    }
+
+    #[test]
+    fn a_new_camera_prefill_replaces_the_old_scope() {
+        let mut group = ContributionGroup {
+            fields: GroupFields {
+                body: "fujifilm/x-s10".to_owned(),
+                sim: "provia".to_owned(),
+                controls: "color=0".to_owned(),
+                ..GroupFields::default()
+            },
+            reproduced: vec![("color".to_owned(), 0)],
+            ..ContributionGroup::default()
+        };
+        apply_site_prefill(
+            &mut group,
+            "fujifilm/x-t5",
+            looklab_wasm::SettingsPrefill {
+                firmware: "2.00".to_owned(),
+                sim: Some("velvia".to_owned()),
+                render_class: None,
+                family: None,
+                mono_filter: None,
+                controls: vec![("color".to_owned(), 2)],
+                unavailable: Vec::new(),
+                unmapped: Vec::new(),
+                monochrome: Vec::new(),
+            },
+        );
+        assert_eq!(group.fields.body, "fujifilm/x-t5");
+        assert_eq!(group.fields.firmware, "2.00");
+        assert_eq!(group.fields.sim, "velvia");
+        assert_eq!(group.fields.controls, "color=2");
+        assert_eq!(group.reproduced, vec![("color".to_owned(), 2)]);
+        assert!(group.camera_ready);
+        assert!(group.blocked.is_none());
+    }
+
+    #[test]
+    fn a_confirmation_for_an_accepted_camera_survives_a_partial_retry() {
+        let envelopes = BTreeMap::from([
+            ("fujifilm/x-t5".to_owned(), ()),
+            ("fujifilm/x-s10".to_owned(), ()),
+            ("sony/a7".to_owned(), ()),
+        ]);
+        let sending = BTreeSet::from(["fujifilm/x-s10".to_owned()]);
+        let completed = BTreeSet::from(["fujifilm/x-t5".to_owned()]);
+        let selected = confirmations_to_send(envelopes, &sending, &completed);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fujifilm/x-s10", "fujifilm/x-t5"]
+        );
     }
 
     #[test]

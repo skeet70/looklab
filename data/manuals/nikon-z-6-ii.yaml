@@ -1,0 +1,302 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: nikon/z-6-ii
+  make: Nikon
+  model: Z 6II
+  sources:
+  - id: nikon-z6ii-rm
+    kind: owner_manual
+    url: https://download.nikonimglib.com/archive5/HNpDp00RpojX05RyXmB45cv7Wf54/Z7IIZ6IIRM_(En)06.pdf
+    title: Z 7II/Z 6II Reference Manual
+    firmware_scope: unspecified
+  capabilities:
+  - key: raw_capture
+    label: Image quality
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 152, Image Quality ([NEF (RAW)])
+  - key: jpeg_capture
+    label: Image quality
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 152, Image Quality ([JPEG fine] through [JPEG basic])
+  - key: heif_capture
+    label: Image quality
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 152, Image Quality
+  - key: raw_jpeg_simultaneous
+    label: Image quality
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 152, Image Quality ([NEF (RAW) + JPEG fine] to [NEF (RAW) + JPEG basic])
+  - key: raw_bit_depth
+    label: NEF (RAW) bit depth
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - '12'
+      - '14'
+      default: '14'
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 265, NEF (RAW) Bit Depth
+    - source: nikon-z6ii-rm
+      locator: p. 213, Photo Shooting Menu Defaults ([NEF (RAW) bit depth])
+  - key: jpeg_quality
+    label: Image quality
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - fine
+      - normal
+      - basic
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 152, Image Quality
+  - key: jpeg_color_spaces
+    label: Color space
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - Adobe RGB
+      default: sRGB
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 282, Color Space
+    - source: nikon-z6ii-rm
+      locator: p. 214, Photo Shooting Menu Defaults ([Color space])
+  - key: in_camera_raw_conversion
+    label: NEF (RAW) processing
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: nikon-z6ii-rm
+      locator: 'p. 506, NEF (RAW) Processing: Converting NEF (RAW) to JPEG'
+    - source: nikon-z6ii-rm
+      locator: p. 153, NEF (RAW) (retouch menu processing)
+  - key: native_simulations
+    label: Set Picture Control
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Auto
+      - Standard
+      - Neutral
+      - Vivid
+      - Monochrome
+      - Portrait
+      - Landscape
+      - Flat
+      - Dream
+      - Morning
+      - Pop
+      - Sunday
+      - Somber
+      - Dramatic
+      - Silence
+      - Bleached
+      - Melancholic
+      - Pure
+      - Denim
+      - Toy
+      - Sepia
+      - Blue
+      - Red
+      - Pink
+      - Charcoal
+      - Graphite
+      - Binary
+      - Carbon
+      default: Auto
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 139, Set Picture Control
+    - source: nikon-z6ii-rm
+      locator: p. 140, Set Picture Control (Creative Picture Control k01-k20)
+    - source: nikon-z6ii-rm
+      locator: p. 214, Photo Shooting Menu Defaults ([Set Picture Control])
+  - key: white_balance_presets
+    label: White balance
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Auto
+      - Natural light auto
+      - Direct sunlight
+      - Cloudy
+      - Shade
+      - Incandescent
+      - Fluorescent
+      - Flash
+      - Choose color temperature
+      - Preset manual
+    citations:
+    - source: nikon-z6ii-rm
+      locator: pp. 95-97, White Balance (option table)
+  - key: white_balance_shift
+    label: White balance
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 268, Fine-Tune White Balance
+  - key: color_temperature
+    label: Choose color temperature
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: 2500
+      max: 10000
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 97, White Balance ([Choose color temperature], Approx. 2500-10000 K)
+  - key: exposure_compensation
+    label: Exposure compensation
+    category: rendering
+    availability: available
+    domain:
+      type: rational
+      min: '-5'
+      max: '+5'
+      step: 1/3
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 122, The E (Exposure Compensation) Button
+    - source: nikon-z6ii-rm
+      locator: p. 756, Specifications (Exposure compensation)
+  - key: dynamic_range
+    label: Active D-Lighting
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Auto
+      - Extra high
+      - High
+      - Normal
+      - Low
+      - 'Off'
+      default: 'Off'
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 283, Active D-Lighting
+    - source: nikon-z6ii-rm
+      locator: p. 214, Photo Shooting Menu Defaults ([Active D-Lighting])
+  - key: sharpening
+    label: Sharpening
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 143, Picture Control Settings ([Sharpening])
+    - source: nikon-z6ii-rm
+      locator: p. 141, Modifying Picture Controls
+  - key: clarity
+    label: Clarity
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 143, Picture Control Settings ([Clarity])
+  - key: contrast
+    label: Contrast
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 143, Picture Control Settings ([Contrast])
+  - key: saturation
+    label: Saturation
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 143, Picture Control Settings ([Saturation])
+  - key: monochrome_toning
+    label: Toning
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 143, Picture Control Settings ([Toning], [Filter effects])
+  - key: noise_reduction
+    label: High ISO NR
+    category: spatial
+    availability: available
+    domain:
+      type: enum
+      values:
+      - High
+      - Normal
+      - Low
+      - 'Off'
+      default: Normal
+    citations:
+    - source: nikon-z6ii-rm
+      locator: p. 286, High ISO NR
+    - source: nikon-z6ii-rm
+      locator: p. 214, Photo Shooting Menu Defaults ([High ISO NR])
+  notes:
+  - The [Image quality] menu on p. 152 lists NEF (RAW), NEF (RAW) + JPEG and JPEG options; HEIF is not listed.
+  - Picture Control values change in increments of 1, or in increments of 0.25 when the sub-command dial is rotated; the manual prints no numeric range for [Sharpening], [Clarity], [Contrast], [Saturation], or [Hue] (p. 141).
+  - '[Quick sharp] adjusts [Sharpening], [Mid-range sharpening], and [Clarity] together as one control; [Mid-range sharpening] covers patterns and lines between the range of [Sharpening] and [Clarity] and has no registry key (p. 143).'
+  - In movie recording the [Mid-range sharpening] value applies only to footage recorded at [3840x2160; 60p], [3840x2160; 50p], or [High quality] (p. 144).
+  - The [n Auto] Picture Control is adjustable from [A-2] to [A+2]; individual settings offer an [A] (auto) value (pp. 142-143).
+  - '[Effect level] is displayed only for Creative Picture Controls and has no registry key (p. 143).'
+  - '[Brightness] (raise or lower brightness without loss of highlight or shadow detail) and [Hue] have no registry keys (p. 143).'
+  - '[Filter effects] offers [Y] (yellow), [O] (orange), [R] (red), and [G] (green) for monochrome pictures (p. 144); the [Toning] tint list is not printed, and pressing 3 with any option other than [B&W] displays saturation options (p. 143).'
+  - Custom Picture Controls are stored in slots C-1 through C-9 (pp. 278-281).
+  - White balance can be fine-tuned up to six steps from the centre on each of the A-B and G-M axes, in increments of 0.5 (A-B) and 0.25 (G-M) (p. 268).
+  - '[Choose color temperature] spans 2500-10000 K (p. 97); the manual states no increment, so `step` is omitted.'
+  - Exposure increments default to 1/3 EV and can be changed to 1/2 EV with Custom Setting b1 [EV steps for exposure cntrl] (p. 122).
+  - '[Auto] white balance offers the sub-options [Keep white (reduce warm colors)], [Keep overall atmosphere], and [Keep warm lighting colors]; [Fluorescent] offers seven bulb types; the default is [Auto] with [Keep overall atmosphere] (pp. 95-96, 214).'
+  - Active D-Lighting offers [Auto], [Extra high], [High], [Normal], [Low], and [Off]; in mode M [Auto] is equivalent to [Normal] (pp. 283-284).
+  - JPEG quality options also exist in star-marked variants that maximize image quality (p. 152).
+  - Exposure compensation is limited to -3 to +3 EV in movie mode (p. 122).
+  - Set Picture Control is also available for movies, with a [Same as photo settings] option (p. 367).

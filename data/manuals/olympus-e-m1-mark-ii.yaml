@@ -1,0 +1,294 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: olympus/e-m1-mark-ii
+  make: Olympus
+  model: OM-D E-M1 Mark II
+  sources:
+  - id: olympus-e-m1-mark-ii-manual
+    kind: owner_manual
+    url: https://download.omsystem.com/pages/inst/em1m2/manual_em1m2_ENU.pdf
+    title: OM-D E-M1 Mark II Instruction Manual
+    edition: ENU
+    firmware_scope: '3.2'
+  capabilities:
+  - key: clarity
+    label: Clarity
+    category: spatial
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: color_chrome
+    label: Color Chrome
+    category: unknown
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: color_temperature
+    label: Custom WB (CWB)
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: 2000
+      max: 14000
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 42
+  - key: contrast
+    label: Contrast
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 62
+  - key: creative_filters
+    label: Art Filter
+    category: mixed
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Pop Art I/II
+      - Soft Focus
+      - Pale&Light Color I/II
+      - Light Tone
+      - Grainy Film I/II
+      - Pin Hole I/II/III
+      - Diorama I/II
+      - Cross Process I/II
+      - Gentle Sepia
+      - Dramatic Tone I/II
+      - Key Line I/II
+      - Watercolor I/II
+      - Vintage I/II/III
+      - Partial Color I/II/III
+      - Bleach Bypass I/II
+      - Instant Film
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 33
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 193
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 196
+  - key: dynamic_range
+    label: Gradation
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - 'AUTO: Auto'
+      - 'NORM: Normal'
+      - 'HIGH: High Key'
+      - 'LOW: Low Key'
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 63
+  - key: exposure_compensation
+    label: Exposure compensation
+    category: rendering
+    availability: available
+    domain:
+      type: rational
+      min: '-5.0'
+      max: '+5.0'
+      steps:
+      - 1/3
+      - 1/2
+      - '1'
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 177
+  - key: grain
+    label: Grain
+    category: spatial
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: heif_capture
+    label: HEIF
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: highlight_tone
+    label: Highlight&Shadow
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 66
+  - key: in_camera_raw_conversion
+    label: RAW Data Edit
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 105
+  - key: jpeg_capture
+    label: JPEG
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 55
+  - key: jpeg_color_spaces
+    label: Color Space
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - AdobeRGB
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 65
+  - key: jpeg_quality
+    label: Compression ratio
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - SF
+      - F
+      - N
+      - B
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 55
+  - key: monochrome_toning
+    label: Monochrome Color
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - N:None
+      - S:Sepia
+      - B:Blue
+      - P:Purple
+      - G:Green
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 64
+  - key: native_simulations
+    label: Picture Mode
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - i-Enhance
+      - Vivid
+      - Natural
+      - Muted
+      - Portrait
+      - Monochrome
+      - Custom
+      - e-Portrait
+      - Underwater
+      - Color Creator
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 61
+  - key: noise_reduction
+    label: Noise Filter
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 118
+  - key: raw_capture
+    label: RAW
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 55
+  - key: raw_jpeg_simultaneous
+    label: RAW+JPEG
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 55
+  - key: saturation
+    label: Saturation
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 63
+  - key: shadow_tone
+    label: Highlight&Shadow
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 66
+  - key: sharpening
+    label: Sharpness
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 62
+  - key: white_balance_presets
+    label: WB
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - 5 (5300K)
+      - N (7500K)
+      - O (6000K)
+      - 1 (3000K)
+      - '> (4000K)'
+      - U (Underwater)
+      - n (5500K)
+      - P/Q/W/X (One-touch)
+      - CWB
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 42
+  - key: white_balance_shift
+    label: WB Compensation
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: A (Red-Blue)
+      - label: G (Green-Magenta)
+    citations:
+    - source: olympus-e-m1-mark-ii-manual
+      locator: p. 52
+  notes:
+  - AdobeRGB is unavailable in movie mode and with ART or HDR (p. 65). Firmware v2.0 adds Bleach Bypass I/II (p. 193); v3.0 adds Instant Film (p. 196). Long-exposure Noise Reduction (Auto/On/Off) is a separate custom-menu item (p. 118). Noise Filter option levels are not enumerated in the manual text.

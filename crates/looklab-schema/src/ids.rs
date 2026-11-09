@@ -180,3 +180,4 @@ impl EnumValue {
 }
 
 id_type!(MakernoteTag);
+id_type!(SourceId);

@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         origin: origin.clone(),
         server_secret_path: secret_path,
         bodies_dir: PathBuf::from("data/bodies"),
+        manuals_dir: PathBuf::from("data/manuals"),
         snapshot_dir,
         nonce_ttl: Duration::from_secs(3600),
         registration_ttl: Duration::from_secs(3600),

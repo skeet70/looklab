@@ -3,9 +3,10 @@
 use looklab_color::linalg::Mat3;
 use looklab_prep::PrepParams;
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, Challenge, CommunitySnapshotVersion, ContributionKind,
-    ControlSettings, FirmwareVersionString, Intent, Limits, ManifestHash, ManifestMetadata,
-    MonochromeAuthorization, Nonce, POW_K, RenderClass, SendManifest, SendManifestHash, SimKey,
+    AttestationHash, BatchManifest, BlobKind, BodyId, Challenge, CommunitySnapshotVersion,
+    ContributionKind, ControlSettings, FirmwareVersionString, Intent, Limits, ManifestHash,
+    ManifestMetadata, MonochromeAuthorization, Nonce, POW_K, RenderClass, SendManifest,
+    SendManifestHash, SimKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +86,8 @@ pub struct BuildManifestResponse {
 pub struct BuildSendManifestRequest {
     pub nonce: Nonce,
     pub manifest_hashes: Vec<ManifestHash>,
+    #[serde(default)]
+    pub attestation_hashes: Vec<AttestationHash>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
