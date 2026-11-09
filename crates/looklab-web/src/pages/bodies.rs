@@ -86,8 +86,8 @@ pub fn BodiesPage() -> impl IntoView {
         });
     });
     view! {
-        <h1>"Explore cameras"</h1>
-        <p class="lede">"Discover the looks built into your camera, or borrow color from another."</p>
+        <h1>"Cameras"</h1>
+        <p class="lede">"Pick a camera to see its built-in looks and what the evidence covers."</p>
         <label for="body-filter">"Filter by make or model"</label>
         <input id="body-filter" type="search" placeholder="Fujifilm"
             on:input=move |event| filter.set(event_target_value(&event))/>

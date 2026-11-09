@@ -8,6 +8,8 @@ use looklab_publish::{GateCheck, LookStatus};
 pub mod components;
 pub use components::*;
 
+pub(crate) const PLATFORM_STORE_UNDETECTED_NOTICE: &str = "No built-in passkey store was detected. Use a password manager, your phone, or a security key.";
+
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
 export function looklabPaint() {
     return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));

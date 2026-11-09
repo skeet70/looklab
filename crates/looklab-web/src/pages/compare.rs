@@ -194,7 +194,7 @@ pub fn ComparePage() -> impl IntoView {
     });
     view! {
         <article class="compare-page">
-            <header class="compare-heading"><h1>"Compare looks"</h1><p>"One photo. Two ways to see it."</p></header>
+            <header class="compare-heading"><h1>"Compare looks"</h1><p>"One photo, two looks. Split, toggle, or map the difference."</p></header>
             {move || match state.get() {
                 Load::Loading => ui::loading().into_any(),
                 Load::Failed(error) => ui::failure(&error).into_any(),

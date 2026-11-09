@@ -133,7 +133,7 @@ fn BodyDetailView(body: BodyPage, manual: Option<ManualPage>) -> impl IntoView {
 
     view! {
         <h1>{format!("{} {}", body.make, body.model)}</h1>
-        <p class="lede">"Explore its built-in color, then find settings for the looks you love."</p>
+        <p class="lede">"Its built-in looks, the evidence behind them, and settings to get one on your camera."</p>
         <h2>"Built-in looks"</h2>
         {move || match gallery.get() { Load::Ready(LookGallery { index, scene, preview_error }) => {
             let items=super::looks::cards(&index);

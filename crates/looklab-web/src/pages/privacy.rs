@@ -6,7 +6,7 @@ use leptos::prelude::*;
 pub fn PrivacyPage() -> impl IntoView {
     view! {
         <article class="prose">
-            <h1>"Your photos stay with you"</h1>
+            <h1>"Your photos stay on your device"</h1>
             <p class="lede">"Browsing, comparing and matching looks is anonymous. Your photos are processed on your device, not uploaded."</p>
             <h2>"When you contribute"</h2>
             <p>"looklab extracts shuffled color samples and a short list of camera settings. No pixels, location, names or capture dates are sent. You can inspect what's being shared before you send it."</p>

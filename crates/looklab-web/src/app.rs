@@ -291,7 +291,7 @@ fn SignInDialog(open: RwSignal<bool>) -> impl IntoView {
     };
     view! {
         <ui::Dialog title="Sign in to looklab".to_owned() open>
-            <p class="muted" hidden=move || !no_platform_store.get()>"This computer can't store passkeys. Your browser will offer to use your phone (scan a QR code) or a security key."</p>
+            <p class="muted" hidden=move || !no_platform_store.get()>{crate::ui::PLATFORM_STORE_UNDETECTED_NOTICE}</p>
             <section class="profile-returning" aria-label="Sign in">
                 <p>"No email or password. Your device keeps a passkey that proves your contributions are yours."</p>
                 <button class="button-primary" disabled=move || busy.get() on:click=move |_| authenticate(SignInAction::Continue)>"Continue with passkey"</button>

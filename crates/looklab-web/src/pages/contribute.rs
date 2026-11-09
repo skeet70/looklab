@@ -1740,12 +1740,12 @@ pub fn ContributePage() -> impl IntoView {
     view! {
         <div class="contribute-page">
         <header class="contribute-intro" class:contribution-active=move || stage.get() != Stage::Drop>
-            <p class="eyebrow">"Made together, kept private"</p>
+            <p class="eyebrow">"What helping takes"</p>
             <h1>"Help build looks"</h1>
             <p class="lede">"Your photos never leave this device. We extract the aesthetic, and you see exactly what's sent before it goes."</p>
-            <p>"Shared samples help measure the looks photographers love. You need RAW+JPEG pairs from a supported camera, shot with a built-in look."</p>
+            <p>"Shared samples are how we measure a look. You need RAW+JPEG pairs from a supported camera, shot with a built-in look."</p>
         </header>
-        <p class="notice" hidden=move || !no_platform_store.get()>"This computer can't store passkeys. Your browser will offer to use your phone (scan a QR code) or a security key."</p>
+        <p class="notice" hidden=move || !no_platform_store.get()>{crate::ui::PLATFORM_STORE_UNDETECTED_NOTICE}</p>
         {(!available).then(crate::ui::preview_notice)}
         <section class="ways-to-help" hidden=move || stage.get() != Stage::Drop>
             <h2>"Ways to help"</h2>
