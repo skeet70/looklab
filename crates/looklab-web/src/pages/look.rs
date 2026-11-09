@@ -405,7 +405,7 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                             camera.get().map(|id| id.to_string()).unwrap_or_default(),
                         ));
                         view! {
-                            <h2>"Get this look"</h2>
+                            <h2>"Get this look on your camera"</h2>
                             <ui::CameraPicker cameras=index.bodies selected=camera/>
                             <a class="button" href=href>"Find my settings"</a>
                         }.into_any()

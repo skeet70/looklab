@@ -1,4 +1,4 @@
-.community-page { max-width: 70rem; margin-inline: auto; }
+.community-page { max-width: 70rem; }
 .community-hero { padding-block: 1.5rem 3rem; max-width: 47rem; }
 .community-hero h1 { max-width: 16ch; }
 .community-principles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2rem; padding-block: 2rem; border-block: 1px solid var(--line); margin-bottom: 3rem; }
@@ -22,7 +22,6 @@
 .community-links { display: flex; flex-wrap: wrap; gap: 1rem 2rem; padding-block: 1rem; }
 .proposal-fields { max-width: 36rem; margin-block: 1.5rem; }
 .proposal-fields input:not([type=checkbox]) { width: 100%; }
-main:has(#submit-proposal) { max-width: 62rem; }
 main:has(#submit-proposal) > section { margin-block: 2rem; border-top: 1px solid var(--line); padding-block: 1rem; }
 main:has(#submit-proposal) .disclosure { margin-block: 1.5rem; }
 main:has(#submit-proposal) .drop-zone { margin-block: 1rem; }

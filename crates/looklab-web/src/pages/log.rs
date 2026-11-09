@@ -174,8 +174,8 @@ pub fn CommunityPage() -> impl IntoView {
         <div class="community-page">
             <header class="community-hero">
                 <p class="eyebrow">"Community"</p>
-                <h1>"Better looks, built together"</h1>
-                <p class="lede">"Share what your camera can do. Help everyone find a closer match."</p>
+                <h1>"How the community decides"</h1>
+                <p class="lede">"Camera data changes through public proposals. Moderators check the evidence, and every decision is logged."</p>
                 <a class="button" href=crate::base::site_url("/community/propose")>
                     "Propose a change"
                 </a>

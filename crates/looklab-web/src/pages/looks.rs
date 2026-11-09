@@ -164,7 +164,7 @@ pub fn LooksPage() -> impl IntoView {
         });
     });
     view! {
-        <h1>"Find your next look"</h1>
+        <h1>"Look gallery"</h1>
         <p class="lede">"Discover what makes other cameras special. Bring it to yours."</p>
         {move || match state.get() {
             Load::Loading => ui::loading().into_any(), Load::Failed(error) => ui::failure(&error).into_any(),

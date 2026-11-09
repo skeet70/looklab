@@ -8,10 +8,10 @@ pub fn HowItWorksPage() -> impl IntoView {
     view! {
         <article class="developers-page developer-prose">
             <header>
-                <p class="eyebrow">"From shared photos to your camera"</p>
-                <h1>"A look is more than a preset"</h1>
+                <p class="eyebrow">"Method"</p>
+                <h1>"How looks are measured and matched"</h1>
                 <p class="lede">"A look describes how colors and brightness change in a photograph. looklab measures that character, then helps you bring it to another camera."</p>
-                <a class="button" href=site_url("/looks")>"Explore looks"</a>
+                <a class="button" href=site_url("/looks")>"Browse looks"</a>
             </header>
             <section>
                 <h2>"Measured from real photographs"</h2>
