@@ -56,9 +56,7 @@ impl ManualPage {
                 confirmation: confirmation
                     .control(capability.key)
                     .cloned()
-                    .unwrap_or_else(|| {
-                        evaluate_control(camera, capability, &[], &[])
-                    }),
+                    .unwrap_or_else(|| evaluate_control(camera, capability, &[], &[])),
             })
             .collect();
         let human_confirmed = confirmation.human_confirmed();

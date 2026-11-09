@@ -1163,7 +1163,7 @@ async fn a_parallel_batch_replay_creates_one_contribution() {
             .filter(|status| **status == StatusCode::CREATED)
             .count(),
         1,
-        "{left:?} {right:?}"
+        "{statuses:?}"
     );
     assert_eq!(
         statuses
@@ -1172,7 +1172,62 @@ async fn a_parallel_batch_replay_creates_one_contribution() {
                 || **status == StatusCode::SERVICE_UNAVAILABLE)
             .count(),
         1,
-        "{left:?} {right:?}"
+        "{statuses:?}"
+    );
+    let batch_hash = manifest_hash(&first);
+    let contributions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contributions WHERE batch_manifest_hash = ?")
+            .bind(batch_hash.as_bytes().as_slice())
+            .fetch_one(&server.db)
+            .await
+            .expect("contributions");
+    assert_eq!(contributions, 1);
+    let refs: i64 = sqlx::query_scalar("SELECT ref_count FROM blobs WHERE hash = ?")
+        .bind(first.images[0].blob_sha256.as_slice())
+        .fetch_one(&server.db)
+        .await
+        .expect("blob refs");
+    assert_eq!(refs, 1);
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'consistency_score'")
+            .fetch_one(&server.db)
+            .await
+            .expect("jobs");
+    assert_eq!(jobs, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persisted_credential_parallel_duplicate_batch_creates_one_contribution() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, _) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let body = send_envelope(nonce, &send, &first, &first_blobs, &assertion);
+
+    let (left, right) = tokio::join!(server.upload_bytes(body.clone()), server.upload_bytes(body));
+    let statuses = [left.0, right.0];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CREATED)
+            .count(),
+        1,
+        "{statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CONFLICT
+                || **status == StatusCode::SERVICE_UNAVAILABLE)
+            .count(),
+        1,
+        "{statuses:?}"
     );
     let batch_hash = manifest_hash(&first);
     let contributions: i64 =
@@ -5101,6 +5156,51 @@ async fn manual_confirmation_after_photos_reuses_the_send_assertion() {
     assert!(withdrawn.is_some());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_upload_and_manual_attestation_under_one_send_both_succeed() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        vec![manifest_hash(&manifest)],
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let serial = RawSerial::from_envelope_ascii(SERIAL.as_bytes()).expect("serial");
+    let upload = envelope_with_send(nonce, &send, &manifest, &blobs, Some(&serial), &assertion);
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (upload_result, confirmation_result) = tokio::join!(
+        server.upload_bytes(upload),
+        post_confirmation(&server.app, &request),
+    );
+    assert_eq!(upload_result.0, StatusCode::CREATED);
+    assert_eq!(confirmation_result.0, StatusCode::OK);
+    let contributions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contributions WHERE batch_manifest_hash = ?")
+            .bind(manifest_hash(&manifest).as_bytes().as_slice())
+            .fetch_one(&server.db)
+            .await
+            .expect("contributions");
+    assert_eq!(contributions, 1);
+    let confirmations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manual_confirmations")
+        .fetch_one(&server.db)
+        .await
+        .expect("confirmations");
+    assert_eq!(confirmations, 1);
+
+    let other_nonce = server.nonce().await;
+    let other = send_envelope(other_nonce, &send, &manifest, &blobs, &assertion);
+    let (status, body) = server.upload_bytes(other).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "SIGNATURE_INVALID");
+}
+
 #[tokio::test]
 async fn withdrawn_send_rejects_a_late_confirmation() {
     let mut server = TestServer::start().await;
@@ -6212,9 +6312,7 @@ async fn client_error_reports_require_json_media_type() {
         Some("json"),
         Some("application/json, text/plain"),
     ] {
-        let mut builder = Request::builder()
-            .method("POST")
-            .uri("/api/client-errors");
+        let mut builder = Request::builder().method("POST").uri("/api/client-errors");
         if let Some(content_type) = content_type {
             builder = builder.header(header::CONTENT_TYPE, content_type);
         }
@@ -6244,7 +6342,11 @@ async fn client_error_reports_require_json_media_type() {
             .body(Body::from(body.clone()))
             .expect("request");
         let (status, _, _) = send(&server.app, request).await;
-        assert_eq!(status, StatusCode::NO_CONTENT, "content type {content_type}");
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "content type {content_type}"
+        );
     }
     let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM client_errors")
         .fetch_one(&server.db)
@@ -6270,7 +6372,8 @@ async fn client_error_reports_accept_every_allowed_asset() {
     ] {
         let mut value = client_error_report(&release);
         value["frames"] = json!([{"asset": asset, "line": 0, "column": 0}]);
-        let status = post_client_error(&server.app, serde_json::to_vec(&value).expect("json")).await;
+        let status =
+            post_client_error(&server.app, serde_json::to_vec(&value).expect("json")).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "asset {asset}");
     }
     let mut twelve = client_error_report(&release);
@@ -6398,7 +6501,8 @@ async fn client_error_reports_never_reach_the_logs() {
     let server = TestServer::start().await;
     let release = "f".repeat(64);
     let mut value = client_error_report(&release);
-    value["frames"] = json!([{"asset": "generated/wasm/looklab_match.wasm", "line": 7, "column": 9}]);
+    value["frames"] =
+        json!([{"asset": "generated/wasm/looklab_match.wasm", "line": 7, "column": 9}]);
     assert_eq!(
         post_client_error(&server.app, serde_json::to_vec(&value).expect("json")).await,
         StatusCode::NO_CONTENT

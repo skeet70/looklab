@@ -11,11 +11,11 @@ use crate::PublishError;
 use crate::audit::AuditLog;
 use crate::body::{BodyKind, BodyPage, BodyStatus, MappingStatus, PreparationPage};
 use crate::hash::{ArtifactHash, ArtifactName, SitePath};
-use crate::manual::{ManualArtifact, ManualPage, ManualSummary};
 use crate::manifest::{
     ArtifactBlob, ArtifactEntry, GateSummary, LookStatus, ProvenanceSummary, VersionManifest,
     verify_artifact,
 };
+use crate::manual::{ManualArtifact, ManualPage, ManualSummary};
 use crate::scene::{SCENE_FORMAT, Scene, SceneIndex, SceneName, SceneSummary};
 
 pub const SITE_FORMAT: &str = "looklab-site/1";

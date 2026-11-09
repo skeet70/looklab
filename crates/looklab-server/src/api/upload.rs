@@ -87,134 +87,156 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
     }
 
     let raw_id = RawCredentialId::new(header.assertion.credential_id.clone());
-    let stored = store::find_credential(&state.db, raw_id.as_slice())
-        .await
-        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
-    let pending = if stored.is_none() {
-        state.pending_credential(raw_id.as_slice())
-    } else {
-        None
-    };
-    let resolved = match (stored, pending) {
-        (Some(credential), _) => ResolvedCredential {
-            passkey: credential.passkey,
-            revision: Some(credential.revision),
-            standing: credential.standing,
-            existing: Some(credential.id),
-        },
-        (None, Some((passkey, _))) => ResolvedCredential {
-            passkey,
-            revision: None,
-            standing: NEW_CREDENTIAL_STANDING,
-            existing: None,
-        },
-        (None, None) => return Err(ApiError::new(ErrorCode::CredentialUnknown)),
-    };
-
     let assertion_hash = assertion_digest(&header.assertion);
-    let send = store::find_send(&state.db, &header.nonce)
-        .await
-        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
-    let mut send_expires_at = send.as_ref().map(|send| send.expires_at);
-    let passkey = resolved.passkey;
     let mut promotion: Option<PendingPromotion> = None;
-    match send {
-        Some(send) => {
-            check_send_binding(
-                &send,
-                header.send_manifest_hash.as_bytes(),
-                &header.assertion.credential_id,
-                &assertion_hash,
-            )?;
-            check_send_open(&send)?;
-            check_batch_pending(&state, &header).await?;
-            if resolved.existing.is_none() {
-                promotion = Some(
-                    state
-                        .begin_promotion(&passkey, &passkey)
-                        .map_err(promotion_error)?,
-                );
-            }
-        }
-        None => {
-            let challenge = Challenge::for_send(&header.nonce, &header.send_manifest_hash);
-            let verified = verify_assertion(
-                &passkey,
-                &header.assertion,
-                challenge,
-                &state.config.origin,
-                &state.config.rp_id,
-            )
-            .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
-            if let Some(id) = &resolved.existing {
-                let revision = resolved
-                    .revision
-                    .as_ref()
-                    .ok_or_else(|| ApiError::new(ErrorCode::Internal))?;
-                match store::update_credential_passkey(&state.db, id, &verified, revision).await {
-                    Ok(store::CredentialUpdate::Applied) => {}
-                    Ok(store::CredentialUpdate::Stale) => {
-                        return Err(ApiError::new(ErrorCode::SignatureInvalid));
-                    }
-                    Err(_) => return Err(ApiError::new(ErrorCode::Internal)),
-                }
-            } else {
-                promotion = Some(
-                    state
-                        .begin_promotion(&passkey, &verified)
-                        .map_err(promotion_error)?,
-                );
-            }
-            let batch_hashes = header
-                .send_manifest
-                .batches
-                .iter()
-                .map(|hash| *hash.as_bytes())
-                .collect::<Vec<_>>();
-            let attestation_hashes = header
-                .send_manifest
-                .attestations
-                .iter()
-                .map(|hash| *hash.as_bytes())
-                .collect::<Vec<_>>();
-            let new_send = NewSend {
-                manifest_hash: header.send_manifest_hash.as_bytes(),
-                nonce: &header.nonce,
-                credential_id: &header.assertion.credential_id,
-                assertion_hash: &assertion_hash,
-                batch_hashes: &batch_hashes,
-                attestation_hashes: &attestation_hashes,
-            };
-            match store::establish_send(&state.db, &new_send)
+    let mut resolved;
+    let mut send_expires_at;
+    {
+        let _guard = state.lock_assertion().await;
+        let mut stored = store::find_credential(&state.db, raw_id.as_slice())
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+        let pending = if stored.is_none() {
+            state.pending_credential(raw_id.as_slice())
+        } else {
+            None
+        };
+        if stored.is_none() && pending.is_none() {
+            stored = store::find_credential(&state.db, raw_id.as_slice())
                 .await
-                .map_err(|_| ApiError::new(ErrorCode::Internal))?
-            {
-                EstablishSend::Established => {
-                    send_expires_at = Some(
-                        store::find_send(&state.db, &header.nonce)
-                            .await
-                            .map_err(|_| ApiError::new(ErrorCode::Internal))?
-                            .ok_or_else(|| ApiError::new(ErrorCode::Internal))?
-                            .expires_at,
-                    );
+                .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+        }
+        resolved = match (stored, pending) {
+            (Some(credential), _) => ResolvedCredential {
+                passkey: credential.passkey,
+                revision: Some(credential.revision),
+                standing: credential.standing,
+                existing: Some(credential.id),
+            },
+            (None, Some((passkey, _))) => ResolvedCredential {
+                passkey,
+                revision: None,
+                standing: NEW_CREDENTIAL_STANDING,
+                existing: None,
+            },
+            (None, None) => return Err(ApiError::new(ErrorCode::CredentialUnknown)),
+        };
+        let send = store::find_send(&state.db, &header.nonce)
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+        send_expires_at = send.as_ref().map(|send| send.expires_at);
+        match send {
+            Some(send) => {
+                check_send_binding(
+                    &send,
+                    header.send_manifest_hash.as_bytes(),
+                    &header.assertion.credential_id,
+                    &assertion_hash,
+                )?;
+                check_send_open(&send)?;
+                check_batch_pending(&state, &header).await?;
+                if resolved.existing.is_none() {
+                    let claim = state
+                        .claim_pending(&resolved.passkey, &resolved.passkey)
+                        .map_err(promotion_error)?;
+                    match claim {
+                        Some(held) => promotion = Some(held),
+                        None => {
+                            resolved = persisted_credential(&state, &raw_id).await?;
+                        }
+                    }
                 }
-                EstablishSend::Existing(send) => {
-                    send_expires_at = Some(send.expires_at);
-                    check_send_binding(
-                        &send,
-                        header.send_manifest_hash.as_bytes(),
-                        &header.assertion.credential_id,
-                        &assertion_hash,
-                    )?;
-                    check_send_open(&send)?;
-                    check_batch_pending(&state, &header).await?;
+            }
+            None => {
+                let challenge = Challenge::for_send(&header.nonce, &header.send_manifest_hash);
+                let verified = verify_assertion(
+                    &resolved.passkey,
+                    &header.assertion,
+                    challenge,
+                    &state.config.origin,
+                    &state.config.rp_id,
+                )
+                .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
+                if resolved.existing.is_some() {
+                    update_passkey(&state, &resolved, &verified).await?;
+                } else {
+                    let claim = state
+                        .claim_pending(&resolved.passkey, &verified)
+                        .map_err(promotion_error)?;
+                    match claim {
+                        Some(held) => promotion = Some(held),
+                        None => {
+                            let persisted = persisted_credential(&state, &raw_id).await?;
+                            let verified = verify_assertion(
+                                &persisted.passkey,
+                                &header.assertion,
+                                challenge,
+                                &state.config.origin,
+                                &state.config.rp_id,
+                            )
+                            .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
+                            update_passkey(&state, &persisted, &verified).await?;
+                            resolved = persisted;
+                        }
+                    }
                 }
-                EstablishSend::Unknown => return Err(ApiError::new(ErrorCode::NonceUnknown)),
-                EstablishSend::Expired => return Err(ApiError::new(ErrorCode::NonceExpired)),
-                EstablishSend::Replayed => return Err(ApiError::new(ErrorCode::NonceReplayed)),
+                let batch_hashes = header
+                    .send_manifest
+                    .batches
+                    .iter()
+                    .map(|hash| *hash.as_bytes())
+                    .collect::<Vec<_>>();
+                let attestation_hashes = header
+                    .send_manifest
+                    .attestations
+                    .iter()
+                    .map(|hash| *hash.as_bytes())
+                    .collect::<Vec<_>>();
+                let new_send = NewSend {
+                    manifest_hash: header.send_manifest_hash.as_bytes(),
+                    nonce: &header.nonce,
+                    credential_id: &header.assertion.credential_id,
+                    assertion_hash: &assertion_hash,
+                    batch_hashes: &batch_hashes,
+                    attestation_hashes: &attestation_hashes,
+                };
+                match store::establish_send(&state.db, &new_send)
+                    .await
+                    .map_err(|_| ApiError::new(ErrorCode::Internal))?
+                {
+                    EstablishSend::Established => {
+                        send_expires_at = Some(
+                            store::find_send(&state.db, &header.nonce)
+                                .await
+                                .map_err(|_| ApiError::new(ErrorCode::Internal))?
+                                .ok_or_else(|| ApiError::new(ErrorCode::Internal))?
+                                .expires_at,
+                        );
+                    }
+                    EstablishSend::Existing(send) => {
+                        send_expires_at = Some(send.expires_at);
+                        check_send_binding(
+                            &send,
+                            header.send_manifest_hash.as_bytes(),
+                            &header.assertion.credential_id,
+                            &assertion_hash,
+                        )?;
+                        check_send_open(&send)?;
+                        check_batch_pending(&state, &header).await?;
+                    }
+                    EstablishSend::Unknown => {
+                        return Err(ApiError::new(ErrorCode::NonceUnknown));
+                    }
+                    EstablishSend::Expired => {
+                        return Err(ApiError::new(ErrorCode::NonceExpired));
+                    }
+                    EstablishSend::Replayed => {
+                        return Err(ApiError::new(ErrorCode::NonceReplayed));
+                    }
+                }
             }
         }
-    };
+    }
     if !state.rate_limiter.check(&RateKey::Assertion {
         action: Action::Upload,
         id: raw_id.clone(),
@@ -601,6 +623,42 @@ pub(super) fn promotion_error(error: PromotionError) -> ApiError {
     match error {
         PromotionError::Stale => ApiError::new(ErrorCode::SignatureInvalid),
         PromotionError::Busy => ApiError::new(ErrorCode::Busy),
+    }
+}
+
+async fn persisted_credential(
+    state: &AppState,
+    raw_id: &RawCredentialId,
+) -> ApiResult<ResolvedCredential> {
+    let credential = store::find_credential(&state.db, raw_id.as_slice())
+        .await
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?
+        .ok_or_else(|| ApiError::new(ErrorCode::CredentialUnknown))?;
+    Ok(ResolvedCredential {
+        passkey: credential.passkey,
+        revision: Some(credential.revision),
+        standing: credential.standing,
+        existing: Some(credential.id),
+    })
+}
+
+async fn update_passkey(
+    state: &AppState,
+    credential: &ResolvedCredential,
+    verified: &Passkey,
+) -> ApiResult<()> {
+    let id = credential
+        .existing
+        .as_ref()
+        .ok_or_else(|| ApiError::new(ErrorCode::Internal))?;
+    let revision = credential
+        .revision
+        .as_ref()
+        .ok_or_else(|| ApiError::new(ErrorCode::Internal))?;
+    match store::update_credential_passkey(&state.db, id, verified, revision).await {
+        Ok(store::CredentialUpdate::Applied) => Ok(()),
+        Ok(store::CredentialUpdate::Stale) => Err(ApiError::new(ErrorCode::SignatureInvalid)),
+        Err(_) => Err(ApiError::new(ErrorCode::Internal)),
     }
 }
 

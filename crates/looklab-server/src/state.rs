@@ -119,11 +119,11 @@ impl Drop for PendingPromotion {
     }
 }
 
-fn begin_promotion(
+fn claim_pending(
     pending: &Arc<Mutex<HashMap<RegistrationHandle, PendingRegistration>>>,
     original: &Passkey,
     verified: &Passkey,
-) -> Result<PendingPromotion, PromotionError> {
+) -> Result<Option<PendingPromotion>, PromotionError> {
     let Ok(mut entries) = pending.lock() else {
         return Err(PromotionError::Busy);
     };
@@ -144,17 +144,25 @@ fn begin_promotion(
             }
             **stored = verified.clone();
             entry.promoting = true;
-            return Ok(PendingPromotion {
+            return Ok(Some(PendingPromotion {
                 pending: Arc::clone(pending),
                 handle: handle.clone(),
                 passkey: verified.clone(),
                 display_handle: display_handle.clone(),
                 committing: false,
                 finished: false,
-            });
+            }));
         }
     }
-    Err(PromotionError::Stale)
+    Ok(None)
+}
+
+fn begin_promotion(
+    pending: &Arc<Mutex<HashMap<RegistrationHandle, PendingRegistration>>>,
+    original: &Passkey,
+    verified: &Passkey,
+) -> Result<PendingPromotion, PromotionError> {
+    claim_pending(pending, original, verified)?.ok_or(PromotionError::Stale)
 }
 
 fn purge_pending(pending: &mut HashMap<RegistrationHandle, PendingRegistration>, ttl: Duration) {
@@ -365,6 +373,7 @@ pub struct AppState {
     pub mod_sessions: ModSessions,
     pub batch_admission: BatchAdmission,
     pending: Arc<Mutex<HashMap<RegistrationHandle, PendingRegistration>>>,
+    assertion_gate: tokio::sync::Mutex<()>,
 }
 
 impl core::fmt::Debug for AppState {
@@ -418,7 +427,13 @@ impl AppState {
             mod_sessions: ModSessions::default(),
             batch_admission: BatchAdmission::default(),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            assertion_gate: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Serializes first-assertion resolution, counter update and send binding.
+    pub(crate) async fn lock_assertion(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.assertion_gate.lock().await
     }
 
     pub fn insert_challenge(
@@ -531,6 +546,14 @@ impl AppState {
         verified: &Passkey,
     ) -> Result<PendingPromotion, PromotionError> {
         begin_promotion(&self.pending, original, verified)
+    }
+
+    pub(crate) fn claim_pending(
+        &self,
+        original: &Passkey,
+        verified: &Passkey,
+    ) -> Result<Option<PendingPromotion>, PromotionError> {
+        claim_pending(&self.pending, original, verified)
     }
 
     pub fn remove_pending_credential(&self, credential_id: &[u8]) {

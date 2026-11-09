@@ -28,16 +28,14 @@ use looklab_schema::{
 use looklab_server::body_schema::{Bodies, BodyRecord, resolve_epoch, validate_settings};
 use looklab_server::{RequestDomain, StatusToken, request_digest};
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge,
-    CommunitySnapshotVersion, ContributionKind, ControlEntry, ControlKey, ControlSettings,
-    DEFAULT_MAX_ATTESTATIONS, DEFAULT_MAX_BATCHES, Envelope, EnvelopeParts, ExpectedAssertion,
-    FirmwareId, FirmwareVersion, FirmwareVersionString, Intent, Limits, LookSlug,
-    ManualWithdrawalRequest, ManifestHash, ManifestImage, ManifestMetadata,
-    MonochromeAuthorization, Nonce, PowParams,
-    RawSerial as UploadSerial, RenderClass, SendManifest, SignatureAlgorithm, StepIndex,
-    StructuralVerdict, TopOriginReview, WebAuthnAssertion, canonical_send_manifest_bytes,
-    check_structure, encode_envelope, parse_envelope_strict, send_manifest_hash,
-    verify as verify_pow,
+    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion,
+    ContributionKind, ControlEntry, ControlKey, ControlSettings, DEFAULT_MAX_ATTESTATIONS,
+    DEFAULT_MAX_BATCHES, Envelope, EnvelopeParts, ExpectedAssertion, FirmwareId, FirmwareVersion,
+    FirmwareVersionString, Intent, Limits, LookSlug, ManifestHash, ManifestImage, ManifestMetadata,
+    ManualWithdrawalRequest, MonochromeAuthorization, Nonce, PowParams, RawSerial as UploadSerial,
+    RenderClass, SendManifest, SignatureAlgorithm, StepIndex, StructuralVerdict, TopOriginReview,
+    WebAuthnAssertion, canonical_send_manifest_bytes, check_structure, encode_envelope,
+    parse_envelope_strict, send_manifest_hash, verify as verify_pow,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -548,9 +546,7 @@ fn load_manual_catalog(data: &Path) -> Result<ManualCatalog> {
         );
     }
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(&root)
-        .with_context(|| format!("reading {}", root.display()))?
-    {
+    for entry in std::fs::read_dir(&root).with_context(|| format!("reading {}", root.display()))? {
         let entry = entry.with_context(|| format!("reading {}", root.display()))?;
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("yaml") {
@@ -760,38 +756,34 @@ struct BatchFields {
     settings_sources: Vec<BatchSetting>,
 }
 
+struct DerivationInputs<'a> {
+    version: CommunitySnapshotVersion,
+    declarations: &'a BTreeMap<ControlKey, StepIndex>,
+    card: bool,
+    card_family: Option<&'a LookId>,
+    card_render_class: Option<RenderClass>,
+}
+
 fn derive_batch(
     images: &[&ReproducedImage],
     bodies: &Bodies,
-    version: CommunitySnapshotVersion,
-    declarations: &BTreeMap<ControlKey, StepIndex>,
-    card: bool,
-    card_family: Option<&LookId>,
-    card_render_class: Option<RenderClass>,
+    inputs: &DerivationInputs<'_>,
     used: &RefCell<BTreeSet<ControlKey>>,
     findings: &mut Findings,
 ) -> Option<BatchFields> {
-    let records = match bodies.at(version) {
+    let records = match bodies.at(inputs.version) {
         Ok(records) => records,
         Err(error) => {
             findings.fail(format!(
-                "the manifest names community snapshot {version}: {error}; --data has up to {}",
+                "the manifest names community snapshot {}: {error}; --data has up to {}",
+                inputs.version,
                 bodies.current_version()
             ));
             return None;
         }
     };
     let first = images.first()?;
-    let fields = match derive_one(
-        &first.metadata,
-        records,
-        version,
-        declarations,
-        card,
-        card_family,
-        card_render_class,
-        used,
-    ) {
+    let fields = match derive_one(&first.metadata, records, inputs, used) {
         Ok(fields) => fields,
         Err(reason) => {
             findings.fail(format!(
@@ -801,16 +793,7 @@ fn derive_batch(
         }
     };
     for image in &images[1..] {
-        match derive_one(
-            &image.metadata,
-            records,
-            version,
-            declarations,
-            card,
-            card_family,
-            card_render_class,
-            used,
-        ) {
+        match derive_one(&image.metadata, records, inputs, used) {
             Ok(other) if other == fields => {}
             Ok(_) => {
                 findings.fail(
@@ -832,13 +815,10 @@ fn derive_batch(
 fn derive_one(
     metadata: &ManifestMetadata,
     records: &BTreeMap<String, BodyRecord>,
-    version: CommunitySnapshotVersion,
-    declarations: &BTreeMap<ControlKey, StepIndex>,
-    card: bool,
-    card_family: Option<&LookId>,
-    card_render_class: Option<RenderClass>,
+    inputs: &DerivationInputs<'_>,
     used: &RefCell<BTreeSet<ControlKey>>,
 ) -> Result<BatchFields, String> {
+    let version = inputs.version;
     let make = metadata
         .make
         .as_deref()
@@ -867,30 +847,32 @@ fn derive_one(
         Err(_) => sim_from_makernote(epoch, &values)
             .map_err(|error| format!("the files do not determine the film simulation: {error}"))?,
     };
-    let (render_class, family, mono_filter) = match (card, card_family, card_render_class) {
-        (true, Some(family), Some(declared)) => {
-            let declared = match declared {
-                RenderClass::Colour => SchemaRenderClass::Colour,
-                RenderClass::Monochrome => SchemaRenderClass::Monochrome,
-            };
-            let classified = classify_card_render(epoch, family, declared, &values)
-                .map_err(|error| format!("the card render does not classify: {error}"))?;
-            (
-                schema_render_class(classified.render_class),
-                classified.family,
-                classified.mono_filter,
-            )
-        }
-        _ => {
-            let classification = native
-                .map_err(|error| format!("the files do not determine the render class: {error}"))?;
-            (
-                schema_render_class(classification.render_class),
-                classification.family,
-                classification.mono_filter,
-            )
-        }
-    };
+    let (render_class, family, mono_filter) =
+        match (inputs.card, inputs.card_family, inputs.card_render_class) {
+            (true, Some(family), Some(declared)) => {
+                let declared = match declared {
+                    RenderClass::Colour => SchemaRenderClass::Colour,
+                    RenderClass::Monochrome => SchemaRenderClass::Monochrome,
+                };
+                let classified = classify_card_render(epoch, family, declared, &values)
+                    .map_err(|error| format!("the card render does not classify: {error}"))?;
+                (
+                    schema_render_class(classified.render_class),
+                    classified.family,
+                    classified.mono_filter,
+                )
+            }
+            _ => {
+                let classification = native.map_err(|error| {
+                    format!("the files do not determine the render class: {error}")
+                })?;
+                (
+                    schema_render_class(classification.render_class),
+                    classification.family,
+                    classification.mono_filter,
+                )
+            }
+        };
     if render_class == RenderClass::Monochrome && !epoch.supports_monochrome_intake(&family) {
         return Err(format!(
             "the schema does not accept monochrome intake for family {family}"
@@ -909,7 +891,7 @@ fn derive_one(
             tag: setting.source.name(),
         })
         .collect();
-    for (key, step) in declarations {
+    for (key, step) in inputs.declarations {
         let applicable = reach.mapped.contains(key)
             || reach.unmapped.contains(key)
             || reach.spatial.contains(key);
@@ -933,9 +915,9 @@ fn derive_one(
     if deferred {
         required.extend(reach.spatial.iter());
     }
-    required.sort_by(|left, right| left.cmp(right));
+    required.sort();
     required.dedup();
-    if !card || deferred {
+    if !inputs.card || deferred {
         for missing in required {
             if sources.iter().any(|setting| &setting.key == missing) {
                 continue;
@@ -971,7 +953,7 @@ fn derive_one(
         .map(|setting| ControlEntry::new(setting.key.clone(), setting.step, setting.source))
         .collect();
     let settings = ControlSettings::new(entries).map_err(|error| error.to_string())?;
-    let validation_family = if card && card_family.is_none() {
+    let validation_family = if inputs.card && inputs.card_family.is_none() {
         None
     } else {
         Some(family.clone())
@@ -982,7 +964,7 @@ fn derive_one(
         &native_sim,
         validation_family.as_ref(),
         &settings,
-        card,
+        inputs.card,
         deferred,
     )
     .map_err(|problem| format!("the derived settings are not valid for {body}: {problem}"))?;
@@ -1383,7 +1365,10 @@ fn print_manual_confirmation(
             SchemaFinding::Matches => {
                 findings.note("        finding: matches the documented options".to_owned());
             }
-            SchemaFinding::Corrected { availability, domain } => {
+            SchemaFinding::Corrected {
+                availability,
+                domain,
+            } => {
                 findings.note(format!(
                     "        finding: corrected, availability {availability}"
                 ));
@@ -1458,9 +1443,8 @@ fn parse_confirmation(request: &HarRequest, findings: &mut Findings) -> Option<P
         return None;
     };
     let Some(authenticator_data) = decode_confirmation_field(&body.authenticator_data, 512) else {
-        findings.fail(
-            "the manual confirmation's authenticator data is not base64url within 512 bytes",
-        );
+        findings
+            .fail("the manual confirmation's authenticator data is not base64url within 512 bytes");
         return None;
     };
     let Some(client_data_json) = decode_confirmation_field(&body.client_data_json, 1024) else {
@@ -1488,9 +1472,7 @@ fn parse_confirmation(request: &HarRequest, findings: &mut Findings) -> Option<P
         findings.fail("the manual confirmation's send manifest is not canonical");
         return None;
     }
-    if let Err(error) =
-        send_manifest.validate(DEFAULT_MAX_BATCHES, DEFAULT_MAX_ATTESTATIONS)
-    {
+    if let Err(error) = send_manifest.validate(DEFAULT_MAX_BATCHES, DEFAULT_MAX_ATTESTATIONS) {
         findings.fail(format!(
             "the manual confirmation's send manifest is invalid: {error}"
         ));
@@ -1578,15 +1560,13 @@ fn audit_withdrawal(
         );
         return;
     };
-    let Some(authenticator_data) = decode_confirmation_field(&body.authenticator_data, 512)
-    else {
+    let Some(authenticator_data) = decode_confirmation_field(&body.authenticator_data, 512) else {
         findings.fail(
             "the manual confirmation withdrawal's authenticator data is not base64url within 512 bytes",
         );
         return;
     };
-    let Some(client_data_json) = decode_confirmation_field(&body.client_data_json, 1024)
-    else {
+    let Some(client_data_json) = decode_confirmation_field(&body.client_data_json, 1024) else {
         findings.fail(
             "the manual confirmation withdrawal's client data is not base64url within 1024 bytes",
         );
@@ -1769,15 +1749,18 @@ fn verify_upload(
                     }
                     _ => None,
                 };
+                let inputs = DerivationInputs {
+                    version: service.snapshot,
+                    declarations: service.declarations,
+                    card: matches!(declared.intent, Intent::Card(_)),
+                    card_family: card_family.as_ref(),
+                    card_render_class: matches!(declared.intent, Intent::Card(_))
+                        .then_some(envelope.manifest.render_class),
+                };
                 let derived = derive_batch(
                     images,
                     service.bodies,
-                    service.snapshot,
-                    service.declarations,
-                    matches!(declared.intent, Intent::Card(_)),
-                    card_family.as_ref(),
-                    matches!(declared.intent, Intent::Card(_))
-                        .then_some(envelope.manifest.render_class),
+                    &inputs,
                     &service.declaration_use,
                     findings,
                 );
