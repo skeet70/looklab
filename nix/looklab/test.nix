@@ -39,7 +39,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_until_succeeds("curl -fsS http://127.0.0.1:8080/healthz", timeout=120)
     machine.wait_until_succeeds("curl -fsS http://127.0.0.1:8080/readyz", timeout=300)
     machine.succeed("curl -fsS http://127.0.0.1:8080/ | grep -qi '<html'")
-    machine.succeed("curl -fsS http://127.0.0.1:8080/data/index.json | grep -q 'looklab-site/1'")
+    machine.succeed("curl -fsS http://127.0.0.1:8080/data/index.json | jq -e '.format == \"looklab-site/1\"'")
     machine.succeed("curl -fsS http://127.0.0.1:8080/data/site-root.json > /dev/null")
 
     machine.wait_for_file("/var/lib/looklab/data/scenes/index.json")
@@ -73,6 +73,19 @@ pkgs.testers.runNixOSTest {
     owner = machine.succeed("stat -c '%U:%G' /var/lib/looklab/server-secret").strip()
     assert owner == "looklab:looklab", f"server-secret is owned by {owner}"
     machine.succeed("stat -c %a /var/lib/looklab/data | grep -qx 700")
+    manual = "/var/lib/looklab/data/manuals/fujifilm-x-m1.yaml"
+    manual_hash = machine.succeed(f"sha256sum {manual}").split()[0]
+    body = "/var/lib/looklab/data/bodies/fujifilm-x-t4.body.yaml"
+    body_hash = machine.succeed(f"sha256sum {body}").split()[0]
+    host_record = "/var/lib/looklab/data/manuals/operator-note.txt"
+    machine.succeed(f"install -o looklab -g looklab -m 0400 /dev/null {host_record}")
+    machine.succeed(f"rm {manual}")
+    for _ in range(2):
+        machine.succeed("systemctl restart looklab-seed-data.service")
+        assert manual_hash == machine.succeed(f"sha256sum {manual}").split()[0]
+        assert "400" == machine.succeed(f"stat -c %a {host_record}").strip()
+        assert body_hash == machine.succeed(f"sha256sum {body}").split()[0]
+
     machine.succeed("install -o looklab -g looklab -m 0600 /dev/null /var/lib/looklab/state-marker")
     secret = machine.succeed("sha256sum /var/lib/looklab/server-secret").split()[0]
     index = machine.succeed("sha256sum /var/lib/looklab/site/data/index.json").split()[0]
@@ -92,6 +105,6 @@ pkgs.testers.runNixOSTest {
     ).strip()
     machine.succeed("test -e /var/lib/looklab/state-marker")
     machine.succeed("curl -fsS http://127.0.0.1:8080/ | grep -qi '<html'")
-    machine.succeed("curl -fsS http://127.0.0.1:8080/data/index.json | grep -q 'looklab-site/1'")
+    machine.succeed("curl -fsS http://127.0.0.1:8080/data/index.json | jq -e '.format == \"looklab-site/1\"'")
   '';
 }

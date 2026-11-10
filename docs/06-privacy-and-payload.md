@@ -95,7 +95,7 @@ Upload envelopes are versioned at the wire boundary. Version 4 carries the send 
      **Residual channels (documented, not closed):**
      - a client can choose *which* valid proof-of-work solutions it sends, leaking a few bits per batch at exponentially more work;
      - **the signature itself**: one signature per send, because every batch and confirmation must carry the same assertion; a site that forges keys can choose its bytes freely (tens to hundreds of bytes per send, depending on algorithm);
-     - **the credential ID chosen at passkey registration**: a forged-key site picks it once (≤ 255 bytes, a one-time leak; it's then fixed by the identical-ID check);
+     - **the credential ID chosen at passkey registration**: a forged-key site picks it once (≤ 255 bytes, enforced at registration, a one-time leak; it's then fixed by the identical-ID check);
      - **human declarations:** firmware and corrected menu options are user-supplied text. Canonical encoding and signatures do not prove what those strings mean; the CLI exposes the complete declaration for human review rather than issuing an unconditional pass.
 - timing.
   4. **When this guarantee holds:** only if the prep module uses no WASM relaxed-SIMD (whose results are implementation-defined across engines) and no NaN reaches stored values. Both are enforced in CI ([09 P1.3](09-roadmap.md)).

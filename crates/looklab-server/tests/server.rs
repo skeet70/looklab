@@ -4589,6 +4589,16 @@ impl SyncedPasskey {
     }
 
     async fn register(&self, app: &Router, display_handle: &str, flags: u8) {
+        let (status, body) = self.register_response(app, display_handle, flags).await;
+        assert_eq!(status, StatusCode::OK, "register finish: {body}");
+    }
+
+    async fn register_response(
+        &self,
+        app: &Router,
+        display_handle: &str,
+        flags: u8,
+    ) -> (StatusCode, Value) {
         let (status, body) = post_json(
             app,
             "/api/passkey/register/start",
@@ -4615,7 +4625,7 @@ impl SyncedPasskey {
         );
         auth_data.extend_from_slice(&self.credential_id);
         auth_data.extend_from_slice(&self.cose_key());
-        let (status, body) = post_json(
+        post_json(
             app,
             "/api/passkey/register/finish",
             &json!({
@@ -4632,8 +4642,7 @@ impl SyncedPasskey {
                 },
             }),
         )
-        .await;
-        assert_eq!(status, StatusCode::OK, "register finish: {body}");
+        .await
     }
 
     fn cose_key(&self) -> Vec<u8> {
@@ -4683,12 +4692,15 @@ fn cbor_text(out: &mut Vec<u8>, text: &str) {
 }
 
 fn cbor_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    let len = u8::try_from(bytes.len()).expect("short CBOR byte string");
+    let len = u16::try_from(bytes.len()).expect("short CBOR byte string");
     if len < 24 {
-        out.push(0x40 | len);
-    } else {
+        out.push(0x40 | len as u8);
+    } else if len < 0x100 {
         out.push(0x58);
-        out.push(len);
+        out.push(len as u8);
+    } else {
+        out.push(0x59);
+        out.extend_from_slice(&len.to_be_bytes());
     }
     out.extend_from_slice(bytes);
 }
@@ -4779,6 +4791,34 @@ async fn a_synced_zero_counter_profile_completes_registration_and_session() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let error: Value = serde_json::from_slice(&body).expect("error response");
     assert_eq!(error["error"], "TOKEN_UNKNOWN");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_credential_id_an_assertion_cannot_carry_is_rejected_at_registration() {
+    let server = TestServer::start().await;
+    let empty = SyncedPasskey::new(b"");
+    let (status, body) = empty.register_response(&server.app, "Jake!", 0x5d).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "MALFORMED_ENVELOPE");
+
+    let longest = SyncedPasskey::new(&[3u8; looklab_upload::webauthn::MAX_CREDENTIAL_ID]);
+    let (status, body) = longest.register_response(&server.app, "Jake!", 0x5d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        longest.assertion(&challenge, 0x1d),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let longer = SyncedPasskey::new(&[4u8; looklab_upload::webauthn::MAX_CREDENTIAL_ID + 1]);
+    let (status, body) = longer.register_response(&server.app, "Jake!", 0x5d).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "MALFORMED_ENVELOPE");
 }
 
 #[tokio::test(flavor = "multi_thread")]

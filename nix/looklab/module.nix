@@ -27,7 +27,7 @@ let
     blob_dir = "${cfg.stateDir}/blobs";
     server_secret_path = "${cfg.stateDir}/server-secret";
     bodies_dir = "${cfg.dataDir}/bodies";
-    manuals_dir = "${cfg.dataDir}/manuals";
+    manuals_dir = cfg.manualsDir;
     snapshot_dir = "${cfg.stateDir}/community";
     inherit (cfg) origin;
     rp_id = cfg.rpId;
@@ -97,7 +97,7 @@ let
     "--data"
     cfg.dataDir
     "--manuals"
-    "${cfg.dataDir}/manuals"
+    cfg.manualsDir
     "--snapshot-dir"
     "${cfg.stateDir}/community"
     "--transforms"
@@ -154,6 +154,12 @@ in
       type = types.str;
       default = "${cfg.stateDir}/data";
       description = "Body, transform and scene tree the worker reads.";
+    };
+
+    manualsDir = mkOption {
+      type = types.str;
+      default = "${cfg.dataDir}/manuals";
+      description = "Documentation-derived camera catalog the server and worker read.";
     };
 
     scenesDir = mkOption {
@@ -343,6 +349,7 @@ in
       [
         "d ${cfg.stateDir} 0700 ${cfg.user} ${cfg.group} -"
         "d ${cfg.dataDir} 0700 ${cfg.user} ${cfg.group} -"
+        "d ${cfg.manualsDir} 0700 ${cfg.user} ${cfg.group} -"
       ]
       ++ optional cfg.litestream.enable "d ${dirOf cfg.litestream.envFile} 0700 root root -";
 
@@ -365,7 +372,7 @@ in
         PrivateTmp = true;
         ProtectHome = true;
         ProtectSystem = "strict";
-        ReadWritePaths = [ cfg.stateDir cfg.dataDir ];
+        ReadWritePaths = [ cfg.stateDir cfg.dataDir cfg.manualsDir ];
       };
       script = ''
         set -eu
@@ -374,20 +381,9 @@ in
           cp -R ${hostPackages.looklab-data}/. ${cfg.dataDir}/
           touch ${cfg.dataDir}/.seeded
         fi
-        if [ -d ${hostPackages.looklab-data}/manuals ]; then
-          staging=${cfg.dataDir}/.manuals.new
-          if [ -e "$staging" ]; then
-            chmod -R u+rwX "$staging"
-            rm -rf "$staging"
-          fi
-          mkdir -p "$staging"
-          cp -R ${hostPackages.looklab-data}/manuals/. "$staging"/
-          chmod -R u+rwX "$staging"
-          if [ -d ${cfg.dataDir}/manuals ]; then
-            chmod -R u+rwX ${cfg.dataDir}/manuals
-            rm -rf ${cfg.dataDir}/manuals
-          fi
-          mv "$staging" ${cfg.dataDir}/manuals
+        if [ -d ${hostPackages.looklab-manuals} ]; then
+          mkdir -p "${cfg.manualsDir}"
+          cp -R --remove-destination "${hostPackages.looklab-manuals}/." "${cfg.manualsDir}/"
         fi
         ${
           optionalString (cfg.scenesDir != null) ''

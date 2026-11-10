@@ -1,0 +1,194 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: hasselblad/x2d-ii-100c
+  make: Hasselblad
+  model: X2D II 100C
+  introduced_year: 2025
+  sources:
+  - id: hasselblad-x2dii-manual
+    kind: owner_manual
+    url: https://cdn.hasselblad.com/manuals/X2D_II_100C_User_Manual/User_Manual/X2D_II_100C_User_Manual_v1.0_en.pdf
+    title: X2D II 100C User Manual
+    edition: v1.0
+    firmware_scope: unspecified
+  - id: hasselblad-x2dii-datasheet
+    kind: owner_manual
+    url: https://cdn.hasselblad.com/f/77891/84af8a3484/x2d_ii_100c_datasheet_multi_202610.pdf
+    title: X2D II 100C Datasheet
+    edition: '2026-10'
+    firmware_scope: unspecified
+  capabilities:
+  - key: raw_capture
+    label: File format (3FR RAW)
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: hasselblad-x2dii-datasheet
+      locator: p. 1, Image and Storage (File Format, Hasselblad 3FR RAW)
+    - source: hasselblad-x2dii-manual
+      locator: p. 53, Quality Settings (image format selected to the option including RAW)
+    - source: hasselblad-x2dii-manual
+      locator: p. 54, Crop Modes (3FR format)
+  - key: jpeg_capture
+    label: File format (JPG)
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: hasselblad-x2dii-datasheet
+      locator: p. 1, Image and Storage (File Format, full size JPG)
+    - source: hasselblad-x2dii-manual
+      locator: p. 41, HDR Function (JPG or HEIF images)
+    - source: hasselblad-x2dii-manual
+      locator: p. 24, Control Screen (HDR icon when capturing JPG or HEIF)
+  - key: heif_capture
+    label: File format (HEIF)
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: hasselblad-x2dii-datasheet
+      locator: p. 1, Image and Storage (File Format, HEIF; Colour Depth, HEIF 10-bit)
+    - source: hasselblad-x2dii-manual
+      locator: p. 41, HDR Function (JPG or HEIF images)
+    - source: hasselblad-x2dii-manual
+      locator: p. 53, Quality Settings (image format selected to the option including JPG or HEIF)
+  - key: raw_jpeg_simultaneous
+    label: Image format
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: hasselblad-x2dii-manual
+      locator: p. 53, Quality Settings (options described only as including RAW or including JPG or HEIF)
+    notes: The manual refers to image-format options that include RAW or include JPG or HEIF but does not enumerate them or state a RAW plus JPG/HEIF combination.
+  - key: raw_bit_depth
+    label: RAW bit depth
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - '14'
+      - '16'
+    citations:
+    - source: hasselblad-x2dii-manual
+      locator: p. 53, Quality Settings > Bit Depth (14 bit or 16 bit)
+    - source: hasselblad-x2dii-datasheet
+      locator: p. 1, Image and Storage (Colour Depth, 3FR RAW 14-bit or 16-bit)
+    notes: Continuous drive mode sets 14 bit and does not allow 16 bit (p. 53). Neither source prints a default outside that mode.
+  - key: raw_compression
+    label: RAW compression
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: hasselblad-x2dii-datasheet
+      locator: p. 1, Image and Storage (File Format, Image Size)
+    notes: The datasheet lists 3FR RAW and an average file size but no compression setting.
+  - key: jpeg_color_spaces
+    label: Color space
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: hasselblad-x2dii-datasheet
+      locator: p. 1, Image and Storage (Colour Management, HNCS HDR)
+    - source: hasselblad-x2dii-manual
+      locator: p. 60, Phocus Mobile 2 and Phocus (HNCS)
+    notes: Neither source documents an sRGB or Adobe RGB setting; the datasheet names HNCS HDR as the colour management.
+  - key: jpeg_quality
+    label: JPG quality
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: hasselblad-x2dii-datasheet
+      locator: p. 1, Image and Storage (File Format, full size JPG)
+    notes: Neither source lists JPG quality levels.
+  - key: in_camera_raw_conversion
+    label: In-camera RAW conversion
+    category: workflow
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: hasselblad-x2dii-manual
+      locator: p. 41, HDR Function (RAW images downloaded to Phocus Mobile 2 or Phocus for HDR editing)
+    - source: hasselblad-x2dii-manual
+      locator: p. 54, Crop Modes (3FR crop mask modified or removed in Phocus)
+    - source: hasselblad-x2dii-manual
+      locator: p. 62, Phocus Software (image saved as a 16-bit 3F file)
+    notes: RAW processing is documented in Phocus; the manual documents no in-camera RAW conversion.
+  - key: native_simulations
+    label: Native simulations
+    category: rendering
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: hasselblad-x2dii-manual
+      locator: p. 60, Phocus Mobile 2 and Phocus (HNCS)
+    - source: hasselblad-x2dii-datasheet
+      locator: p. 1, Image and Storage (Colour Management, HNCS HDR)
+    notes: The manual documents no film-simulation or picture-style control; colour is handled by HNCS.
+  - key: white_balance_presets
+    label: White balance
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: hasselblad-x2dii-manual
+      locator: p. 23, Control Screen (White Balance (WB), Auto WB and preset modes)
+    notes: The manual names Auto WB and refers to preset WB modes but does not list their names; only Auto is named.
+  - key: color_temperature
+    label: Manual white balance
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: Color temperature
+      - label: Tint
+    citations:
+    - source: hasselblad-x2dii-manual
+      locator: p. 23, Control Screen (adjust temperature and tint; Manual WB Mode)
+    - source: hasselblad-x2dii-manual
+      locator: p. 24, Control Screen (picker displays Temp and Tint)
+    notes: Adjusting temperature or tint selects Manual WB Mode and does not change the preset WB values (p. 23). The manual prints no numeric range or step.
+  - key: exposure_compensation
+    label: Exposure compensation
+    category: rendering
+    availability: available
+    domain:
+      type: rational
+      min: '-5'
+      max: '+5'
+      steps:
+      - '1/3'
+      - '1/2'
+      - '1'
+    citations:
+    - source: hasselblad-x2dii-datasheet
+      locator: p. 2, Exposure Control (Exposure Compensation, -5 to 5 EV, step 1, 1/2, or 1/3)
+    - source: hasselblad-x2dii-manual
+      locator: p. 28, Automatic Exposure (rear scroll wheel adjusts exposure compensation)
+    - source: hasselblad-x2dii-manual
+      locator: p. 28, Exposure scale (1, 1/2, and 1/3 step intervals)
+  notes:
+  - Neither source states a firmware version; both sources are scoped `unspecified`.
+  - This record covers the X2D II 100C only. The X2D 100C is a different model and is not covered.
+  - The manual describes image-format options only as including RAW or including JPG or HEIF (p. 53); the datasheet lists 3FR RAW, full size JPG, and HEIF (p. 1).
+  - The manual documents RAW editing and 3FR crop-mask changes in Phocus, not in the camera (pp. 41, 54, 62).
+  - HDR is a JPG/HEIF capture function (p. 41); neither source documents a tone curve or dynamic-range setting.
