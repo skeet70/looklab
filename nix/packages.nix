@@ -162,6 +162,8 @@ in
     looklab-scenes = scenes;
     # Seeded into the state directory on first start.
     looklab-data = src + "/data";
+    # Copied into the configured manuals directory on every seed-service start.
+    looklab-manuals = src + "/data/manuals";
     default = server;
   };
 }
