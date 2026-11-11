@@ -202,7 +202,10 @@ fn BodyDetailView(body: BodyPage, manual: Option<ManualPage>) -> impl IntoView {
         {if ready {
             view! { <a href=crate::base::site_url(&format!("/match?camera={}",body.id))>"Find settings and downloads →"</a> }.into_any()
         } else {
-            view! { <p class="muted">"Settings matching becomes available when this camera's input transform is published."</p> }.into_any()
+            view! {
+                <p class="muted">"Settings matching becomes available when this camera's input transform is published."</p>
+                <a href=crate::base::site_url("/match?apply=card")>"Get a target card for custom firmware →"</a>
+            }.into_any()
         }}
         {body.native_looks.iter().flat_map(|card| card.blockers.clone()).next().map(|blocker| view! {
             <p class="muted">{format!("Stock-settings matching needs a usable camera realization. {blocker}")}</p>

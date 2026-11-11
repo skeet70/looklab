@@ -411,7 +411,6 @@ in
         Group = cfg.group;
         ExecStartPre = "${cfg.server.package}/bin/looklab-server init --config ${configFile}";
         ExecStart = "${cfg.server.package}/bin/looklab-server --config ${configFile}";
-        Environment = [ "LOOKLAB_MANUALS_DIR=${cfg.manualsDir}" ];
         Restart = "on-failure";
         RestartSec = 2;
         KillSignal = "SIGTERM";

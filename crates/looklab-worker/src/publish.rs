@@ -1515,6 +1515,7 @@ async fn record_evidence_requests(pool: &SqlitePool, reports: &[StoredReport]) -
     }
     Ok(())
 }
+
 async fn load_manuals(
     path: &Path,
     bodies: &[BodyPage],

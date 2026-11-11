@@ -56,8 +56,8 @@ pub async fn manual_summary(
 }
 pub use verify::{RequestDomain, request_digest};
 
-pub mod manual_confirm;
-pub mod manuals;
+mod manual_confirm;
+mod manuals;
 mod model_events;
 pub mod model_store;
 

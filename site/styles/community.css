@@ -72,7 +72,6 @@ main:has(#submit-proposal) textarea { max-width: 100%; }
 .manual-moderation-fields > .manual-moderation-wide { grid-column: 1 / -1; }
 .manual-moderation-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem 1rem; margin-block-start: 1.25rem; }
 .manual-moderation-actions > button { margin: 0; }
-.manual-moderation-actions > p { margin: 0; flex: 1 1 18rem; }
 .manual-check-detail { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); gap: .35rem 1.25rem; }
 .manual-check-detail dt { font-weight: 600; }
 .manual-check-detail dd { margin: 0; min-width: 0; }

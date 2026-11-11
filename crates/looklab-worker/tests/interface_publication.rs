@@ -118,7 +118,7 @@ impl Fixture {
             db: self.db.clone(),
             blobs: self.blobs.clone(),
             data: self.data.clone(),
-            manuals: self.data.join("manuals/catalog.yaml"),
+            manuals: self.data.join("manuals"),
             snapshot_dir: self.snapshot_dir.clone(),
             transforms: self.transforms.clone(),
             out: out.to_owned(),

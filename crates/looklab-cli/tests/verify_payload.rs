@@ -1067,6 +1067,7 @@ impl HarBuilder {
         self.entries.push(entry("GET", url, Some(body)));
         self
     }
+
     fn header(mut self, name: &str, value: &str) -> Self {
         let Some(last) = self.entries.last_mut() else {
             panic!("a header needs a request");

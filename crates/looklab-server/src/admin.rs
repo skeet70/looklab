@@ -1288,7 +1288,7 @@ pub async fn revoke_root(
             .map(|(id,)| LookVersionId::try_from(id).map_err(|_| AdminError::Corrupt))
             .collect::<Result<Vec<_>, _>>()?;
         let lut_dependents = affected_lut_dependents_conn(&mut conn, root_admission).await?;
-        mark_lut_dependents_conn(&mut conn, now).await?;
+        mark_lut_dependents_conn(&mut conn, now, None).await?;
         enqueue_lut_rebase(&mut conn, now).await?;
         let payload = json!({
             "event": "root_revoked",
@@ -2470,7 +2470,11 @@ pub async fn revert(
                 .await?;
         }
 
-        let lut_dependents = mark_lut_dependents_conn(&mut conn, now).await?;
+        let republished = VersionRef {
+            look: look.clone(),
+            version: version.get(),
+        };
+        let lut_dependents = mark_lut_dependents_conn(&mut conn, now, Some(&republished)).await?;
         enqueue_lut_rebase(&mut conn, now).await?;
 
         let payload = json!({
@@ -2922,7 +2926,7 @@ pub async fn write_version_manifest_conn(
         .execute(&mut *conn)
         .await?;
     }
-    mark_lut_dependents_conn(&mut *conn, now).await?;
+    mark_lut_dependents_conn(&mut *conn, now, None).await?;
     enqueue_lut_rebase(&mut *conn, now).await?;
     let manifest_sha256 = manifest_hash(look, version.get(), &artifacts)?;
     let payload = json!({
@@ -3425,12 +3429,14 @@ async fn enqueue_lut_rebase(conn: &mut SqliteConnection, now: i64) -> Result<(),
 /// Marks the latest published version of each affected LUT Look.
 pub async fn mark_lut_dependents(db: &SqlitePool, now: i64) -> Result<Vec<VersionRef>, AdminError> {
     let mut conn = db.acquire().await?;
-    mark_lut_dependents_conn(&mut conn, now).await
+    mark_lut_dependents_conn(&mut conn, now, None).await
 }
 
+/// `republished` names a base version a revert just wrote; it counts as that Look's newest layered version whatever its status.
 async fn mark_lut_dependents_conn(
     conn: &mut SqliteConnection,
     now: i64,
+    republished: Option<&VersionRef>,
 ) -> Result<Vec<VersionRef>, AdminError> {
     let pins = pins_conn(&mut *conn).await?;
     let invalid: HashSet<(String, u32)> = invalidated_versions_conn(&mut *conn)
@@ -3473,6 +3479,12 @@ async fn mark_lut_dependents_conn(
             .entry(look)
             .and_modify(|newest| *newest = (*newest).max(version))
             .or_insert(version);
+    }
+    if let Some(base) = republished {
+        let newest = layered_latest
+            .entry(base.look.as_str().to_owned())
+            .or_insert(base.version);
+        *newest = (*newest).max(base.version);
     }
     let renderings: Vec<(String, String)> =
         sqlx::query_as("SELECT maker, rendering FROM lut_native_renderings")

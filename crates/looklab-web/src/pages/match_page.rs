@@ -1613,7 +1613,7 @@ fn TargetCardDownload(
         let slug = check_slug.clone();
         let version = check_version.clone();
         leptos::task::spawn_local_scoped_with_cancellation(async move {
-            let ready = match data::current_index().await {
+            let ready = match data::fetch_index().await {
                 Ok(index) => index
                     .looks
                     .iter()

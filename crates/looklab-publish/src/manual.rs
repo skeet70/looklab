@@ -104,18 +104,6 @@ impl ManualPage {
             documented_controls: self.capabilities.len(),
             confirmed_controls: self.confirmation.confirmed,
             contradicted_controls: self.confirmation.contradicted,
-            recorded_checks: self
-                .confirmation
-                .controls
-                .iter()
-                .map(|control| control.intake.recorded)
-                .sum(),
-            unlinked_checks: self
-                .confirmation
-                .controls
-                .iter()
-                .map(|control| control.intake.unlinked)
-                .sum(),
             preparation: self.preparation.clone(),
             artifact,
         }
@@ -140,12 +128,6 @@ pub struct ManualSummary {
     pub documented_controls: usize,
     pub confirmed_controls: u32,
     pub contradicted_controls: u32,
-    /// Total checks recorded against current control definitions.
-    #[serde(default)]
-    pub recorded_checks: u32,
-    /// Subset of `recorded_checks` from profiles with no serial-linked photo.
-    #[serde(default)]
-    pub unlinked_checks: u32,
     pub preparation: PreparationPage,
     pub artifact: ManualArtifact,
 }

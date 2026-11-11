@@ -175,6 +175,7 @@ impl MonochromeTally {
         }
     }
 }
+
 impl BatchSet {
     fn from_groups(groups: Vec<ContributionGroup>) -> Self {
         let next = groups.iter().map(|group| group.id.0).max().unwrap_or(0);

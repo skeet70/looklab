@@ -116,13 +116,8 @@ pub async fn index() -> Result<SiteIndex, String> {
     fetch_index().await
 }
 
-/// Fetches the index even when a cached copy exists.
-pub async fn current_index() -> Result<SiteIndex, String> {
-    fetch_index().await
-}
-
 /// Verifies the index against the deployment's advertised root and replaces the cached copy.
-async fn fetch_index() -> Result<SiteIndex, String> {
+pub async fn fetch_index() -> Result<SiteIndex, String> {
     let bytes = get(&publication_url("/data/index.json")).await?;
     let expected = expected_site_root().await?;
     let actual = ArtifactHash::of(&bytes);
@@ -556,7 +551,7 @@ pub enum CardUse {
 
 pub async fn card(slug: &str, version: &str, purpose: CardUse) -> Result<Vec<u8>, String> {
     let index = match purpose {
-        CardUse::Download => current_index().await?,
+        CardUse::Download => fetch_index().await?,
         CardUse::VerifyRenderTag => index().await?,
     };
     let summary = version_summary(&index, slug, version)?;
@@ -608,7 +603,7 @@ pub async fn export_target(
     version: &looklab_model::file::LookVersion,
     expected_manifest: Option<&ArtifactHash>,
 ) -> Result<ExportTarget, String> {
-    let index = current_index().await?;
+    let index = fetch_index().await?;
     let summary = version_summary(&index, slug.as_str(), version.as_str())?;
     if !summary.matchable {
         return Err("This target version is not eligible for a software export.".to_owned());
@@ -721,7 +716,7 @@ async fn load_version(
 ) -> Result<LoadedVersion, String> {
     let index = match purpose {
         VersionPurpose::Browse => index().await?,
-        VersionPurpose::Match => current_index().await?,
+        VersionPurpose::Match => fetch_index().await?,
     };
     let summary = version_summary(&index, slug, version)?;
     if matches!(purpose, VersionPurpose::Match) && !summary.matchable {
@@ -1780,10 +1775,10 @@ impl ApiRejection {
                 "{path}: this profile cannot submit new contributions. Existing uploads can still be withdrawn from the status link."
             ),
             Some(ApiErrorCode::RateLimited) => {
-                format!("{path}: too many proposals. Wait a moment and try again.")
+                format!("{path}: too many requests. Wait a moment and try again.")
             }
             Some(ApiErrorCode::Forbidden) => {
-                format!("{path}: this profile cannot submit that proposal.")
+                format!("{path}: this profile cannot do that.")
             }
             Some(ApiErrorCode::SchemaInvalid) => {
                 format!("{path}: the server rejected the payload schema.")

@@ -194,8 +194,6 @@ mod tests {
             documented_controls: 7,
             confirmed_controls: 3,
             contradicted_controls: 1,
-            recorded_checks: 0,
-            unlinked_checks: 0,
             preparation: PreparationPage::default(),
             artifact: ManualArtifact {
                 path,
