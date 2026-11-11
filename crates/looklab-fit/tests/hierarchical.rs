@@ -231,9 +231,9 @@ fn one_body_update_refits_exactly_its_dependent_looks() {
         ..hier_options()
     };
     let fit = fit_hierarchical(&input, &options).expect("hierarchical fit");
-    let first = body(&input, "body-0").id.clone();
-    let last = body(&input, "body-2").id.clone();
-    let middle = body(&input, "body-1").id.clone();
+    let first = body(&input, "test/body-0").id.clone();
+    let last = body(&input, "test/body-2").id.clone();
+    let middle = body(&input, "test/body-1").id.clone();
 
     assert_eq!(fit.refit_cascade(&[first]), vec![target(0)]);
     assert_eq!(fit.refit_cascade(&[last]), vec![target(1)]);
@@ -795,7 +795,7 @@ fn persisted_gauge_body_is_kept() {
         ..HierOptions::default()
     };
     let fit = fit_hierarchical(&input, &options).expect("hierarchical fit");
-    assert_eq!(fit.components[0].designated.as_str(), "body-0");
+    assert_eq!(fit.components[0].designated.as_str(), "test/body-0");
 }
 
 #[test]

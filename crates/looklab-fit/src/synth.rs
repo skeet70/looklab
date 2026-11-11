@@ -846,7 +846,7 @@ pub fn multi_body(config: &MultiBodyConfig) -> MultiBodyDataset {
 
     let mut bodies = Vec::with_capacity(body_count);
     for body_index in 0..body_count {
-        let id = BodyId::new(format!("body-{body_index}")).expect("generated id is non-empty");
+        let id = BodyId::new(format!("test/body-{body_index}")).expect("generated id is non-empty");
         let schema_id =
             looklab_schema::BodyId::new(id.as_str()).expect("generated schema id is valid");
         let firmware_ids: Vec<FirmwareId> = (0..config.firmware.max(1))
