@@ -918,7 +918,7 @@ fn single_body_bootstrap_draws_images() {
     });
     let result = looklab_fit::fit(&data.images, &fit_options()).expect("fit");
     let group = looklab_fit::BodyGroup {
-        body: BodyId::new("one").expect("id"),
+        body: BodyId::new("test/one").expect("id"),
         images: (0..data.images.len()).collect(),
     };
     let published = published_uncertainty(
@@ -954,8 +954,8 @@ fn control_body(
     dataset: &looklab_fit::synth::ControlledDataset,
     model: Option<looklab_fit::ControlResponseModel>,
 ) -> BodyData {
-    let id = BodyId::new("controlled").expect("body id");
-    let body_id = looklab_body::BodyId::new("controlled").expect("body id");
+    let id = BodyId::new("test/controlled").expect("body id");
+    let body_id = looklab_body::BodyId::new("test/controlled").expect("body id");
     let a0 = dataset.images[0].transform;
     let prior = looklab_body::BodyPrior {
         source: looklab_body::A0Source::Dng,
