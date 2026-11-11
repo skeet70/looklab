@@ -179,3 +179,92 @@ pub fn version_scope(
     };
     (scope, blockers)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use looklab_model::file::{LookKind, LookVersion, Slug, WbPolicy};
+    use looklab_publish::{
+        ArtifactHash, ArtifactName, FamilyHeadPage, LookStatus, LookSummary, LookVisibility,
+        SitePath, VersionSummary,
+    };
+    use looklab_schema::{FamilyTargetId, LookId, SafetyCheck, TargetVersion};
+
+    fn version_summary() -> VersionSummary {
+        VersionSummary {
+            support: looklab_publish::PublishedSupport::Unstated,
+            version: LookVersion::new("1.0.0").expect("version"),
+            status: LookStatus::Published,
+            matchable: true,
+            card_eligible: false,
+            approximated: false,
+            applicability: Applicability::Current,
+            eligibility_status: None,
+            card: None,
+            manifest: SitePath::new("data/looks/provia/1.0.0/manifest.json").expect("path"),
+            manifest_sha256: ArtifactHash::of(b""),
+            manifest_bytes: 0,
+            artifact: ArtifactName::new("look.looklab").expect("artifact"),
+            sha256: ArtifactHash::of(b""),
+            bytes: 0,
+        }
+    }
+
+    fn summary(report: Option<looklab_schema::ModelReportId>) -> LookSummary {
+        let target = FamilyTargetId {
+            family: LookId::new("provia").expect("family"),
+            version: TargetVersion::new(1).expect("target version"),
+        };
+        LookSummary {
+            slug: Slug::new("provia").expect("slug"),
+            name: "Provia".to_owned(),
+            kind: LookKind::NativeFamily,
+            wb_policy: WbPolicy::Adaptive,
+            visibility: LookVisibility::Public,
+            head: Some(FamilyHeadPage {
+                target,
+                version: LookVersion::new("1.0.0").expect("version"),
+                source_limited: report.is_none(),
+                safety: looklab_schema::CandidateSafety {
+                    numerical: SafetyCheck::Passed,
+                    release_gates: SafetyCheck::Passed,
+                },
+                report,
+                applicability: Applicability::Current,
+            }),
+            selected: Some(looklab_publish::SelectedTargetSummary {
+                version: LookVersion::new("1.0.0").expect("version"),
+                eligibility: None,
+                applicability: Applicability::Current,
+            }),
+            versions: vec![version_summary()],
+        }
+    }
+
+    #[test]
+    fn a_source_limited_selected_target_is_experimental() {
+        let look = summary(None);
+        let (scope, blockers) = catalog_scope(&look);
+        assert_eq!(scope, SelectionScope::Experimental);
+        assert_eq!(
+            blockers.len(),
+            1,
+            "the missing assessment is the only blocker"
+        );
+        assert_eq!(browsable_scope(&look).0, SelectionScope::Experimental);
+        assert_eq!(
+            crate::data::selection_scope_label(scope),
+            crate::data::selection_scope_label(SelectionScope::Experimental)
+        );
+        assert_ne!(
+            crate::data::selection_scope_label(scope),
+            crate::data::selection_scope_label(SelectionScope::Qualified)
+        );
+    }
+
+    #[test]
+    fn a_selected_target_with_a_report_stays_qualified() {
+        let look = summary(Some(looklab_schema::ModelReportId::from_digest([3; 32])));
+        assert_eq!(catalog_scope(&look).0, SelectionScope::Qualified);
+    }
+}

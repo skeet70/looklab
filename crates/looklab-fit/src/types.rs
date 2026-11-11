@@ -16,6 +16,11 @@ pub enum FitError {
     NoSamples,
     #[error("held-out model error has no evidence")]
     NoModelErrorEvidence,
+    #[error(
+        "probe {}: non-finite covariance, sigma, bias or pre-clip value",
+        .probe.as_str()
+    )]
+    NonFiniteProbeEstimate { probe: ProbeId },
     #[error("image {image}: sample_trust has {found} entries, expected {expected}")]
     SampleTrustLength {
         image: usize,
@@ -38,6 +43,8 @@ pub enum FitError {
     Realization(#[from] looklab_model::realization::RealizationError),
     #[error("hierarchical fit: {0}")]
     Hierarchy(String),
+    #[error("resume state does not match the current hierarchy layout")]
+    ResumeMismatch,
     #[error("row context: {0}")]
     RowContext(String),
     #[error("firmware identity: {0}")]
@@ -343,6 +350,9 @@ pub struct ProbeEstimate {
     /// Independent held-out model-error evidence exists at this encoding and cell.
     pub supported_evidence: bool,
     pub supported: bool,
+    /// Covariance is a finite fallback (singular chroma path, non-finite derivative or
+    /// clip chain); support stays off through later re-marking.
+    pub support_withheld: bool,
     /// Images with non-negligible weight in the probe's region.
     pub clusters: usize,
 }

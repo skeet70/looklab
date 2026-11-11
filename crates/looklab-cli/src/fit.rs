@@ -8,7 +8,10 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use looklab_color::{Rgb, RgbSpace, Xyz};
 use looklab_export::{DeltaStats, checked_appearance};
-use looklab_fit::{ExposureModeId, FitImage, FitOptions, FitResult, OutlierReason, Verdict, fit};
+use looklab_fit::{
+    ExposureModeId, FitImage, FitOptions, FitResult, OutlierReason, StationarityCertificate,
+    Verdict, fit,
+};
 use looklab_model::file::{BodyProvenance, Provenance, RootProvenance};
 use looklab_model::solve::ucs_of_xyz;
 use looklab_model::{
@@ -97,6 +100,21 @@ pub fn run(args: &FitArgs) -> Result<()> {
         ..FitOptions::default()
     };
     let result = fit(&train_images, &options).context("fitting the Look")?;
+    if !result.diagnostics.converged {
+        let termination = result
+            .diagnostics
+            .stationarity
+            .map(|report| match report.certificate {
+                StationarityCertificate::CertifiedStationary { .. } => "stationary",
+                StationarityCertificate::CertifiedNonstationary { .. } => "nonstationary",
+                StationarityCertificate::Unresolved { termination } => termination.label(),
+            })
+            .unwrap_or("none");
+        bail!(
+            "fit did not converge after {} evaluations (certificate: {termination}); no look document written",
+            result.diagnostics.evaluations
+        );
+    }
 
     let document = build_document(args, &transform, &result, train)?;
     let bytes = document.encode().context("encoding the look file")?;
@@ -191,7 +209,11 @@ fn build_document(
         sigma.push(probe.sigma_de);
         sigma_post.push(probe.post_sigma_de);
         reliable.push(if probe.pre_clip_reliable { 1.0 } else { 0.0 });
-        support.push(if probe.supported { 1.0 } else { 0.0 });
+        support.push(if probe.supported && probe.supported_evidence {
+            1.0
+        } else {
+            0.0
+        });
         density.push(probe.density);
     }
     let uncertainty = UncertaintyData {

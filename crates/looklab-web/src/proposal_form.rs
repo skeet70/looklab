@@ -634,6 +634,7 @@ fn admissible_base_version(version: &looklab_publish::VersionSummary) -> bool {
             &version.applicability,
             looklab_schema::Applicability::Invalidated { .. }
         )
+        && version.support != looklab_publish::PublishedSupport::EarlyEstimate
         && (version.matchable || version.artifact.as_str() == SOURCE_LUT_ARTIFACT)
 }
 
@@ -810,6 +811,7 @@ epochs:
             applicability: looklab_schema::Applicability,
         ) -> VersionSummary {
             VersionSummary {
+                support: looklab_publish::PublishedSupport::Unstated,
                 version: LookVersion::new("1.0.0").expect("version"),
                 status,
                 matchable,

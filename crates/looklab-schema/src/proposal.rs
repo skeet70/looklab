@@ -440,12 +440,15 @@ pub enum LutBase {
 pub enum LutRenderer {
     #[serde(rename = "x_raw_studio")]
     XRawStudio,
+    /// The donor named no rendering engine.
+    Unspecified,
 }
 
 impl LutRenderer {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::XRawStudio => "x_raw_studio",
+            Self::Unspecified => "unspecified",
         }
     }
 }

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Frozen diagonal-fallback A/B: one shared linearization, one trust-region solve per arm, one
-//! objective trial of each arm's production-selected winner.
+//! Frozen diagonal-fallback A/B: one shared linearization, one trust-region solve per arm, the
+//! objective trials of each arm's applied step.
 
 use super::*;
 use crate::TrustRadius;
@@ -153,6 +153,7 @@ pub struct FallbackArmReport {
     pub inner_products: usize,
     pub post_products: usize,
     pub total_products: usize,
+    pub objective_passes: usize,
     pub sample_evaluations: u64,
     pub trace: TrustRegionTrace,
 }
@@ -184,6 +185,7 @@ impl FallbackArmReport {
             inner_products: 0,
             post_products: 0,
             total_products: 0,
+            objective_passes: 0,
             sample_evaluations: 0,
             trace: TrustRegionTrace::default(),
         }
@@ -1142,27 +1144,11 @@ fn evaluate_arm(
         radius_feasible: box_radius_feasible,
     };
     let box_positive = box_prediction.filter(|value| *value > 0.0);
-    let box_wins = ordinary_prediction
+    let box_ranked_first = ordinary_prediction
         .zip(box_positive)
         .is_some_and(|(ordinary, boxed)| boxed > ordinary);
-    report.winner = if box_wins {
-        FixedLinearizationWinner::Box
-    } else {
-        match report.ordinary {
-            FixedLinearizationOrdinary::TrustRegion => FixedLinearizationWinner::TrustRegion,
-            FixedLinearizationOrdinary::Cauchy => FixedLinearizationWinner::Cauchy,
-            FixedLinearizationOrdinary::None => FixedLinearizationWinner::None,
-        }
-    };
-    let (winner_candidate, winner_prediction, winner_params) = match report.winner {
-        FixedLinearizationWinner::TrustRegion => (report.tr, tr_positive, Some(&tr_params)),
-        FixedLinearizationWinner::Cauchy => (report.cauchy, cauchy_positive, cauchy_trial.as_ref()),
-        FixedLinearizationWinner::Box => (report.box_candidate, box_positive, Some(&box_params)),
-        FixedLinearizationWinner::None => (FixedLinearizationCandidate::default(), None, None),
-    };
-    report.winner_candidate = winner_candidate;
-    if let (Some(prediction), Some(trial_params)) = (winner_prediction, winner_params) {
-        let stage = &STAGES[4];
+    let stage = &STAGES[4];
+    let mut evaluate = |trial_params: &Params, prediction: f64| -> FixedLinearizationTrial {
         let candidate = problem.pass(
             trial_params,
             stage.active,
@@ -1174,14 +1160,33 @@ fn evaluate_arm(
         );
         let trial_cost =
             candidate.cost + total_cost(problem, trial_params, blocks, penalties, lambdas, options);
-        report.sample_evaluations = problem.samples.len() as u64;
-        report.trial = Some(trial_result(
-            cost,
-            trial_cost,
-            candidate.infeasible,
-            prediction,
-        ));
+        report.objective_passes += 1;
+        report.sample_evaluations += problem.samples.len() as u64;
+        trial_result(cost, trial_cost, candidate.infeasible, prediction)
+    };
+    let (ordinary_candidate, ordinary_params) = match report.ordinary {
+        FixedLinearizationOrdinary::TrustRegion => (report.tr, Some(&tr_params)),
+        FixedLinearizationOrdinary::Cauchy => (report.cauchy, cauchy_trial.as_ref()),
+        FixedLinearizationOrdinary::None => (FixedLinearizationCandidate::default(), None),
+    };
+    let ordinary_trial = match (ordinary_prediction, ordinary_params) {
+        (Some(prediction), Some(trial_params)) => Some(evaluate(trial_params, prediction)),
+        _ => None,
+    };
+    let mut winner = report.ordinary.winner();
+    let mut winner_candidate = ordinary_candidate;
+    let mut trial = ordinary_trial;
+    if box_ranked_first && let Some(prediction) = box_positive {
+        let box_trial = evaluate(&box_params, prediction);
+        if box_trial.decrease > trial.map_or(f64::NEG_INFINITY, |trial| trial.decrease) {
+            winner = FixedLinearizationWinner::Box;
+            winner_candidate = report.box_candidate;
+            trial = Some(box_trial);
+        }
     }
+    report.winner = winner;
+    report.winner_candidate = winner_candidate;
+    report.trial = trial;
     report.status = FallbackArmStatus::Compared;
     report.post_products = post_products;
     report.trace = trace;
@@ -1455,8 +1460,7 @@ pub fn diagnose_fallback_ab(
     let candidate_exhausted = arm_exhausted(candidate.inner_products, candidate.work_limit);
     report.shared_allowance_binding = limits.binding || baseline_exhausted || candidate_exhausted;
     report.operations.linearization_passes = 1;
-    report.operations.objective_passes =
-        usize::from(baseline.trial.is_some()) + usize::from(candidate.trial.is_some());
+    report.operations.objective_passes = baseline.objective_passes + candidate.objective_passes;
     report.operations.sample_evaluations =
         report.samples as u64 + baseline.sample_evaluations + candidate.sample_evaluations;
     report.operations.inner_products = baseline.inner_products + candidate.inner_products;

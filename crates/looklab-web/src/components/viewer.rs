@@ -438,6 +438,8 @@ pub struct LookCardItem {
     pub status: LookStatus,
     pub scope: looklab_publish::SelectionScope,
     pub blockers: Vec<String>,
+    /// The missing evidence an active request names, when one exists.
+    pub evidence: Option<String>,
     pub lut: Option<Arc<Vec<u8>>>,
 }
 
@@ -531,6 +533,9 @@ pub fn LookCard(
                 <span>{character}</span>
                 <span class="muted">"Simulated"</span>
             </button>
+            {(item.scope == looklab_publish::SelectionScope::Experimental).then(|| view! {
+                <crate::pages::ExperimentalEvidence detail=item.evidence.clone()/>
+            })}
             {move || error.get().map(|message| view! { <p role="alert">{message}</p> })}
         </div>
     }

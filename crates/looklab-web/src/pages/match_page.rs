@@ -474,7 +474,7 @@ pub fn MatchPage() -> impl IntoView {
                     Some(ui::LookCardItem {
                         slug: look.slug.clone(), version: version.version.clone(), name: look.name.clone(),
                         origin: ui::LookOrigin::BuiltIn { cameras: index.bodies.iter().filter(|body| body.looks.contains(&look.slug)).map(|body| format!("{} {}", body.make, body.model)).collect() },
-                        character: String::new(), status: version.status, scope, blockers, lut: None,
+                        character: String::new(), status: version.status, scope, blockers, evidence: None, lut: None,
                     })
                 }).collect::<Vec<_>>();
                 let items = StoredValue::new(items);
@@ -637,7 +637,6 @@ pub fn MatchPage() -> impl IntoView {
                 <strong>"No recipe found for these choices."</strong>
                 <p>{message}</p>
                 <ul>{blockers.get().into_iter().map(|blocker| view! { <li>{blocker}</li> }).collect_view()}</ul>
-                <p>"Custom firmware can still load this look's target card; it does not use a camera realization."</p>
                 {selected.get().zip(target_version.get()).and_then(|(slug, version)| {
                     looklab_model::file::LookVersion::new(version).ok().map(|version| view! {
                         <TargetCardDownload slug version/>
@@ -706,7 +705,10 @@ fn TargetOutput(
             }
             if !(match application {
                 Application::Card => version.card_eligible,
-                Application::Software => version.matchable,
+                Application::Software => {
+                    version.matchable
+                        && version.support != looklab_publish::PublishedSupport::EarlyEstimate
+                }
                 Application::Camera => false,
             }) {
                 return None;
@@ -728,6 +730,7 @@ fn TargetOutput(
                 status: version.status,
                 scope,
                 blockers,
+                evidence: None,
                 lut: None,
             })
         })
@@ -800,6 +803,7 @@ fn MatchResult(
     let body_id = reply.body.clone();
     let body = RwSignal::new(None::<looklab_publish::BodyPage>);
     let heading = RwSignal::new("Your camera recipe".to_owned());
+    let evidence = RwSignal::new(None::<String>);
     let full_preview_error = RwSignal::new(None::<String>);
     let full_scene = RwSignal::new(None::<Arc<looklab_publish::PreparedScene>>);
     let camera_id = body_id.clone();
@@ -817,6 +821,12 @@ fn MatchResult(
         leptos::task::spawn_local_scoped_with_cancellation(async move {
             let result = async {
                 let index = data::index().await?;
+                let wanted = data::wanted_optional().await;
+                evidence.set(
+                    wanted
+                        .as_ref()
+                        .and_then(|wanted| data::missing_captures(wanted, &index, &slug)),
+                );
                 let look_name = index
                     .looks
                     .iter()
@@ -921,6 +931,9 @@ fn MatchResult(
         <section class="match-result">
             <h2>{move || heading.get()}</h2>
             <p class="muted">{data::selection_scope_label(scope)}</p>
+            {move || (scope == looklab_publish::SelectionScope::Experimental).then(|| view! {
+                <crate::pages::ExperimentalEvidence detail=evidence.get()/>
+            })}
             <p class="muted">{format!("Scoring metric: {}.", reply.card.metric.identity())}</p>
             {excluded.map(|note| view! { <p class="muted">{note}</p> })}
             {blockers.into_iter().map(|blocker| view! { <p class="notice">{blocker}</p> }).collect_view()}
@@ -1046,6 +1059,13 @@ fn recipe_text(
     }
     text.push_str(joint_uncertainty_text(card.joint_uncertainty));
     text.push('\n');
+    if let Some(images) = card.experimental {
+        text.push_str(&format!(
+            "Support: experimental estimate resting on {} {}; no region has an independent held-out check.\n",
+            images.get(),
+            if images.get() == 1 { "image" } else { "images" }
+        ));
+    }
     for entry in &card.entries {
         text.push_str(&format!(
             "{}: {}\n",
@@ -1071,7 +1091,9 @@ pub fn Card(
                 card.median_delta_e + band,
             ],
             card.p95_delta_e.max(card.median_delta_e),
-            if card.confidence == looklab_wasm::dto::ConfidenceDto::Low {
+            if card.confidence == looklab_wasm::dto::ConfidenceDto::Low
+                || card.experimental.is_some()
+            {
                 ui::EstimateConfidence::EarlyEstimate
             } else {
                 ui::EstimateConfidence::Established
@@ -1136,6 +1158,16 @@ pub fn Card(
                 }}</p>
                 <h3>"Take this recipe shooting"</h3>
                 {estimate.map(|estimate| view! { <ui::Closeness estimate/> })}
+                {card.experimental.map(|images| view! {
+                    <p class="notice" role="note">
+                        {format!(
+                            "This estimate rests on {} {} with no independently checked region. ",
+                            images.get(),
+                            if images.get() == 1 { "image" } else { "images" }
+                        )}
+                        <a href=crate::base::site_url("/contribute/wanted")>"Help with a few more shots →"</a>
+                    </p>
+                })}
             </header>
             <dl class="recipe-settings">
                 <dt>"Film simulation"</dt>
@@ -1607,6 +1639,7 @@ fn TargetCardDownload(
     let message = RwSignal::new(None::<String>);
     let available = RwSignal::new(None::<bool>);
     let scope = RwSignal::new(None::<(looklab_publish::SelectionScope, Vec<String>)>);
+    let approximated = RwSignal::new(false);
     let check_slug = slug.clone();
     let check_version = version.clone();
     Effect::new(move |_| {
@@ -1619,17 +1652,16 @@ fn TargetCardDownload(
                     .iter()
                     .find(|look| look.slug == slug)
                     .is_some_and(|look| {
-                        let eligible = look.versions.iter().any(|entry| {
-                            entry.version == version
-                                && entry.card_eligible
-                                && entry.permits_new_outputs()
-                        });
-                        if eligible {
-                            scope.set(Some(crate::selection::catalog_version_scope(
-                                look, &version,
-                            )));
-                        }
-                        eligible
+                        let Some(entry) =
+                            look.versions.iter().find(|entry| entry.version == version)
+                        else {
+                            return false;
+                        };
+                        approximated.set(entry.approximated);
+                        scope.set(Some(crate::selection::catalog_version_scope(
+                            look, &version,
+                        )));
+                        entry.card_eligible && entry.permits_new_outputs()
                     }),
                 Err(_) => false,
             };
@@ -1656,11 +1688,20 @@ fn TargetCardDownload(
             {blockers.into_iter().map(|blocker| view! { <p class="notice">{blocker}</p> }).collect_view()}
         })}
         {move || (available.get() == Some(true)).then(|| view! {
+            <p>"Custom firmware can load this look's target card; it does not use a camera realization."</p>
             <button on:click=move |_| download.run(())>"Download the look's target card (.LLK)"</button>
             <p class="muted">"Verified against the target version manifest. This download does not use a camera realization, control-response model or matching result."</p>
         })}
         {move || (available.get() == Some(false)).then(|| view! {
-            <p class="muted">"This look version has no publishable target card."</p>
+            <p class="muted">{if approximated.get() {
+                "No card is offered for this target version: its fitted coefficients approximate a declared base, so it is an experimental approximation rather than the base itself."
+            } else {
+                match scope.get() {
+                    Some((looklab_publish::SelectionScope::Experimental, _)) => "No card is offered for this target version: it is an experimental early estimate with no independently checked region yet. More independent photos would make a card available.",
+                    _ => "This look version has no publishable target card.",
+                }
+            }}</p>
+            <a href=crate::base::site_url("/contribute/wanted")>"Help with a few more shots →"</a>
         })}
         {move || message.get().map(|message| view! { <p role="alert">{message}</p> })}
     }

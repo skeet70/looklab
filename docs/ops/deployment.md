@@ -214,6 +214,22 @@ sudo -u looklab looklab admin grant \
 
 `looklab-server bootstrap-admin --config /etc/looklab/looklab.toml (--credential <id> | --display-handle <name>)` is the equivalent path inside the server binary; `--display-handle` is accepted when exactly one active credential carries it and fails on an ambiguous handle. A public handle registered by someone else before bootstrap can be selected by mistake, so prefer `--subject`/`--credential` when more than one person can reach the instance. The grant never goes through an unauthenticated HTTP route.
 
+**Admit a community LUT.** A donated `.cube` becomes an approved `lut_defined` Look through the same audited CLI actor, without a browser session or passkey. The command writes the proposal, its cube bytes, the approval decision, the `moderation_decision` audit row and the `lut_import` job in one transaction; the worker publishes the Look version.
+
+The manifest and its cubes ship in the release's `data/luts` directory, and an already-seeded host does not refresh `/var/lib/looklab/data`, so point `--manifest` at that directory in the release checkout or in the `looklab-data` store path:
+
+```sh
+sudo -u looklab looklab admin import-lut \
+  --db /var/lib/looklab/looklab.sqlite3 \
+  --blobs /var/lib/looklab/blobs \
+  --manifest /path/to/data/luts/manifest.toml \
+  --id leica-classic-gold-200
+```
+
+`--reason` overrides the manifest entry's admission reason. Without `--manifest`, pass `--cube`, `--name`, `--license` or `--own-work`, `--attribution`, `--encoding` and `--reason`, plus the base flags for the declared encoding. The command refuses cube bytes that do not match the manifest `sha256`, a cube over the 16 MiB limit, an empty reason and a manifest entry whose `role` is not `original` without `--allow-non-original`; nothing is stored in those cases.
+
+A display-referred entry whose declared base is not a published Look, whether an intended family rendering or a body rendering with a missing field, publishes a labelled approximate preview on the neutral baseline rather than a matchable target.
+
 ## Activate deferred monochrome intake
 
 Monochrome intake requires an approved camera schema with monochrome capability and family-scoped controls. Deploying the binaries does not replace the server's authoritative snapshot.

@@ -197,6 +197,9 @@ fn import(args: &ImportArgs) -> Result<()> {
             ..LutLookOptions::default()
         },
     )?;
+    if !imported.converged {
+        bail!("the LUT fit did not converge; no look document written");
+    }
     let bytes = imported.document.encode()?;
     crate::write(&args.out, &bytes)?;
     let report = imported.approximation;

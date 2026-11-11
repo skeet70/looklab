@@ -8,12 +8,13 @@ use std::time::Duration;
 use looklab_publish::{RoundTripReport, reference_round_trip};
 use looklab_schema::{
     Evidence, FIXTURE_MANIFEST, FixtureDonation, FixtureFileName, LabeledTag, LookId, LutBase,
-    LutEncoding, LutFile, Placement, ProposalImportState, ProposalKind, ProposalStatus,
-    ProposalSummary, ProposalView, SNAPSHOT_MANIFEST, Sha256Hex, SnapshotManifest,
-    ValidatedPayload, apply_sim_mapping, body_export_path, content_hash, fixture_manifest_toml,
-    interface_export_path, mapping_status_supported, schema_export_path, validate_confirmation,
-    validate_proposal,
+    LutEncoding, LutFile, LutLookProposal, Placement, ProposalImportState, ProposalKind,
+    ProposalStatus, ProposalSummary, ProposalView, SNAPSHOT_MANIFEST, Sha256Hex, SnapshotManifest,
+    ValidatedPayload, apply_sim_mapping, body_export_path, content_hash, encode_proposal,
+    fixture_manifest_toml, interface_export_path, mapping_status_supported, schema_export_path,
+    validate_confirmation, validate_proposal,
 };
+use looklab_trust::Actor;
 use looklab_upload::CommunitySnapshotVersion;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,7 +22,7 @@ use sqlx::{Row, SqlitePool};
 use tokio::sync::Mutex;
 
 use crate::admin::{self, AdminError, ModDecision};
-use crate::blob::BlobHash;
+use crate::blob::{BlobHash, BlobStore};
 use crate::body_schema::{Bodies, BodiesError};
 use crate::db::now_unix;
 use crate::ids::{BlobAttemptId, CredentialId, ProposalId, ProposalMessageId};
@@ -167,7 +168,8 @@ fn verify_lut_bytes(file: &LutFile, bytes: &[u8]) -> Result<(), ProposalError> {
 
 /// Rejects a Look base that is not released.
 async fn lut_base_admissible(
-    state: &AppState,
+    db: &SqlitePool,
+    blobs: &dyn crate::blob::BlobStore,
     encoding: &LutEncoding,
 ) -> Result<(), ProposalError> {
     let LutEncoding::Display { base } = encoding else {
@@ -197,7 +199,7 @@ async fn lut_base_admissible(
     )
     .bind(look.as_str())
     .bind(i64::from(major))
-    .fetch_one(&state.db)
+    .fetch_one(db)
     .await?;
     if released == 0 {
         return Err(ProposalError::InvalidPayload(
@@ -212,7 +214,7 @@ async fn lut_base_admissible(
     )
     .bind(look.as_str())
     .bind(i64::from(major))
-    .fetch_optional(&state.db)
+    .fetch_optional(db)
     .await?;
     let Some(artifacts) = artifacts else {
         return Err(ProposalError::InvalidPayload(
@@ -230,8 +232,7 @@ async fn lut_base_admissible(
     match (document, source) {
         (Some(document), None) => {
             let hash = BlobHash::from_hex(&document.sha256).ok_or(ProposalError::Corrupt)?;
-            let bytes = state
-                .blobs
+            let bytes = blobs
                 .get(hash)
                 .map_err(|_| ProposalError::Corrupt)?
                 .ok_or(ProposalError::Corrupt)?;
@@ -247,11 +248,15 @@ async fn lut_base_admissible(
                     "the selected base Look version is not published".to_owned(),
                 ));
             }
+            if document.match_refusal() == Some(looklab_model::file::MatchRefusal::Unsupported) {
+                return Err(ProposalError::InvalidPayload(
+                    "the selected base Look version is not a usable rendering".to_owned(),
+                ));
+            }
         }
         (None, Some(source)) => {
             let hash = BlobHash::from_hex(&source.sha256).ok_or(ProposalError::Corrupt)?;
-            let bytes = state
-                .blobs
+            let bytes = blobs
                 .get(hash)
                 .map_err(|_| ProposalError::Corrupt)?
                 .ok_or(ProposalError::Corrupt)?;
@@ -274,10 +279,10 @@ async fn lut_base_admissible(
 }
 
 /// True when the link already has a release or an open proposal.
-async fn lut_look_conflict(state: &AppState, look: &str) -> Result<bool, ProposalError> {
+async fn lut_look_conflict(db: &SqlitePool, look: &str) -> Result<bool, ProposalError> {
     let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM look_versions WHERE look = ?")
         .bind(look)
-        .fetch_one(&state.db)
+        .fetch_one(db)
         .await?;
     if versions > 0 {
         return Ok(true);
@@ -290,7 +295,7 @@ async fn lut_look_conflict(state: &AppState, look: &str) -> Result<bool, Proposa
                     AND NOT EXISTS (SELECT 1 FROM lut_imports i WHERE i.proposal_id = p.id)
                     AND NOT EXISTS (SELECT 1 FROM lut_import_failures f WHERE f.proposal_id = p.id)))",
     )
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await?;
     for (payload,) in payloads {
         if let Ok(ValidatedPayload::LutLook(proposal)) =
@@ -389,14 +394,14 @@ pub async fn submit(
                 "the credential's pending LUT storage is full; wait for moderation".to_owned(),
             ));
         }
-        lut_base_admissible(state, &look.encoding).await?;
+        lut_base_admissible(&state.db, state.blobs.as_ref(), &look.encoding).await?;
         lut_row = Some((
             look.lut.file.clone(),
             look.lut.size,
             *look.lut.sha256.as_bytes(),
         ));
         lut_look = Some(look.look.as_str().to_owned());
-        if lut_look_conflict(state, look.look.as_str()).await? {
+        if lut_look_conflict(&state.db, look.look.as_str()).await? {
             return Err(ProposalError::InvalidPayload(
                 "the look link already has published versions or an open proposal; propose a different name"
                     .to_owned(),
@@ -442,7 +447,7 @@ pub async fn submit(
     let summary_text = summary.text();
     let pending_proposal = PendingProposal {
         id: &id,
-        credential,
+        credential: Some(credential),
         kind: submission.kind,
         payload: submission.payload.as_str(),
         summary: summary_text.as_str(),
@@ -492,18 +497,15 @@ pub async fn submit(
                 crate::blob::write_guarded(tx, move || ((), store.put(hash, &bytes)))
                     .await
                     .map_err(|error| ProposalError::Snapshot(error.to_string()))?;
-            sqlx::query(
-                "INSERT INTO lut_uploads
-                 (proposal_id, sha256, credential_id, file, size, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?)",
+            insert_lut_upload(
+                &mut tx,
+                &id,
+                sha256,
+                Some(credential),
+                file,
+                i64::try_from(*size).map_err(|_| ProposalError::Corrupt)?,
+                created_at,
             )
-            .bind(id.as_str())
-            .bind(sha256.as_slice())
-            .bind(credential.as_str())
-            .bind(file)
-            .bind(i64::try_from(*size).map_err(|_| ProposalError::Corrupt)?)
-            .bind(created_at)
-            .execute(&mut *tx)
             .await?;
             crate::store::clear_staged(&mut tx, attempt).await?;
             tx.commit().await?;
@@ -536,7 +538,7 @@ pub async fn submit(
 
 struct PendingProposal<'a> {
     id: &'a ProposalId,
-    credential: &'a CredentialId,
+    credential: Option<&'a CredentialId>,
     kind: ProposalKind,
     payload: &'a str,
     summary: &'a str,
@@ -556,7 +558,7 @@ async fn insert_pending(
          VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
     )
     .bind(proposal.id.as_str())
-    .bind(proposal.credential.as_str())
+    .bind(proposal.credential.map(CredentialId::as_str))
     .bind(proposal.kind.as_str())
     .bind(proposal.payload)
     .bind(proposal.summary)
@@ -566,6 +568,143 @@ async fn insert_pending(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+async fn insert_lut_upload(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    proposal: &ProposalId,
+    sha256: &[u8; 32],
+    credential: Option<&CredentialId>,
+    file: &str,
+    size: i64,
+    created_at: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO lut_uploads
+         (proposal_id, sha256, credential_id, file, size, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(proposal.as_str())
+    .bind(sha256.as_slice())
+    .bind(credential.map(CredentialId::as_str))
+    .bind(file)
+    .bind(size)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn lut_import_job(proposal: &ProposalId) -> admin::DecisionJob {
+    admin::DecisionJob {
+        kind: crate::store::JobKind::LutImport,
+        payload: serde_json::json!({ "proposal_id": proposal.as_str() }).to_string(),
+    }
+}
+
+/// A custom look the offline operator CLI admits.
+#[derive(Debug, Clone)]
+pub struct LutAdmission {
+    pub proposal: LutLookProposal,
+    pub cube: Vec<u8>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdmittedLut {
+    pub proposal: ProposalId,
+    pub look: LookId,
+}
+
+/// Stores an operator's LUT admission and its approval in one transaction.
+///
+/// # Errors
+/// A proposal the schema rejects, cube bytes that do not match it, a base that
+/// is not released, a conflicting link, or an invalid reason.
+pub async fn admit_lut(
+    db: &SqlitePool,
+    blobs: &crate::blob::FsBlobStore,
+    admission: LutAdmission,
+) -> Result<AdmittedLut, ProposalError> {
+    let reason = admin::normalize_reason(&admission.reason)?;
+    let payload = encode_proposal(&admission.proposal)
+        .map_err(|errors| ProposalError::InvalidPayload(join_errors(&errors)))?;
+    let validated = validate_proposal(ProposalKind::LutLook, &payload)
+        .map_err(|errors| ProposalError::InvalidPayload(join_errors(&errors)))?;
+    let ValidatedPayload::LutLook(look) = &validated else {
+        return Err(ProposalError::Corrupt);
+    };
+    verify_lut_bytes(&look.lut, &admission.cube)?;
+    lut_base_admissible(db, blobs, &look.encoding).await?;
+    let summary = validated.summary().text();
+    let id = ProposalId::new();
+    let created_at = now_unix();
+    let sha256 = *look.lut.sha256.as_bytes();
+    let file = look.lut.file.clone();
+    let size = i64::try_from(look.lut.size).map_err(|_| ProposalError::Corrupt)?;
+    let admitted_look = look.look.clone();
+    let pending = PendingProposal {
+        id: &id,
+        credential: None,
+        kind: ProposalKind::LutLook,
+        payload: payload.as_str(),
+        summary: summary.as_str(),
+        evidence: "[]",
+        created_at,
+        round_trip: None,
+    };
+    let store = blobs.clone();
+    let bytes = admission.cube;
+    let hash = BlobHash::from_bytes(sha256);
+    let attempt = BlobAttemptId::new();
+    crate::store::stage_blobs(
+        db,
+        &attempt,
+        &[sha256],
+        created_at + crate::store::STAGED_TTL_SECONDS,
+    )
+    .await?;
+    let result = async {
+        let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+        if !crate::store::reservation_live(&mut tx, &attempt, 1).await? {
+            return Err(ProposalError::Snapshot(
+                "the LUT upload reservation expired".to_owned(),
+            ));
+        }
+        if lut_look_conflict_tx(&mut tx, look.look.as_str()).await? {
+            return Err(ProposalError::InvalidPayload(
+                "the look link already has published versions or an open proposal; propose a different name"
+                    .to_owned(),
+            ));
+        }
+        insert_pending(&mut tx, pending).await?;
+        let (mut tx, ()) = crate::blob::write_guarded(tx, move || ((), store.put(hash, &bytes)))
+            .await
+            .map_err(|error| ProposalError::Storage(error.to_string()))?;
+        insert_lut_upload(&mut tx, &id, &sha256, None, &file, size, created_at).await?;
+        admin::decide_recording_job_in(
+            &mut tx,
+            Actor::Cli,
+            &id,
+            ModDecision::Approve,
+            &reason,
+            None,
+            Some(lut_import_job(&id)),
+        )
+        .await?;
+        crate::store::clear_staged(&mut tx, &attempt).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = crate::store::abandon_staged(db, &attempt).await;
+    }
+    result?;
+    Ok(AdmittedLut {
+        proposal: id,
+        look: admitted_look,
+    })
 }
 
 pub async fn view(db: &SqlitePool, proposal: &ProposalId) -> Result<ProposalView, ProposalError> {
@@ -953,7 +1092,7 @@ impl PreparedSnapshot {
 
 pub async fn record_decision(
     state: &AppState,
-    moderator: &CredentialId,
+    actor: Actor,
     proposal: &ProposalId,
     decision: ModDecision,
     reason: &str,
@@ -970,24 +1109,20 @@ pub async fn record_decision(
         .parse::<ProposalKind>()
         .map_err(|_| ProposalError::Corrupt)?;
     if decision == ModDecision::Approve && kind == ProposalKind::LutLook {
-        let payload = serde_json::json!({ "proposal_id": proposal.as_str() }).to_string();
         admin::decide_recording_job(
             &state.db,
-            moderator,
+            actor,
             proposal,
             decision,
             reason,
             None,
-            Some(admin::DecisionJob {
-                kind: crate::store::JobKind::LutImport,
-                payload,
-            }),
+            Some(lut_import_job(proposal)),
         )
         .await?;
         return Ok(None);
     }
     if decision != ModDecision::Approve || !kind.contributes_document() {
-        admin::decide(&state.db, moderator, proposal, decision, reason).await?;
+        admin::decide(&state.db, actor, proposal, decision, reason).await?;
         if decision == ModDecision::Reject && kind == ProposalKind::LutLook {
             release_lut_upload(state, proposal, &payload).await;
         }
@@ -1000,7 +1135,7 @@ pub async fn record_decision(
     let prepared = prepare_snapshot(state, kind, &payload, &evidence_donations(&evidence)).await?;
     admin::decide_recording(
         &state.db,
-        moderator,
+        actor,
         proposal,
         decision,
         reason,

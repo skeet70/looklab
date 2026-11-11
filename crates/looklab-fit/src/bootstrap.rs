@@ -257,6 +257,10 @@ pub fn published_uncertainty(
             supported_bias: false,
             supported_evidence: false,
             supported: false,
+            support_withheld: sandwich
+                .probes
+                .get(index)
+                .is_some_and(|estimate| estimate.support_withheld),
             clusters,
         });
     }

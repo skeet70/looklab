@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Offline admin path for grants and Look anchors.
+//! Offline admin path for grants, Look anchors and LUT admissions.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
-use looklab_server::CredentialId;
+use looklab_model::file::{NEUTRAL_BASELINE_SLUG, NEUTRAL_BASELINE_VERSION};
+use looklab_schema::{
+    LicenseDeclaration, LookId, LutBase, LutDynamicRange, LutEmulationDecl, LutEncoding, LutFile,
+    LutLookProposal, LutLookVersion, LutRenderer, Sha256Hex, SimKey, look_id_from_name,
+};
+use looklab_server::{FsBlobStore, LutAdmission, admit_lut};
 use looklab_trust::{Actor, Grant, Scope, ScopeRule};
 use looklab_upload::{BodyId, LookSlug};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Args)]
 pub struct AdminArgs {
@@ -25,6 +32,8 @@ enum AdminCommand {
     List(ListArgs),
     /// Start a Look's cumulative anchor at a released version.
     ReAnchor(ReAnchorArgs),
+    /// Admit a community LUT as an approved custom look.
+    ImportLut(Box<ImportLutArgs>),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -98,6 +107,197 @@ struct ReAnchorArgs {
     reason: String,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EncodingArg {
+    /// Scene-referred.
+    Flog2Fgamut,
+    /// Display-referred, expecting the fixed neutral baseline.
+    Neutral,
+    /// Display-referred, expecting a published Look version.
+    Look,
+    /// Display-referred, expecting a body rendering.
+    Body,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RendererArg {
+    XRawStudio,
+    /// The donor named no rendering engine.
+    Unspecified,
+}
+
+impl From<RendererArg> for LutRenderer {
+    fn from(value: RendererArg) -> Self {
+        match value {
+            RendererArg::XRawStudio => Self::XRawStudio,
+            RendererArg::Unspecified => Self::Unspecified,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DynamicRangeArg {
+    Dr100,
+    Dr200,
+    Dr400,
+}
+
+impl From<DynamicRangeArg> for LutDynamicRange {
+    fn from(value: DynamicRangeArg) -> Self {
+        match value {
+            DynamicRangeArg::Dr100 => Self::Dr100,
+            DynamicRangeArg::Dr200 => Self::Dr200,
+            DynamicRangeArg::Dr400 => Self::Dr400,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct ImportLutArgs {
+    #[arg(long)]
+    db: PathBuf,
+    #[arg(long)]
+    blobs: PathBuf,
+    /// Repository manifest to read one entry from.
+    #[arg(long, requires = "id")]
+    manifest: Option<PathBuf>,
+    /// The manifest entry's `look` slug.
+    #[arg(long, requires = "manifest")]
+    id: Option<String>,
+    /// The `.cube` file; defaults to the manifest entry's `file`.
+    #[arg(long)]
+    cube: Option<PathBuf>,
+    /// The Look's name; the slug is generated from it.
+    #[arg(long)]
+    name: Option<String>,
+    /// The redistribution license the donor declared.
+    #[arg(long, conflicts_with = "own_work")]
+    license: Option<String>,
+    /// The donor's own work, with no separate source license.
+    #[arg(long)]
+    own_work: bool,
+    /// Credit for the donor.
+    #[arg(long)]
+    attribution: Option<String>,
+    /// Where the donor published the LUT.
+    #[arg(long)]
+    source_url: Option<String>,
+    #[arg(long, value_enum)]
+    encoding: Option<EncodingArg>,
+    /// The published base Look slug for `--encoding look`.
+    #[arg(long)]
+    base_look: Option<String>,
+    /// The published base Look version for `--encoding look`.
+    #[arg(long)]
+    base_version: Option<String>,
+    /// The body id for `--encoding body`.
+    #[arg(long)]
+    base_body: Option<String>,
+    /// The rendering engine for `--encoding body`.
+    #[arg(long, value_enum)]
+    base_renderer: Option<RendererArg>,
+    /// The film simulation for `--encoding body`.
+    #[arg(long)]
+    base_sim: Option<String>,
+    /// The dynamic range for `--encoding body`.
+    #[arg(long, value_enum)]
+    base_dr: Option<DynamicRangeArg>,
+    /// Notes stored with the declared body rendering.
+    #[arg(long)]
+    base_notes: Option<String>,
+    /// The camera maker the LUT emulates.
+    #[arg(long)]
+    emulates_camera: Option<String>,
+    /// The camera rendering the LUT emulates.
+    #[arg(long)]
+    emulates_rendering: Option<String>,
+    /// The film stock the LUT emulates.
+    #[arg(long)]
+    emulates_film_stock: Option<String>,
+    /// The operator's admission reason; overrides a manifest entry's reason.
+    #[arg(long)]
+    reason: Option<String>,
+    /// Admit a manifest entry whose `role` is not `original`.
+    #[arg(long, requires = "manifest")]
+    allow_non_original: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LutManifest {
+    donor: Donor,
+    #[serde(default, rename = "donor_body")]
+    _donor_body: Option<DonorBody>,
+    #[serde(default, rename = "lut")]
+    luts: Vec<ManifestLut>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Donor {
+    #[serde(rename = "handle")]
+    _handle: String,
+    #[serde(rename = "source")]
+    _source: String,
+    #[serde(rename = "date")]
+    _date: String,
+    license: String,
+    attribution: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DonorBody {
+    #[serde(rename = "body")]
+    _body: String,
+    #[serde(rename = "notes")]
+    _notes: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestLut {
+    name: String,
+    look: String,
+    file: String,
+    #[serde(rename = "title")]
+    _title: String,
+    sha256: String,
+    #[serde(default, rename = "role")]
+    _role: Option<String>,
+    #[serde(rename = "provenance")]
+    _provenance: String,
+    #[serde(default, rename = "donor_body")]
+    _donor_body: Option<String>,
+    #[serde(default)]
+    emulates: Option<LutEmulationDecl>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    attribution: Option<String>,
+    #[serde(default)]
+    source_url: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    encoding: ManifestEncoding,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ManifestEncoding {
+    Flog2Fgamut,
+    Display { base: LutBase },
+}
+
+impl From<ManifestEncoding> for LutEncoding {
+    fn from(value: ManifestEncoding) -> Self {
+        match value {
+            ManifestEncoding::Flog2Fgamut => Self::Flog2Fgamut,
+            ManifestEncoding::Display { base } => Self::Display { base },
+        }
+    }
+}
+
 pub fn run(args: &AdminArgs) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -112,17 +312,19 @@ async fn run_async(args: &AdminArgs) -> Result<()> {
         AdminCommand::Revoke(args) => revoke(args).await,
         AdminCommand::List(args) => list(args).await,
         AdminCommand::ReAnchor(args) => reanchor(args).await,
+        AdminCommand::ImportLut(args) => import_lut(args).await,
     }
 }
 
-async fn open(path: &std::path::Path) -> Result<sqlx::SqlitePool> {
+async fn open(path: &Path) -> Result<sqlx::SqlitePool> {
     looklab_server::open_database(path)
         .await
         .with_context(|| format!("opening {}", path.display()))
 }
 
-fn subject(text: &str) -> Result<CredentialId> {
-    CredentialId::try_from(text).with_context(|| format!("{text} is not an internal credential id"))
+fn subject(text: &str) -> Result<looklab_server::CredentialId> {
+    looklab_server::CredentialId::try_from(text)
+        .with_context(|| format!("{text} is not an internal credential id"))
 }
 
 fn scope(bodies: &[String], looks: &[String], pairs: &[String]) -> Result<Option<Scope>> {
@@ -200,6 +402,238 @@ async fn reanchor(args: &ReAnchorArgs) -> Result<()> {
         record.look, record.version, record.reason
     );
     Ok(())
+}
+
+async fn import_lut(args: &ImportLutArgs) -> Result<()> {
+    if !args.db.is_file() {
+        bail!("{} is not an existing database file", args.db.display());
+    }
+    if !args.blobs.is_dir() {
+        bail!("{} is not an existing blob directory", args.blobs.display());
+    }
+    let (bytes, proposal, reason) = admission(args)?;
+    let db = open(&args.db).await?;
+    let blobs = FsBlobStore::new(&args.blobs)
+        .with_context(|| format!("opening blob storage at {}", args.blobs.display()))?;
+    let admitted = admit_lut(
+        &db,
+        &blobs,
+        LutAdmission {
+            proposal,
+            cube: bytes,
+            reason,
+        },
+    )
+    .await
+    .context("admitting the LUT")?;
+    println!(
+        "admitted {} as proposal {} (approved by cli); the import job is queued",
+        admitted.look, admitted.proposal
+    );
+    Ok(())
+}
+
+fn admission(args: &ImportLutArgs) -> Result<(Vec<u8>, LutLookProposal, String)> {
+    match &args.manifest {
+        Some(path) => manifest_admission(args, path),
+        None => explicit_admission(args),
+    }
+}
+
+fn manifest_admission(
+    args: &ImportLutArgs,
+    path: &Path,
+) -> Result<(Vec<u8>, LutLookProposal, String)> {
+    reject_explicit(args)?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let manifest: LutManifest = toml::from_str(&text)
+        .with_context(|| format!("{} is not a LUT manifest", path.display()))?;
+    let id = args
+        .id
+        .as_deref()
+        .context("--id is required with --manifest")?;
+    let entry = manifest
+        .luts
+        .iter()
+        .find(|entry| entry.look == id)
+        .with_context(|| format!("{id} is not an entry in {}", path.display()))?;
+    let role = entry._role.as_deref().unwrap_or("original");
+    if role != "original" && !args.allow_non_original {
+        bail!("{id} has role {role:?}; pass --allow-non-original to admit it");
+    }
+    let cube = args.cube.clone().unwrap_or_else(|| {
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(&entry.file)
+    });
+    let bytes = std::fs::read(&cube).with_context(|| format!("reading {}", cube.display()))?;
+    let size = u64::try_from(bytes.len()).context("cube size")?;
+    let proposal = LutLookProposal {
+        look: LookId::new(&entry.look)
+            .with_context(|| format!("{} is not a look slug", entry.look))?,
+        name: entry.name.clone(),
+        license: LicenseDeclaration {
+            own_work: false,
+            source_license: Some(
+                entry
+                    .license
+                    .clone()
+                    .unwrap_or_else(|| manifest.donor.license.clone()),
+            ),
+            source_url: entry.source_url.clone(),
+        },
+        attribution: entry
+            .attribution
+            .clone()
+            .unwrap_or_else(|| manifest.donor.attribution.clone()),
+        lut: LutFile {
+            file: entry.file.clone(),
+            sha256: Sha256Hex::parse(&entry.sha256)
+                .with_context(|| format!("{} is not a sha256", entry.sha256))?,
+            size,
+        },
+        encoding: entry.encoding.clone().into(),
+        emulates: entry.emulates.clone(),
+    };
+    let reason = args
+        .reason
+        .clone()
+        .or_else(|| entry.reason.clone())
+        .with_context(|| format!("{id} has no reason; pass --reason"))?;
+    Ok((bytes, proposal, reason))
+}
+
+fn explicit_admission(args: &ImportLutArgs) -> Result<(Vec<u8>, LutLookProposal, String)> {
+    let cube = args
+        .cube
+        .as_ref()
+        .context("--cube is required without --manifest")?;
+    let name = args
+        .name
+        .as_ref()
+        .context("--name is required without --manifest")?;
+    let reason = args
+        .reason
+        .clone()
+        .context("--reason is required without --manifest")?;
+    let attribution = args
+        .attribution
+        .clone()
+        .context("--attribution is required without --manifest")?;
+    let bytes = std::fs::read(cube).with_context(|| format!("reading {}", cube.display()))?;
+    let size = u64::try_from(bytes.len()).context("cube size")?;
+    let file = cube
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("{} has no file name", cube.display()))?
+        .to_owned();
+    let proposal = LutLookProposal {
+        look: look_id_from_name(name)?,
+        name: name.clone(),
+        license: LicenseDeclaration {
+            own_work: args.own_work,
+            source_license: args.license.clone(),
+            source_url: args.source_url.clone(),
+        },
+        attribution,
+        lut: LutFile {
+            file,
+            sha256: Sha256Hex::parse(&sha256_hex(&bytes))?,
+            size,
+        },
+        encoding: explicit_encoding(args)?,
+        emulates: explicit_emulation(args)?,
+    };
+    Ok((bytes, proposal, reason))
+}
+
+fn explicit_encoding(args: &ImportLutArgs) -> Result<LutEncoding> {
+    let encoding = args
+        .encoding
+        .context("--encoding is required without --manifest")?;
+    let base = match encoding {
+        EncodingArg::Flog2Fgamut => return Ok(LutEncoding::Flog2Fgamut),
+        EncodingArg::Neutral => LutBase::Look {
+            look: LookId::new(NEUTRAL_BASELINE_SLUG)?,
+            version: LutLookVersion::new(NEUTRAL_BASELINE_VERSION)?,
+        },
+        EncodingArg::Look => LutBase::Look {
+            look: LookId::new(
+                args.base_look
+                    .as_deref()
+                    .context("--base-look is required for --encoding look")?,
+            )?,
+            version: LutLookVersion::new(
+                args.base_version
+                    .as_deref()
+                    .context("--base-version is required for --encoding look")?,
+            )?,
+        },
+        EncodingArg::Body => LutBase::BodyRealization {
+            body: BodyId::new(
+                args.base_body
+                    .as_deref()
+                    .context("--base-body is required for --encoding body")?,
+            )?,
+            renderer: args
+                .base_renderer
+                .unwrap_or(RendererArg::Unspecified)
+                .into(),
+            film_simulation: args.base_sim.as_deref().map(SimKey::new).transpose()?,
+            dynamic_range: args.base_dr.map(Into::into),
+            notes: args.base_notes.clone().unwrap_or_default(),
+        },
+    };
+    Ok(LutEncoding::Display { base })
+}
+
+fn explicit_emulation(args: &ImportLutArgs) -> Result<Option<LutEmulationDecl>> {
+    match (
+        &args.emulates_camera,
+        &args.emulates_rendering,
+        &args.emulates_film_stock,
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(maker), Some(rendering), None) => Ok(Some(LutEmulationDecl::CameraRendering {
+            maker: maker.clone(),
+            rendering: rendering.clone(),
+        })),
+        (None, None, Some(name)) => Ok(Some(LutEmulationDecl::FilmStock { name: name.clone() })),
+        _ => bail!("use --emulates-camera with --emulates-rendering, or --emulates-film-stock"),
+    }
+}
+
+fn reject_explicit(args: &ImportLutArgs) -> Result<()> {
+    let explicit = [
+        (args.name.is_some(), "--name"),
+        (args.license.is_some(), "--license"),
+        (args.own_work, "--own-work"),
+        (args.attribution.is_some(), "--attribution"),
+        (args.source_url.is_some(), "--source-url"),
+        (args.encoding.is_some(), "--encoding"),
+        (args.base_look.is_some(), "--base-look"),
+        (args.base_version.is_some(), "--base-version"),
+        (args.base_body.is_some(), "--base-body"),
+        (args.base_renderer.is_some(), "--base-renderer"),
+        (args.base_sim.is_some(), "--base-sim"),
+        (args.base_dr.is_some(), "--base-dr"),
+        (args.base_notes.is_some(), "--base-notes"),
+        (args.emulates_camera.is_some(), "--emulates-camera"),
+        (args.emulates_rendering.is_some(), "--emulates-rendering"),
+        (args.emulates_film_stock.is_some(), "--emulates-film-stock"),
+    ];
+    if let Some((_, flag)) = explicit.into_iter().find(|(set, _)| *set) {
+        bail!("{flag} cannot be combined with --manifest");
+    }
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn print_scope(scope: Option<&str>) {

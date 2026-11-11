@@ -224,6 +224,19 @@ fn x_e3_base_resolution_rejects_eterna_and_keeps_provia() {
         base(Some("provia"), looklab_model::DynamicRange::Dr200).resolve_status(Some(&schema)),
         BaseStatus::BaseIdentifiedUnmeasured
     );
+    let unnamed = BaseReference::BodyRealization {
+        body: looklab_schema::BodyId::new("fujifilm/x-e3").expect("body"),
+        renderer: looklab_model::Renderer::Unspecified,
+        film_simulation: Some(looklab_schema::SimKey::new("provia").expect("sim")),
+        dynamic_range: Some(looklab_model::DynamicRange::Dr200),
+        notes: String::new(),
+    };
+    assert_eq!(
+        unnamed.resolve_status(Some(&schema)),
+        BaseStatus::BaseIncomplete {
+            missing: BaseField::Renderer
+        }
+    );
 }
 
 #[test]

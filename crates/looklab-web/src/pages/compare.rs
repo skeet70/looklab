@@ -30,8 +30,10 @@ struct CompareReady {
     b_label: String,
     a_scope: SelectionScope,
     a_blockers: Vec<String>,
+    a_evidence: Option<String>,
     b_scope: SelectionScope,
     b_blockers: Vec<String>,
+    b_evidence: Option<String>,
 }
 
 /// What the compare page can show for the current query.
@@ -235,6 +237,13 @@ async fn load_pair(query: CompareQuery) -> Result<CompareOutcome, String> {
     let b = data::look(plan.b.slug.as_str()).await?;
     let (a_scope, a_blockers) = displayed_scope(&a, &index, &plan.a.version);
     let (b_scope, b_blockers) = displayed_scope(&b, &index, &plan.b.version);
+    let wanted = data::wanted_optional().await;
+    let evidence = |slug: &looklab_model::file::Slug| {
+        wanted
+            .as_ref()
+            .and_then(|wanted| data::missing_captures(wanted, &index, slug.as_str()))
+    };
+    let (a_evidence, b_evidence) = (evidence(&plan.a.slug), evidence(&plan.b.slug));
     let a_lut = data::preview(plan.a.slug.as_str(), plan.a.version.as_str()).await?;
     let b_lut = data::preview(plan.b.slug.as_str(), plan.b.version.as_str()).await?;
     let thumbnail = Arc::new(data::scene_thumbnail(plan.scene.as_str()).await?);
@@ -252,8 +261,10 @@ async fn load_pair(query: CompareQuery) -> Result<CompareOutcome, String> {
         b_label,
         a_scope,
         a_blockers,
+        a_evidence,
         b_scope,
         b_blockers,
+        b_evidence,
     })))
 }
 
@@ -613,6 +624,7 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
                 status: version.status,
                 scope,
                 blockers,
+                evidence: None,
                 lut: None,
             })
         })
@@ -731,8 +743,14 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
         <section class="compare-scope" aria-label="Comparison scope">
             <p class="muted">{format!("A · {}: {}", ready.a_label, data::selection_scope_label(ready.a_scope))}</p>
             {ready.a_blockers.into_iter().map(|blocker| view! { <p class="notice">{blocker}</p> }).collect_view()}
+            {(ready.a_scope == SelectionScope::Experimental).then(|| view! {
+                <crate::pages::ExperimentalEvidence detail=ready.a_evidence.clone()/>
+            })}
             <p class="muted">{format!("B · {}: {}", ready.b_label, data::selection_scope_label(ready.b_scope))}</p>
             {ready.b_blockers.into_iter().map(|blocker| view! { <p class="notice">{blocker}</p> }).collect_view()}
+            {(ready.b_scope == SelectionScope::Experimental).then(|| view! {
+                <crate::pages::ExperimentalEvidence detail=ready.b_evidence.clone()/>
+            })}
         </section>
         {move || match comparison.get() {
             Load::Ready(ComparisonOutcome::Compared(comparison)) => view! { <ComparisonSummary comparison a_name=summary_a.clone() b_name=summary_b.clone()/> }.into_any(),
@@ -985,6 +1003,7 @@ mod tests {
 
     fn version(name: &str) -> VersionSummary {
         VersionSummary {
+            support: looklab_publish::PublishedSupport::Unstated,
             version: LookVersion::new(name).expect("version"),
             status: LookStatus::Published,
             matchable: true,

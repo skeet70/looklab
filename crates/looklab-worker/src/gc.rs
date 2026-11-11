@@ -47,7 +47,7 @@ pub async fn run(
             )
             .await?;
         }
-        db::expire_deferred_contribution(db_pool, &expiry.contribution).await?;
+        db::expire_deferred_contribution(db_pool, &expiry.contribution, now).await?;
         db::mark_deferred_expiry_deleted(db_pool, &expiry.contribution).await?;
         db::mark_withdrawal_deleted(db_pool, &expiry.contribution).await?;
     }

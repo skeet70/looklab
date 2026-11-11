@@ -330,6 +330,9 @@ pub async fn run(
         });
     }
     let mut tx = model_store::begin_immediate(db_pool).await?;
+    // Rows that predate the model store reach scoring before any refit registered them.
+    model_store::register_subject(&mut tx, &ModelSubject::BodyRealization { realization }, now)
+        .await?;
     model_store::clear_diagnostic_image_stats(&mut tx, &subject).await?;
     for stat in &stats {
         model_store::write_diagnostic_image_stats(&mut tx, &subject, stat, now).await?;

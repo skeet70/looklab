@@ -391,10 +391,12 @@ async fn ack_subject_generation(
 
 async fn note_missing_capture_groups(
     conn: &mut sqlx::SqliteConnection,
+    family: &LookId,
     members: &[ScopeMember],
     count: usize,
     now: i64,
 ) -> Result<()> {
+    let observed = Some(u32::try_from(count).unwrap_or(u32::MAX));
     for member in members {
         let subject_model = ModelSubject::BodyRealization {
             realization: member.realization.clone(),
@@ -402,8 +404,13 @@ async fn note_missing_capture_groups(
         let subject = subject_model.key();
         model_store::register_subject(conn, &subject_model, now).await?;
         if count < 2 {
+            let needed = if count == 0 {
+                "An independent capture from a different scene is needed"
+            } else {
+                "A second independent capture from a different scene is needed"
+            };
             let detail = format!(
-                "{}/{}/{}: {count} independent RAW capture(s); at least 2 independent RAW captures are required",
+                "{}/{}/{}: {count} independent RAW capture(s) exist. {needed} to check the look against photos it was not fitted to. One RAW re-rendered to several film simulations counts as one capture.",
                 member.body.as_str(),
                 member.realization.epoch.get(),
                 member.realization.native_sim.as_str()
@@ -416,7 +423,7 @@ async fn note_missing_capture_groups(
                     kind: EvidenceRequestKind::MissingIndependentCaptures,
                     detail,
                 },
-                Some(u32::try_from(count).unwrap_or(u32::MAX)),
+                observed,
                 now,
             )
             .await?;
@@ -428,6 +435,56 @@ async fn note_missing_capture_groups(
             )
             .await?;
         }
+    }
+    let family_model = ModelSubject::SharedFamily {
+        family: family.clone(),
+    };
+    let family_subject = family_model.key();
+    model_store::register_subject(conn, &family_model, now).await?;
+    if count < 2 {
+        let bodies: Vec<&str> = members
+            .iter()
+            .map(|member| member.body.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let bodies = if bodies.is_empty() {
+            "the supported body".to_owned()
+        } else {
+            bodies.join(", ")
+        };
+        let captures = if count == 1 {
+            "1 independent RAW capture exists".to_owned()
+        } else {
+            format!("{count} independent RAW captures exist")
+        };
+        let needed = if count == 0 {
+            "An independent capture from a different scene is needed"
+        } else {
+            "A second independent capture from a different scene is needed"
+        };
+        let detail = format!(
+            "{bodies}: {captures}. {needed} to check the look against photos it was not fitted to. One RAW re-rendered to several film simulations counts as one capture."
+        );
+        model_store::record_active_evidence_request(
+            conn,
+            &family_subject,
+            QualificationCapability::NativePrediction,
+            &EvidenceRequest {
+                kind: EvidenceRequestKind::MissingIndependentCaptures,
+                detail,
+            },
+            observed,
+            now,
+        )
+        .await?;
+    } else {
+        model_store::resolve_active_evidence_request(
+            conn,
+            &family_subject,
+            EvidenceRequestKind::MissingIndependentCaptures,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -634,6 +691,7 @@ async fn run_inner(
                 }
             }
         }
+        discard_unselected_reservations(db_pool, &component).await?;
         for plan in &component {
             let Some(observed) = observed.get(&plan.family_id) else {
                 continue;
@@ -747,6 +805,28 @@ fn has_out_of_scope_native(experimental: &LookPool, scope: &EvidenceScope) -> bo
             && image.is_eligible()
             && scope.excludes_samples(experimental, image)
     })
+}
+
+async fn discard_unselected_reservations(
+    db_pool: &SqlitePool,
+    plans: &[&FamilyPlan],
+) -> Result<()> {
+    let mut tx = model_store::begin_immediate(db_pool).await?;
+    for plan in plans {
+        let subject = SubjectKey::for_family(&plan.family_id);
+        let Some(reserved) = model_store::reserved_version(&mut tx, &subject).await? else {
+            continue;
+        };
+        if reserved.kind != model_store::ReservedVersionKind::Family {
+            continue;
+        }
+        let Some(version) = TargetVersion::new(reserved.version) else {
+            continue;
+        };
+        model_store::discard_reserved_family_version(&mut tx, &plan.family_id, version).await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn discover(
@@ -1190,9 +1270,35 @@ async fn fit_free(
     let capture_groups = native_group_count(&pools)?;
     {
         let mut conn = db_pool.acquire().await?;
-        note_missing_capture_groups(&mut conn, &plan.members, capture_groups, now_unix()).await?;
+        note_missing_capture_groups(
+            &mut conn,
+            &plan.family_id,
+            &plan.members,
+            capture_groups,
+            now_unix(),
+        )
+        .await?;
     }
-    if capture_groups < 2 {
+    if capture_groups == 0 {
+        ack_observed_plan(db_pool, plan, &observed, now_unix()).await?;
+        return Ok((
+            plan.members
+                .iter()
+                .map(|member| {
+                    (
+                        member.body.clone(),
+                        plan.family.clone(),
+                        RefitOutcome::Unavailable(
+                            "no eligible native images remain after excluding unsupported settings"
+                                .to_owned(),
+                        ),
+                    )
+                })
+                .collect(),
+            Vec::new(),
+        ));
+    }
+    if capture_groups < 2 && plan.kind == PlanKind::Qualified {
         ack_observed_plan(db_pool, plan, &observed, now_unix()).await?;
         return Ok((
             plan.members
@@ -1461,8 +1567,10 @@ async fn fit_free(
         })
         .filter(|state| state.generation == HierStateGeneration::CURRENT);
     let mut resume = common_native_resume(cold_common_native, resume);
-    if let Some(state) = &mut resume {
-        rebind_hier_state(state, &resume_inventories, &mut prepared_modes)?;
+    if let Some(state) = &mut resume
+        && rebind_hier_state(state, &resume_inventories, &mut prepared_modes).is_err()
+    {
+        resume = None;
     }
     let mut hier_options = hier_options(
         config,
@@ -1476,7 +1584,14 @@ async fn fit_free(
         families: vec![family_data],
         bodies: bodies_data,
     };
-    let fit = match fit_hierarchical(&input, &hier_options) {
+    let mut fit = fit_hierarchical(&input, &hier_options);
+    if let Err(looklab_fit::FitError::ResumeMismatch) = &fit
+        && hier_options.resume.is_some()
+    {
+        hier_options.resume = None;
+        fit = fit_hierarchical(&input, &hier_options);
+    }
+    let mut fit = match fit {
         Ok(fit) => fit,
         Err(looklab_fit::FitError::NoImages) => {
             ack_observed_plan(db_pool, plan, &observed, now_unix()).await?;
@@ -1529,9 +1644,19 @@ async fn fit_free(
             state: fit.state.clone(),
             inventories: body_modes.clone(),
         })?;
-        let mut conn = db_pool.acquire().await?;
+        let diagnostics = serde_json::json!({
+            "converged": fit.diagnostics.converged,
+            "evaluations": fit.diagnostics.evaluations,
+            "outer_iterations": fit.diagnostics.outer_iterations,
+            "limitations": fit.diagnostics.limitations,
+        })
+        .to_string();
+        let first_attempt = prior_attempt
+            .as_ref()
+            .map_or(now, |attempt| attempt.started_at);
+        let mut tx = model_store::begin_immediate(db_pool).await?;
         let consecutive = model_store::record_fit_attempt(
-            &mut conn,
+            &mut tx,
             &subject,
             FAMILY_BLOCK,
             Some(&FitCheckpoint::new(state)),
@@ -1540,23 +1665,16 @@ async fn fit_free(
         .await?;
         if consecutive >= config.max_consecutive_nonconverged {
             model_store::open_fit_hold(
-                &mut conn,
+                &mut tx,
                 &subject,
                 consecutive,
-                prior_attempt
-                    .as_ref()
-                    .map_or(now, |attempt| attempt.started_at),
+                first_attempt,
                 now,
-                &serde_json::json!({
-                    "converged": fit.diagnostics.converged,
-                    "evaluations": fit.diagnostics.evaluations,
-                    "outer_iterations": fit.diagnostics.outer_iterations,
-                    "limitations": fit.diagnostics.limitations,
-                })
-                .to_string(),
+                &diagnostics,
             )
             .await?;
         }
+        tx.commit().await?;
         ack_observed_plan(db_pool, plan, &observed, now_unix()).await?;
         return Ok((
             plan.members
@@ -1578,6 +1696,14 @@ async fn fit_free(
         model_store::resolve_fit_hold(&mut conn, &subject).await?;
     }
 
+    if capture_groups < 2
+        && let Some(family) = fit
+            .families
+            .iter_mut()
+            .find(|family| family.target.family == plan.family_id)
+    {
+        clear_family_support(family);
+    }
     let family = fit
         .family_of(&plan.family_id)
         .ok_or_else(|| WorkerError::Data("the hierarchical fit produced no family".to_owned()))?;
@@ -1950,6 +2076,24 @@ async fn fit_free(
     ))
 }
 
+fn component_unavailable(
+    plans: &[&FamilyPlan],
+    reason: &str,
+) -> Vec<(UploadBodyId, LookSlug, RefitOutcome)> {
+    plans
+        .iter()
+        .flat_map(|plan| {
+            plan.members.iter().map(|member| {
+                (
+                    member.body.clone(),
+                    plan.family.clone(),
+                    RefitOutcome::Unavailable(reason.to_owned()),
+                )
+            })
+        })
+        .collect()
+}
+
 async fn fit_component(
     db_pool: &SqlitePool,
     config: &WorkerConfig,
@@ -2057,9 +2201,37 @@ async fn fit_component(
                 .filter(|candidate| candidate.family_id == plan.family_id)
                 .flat_map(|candidate| candidate.members.iter().cloned())
                 .collect();
-            note_missing_capture_groups(&mut conn, &members, capture_groups, now_unix()).await?;
+            note_missing_capture_groups(
+                &mut conn,
+                &plan.family_id,
+                &members,
+                capture_groups,
+                now_unix(),
+            )
+            .await?;
         }
-        if capture_groups < 2 {
+        if capture_groups == 0 {
+            ack_observed_plans(db_pool, plans, &observed_plans, now_unix()).await?;
+            return Ok((
+                plans
+                    .iter()
+                    .flat_map(|plan| {
+                        plan.members.iter().map(|member| {
+                            (
+                                member.body.clone(),
+                                plan.family.clone(),
+                                RefitOutcome::Unavailable(
+                                    "no eligible native images remain after excluding unsupported settings"
+                                        .to_owned(),
+                                ),
+                            )
+                        })
+                    })
+                    .collect(),
+                Vec::new(),
+            ));
+        }
+        if capture_groups < 2 && plan.kind == PlanKind::Qualified {
             ack_observed_plans(db_pool, plans, &observed_plans, now_unix()).await?;
             return Ok((
                 plans
@@ -2280,7 +2452,13 @@ async fn fit_component(
     )?;
     if bodies_data.is_empty() {
         ack_observed_plans(db_pool, plans, &observed_plans, now_unix()).await?;
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((
+            component_unavailable(
+                plans,
+                "no native evidence with an observed WB mode enters the component fit",
+            ),
+            Vec::new(),
+        ));
     }
     let prior_attempts: BTreeMap<LookId, Option<model_store::FitAttempt>> = {
         let mut conn = db_pool.acquire().await?;
@@ -2306,11 +2484,17 @@ async fn fit_component(
         families: family_data,
         bodies: bodies_data,
     };
-    let fit = match fit_hierarchical(&input, &hier_options) {
+    let mut fit = match fit_hierarchical(&input, &hier_options) {
         Ok(fit) => fit,
         Err(looklab_fit::FitError::NoImages) => {
             ack_observed_plans(db_pool, plans, &observed_plans, now_unix()).await?;
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((
+                component_unavailable(
+                    plans,
+                    "no native images remain after partition and eligibility",
+                ),
+                Vec::new(),
+            ));
         }
         Err(looklab_fit::FitError::NoModelErrorEvidence) => {
             let mut conn = db_pool.acquire().await?;
@@ -2350,11 +2534,22 @@ async fn fit_component(
             state: fit.state.clone(),
             inventories: body_modes.clone(),
         })?;
-        let mut conn = db_pool.acquire().await?;
+        let diagnostics = serde_json::json!({
+            "converged": fit.diagnostics.converged,
+            "evaluations": fit.diagnostics.evaluations,
+            "outer_iterations": fit.diagnostics.outer_iterations,
+            "limitations": fit.diagnostics.limitations,
+        })
+        .to_string();
+        let mut tx = model_store::begin_immediate(db_pool).await?;
         for plan in plans {
             let subject = SubjectKey::for_family(&plan.family_id);
+            let first_attempt = prior_attempts
+                .get(&plan.family_id)
+                .and_then(|attempt| attempt.as_ref())
+                .map_or(now, |attempt| attempt.started_at);
             let consecutive = model_store::record_fit_attempt(
-                &mut conn,
+                &mut tx,
                 &subject,
                 FAMILY_BLOCK,
                 Some(&FitCheckpoint::new(state.clone())),
@@ -2363,25 +2558,17 @@ async fn fit_component(
             .await?;
             if consecutive >= config.max_consecutive_nonconverged {
                 model_store::open_fit_hold(
-                    &mut conn,
+                    &mut tx,
                     &subject,
                     consecutive,
-                    prior_attempts
-                        .get(&plan.family_id)
-                        .and_then(|attempt| attempt.as_ref())
-                        .map_or(now, |attempt| attempt.started_at),
+                    first_attempt,
                     now,
-                    &serde_json::json!({
-                        "converged": fit.diagnostics.converged,
-                        "evaluations": fit.diagnostics.evaluations,
-                        "outer_iterations": fit.diagnostics.outer_iterations,
-                        "limitations": fit.diagnostics.limitations,
-                    })
-                    .to_string(),
+                    &diagnostics,
                 )
                 .await?;
             }
         }
+        tx.commit().await?;
         ack_observed_plans(db_pool, plans, &observed_plans, now_unix()).await?;
         return Ok((
             plans
@@ -2398,6 +2585,34 @@ async fn fit_component(
                 .collect(),
             Vec::new(),
         ));
+    }
+    {
+        let mut tx = model_store::begin_immediate(db_pool).await?;
+        for plan in plans {
+            let subject = SubjectKey::for_family(&plan.family_id);
+            model_store::clear_fit_attempt(&mut tx, &subject).await?;
+            model_store::resolve_fit_hold(&mut tx, &subject).await?;
+        }
+        tx.commit().await?;
+    }
+    let one_group: BTreeSet<LookId> = {
+        let mut families = BTreeSet::new();
+        for plan in plans {
+            let pools: Vec<LookPool> = member_pools
+                .iter()
+                .filter(|(index, _, _)| plans[*index].family_id == plan.family_id)
+                .map(|(_, _, pool)| pool.clone())
+                .collect();
+            if native_group_count(&pools)? < 2 {
+                families.insert(plan.family_id.clone());
+            }
+        }
+        families
+    };
+    for family in &mut fit.families {
+        if one_group.contains(&family.target.family) {
+            clear_family_support(family);
+        }
     }
     let gauge = fit
         .components
@@ -3750,9 +3965,18 @@ async fn migration_outcome(
 )> {
     let version = target.version.get();
     let now = now_unix();
-    db::open_fit_hold(
-        db_pool,
-        plan.family.as_str(),
+    let mut conn = db_pool.acquire().await?;
+    model_store::register_subject(
+        &mut conn,
+        &ModelSubject::SharedFamily {
+            family: plan.family_id.clone(),
+        },
+        now,
+    )
+    .await?;
+    model_store::open_fit_hold(
+        &mut conn,
+        &SubjectKey::for_family(&plan.family_id),
         1,
         now,
         now,
@@ -3966,8 +4190,10 @@ async fn fit_pinned(
                 })
         })
         .filter(|state| state.generation == HierStateGeneration::CURRENT);
-    if let Some(state) = &mut resume {
-        rebind_hier_state(state, &resume_inventories, &mut prepared_modes)?;
+    if let Some(state) = &mut resume
+        && rebind_hier_state(state, &resume_inventories, &mut prepared_modes).is_err()
+    {
+        resume = None;
     }
     let mut observed = crate::pool::EvidenceObservation::merge([&pool.observation])?;
     let pin_stage = lineage
@@ -4069,7 +4295,14 @@ async fn fit_pinned(
         families: vec![FamilyData::pinned(target.clone(), snapshot.look.clone())],
         bodies: bodies_data,
     };
-    let fit = match fit_realizations(&input, &hier_options) {
+    let mut fit = fit_realizations(&input, &hier_options);
+    if let Err(looklab_fit::FitError::ResumeMismatch) = &fit
+        && hier_options.resume.is_some()
+    {
+        hier_options.resume = None;
+        fit = fit_realizations(&input, &hier_options);
+    }
+    let fit = match fit {
         Ok(fit) => fit,
         Err(looklab_fit::FitError::NoImages) => {
             ack_subject_generation(db_pool, &subject, observed_pending, now_unix()).await?;
@@ -4592,6 +4825,15 @@ fn build_bodies(
                     .map(|entry| entry.0),
             );
             let mut images = Vec::new();
+            let held_out = pool
+                .images
+                .iter()
+                .filter(|image| {
+                    evidence_group(image)
+                        .is_ok_and(|group| !partition.training_groups.contains(&group))
+                })
+                .count();
+            let (mut unknown_exposure, mut unobserved_wb) = (0usize, 0usize);
             for index in &entries {
                 let image = &pool.images[*index];
                 if !partition.training_groups.contains(&evidence_group(image)?) {
@@ -4602,6 +4844,7 @@ fn build_bodies(
                     .get(image.exposure_mode.0 as usize)
                     .map(|mode| mode.key.clone())
                 else {
+                    unknown_exposure += 1;
                     continue;
                 };
                 let Some(exposure_mode) = modes
@@ -4609,6 +4852,7 @@ fn build_bodies(
                     .iter()
                     .find_map(|(id, key)| (*key == exposure_key).then_some(*id))
                 else {
+                    unknown_exposure += 1;
                     continue;
                 };
                 let mut fit = weights::stage_fit_image(&pool, weighted, contributors, *index);
@@ -4623,7 +4867,10 @@ fn build_bodies(
                     require_observed_wb,
                 ) {
                     (Some(class), _) => class,
-                    (None, true) => continue,
+                    (None, true) => {
+                        unobserved_wb += 1;
+                        continue;
+                    }
                     (None, false) => UNKNOWN_WB_CLASS,
                 };
                 default_mode.get_or_insert(exposure_mode);
@@ -4641,6 +4888,16 @@ fn build_bodies(
                 });
             }
             if images.is_empty() {
+                tracing::warn!(
+                    body = %member.body,
+                    realization = %member.realization.native_sim,
+                    pool_images = pool.images.len(),
+                    weighted = entries.len(),
+                    held_out,
+                    unknown_exposure,
+                    unobserved_wb,
+                    "no image of this realization enters the fit"
+                );
                 continue;
             }
             realizations.push(RealizationData {
@@ -6858,6 +7115,7 @@ fn look_document(
     let mut sigma_post = Vec::with_capacity(count);
     let mut pre_reliable = Vec::with_capacity(count);
     let mut support = Vec::with_capacity(count);
+    let mut density = Vec::with_capacity(count);
     for probe in &family.probes.probes {
         for row in &probe.covariance {
             covariance.extend_from_slice(row);
@@ -6870,6 +7128,7 @@ fn look_document(
         sigma_post.push(probe.post_sigma_de);
         pre_reliable.push(if probe.pre_clip_reliable { 1.0 } else { 0.0 });
         support.push(if probe.supported { 1.0 } else { 0.0 });
+        density.push(probe.density);
     }
     document = document.with_uncertainty(UncertaintyData {
         probe_cov: Some(ProbeCovariance::new(count, covariance)?),
@@ -6879,7 +7138,7 @@ fn look_document(
         probe_sigma_post: Some(ProbeScalars::new(sigma_post)?),
         probe_pre_reliable: Some(ProbeScalars::new(pre_reliable)?),
         support: Some(ProbeScalars::new(support)?),
-        density: Some(Density::new(family.density.counts.clone())?),
+        density: Some(Density::new(density)?),
     })?;
     let bytes = document.encode()?;
     Ok((document, bytes))
@@ -6896,6 +7155,16 @@ fn probe_xyz() -> BTreeMap<ProbeId, looklab_color::Xyz> {
         .into_iter()
         .map(|probe| (probe.id, probe.xyz))
         .collect()
+}
+
+fn clear_family_support(family: &mut looklab_fit::hierarchical::FamilyParameters) {
+    for probe in &mut family.probes.probes {
+        probe.supported = false;
+        probe.supported_sigma = false;
+        probe.supported_density = false;
+        probe.supported_clusters = false;
+        probe.supported_bias = false;
+    }
 }
 
 fn stored_probes(look: &Look, probes: &ProbeUncertainty) -> Vec<StoredProbe> {

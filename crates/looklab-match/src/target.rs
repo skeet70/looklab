@@ -3,8 +3,9 @@
 use looklab_color::Xyz;
 use looklab_color::ucs::Ucs;
 use looklab_model::domain_penalty::check_published_paths;
-use looklab_model::file::UncertaintyData;
+use looklab_model::file::{LookDocument, UncertaintyData};
 use looklab_model::{Look, LookInput, ProbeGroup, ProbeSet};
+use serde::{Deserialize, Serialize};
 
 use crate::emphasis::Emphasis;
 use crate::error::{MatchError, Result};
@@ -41,6 +42,44 @@ pub struct TargetSpec<'a> {
     pub appearance: TargetAppearance,
 }
 
+/// The rendered images a published target's estimate rests on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ImageCount(u32);
+
+impl ImageCount {
+    pub const fn new(count: u32) -> Self {
+        Self(count)
+    }
+
+    /// The images the document's provenance records.
+    pub fn of_document(document: &LookDocument) -> Self {
+        Self(
+            document
+                .file
+                .provenance
+                .bodies
+                .iter()
+                .map(|body| body.images)
+                .sum(),
+        )
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// How a prepared target chose its supported probes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetSupport {
+    /// The published support mask, or the sigma and density predicates when the
+    /// target stores no mask.
+    Published,
+    /// The published mask supported nothing, so the sigma and density predicates
+    /// chose the probes.
+    Experimental(ImageCount),
+}
+
 pub struct PreparedTarget<'a> {
     pub probes: &'a ProbeSet,
     pub function: &'a dyn TargetFunction,
@@ -58,10 +97,74 @@ pub struct PreparedTarget<'a> {
     pub covariance_weight: Vec<f64>,
     pub target: Vec<Ucs>,
     pub density_floor: f64,
+    pub support: TargetSupport,
+}
+
+struct ProbeSelection {
+    supported: Vec<usize>,
+    weight: Vec<f64>,
+    covariance_weight: Vec<f64>,
+}
+
+fn select_probes(
+    spec: &TargetSpec<'_>,
+    sigma2: &[f64],
+    mask: Option<&[f64]>,
+    density_floor: f64,
+) -> ProbeSelection {
+    let mut selection = ProbeSelection {
+        supported: Vec::new(),
+        weight: vec![0.0_f64; sigma2.len()],
+        covariance_weight: vec![0.0_f64; sigma2.len()],
+    };
+    for (index, probe) in spec.probes.probes.iter().enumerate() {
+        let sigma = sigma2[index].max(0.0).sqrt();
+        let dense = spec
+            .uncertainty
+            .and_then(|data| data.density.as_ref())
+            .and_then(|density| density.values.get(index).copied())
+            .unwrap_or(f64::INFINITY);
+        let render_feasible = spec.appearance.metric().is_legacy()
+            || spec.function.look().is_none_or(|look| {
+                let input = LookInput::new(probe.xyz);
+                let values = look.layer_values(&input);
+                check_published_paths(&look.chroma_paths(&input, &values)).is_ok()
+            });
+        let accepted = render_feasible
+            && mask.map_or_else(
+                || sigma <= spec.support_sigma && dense >= density_floor,
+                |values| values[index] > 0.5,
+            );
+        if accepted {
+            selection.supported.push(index);
+            let c = 1.0 / (1.0 + sigma2[index] / (spec.tau * spec.tau));
+            selection.covariance_weight[index] =
+                probe.weight * spec.emphasis.group_multiplier(probe.group);
+            selection.weight[index] = selection.covariance_weight[index] * c;
+        }
+    }
+    selection
 }
 
 impl<'a> PreparedTarget<'a> {
+    /// # Errors
+    /// A covariance that does not cover the probe set, or a probe set with no
+    /// supported probe.
     pub fn new(spec: TargetSpec<'a>) -> Result<Self> {
+        Self::build(spec, None)
+    }
+
+    /// An experimental selection: when the published support mask supports no
+    /// probe, the sigma and density predicates choose the probes instead.
+    ///
+    /// # Errors
+    /// [`Self::new`]'s errors, including a probe set that neither the mask nor
+    /// the predicates support.
+    pub fn experimental(spec: TargetSpec<'a>, images: ImageCount) -> Result<Self> {
+        Self::build(spec, Some(images))
+    }
+
+    fn build(spec: TargetSpec<'a>, fallback: Option<ImageCount>) -> Result<Self> {
         let count = spec.probes.probes.len();
         let mut sigma2 = vec![0.0_f64; count];
         let mut target_uncertainty = AssessmentStatus::Unassessed;
@@ -85,44 +188,31 @@ impl<'a> PreparedTarget<'a> {
                 }
             }
         }
-        let support_mask = spec
+        let mask = spec
             .uncertainty
             .and_then(|data| data.support.as_ref())
-            .filter(|mask| mask.values.len() == count);
+            .filter(|mask| mask.values.len() == count)
+            .map(|mask| mask.values.as_slice());
         let density_floor = spec.density_floor.unwrap_or(0.0);
+        let fallback_floor = spec
+            .density_floor
+            .unwrap_or(looklab_fit::FitOptions::default().density_floor);
+        let target: Vec<Ucs> = spec
+            .probes
+            .probes
+            .iter()
+            .map(|probe| spec.appearance.render(spec.function.predict(probe.xyz)))
+            .collect();
 
-        let mut supported = Vec::with_capacity(count);
-        let mut weight = vec![0.0_f64; count];
-        let mut covariance_weight = vec![0.0_f64; count];
-        let mut target = Vec::with_capacity(count);
-        for (index, probe) in spec.probes.probes.iter().enumerate() {
-            target.push(spec.appearance.render(spec.function.predict(probe.xyz)));
-            let sigma = sigma2[index].max(0.0).sqrt();
-            let dense = spec
-                .uncertainty
-                .and_then(|data| data.density.as_ref())
-                .and_then(|density| density.values.get(index).copied())
-                .unwrap_or(f64::INFINITY);
-            let render_feasible = spec.appearance.metric().is_legacy()
-                || spec.function.look().is_none_or(|look| {
-                    let input = LookInput::new(probe.xyz);
-                    let values = look.layer_values(&input);
-                    check_published_paths(&look.chroma_paths(&input, &values)).is_ok()
-                });
-            let accepted = render_feasible
-                && support_mask.map_or_else(
-                    || sigma <= spec.support_sigma && dense >= density_floor,
-                    |mask| mask.values[index] > 0.5,
-                );
-            if accepted {
-                supported.push(index);
-                let c = 1.0 / (1.0 + sigma2[index] / (spec.tau * spec.tau));
-                covariance_weight[index] =
-                    probe.weight * spec.emphasis.group_multiplier(probe.group);
-                weight[index] = covariance_weight[index] * c;
-            }
+        let mut support = TargetSupport::Published;
+        let mut selection = select_probes(&spec, &sigma2, mask, density_floor);
+        let mask_supports_nothing =
+            mask.is_some_and(|values| values.iter().all(|value| *value <= 0.5));
+        if mask_supports_nothing && let Some(images) = fallback {
+            selection = select_probes(&spec, &sigma2, None, fallback_floor);
+            support = TargetSupport::Experimental(images);
         }
-        if supported.is_empty() {
+        if selection.supported.is_empty() {
             return Err(MatchError::NoSupportedProbes);
         }
 
@@ -134,12 +224,13 @@ impl<'a> PreparedTarget<'a> {
             appearance: spec.appearance,
             declared_points: spec.probes.probes.len(),
             target_uncertainty,
-            supported,
+            supported: selection.supported,
             sigma2,
-            weight,
-            covariance_weight,
+            weight: selection.weight,
+            covariance_weight: selection.covariance_weight,
             target,
             density_floor,
+            support,
         })
     }
 

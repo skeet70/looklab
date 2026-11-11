@@ -970,15 +970,7 @@ async fn site_data(pool: &SqlitePool, config: &PublishConfig) -> Result<SiteData
                     .find(|blob| blob.name.as_str() == LOOK_ARTIFACT)
                     .ok_or(looklab_publish::PublishError::MissingLookArtifact)?;
                 let document = LookDocument::decode(&blob.bytes)?;
-                page.matchable = document.is_matchable();
-                page.approximated = document
-                    .file
-                    .definition
-                    .as_ref()
-                    .is_some_and(|definition| definition.declared_base.is_some());
-                if page.approximated {
-                    page.card_eligible = false;
-                }
+                page.apply_document(&document);
                 LookIdentity {
                     kind: document.file.look.kind,
                     name: document

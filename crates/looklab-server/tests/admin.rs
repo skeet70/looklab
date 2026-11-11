@@ -2,21 +2,24 @@
 
 use std::path::{Path, PathBuf};
 
+use looklab_export::{CubeFile, Lut3d, write_cube};
 use looklab_model::file::{LookIdentity, LookKind, WbPolicy};
 use looklab_model::{Look, LookDocument};
 use looklab_schema::{
     Applicability, ArtifactRole, ContributionRef, DependencyKind, DependencyRef, DependencyTarget,
-    EligibilitySnapshotId, FamilyTargetId, ImageRef, InvalidationReason, LookId,
+    EligibilitySnapshotId, FamilyTargetId, ImageRef, InvalidationReason, LicenseDeclaration,
+    LookId, LutBase, LutDynamicRange, LutEncoding, LutFile, LutLookProposal, LutRenderer,
     MANUAL_CATALOG_VERSION, ManualCatalog, ModelSubject, ProposalKind, PublishedTargetId,
-    SafetyCheck, SourceRef, SubjectKey, TargetBasis, TargetEligibility, TargetEligibilityStatus,
-    TargetVersion,
+    SafetyCheck, Sha256Hex, SourceRef, SubjectKey, TargetBasis, TargetEligibility,
+    TargetEligibilityStatus, TargetVersion, ValidatedPayload,
 };
 use looklab_server::admin::{
     self, AdminError, ManifestArtifact, Restoration, RestorationHold, WorkerProposal,
 };
 use looklab_server::model_store::{self, JobLease, NumericalSources};
 use looklab_server::{
-    ContributionId, CredentialId, EndorsementId, GrantId, JobId, LookVersionId, Tier,
+    ContributionId, CredentialId, EndorsementId, FsBlobStore, GrantId, JobId, LookVersionId,
+    LutAdmission, ProposalError, Tier, admit_lut,
 };
 use looklab_trust::{Actor, Grant, Scope, ScopeRule, TrustError, VersionId};
 use looklab_upload::{BodyId, LookSlug};
@@ -91,6 +94,61 @@ fn version_artifacts(
     ]
 }
 
+fn zero_support_version_artifacts(
+    blobs: &Path,
+    look: &str,
+    version: u32,
+    anchor: u32,
+) -> Vec<ManifestArtifact> {
+    use looklab_model::file::{Density, ProbeCovariance, ProbeScalars, UncertaintyData};
+
+    let identity = LookIdentity::new(
+        look,
+        &format!("{version}.0.0"),
+        LookKind::NativeFamily,
+        WbPolicy::Adaptive,
+    )
+    .expect("identity");
+    let count = looklab_model::probes::v1().probes.len();
+    let mut covariance = Vec::with_capacity(count * 9);
+    for _ in 0..count {
+        covariance.extend_from_slice(&[0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01]);
+    }
+    let document = LookDocument::from_look(identity, Look::colorimetric())
+        .expect("document")
+        .with_uncertainty(UncertaintyData {
+            probe_cov: Some(ProbeCovariance::new(count, covariance.clone()).expect("covariance")),
+            probe_cov_post: Some(ProbeCovariance::new(count, covariance).expect("covariance")),
+            support: Some(ProbeScalars::new(vec![0.0; count]).expect("support")),
+            density: Some(Density::new(vec![1.0; count]).expect("density")),
+            ..UncertaintyData::default()
+        })
+        .expect("uncertainty");
+    let look_bytes = document.encode().expect("look bytes");
+    let release = serde_json::json!({
+        "version": version,
+        "gauge": 0.0,
+        "anchor": anchor,
+        "clip_k": 1.0,
+        "probes": [],
+        "gated_since_anchor": {"probes": []},
+        "converged": true,
+        "gate": {},
+        "provenance": {"anchor_version": format!("{anchor}.0.0")},
+        "created_at": 0,
+    });
+    vec![
+        ManifestArtifact {
+            name: looklab_publish::DOCUMENT_ARTIFACT.to_owned(),
+            sha256: store_blob(blobs, &look_bytes),
+        },
+        ManifestArtifact {
+            name: "release.json".to_owned(),
+            sha256: store_blob(blobs, &serde_json::to_vec(&release).expect("release json")),
+        },
+    ]
+}
+
 fn lut_version_artifacts(
     blobs: &Path,
     look: &str,
@@ -120,6 +178,83 @@ fn lut_version_artifacts(
         encoding: DeclaredEncoding::SceneReferred {
             transfer: LogTransfer::Flog2,
             gamut: Gamut::Fgamut,
+        },
+        declared_base: None,
+        output: OutputEncoding::Srgb,
+        lut: LutRecord {
+            size: 2,
+            domain_min: [0.0; 3],
+            domain_max: [1.0; 3],
+            values_ref: looklab_model::BinRef::new("bin:lut").expect("ref"),
+        },
+        emulates: None,
+        superseded_by: None,
+        notes: Vec::new(),
+    };
+    let lut = LutData::new(
+        2,
+        [0.0; 3],
+        [1.0; 3],
+        (0..24).map(|value| value as f64 / 23.0).collect(),
+    )
+    .expect("lut");
+    let document =
+        LookDocument::from_lut_definition(identity, Look::colorimetric(), definition, lut)
+            .expect("document");
+    let look_bytes = document.encode().expect("look bytes");
+    let release = serde_json::json!({
+        "version": version,
+        "gauge": 0.0,
+        "anchor": anchor,
+        "clip_k": 1.0,
+        "probes": [],
+        "gated_since_anchor": {"probes": []},
+        "converged": true,
+        "gate": {},
+        "provenance": {"anchor_version": format!("{anchor}.0.0")},
+        "created_at": 0,
+    });
+    vec![
+        ManifestArtifact {
+            name: looklab_publish::DOCUMENT_ARTIFACT.to_owned(),
+            sha256: store_blob(blobs, &look_bytes),
+        },
+        ManifestArtifact {
+            name: "release.json".to_owned(),
+            sha256: store_blob(blobs, &serde_json::to_vec(&release).expect("release json")),
+        },
+    ]
+}
+
+fn unpinned_display_version_artifacts(
+    blobs: &Path,
+    look: &str,
+    version: u32,
+    anchor: u32,
+) -> Vec<ManifestArtifact> {
+    use looklab_model::file::{
+        BaseReference, BaseStatus, DeclaredEncoding, LicenseRecord, LutData, LutDefinition,
+        LutRecord, OutputEncoding,
+    };
+
+    let identity = LookIdentity::new(
+        look,
+        &format!("{version}.0.0"),
+        LookKind::LutDefined,
+        WbPolicy::Adaptive,
+    )
+    .expect("identity");
+    let definition = LutDefinition {
+        name: "Display Look".to_owned(),
+        license: LicenseRecord {
+            own_work: false,
+            source_license: Some("CC0-1.0".to_owned()),
+            source_url: None,
+            attribution: "a donor".to_owned(),
+        },
+        encoding: DeclaredEncoding::DisplayReferred {
+            base: BaseReference::neutral_baseline(),
+            status: BaseStatus::BaseIdentifiedUnmeasured,
         },
         declared_base: None,
         output: OutputEncoding::Srgb,
@@ -2896,4 +3031,409 @@ async fn fenced_worker_proposal_checks_lease_sources_and_accepted_evidence() {
         .await,
         Err(AdminError::Conflict)
     ));
+}
+
+fn operator_cube() -> CubeFile {
+    let size = 3;
+    let mut data = Vec::new();
+    for b in 0..size {
+        for g in 0..size {
+            for r in 0..size {
+                let value = |n: u32| n as f32 / (size - 1) as f32;
+                data.push([value(r), value(g), value(b)]);
+            }
+        }
+    }
+    CubeFile {
+        lut: Lut3d {
+            size,
+            data,
+            shaper: None,
+        },
+        domain: [0.0, 1.0],
+    }
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn operator_proposal(name: &str, bytes: &[u8], digest: &str) -> LutLookProposal {
+    LutLookProposal {
+        look: LookId::new(name).expect("look"),
+        name: name.to_owned(),
+        license: LicenseDeclaration {
+            own_work: false,
+            source_license: Some("CC0-1.0".to_owned()),
+            source_url: None,
+        },
+        attribution: "a donor".to_owned(),
+        lut: LutFile {
+            file: "donated.cube".to_owned(),
+            sha256: Sha256Hex::parse(digest).expect("digest"),
+            size: bytes.len() as u64,
+        },
+        encoding: LutEncoding::Display {
+            base: LutBase::BodyRealization {
+                body: BodyId::new("fujifilm/x-e3").expect("body"),
+                renderer: LutRenderer::XRawStudio,
+                film_simulation: None,
+                dynamic_range: Some(LutDynamicRange::Dr200),
+                notes: "X-E3 RAW; film simulation not yet known.".to_owned(),
+            },
+        },
+        emulates: None,
+    }
+}
+
+async fn assert_operator_admission_wrote_nothing(fixture: &Fixture) {
+    for table in [
+        "proposals",
+        "moderation_decisions",
+        "jobs",
+        "audit_log",
+        "lut_uploads",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&fixture.db)
+            .await
+            .expect("count");
+        assert_eq!(count, 0, "{table} has rows");
+    }
+    assert_eq!(std::fs::read_dir(&fixture.blobs).expect("blobs").count(), 0);
+}
+
+#[tokio::test]
+async fn an_operator_lut_admission_stores_an_approved_proposal_and_job() {
+    let fixture = fixture().await;
+    let cube = operator_cube();
+    let text = write_cube(&cube.lut, "Donated", cube.domain);
+    let bytes = text.as_bytes();
+    let digest = digest_hex(bytes);
+    let proposal = operator_proposal("operator-lut", bytes, &digest);
+    let store = FsBlobStore::new(&fixture.blobs).expect("store");
+    let admitted = admit_lut(
+        &fixture.db,
+        &store,
+        LutAdmission {
+            proposal: proposal.clone(),
+            cube: bytes.to_vec(),
+            reason: "donation round".to_owned(),
+        },
+    )
+    .await
+    .expect("admit");
+    assert_eq!(admitted.look.as_str(), "operator-lut");
+
+    let (status, credential, payload): (String, Option<String>, String) =
+        sqlx::query_as("SELECT status, credential_id, payload FROM proposals WHERE id = ?")
+            .bind(admitted.proposal.as_str())
+            .fetch_one(&fixture.db)
+            .await
+            .expect("proposal");
+    assert_eq!(status, "approved");
+    assert!(credential.is_none());
+    let stored =
+        looklab_schema::validate_proposal(ProposalKind::LutLook, &payload).expect("stored payload");
+    let ValidatedPayload::LutLook(stored) = stored else {
+        panic!("not a LUT proposal");
+    };
+    assert_eq!(stored, proposal);
+
+    let (moderator, decision, reason): (String, String, String) = sqlx::query_as(
+        "SELECT moderator_credential, decision, reason FROM moderation_decisions
+         WHERE proposal_id = ?",
+    )
+    .bind(admitted.proposal.as_str())
+    .fetch_one(&fixture.db)
+    .await
+    .expect("decision");
+    assert_eq!(moderator, "cli");
+    assert_eq!(decision, "approve");
+    assert_eq!(reason, "donation round");
+
+    let (kind, job): (String, String) =
+        sqlx::query_as("SELECT kind, payload FROM jobs WHERE kind = 'lut_import'")
+            .fetch_one(&fixture.db)
+            .await
+            .expect("job");
+    assert_eq!(kind, "lut_import");
+    let job: serde_json::Value = serde_json::from_str(&job).expect("job payload");
+    assert_eq!(job["proposal_id"], admitted.proposal.as_str());
+
+    let audit: String =
+        sqlx::query_scalar("SELECT payload FROM audit_log WHERE type = 'moderation_decision'")
+            .fetch_one(&fixture.db)
+            .await
+            .expect("audit");
+    let audit: serde_json::Value = serde_json::from_str(&audit).expect("audit payload");
+    assert_eq!(audit["actor"], "cli");
+    assert_eq!(audit["decision"], "approve");
+    assert_eq!(audit["proposal"], admitted.proposal.as_str());
+
+    let (sha, size, uploader): (Vec<u8>, i64, Option<String>) =
+        sqlx::query_as("SELECT sha256, size, credential_id FROM lut_uploads WHERE proposal_id = ?")
+            .bind(admitted.proposal.as_str())
+            .fetch_one(&fixture.db)
+            .await
+            .expect("upload");
+    assert_eq!(sha, Sha256::digest(bytes).to_vec());
+    assert_eq!(size, i64::try_from(bytes.len()).expect("size"));
+    assert!(uploader.is_none());
+    assert!(fixture.blobs.join(&digest).exists());
+}
+
+#[tokio::test]
+async fn an_operator_lut_admission_refuses_a_digest_mismatch() {
+    let fixture = fixture().await;
+    let cube = operator_cube();
+    let text = write_cube(&cube.lut, "Donated", cube.domain);
+    let bytes = text.as_bytes();
+    let proposal = operator_proposal("operator-lut", bytes, &digest_hex(b"other bytes"));
+    let store = FsBlobStore::new(&fixture.blobs).expect("store");
+    let error = admit_lut(
+        &fixture.db,
+        &store,
+        LutAdmission {
+            proposal,
+            cube: bytes.to_vec(),
+            reason: "donation round".to_owned(),
+        },
+    )
+    .await
+    .expect_err("digest mismatch");
+    assert!(matches!(
+        error,
+        ProposalError::InvalidFixture(message) if message.contains("digest")
+    ));
+    assert_operator_admission_wrote_nothing(&fixture).await;
+}
+
+#[tokio::test]
+async fn an_operator_lut_admission_refuses_an_over_limit_cube() {
+    let fixture = fixture().await;
+    let bytes = vec![0u8; usize::try_from(looklab_schema::MAX_LUT_BYTES).expect("limit") + 1];
+    let proposal = operator_proposal("operator-lut", &bytes, &digest_hex(&bytes));
+    let store = FsBlobStore::new(&fixture.blobs).expect("store");
+    let error = admit_lut(
+        &fixture.db,
+        &store,
+        LutAdmission {
+            proposal,
+            cube: bytes,
+            reason: "donation round".to_owned(),
+        },
+    )
+    .await
+    .expect_err("over limit");
+    assert!(matches!(
+        error,
+        ProposalError::InvalidPayload(message) if message.contains("size")
+    ));
+    assert_operator_admission_wrote_nothing(&fixture).await;
+}
+
+#[tokio::test]
+async fn an_operator_lut_admission_refuses_a_missing_reason() {
+    let fixture = fixture().await;
+    let cube = operator_cube();
+    let text = write_cube(&cube.lut, "Donated", cube.domain);
+    let bytes = text.as_bytes();
+    let proposal = operator_proposal("operator-lut", bytes, &digest_hex(bytes));
+    let store = FsBlobStore::new(&fixture.blobs).expect("store");
+    let error = admit_lut(
+        &fixture.db,
+        &store,
+        LutAdmission {
+            proposal,
+            cube: bytes.to_vec(),
+            reason: "  ".to_owned(),
+        },
+    )
+    .await
+    .expect_err("missing reason");
+    assert!(matches!(
+        error,
+        ProposalError::Admin(AdminError::InvalidReason)
+    ));
+    assert_operator_admission_wrote_nothing(&fixture).await;
+}
+
+#[tokio::test]
+async fn an_operator_lut_admission_refuses_an_unpublished_base_look() {
+    let fixture = fixture().await;
+    let cube = operator_cube();
+    let text = write_cube(&cube.lut, "Donated", cube.domain);
+    let bytes = text.as_bytes();
+    let mut proposal = operator_proposal("operator-lut", bytes, &digest_hex(bytes));
+    proposal.encoding = LutEncoding::Display {
+        base: LutBase::Look {
+            look: LookId::new("missing-base").expect("look"),
+            version: looklab_schema::LutLookVersion::new("1.0.0").expect("version"),
+        },
+    };
+    let store = FsBlobStore::new(&fixture.blobs).expect("store");
+    let error = admit_lut(
+        &fixture.db,
+        &store,
+        LutAdmission {
+            proposal,
+            cube: bytes.to_vec(),
+            reason: "donation round".to_owned(),
+        },
+    )
+    .await
+    .expect_err("unpublished base");
+    assert!(matches!(
+        error,
+        ProposalError::InvalidPayload(message) if message.contains("not published")
+    ));
+    assert_operator_admission_wrote_nothing(&fixture).await;
+}
+
+#[tokio::test]
+async fn an_operator_lut_admission_refuses_a_zero_support_base_look() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    accept_family_version(db, &look("zero-base"), 1).await;
+    let artifacts = zero_support_version_artifacts(&fixture.blobs, "zero-base", 1, 1);
+    admin::write_version_manifest(
+        db,
+        &look("zero-base"),
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &artifacts,
+        &[],
+    )
+    .await
+    .expect("base version");
+
+    let cube = operator_cube();
+    let text = write_cube(&cube.lut, "Donated", cube.domain);
+    let bytes = text.as_bytes();
+    let mut proposal = operator_proposal("operator-lut", bytes, &digest_hex(bytes));
+    proposal.encoding = LutEncoding::Display {
+        base: LutBase::Look {
+            look: LookId::new("zero-base").expect("look"),
+            version: looklab_schema::LutLookVersion::new("1.0.0").expect("version"),
+        },
+    };
+    let store = FsBlobStore::new(&fixture.blobs).expect("store");
+    let error = admit_lut(
+        &fixture.db,
+        &store,
+        LutAdmission {
+            proposal,
+            cube: bytes.to_vec(),
+            reason: "donation round".to_owned(),
+        },
+    )
+    .await
+    .expect_err("zero-support base");
+    assert!(matches!(
+        error,
+        ProposalError::InvalidPayload(message) if message.contains("not a usable rendering")
+    ));
+    let proposals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proposals")
+        .fetch_one(&fixture.db)
+        .await
+        .expect("proposals");
+    assert_eq!(proposals, 0);
+}
+
+#[tokio::test]
+async fn an_operator_lut_admission_admits_an_unpinned_display_base_look() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    accept_family_version(db, &look("unpinned-base"), 1).await;
+    let artifacts = unpinned_display_version_artifacts(&fixture.blobs, "unpinned-base", 1, 1);
+    admin::write_version_manifest(
+        db,
+        &look("unpinned-base"),
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &artifacts,
+        &[],
+    )
+    .await
+    .expect("base version");
+
+    let cube = operator_cube();
+    let text = write_cube(&cube.lut, "Donated", cube.domain);
+    let bytes = text.as_bytes();
+    let mut proposal = operator_proposal("operator-lut", bytes, &digest_hex(bytes));
+    proposal.encoding = LutEncoding::Display {
+        base: LutBase::Look {
+            look: LookId::new("unpinned-base").expect("look"),
+            version: looklab_schema::LutLookVersion::new("1.0.0").expect("version"),
+        },
+    };
+    let store = FsBlobStore::new(&fixture.blobs).expect("store");
+    admit_lut(
+        &fixture.db,
+        &store,
+        LutAdmission {
+            proposal,
+            cube: bytes.to_vec(),
+            reason: "donation round".to_owned(),
+        },
+    )
+    .await
+    .expect("an unpinned display base stays admissible");
+}
+
+#[tokio::test]
+async fn an_operator_lut_admission_refuses_a_link_with_an_open_proposal() {
+    let fixture = fixture().await;
+    let cube = operator_cube();
+    let text = write_cube(&cube.lut, "Donated", cube.domain);
+    let bytes = text.as_bytes();
+    let proposal = operator_proposal("operator-lut", bytes, &digest_hex(bytes));
+    let payload = looklab_schema::encode_proposal(&proposal).expect("payload");
+    sqlx::query(
+        "INSERT INTO proposals
+         (id, credential_id, type, payload, human_summary, evidence, status, created_at)
+         VALUES ('open-proposal', NULL, 'lut_look', ?, 'x', '[]', 'pending', 0)",
+    )
+    .bind(&payload)
+    .execute(&fixture.db)
+    .await
+    .expect("open proposal");
+    let store = FsBlobStore::new(&fixture.blobs).expect("store");
+    let error = admit_lut(
+        &fixture.db,
+        &store,
+        LutAdmission {
+            proposal,
+            cube: bytes.to_vec(),
+            reason: "donation round".to_owned(),
+        },
+    )
+    .await
+    .expect_err("link conflict");
+    assert!(matches!(
+        error,
+        ProposalError::InvalidPayload(message) if message.contains("open proposal")
+    ));
+    let proposals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proposals")
+        .fetch_one(&fixture.db)
+        .await
+        .expect("proposals");
+    assert_eq!(proposals, 1);
+    for table in ["moderation_decisions", "jobs", "audit_log", "lut_uploads"] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&fixture.db)
+            .await
+            .expect("count");
+        assert_eq!(count, 0, "{table} has rows");
+    }
+    assert_eq!(std::fs::read_dir(&fixture.blobs).expect("blobs").count(), 0);
+    let staged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blob_staging WHERE expires_at = 0")
+        .fetch_one(&fixture.db)
+        .await
+        .expect("staging");
+    assert_eq!(staged, 1);
 }

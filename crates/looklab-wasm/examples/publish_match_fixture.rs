@@ -256,6 +256,7 @@ fn upsert_index(
         head: None,
         selected: None,
         versions: vec![VersionSummary {
+            support: looklab_publish::PublishedSupport::Unstated,
             version: LookVersion::new(VERSION).map_err(|error| error.to_string())?,
             status: LookStatus::Published,
             matchable: true,

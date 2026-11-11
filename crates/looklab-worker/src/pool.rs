@@ -228,7 +228,8 @@ pub struct PoolImage {
     pub exposure_mode: ExposureModeId,
     pub outcome: Option<ImageOutcome>,
     pub capture: looklab_trust::CaptureTuple,
-    pub coverage: RegionCoverage,
+    /// `None` when the scope admits no sample.
+    pub coverage: Option<RegionCoverage>,
     /// `(s, hue, √C)` per admitted sample.
     pub axes: Vec<(f64, f64, f64)>,
     /// One entry per sample; only admitted samples enter fits and evidence.
@@ -342,13 +343,29 @@ pub fn stage_dependencies(pools: &[LookPool], stage: EvidenceStage) -> Vec<Depen
 }
 
 /// The metadata rows and dependency generations read with one pool's evidence.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EvidenceObservation {
     pub snapshot_version: CommunitySnapshotVersion,
     pub dependencies: Vec<DependencyGeneration>,
     pub root_admissions: Vec<ActiveRootAdmission>,
+    /// Serial links of deferred monochrome contributions on the same body.
+    pub identity_links: Vec<(TrustCredentialId, looklab_meta::SerialHmac)>,
     pub native_contributors: BTreeMap<TrustCredentialId, EffectiveContributorId>,
     pub published_contributors: BTreeMap<TrustCredentialId, EffectiveContributorId>,
+}
+
+impl std::fmt::Debug for EvidenceObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EvidenceObservation")
+            .field("snapshot_version", &self.snapshot_version)
+            .field("dependencies", &self.dependencies)
+            .field("root_admissions", &self.root_admissions)
+            .field("identity_links", &self.identity_links.len())
+            .field("native_contributors", &self.native_contributors)
+            .field("published_contributors", &self.published_contributors)
+            .finish()
+    }
 }
 
 impl EvidenceObservation {
@@ -397,6 +414,11 @@ impl EvidenceObservation {
                             None => merged.root_admissions.push(admission.clone()),
                         }
                     }
+                    for link in &observation.identity_links {
+                        if !merged.identity_links.contains(link) {
+                            merged.identity_links.push(*link);
+                        }
+                    }
                     merge_contributors(
                         &mut merged.native_contributors,
                         &observation.native_contributors,
@@ -412,6 +434,7 @@ impl EvidenceObservation {
             snapshot_version: CommunitySnapshotVersion::new(0),
             dependencies: Vec::new(),
             root_admissions: Vec::new(),
+            identity_links: Vec::new(),
             native_contributors: BTreeMap::new(),
             published_contributors: BTreeMap::new(),
         });
@@ -728,6 +751,13 @@ async fn observe(
         }
         contributions.push((contribution, images));
     }
+    let mut identity_links = Vec::new();
+    for (credential, hmac) in db::deferred_serial_links_conn(&mut tx, body, now_unix()).await? {
+        identity_links.push((
+            looklab_server::admin::trust_id(&credential).map_err(WorkerError::Admin)?,
+            hmac,
+        ));
+    }
     let mut credentials: HashMap<looklab_server::CredentialId, CredentialInfo> = HashMap::new();
     for (contribution, _) in &contributions {
         if !credentials.contains_key(&contribution.credential) {
@@ -826,6 +856,7 @@ async fn observe(
             snapshot_version: CommunitySnapshotVersion::new(snapshot_version),
             dependencies: generations,
             root_admissions,
+            identity_links,
             native_contributors: BTreeMap::new(),
             published_contributors: BTreeMap::new(),
         },
@@ -1021,6 +1052,9 @@ fn admitted_links(
     let mut credentials = BTreeSet::new();
     let mut links = BTreeSet::new();
     for pool in pools {
+        for (credential, hmac) in &pool.observation.identity_links {
+            links.insert((*credential, *hmac.as_bytes()));
+        }
         for image in &pool.images {
             if !image.is_eligible()
                 || !image.admitted.iter().any(|admitted| *admitted)
@@ -1413,13 +1447,16 @@ fn axes_and_admission(
     (axes, admitted)
 }
 
-fn coverage_of(axes: &[(f64, f64, f64)]) -> Result<RegionCoverage> {
+fn coverage_of(axes: &[(f64, f64, f64)]) -> Result<Option<RegionCoverage>> {
+    if axes.is_empty() {
+        return Ok(None);
+    }
     let mut counts: BTreeMap<Region, f64> = BTreeMap::new();
     for (s, hue, _chroma) in axes {
         let region = Region::from_probe(*s, *hue)?;
         *counts.entry(region).or_insert(0.0) += 1.0;
     }
-    Ok(RegionCoverage::from_shares(counts)?)
+    Ok(Some(RegionCoverage::from_shares(counts)?))
 }
 
 fn clip_fraction(samples: &SampleSet, admitted: &[bool]) -> f64 {
@@ -1474,6 +1511,7 @@ mod tests {
             snapshot_version: CommunitySnapshotVersion::SHIPPED,
             dependencies: Vec::new(),
             root_admissions: Vec::new(),
+            identity_links: Vec::new(),
             native_contributors: BTreeMap::from([(credential_x, native), (credential_y, native)]),
             published_contributors: BTreeMap::from([
                 (credential_x, published),

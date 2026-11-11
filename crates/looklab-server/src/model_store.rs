@@ -867,6 +867,34 @@ pub async fn release_reserved_version(
     Ok(())
 }
 
+/// Drops a provisional family version and its reservation after a candidate does not publish.
+pub async fn discard_reserved_family_version(
+    conn: &mut SqliteConnection,
+    family: &LookId,
+    version: TargetVersion,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM model_reserved_versions
+         WHERE subject_key = ? AND kind = 'family' AND version = ?",
+    )
+    .bind(SubjectKey::for_family(family).as_str())
+    .bind(i64::from(version.get()))
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "DELETE FROM look_versions
+         WHERE look = ? AND version = ? AND status = 'provisional'
+           AND NOT EXISTS (
+               SELECT 1 FROM version_manifests m WHERE m.look_version_id = look_versions.id
+           )",
+    )
+    .bind(family.as_str())
+    .bind(i64::from(version.get()))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 pub async fn reserve_family_version(
     conn: &mut SqliteConnection,
     family: &LookId,
@@ -2498,7 +2526,8 @@ pub async fn open_fit_hold(
          SET consecutive = excluded.consecutive,
              first_attempt = excluded.first_attempt,
              last_attempt = excluded.last_attempt,
-             diagnostics = excluded.diagnostics",
+             diagnostics = excluded.diagnostics,
+             status = excluded.status",
     )
     .bind(subject.as_str())
     .bind(i64::from(consecutive))

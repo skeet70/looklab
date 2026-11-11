@@ -1,5 +1,7 @@
-# Community LUT donations. Every entry is CC0-1.0 and is imported with
-# `looklab lut-look import`; the source bytes are never edited.
+# Community LUT donations. Every entry is CC0-1.0. `looklab admin import-lut`
+# reads one entry, checks the cube bytes against `sha256` and stores the
+# admission the worker's `lut_import` job publishes. The source bytes are never
+# edited.
 
 [donor]
 handle = "mistycycles"
@@ -13,46 +15,88 @@ body = "fujifilm/x-e3"
 notes = "Metadata only. The X-E3 does not offer Eterna or Classic Negative."
 
 [[lut]]
+name = "Ricoh GRIV Cinema Green"
+look = "ricoh-griv-cinema-green"
 file = "Ricoh_GRIV_Cinema_Green_SRGB.cube"
 title = "Ricoh_GRIV_Cinema_Green_v1 sRGB 33-grid - highlights -1/3 stop"
 sha256 = "111d50be9209b064d0a7a48ee0b69077737f358b39111330c763be1caad09aab"
 role = "original"
-emulates = "camera rendering: ricoh / Cinema (Green)"
 provenance = "AI-tool approximation of Ricoh GR stock Cinema (Green) image control, sRGB variant; not graded by a person. Donor revision v3 (2026-11-06) lowers the brightest near-neutral tones by 1/3 stop."
-declared_input = "display-referred; intended rendering not declared"
-base_status = "base_incomplete(film_simulation)"
-look = "ricoh-griv-cinema-green"
+donor_body = "fujifilm/x-e3"
+reason = "Community LUT donation round 2026-11: CC0 sRGB grade, admitted as a labelled approximate preview on the neutral baseline because the film simulation is not yet known."
+
+[lut.emulates]
+kind = "camera_rendering"
+maker = "ricoh"
+rendering = "Cinema (Green)"
+
+[lut.encoding]
+kind = "display"
+
+[lut.encoding.base]
+kind = "body_realization"
+body = "fujifilm/x-e3"
+renderer = "unspecified"
+notes = "Fujifilm X-E3 RAW through an unnamed RAW converter."
 
 [[lut]]
+name = "Ricoh GRIV Cinema Green (F-Log2)"
+look = "ricoh-griv-cinema-green-flog2"
 file = "Ricoh_GRIV_Cinema_Green_FLog2.cube"
 title = "Ricoh_GRIV_Cinema_Green_v1 F-Log2 input"
 sha256 = "40b466dfcc1815581f7657b38730f20e8d70394fa0bf3a34d9dd5f291117d673"
 role = "internal-test"
-emulates = "camera rendering: ricoh / Cinema (Green)"
 provenance = "AI-tool approximation of Ricoh GR stock Cinema (Green) image control, sRGB variant; not graded by a person. Converted to F-Log2/F-Gamut input by the same AI tool from the first sRGB revision, before the v3 highlight change."
-declared_input = "scene-referred log: F-Log2 transfer, F-Gamut"
-declared_output = "sRGB"
-look = "ricoh-griv-cinema-green-flog2"
+reason = "Community LUT donation round 2026-11: CC0 internal-test F-Log2 conversion, admitted for preview and comparison."
+
+[lut.emulates]
+kind = "camera_rendering"
+maker = "ricoh"
+rendering = "Cinema (Green)"
+
+[lut.encoding]
+kind = "flog2_fgamut"
 
 [[lut]]
+name = "Leica Classic Gold 200"
+look = "leica-classic-gold-200"
 file = "Leica_Classic_Gold_200.cube"
 title = "LClassic_Neo_Gold_200 sRGB 33-grid"
 sha256 = "db66d96ca4be91dbe097f2884f096f2b8219a03ee31521fd7636b8f7344926cd"
 role = "original"
 provenance = "Unofficial donor-defined grade, not an official Leica rendering or a confirmed emulation of one. The donor declared Eterna DR200 as the theoretical intended base but did not apply the LUT on it; their X-E3 lacks Eterna."
 donor_body = "fujifilm/x-e3"
-declared_input = "display-referred; family rendering fujifilm / Eterna, DR200, other settings default"
-base_status = "base_identified_unmeasured"
-look = "leica-classic-gold-200"
+reason = "Community LUT donation round 2026-11: CC0 donor grade, admitted as a labelled approximate preview on the neutral baseline because no measured base exists for the declared Eterna DR200 rendering."
+
+[lut.encoding]
+kind = "display"
+
+[lut.encoding.base]
+kind = "family_rendering"
+maker = "fujifilm"
+rendering = "Eterna"
+dynamic_range = "dr200"
 
 [[lut]]
+name = "CineStill 800T pushed to 1600"
+look = "cinestill-800t-pushed-1600"
 file = "CineStill_800T_1600T_sRGB_V4.cube"
 title = "CineStill 800T pushed to 1600 (approximation) sRGB"
 sha256 = "098a1a3e78b2c665307e708e68d3df93c64cc78e1674f3bbcd31659f11269d46"
 role = "original"
-emulates = "film stock: CineStill 800T"
 provenance = "Intended base declared by the donor; the LUT was authored for this base and not applied on it (donor body X-E3 lacks the sim)."
 donor_body = "fujifilm/x-e3"
-declared_input = "display-referred; family rendering fujifilm / Classic Negative, DR400, other settings default"
-base_status = "base_identified_unmeasured"
-look = "cinestill-800t-pushed-1600"
+reason = "Community LUT donation round 2026-11: CC0 film-stock approximation, admitted as a labelled approximate preview on the neutral baseline because no measured base exists for the declared Classic Negative DR400 rendering."
+
+[lut.emulates]
+kind = "film_stock"
+name = "CineStill 800T"
+
+[lut.encoding]
+kind = "display"
+
+[lut.encoding.base]
+kind = "family_rendering"
+maker = "fujifilm"
+rendering = "Classic Negative"
+dynamic_range = "dr400"

@@ -321,3 +321,147 @@ async fn contribution_moderation_state_is_append_only_and_sticky() {
         .await
         .expect("withdrawal remains allowed");
 }
+
+#[tokio::test]
+async fn operator_actor_migration_keeps_existing_rows() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("memory database");
+    for sql in [
+        include_str!("../migrations/0001_init.sql"),
+        include_str!("../migrations/0002_scope_rules.sql"),
+        include_str!("../migrations/0003_proposals.sql"),
+        include_str!("../migrations/0004_publication.sql"),
+        include_str!("../migrations/0005_worker_bookkeeping.sql"),
+        include_str!("../migrations/0006_worker_proposals.sql"),
+        include_str!("../migrations/0007_fixture_uploads.sql"),
+        include_str!("../migrations/0008_bounties.sql"),
+        include_str!("../migrations/0009_card_contributions.sql"),
+        include_str!("../migrations/0010_card_verifications.sql"),
+        include_str!("../migrations/0011_browser_sessions.sql"),
+        include_str!("../migrations/0012_fit_attempts.sql"),
+        include_str!("../migrations/0013_setting_source.sql"),
+        include_str!("../migrations/0014_look_listing.sql"),
+        include_str!("../migrations/0015_publish_requests.sql"),
+        include_str!("../migrations/0016_lut_dependencies.sql"),
+        include_str!("../migrations/0017_look_reverts.sql"),
+        include_str!("../migrations/0018_look_refit_requests.sql"),
+        include_str!("../migrations/0019_send_manifests.sql"),
+        include_str!("../migrations/0020_blob_staging.sql"),
+        include_str!("../migrations/0021_deferred_monochrome.sql"),
+        include_str!("../migrations/0022_manual_catalog.sql"),
+        include_str!("../migrations/0023_manual_confirmation_withdrawal.sql"),
+        include_str!("../migrations/0024_manual_confirmation_blocked_sends.sql"),
+        include_str!("../migrations/0025_manual_confirmation_occurrences.sql"),
+        include_str!("../migrations/0026_lut_uploads.sql"),
+        include_str!("../migrations/0027_client_errors.sql"),
+        include_str!("../migrations/0028_model_qualification.sql"),
+        include_str!("../migrations/0029_pending_consumption.sql"),
+        include_str!("../migrations/0030_recipe_source_binding.sql"),
+        include_str!("../migrations/0031_snapshot_activation.sql"),
+        include_str!("../migrations/0032_artifact_fit_diagnostic.sql"),
+        include_str!("../migrations/0033_publication_history.sql"),
+        include_str!("../migrations/0034_rendered_recipe_evidence.sql"),
+        include_str!("../migrations/0035_contribution_moderation.sql"),
+        include_str!("../migrations/0036_lut_preview_base.sql"),
+    ] {
+        sqlx::raw_sql(sql).execute(&pool).await.expect("migration");
+    }
+    sqlx::query(
+        "INSERT INTO credentials (id, credential_id, webauthn_credential, created_at)
+         VALUES ('row-cred', x'01', '{}', 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("credential");
+    sqlx::query(
+        "INSERT INTO proposals
+         (id, credential_id, type, payload, human_summary, evidence, status, created_at)
+         VALUES ('row-proposal', 'row-cred', 'lut_look', '{}', 'x', '[]', 'pending', 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("proposal");
+    sqlx::query(
+        "INSERT INTO moderation_decisions
+         (id, proposal_id, moderator_credential, decision, reason, decided_at)
+         VALUES ('decision', 'row-proposal', 'row-cred', 'approve', 'before', 7)",
+    )
+    .execute(&pool)
+    .await
+    .expect("decision");
+    sqlx::query(
+        "INSERT INTO lut_uploads
+         (proposal_id, sha256, credential_id, file, size, created_at)
+         VALUES ('row-proposal', x'abababababababababababababababababababababababababababababababab',
+                 'row-cred', 'before.cube', 4096, 9)",
+    )
+    .execute(&pool)
+    .await
+    .expect("upload");
+    sqlx::raw_sql(include_str!("../migrations/0037_operator_actor.sql"))
+        .execute(&pool)
+        .await
+        .expect("operator actor migration");
+
+    let decision: (String, String, String, i64) = sqlx::query_as(
+        "SELECT moderator_credential, decision, reason, decided_at
+         FROM moderation_decisions WHERE id = 'decision'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("decision");
+    assert_eq!(
+        decision,
+        (
+            "row-cred".to_owned(),
+            "approve".to_owned(),
+            "before".to_owned(),
+            7
+        )
+    );
+    let upload: (String, Vec<u8>, i64, i64) = sqlx::query_as(
+        "SELECT file, sha256, size, created_at FROM lut_uploads WHERE proposal_id = 'row-proposal'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("upload");
+    assert_eq!(upload.0, "before.cube");
+    assert_eq!(upload.1, vec![0xab; 32]);
+    assert_eq!(upload.2, 4096);
+    assert_eq!(upload.3, 9);
+
+    sqlx::query(
+        "INSERT INTO moderation_decisions
+         (id, proposal_id, moderator_credential, decision, reason, decided_at)
+         VALUES ('cli-decision', 'row-proposal', 'cli', 'approve', 'after', 10)",
+    )
+    .execute(&pool)
+    .await
+    .expect("cli decision");
+    sqlx::query(
+        "INSERT INTO proposals
+         (id, credential_id, type, payload, human_summary, evidence, status, created_at)
+         VALUES ('row-proposal-2', NULL, 'lut_look', '{}', 'x', '[]', 'approved', 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("operator proposal");
+    sqlx::query(
+        "INSERT INTO lut_uploads
+         (proposal_id, sha256, credential_id, file, size, created_at)
+         VALUES ('row-proposal-2', x'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd',
+                 NULL, 'after.cube', 1, 10)",
+    )
+    .execute(&pool)
+    .await
+    .expect("operator upload");
+    let referenced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blob_references WHERE hash = ?")
+        .bind("cd".repeat(32))
+        .fetch_one(&pool)
+        .await
+        .expect("references");
+    assert_eq!(referenced, 1);
+}

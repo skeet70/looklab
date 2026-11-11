@@ -76,10 +76,10 @@ w_img = base(kind) × evidence × tier × reputation        → then caps (§6)
 | `gradient` | 1.0 |
 | `chart` | 2.0 |
 
-- `evidence = coverage_gain^0.5 × (1 − clip_fraction)`, clamped to [0.1, 1]. Computed **at fit time** from the samples, against the density of the rest of the pool **with this image left out**, so it doesn't depend on upload order.
+- `evidence = coverage_gain^0.5 × (1 − clip_fraction)`, clamped to [0.1, 1]. Computed **at fit time** from the samples, against the density of the rest of the pool **with this image left out**, so it doesn't depend on upload order. For a Look weight the pool is that family's native images; for a body weight it is every image entering the body fit. A render of the same RAW in another film simulation therefore lowers body evidence, not the other family's Look evidence.
 - **σ_v is in the likelihood only** ([02 §4.1](02-color-pipeline.md)). It's not a weight factor.
 - Per-image consistency checks apply regardless of tier. Diagnostics in an unqualified scope remain experimental rather than automatically changing qualified consistency/reputation state (§8.2).
-- **Duplicates (honest):** images from the same effective contributor with the same capture-metadata tuple are merged into one weight. Shuffling makes uploads byte-different, so there's no byte-level comparison.
+- **Duplicates (honest):** images from the same effective contributor with the same capture-metadata tuple are merged into one weight. The tuple includes the recorded in-camera look settings, so re-renders of one RAW at different settings or film simulations stay separate weights. Shuffling makes uploads byte-different, so there's no byte-level comparison.
 - **Chart anchoring of input transforms:** only chart sessions from `endorsed` or `seeder` credentials enter as gauge anchors with tight priors ([02 §2](02-color-pipeline.md)). New-tier chart sessions count as ordinary data, subject to the body-level cap (§6).
 - **Deferred monochrome:** scientific fit weight is zero. These records are excluded from colour Look parameters, input transforms, shared body exposure/WB parameters, gauge estimates, colour uncertainty, supported-image counts, cap denominators and release scores. The worker enforces this on every analysis entry point, including stale jobs; intake rejects a signed colour classification that conflicts with the schema or rendering metadata.
 - A shared RAW establishes correspondence, not an exposure reference. Monochrome re-renders remain correlated captures, even with different filters. Future monochrome analysis may consume a frozen, versioned colour calibration; feedback into shared calibration requires separate evidence.
@@ -113,7 +113,7 @@ Any supported body's eligible native evidence may seed a previously unseen famil
 
 ## 8. Release gates and rollback
 
-**Anchor:** the first rooted version of a Look, or the last version a moderator explicitly re-anchored (the re-anchor action requires a reason, e.g. a new root session). Re-anchoring is needed so that legitimate long-term improvement isn't blocked forever.
+**Anchor:** the first published version of a Look is its anchor. It changes only when a moderator explicitly re-anchors (the re-anchor action requires a reason, e.g. a new root session). Re-anchoring is needed so that legitimate long-term improvement isn't blocked forever.
 
 **Release scope.** A canonical native-family target and a `(body, epoch, native_sim)` realization have separate immutable revisions and selected histories ([03 §1](03-data-model.md#1-entities)). A realization pins its target and calibration/CRM dependencies. Previous/anchor lookup, support history, attempts, resumable state and holds use that subject, not just a shared Look slug. Cohort updates preserve the family's anchor and gauge; scope splits retain applicable parent comparison lineage.
 
@@ -129,6 +129,8 @@ When no historical comparison exists, the corresponding gate is initialization/n
 - independent held-out model-error evidence for that output encoding and colour/exposure cell.
 
 Enter and exit thresholds differ so that honest boundary jitter does not flip a probe between versions, and the previous published version's per-cause state is an input to marking. The first version uses the enter rule only. The absolute floor means data uploaded elsewhere cannot push a rare region below it.
+
+A native-family pool with fewer than two independent capture groups cannot hold out a fold and keep an image, so no probe can meet the held-out evidence cause and the version supports no probe. Its convergence and every numerical gate above are unchanged, and it still publishes: status `published`, no qualification report on the family head, scope `Experimental`, an active request for the missing independent captures, no firmware card, and a version notice. This zero-support subset of source-limited targets is never a qualified target; a source-limited target with supported probes keeps the existing same-camera qualified path.
 
 A candidate target or realization is eligible for publication only if its required numerical and uncertainty computations pass and the applicable release comparisons below pass:
 
@@ -168,6 +170,8 @@ An immutable `MatchBundleRevision` for `(body, epoch)` publishes independently o
 
 Preparation availability, numerical validity, empirical qualification, publication eligibility and rooted trust are separate axes. A numerically valid, gate-passing experimental realization may be published against a publishable pinned target. A failed or non-converged candidate may expose permitted diagnostics, not accepted render/match artifacts. Missing resources and missing empirical evidence have different reasons and evidence requests.
 
+A source-limited target with no supported probe is published as an experimental target under those separate axes: publication eligibility follows its artifacts and base pin, so it carries an `Eligible` target snapshot and status `published`, while its qualification scope is `Experimental` because the family head has no report. It stays listed, matchable and previewable, offers no firmware card, and its settings result states that no region has an independently checked measurement. Experimental matching over it uses the target's published supported probes, falls back to the unchanged sigma and density predicates when the published mask supports none, and states how many images the estimate rests on ([02 §5](02-color-pipeline.md#5-uncertainty)). Qualified selection never uses it.
+
 Qualification reports bind the exact candidate, private evidence roles, schema/epoch/profile interpretation, source implementation/options, probe set, rule version and assessed settings/conditions ([03 §1](03-data-model.md#1-entities)). The three common protocols are conditional native prediction, controls and matching, and cross-body pooling ([02 §5.1](02-color-pipeline.md#51-qualification-claims-and-protocols)). Default-setting evidence does not qualify nondefault controls; numeric endpoints or separate control checks do not prove untested intervals or combinations. No empty or unavailable assessment passes, and no report proves absolute calibration from a source label or self-consistency.
 
 P4.3's known-reference uncertainty coverage is an engine-version prerequisite for qualified multi-body activation, not a latent-truth requirement for each new camera. Camera/domain admission uses the scoped P1.9 agreement and independent discrepancy/support evidence under pinned calibration assumptions. Admission schedules a new qualified-cohort family fit; only a passing candidate becomes selected. It does not copy a camera-local diagnostic target into the family. A seed cohort's source-limited updates do not claim cross-body qualification.
@@ -175,6 +179,8 @@ P4.3's known-reference uncertainty coverage is an engine-version prerequisite fo
 The worker promotes passing scoped assessments automatically and keeps missing-evidence requests current. Qualification does not grant a tier, endorsement, root admission or re-anchor. Missing evidence is not a camera-promotion moderation queue. Keep fixed versioned protocols, immutable reports, dependency links and a small current projection on existing jobs; no separate scheduler or camera-specific policy code is required. Implementation rationale and acceptance cases are in the [qualification plan](model-qualification-plan.md).
 
 A prerequisite request may be active before a numerical candidate exists. It is keyed by subject, capability and evidence kind; the worker updates it as usable independent capture groups change and resolves it when that prerequisite is satisfied. It is advisory, not an assessment outcome or a promotion.
+
+For a zero-support source-limited target the request stays active after publication and resolves when a second independent capture group arrives. The wanted-shots card labels the request from whether its Look has a published version, and the call to action names more independent photos of that film simulation on that camera, with one RAW re-rendered to several simulations counting as one capture.
 
 ### 8.2 Experimental isolation
 
@@ -285,6 +291,7 @@ Maintainers can request the **Full-scale validation** workflow manually. Its loc
   - epoch/look splits;
   - Look hiding, removal and relisting;
   - release manifests.
+- An operator LUT admission through `looklab admin import-lut` writes the same `moderation_decision` row as a moderator approval, with the CLI actor.
 - Artifacts are **content-addressed** ([03 §4](03-data-model.md)). Each version manifest lists its artifact hashes, and clients check downloaded artifacts against the manifest.
 - Qualification reports and current applicability notices are hash-bound through the publication root. Private evidence/dependency records remain private; public reports expose permitted aggregates, reasons and limitations, not sample contents, RAW identifiers, credential keys or serial HMACs.
 - Entries reference credentials by internal id or display handle, never by public key or serial HMAC. Historical revert entries keep their original credential-exclusion payload and render as previous-policy exclusions; they are not rewritten into contribution ids.

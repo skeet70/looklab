@@ -27,6 +27,7 @@ mod status;
 pub use bodies::BodiesPage;
 pub use body::BodyDetail;
 pub use bounties::BountiesPage;
+pub(crate) use bounties::ExperimentalEvidence;
 pub use compare::ComparePage;
 pub use contribute::ContributePage;
 pub use developers::{DevelopersPage, PipelinesPage};

@@ -137,6 +137,7 @@ fn neutral_probes() -> ProbeUncertainty {
             supported_bias: false,
             supported_evidence: false,
             supported: false,
+            support_withheld: false,
             clusters: 10,
         })
         .collect();
@@ -928,6 +929,46 @@ fn insufficient_evidence_is_a_typed_failure() {
     assert!(matches!(error, FitError::NoModelErrorEvidence));
     let error = estimate_model_error(&[], &[], None, &options(19), 0.03).expect_err("no images");
     assert!(matches!(error, FitError::NoImages));
+}
+
+#[test]
+fn a_pool_without_a_held_out_fold_returns_an_unsupported_result() {
+    let data = synth::dataset(&SynthConfig {
+        seed: 810,
+        images: 4,
+        samples_per_image: 300,
+        ..SynthConfig::default()
+    });
+    let group = RerenderGroupId::new([0; 16]);
+    let images: Vec<FitImage> = data
+        .images
+        .iter()
+        .map(|image| copy_with_group(image, group))
+        .collect();
+    let result = fit(&images, &FitOptions::default()).expect("fit without held-out evidence");
+    assert!(result.diagnostics.converged);
+    assert_eq!(result.probes.probes.len(), probes_v1().probes.len());
+    assert_eq!(result.probes.supported_fraction, 0.0);
+    for probe in &result.probes.probes {
+        assert!(!probe.supported_evidence);
+        assert!(!probe.supported);
+        assert!(
+            probe
+                .covariance
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert!(
+            probe
+                .post_covariance
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert!(probe.sigma_de.is_finite());
+        assert!(probe.post_sigma_de.is_finite());
+    }
 }
 
 fn copy_with_group(image: &FitImage, group: RerenderGroupId) -> FitImage {

@@ -57,6 +57,9 @@ pub struct CardDto {
     pub output: Option<OutputContext>,
     pub confidence: ConfidenceDto,
     pub confidence_reason: String,
+    /// Set when the target's published support mask supported nothing.
+    #[serde(default)]
+    pub experimental: Option<looklab_match::ImageCount>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +119,7 @@ impl CardDto {
             output: card.output,
             confidence: level_value(card.confidence.level),
             confidence_reason: card.confidence.reason.clone(),
+            experimental: card.experimental,
         }
     }
 }

@@ -17,7 +17,7 @@ use crate::metric::{AssessmentStatus, OutputContext, ScoringMetric, TargetAppear
 use crate::model::MatchModel;
 use crate::optimizer::{Suggestion, quantile};
 use crate::settings::Plan;
-use crate::target::PreparedTarget;
+use crate::target::{ImageCount, PreparedTarget, TargetSupport};
 
 /// The numerical tolerance a reachability witness must meet at every declared point.
 pub const REACHABILITY_TOLERANCE_DE: f64 = 2.0;
@@ -126,6 +126,9 @@ pub struct SettingsCard {
     pub reachability: Reachability,
     pub missed: Vec<MissedRegion>,
     pub confidence: Confidence,
+    /// Set when the target's published support mask supported nothing and the
+    /// sigma and density predicates chose the probes.
+    pub experimental: Option<ImageCount>,
 }
 
 impl SettingsCard {
@@ -183,6 +186,13 @@ impl SettingsCard {
             "confidence: {} ({})\n",
             self.confidence.level, self.confidence.reason
         ));
+        if let Some(images) = self.experimental {
+            out.push_str(&format!(
+                "support: experimental estimate resting on {} {}; no region has an independent held-out check\n",
+                images.get(),
+                if images.get() == 1 { "image" } else { "images" }
+            ));
+        }
         out
     }
 }
@@ -407,6 +417,10 @@ pub fn settings_card_with_support(
     let exposure_note = exposure_note(plan, &suggestion.settings);
     let confidence = confidence(target, plan, model, &suggestion.settings);
     let output = target.optional_output_context(model, &suggestion.settings)?;
+    let experimental = match target.support {
+        TargetSupport::Published => None,
+        TargetSupport::Experimental(images) => Some(images),
+    };
     Ok(SettingsCard {
         sim: model.sim().clone(),
         metric,
@@ -421,6 +435,7 @@ pub fn settings_card_with_support(
         reachability,
         missed,
         confidence,
+        experimental,
     })
 }
 
@@ -660,7 +675,10 @@ fn confidence(
     let planned = plan.plan_controls.len();
     let fraction = target.support_fraction();
     let target_uncertainty = target.target_uncertainty == AssessmentStatus::Assessed;
-    let level = if covered == planned
+    let experimental = matches!(target.support, TargetSupport::Experimental(_));
+    let level = if experimental {
+        ConfidenceLevel::Low
+    } else if covered == planned
         && extrapolated == 0
         && fraction >= 0.9
         && model.covariance.is_some()
@@ -673,13 +691,15 @@ fn confidence(
     } else {
         ConfidenceLevel::Low
     };
-    let support = if target_uncertainty {
+    let support = if experimental {
+        "the published support has no independently checked region".to_string()
+    } else if target_uncertainty {
         format!("{:.0}% of probes are supported", fraction * 100.0)
     } else {
         "probe support is unassessed".to_string()
     };
     let reason = format!(
-        "{covered} of {planned} solve-plan controls have nondefault observed responses; {extrapolated} recommended values extrapolate; {missing} controls lack nondefault support; {support}{}{}",
+        "{covered} of {planned} solve-plan controls have nondefault observed responses; {extrapolated} recommended values extrapolate; {missing} controls lack nondefault support; {support}{}{}{}",
         if model.covariance.is_none() {
             "; no control-response covariance, so the predicted band is unavailable"
         } else {
@@ -689,6 +709,11 @@ fn confidence(
             ""
         } else {
             "; target probe uncertainty is unassessed for this metric"
+        },
+        if experimental {
+            "; the estimate is not a checked rating"
+        } else {
+            ""
         }
     );
     Confidence { level, reason }

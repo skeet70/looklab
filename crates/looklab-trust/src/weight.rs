@@ -61,6 +61,13 @@ impl CaptureTuple {
             look: encode(&metadata.look)?,
         })
     }
+
+    /// Sets the look slot from the stored wire mirror of the in-camera settings, so
+    /// re-renders of one RAW at different settings stay separate weights.
+    pub fn with_wire_look(mut self, look: Option<&looklab_upload::LookSettings>) -> Result<Self> {
+        self.look = encode(&look)?;
+        Ok(self)
+    }
 }
 
 fn encode<T: Serialize>(value: &Option<T>) -> Result<Option<Vec<u8>>> {

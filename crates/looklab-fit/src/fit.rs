@@ -2171,21 +2171,33 @@ fn run_inner(
         // The published σ includes the same body/image K-fold model-error term the
         // bootstrap path uses, so systematic basis misfit widens support probes.
         let clip_k = params.clip_k();
-        let field = estimate_model_error(&native, &[], model.as_ref(), options, clip_k)?;
         let space = problem
             .images
             .first()
             .map_or(looklab_color::RgbSpace::Srgb, |image| image.space);
-        apply_model_error(
-            &mut probe_result,
-            &field,
-            &look,
-            &density,
-            space,
-            options,
-            clip_k,
-            previous,
-        );
+        match estimate_model_error(&native, &[], model.as_ref(), options, clip_k) {
+            Ok(field) => {
+                apply_model_error(
+                    &mut probe_result,
+                    &field,
+                    &look,
+                    &density,
+                    space,
+                    options,
+                    clip_k,
+                    previous,
+                );
+                crate::uncertainty::unsupport_unreliable(&mut probe_result);
+            }
+            Err(FitError::NoModelErrorEvidence) => {
+                for probe in &mut probe_result.probes {
+                    probe.supported_evidence = false;
+                    probe.supported = false;
+                }
+                probe_result.supported_fraction = 0.0;
+            }
+            Err(error) => return Err(error),
+        }
     }
     let control_response = if reference_mode {
         None
@@ -2432,6 +2444,37 @@ impl AppliedStep {
             Self::Cauchy => "cauchy",
             Self::Box => "box",
         }
+    }
+}
+
+/// The trust-region or Cauchy candidate that wins the ordinary predicted-decrease ranking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrdinaryStep {
+    TrustRegion,
+    Cauchy,
+}
+
+impl From<OrdinaryStep> for AppliedStep {
+    fn from(step: OrdinaryStep) -> Self {
+        match step {
+            OrdinaryStep::TrustRegion => Self::TrustRegion,
+            OrdinaryStep::Cauchy => Self::Cauchy,
+        }
+    }
+}
+
+/// The box alternative replaces the ordinary winner only when it ranks first on predicted
+/// decrease and its realized decrease is strictly larger.
+fn guarded_selection(
+    ordinary: OrdinaryStep,
+    box_ranked_first: bool,
+    ordinary_decrease: f64,
+    box_decrease: f64,
+) -> AppliedStep {
+    if box_ranked_first && box_decrease > ordinary_decrease {
+        AppliedStep::Box
+    } else {
+        ordinary.into()
     }
 }
 
@@ -2711,9 +2754,9 @@ fn analytic_attempts(
             _ => false,
         };
         let ordinary = if cauchy_wins {
-            Some(AppliedStep::Cauchy)
+            Some(OrdinaryStep::Cauchy)
         } else if tr_prediction.is_some() {
-            Some(AppliedStep::TrustRegion)
+            Some(OrdinaryStep::TrustRegion)
         } else {
             None
         };
@@ -2784,19 +2827,47 @@ fn analytic_attempts(
             }
         }
         let ordinary_prediction = match ordinary {
-            AppliedStep::TrustRegion => tr_prediction,
-            AppliedStep::Cauchy => cauchy_prediction,
-            AppliedStep::Box => None,
+            OrdinaryStep::TrustRegion => tr_prediction,
+            OrdinaryStep::Cauchy => cauchy_prediction,
         };
-        // Additive candidate: box replaces the ordinary winner only on a strictly larger
-        // fresh realized prediction.
-        let selected = if box_prediction
+        let box_ranked_first = box_prediction
             .zip(ordinary_prediction)
-            .is_some_and(|(boxed, ordinary)| boxed > ordinary)
-        {
-            AppliedStep::Box
+            .is_some_and(|(boxed, ordinary)| boxed > ordinary);
+        let mut evaluate = |trial_params: &Params| {
+            let candidate = stage_problem.pass(
+                trial_params,
+                stage.active,
+                &mut [],
+                false,
+                false,
+                stage.neutral,
+                IntentFilter::NativeOnly,
+            );
+            *evaluations += 1;
+            *sample_evaluations += samples_per_pass;
+            let trial_cost = candidate.cost
+                + total_cost(problem, trial_params, blocks, penalties, lambdas, options);
+            (candidate, trial_cost)
+        };
+        let (mut candidate, mut trial_cost) = evaluate(match ordinary {
+            OrdinaryStep::TrustRegion => &*trial_params,
+            OrdinaryStep::Cauchy => &*cauchy_params,
+        });
+        let selected = if box_ranked_first {
+            let (box_candidate, box_cost) = evaluate(box_params);
+            let applied = guarded_selection(
+                ordinary,
+                box_ranked_first,
+                cost - trial_cost,
+                cost - box_cost,
+            );
+            if applied == AppliedStep::Box {
+                candidate = box_candidate;
+                trial_cost = box_cost;
+            }
+            applied
         } else {
-            ordinary
+            ordinary.into()
         };
         let (selected_params, selected_step, selected_product, prediction) = match selected {
             AppliedStep::TrustRegion => (
@@ -2818,26 +2889,6 @@ fn analytic_attempts(
                 box_prediction.unwrap_or(f64::NAN),
             ),
         };
-        let candidate = stage_problem.pass(
-            selected_params,
-            stage.active,
-            &mut [],
-            false,
-            false,
-            stage.neutral,
-            IntentFilter::NativeOnly,
-        );
-        *evaluations += 1;
-        *sample_evaluations += samples_per_pass;
-        let trial_cost = candidate.cost
-            + total_cost(
-                problem,
-                selected_params,
-                blocks,
-                penalties,
-                lambdas,
-                options,
-            );
         let decrease = cost - trial_cost;
         let ratio = decrease / prediction;
         if !candidate.infeasible
@@ -3001,9 +3052,17 @@ impl FixedLinearizationOrdinary {
             Self::None => "none",
         }
     }
+
+    fn winner(self) -> FixedLinearizationWinner {
+        match self {
+            Self::TrustRegion => FixedLinearizationWinner::TrustRegion,
+            Self::Cauchy => FixedLinearizationWinner::Cauchy,
+            Self::None => FixedLinearizationWinner::None,
+        }
+    }
 }
 
-/// The production predicted-decrease winner after the box candidate is considered.
+/// The candidate production applies after the box guard.
 #[cfg(feature = "synth")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FixedLinearizationWinner {
@@ -3060,7 +3119,7 @@ impl FixedLinearizationBoxSource {
     }
 }
 
-/// What production would do with the predicted winner.
+/// What production would do with the applied candidate.
 #[cfg(feature = "synth")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FixedLinearizationDisposition {
@@ -4033,17 +4092,18 @@ pub fn diagnose_fixed_linearization(
         report.box_trial = Some(trial_result(trial_cost, infeasible, prediction));
     }
 
-    let box_wins = ordinary_prediction
+    let box_ranked_first = ordinary_prediction
         .zip(box_positive)
         .is_some_and(|(ordinary, boxed)| boxed > ordinary);
-    report.winner = if box_wins {
+    let box_applied = box_ranked_first
+        && report
+            .ordinary_trial
+            .zip(report.box_trial)
+            .is_some_and(|(ordinary, boxed)| boxed.decrease > ordinary.decrease);
+    report.winner = if box_applied {
         FixedLinearizationWinner::Box
     } else {
-        match report.ordinary {
-            FixedLinearizationOrdinary::TrustRegion => FixedLinearizationWinner::TrustRegion,
-            FixedLinearizationOrdinary::Cauchy => FixedLinearizationWinner::Cauchy,
-            FixedLinearizationOrdinary::None => FixedLinearizationWinner::None,
-        }
+        report.ordinary.winner()
     };
     report.winner_candidate = match report.winner {
         FixedLinearizationWinner::TrustRegion => report.tr,
@@ -12439,6 +12499,44 @@ mod lifecycle_tests {
             | FinalOutcome::SigmaRefresh
             | FinalOutcome::Unresolved(_) => {}
         }
+    }
+
+    #[test]
+    fn box_prediction_lead_yields_to_a_larger_realized_decrease() {
+        // Controlled-recovery endpoint: box predicted 4.42980459456707649e2 and realized
+        // 7.64977619483199760e1; trust-region predicted 3.55131986310910918e2 and realized
+        // 2.77056179438026902e2.
+        assert_eq!(
+            guarded_selection(
+                OrdinaryStep::TrustRegion,
+                true,
+                2.770_561_794_380_269e2,
+                7.649_776_194_831_998e1
+            ),
+            AppliedStep::TrustRegion
+        );
+        assert_eq!(
+            guarded_selection(
+                OrdinaryStep::TrustRegion,
+                true,
+                2.770_561_794_380_269e2,
+                2.770_561_794_380_27e2
+            ),
+            AppliedStep::Box
+        );
+        assert_eq!(
+            guarded_selection(
+                OrdinaryStep::Cauchy,
+                true,
+                5.750_634_682_022_542e1,
+                5.750_634_682_022_542e1
+            ),
+            AppliedStep::Cauchy
+        );
+        assert_eq!(
+            guarded_selection(OrdinaryStep::Cauchy, false, 5.750_634_682_022_542e1, 9.0e1),
+            AppliedStep::Cauchy
+        );
     }
 
     #[test]

@@ -139,7 +139,7 @@ fn BodyDetailView(body: BodyPage, manual: Option<ManualPage>) -> impl IntoView {
         <p class="lede">"Its built-in looks, the evidence behind them, and settings to get one on your camera."</p>
         <h2>"Built-in looks"</h2>
         {move || match gallery.get() { Load::Ready(LookGallery { index, scene, preview_error }) => {
-            let items=super::looks::cards(&index);
+            let items=super::looks::cards(&index, None);
             if items.is_empty() {
                 crate::prefetch::route_rendered();
                 return view! {

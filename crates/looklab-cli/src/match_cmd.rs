@@ -7,14 +7,14 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use looklab_color::Mat3;
 use looklab_match::{
-    Calibration, ControlCovariance, Emphasis, FitObservedOptions, MatchModel, MatchOptions,
-    ObservedRender, OutputPin, Permalink, PermalinkSources, Plan, PreparedTarget, QualificationRef,
-    ReportPin, ReportSubject, ScaleFitter, ScoringMetric, SelectionContext, SelectionMode,
-    TargetAppearance, TargetSpec, measure_target_error, optimize, optimize_scoped,
+    Calibration, ControlCovariance, Emphasis, FitObservedOptions, ImageCount, MatchModel,
+    MatchOptions, ObservedRender, OutputPin, Permalink, PermalinkSources, Plan, PreparedTarget,
+    QualificationRef, ReportPin, ReportSubject, ScaleFitter, ScoringMetric, SelectionContext,
+    SelectionMode, TargetAppearance, TargetSpec, measure_target_error, optimize, optimize_scoped,
     settings_card_with_support,
 };
 use looklab_model::ProbeSetVersion;
-use looklab_model::file::LookDocument;
+use looklab_model::file::{LookDocument, MatchRefusal};
 use looklab_model::realization::{ControlResponseModel, Settings, decode_crm, encode_crm};
 use looklab_publish::{
     ArtifactHash, ArtifactName, MANIFEST_NAME, MatchBundle, TargetEligibilitySnapshot,
@@ -196,10 +196,15 @@ pub fn run_match(args: &MatchArgs) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("unknown emphasis {:?}", args.emphasis))?;
     validate_match_args(args)?;
     let document = util::load_document(&args.look)?;
-    if let Some(refusal) = document.match_refusal() {
+    let selection = selection_context(args, &document)?;
+    let experimental = selection
+        .as_ref()
+        .is_some_and(|context| context.mode == SelectionMode::Experimental);
+    if let Some(refusal) = document.match_refusal()
+        && !(experimental && refusal == MatchRefusal::Unsupported)
+    {
         bail!("this Look is not matchable: {refusal}");
     }
-    let selection = selection_context(args, &document)?;
     let output_encoding = OutputEncoding::from(args.output_encoding);
     let LoadedMatchInputs {
         schema,
@@ -256,17 +261,15 @@ pub fn run_match(args: &MatchArgs) -> Result<()> {
     }
     let requested_points = looklab_model::probes::v1().probes.len();
     let uncertainty = document.uncertainty.restrict_to(&probe_indices)?;
-    let target = PreparedTarget::new(TargetSpec {
-        probes: &probes,
-        function: &document.look,
-        uncertainty: Some(&uncertainty),
-        appearance: TargetAppearance::Rendered(OutputPin::from_document(&document)?),
+    let target = prepared_target(
+        &probes,
+        &document,
+        &uncertainty,
+        TargetAppearance::Rendered(OutputPin::from_document(&document)?),
         emphasis,
-        tau: 1.0,
-        support_sigma: 1.5,
-        density_floor: None,
-    })?
-    .with_declared_points(requested_points)?;
+        selection.as_ref().map(|context| context.mode),
+        requested_points,
+    )?;
     let options = MatchOptions {
         seed: args.seed,
         ..MatchOptions::default()
@@ -427,6 +430,35 @@ fn pinned_realization_version(args: &MatchArgs) -> Result<u32> {
         bail!("--realization-version must be positive");
     }
     Ok(version)
+}
+
+fn prepared_target<'a>(
+    probes: &'a looklab_model::ProbeSet,
+    document: &'a LookDocument,
+    uncertainty: &'a looklab_model::file::UncertaintyData,
+    appearance: TargetAppearance,
+    emphasis: Emphasis,
+    mode: Option<SelectionMode>,
+    declared_points: usize,
+) -> Result<PreparedTarget<'a>> {
+    let spec = TargetSpec {
+        probes,
+        function: &document.look,
+        uncertainty: Some(uncertainty),
+        appearance,
+        emphasis,
+        tau: 1.0,
+        support_sigma: 1.5,
+        density_floor: None,
+    };
+    let experimental = mode == Some(SelectionMode::Experimental)
+        && document.file.look.kind == looklab_model::LookKind::NativeFamily;
+    let target = if experimental {
+        PreparedTarget::experimental(spec, ImageCount::of_document(document))?
+    } else {
+        PreparedTarget::new(spec)?
+    };
+    Ok(target.with_declared_points(declared_points)?)
 }
 
 fn selection_context(
@@ -1323,17 +1355,15 @@ pub fn run_verify(args: &VerifyArgs) -> Result<()> {
     let (first_probes, first_indices) = qualification::probes(&domains)?;
     let requested_points = looklab_model::probes::v1().probes.len();
     let first_uncertainty = document.uncertainty.restrict_to(&first_indices)?;
-    let first_target = PreparedTarget::new(TargetSpec {
-        probes: &first_probes,
-        function: &document.look,
-        uncertainty: Some(&first_uncertainty),
-        appearance: target_appearance(&permalink, &document)?,
+    let first_target = prepared_target(
+        &first_probes,
+        &document,
+        &first_uncertainty,
+        target_appearance(&permalink, &document)?,
         emphasis,
-        tau: 1.0,
-        support_sigma: 1.5,
-        density_floor: None,
-    })?
-    .with_declared_points(requested_points)?;
+        permalink.selection.as_ref().map(|context| context.mode),
+        requested_points,
+    )?;
     let first_outcome = if domains.is_empty() {
         optimize(&models, &first_target, &plan, &options)?
     } else {
@@ -1393,17 +1423,15 @@ pub fn run_verify(args: &VerifyArgs) -> Result<()> {
     }
     let (second_probes, second_indices) = qualification::probes(&domains)?;
     let second_uncertainty = document.uncertainty.restrict_to(&second_indices)?;
-    let second_target = PreparedTarget::new(TargetSpec {
-        probes: &second_probes,
-        function: &document.look,
-        uncertainty: Some(&second_uncertainty),
-        appearance: target_appearance(&permalink, &document)?,
+    let second_target = prepared_target(
+        &second_probes,
+        &document,
+        &second_uncertainty,
+        target_appearance(&permalink, &document)?,
         emphasis,
-        tau: 1.0,
-        support_sigma: 1.5,
-        density_floor: None,
-    })?
-    .with_declared_points(requested_points)?;
+        next_mode,
+        requested_points,
+    )?;
     let mut updated_models = models;
     updated_models[winner_index] = updated.clone();
     let second_outcome = if domains.is_empty() {

@@ -3831,9 +3831,7 @@ pub fn fit_hierarchical(input: &HierInput, options: &HierOptions) -> Result<Hier
     if let Some(state) = &options.resume
         && (state.generation != HierStateGeneration::CURRENT || state.fingerprint != fingerprint)
     {
-        return Err(FitError::Hierarchy(
-            "resume state does not match the current hierarchy layout".to_string(),
-        ));
+        return Err(FitError::ResumeMismatch);
     }
     let mut body_states: Vec<BodyState> = input.bodies.iter().map(BodyState::initial).collect();
     let mut realization_states: Vec<RealizationState> = input
@@ -4440,9 +4438,7 @@ pub fn fit_realizations(input: &HierInput, options: &HierOptions) -> Result<Real
     if let Some(state) = &options.resume
         && (state.generation != HierStateGeneration::CURRENT || state.fingerprint != fingerprint)
     {
-        return Err(FitError::Hierarchy(
-            "resume state does not match the current hierarchy layout".to_string(),
-        ));
+        return Err(FitError::ResumeMismatch);
     }
     let mut body_states: Vec<BodyState> = input.bodies.iter().map(BodyState::initial).collect();
     let mut realization_states: Vec<RealizationState> = input

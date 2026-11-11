@@ -95,7 +95,7 @@ pub fn BodiesPage() -> impl IntoView {
             Load::Loading => ui::loading().into_any(),
             Load::Failed(error) => ui::failure(&error).into_any(),
             Load::Ready(BodiesReady { index, scene, preview_error }) => {
-                let items = cards(&index);
+                let items = cards(&index, None);
                 let needle = filter.get().to_lowercase();
                 let mut matching = camera_entries(&index)
                     .into_iter()

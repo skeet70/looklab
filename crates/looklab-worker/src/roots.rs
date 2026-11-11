@@ -108,7 +108,9 @@ pub fn load_family(
             let entry = pending
                 .entry(image.contribution.id.clone())
                 .or_insert_with(|| (BTreeSet::new(), image, admission, pool));
-            entry.0.extend(image.coverage.regions());
+            if let Some(coverage) = &image.coverage {
+                entry.0.extend(coverage.regions());
+            }
         }
     }
 
@@ -145,7 +147,12 @@ pub fn load_family(
                 && scores.effective(&image.image.id, image.outcome)
                     != Some(crate::db::ImageOutcome::Quarantined)
         })
-        .flat_map(|image| image.coverage.regions())
+        .flat_map(|image| {
+            image
+                .coverage
+                .iter()
+                .flat_map(|coverage| coverage.regions())
+        })
         .collect();
     let is_rooted = rooted(&sessions, &supported);
 

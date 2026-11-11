@@ -38,7 +38,9 @@ pub use ids::{
     ContributionId, CredentialId, EndorsementId, GrantId, JobId, LookVersionId,
     ModerationDecisionId, ProposalId, RootAdmissionId, StatusToken,
 };
-pub use proposals::expire_stale_lut_uploads;
+pub use proposals::{
+    AdmittedLut, LutAdmission, ProposalError, admit_lut, expire_stale_lut_uploads,
+};
 pub use state::{AppState, ModSessions};
 pub use store::active_snapshot_identity;
 pub use store::request_publication;
@@ -59,6 +61,7 @@ pub use verify::{RequestDomain, request_digest};
 mod manual_confirm;
 mod manuals;
 mod model_events;
+pub use model_events::contribution_identity_changed;
 pub mod model_store;
 
 pub fn router(state: Arc<AppState>) -> Router {

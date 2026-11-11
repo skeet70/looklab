@@ -252,7 +252,7 @@ pub async fn recipes() -> Result<Vec<looklab_trust::RecipeLeaderboard>, String> 
     get_json(&api_url("/api/recipes")).await
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct WantedFile {
     pub bounties: Vec<looklab_trust::Bounty>,
     #[serde(default)]
@@ -261,6 +261,67 @@ pub struct WantedFile {
 
 pub async fn wanted() -> Result<WantedFile, String> {
     get_json(&api_url("/bounties.json")).await
+}
+
+/// The wanted-shot requests, when the API is available.
+pub async fn wanted_optional() -> Option<WantedFile> {
+    if !crate::base::server_available() {
+        return None;
+    }
+    wanted().await.ok()
+}
+
+/// The Look an evidence request is about, when the publication names one.
+///
+/// A per-realization request resolves through its body page, whose native-sim
+/// cards name the Look each `(epoch, sim)` realization belongs to.
+pub fn evidence_look<'a>(
+    index: &'a SiteIndex,
+    bodies: &'a [BodyPage],
+    request: &looklab_schema::EvidenceRequestWire,
+) -> Option<&'a looklab_model::file::Slug> {
+    match &request.subject {
+        looklab_schema::ModelSubject::SharedFamily { family } => index
+            .looks
+            .iter()
+            .find(|look| look.slug.as_str() == family.as_str())
+            .map(|look| &look.slug),
+        looklab_schema::ModelSubject::BodyRealization { realization } => bodies
+            .iter()
+            .find(|body| body.id == realization.body)
+            .and_then(|body| {
+                body.native_looks.iter().find(|card| {
+                    card.epoch == realization.epoch.get() && card.sim_key == realization.native_sim
+                })
+            })
+            .map(|card| &card.look),
+    }
+}
+
+/// Whether the Look an evidence request names has a published version.
+pub fn evidence_look_published(
+    index: &SiteIndex,
+    bodies: &[BodyPage],
+    request: &looklab_schema::EvidenceRequestWire,
+) -> bool {
+    evidence_look(index, bodies, request).is_some_and(|slug| {
+        index
+            .looks
+            .iter()
+            .any(|look| &look.slug == slug && !look.versions.is_empty())
+    })
+}
+
+/// The active request for the independent captures a Look still needs.
+pub fn missing_captures(wanted: &WantedFile, index: &SiteIndex, look: &str) -> Option<String> {
+    wanted
+        .evidence_requests
+        .iter()
+        .find(|request| {
+            request.kind == looklab_schema::EvidenceRequestKind::MissingIndependentCaptures
+                && evidence_look(index, &[], request).is_some_and(|slug| slug.as_str() == look)
+        })
+        .map(|request| request.detail.clone())
 }
 
 pub async fn scene(name: &str) -> Result<PreparedScene, String> {
@@ -781,7 +842,13 @@ async fn load_version(
                 look_bytes.ok_or_else(|| format!("{slug} {version}: no look artifact"))?;
             let document = LookDocument::decode(&look_bytes)
                 .map_err(|error| format!("{slug} {version}: {error}"))?;
-            if matches!(purpose, VersionPurpose::Match) && !document.is_matchable() {
+            let experimental_only = document.file.look.kind
+                == looklab_model::LookKind::NativeFamily
+                && document.match_refusal() == Some(looklab_model::file::MatchRefusal::Unsupported);
+            if matches!(purpose, VersionPurpose::Match)
+                && !document.is_matchable()
+                && !experimental_only
+            {
                 return Err(format!(
                     "{slug} {version}: this version is a preview only and cannot be matched."
                 ));

@@ -535,6 +535,7 @@ fn camera_fixture() -> CameraFixture {
                 applicability: Applicability::Current,
             }),
             versions: vec![VersionSummary {
+                support: looklab_publish::PublishedSupport::Unstated,
                 version: LookVersion::new("1.0.0").expect("version"),
                 status: LookStatus::Published,
                 matchable: true,

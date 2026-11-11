@@ -88,7 +88,42 @@ pub(crate) async fn contribution_withdrawn(
     contribution: &ContributionId,
     now: i64,
 ) -> Result<(), sqlx::Error> {
-    contribution_changed(conn, contribution, InvalidationReason::Withdrawal, now).await
+    contribution_changed(conn, contribution, InvalidationReason::Withdrawal, now).await?;
+    contribution_identity_changed(conn, contribution, now).await
+}
+
+/// Invalidates the identity-resolution dependency of a removed deferred serial link.
+pub async fn contribution_identity_changed(
+    conn: &mut SqliteConnection,
+    contribution: &ContributionId,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT credential_id, serial_hmac FROM contributions
+         WHERE id = ? AND serial_hmac IS NOT NULL AND render_class = 'monochrome'",
+    )
+    .bind(contribution.as_str())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((credential, hmac)) = row else {
+        return Ok(());
+    };
+    let connects_another: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM contributions
+         WHERE serial_hmac = ? AND credential_id != ?)",
+    )
+    .bind(&hmac)
+    .bind(&credential)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !connects_another {
+        return Ok(());
+    }
+    let credential = CredentialId::try_from(credential).map_err(database_error)?;
+    for member in identity_members(conn, &credential).await? {
+        identity_changed(conn, &member, now).await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn contribution_rejected(
@@ -96,7 +131,8 @@ pub(crate) async fn contribution_rejected(
     contribution: &ContributionId,
     now: i64,
 ) -> Result<(), sqlx::Error> {
-    contribution_changed(conn, contribution, InvalidationReason::Exclusion, now).await
+    contribution_changed(conn, contribution, InvalidationReason::Exclusion, now).await?;
+    contribution_identity_changed(conn, contribution, now).await
 }
 
 pub(crate) async fn root_revoked(

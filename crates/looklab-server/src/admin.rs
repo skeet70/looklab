@@ -138,7 +138,7 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-fn normalize_reason(reason: &str) -> Result<String, AdminError> {
+pub(crate) fn normalize_reason(reason: &str) -> Result<String, AdminError> {
     let reason = reason.trim();
     if reason.is_empty() || reason.chars().count() > MAX_REASON_CHARS {
         return Err(AdminError::InvalidReason);
@@ -3956,8 +3956,11 @@ pub async fn mod_queue(
     .collect::<Result<Vec<_>, AdminError>>()?;
 
     let fit_holds = sqlx::query(
-        "SELECT look, consecutive, first_attempt, last_attempt, diagnostics FROM fit_holds
-         WHERE status = 'pending' ORDER BY last_attempt, look",
+        "SELECT s.family AS look, h.consecutive, h.first_attempt, h.last_attempt, h.diagnostics
+         FROM model_fit_holds h
+         JOIN model_subjects s ON s.key = h.subject_key
+         WHERE h.status = 'pending' AND s.kind = 'shared_family'
+         ORDER BY h.last_attempt, s.family",
     )
     .fetch_all(db)
     .await?
@@ -4088,23 +4091,23 @@ pub(crate) struct Publication<'a> {
 
 pub async fn decide(
     db: &SqlitePool,
-    moderator: &CredentialId,
+    actor: Actor,
     proposal: &ProposalId,
     decision: ModDecision,
     reason: &str,
 ) -> Result<(), AdminError> {
-    decide_recording(db, moderator, proposal, decision, reason, None).await
+    decide_recording(db, actor, proposal, decision, reason, None).await
 }
 
 pub(crate) async fn decide_recording(
     db: &SqlitePool,
-    moderator: &CredentialId,
+    actor: Actor,
     proposal: &ProposalId,
     decision: ModDecision,
     reason: &str,
     publication: Option<Publication<'_>>,
 ) -> Result<(), AdminError> {
-    decide_recording_job(db, moderator, proposal, decision, reason, publication, None).await
+    decide_recording_job(db, actor, proposal, decision, reason, publication, None).await
 }
 
 pub(crate) struct DecisionJob {
@@ -4114,7 +4117,30 @@ pub(crate) struct DecisionJob {
 
 pub(crate) async fn decide_recording_job(
     db: &SqlitePool,
-    moderator: &CredentialId,
+    actor: Actor,
+    proposal: &ProposalId,
+    decision: ModDecision,
+    reason: &str,
+    publication: Option<Publication<'_>>,
+    job: Option<DecisionJob>,
+) -> Result<(), AdminError> {
+    let mut conn = begin_write(db).await?;
+    let result = decide_recording_job_in(
+        &mut conn,
+        actor,
+        proposal,
+        decision,
+        reason,
+        publication,
+        job,
+    )
+    .await;
+    finish(&mut conn, result).await
+}
+
+pub(crate) async fn decide_recording_job_in(
+    conn: &mut SqliteConnection,
+    actor: Actor,
     proposal: &ProposalId,
     decision: ModDecision,
     reason: &str,
@@ -4122,65 +4148,61 @@ pub(crate) async fn decide_recording_job(
     job: Option<DecisionJob>,
 ) -> Result<(), AdminError> {
     let reason = normalize_reason(reason)?;
-    let mut conn = begin_write(db).await?;
-    let result = async {
-        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM proposals WHERE id = ?")
-            .bind(proposal.as_str())
-            .fetch_optional(&mut *conn)
-            .await?;
-        let Some((status,)) = row else {
-            return Err(AdminError::UnknownProposal);
-        };
-        match parse_proposal_status(&status)? {
-            ProposalStatus::Pending | ProposalStatus::NeedsInfo => {}
-            ProposalStatus::Approved | ProposalStatus::Rejected => {
-                return Err(AdminError::ProposalDecided);
-            }
-        }
-        sqlx::query(
-            "INSERT INTO moderation_decisions
-             (id, proposal_id, moderator_credential, decision, reason, decided_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(ModerationDecisionId::new().as_str())
+    let actor = actor_text(actor)?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT status FROM proposals WHERE id = ?")
         .bind(proposal.as_str())
-        .bind(moderator.as_str())
-        .bind(decision.as_str())
-        .bind(&reason)
-        .bind(now_unix())
+        .fetch_optional(&mut *conn)
+        .await?;
+    let Some((status,)) = row else {
+        return Err(AdminError::UnknownProposal);
+    };
+    match parse_proposal_status(&status)? {
+        ProposalStatus::Pending | ProposalStatus::NeedsInfo => {}
+        ProposalStatus::Approved | ProposalStatus::Rejected => {
+            return Err(AdminError::ProposalDecided);
+        }
+    }
+    sqlx::query(
+        "INSERT INTO moderation_decisions
+         (id, proposal_id, moderator_credential, decision, reason, decided_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(ModerationDecisionId::new().as_str())
+    .bind(proposal.as_str())
+    .bind(actor.as_str())
+    .bind(decision.as_str())
+    .bind(&reason)
+    .bind(now_unix())
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query("UPDATE proposals SET status = ? WHERE id = ?")
+        .bind(decision.proposal_status())
+        .bind(proposal.as_str())
         .execute(&mut *conn)
         .await?;
-        sqlx::query("UPDATE proposals SET status = ? WHERE id = ?")
-            .bind(decision.proposal_status())
-            .bind(proposal.as_str())
-            .execute(&mut *conn)
-            .await?;
-        if let Some(publication) = publication {
-            let version = i64::try_from(publication.version).map_err(|_| AdminError::Corrupt)?;
-            sqlx::query(
-                "UPDATE proposals
-                 SET publication = 'pending', published_version = ?, published_hash = ?
-                 WHERE id = ?",
-            )
-            .bind(version)
-            .bind(publication.content_hash)
-            .bind(proposal.as_str())
-            .execute(&mut *conn)
-            .await?;
-        }
-        let payload = json!({
-            "event": "moderation_decision",
-            "actor": moderator,
-            "proposal": proposal,
-            "decision": decision,
-            "reason": reason,
-        });
-        audit::insert(&mut conn, AuditKind::ModerationDecision, &payload).await?;
-        if let Some(job) = job {
-            crate::store::enqueue_job(&mut conn, job.kind, &job.payload, now_unix()).await?;
-        }
-        Ok(())
+    if let Some(publication) = publication {
+        let version = i64::try_from(publication.version).map_err(|_| AdminError::Corrupt)?;
+        sqlx::query(
+            "UPDATE proposals
+             SET publication = 'pending', published_version = ?, published_hash = ?
+             WHERE id = ?",
+        )
+        .bind(version)
+        .bind(publication.content_hash)
+        .bind(proposal.as_str())
+        .execute(&mut *conn)
+        .await?;
     }
-    .await;
-    finish(&mut conn, result).await
+    let payload = json!({
+        "event": "moderation_decision",
+        "actor": actor,
+        "proposal": proposal,
+        "decision": decision,
+        "reason": reason,
+    });
+    audit::insert(&mut *conn, AuditKind::ModerationDecision, &payload).await?;
+    if let Some(job) = job {
+        crate::store::enqueue_job(&mut *conn, job.kind, &job.payload, now_unix()).await?;
+    }
+    Ok(())
 }

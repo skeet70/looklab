@@ -796,10 +796,14 @@ pub fn apply_model_error(
                 let transported: CellMoment = core::array::from_fn(|i| {
                     core::array::from_fn(|j| 0.5 * (transported[i][j] + transported[j][i]))
                 });
-                for a in 0..3 {
-                    for b in 0..3 {
-                        probe.covariance[a][b] += transported[a][b];
+                if transported.iter().flatten().all(|value| value.is_finite()) {
+                    for a in 0..3 {
+                        for b in 0..3 {
+                            probe.covariance[a][b] += transported[a][b];
+                        }
                     }
+                } else {
+                    pre_clip_reliable = false;
                 }
             } else {
                 pre_clip_reliable = false;
@@ -816,7 +820,15 @@ pub fn apply_model_error(
             .sqrt();
         probe.post_ucs =
             crate::predict::post_clip(look, probes_v1.probes[index].xyz, space, clip_k);
-        probe.pre_clip_reliable = pre_clip_reliable;
+        if !probe
+            .post_ucs
+            .to_array()
+            .iter()
+            .all(|value| value.is_finite())
+        {
+            probe.post_ucs = looklab_model::output_encode_clip(prediction, space, clip_k);
+        }
+        probe.pre_clip_reliable = pre_clip_reliable && !probe.support_withheld;
         probe.gamut_edge = probes_v1.probes[index].id.as_str().split('-').nth(2) == Some("80");
         let previous_sigma = previous
             .and_then(|state| state.sigma.get(index).copied())
@@ -834,12 +846,12 @@ pub fn apply_model_error(
             previous_bias,
             options,
         );
-        probe.supported_sigma = flags.sigma;
+        probe.supported_sigma = flags.sigma && !probe.support_withheld;
         probe.supported_density = flags.density;
         probe.supported_clusters = flags.clusters;
         probe.supported_bias = flags.bias;
         probe.supported_evidence = has_evidence;
-        probe.supported = flags.all() && has_evidence;
+        probe.supported = flags.all() && has_evidence && !probe.support_withheld;
         if probe.supported {
             supported += 1;
         }
@@ -912,6 +924,7 @@ mod review_tests {
                 supported_bias: false,
                 supported_evidence: false,
                 supported: false,
+                support_withheld: false,
                 clusters: 5,
             })
             .collect();
@@ -985,6 +998,61 @@ mod review_tests {
         }
         assert!(reliable, "fixture has no reliable probe");
         assert!(unreliable, "fixture has no unreliable probe");
+    }
+
+    #[test]
+    fn withheld_probes_stay_unsupported_after_model_error() {
+        const MID_GRAY: usize = 30;
+        let look = Look::colorimetric_spline().expect("look");
+        let mut field = ModelErrorField::empty();
+        let moment = [[0.25, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        field.post.fill(moment);
+        field.evidence.fill(true);
+        let mut estimates = probes();
+        estimates.probes[MID_GRAY].support_withheld = true;
+        estimates.probes[MID_GRAY].pre_clip_reliable = false;
+        apply_model_error(
+            &mut estimates,
+            &field,
+            &look,
+            &density(),
+            RgbSpace::Srgb,
+            &FitOptions {
+                density_floor: 0.0,
+                ..FitOptions::default()
+            },
+            0.03,
+            None,
+        );
+        crate::uncertainty::unsupport_unreliable(&mut estimates);
+        let withheld = &estimates.probes[MID_GRAY];
+        assert!(withheld.support_withheld);
+        assert!(!withheld.supported);
+        assert!(!withheld.supported_sigma);
+        assert!(!withheld.pre_clip_reliable);
+        assert!(
+            estimates.probes[1..].iter().any(|probe| probe.supported),
+            "full evidence made no probe supported"
+        );
+        let mut control = probes();
+        apply_model_error(
+            &mut control,
+            &field,
+            &look,
+            &density(),
+            RgbSpace::Srgb,
+            &FitOptions {
+                density_floor: 0.0,
+                ..FitOptions::default()
+            },
+            0.03,
+            None,
+        );
+        crate::uncertainty::unsupport_unreliable(&mut control);
+        assert!(
+            control.probes[MID_GRAY].supported,
+            "a mid-gray probe fails support without the withheld bit"
+        );
     }
 
     #[test]

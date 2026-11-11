@@ -237,6 +237,7 @@ impl BaseReference {
     pub fn resolve_status(&self, schema: Option<&looklab_schema::ControlSchema>) -> BaseStatus {
         let Self::BodyRealization {
             body,
+            renderer,
             film_simulation,
             dynamic_range,
             ..
@@ -263,6 +264,11 @@ impl BaseReference {
                 missing: BaseField::FilmSimulation,
             };
         };
+        if *renderer == Renderer::Unspecified {
+            return BaseStatus::BaseIncomplete {
+                missing: BaseField::Renderer,
+            };
+        }
         let Some(dynamic_range) = dynamic_range else {
             return BaseStatus::BaseIncomplete {
                 missing: BaseField::DynamicRange,
@@ -339,6 +345,7 @@ impl From<LutRenderer> for Renderer {
     fn from(renderer: LutRenderer) -> Self {
         match renderer {
             LutRenderer::XRawStudio => Self::XRawStudio,
+            LutRenderer::Unspecified => Self::Unspecified,
         }
     }
 }
@@ -358,6 +365,8 @@ impl From<LutDynamicRange> for DynamicRange {
 pub enum Renderer {
     #[serde(rename = "x_raw_studio")]
     XRawStudio,
+    /// The donor named no rendering engine.
+    Unspecified,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -65,18 +65,33 @@ pub fn Landing() -> impl IntoView {
 
 #[component]
 fn HomeChoices(index: SiteIndex, scene: Arc<PreparedScene>) -> impl IntoView {
-    let items = cards(&index);
+    let items = RwSignal::new(cards(&index, None));
     let camera = RwSignal::new(index.bodies.first().map(|camera| camera.id.clone()));
-    let look = RwSignal::new(items.first().map(|item| item.slug.clone()));
+    let initial_items = items.get_untracked();
+    let look = RwSignal::new(initial_items.first().map(|item| item.slug.clone()));
     let show_reference_labels = index.reference_preview.is_some();
     let initial_right = if index.reference_preview.is_some() {
-        items.first()
+        initial_items.first()
     } else {
-        items.get(1).or_else(|| items.first())
+        initial_items.get(1).or_else(|| initial_items.first())
     };
     let right = RwSignal::new(initial_right.cloned());
     let preview = RwSignal::new(Load::<(Arc<Vec<u8>>, Arc<Vec<u8>>, String, String)>::Loading);
-    let first = items.first().cloned();
+    let first = initial_items.first().cloned();
+    let index_for_evidence = index.clone();
+    Effect::new(move |_| {
+        let index = index_for_evidence.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Some(wanted) = data::wanted_optional().await else {
+                return;
+            };
+            items.update(|items| {
+                for item in items.iter_mut() {
+                    item.evidence = data::missing_captures(&wanted, &index, item.slug.as_str());
+                }
+            });
+        });
+    });
     let generation = RwSignal::new(0_u32);
     Effect::new(move |_| {
         let first = first.clone();
@@ -136,8 +151,8 @@ fn HomeChoices(index: SiteIndex, scene: Arc<PreparedScene>) -> impl IntoView {
         });
     });
     let picker_scene = scene.clone();
-    let picker_items = items.clone();
-    let chips = items.clone();
+    let picker_items = items.get_untracked();
+    let chips = items.get_untracked();
     view! {
         <section class="home-preview">
             {move || match preview.get() {
@@ -177,7 +192,7 @@ fn HomeChoices(index: SiteIndex, scene: Arc<PreparedScene>) -> impl IntoView {
             </div>
             <div class="look-gallery">
                 <Show when=move || gallery_ready.get()>
-                    {items.clone().into_iter().map(|item| view! {
+                    {items.get().into_iter().map(|item| view! {
                         <super::looks::CharacterCard item scene=scene.clone()/>
                     }).collect_view()}
                 </Show>

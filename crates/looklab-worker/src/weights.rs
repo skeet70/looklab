@@ -228,7 +228,8 @@ pub fn weigh_family(
         return Ok(WeightedFamily { images: Vec::new() });
     }
 
-    let evidence = evidence_values(&entries, params)?;
+    let evidence = evidence_values(&entries, params, EvidenceUnion::Pass)?;
+    let look_evidence = evidence_values(&entries, params, EvidenceUnion::Family)?;
     let published_inputs: Vec<WeightImage> = entries
         .iter()
         .zip(&evidence)
@@ -245,7 +246,14 @@ pub fn weigh_family(
         })
         .collect();
 
-    let native: Vec<WeightImage> = native_inputs.iter().flatten().cloned().collect();
+    let native: Vec<WeightImage> = entries
+        .iter()
+        .zip(&look_evidence)
+        .filter(|((_, image), _)| image.role == EvidenceRole::Native)
+        .map(|((pool, image), evidence)| {
+            weight_image(pool, image, *evidence, EvidenceStage::Native)
+        })
+        .collect();
     let look = weight_look(
         params,
         &LookWeightInput {
@@ -368,76 +376,130 @@ fn weight_image(
             &pool.body,
         ),
         capture: image.capture.clone(),
-        coverage: image.coverage.clone(),
+        coverage: image
+            .coverage
+            .clone()
+            .expect("eligible images admit at least one sample"),
     }
 }
 
+/// The images one leave-one-out union spans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EvidenceUnion {
+    /// Every image of the weighting pass: the body stage, whose parameters all of them move.
+    Pass,
+    /// The images of one family: the Look stage. A render of the same RAW in another
+    /// film simulation says nothing about this family's Look.
+    Family,
+}
+
+/// One image as the evidence computation sees it.
+struct EvidenceEntry<'a> {
+    /// Images with equal scope share one union.
+    scope: usize,
+    native: bool,
+    contributor: EffectiveContributorId,
+    capture: &'a looklab_trust::CaptureTuple,
+    axes: &'a [(f64, f64, f64)],
+    clip_fraction: f64,
+}
+
 /// Leave-one-out coverage over native images; a recipe image is scored against the
-/// native pool alone (docs/05 §12).
-fn evidence_values(entries: &[(&LookPool, &PoolImage)], params: &TrustParams) -> Result<Vec<f64>> {
+/// native pool alone (docs/05 §5, §12).
+fn evidence_values(
+    entries: &[(&LookPool, &PoolImage)],
+    params: &TrustParams,
+    union: EvidenceUnion,
+) -> Result<Vec<f64>> {
+    let mut families = Vec::new();
+    let views: Vec<EvidenceEntry<'_>> = entries
+        .iter()
+        .map(|(pool, image)| {
+            let scope = match union {
+                EvidenceUnion::Pass => 0,
+                EvidenceUnion::Family => {
+                    let known = families.iter().position(|family| *family == &pool.look);
+                    known.unwrap_or_else(|| {
+                        families.push(&pool.look);
+                        families.len() - 1
+                    })
+                }
+            };
+            EvidenceEntry {
+                scope,
+                native: image.role == EvidenceRole::Native,
+                contributor: image.contributor,
+                capture: &image.capture,
+                axes: &image.axes,
+                clip_fraction: image.clip_fraction,
+            }
+        })
+        .collect();
+    scoped_evidence(&views, params)
+}
+
+fn scoped_evidence(entries: &[EvidenceEntry<'_>], params: &TrustParams) -> Result<Vec<f64>> {
     let mut grids: Vec<EvidenceGrid> = Vec::with_capacity(entries.len());
-    for (_, image) in entries {
+    for entry in entries {
         let mut grid = EvidenceGrid::default();
-        for (s, hue, chroma) in &image.axes {
+        for (s, hue, chroma) in entry.axes {
             grid.add(*s, *hue, *chroma, 1.0)?;
         }
         grids.push(grid);
     }
-    let native: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, image))| image.role == EvidenceRole::Native)
-        .map(|(index, _)| index)
-        .collect();
-    let mut groups: BTreeMap<(EffectiveContributorId, looklab_trust::CaptureTuple), Vec<usize>> =
-        BTreeMap::new();
-    for index in &native {
-        let image = entries[*index].1;
-        groups
-            .entry((image.contributor, image.capture.clone()))
-            .or_default()
-            .push(*index);
+    type GroupKey<'a> = (
+        usize,
+        EffectiveContributorId,
+        &'a looklab_trust::CaptureTuple,
+    );
+    let mut groups: BTreeMap<GroupKey<'_>, Vec<usize>> = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.native {
+            groups
+                .entry((entry.scope, entry.contributor, entry.capture))
+                .or_default()
+                .push(index);
+        }
     }
-    let representatives: Vec<usize> = groups
-        .values()
-        .map(|members| members.iter().copied().min().unwrap_or_default())
-        .collect();
     let mut representative_of: HashMap<usize, usize> = HashMap::new();
-    for members in groups.values() {
+    let mut unions: BTreeMap<usize, EvidenceGrid> = BTreeMap::new();
+    let mut representatives: Vec<usize> = Vec::with_capacity(groups.len());
+    for ((scope, _, _), members) in &groups {
         let representative = members.iter().copied().min().unwrap_or_default();
         for member in members {
             representative_of.insert(*member, representative);
         }
-    }
-    let mut native_union = EvidenceGrid::default();
-    for index in &representatives {
-        for (s, hue, chroma) in &entries[*index].1.axes {
+        let native_union = unions.entry(*scope).or_default();
+        for (s, hue, chroma) in entries[representative].axes {
             native_union.add(*s, *hue, *chroma, 1.0)?;
         }
+        representatives.push(representative);
     }
 
+    let empty = EvidenceGrid::default();
     let mut representative_values: HashMap<usize, f64> = HashMap::new();
     for representative in &representatives {
+        let entry = &entries[*representative];
         let value = representative_evidence(
-            &native_union,
+            unions.get(&entry.scope).unwrap_or(&empty),
             &grids[*representative],
-            entries[*representative].1.clip_fraction,
+            entry.clip_fraction,
             params,
         )?;
         representative_values.insert(*representative, value);
     }
 
     let mut values = Vec::with_capacity(entries.len());
-    for (index, (_, image)) in entries.iter().enumerate() {
-        let value = if image.role == EvidenceRole::Native {
+    for (index, entry) in entries.iter().enumerate() {
+        let value = if entry.native {
             representative_of
                 .get(&index)
                 .and_then(|representative| representative_values.get(representative))
                 .copied()
                 .unwrap_or(0.0)
         } else {
-            let gain = coverage_gain(&native_union, &grids[index])?;
-            evidence(gain, image.clip_fraction, params)
+            let gain = coverage_gain(unions.get(&entry.scope).unwrap_or(&empty), &grids[index])?;
+            evidence(gain, entry.clip_fraction, params)
         };
         values.push(value);
     }
@@ -690,5 +752,35 @@ mod tests {
                 evidence(coverage_gain(&rebuilt, own).expect("gain"), 0.2, &params),
             );
         }
+    }
+
+    fn render(film_mode: &str, raw: i64) -> looklab_trust::CaptureTuple {
+        crate::meta::capture_tuple(&format!(
+            r#"{{"model":"X-T4","iso":160,"look":{{"film_mode":{{"raw":{raw},"value":"{film_mode}"}}}}}}"#
+        ))
+        .expect("capture tuple")
+    }
+
+    #[test]
+    fn a_render_in_another_family_does_not_lower_look_evidence() {
+        let params = TrustParams::default();
+        let contributor = EffectiveContributorId::from(looklab_trust::CredentialId::from_u128(7));
+        let axes = vec![(0.0, 10.0, 0.2), (0.5, 20.0, 0.4), (1.0, 30.0, 0.6)];
+        let (astia, velvia) = (render("Astia", 288), render("Velvia", 512));
+        let entry = |scope, capture| EvidenceEntry {
+            scope,
+            native: true,
+            contributor,
+            capture,
+            axes: &axes,
+            clip_fraction: 0.1,
+        };
+        let alone = scoped_evidence(&[entry(0, &astia)], &params).expect("standalone");
+        let per_family =
+            scoped_evidence(&[entry(0, &astia), entry(1, &velvia)], &params).expect("families");
+        let pooled =
+            scoped_evidence(&[entry(0, &astia), entry(0, &velvia)], &params).expect("pooled");
+        assert_eq!(per_family, vec![alone[0], alone[0]]);
+        assert!(pooled[0] < alone[0], "{} vs {}", pooled[0], alone[0]);
     }
 }

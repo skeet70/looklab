@@ -35,8 +35,31 @@ pub fn capture_tuple(meta_json: &str) -> Result<CaptureTuple> {
         software: meta.software,
         render_tag: meta.render_tag,
         render_tag_malformed: meta.render_tag_malformed,
-        // The wire mirror keeps no FujiTag, so the in-camera look slot cannot be rebuilt.
+        // The typed look needs FujiTag values the wire mirror does not keep; the tuple
+        // takes the mirror itself.
         look: None,
     };
-    Ok(CaptureTuple::from_metadata(&sanitized)?)
+    Ok(CaptureTuple::from_metadata(&sanitized)?.with_wire_look(meta.look.as_ref())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capture_tuple;
+
+    fn record(film_mode: &str, raw: i64) -> String {
+        format!(
+            r#"{{"model":"X-T4","iso":160,"shutter_seconds":0.0166,"look":{{"film_mode":{{"raw":{raw},"value":"{film_mode}"}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn rerenders_of_one_capture_with_different_settings_are_not_duplicates() {
+        let astia = capture_tuple(&record("Astia", 288)).expect("astia");
+        let velvia = capture_tuple(&record("Velvia", 512)).expect("velvia");
+        assert_ne!(astia, velvia);
+        assert_eq!(
+            astia,
+            capture_tuple(&record("Astia", 288)).expect("repeat upload")
+        );
+    }
 }

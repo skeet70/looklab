@@ -53,7 +53,7 @@ pub use permalink::{
     SelectionContext, SelectionMode,
 };
 pub use settings::{ControlDomain, Plan};
-pub use target::{PreparedTarget, TargetFunction, TargetSpec};
+pub use target::{ImageCount, PreparedTarget, TargetFunction, TargetSpec, TargetSupport};
 pub use verify::{
     DeltaStats, FitObservedOptions, ObservedFitter, ObservedRender, ScaleFitter, TruthRenderer,
     VerifyOutcome, VerifyRequest, measure_target_error, select_verification_samples,

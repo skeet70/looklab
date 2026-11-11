@@ -140,6 +140,9 @@ fn LookPageView(page: LookPage) -> impl IntoView {
     let version = RwSignal::new(Load::<Arc<LoadedVersion>>::Loading);
     let version_scope = RwSignal::new(looklab_publish::SelectionScope::Unassessed);
     let version_blockers = RwSignal::new(Vec::<String>::new());
+    let evidence = RwSignal::new(None::<String>);
+    let approximated = RwSignal::new(false);
+    let evidence_slug = page.slug.to_string();
     let card_eligible = RwSignal::new(false);
     let scene_index = RwSignal::new(Load::<SceneIndex>::Loading);
     let scene_name = RwSignal::new(String::new());
@@ -180,11 +183,30 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                         version_scope.set(scope);
                         version_blockers.set(blockers);
                         card_eligible.set(page_version.card_eligible);
+                        approximated.set(page_version.approximated);
                     }
                     version.set(Load::Ready(Arc::new(loaded)));
                 }
                 Err(error) => version.set(Load::Failed(error)),
             }
+        });
+    });
+
+    Effect::new(move |_| {
+        if version_scope.get() != looklab_publish::SelectionScope::Experimental
+            || !crate::base::server_available()
+        {
+            return;
+        }
+        let slug = evidence_slug.clone();
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
+            let Some(wanted) = data::wanted_optional().await else {
+                return;
+            };
+            let Ok(index) = data::index().await else {
+                return;
+            };
+            evidence.set(data::missing_captures(&wanted, &index, &slug));
         });
     });
 
@@ -321,6 +343,9 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                     view! {
                         <ui::Badge status=loaded.manifest.status/>
                         <span class="muted">{data::selection_scope_label(version_scope.get())}</span>
+                        {(version_scope.get() == looklab_publish::SelectionScope::Experimental).then(|| view! {
+                            <crate::pages::ExperimentalEvidence detail=evidence.get()/>
+                        })}
                         {version_blockers.get().into_iter().map(|blocker| view! { <p class="notice">{blocker}</p> }).collect_view()}
                         <p class="lede">{character}</p>
                         <ul class="character-tags">{tags.into_iter().map(|tag|view! { <li>{tag}</li> }).collect_view()}</ul>
@@ -485,6 +510,13 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                     </p>
                     <p class="muted">"Target-only card: this download does not use a camera realization, control-response model or matching result. Firmware translation is verified separately and is not guaranteed."</p>
                 }
+            })}
+            {move || (!card_eligible.get() && version_scope.get() == looklab_publish::SelectionScope::Experimental).then(|| view! {
+                <p class="muted">{if approximated.get() {
+                    "No firmware card is offered for this version: its fitted coefficients approximate a declared base, so it is an experimental approximation rather than the base itself."
+                } else {
+                    "No firmware card is offered for this version: it is an experimental early estimate with no independently checked region yet."
+                }}</p>
             })}
             {move || overview_details.iter().find(|details| details.version == selected.get()).map(|details| view! {
                 {details.notice.clone().map(|notice| view! { <p class="notice">{notice}</p> })}

@@ -1932,6 +1932,20 @@ pub(crate) fn clip_derivative_min(pre: Ucs, space: RgbSpace, clip_k: f64) -> f64
         .fold(1.0_f64, f64::min)
 }
 
+/// Finite `Φ` derivative from [`composite::evaluate`], or `None` at its singular
+/// point and outside its inverse domain.
+fn composite_clip_derivative(pre: Ucs, space: RgbSpace, clip_k: f64) -> Option<(Mat3, [f64; 3])> {
+    let point = composite::evaluate(pre, space, clip_k).ok()?;
+    match point.derivative {
+        CompositeDerivative::Finite {
+            jacobian,
+            jacobian_k,
+            ..
+        } => Some((Mat3(jacobian), jacobian_k)),
+        CompositeDerivative::Singular(_) => None,
+    }
+}
+
 /// `d post-clip / d k` in `J'a'b'` coordinates.
 pub(crate) fn clip_k_gradient(pre: Ucs, space: RgbSpace, clip_k: f64) -> [f64; 3] {
     let channels = output_channels(pre, space);
@@ -1944,11 +1958,15 @@ pub(crate) fn clip_k_gradient(pre: Ucs, space: RgbSpace, clip_k: f64) -> [f64; 3
     let clipped = channels.map(|value| soft_clip(value, clip_k));
     let xyz1 = space.rgb_linear_to_xyz(Rgb::new(clipped[0], clipped[1], clipped[2]));
     let (_, j1) = cam::ucs_jacobian(xyz1);
-    Mat3(j1).mul(&space.to_xyz_matrix()).mul_vec([
+    let gradient = Mat3(j1).mul(&space.to_xyz_matrix()).mul_vec([
         clip_k_derivative(channels[0], clip_k),
         clip_k_derivative(channels[1], clip_k),
         clip_k_derivative(channels[2], clip_k),
-    ])
+    ]);
+    if gradient.iter().all(|value| value.is_finite()) {
+        return gradient;
+    }
+    composite_clip_derivative(pre, space, clip_k).map_or(gradient, |(_, jacobian_k)| jacobian_k)
 }
 
 /// `d post-clip / d pre-clip` in `J'a'b'` coordinates.
@@ -1969,11 +1987,15 @@ pub(crate) fn clip_jacobian(pre: Ucs, space: RgbSpace, clip_k: f64) -> Mat3 {
         clip_derivative(channels[2], clip_k),
     ]);
     let (_, d_xyz0) = looklab_model::clip::preclip_xyz_jacobian(pre);
-    Mat3(j1)
+    let jacobian = Mat3(j1)
         .mul(&space.to_xyz_matrix())
         .mul(&per_channel)
         .mul(&space.from_xyz_matrix())
-        .mul(&Mat3(d_xyz0))
+        .mul(&Mat3(d_xyz0));
+    if jacobian.0.iter().flatten().all(|value| value.is_finite()) {
+        return jacobian;
+    }
+    composite_clip_derivative(pre, space, clip_k).map_or(jacobian, |(jacobian, _)| jacobian)
 }
 
 /// Pre-clip `J'a'b'` of one probe and `dJ'a'b'/dθ`, for the sandwich estimator.
@@ -3668,5 +3690,50 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn saturated_neutral_clip_chain_is_finite_and_floored() {
+        let pre = Ucs::new(116.0, 0.0, 0.0);
+        let clip_k = 0.03;
+        let channels = output_channels(pre, RgbSpace::Srgb);
+        let clipped = channels.map(|value| soft_clip(value, clip_k));
+        let xyz = RgbSpace::Srgb.rgb_linear_to_xyz(Rgb::new(clipped[0], clipped[1], clipped[2]));
+        let (_, naive) = cam::ucs_jacobian(xyz);
+        assert!(
+            naive.iter().flatten().any(|value| !value.is_finite()),
+            "the naive clip chain is finite, so the test does not reach the fallback"
+        );
+        let chain = clip_jacobian(pre, RgbSpace::Srgb, clip_k);
+        assert!(
+            chain.0.iter().flatten().all(|value| value.is_finite()),
+            "saturated neutral clip Jacobian is not finite: {:?}",
+            chain.0
+        );
+        assert!(
+            clip_k_gradient(pre, RgbSpace::Srgb, clip_k)
+                .iter()
+                .all(|value| value.is_finite())
+        );
+        let pre_covariance = [[4.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 4.0]];
+        let mut post = chain.mul(&Mat3(pre_covariance)).mul(&chain.transpose()).0;
+        crate::uncertainty::floor_post_covariance(&pre_covariance, &mut post);
+        let trace = post[0][0] + post[1][1] + post[2][2];
+        let floor = 0.0625 * 12.0;
+        assert!(
+            (trace - floor).abs() < 1e-9,
+            "post trace {trace} does not reach the documented floor {floor}"
+        );
+        let flags = crate::uncertainty::mark_support(
+            trace.sqrt(),
+            0.0,
+            1.0,
+            3,
+            0.0,
+            false,
+            false,
+            &crate::types::FitOptions::default(),
+        );
+        assert!(flags.sigma, "the floored probe was forced unsupported");
     }
 }

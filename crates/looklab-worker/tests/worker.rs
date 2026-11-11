@@ -23,12 +23,13 @@ use looklab_upload::{BodyId, ContributionKind, LookSlug, ManifestMetadata, Rende
 use looklab_worker::db::ContributionIntent;
 #[cfg(feature = "integration")]
 use looklab_worker::db::{ContributionStatus, ImageOutcome};
-use looklab_worker::{JobPayload, Worker, WorkerConfig, WorkerError};
+use looklab_worker::{JobPayload, Worker, WorkerConfig};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const BODY: &str = "fujifilm/x-t5";
 const LOOK: &str = "classic-chrome";
+const FAMILY_SUBJECT: &str = "shared_family:classic-chrome";
 const FIRMWARE: &str = "1.50";
 const SIM: &str = "classic_chrome";
 
@@ -454,18 +455,20 @@ async fn dump_state(worker: &Worker, at: &str) {
     .fetch_all(worker.pool())
     .await
     .unwrap_or_default();
-    let attempts: Vec<(String, i64, i64)> =
-        sqlx::query_as("SELECT states, consecutive, updated_at FROM fit_attempts WHERE look = ?")
-            .bind(LOOK)
-            .fetch_all(worker.pool())
-            .await
-            .unwrap_or_default();
-    let holds: Vec<(i64, String, String)> =
-        sqlx::query_as("SELECT consecutive, status, diagnostics FROM fit_holds WHERE look = ?")
-            .bind(LOOK)
-            .fetch_all(worker.pool())
-            .await
-            .unwrap_or_default();
+    let attempts: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT states, consecutive, updated_at FROM model_fit_attempts WHERE subject_key = ?",
+    )
+    .bind(FAMILY_SUBJECT)
+    .fetch_all(worker.pool())
+    .await
+    .unwrap_or_default();
+    let holds: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT consecutive, status, diagnostics FROM model_fit_holds WHERE subject_key = ?",
+    )
+    .bind(FAMILY_SUBJECT)
+    .fetch_all(worker.pool())
+    .await
+    .unwrap_or_default();
     let gates: Vec<(i64, String)> =
         sqlx::query_as("SELECT version, status FROM gate_failures WHERE look = ? ORDER BY version")
             .bind(LOOK)
@@ -2065,7 +2068,10 @@ async fn publish_rejects_bytes_that_do_not_match_the_manifest() {
         .await
         .expect("enqueue publish");
     let error = worker.run_once().await.expect_err("hash mismatch");
-    assert!(matches!(error, WorkerError::Data(_)), "{error}");
+    assert!(
+        matches!(error, looklab_worker::WorkerError::Data(_)),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -2319,7 +2325,7 @@ async fn deferred_serial_links_still_merge_colour_identity() {
     let deferred_credential = add_credential(worker, "new", 0.5).await;
     let (colour, _) = add_contribution(worker, &colour_credential, &dataset, &[0], 100).await;
     let (deferred, _) = add_contribution(worker, &deferred_credential, &dataset, &[1], 200).await;
-    defer(worker, &deferred, 1_000).await;
+    defer(worker, &deferred, 4_000_000_000).await;
     let hmac = vec![7_u8; 32];
     for contribution in [&colour, &deferred] {
         sqlx::query("UPDATE contributions SET serial_hmac = ? WHERE id = ?")
@@ -3131,23 +3137,57 @@ async fn non_tolerated_spatial_settings_exclude_every_image() {
         r#"[{"key":"clarity","step":2,"source":"reproduced"}]"#,
     )
     .await;
-    worker
-        .enqueue(
-            &JobPayload::NightlyRefit {
-                bodies: vec![looklab_upload::BodyId::new(BODY).expect("body")],
-            },
-            0,
-        )
-        .await
-        .expect("enqueue");
-    let error = worker.run_once().await.expect_err("excluded images");
+    let ownership = looklab_worker::jobs::JobOwnership {
+        id: looklab_worker::JobId::new(),
+        attempts: 1,
+    };
+    let outcomes = looklab_worker::refit::run(
+        worker.pool(),
+        worker.config(),
+        &[looklab_upload::BodyId::new(BODY).expect("body")],
+        &ownership,
+    )
+    .await
+    .expect("the refit reports the family without failing the job");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].1.as_str(), LOOK);
     assert!(
         matches!(
-            error,
-            WorkerError::Fit(looklab_fit::FitError::NoNativeImages)
+            &outcomes[0].2,
+            looklab_worker::refit::RefitOutcome::Unavailable(_)
         ),
-        "{error}"
+        "{:?}",
+        outcomes[0].2
     );
+    let body = looklab_upload::BodyId::new(BODY).expect("body");
+    let look = looklab_upload::LookSlug::new(LOOK).expect("look");
+    let pools = looklab_worker::pool::build_all(
+        worker.pool(),
+        worker.config(),
+        &body,
+        &look,
+        &looklab_worker::pool::EvidenceScope::Experimental,
+    )
+    .await
+    .expect("pools");
+    let images: Vec<_> = pools.iter().flat_map(|pool| pool.images.iter()).collect();
+    assert_eq!(images.len(), 2);
+    let clarity = looklab_schema::ControlKey::new("clarity").expect("control");
+    for image in images {
+        let looklab_worker::pool::EvidenceEligibility::Ineligible(blockers) = &image.eligibility
+        else {
+            panic!("clarity image is eligible");
+        };
+        assert!(
+            blockers.contains(
+                &looklab_worker::pool::EvidenceBlocker::SpatialNotTolerated {
+                    control: clarity.clone(),
+                }
+            ),
+            "{blockers:?}"
+        );
+    }
+    assert_eq!(count(worker, "SELECT COUNT(*) FROM look_versions").await, 0);
 }
 
 #[tokio::test]
@@ -3597,7 +3637,8 @@ async fn a_non_converged_batch_publishes_nothing_and_resumes_to_convergence() {
     assert_eq!(
         count(
             worker,
-            "SELECT COUNT(*) FROM fit_attempts WHERE look = 'classic-chrome'",
+            "SELECT COUNT(*) FROM model_fit_attempts
+             WHERE subject_key = 'shared_family:classic-chrome'",
         )
         .await,
         1
@@ -3619,7 +3660,8 @@ async fn a_non_converged_batch_publishes_nothing_and_resumes_to_convergence() {
     assert_eq!(
         count(
             worker,
-            "SELECT COUNT(*) FROM fit_attempts WHERE look = 'classic-chrome'",
+            "SELECT COUNT(*) FROM model_fit_attempts
+             WHERE subject_key = 'shared_family:classic-chrome'",
         )
         .await,
         0
@@ -3627,7 +3669,7 @@ async fn a_non_converged_batch_publishes_nothing_and_resumes_to_convergence() {
     assert_eq!(
         count(
             worker,
-            "SELECT COUNT(*) FROM fit_holds WHERE status = 'pending'",
+            "SELECT COUNT(*) FROM model_fit_holds WHERE status = 'pending'",
         )
         .await,
         0
@@ -3662,7 +3704,10 @@ async fn three_non_converged_batches_open_one_moderation_item() {
         .await,
         0
     );
-    assert_eq!(count(worker, "SELECT COUNT(*) FROM fit_holds").await, 1);
+    assert_eq!(
+        count(worker, "SELECT COUNT(*) FROM model_fit_holds").await,
+        1
+    );
     let catalog = looklab_schema::ManualCatalog {
         catalog_version: looklab_schema::MANUAL_CATALOG_VERSION,
         cameras: Vec::new(),
@@ -3673,6 +3718,231 @@ async fn three_non_converged_batches_open_one_moderation_item() {
             .expect("moderation queue");
     assert_eq!(queue.fit_holds.len(), 1);
     assert_eq!(queue.fit_holds[0].consecutive, 4);
+}
+
+#[tokio::test]
+async fn one_capture_group_reaches_the_fit() {
+    let fixture = fixture_with(true, |config| {
+        config.sweep_budget = Some(1.0);
+    })
+    .await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 2,
+        samples_per_image: 400,
+        ..SynthConfig::default()
+    });
+    let credential = add_credential(worker, "seeder", 1.2).await;
+    add_contribution(worker, &credential, &dataset, &[0], 100).await;
+    let ownership = looklab_worker::jobs::JobOwnership {
+        id: looklab_worker::JobId::new(),
+        attempts: 1,
+    };
+    let outcomes = looklab_worker::refit::run(
+        worker.pool(),
+        worker.config(),
+        &[looklab_upload::BodyId::new(BODY).expect("body")],
+        &ownership,
+    )
+    .await
+    .expect("the fit runs");
+    assert_eq!(outcomes.len(), 1);
+    assert!(
+        matches!(
+            &outcomes[0].2,
+            looklab_worker::refit::RefitOutcome::NotConverged(_)
+        ),
+        "{:?}",
+        outcomes[0].2
+    );
+    assert_eq!(
+        count(
+            worker,
+            "SELECT COUNT(*) FROM look_versions WHERE look = 'classic-chrome'",
+        )
+        .await,
+        0
+    );
+    let observed: Option<i64> = sqlx::query_scalar(
+        "SELECT observed_groups FROM model_active_evidence_requests
+         WHERE subject_key = 'shared_family:classic-chrome'
+           AND request_kind = 'missing_independent_captures'",
+    )
+    .fetch_one(worker.pool())
+    .await
+    .expect("family capture request");
+    assert_eq!(observed, Some(1));
+
+    add_contribution(worker, &credential, &dataset, &[1], 101).await;
+    looklab_worker::refit::run(
+        worker.pool(),
+        worker.config(),
+        &[looklab_upload::BodyId::new(BODY).expect("body")],
+        &ownership,
+    )
+    .await
+    .expect("the second capture fits");
+    assert_eq!(
+        count(
+            worker,
+            "SELECT COUNT(*) FROM model_active_evidence_requests
+             WHERE subject_key = 'shared_family:classic-chrome'
+               AND request_kind = 'missing_independent_captures'",
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_zero_group_family_reports_unavailable_without_blocking_silently() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 1,
+        samples_per_image: 200,
+        ..SynthConfig::default()
+    });
+    let credential = add_credential(worker, "seeder", 1.2).await;
+    insert_contribution_for(
+        worker,
+        &credential,
+        &dataset,
+        &[0],
+        100,
+        ContributionKind::Library,
+        ContributionIntent::Native,
+        None,
+        r#"[{"key":"clarity","step":2,"source":"reproduced"}]"#,
+        None,
+        None,
+        BODY,
+        SIM,
+    )
+    .await;
+    insert_contribution_for(
+        worker,
+        &credential,
+        &dataset,
+        &[0],
+        101,
+        ContributionKind::Library,
+        ContributionIntent::Native,
+        None,
+        "[]",
+        None,
+        None,
+        BODY,
+        "provia",
+    )
+    .await;
+    let ownership = looklab_worker::jobs::JobOwnership {
+        id: looklab_worker::JobId::new(),
+        attempts: 1,
+    };
+    let outcomes = looklab_worker::refit::run(
+        worker.pool(),
+        worker.config(),
+        &[looklab_upload::BodyId::new(BODY).expect("body")],
+        &ownership,
+    )
+    .await
+    .expect("the component reports");
+    assert_eq!(outcomes.len(), 2);
+    assert!(
+        outcomes.iter().all(|(_, _, outcome)| matches!(
+            outcome,
+            looklab_worker::refit::RefitOutcome::Unavailable(_)
+        )),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        count(
+            worker,
+            "SELECT COUNT(*) FROM look_versions WHERE look IN ('classic-chrome', 'provia')",
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "integration")]
+async fn single_group_seed_is_source_limited_and_published() {
+    let fixture = fixture().await;
+    let worker = &fixture.worker;
+    let dataset = looklab_fit::synth::dataset(&SynthConfig {
+        seed: 21,
+        images: 1,
+        samples_per_image: 400,
+        ..SynthConfig::default()
+    });
+    let credential = add_credential(worker, "seeder", 1.2).await;
+    add_contribution(worker, &credential, &dataset, &[0], 100).await;
+    refit(worker).await;
+
+    assert_eq!(
+        count(
+            worker,
+            "SELECT COUNT(*) FROM look_versions
+             WHERE look = 'classic-chrome' AND status = 'published'",
+        )
+        .await,
+        1
+    );
+    let (source_limited, report): (i64, Option<String>) = sqlx::query_as(
+        "SELECT source_limited, report_id FROM model_family_heads
+         WHERE family = 'classic-chrome'",
+    )
+    .fetch_one(worker.pool())
+    .await
+    .expect("family head");
+    assert_eq!(source_limited, 1);
+    assert!(report.is_none(), "a source-limited seed carries no report");
+    let artifacts: String = sqlx::query_scalar(
+        "SELECT m.artifacts FROM version_manifests m
+         JOIN look_versions v ON v.id = m.look_version_id
+         WHERE v.look = 'classic-chrome' AND v.version = 1",
+    )
+    .fetch_one(worker.pool())
+    .await
+    .expect("manifest");
+    assert!(artifacts.contains("look.looklab"));
+    assert!(artifacts.contains("preview.lut33"));
+    assert!(!artifacts.contains("card.llk"));
+    let look_bytes = std::fs::read(
+        fixture
+            .site
+            .join("data/looks/classic-chrome/1.0.0/look.looklab"),
+    )
+    .expect("look artifact");
+    let document = LookDocument::decode(&look_bytes).expect("look document");
+    let support = document
+        .uncertainty
+        .support
+        .as_ref()
+        .expect("support scalars");
+    assert!(support.values.iter().all(|value| *value == 0.0));
+    assert_eq!(
+        count(
+            worker,
+            "SELECT COUNT(*) FROM model_target_eligibility_snapshots
+             WHERE status = 'eligible'",
+        )
+        .await,
+        1
+    );
+    let observed: Option<i64> = sqlx::query_scalar(
+        "SELECT observed_groups FROM model_active_evidence_requests
+         WHERE subject_key = 'shared_family:classic-chrome'
+           AND request_kind = 'missing_independent_captures'",
+    )
+    .fetch_one(worker.pool())
+    .await
+    .expect("family capture request");
+    assert_eq!(observed, Some(1));
 }
 
 #[tokio::test]
@@ -3721,25 +3991,25 @@ async fn refit_1000_images_under_target() {
     );
 }
 
-const REFERENCE_SETTINGS: &str = r#"[{"key":"dynamic_range","step":0,"source":"reproduced"},
-    {"key":"highlight_tone","step":0,"source":"reproduced"},
-    {"key":"shadow_tone","step":0,"source":"reproduced"},
-    {"key":"color","step":0,"source":"reproduced"},
+const REFERENCE_SETTINGS: &str = r#"[{"key":"color","step":0,"source":"reproduced"},
     {"key":"color_chrome_effect","step":0,"source":"reproduced"},
     {"key":"color_chrome_fx_blue","step":0,"source":"reproduced"},
-    {"key":"wb_shift_r","step":0,"source":"reproduced"},
-    {"key":"wb_shift_b","step":0,"source":"reproduced"}]"#;
-
-const NONDEFAULT_SETTINGS: &str = r#"[{"key":"dynamic_range","step":1,"source":"reproduced"},
+    {"key":"dynamic_range","step":0,"source":"reproduced"},
     {"key":"highlight_tone","step":0,"source":"reproduced"},
     {"key":"shadow_tone","step":0,"source":"reproduced"},
-    {"key":"color","step":0,"source":"reproduced"},
+    {"key":"wb_shift_b","step":0,"source":"reproduced"},
+    {"key":"wb_shift_r","step":0,"source":"reproduced"}]"#;
+
+const NONDEFAULT_SETTINGS: &str = r#"[{"key":"color","step":0,"source":"reproduced"},
     {"key":"color_chrome_effect","step":0,"source":"reproduced"},
     {"key":"color_chrome_fx_blue","step":0,"source":"reproduced"},
-    {"key":"wb_shift_r","step":0,"source":"reproduced"},
-    {"key":"wb_shift_b","step":0,"source":"reproduced"}]"#;
+    {"key":"dynamic_range","step":1,"source":"reproduced"},
+    {"key":"highlight_tone","step":0,"source":"reproduced"},
+    {"key":"shadow_tone","step":0,"source":"reproduced"},
+    {"key":"wb_shift_b","step":0,"source":"reproduced"},
+    {"key":"wb_shift_r","step":0,"source":"reproduced"}]"#;
 
-fn install_two_epoch_snapshot(worker: &Worker) {
+async fn install_two_epoch_snapshot(worker: &Worker) {
     let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
     let root = worker.config().snapshot_dir.join("v1");
     copy_body_files(&shipped, &root);
@@ -3751,6 +4021,16 @@ fn install_two_epoch_snapshot(worker: &Worker) {
         "firmware: { from: \"2.00\", to: \"2.99\" }",
     );
     std::fs::write(&path, format!("{schema}{second}")).expect("two-epoch schema");
+    let hash = write_snapshot_manifest(&root, 1);
+    sqlx::query(
+        "INSERT INTO community_snapshot_activation
+         (id, version, content_hash, activated_at)
+         VALUES (1, 1, ?, 0)",
+    )
+    .bind(hash)
+    .execute(worker.pool())
+    .await
+    .expect("activation");
 }
 
 #[tokio::test]
@@ -3787,14 +4067,20 @@ async fn experimental_settings_cannot_change_qualified_weights() {
         "highlight_tone",
         "shadow_tone",
         "color",
-        "color_chrome_effect",
-        "color_chrome_fx_blue",
         "wb_shift_r",
         "wb_shift_b",
     ] {
         combination.insert(
             looklab_schema::ControlKey::new(name).expect("control"),
             looklab_schema::SettingValue::Step(0),
+        );
+    }
+    for name in ["color_chrome_effect", "color_chrome_fx_blue"] {
+        combination.insert(
+            looklab_schema::ControlKey::new(name).expect("control"),
+            looklab_schema::SettingValue::Enum(
+                looklab_schema::EnumValue::new("off").expect("value"),
+            ),
         );
     }
     let mut mask = looklab_schema::SupportedMask::new();
@@ -3823,7 +4109,7 @@ async fn experimental_settings_cannot_change_qualified_weights() {
                 epoch: looklab_schema::ControlEpochId::new(1),
                 version: "1.50".parse().expect("firmware"),
             }],
-            wb_modes: vec![looklab_schema::WbModeKey::new("daylight".to_owned()).expect("wb")],
+            wb_modes: vec![looklab_schema::WbModeKey::new("Daylight").expect("wb")],
         },
     };
     let pools =
@@ -4470,7 +4756,7 @@ async fn experimental_only_evidence_leaves_a_qualified_target_unchanged() {
 #[tokio::test]
 async fn epochs_of_one_family_stay_distinct_realizations() {
     let fixture = fixture().await;
-    install_two_epoch_snapshot(&fixture.worker);
+    install_two_epoch_snapshot(&fixture.worker).await;
     let worker = &fixture.worker;
     let dataset = looklab_fit::synth::dataset(&SynthConfig {
         seed: 21,
@@ -4519,7 +4805,7 @@ async fn epochs_of_one_family_stay_distinct_realizations() {
 #[tokio::test]
 async fn combined_family_weights_cap_across_realizations() {
     let fixture = fixture().await;
-    install_two_epoch_snapshot(&fixture.worker);
+    install_two_epoch_snapshot(&fixture.worker).await;
     let worker = &fixture.worker;
     let dataset = looklab_fit::synth::dataset(&SynthConfig {
         seed: 21,
@@ -4610,6 +4896,7 @@ fn evidence_observation_merge_rejects_conflicting_generations() {
             generation,
         }],
         root_admissions: Vec::new(),
+        identity_links: Vec::new(),
         native_contributors: std::collections::BTreeMap::new(),
         published_contributors: std::collections::BTreeMap::new(),
     };
@@ -4696,6 +4983,7 @@ async fn ineligible_serial_bridge_does_not_merge_admitted_contributors() {
 #[tokio::test]
 async fn union_contributor_graph_is_shared_across_pools() {
     let fixture = fixture().await;
+    install_two_epoch_snapshot(&fixture.worker).await;
     let worker = &fixture.worker;
     let dataset = looklab_fit::synth::dataset(&SynthConfig {
         seed: 49,
@@ -4793,8 +5081,30 @@ async fn unsupported_output_encoding_does_not_change_qualified_pins() {
         ..SynthConfig::default()
     });
     let credential = add_credential(worker, "seeder", 1.2).await;
-    let (_, daylight) = add_contribution(worker, &credential, &dataset, &[0], 100).await;
-    let (_, tungsten) = add_contribution(worker, &credential, &dataset, &[1], 101).await;
+    let (_, daylight) = add_contribution_with(
+        worker,
+        &credential,
+        &dataset,
+        &[0],
+        100,
+        ContributionKind::Library,
+        ContributionIntent::Native,
+        None,
+        REFERENCE_SETTINGS,
+    )
+    .await;
+    let (_, tungsten) = add_contribution_with(
+        worker,
+        &credential,
+        &dataset,
+        &[1],
+        101,
+        ContributionKind::Library,
+        ContributionIntent::Native,
+        None,
+        REFERENCE_SETTINGS,
+    )
+    .await;
     let image = &tungsten[0];
     let hash: Vec<u8> =
         sqlx::query_scalar("SELECT samples_hash FROM contribution_images WHERE id = ?")
@@ -4859,7 +5169,7 @@ async fn unsupported_output_encoding_does_not_change_qualified_pins() {
                 epoch: looklab_schema::ControlEpochId::new(1),
                 version: "1.50".parse().expect("firmware"),
             }],
-            wb_modes: vec![looklab_schema::WbModeKey::new("daylight".to_owned()).expect("wb")],
+            wb_modes: vec![looklab_schema::WbModeKey::new("Daylight").expect("wb")],
         },
     };
     let pools =

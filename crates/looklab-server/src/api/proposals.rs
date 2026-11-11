@@ -512,8 +512,15 @@ pub async fn decide(
     decision: crate::admin::ModDecision,
     reason: &str,
 ) -> ApiResult<Response> {
-    let snapshot =
-        crate::proposals::record_decision(state, moderator, proposal, decision, reason).await?;
+    let actor = crate::admin::trust_id(moderator)?;
+    let snapshot = crate::proposals::record_decision(
+        state,
+        looklab_trust::Actor::Credential(actor),
+        proposal,
+        decision,
+        reason,
+    )
+    .await?;
     Ok(Json(DecisionResponse {
         state: DecisionState::Recorded,
         snapshot,

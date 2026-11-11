@@ -8,7 +8,12 @@ use crate::layout::Params;
 use crate::predict::{Jac, evaluate_probe};
 use crate::problem::{BlockAcc, Problem, ResidualSample};
 use crate::solve::{factor_in_place, solve_four_in_place, solve_in_place};
-use crate::types::{Density, FitOptions, PreviousSupport, ProbeEstimate, ProbeUncertainty, Result};
+use crate::types::{
+    Density, FitError, FitOptions, PreviousSupport, ProbeEstimate, ProbeUncertainty, Result,
+};
+
+/// Variance stored for a probe whose covariance is a finite fallback; support stays off.
+const UNKNOWN_VARIANCE: f64 = 1.0e30;
 
 /// Keep post-clip variance at least `(0.25)²` times the pre-clip trace, the clip
 /// derivative below which the pre-clip value is not identifiable.
@@ -396,6 +401,24 @@ pub(crate) fn probe_uncertainty(
 
     for probe in &probes.probes {
         let pre = evaluate_probe(look, layout, probe.xyz, &beta_slope, &mut jac);
+        let mut masked = [false; 3];
+        let degraded = if jac
+            .derivs
+            .iter()
+            .all(|deriv| deriv.iter().all(|value| value.is_finite()))
+        {
+            false
+        } else {
+            for deriv in &mut jac.derivs {
+                for (channel, value) in deriv.iter_mut().enumerate() {
+                    if !value.is_finite() {
+                        *value = 0.0;
+                        masked[channel] = true;
+                    }
+                }
+            }
+            true
+        };
         for index in residual_written.drain(..) {
             for z in z_columns.iter_mut() {
                 z[index] = 0.0;
@@ -488,7 +511,7 @@ pub(crate) fn probe_uncertainty(
                 covariance[a][b] = factor * meat[a][b] + prior_cov[a][b];
             }
         }
-        let sigma_de = (covariance[0][0] + covariance[1][1] + covariance[2][2])
+        let mut sigma_de = (covariance[0][0] + covariance[1][1] + covariance[2][2])
             .max(0.0)
             .sqrt();
         let mut bias_pre = [0.0_f64; 3];
@@ -578,15 +601,53 @@ pub(crate) fn probe_uncertainty(
             bias_post[c] = sum + clip_slope * dk[c] * k_bias;
         }
         floor_post_covariance(&covariance, &mut post_covariance);
-        let post_sigma_de = (post_covariance[0][0] + post_covariance[1][1] + post_covariance[2][2])
-            .max(0.0)
-            .sqrt();
-        let bias_de = (bias_post[0] * bias_post[0]
+        if degraded {
+            // A masked channel has no variance estimate; the unknown-variance convention
+            // (docs/02 §5) keeps mask-ignoring consumers from reading zero.
+            for channel in 0..3 {
+                if masked[channel] {
+                    covariance[channel][channel] = UNKNOWN_VARIANCE;
+                    post_covariance[channel][channel] = UNKNOWN_VARIANCE;
+                }
+            }
+            sigma_de = (covariance[0][0] + covariance[1][1] + covariance[2][2])
+                .max(0.0)
+                .sqrt();
+        }
+        let mut post_sigma_de =
+            (post_covariance[0][0] + post_covariance[1][1] + post_covariance[2][2])
+                .max(0.0)
+                .sqrt();
+        let mut bias_de = (bias_post[0] * bias_post[0]
             + bias_post[1] * bias_post[1]
             + bias_post[2] * bias_post[2])
             .max(0.0)
             .sqrt();
+        let clip_reliable =
+            crate::predict::clip_derivative_min(pre, space, params.clip_k()) >= 0.25;
+        let mut clip_fallback = false;
+        if !post_covariance
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+            || !post_sigma_de.is_finite()
+            || !bias_post.iter().all(|value| value.is_finite())
+            || !bias_de.is_finite()
+        {
+            post_covariance = covariance;
+            post_sigma_de = sigma_de;
+            bias_de =
+                (bias_pre[0] * bias_pre[0] + bias_pre[1] * bias_pre[1] + bias_pre[2] * bias_pre[2])
+                    .max(0.0)
+                    .sqrt();
+            clip_fallback = true;
+        }
         let post_ucs = crate::predict::post_clip(look, probe.xyz, space, params.clip_k());
+        let post_ucs = if post_ucs.to_array().iter().all(|value| value.is_finite()) {
+            post_ucs
+        } else {
+            looklab_model::output_encode_clip(pre, space, params.clip_k())
+        };
         let clusters = probe_cluster_count(
             &cluster_samples,
             probe.xyz,
@@ -632,7 +693,7 @@ pub(crate) fn probe_uncertainty(
         let previous_bias = previous
             .and_then(|state| state.bias.get(estimates.len()).copied())
             .unwrap_or(false);
-        let flags = mark_support(
+        let mut flags = mark_support(
             post_sigma_de,
             bias_de,
             local_density,
@@ -642,6 +703,24 @@ pub(crate) fn probe_uncertainty(
             previous_bias,
             options,
         );
+        let withheld = degraded || clip_fallback;
+        if withheld {
+            flags.sigma = false;
+        }
+        if !pre.to_array().iter().all(|value| value.is_finite())
+            || !covariance.iter().flatten().all(|value| value.is_finite())
+            || !post_covariance
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+            || !sigma_de.is_finite()
+            || !post_sigma_de.is_finite()
+            || !bias_de.is_finite()
+        {
+            return Err(FitError::NonFiniteProbeEstimate {
+                probe: probes.probes[estimates.len()].id.clone(),
+            });
+        }
         if flags.all() {
             supported += 1;
         }
@@ -654,8 +733,7 @@ pub(crate) fn probe_uncertainty(
             post_covariance,
             post_sigma_de,
             bias_de,
-            pre_clip_reliable: crate::predict::clip_derivative_min(pre, space, params.clip_k())
-                >= 0.25,
+            pre_clip_reliable: !withheld && clip_reliable,
             gamut_edge: probe.id.as_str().split('-').nth(2) == Some("80"),
             density: local_density,
             supported_sigma: flags.sigma,
@@ -664,6 +742,7 @@ pub(crate) fn probe_uncertainty(
             supported_bias: flags.bias,
             supported_evidence: false,
             supported: flags.all(),
+            support_withheld: withheld,
             clusters,
         });
     }
@@ -678,6 +757,22 @@ pub(crate) fn probe_uncertainty(
         ids,
         supported_fraction: fraction,
     })
+}
+
+/// Clears support on probes whose covariance is a finite fallback.
+pub(crate) fn unsupport_unreliable(probes: &mut ProbeUncertainty) {
+    let mut supported = 0usize;
+    for probe in &mut probes.probes {
+        if probe.support_withheld {
+            probe.supported_sigma = false;
+            probe.supported = false;
+            probe.pre_clip_reliable = false;
+        }
+        if probe.supported {
+            supported += 1;
+        }
+    }
+    probes.supported_fraction = supported as f64 / probes.probes.len().max(1) as f64;
 }
 
 /// Image-clustered sandwich covariance of the control-response coefficients.
@@ -877,5 +972,84 @@ mod review_tests {
         let ratio = 12.706_204_6 / 1.644_853_626_951_472_2;
         let expected = 2.0 * ratio * ratio;
         assert!((small_cluster_factor(2) - expected).abs() < 1e-9);
+    }
+
+    #[cfg(feature = "synth")]
+    #[test]
+    fn singular_chroma_probes_are_finite_and_unsupported() {
+        let data = crate::synth::dataset(&crate::synth::SynthConfig {
+            images: 2,
+            samples_per_image: 64,
+            ..crate::synth::SynthConfig::default()
+        });
+        let options = crate::types::FitOptions::default();
+        let problem =
+            crate::problem::Problem::new_with(&data.images, None, &options).expect("problem");
+        let look = looklab_model::Look::colorimetric_spline().expect("look");
+        let params = crate::fit::params_from_look(&problem, &look);
+        let (probes, density, _) = crate::fit::look_only_probes(
+            &problem,
+            &params,
+            &crate::types::StageLambdas::default(),
+            None,
+            &options,
+        )
+        .expect("probe uncertainty");
+        let set = looklab_model::probes::v1();
+        let mut neutral = 0usize;
+        let mut chart = 0usize;
+        for (index, probe) in probes.probes.iter().enumerate() {
+            assert!(
+                probe
+                    .covariance
+                    .iter()
+                    .flatten()
+                    .all(|value| value.is_finite())
+            );
+            assert!(
+                probe
+                    .post_covariance
+                    .iter()
+                    .flatten()
+                    .all(|value| value.is_finite())
+            );
+            assert!(probe.sigma_de.is_finite());
+            assert!(probe.post_sigma_de.is_finite());
+            assert!(probe.bias_de.is_finite());
+            if probe.support_withheld {
+                neutral += 1;
+                assert!(!probe.supported);
+                assert!(!probe.supported_sigma);
+                assert!(!probe.pre_clip_reliable);
+                assert!(probe.covariance[0][0] > 0.0);
+                assert_eq!(probe.covariance[1][1], UNKNOWN_VARIANCE);
+                assert_eq!(probe.covariance[2][2], UNKNOWN_VARIANCE);
+                assert_eq!(probe.post_covariance[1][1], UNKNOWN_VARIANCE);
+                assert_eq!(probe.post_covariance[2][2], UNKNOWN_VARIANCE);
+                assert!(probe.post_covariance[0][0] < UNKNOWN_VARIANCE);
+            } else {
+                chart += 1;
+                let expected = mark_support(
+                    probe.post_sigma_de,
+                    probe.bias_de,
+                    probe.density,
+                    probe.clusters,
+                    density.floor,
+                    false,
+                    false,
+                    &options,
+                );
+                assert_eq!(probe.supported_sigma, expected.sigma);
+                assert_eq!(probe.supported, expected.all());
+            }
+            let input = LookInput::new(set.probes[index].xyz);
+            let values = look.layer_values(&input);
+            let paths = look.chroma_paths(&input, &values);
+            if paths.singular() && paths.blend < 1.0 {
+                assert!(probe.support_withheld);
+            }
+        }
+        assert!(neutral > 0, "colorimetric look has no singular gray probe");
+        assert!(chart > 0, "colorimetric look has no non-singular probe");
     }
 }

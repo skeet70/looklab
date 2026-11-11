@@ -3,6 +3,7 @@
 
 use std::io;
 
+use looklab_model::LookDocument;
 use looklab_model::file::{LookKind, LookPin, LookVersion, Slug, WbPolicy};
 use looklab_schema::{Applicability, BodyId, EligibilitySnapshotId, ModelReportId};
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,8 @@ pub struct LookVersionPage {
     #[serde(default, skip_serializing_if = "is_false")]
     pub approximated: bool,
     #[serde(default)]
+    pub support: PublishedSupport,
+    #[serde(default)]
     pub canonical: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligibility: Option<EligibilitySnapshotId>,
@@ -70,6 +73,19 @@ pub struct LookVersionPage {
     pub eligibility_status: Option<looklab_schema::TargetEligibilityStatus>,
     #[serde(default = "unassessed_applicability")]
     pub applicability: Applicability,
+}
+
+/// The support a published version's mask can offer to matching and downstream paths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishedSupport {
+    /// The version publishes no support mask.
+    #[default]
+    Unstated,
+    /// The published mask supports at least one probe.
+    Checked,
+    /// The published mask supports no probe; only experimental matching can use it.
+    EarlyEstimate,
 }
 
 fn unassessed_applicability() -> Applicability {
@@ -125,6 +141,7 @@ impl LookVersionPage {
             matchable: layered,
             card_eligible,
             approximated: false,
+            support: PublishedSupport::default(),
             canonical: false,
             eligibility: None,
             eligibility_status: None,
@@ -139,7 +156,54 @@ impl LookVersionPage {
     pub fn artifacts(&self) -> &[ArtifactEntry] {
         &self.manifest.artifacts
     }
+
+    /// Derives the version's matchable, approximation and support state from its
+    /// published document.
+    ///
+    /// A layered native-family target whose published support mask supports no
+    /// probe is an early estimate: it stays matchable and previewable, records
+    /// the missing independent check, and offers no firmware card.
+    pub fn apply_document(&mut self, document: &LookDocument) {
+        self.matchable = document.is_matchable();
+        self.approximated = document
+            .file
+            .definition
+            .as_ref()
+            .is_some_and(|definition| definition.declared_base.is_some());
+        if self.approximated {
+            self.card_eligible = false;
+        }
+        let mask = document.uncertainty.support.as_ref();
+        self.support = match mask {
+            Some(mask) if mask.values.iter().any(|value| *value > 0.5) => PublishedSupport::Checked,
+            Some(_) => PublishedSupport::EarlyEstimate,
+            None => PublishedSupport::Unstated,
+        };
+        if self.support == PublishedSupport::EarlyEstimate {
+            self.card_eligible = false;
+        }
+        let unsupported = document.file.look.kind == LookKind::NativeFamily
+            && self.support == PublishedSupport::EarlyEstimate;
+        if unsupported {
+            // The document refuses an ordinary match, but experimental selection
+            // can use it, so the version stays matchable.
+            self.matchable = true;
+            self.notes.notice = Some(UNCHECKED_REGION_NOTICE.to_owned());
+            self.notes.weak_spots.push(WeakSpot {
+                region: UNCHECKED_REGION_SPOT.to_owned(),
+                note: UNCHECKED_REGION_NOTE.to_owned(),
+                bounty: None,
+            });
+        }
+    }
 }
+
+/// The version notice for a target whose published support has no checked region.
+pub const UNCHECKED_REGION_NOTICE: &str = "Experimental early estimate: the fit converged, but no region has an independently checked measurement yet.";
+
+const UNCHECKED_REGION_SPOT: &str = "the overall colour response";
+
+const UNCHECKED_REGION_NOTE: &str = "More independent photos (different scenes) of this film simulation on this camera would supply the missing check.";
 
 fn source_preview(
     manifest: &VersionManifest,
@@ -229,6 +293,8 @@ pub struct VersionSummary {
     pub card_eligible: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub approximated: bool,
+    #[serde(default)]
+    pub support: PublishedSupport,
     #[serde(default = "unassessed_applicability")]
     pub applicability: Applicability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -749,6 +815,7 @@ fn site_index(site: &SiteData, entries: SiteEntries) -> Result<SiteIndex, Publis
                         matchable: version.matchable,
                         card_eligible: version.card_eligible,
                         approximated: version.approximated,
+                        support: version.support,
                         applicability: version.applicability.clone(),
                         eligibility_status: version.eligibility_status,
                         card: version
@@ -1017,7 +1084,9 @@ fn validate(site: &SiteData) -> Result<(), PublishError> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use looklab_model::file::{LookKind, LookVersion, Slug, WbPolicy};
+    use looklab_model::file::{
+        LookKind, LookVersion, ProbeCovariance, ProbeScalars, Slug, UncertaintyData, WbPolicy,
+    };
     use looklab_schema::{validate_body, validate_control_schema};
 
     use super::*;
@@ -1779,5 +1848,104 @@ mod tests {
             write_site(&mut sink, &site),
             Err(PublishError::SourceLut(_))
         ));
+    }
+
+    fn layered_version(card: bool) -> LookVersionPage {
+        let mut blobs = vec![
+            ArtifactBlob::new(
+                ArtifactName::new(crate::manifest::DOCUMENT_ARTIFACT).expect("name"),
+                vec![1, 2, 3],
+            ),
+            ArtifactBlob::new(
+                ArtifactName::new(crate::manifest::PREVIEW_LUT_ARTIFACT).expect("name"),
+                vec![0; crate::preview::LUT_BYTES],
+            ),
+        ];
+        if card {
+            blobs.push(ArtifactBlob::new(
+                ArtifactName::new(crate::manifest::CARD_ARTIFACT).expect("name"),
+                vec![4, 5, 6],
+            ));
+        }
+        LookVersionPage::new(
+            Slug::new("provia").expect("slug"),
+            LookVersion::new("1.0.0").expect("version"),
+            LookStatus::Published,
+            GateSummary::default(),
+            ProvenanceSummary::default(),
+            blobs,
+            VersionNotes::default(),
+        )
+        .expect("version")
+    }
+
+    fn layered_document(support: Option<Vec<f64>>) -> LookDocument {
+        let count = looklab_model::probes::v1().probes.len();
+        let mut covariance = Vec::with_capacity(count * 9);
+        for _ in 0..count {
+            covariance.extend_from_slice(&[0.01, 0.0, 0.0, 0.0, 0.01, 0.0, 0.0, 0.0, 0.01]);
+        }
+        let uncertainty = UncertaintyData {
+            probe_cov: Some(ProbeCovariance::new(count, covariance.clone()).expect("covariance")),
+            probe_cov_post: Some(ProbeCovariance::new(count, covariance).expect("covariance")),
+            support: support.map(|values| ProbeScalars::new(values).expect("support")),
+            ..UncertaintyData::default()
+        };
+        LookDocument::from_look(
+            looklab_model::file::identity("provia", "1.0.0").expect("identity"),
+            looklab_model::Look::colorimetric(),
+        )
+        .expect("document")
+        .with_uncertainty(uncertainty)
+        .expect("uncertainty")
+    }
+
+    #[test]
+    fn a_target_without_a_supported_probe_is_an_experimental_estimate() {
+        let count = looklab_model::probes::v1().probes.len();
+        let mut version = layered_version(true);
+        assert!(version.card_eligible, "the card artifact makes it eligible");
+        version.apply_document(&layered_document(Some(vec![0.0; count])));
+        assert!(version.matchable);
+        assert!(
+            version
+                .artifacts()
+                .iter()
+                .any(|artifact| artifact.name.as_str() == crate::manifest::PREVIEW_LUT_ARTIFACT)
+        );
+        assert!(!version.card_eligible);
+        assert_eq!(version.support, PublishedSupport::EarlyEstimate);
+        assert_eq!(
+            version.notes.notice.as_deref(),
+            Some(UNCHECKED_REGION_NOTICE)
+        );
+        assert_eq!(version.notes.weak_spots.len(), 1);
+        assert_eq!(version.notes.weak_spots[0].region, UNCHECKED_REGION_SPOT);
+    }
+
+    #[test]
+    fn a_lut_defined_zero_support_document_stays_non_matchable() {
+        let count = looklab_model::probes::v1().probes.len();
+        let mut document = layered_document(Some(vec![0.0; count]));
+        document.file.look.kind = LookKind::LutDefined;
+        let mut version = layered_version(true);
+        version.apply_document(&document);
+        assert!(!version.matchable);
+        assert_eq!(version.support, PublishedSupport::EarlyEstimate);
+        assert!(!version.card_eligible);
+    }
+
+    #[test]
+    fn a_target_with_a_supported_probe_keeps_its_card() {
+        let count = looklab_model::probes::v1().probes.len();
+        let mut support = vec![0.0; count];
+        support[0] = 1.0;
+        let mut version = layered_version(true);
+        version.apply_document(&layered_document(Some(support)));
+        assert!(version.matchable);
+        assert!(version.card_eligible);
+        assert_eq!(version.support, PublishedSupport::Checked);
+        assert!(version.notes.notice.is_none());
+        assert!(version.notes.weak_spots.is_empty());
     }
 }

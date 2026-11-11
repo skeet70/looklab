@@ -6,6 +6,7 @@ use looklab_publish::{
     ArtifactHash, PublishError, Scene, SceneCredit, SceneIndex, SceneKind, SceneName, SiteIndex,
     write_scene_sources,
 };
+use looklab_schema::{SNAPSHOT_MANIFEST, SnapshotManifest, content_hash};
 use looklab_worker::WorkerError;
 use looklab_worker::publish::{PublishConfig, publish_with_pool};
 use tempfile::TempDir;
@@ -56,6 +57,22 @@ impl Fixture {
         };
         publish_with_pool(&pool, &config).await.map(|_| ())
     }
+
+    async fn activate(&self, version: u64, hash: &str) {
+        let pool = looklab_server::open_database(&self.db)
+            .await
+            .expect("database");
+        sqlx::query(
+            "INSERT INTO community_snapshot_activation
+             (id, version, content_hash, activated_at)
+             VALUES (1, ?, ?, 0)",
+        )
+        .bind(i64::try_from(version).expect("version"))
+        .bind(hash)
+        .execute(&pool)
+        .await
+        .expect("activation");
+    }
 }
 
 fn photo(index: usize) -> Scene {
@@ -77,7 +94,7 @@ fn photo(index: usize) -> Scene {
     scene
 }
 
-fn write_community_snapshot(fixture: &Fixture, version: u64) {
+fn write_community_snapshot(fixture: &Fixture, version: u64) -> String {
     let root = fixture.data.join(format!("community/v{version}"));
     std::fs::create_dir_all(root.join("bodies")).expect("snapshot bodies");
     let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies");
@@ -85,16 +102,28 @@ fn write_community_snapshot(fixture: &Fixture, version: u64) {
     let schema_text = std::fs::read_to_string(shipped.join("fujifilm-x-t5.yaml")).expect("schema");
     let body = looklab_schema::validate_body(&body_text).expect("body");
     let schema = looklab_schema::validate_control_schema(&schema_text).expect("schema");
+    let body_path = looklab_schema::body_export_path(&body.id);
+    let schema_path = looklab_schema::schema_export_path(&schema.body);
+    std::fs::write(root.join(&body_path), body_text).expect("snapshot body");
+    std::fs::write(root.join(&schema_path), schema_text).expect("snapshot schema");
+    let files = [body_path, schema_path]
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(root.join(&path)).expect("snapshot file");
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    let hash = content_hash(&files);
     std::fs::write(
-        root.join(looklab_schema::body_export_path(&body.id)),
-        body_text,
+        root.join(SNAPSHOT_MANIFEST),
+        serde_json::to_vec(&SnapshotManifest {
+            version,
+            content_hash: hash.clone(),
+        })
+        .expect("manifest"),
     )
-    .expect("snapshot body");
-    std::fs::write(
-        root.join(looklab_schema::schema_export_path(&schema.body)),
-        schema_text,
-    )
-    .expect("snapshot schema");
+    .expect("snapshot manifest");
+    hash
 }
 
 fn prepare(fixture: &Fixture, count: usize) -> Vec<Scene> {
@@ -159,7 +188,8 @@ async fn publication_lists_prepared_photo_scenes_with_their_provenance() {
 async fn publication_uses_the_newest_approved_community_snapshot() {
     let fixture = Fixture::new();
     prepare(&fixture, 1);
-    write_community_snapshot(&fixture, 3);
+    let hash = write_community_snapshot(&fixture, 3);
+    fixture.activate(3, &hash).await;
     fixture.publish().await.expect("publish");
 
     let site: SiteIndex =

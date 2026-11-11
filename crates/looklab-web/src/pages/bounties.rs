@@ -51,6 +51,7 @@ struct WantedShots {
     bounties: Vec<Bounty>,
     requests: Vec<EvidenceRequestWire>,
     index: Arc<SiteIndex>,
+    bodies: Arc<Vec<looklab_publish::BodyPage>>,
 }
 
 #[component]
@@ -87,10 +88,31 @@ pub(super) fn WantedCards(
                         .total_cmp(&left.expected_variance_reduction)
                 });
                 let index = Arc::new(data::index().await?);
+                let mut bodies: Vec<looklab_publish::BodyPage> = Vec::new();
+                let mut missing: Vec<looklab_schema::BodyId> = Vec::new();
+                for request in wanted.evidence_requests.iter().take(limit) {
+                    let ModelSubject::BodyRealization { realization } = &request.subject else {
+                        continue;
+                    };
+                    if bodies.iter().any(|body| body.id == realization.body)
+                        || missing.contains(&realization.body)
+                    {
+                        continue;
+                    }
+                    let Some((make, model)) = realization.body.as_str().split_once('/') else {
+                        missing.push(realization.body.clone());
+                        continue;
+                    };
+                    match data::body_optional(make, model).await {
+                        Ok(Some(page)) => bodies.push(page),
+                        _ => missing.push(realization.body.clone()),
+                    }
+                }
                 Ok::<_, String>(WantedShots {
                     bounties,
                     requests: wanted.evidence_requests,
                     index,
+                    bodies: Arc::new(bodies),
                 })
             }
             .await;
@@ -128,7 +150,7 @@ pub(super) fn WantedCards(
                         <WantedCard bounty index=wanted.index.clone() show_action=show_actions/>
                     }).collect_view()}
                     {wanted.requests.into_iter().take(limit).map(|request| view! {
-                        <EvidenceRequestCard request index=wanted.index.clone() show_action=show_actions/>
+                        <EvidenceRequestCard request index=wanted.index.clone() bodies=wanted.bodies.clone() show_action=show_actions/>
                     }).collect_view()}
                 </div>
             }
@@ -137,10 +159,75 @@ pub(super) fn WantedCards(
     }
 }
 
+/// Where a wanted-shot card's evidence request came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WantedOrigin {
+    PublishedEstimate,
+    BeforePublication,
+    Assessment,
+}
+
+impl WantedOrigin {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PublishedEstimate => "A published early estimate still needs this",
+            Self::BeforePublication => "Before a model is published",
+            Self::Assessment => "From a published assessment",
+        }
+    }
+}
+
+/// The origin a wanted-shot card shows for one evidence request.
+pub(crate) fn origin(
+    index: &SiteIndex,
+    bodies: &[looklab_publish::BodyPage],
+    request: &EvidenceRequestWire,
+) -> WantedOrigin {
+    match &request.origin {
+        EvidenceRequestOrigin::Report { .. } => WantedOrigin::Assessment,
+        EvidenceRequestOrigin::PreCandidate => {
+            if crate::data::evidence_look_published(index, bodies, request) {
+                WantedOrigin::PublishedEstimate
+            } else {
+                WantedOrigin::BeforePublication
+            }
+        }
+    }
+}
+
+/// The experimental label, the missing evidence a published request names, and
+/// the wanted-shots call to action.
+#[component]
+pub(crate) fn ExperimentalEvidence(
+    #[prop(optional_no_strip)] detail: Option<String>,
+) -> impl IntoView {
+    let (line, action) = match detail {
+        Some(detail) => (
+            format!("Experimental: {detail}"),
+            Some(
+                "More independent photos (different scenes) of this film simulation on that camera help.",
+            ),
+        ),
+        None => (
+            "Experimental: this target is not a qualified result for these settings.".to_owned(),
+            None,
+        ),
+    };
+    view! {
+        <p class="notice" role="note">
+            {line}
+            " "
+            <a href=crate::base::site_url("/contribute/wanted")>"Help with a few more shots →"</a>
+        </p>
+        {action.map(|action| view! { <p class="muted">{action}</p> })}
+    }
+}
+
 #[component]
 fn EvidenceRequestCard(
     request: EvidenceRequestWire,
     index: Arc<SiteIndex>,
+    bodies: Arc<Vec<looklab_publish::BodyPage>>,
     show_action: bool,
 ) -> impl IntoView {
     let camera = request
@@ -168,10 +255,7 @@ fn EvidenceRequestCard(
         looklab_schema::QualificationCapability::ControlsMatching => "settings and controls",
         looklab_schema::QualificationCapability::CrossBodyAdmission => "cross-camera agreement",
     };
-    let origin = match &request.origin {
-        EvidenceRequestOrigin::Report { .. } => "From a published assessment",
-        EvidenceRequestOrigin::PreCandidate => "Before a model is published",
-    };
+    let origin = origin(&index, &bodies, &request).label();
     let context = match (request.epoch(), request.native_sim()) {
         (Some(epoch), Some(sim)) => format!("Firmware epoch {} · {}", epoch.get(), sim.as_str()),
         _ => String::new(),
@@ -261,5 +345,178 @@ fn WantedCard(bounty: Bounty, index: Arc<SiteIndex>, show_action: bool) -> impl 
                 )}</p>
             </ui::Disclosure>
         </article>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use looklab_model::file::{LookKind, LookVersion, Slug, WbPolicy};
+    use looklab_publish::{LookStatus, LookSummary, LookVisibility, VersionSummary};
+    use looklab_schema::{EvidenceRequestKind, LookId, ModelSubject, QualificationCapability};
+
+    fn version_summary() -> VersionSummary {
+        VersionSummary {
+            support: looklab_publish::PublishedSupport::Unstated,
+            version: LookVersion::new("1.0.0").expect("version"),
+            status: LookStatus::Published,
+            matchable: true,
+            card_eligible: false,
+            approximated: false,
+            applicability: looklab_schema::Applicability::Current,
+            eligibility_status: None,
+            card: None,
+            manifest: looklab_publish::SitePath::new("data/looks/provia/1.0.0/manifest.json")
+                .expect("manifest path"),
+            manifest_sha256: looklab_publish::ArtifactHash::of(b""),
+            manifest_bytes: 0,
+            artifact: looklab_publish::ArtifactName::new("look.looklab").expect("artifact"),
+            sha256: looklab_publish::ArtifactHash::of(b""),
+            bytes: 0,
+        }
+    }
+
+    fn index_for(slug: &str, published: bool) -> SiteIndex {
+        SiteIndex {
+            format: looklab_publish::SITE_FORMAT.to_owned(),
+            community_snapshot_version: 0,
+            bodies: Vec::new(),
+            manuals: Vec::new(),
+            interfaces: Vec::new(),
+            input_transforms: Vec::new(),
+            looks: vec![LookSummary {
+                slug: Slug::new(slug).expect("slug"),
+                name: "Look".to_owned(),
+                kind: LookKind::NativeFamily,
+                wb_policy: WbPolicy::Adaptive,
+                visibility: LookVisibility::Public,
+                head: None,
+                selected: None,
+                versions: if published {
+                    vec![version_summary()]
+                } else {
+                    Vec::new()
+                },
+            }],
+            scenes: Vec::new(),
+            reports: Vec::new(),
+            eligibility: Vec::new(),
+            current: Vec::new(),
+            bundles: Vec::new(),
+            reference_preview: None,
+        }
+    }
+
+    fn index(published: bool) -> SiteIndex {
+        index_for("provia", published)
+    }
+
+    fn request() -> EvidenceRequestWire {
+        EvidenceRequestWire {
+            origin: EvidenceRequestOrigin::PreCandidate,
+            subject: ModelSubject::SharedFamily {
+                family: LookId::new("provia").expect("family"),
+            },
+            capability: QualificationCapability::NativePrediction,
+            kind: EvidenceRequestKind::MissingIndependentCaptures,
+            detail: "one independent RAW capture".to_owned(),
+            observed_groups: Some(1),
+        }
+    }
+
+    #[test]
+    fn an_unpublished_look_reads_before_publication() {
+        assert_eq!(
+            origin(&index(false), &[], &request()),
+            WantedOrigin::BeforePublication
+        );
+    }
+
+    #[test]
+    fn a_published_experimental_look_reads_as_a_published_estimate() {
+        assert_eq!(
+            origin(&index(true), &[], &request()),
+            WantedOrigin::PublishedEstimate
+        );
+    }
+
+    #[test]
+    fn a_report_origin_keeps_its_assessment_label() {
+        let mut request = request();
+        request.origin = EvidenceRequestOrigin::Report {
+            report: looklab_schema::ModelReportId::from_digest([7; 32]),
+        };
+        assert_eq!(
+            origin(&index(false), &[], &request),
+            WantedOrigin::Assessment
+        );
+    }
+
+    #[test]
+    fn missing_captures_names_the_request_for_the_look() {
+        let wanted = crate::data::WantedFile {
+            bounties: Vec::new(),
+            evidence_requests: vec![request()],
+        };
+        let index = index(true);
+        assert_eq!(
+            crate::data::missing_captures(&wanted, &index, "provia"),
+            Some("one independent RAW capture".to_owned())
+        );
+        assert_eq!(
+            crate::data::missing_captures(&wanted, &index, "classic-chrome"),
+            None
+        );
+    }
+
+    fn body_page() -> looklab_publish::BodyPage {
+        let body = looklab_schema::validate_body(
+            "id: fujifilm/x-t5\nmake: Fujifilm\nmodel: X-T5\nexif_aliases: [X-T5]\nkind: camera\ncapabilities:\n  in_camera_raw_conversion: true\n  jpeg_color_spaces: [srgb]\n  heif: false\nstatus: active\nmapping_status: provisional\n",
+        )
+        .expect("body");
+        let schema = looklab_schema::validate_control_schema(include_str!(
+            "../../../../data/bodies/fujifilm-x-t5.yaml"
+        ))
+        .expect("schema");
+        looklab_publish::BodyPage::from_schema(
+            &body,
+            &schema,
+            &looklab_publish::BodyExtras::default(),
+        )
+        .expect("body page")
+    }
+
+    fn realization_request(page: &looklab_publish::BodyPage) -> EvidenceRequestWire {
+        let card = page.native_looks.first().expect("native sim card");
+        EvidenceRequestWire {
+            origin: EvidenceRequestOrigin::PreCandidate,
+            subject: ModelSubject::BodyRealization {
+                realization: looklab_schema::BodyRealizationId {
+                    body: page.id.clone(),
+                    epoch: looklab_schema::ControlEpochId::new(card.epoch),
+                    native_sim: card.sim_key.clone(),
+                },
+            },
+            capability: QualificationCapability::NativePrediction,
+            kind: EvidenceRequestKind::MissingIndependentCaptures,
+            detail: "one independent RAW capture".to_owned(),
+            observed_groups: Some(1),
+        }
+    }
+
+    #[test]
+    fn a_realization_request_resolves_its_look_through_the_body_page() {
+        let page = body_page();
+        let request = realization_request(&page);
+        let look = page.native_looks[0].look.as_str().to_owned();
+        let bodies = std::slice::from_ref(&page);
+        assert_eq!(
+            origin(&index_for(&look, true), bodies, &request),
+            WantedOrigin::PublishedEstimate
+        );
+        assert_eq!(
+            origin(&index_for(&look, false), bodies, &request),
+            WantedOrigin::BeforePublication
+        );
     }
 }

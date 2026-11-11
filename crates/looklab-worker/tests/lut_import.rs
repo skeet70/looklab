@@ -13,10 +13,11 @@ use looklab_publish::{
 };
 use looklab_schema::{
     ArtifactBinding, ArtifactRole, EligibilitySnapshotId, LicenseDeclaration, LookId, LutBase,
-    LutEncoding, LutFile, LutLookProposal, LutLookVersion, PublishedTargetId, Sha256Hex,
-    TargetBasis, TargetEligibility, TargetEligibilityStatus, TargetVersion,
+    LutDynamicRange, LutEncoding, LutFile, LutLookProposal, LutLookVersion, LutRenderer,
+    PublishedTargetId, Sha256Hex, TargetBasis, TargetEligibility, TargetEligibilityStatus,
+    TargetVersion,
 };
-use looklab_server::{ProposalId, admin, model_store};
+use looklab_server::{FsBlobStore, LutAdmission, ProposalId, admin, admit_lut, model_store};
 use looklab_trust::VersionId;
 use looklab_upload::LookSlug;
 use looklab_worker::jobs::{self, JobPayload};
@@ -308,7 +309,14 @@ async fn publish_source_preview_base(worker: &Worker, slug: &str, version: u32) 
     .expect("base preview manifest");
 }
 
-async fn publish_layered_base(worker: &Worker, slug: &str, version: u32, eligible: bool) {
+async fn publish_layered_base(
+    worker: &Worker,
+    slug: &str,
+    version: u32,
+    eligible: bool,
+    maker: &str,
+    rendering: &str,
+) {
     let identity = LookIdentity::new(
         slug,
         &format!("{version}.0.0"),
@@ -317,10 +325,11 @@ async fn publish_layered_base(worker: &Worker, slug: &str, version: u32, eligibl
     )
     .expect("identity");
     let mut document = LookDocument::from_look(identity, Look::colorimetric()).expect("document");
-    document.file.rendering = Some(CameraRendering {
-        maker: "Fujifilm".to_owned(),
-        name: "Classic Chrome".to_owned(),
-    });
+    let rendering = CameraRendering {
+        maker: maker.to_owned(),
+        name: rendering.to_owned(),
+    };
+    document.file.rendering = Some(rendering.clone());
     document.file.provenance = Provenance {
         bodies: vec![BodyProvenance {
             body: "fujifilm/x-t5".to_owned(),
@@ -359,6 +368,9 @@ async fn publish_layered_base(worker: &Worker, slug: &str, version: u32, eligibl
     )
     .await
     .expect("base layered manifest");
+    admin::record_native_rendering(worker.pool(), &look_slug(slug), version, &rendering)
+        .await
+        .expect("native rendering");
     if eligible {
         let mut conn = worker.pool().acquire().await.expect("connection");
         model_store::record_target_eligibility(
@@ -463,7 +475,15 @@ async fn run_import(worker: &Worker, proposal: &ProposalId, look: &str, cube: &C
 async fn an_approximated_import_falls_back_to_the_recorded_preview() {
     let fixture = fixture().await;
     publish_source_preview_base(&fixture.worker, "base-look", 1).await;
-    publish_layered_base(&fixture.worker, "base-look", 2, false).await;
+    publish_layered_base(
+        &fixture.worker,
+        "base-look",
+        2,
+        false,
+        "Fujifilm",
+        "Classic Chrome",
+    )
+    .await;
     let proposal = ProposalId::new();
     run_import(
         &fixture.worker,
@@ -514,7 +534,15 @@ async fn an_approximated_import_falls_back_to_the_recorded_preview() {
 #[tokio::test]
 async fn a_preview_on_the_latest_base_is_not_re_marked() {
     let fixture = fixture().await;
-    publish_layered_base(&fixture.worker, "base-look", 2, false).await;
+    publish_layered_base(
+        &fixture.worker,
+        "base-look",
+        2,
+        false,
+        "Fujifilm",
+        "Classic Chrome",
+    )
+    .await;
     let pool = fixture.worker.pool();
     let look = look_slug("preview-lut");
     let declared = base_reference("base-look", "1.0.0");
@@ -561,7 +589,15 @@ async fn a_preview_on_the_latest_base_is_not_re_marked() {
 async fn an_approximated_fit_publishes_one_marked_version() {
     let fixture = fixture().await;
     publish_source_preview_base(&fixture.worker, "base-look", 1).await;
-    publish_layered_base(&fixture.worker, "base-look", 2, true).await;
+    publish_layered_base(
+        &fixture.worker,
+        "base-look",
+        2,
+        true,
+        "Fujifilm",
+        "Classic Chrome",
+    )
+    .await;
     let proposal = ProposalId::new();
     run_import(&fixture.worker, &proposal, "fitted-lut", &identity_cube()).await;
 
@@ -626,4 +662,241 @@ async fn a_base_error_does_not_fail_the_preview_bake() {
     )
     .expect("preview");
     assert_eq!(preview.len(), LUT_BYTES);
+}
+
+#[tokio::test]
+async fn an_operator_admission_publishes_a_neutral_preview() {
+    let fixture = fixture().await;
+    let cube = identity_cube();
+    let text = write_cube(&cube.lut, "Donated", cube.domain);
+    let bytes = text.as_bytes();
+    let digest = hex(&Sha256::digest(bytes));
+    let proposal = LutLookProposal {
+        look: LookId::new("operator-preview").expect("look"),
+        name: "Operator Preview".to_owned(),
+        license: LicenseDeclaration {
+            own_work: false,
+            source_license: Some("CC0-1.0".to_owned()),
+            source_url: None,
+        },
+        attribution: "A donor".to_owned(),
+        lut: LutFile {
+            file: "donated.cube".to_owned(),
+            sha256: Sha256Hex::parse(&digest).expect("digest"),
+            size: bytes.len() as u64,
+        },
+        encoding: LutEncoding::Display {
+            base: LutBase::BodyRealization {
+                body: looklab_schema::BodyId::new("fujifilm/x-e3").expect("body"),
+                renderer: LutRenderer::Unspecified,
+                film_simulation: None,
+                dynamic_range: None,
+                notes: "Fujifilm X-E3 RAW through an unnamed RAW converter.".to_owned(),
+            },
+        },
+        emulates: None,
+    };
+    let store = FsBlobStore::new(fixture.worker.config().blobs.clone()).expect("store");
+    let admitted = admit_lut(
+        fixture.worker.pool(),
+        &store,
+        LutAdmission {
+            proposal,
+            cube: bytes.to_vec(),
+            reason: "operator test admission".to_owned(),
+        },
+    )
+    .await
+    .expect("admit");
+    let pool = fixture.worker.pool();
+    let audit: String =
+        sqlx::query_scalar("SELECT payload FROM audit_log WHERE type = 'moderation_decision'")
+            .fetch_one(pool)
+            .await
+            .expect("audit");
+    let audit: serde_json::Value = serde_json::from_str(&audit).expect("audit payload");
+    assert_eq!(audit["actor"], "cli");
+    assert_eq!(audit["proposal"], admitted.proposal.as_str());
+    let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'lut_import'")
+        .fetch_one(pool)
+        .await
+        .expect("job");
+    assert_eq!(queued, 1);
+    for _ in 0..8 {
+        fixture.worker.run_once().await.expect("worker");
+        let imported: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM lut_imports WHERE proposal_id = ?")
+                .bind(admitted.proposal.as_str())
+                .fetch_one(pool)
+                .await
+                .expect("imports");
+        if imported > 0 {
+            break;
+        }
+        if let Some(reason) = sqlx::query_scalar::<_, String>(
+            "SELECT reason FROM lut_import_failures WHERE proposal_id = ?",
+        )
+        .bind(admitted.proposal.as_str())
+        .fetch_optional(pool)
+        .await
+        .expect("import failure")
+        {
+            panic!("the LUT import failed: {reason}");
+        }
+    }
+    let failures: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM lut_import_failures WHERE proposal_id = ?")
+            .bind(admitted.proposal.as_str())
+            .fetch_one(pool)
+            .await
+            .expect("failures");
+    assert_eq!(failures, 0);
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM look_versions WHERE look = 'operator-preview' AND version = 1",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("status");
+    assert_eq!(
+        looklab_worker::db::LookVersionStatus::parse(&status).expect("status"),
+        looklab_worker::db::LookVersionStatus::Published
+    );
+    let uploads: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lut_uploads WHERE proposal_id = ?")
+        .bind(admitted.proposal.as_str())
+        .fetch_one(pool)
+        .await
+        .expect("uploads");
+    assert_eq!(uploads, 0);
+    let artifacts = looklab_worker::db::manifest_artifacts(pool, "operator-preview", 1)
+        .await
+        .expect("manifest")
+        .expect("version");
+    assert!(
+        !artifacts
+            .iter()
+            .any(|artifact| artifact.name == looklab_publish::DOCUMENT_ARTIFACT)
+    );
+    let descriptor = artifacts
+        .iter()
+        .find(|artifact| artifact.name == SOURCE_LUT_ARTIFACT)
+        .map(|artifact| {
+            std::fs::read(fixture.worker.config().blobs.join(&artifact.sha256))
+                .expect("descriptor bytes")
+        })
+        .expect("descriptor");
+    let descriptor = SourceLutPreview::decode(&descriptor).expect("decode");
+    assert_eq!(
+        descriptor.preview.baseline,
+        PreviewBaseline::NeutralFallback
+    );
+    assert!(matches!(
+        descriptor.encoding,
+        DeclaredEncoding::DisplayReferred {
+            status: BaseStatus::BaseIncomplete {
+                missing: BaseField::FilmSimulation
+            },
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn an_operator_family_base_publishes_a_neutral_preview() {
+    let fixture = fixture().await;
+    publish_layered_base(
+        &fixture.worker,
+        "eterna-base",
+        1,
+        false,
+        "Fujifilm",
+        "Eterna",
+    )
+    .await;
+    let cube = identity_cube();
+    let text = write_cube(&cube.lut, "Donated", cube.domain);
+    let bytes = text.as_bytes();
+    let digest = hex(&Sha256::digest(bytes));
+    let proposal = LutLookProposal {
+        look: LookId::new("operator-family-preview").expect("look"),
+        name: "Operator Family Preview".to_owned(),
+        license: LicenseDeclaration {
+            own_work: false,
+            source_license: Some("CC0-1.0".to_owned()),
+            source_url: None,
+        },
+        attribution: "A donor".to_owned(),
+        lut: LutFile {
+            file: "donated.cube".to_owned(),
+            sha256: Sha256Hex::parse(&digest).expect("digest"),
+            size: bytes.len() as u64,
+        },
+        encoding: LutEncoding::Display {
+            base: LutBase::FamilyRendering {
+                maker: "fujifilm".to_owned().try_into().expect("maker"),
+                rendering: "Eterna".to_owned().try_into().expect("rendering"),
+                dynamic_range: Some(LutDynamicRange::Dr200),
+                notes: String::new(),
+            },
+        },
+        emulates: None,
+    };
+    let store = FsBlobStore::new(fixture.worker.config().blobs.clone()).expect("store");
+    let admitted = admit_lut(
+        fixture.worker.pool(),
+        &store,
+        LutAdmission {
+            proposal,
+            cube: bytes.to_vec(),
+            reason: "operator test admission".to_owned(),
+        },
+    )
+    .await
+    .expect("admit");
+    let pool = fixture.worker.pool();
+    for _ in 0..8 {
+        fixture.worker.run_once().await.expect("worker");
+        let imported: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM lut_imports WHERE proposal_id = ?")
+                .bind(admitted.proposal.as_str())
+                .fetch_one(pool)
+                .await
+                .expect("imports");
+        if imported > 0 {
+            break;
+        }
+        if let Some(reason) = sqlx::query_scalar::<_, String>(
+            "SELECT reason FROM lut_import_failures WHERE proposal_id = ?",
+        )
+        .bind(admitted.proposal.as_str())
+        .fetch_optional(pool)
+        .await
+        .expect("import failure")
+        {
+            panic!("the LUT import failed: {reason}");
+        }
+    }
+    let artifacts = looklab_worker::db::manifest_artifacts(pool, "operator-family-preview", 1)
+        .await
+        .expect("manifest")
+        .expect("version");
+    let descriptor = artifacts
+        .iter()
+        .find(|artifact| artifact.name == SOURCE_LUT_ARTIFACT)
+        .map(|artifact| {
+            std::fs::read(fixture.worker.config().blobs.join(&artifact.sha256))
+                .expect("descriptor bytes")
+        })
+        .expect("descriptor");
+    let descriptor = SourceLutPreview::decode(&descriptor).expect("decode");
+    assert_eq!(
+        descriptor.preview.baseline,
+        PreviewBaseline::NeutralFallback
+    );
+    assert!(matches!(
+        descriptor.encoding,
+        DeclaredEncoding::DisplayReferred {
+            status: BaseStatus::BaseIdentifiedUnmeasured,
+            ..
+        }
+    ));
 }

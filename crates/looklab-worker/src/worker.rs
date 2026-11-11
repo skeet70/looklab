@@ -220,6 +220,9 @@ impl Worker {
             RefitOutcome,
         )],
     ) -> Result<()> {
+        for (body, family, outcome) in outcomes {
+            tracing::info!(%body, %family, ?outcome, "refit outcome");
+        }
         if !outcomes.is_empty() {
             jobs::enqueue_if_idle(&self.pool, &JobPayload::Bounties, now_unix()).await?;
             jobs::enqueue_if_idle(&self.pool, &JobPayload::CardVerification, now_unix()).await?;

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Row access for uploads, credentials, blobs, versions and moderation items.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use looklab_meta::SerialHmac;
 use looklab_server::admin::{self, ManifestArtifact};
 use looklab_server::{ContributionId, CredentialId};
 use looklab_trust::{CredentialId as TrustCredentialId, Reputation, Scope, Tier};
@@ -558,6 +558,37 @@ pub async fn body_pool_conn(
     Ok(out)
 }
 
+/// Distinct serial links of live deferred monochrome contributions on one body.
+pub async fn deferred_serial_links_conn(
+    conn: &mut SqliteConnection,
+    body: &BodyId,
+    now: i64,
+) -> Result<Vec<(CredentialId, SerialHmac)>> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT credential_id, serial_hmac FROM contributions
+         WHERE body_id = ? AND intent != 'card' AND render_class = 'monochrome'
+           AND deferred_until IS NOT NULL AND deferred_until > ?
+           AND status IN ('pending', 'accepted') AND serial_hmac IS NOT NULL
+         ORDER BY credential_id",
+    )
+    .bind(body.as_str())
+    .bind(now)
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            let credential: String = row.get("credential_id");
+            let credential = CredentialId::try_from(credential)
+                .map_err(|_| WorkerError::Data("credential id is not a UUID".to_owned()))?;
+            let hmac: Vec<u8> = row.get("serial_hmac");
+            let hmac = hmac
+                .try_into()
+                .map_err(|_| WorkerError::Data("serial HMAC is not 32 bytes".to_owned()))?;
+            Ok((credential, SerialHmac::from_bytes(hmac)))
+        })
+        .collect()
+}
+
 pub async fn all_contributions(pool: &SqlitePool) -> Result<Vec<ContributionRow>> {
     let sql = format!(
         "SELECT {CONTRIBUTION_COLUMNS} FROM contributions c
@@ -887,14 +918,18 @@ pub async fn deferred_expiries_due(
 pub async fn expire_deferred_contribution(
     pool: &SqlitePool,
     contribution: &ContributionId,
+    now: i64,
 ) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     sqlx::query(
         "UPDATE contributions SET status = 'withdrawn'
          WHERE id = ? AND render_class = 'monochrome' AND status != 'withdrawn'",
     )
     .bind(contribution.as_str())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    looklab_server::contribution_identity_changed(&mut tx, contribution, now).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1049,149 +1084,6 @@ pub async fn record_pool_fingerprint(
     .bind(now)
     .execute(pool)
     .await?;
-    Ok(())
-}
-
-/// A serialized resumable fit state, opaque to the worker.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-pub struct FitState(String);
-
-impl FitState {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Non-converged native fit state carried across batches for one Look.
-#[derive(Debug, Clone, Default)]
-pub struct FitAttempt {
-    pub states: BTreeMap<String, FitState>,
-    pub consecutive: u32,
-    /// First non-converged batch in the current streak.
-    pub started_at: i64,
-}
-
-pub async fn fit_attempt(pool: &SqlitePool, look: &str) -> Result<Option<FitAttempt>> {
-    let row: Option<(String, i64, i64)> =
-        sqlx::query_as("SELECT states, consecutive, started_at FROM fit_attempts WHERE look = ?")
-            .bind(look)
-            .fetch_optional(pool)
-            .await?;
-    row.map(|(states, consecutive, started_at)| {
-        let states: BTreeMap<String, FitState> = serde_json::from_str(&states)?;
-        Ok(FitAttempt {
-            states,
-            consecutive: u32::try_from(consecutive).unwrap_or(u32::MAX),
-            started_at,
-        })
-    })
-    .transpose()
-}
-
-/// Stores one body's state and returns the Look's consecutive non-converged count.
-pub async fn record_fit_attempt(
-    pool: &SqlitePool,
-    look: &str,
-    body: &str,
-    state: Option<&FitState>,
-    now: i64,
-) -> Result<u32> {
-    let mut attempt = fit_attempt(pool, look).await?.unwrap_or_default();
-    if let Some(state) = state {
-        attempt.states.insert(body.to_owned(), state.clone());
-    }
-    let consecutive = attempt.consecutive.saturating_add(1);
-    let started_at = if attempt.consecutive == 0 {
-        now
-    } else {
-        attempt.started_at
-    };
-    let states = serde_json::to_string(&attempt.states)?;
-    sqlx::query(
-        "INSERT INTO fit_attempts (look, states, consecutive, started_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (look) DO UPDATE
-         SET states = excluded.states,
-             consecutive = excluded.consecutive,
-             started_at = excluded.started_at,
-             updated_at = excluded.updated_at",
-    )
-    .bind(look)
-    .bind(states)
-    .bind(i64::from(consecutive))
-    .bind(started_at)
-    .bind(now)
-    .execute(pool)
-    .await?;
-    Ok(consecutive)
-}
-
-pub async fn clear_fit_attempt(pool: &SqlitePool, look: &str) -> Result<()> {
-    sqlx::query("DELETE FROM fit_attempts WHERE look = ?")
-        .bind(look)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-/// The `fit_holds.status` column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FitHoldStatus {
-    Pending,
-    Resolved,
-}
-
-impl FitHoldStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Resolved => "resolved",
-        }
-    }
-}
-
-/// Raises the moderation item for a Look whose batches keep not converging.
-pub async fn open_fit_hold(
-    pool: &SqlitePool,
-    look: &str,
-    consecutive: u32,
-    first_attempt: i64,
-    last_attempt: i64,
-    diagnostics: &str,
-) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO fit_holds
-         (look, consecutive, first_attempt, last_attempt, diagnostics, status)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT (look) DO UPDATE
-         SET consecutive = excluded.consecutive,
-             last_attempt = excluded.last_attempt,
-             diagnostics = excluded.diagnostics,
-             status = excluded.status",
-    )
-    .bind(look)
-    .bind(i64::from(consecutive))
-    .bind(first_attempt)
-    .bind(last_attempt)
-    .bind(diagnostics)
-    .bind(FitHoldStatus::Pending.as_str())
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-pub async fn resolve_fit_hold(pool: &SqlitePool, look: &str) -> Result<()> {
-    sqlx::query("UPDATE fit_holds SET status = ? WHERE look = ? AND status = ?")
-        .bind(FitHoldStatus::Resolved.as_str())
-        .bind(look)
-        .bind(FitHoldStatus::Pending.as_str())
-        .execute(pool)
-        .await?;
     Ok(())
 }
 

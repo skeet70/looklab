@@ -3,8 +3,8 @@
 
 use looklab_color::Mat3;
 use looklab_match::{
-    AssessedDomain, Calibration, ControlCovariance, Emphasis, FitObservedOptions, MatchModel,
-    MatchOptions, OutputContext, OutputPin, PRE_CLIP_OPTIMIZER_VERSION, Permalink,
+    AssessedDomain, Calibration, ControlCovariance, Emphasis, FitObservedOptions, ImageCount,
+    MatchModel, MatchOptions, OutputContext, OutputPin, PRE_CLIP_OPTIMIZER_VERSION, Permalink,
     PermalinkSources, Plan, PreparedTarget, ReportPin, ScaleFitter, ScoringMetric,
     SelectionContext, SelectionMode, TargetAppearance, TargetSpec, measure_target_error, optimize,
     settings_card_with_support,
@@ -394,12 +394,16 @@ impl Case {
         })
     }
 
-    fn target<'a>(&'a self, scoped: &'a ScopedProbes) -> Result<PreparedTarget<'a>, FacadeError> {
+    fn target<'a>(
+        &'a self,
+        scoped: &'a ScopedProbes,
+        mode: Option<SelectionMode>,
+    ) -> Result<PreparedTarget<'a>, FacadeError> {
         let uncertainty = scoped
             .uncertainty
             .as_ref()
             .unwrap_or(&self.target.uncertainty);
-        Ok(PreparedTarget::new(TargetSpec {
+        let spec = TargetSpec {
             probes: &scoped.probes,
             function: &self.target.look,
             uncertainty: Some(uncertainty),
@@ -408,7 +412,14 @@ impl Case {
             support_sigma: 1.5,
             density_floor: None,
             appearance: self.appearance,
-        })?)
+        };
+        let experimental = mode == Some(SelectionMode::Experimental)
+            && self.target.file.look.kind == looklab_model::LookKind::NativeFamily;
+        Ok(if experimental {
+            PreparedTarget::experimental(spec, ImageCount::of_document(&self.target))?
+        } else {
+            PreparedTarget::new(spec)?
+        })
     }
 
     fn probes(
@@ -629,8 +640,13 @@ pub fn run_match(message: &MatchRequest) -> Result<MatchReply, FacadeError> {
     let plan = case.plan()?;
     let domains = case.domains(&plan)?;
     let scoped = case.probes(&domains)?;
+    let mode = case
+        .inputs
+        .selection
+        .as_ref()
+        .map(|selection| selection.mode);
     let target = case
-        .target(&scoped)?
+        .target(&scoped, mode)?
         .with_declared_points(scoped.declared_points)?;
     let models = case.models(&plan)?;
     let outcome = if domains.is_empty() {
@@ -697,8 +713,13 @@ pub fn run_verify(message: &VerifyRequestMessage) -> Result<VerifyReply, FacadeE
     let plan = case.plan()?;
     let domains = case.domains(&plan)?;
     let scoped = case.probes(&domains)?;
+    let mode = case
+        .inputs
+        .selection
+        .as_ref()
+        .map(|selection| selection.mode);
     let target = case
-        .target(&scoped)?
+        .target(&scoped, mode)?
         .with_declared_points(scoped.declared_points)?;
     if case.sims.is_empty() {
         return Err(FacadeError::Input(
@@ -758,7 +779,7 @@ pub fn run_verify(message: &VerifyRequestMessage) -> Result<VerifyReply, FacadeE
     };
     let second_target = match &second_scoped {
         Some(scoped) => Some(
-            case.target(scoped)?
+            case.target(scoped, next_mode)?
                 .with_declared_points(scoped.declared_points)?,
         ),
         None => None,

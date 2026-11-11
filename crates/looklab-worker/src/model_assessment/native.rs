@@ -191,6 +191,7 @@ fn probe_uncertainty(loaded: &LoadedRealization) -> Result<ProbeUncertainty, Str
             supported_bias: stored.support.bias,
             supported_evidence: true,
             supported: stored.support.supported(),
+            support_withheld: false,
             clusters: 0,
         });
         ids.push(stored.id.clone());
