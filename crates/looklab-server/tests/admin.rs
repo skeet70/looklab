@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use looklab_model::file::{LookIdentity, LookKind, WbPolicy};
 use looklab_model::{Look, LookDocument};
+use looklab_schema::{MANUAL_CATALOG_VERSION, ManualCatalog};
 use looklab_server::admin::{self, AdminError, ManifestArtifact};
 use looklab_server::{ContributionId, CredentialId, EndorsementId, GrantId, LookVersionId, Tier};
 use looklab_trust::{Actor, Grant, Scope, ScopeRule, TrustError, VersionId};
@@ -582,10 +583,18 @@ async fn endorsement_nominations_are_seeder_only() {
     let db = &fixture.db;
     let nominated = credential(db, "new", "[]", 1.4).await;
 
-    let queue = admin::mod_queue(db, Tier::New).await.expect("queue");
+    let catalog = ManualCatalog {
+        catalog_version: MANUAL_CATALOG_VERSION,
+        cameras: Vec::new(),
+    };
+    let queue = admin::mod_queue(db, Tier::New, &catalog)
+        .await
+        .expect("queue");
     assert!(queue.nominations.is_empty());
 
-    let queue = admin::mod_queue(db, Tier::Seeder).await.expect("queue");
+    let queue = admin::mod_queue(db, Tier::Seeder, &catalog)
+        .await
+        .expect("queue");
     assert_eq!(queue.nominations.len(), 1);
     assert_eq!(queue.nominations[0].credential, nominated);
 }

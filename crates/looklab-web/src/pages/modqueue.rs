@@ -3,7 +3,8 @@
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use looklab_schema::ProposalRef;
+use leptos_router::components::A;
+use looklab_schema::{ManualCheckReviewStatus, ManualOwnerLinkage, ProposalRef};
 
 use crate::data::{self, Decision, DecisionReceipt, Load, ModeratorProposal, ReviewQueue};
 use crate::ui;
@@ -53,6 +54,7 @@ enum ReviewTarget {
     FailedGate(usize),
     FitHold(usize),
     SerialReuse(usize),
+    ManualCheck(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,7 @@ enum QueueFilter {
     FailedGates,
     FitHolds,
     SharedCameras,
+    CameraChecks,
 }
 
 impl QueueFilter {
@@ -70,6 +73,7 @@ impl QueueFilter {
             "failed-gates" => Self::FailedGates,
             "fit-holds" => Self::FitHolds,
             "shared-cameras" => Self::SharedCameras,
+            "camera-checks" => Self::CameraChecks,
             _ => value.parse().map(Self::Proposal).unwrap_or(Self::All),
         }
     }
@@ -102,7 +106,13 @@ pub fn ModQueuePage() -> impl IntoView {
     let revert_excluded = RwSignal::new(String::new());
     let revert_reason = RwSignal::new(String::new());
     let revert_notice = RwSignal::new(None::<String>);
-    let filter = RwSignal::new(QueueFilter::All);
+    let filter = RwSignal::new(QueueFilter::parse(
+        leptos_router::hooks::use_query_map()
+            .get_untracked()
+            .get("filter")
+            .unwrap_or_default()
+            .as_str(),
+    ));
     let expiry_timer = StoredValue::new(None::<leptos::leptos_dom::helpers::TimeoutHandle>);
     on_cleanup(move || {
         if let Some(timer) = expiry_timer.get_value() {
@@ -464,21 +474,24 @@ pub fn ModQueuePage() -> impl IntoView {
         <div class="field-row review-filters">
             <label for="review-filter">"Item type"</label>
             <select id="review-filter" on:change=move |event| filter.set(QueueFilter::parse(&event_target_value(&event)))>
-                <option value="">"All types"</option>
+                <option value="" selected=move || filter.get() == QueueFilter::All>"All types"</option>
                 {looklab_schema::ProposalKind::ALL.into_iter().map(|kind| view! {
-                    <option value=kind.as_str()>{move || format!("{} ({})", crate::proposal_form::kind_label(kind), match queue.get() {
+                    <option value=kind.as_str() selected=move || filter.get() == QueueFilter::Proposal(kind)>{move || format!("{} ({})", crate::proposal_form::kind_label(kind), match queue.get() {
                         Load::Ready(items) => items.proposals.iter().filter(|item| item.kind == kind).count(),
                         _ => 0,
                     })}</option>
                 }).collect_view()}
-                <option value="failed-gates">{move || format!("Release checks ({})", match queue.get() {
+                <option value="failed-gates" selected=move || filter.get() == QueueFilter::FailedGates>{move || format!("Release checks ({})", match queue.get() {
                     Load::Ready(items) => items.failed_gates.len(), _ => 0,
                 })}</option>
-                <option value="fit-holds">{move || format!("Fit not converging ({})", match queue.get() {
+                <option value="fit-holds" selected=move || filter.get() == QueueFilter::FitHolds>{move || format!("Fit not converging ({})", match queue.get() {
                     Load::Ready(items) => items.fit_holds.len(), _ => 0,
                 })}</option>
-                <option value="shared-cameras">{move || format!("Shared camera flags ({})", match queue.get() {
+                <option value="shared-cameras" selected=move || filter.get() == QueueFilter::SharedCameras>{move || format!("Shared camera flags ({})", match queue.get() {
                     Load::Ready(items) => items.serial_reuse.len(), _ => 0,
+                })}</option>
+                <option value="camera-checks" selected=move || filter.get() == QueueFilter::CameraChecks>{move || format!("Camera checks ({})", match queue.get() {
+                    Load::Ready(items) => pending_manual_check_count(&items), _ => 0,
                 })}</option>
             </select>
             <p class="muted">"Use j and k to move through items."</p>
@@ -491,7 +504,7 @@ pub fn ModQueuePage() -> impl IntoView {
             match queue.get() {
                 Load::Loading => ui::loading().into_any(),
                 Load::Failed(error) => ui::failure(&error).into_any(),
-                Load::Ready(queue) if queue.proposals.is_empty() && queue.failed_gates.is_empty() && queue.fit_holds.is_empty() && queue.serial_reuse.is_empty() => {
+                Load::Ready(queue) if queue.proposals.is_empty() && queue.failed_gates.is_empty() && queue.fit_holds.is_empty() && queue.serial_reuse.is_empty() && pending_manual_check_count(&queue) == 0 => {
                     view! { <p class="muted">"Nothing is waiting for moderation."</p> }.into_any()
                 }
                 Load::Ready(queue) => {
@@ -566,6 +579,36 @@ pub fn ModQueuePage() -> impl IntoView {
                                     </button>
                                     <p>{format!("{} contributions need a check.", flag.contributions.len())}</p>
                                 </li>
+                            }).collect_view()}
+                        </ul>
+                        <ul class="activity-list" hidden=move || !matches!(filter.get(), QueueFilter::All | QueueFilter::CameraChecks)>
+                            {queue.manual_checks.into_iter().enumerate().map(|(index, check)| {
+                                let title = format!(
+                                    "{} {}: {}",
+                                    check.camera.make(),
+                                    check.camera.model(),
+                                    check.label
+                                );
+                                let linkage = match &check.owner_linkage {
+                                    ManualOwnerLinkage::Linked => "linked",
+                                    ManualOwnerLinkage::Unlinked => "not linked",
+                                };
+                                let detail = format!(
+                                    "Firmware {} · {} · {} · {}",
+                                    check.firmware.as_str(),
+                                    super::body::finding_text(&check.finding),
+                                    manual_check_status_text(&check.status),
+                                    linkage
+                                );
+                                view! {
+                                    <li>
+                                        <button type="button" on:click=move |_| activate(ReviewTarget::ManualCheck(index))>
+                                            {title}
+                                        </button>
+                                        <p>{detail}</p>
+                                        <small>{ui::timestamp(check.submitted_at)}</small>
+                                    </li>
+                                }
                             }).collect_view()}
                         </ul>
                         </div>
@@ -725,6 +768,47 @@ pub fn ModQueuePage() -> impl IntoView {
                         <p>"Sharing a camera is not evidence of misuse. No trust change happens automatically."</p>
                     </section>
                 }.into_any()).unwrap_or_else(|| ().into_any()),
+                Some(ReviewTarget::ManualCheck(index)) => queue.manual_checks.get(index).map(|check| {
+                    let camera_path = format!(
+                        "/cameras/{}?control={}#manual-moderation",
+                        check.camera.as_str(),
+                        check.control.as_str()
+                    );
+                    let definition = check.definition_digest.to_string();
+                    let linkage = match &check.owner_linkage {
+                        ManualOwnerLinkage::Linked => {
+                            "Linked to this camera by a photo contribution."
+                        }
+                        ManualOwnerLinkage::Unlinked => {
+                            "No photo contribution links this profile to the camera."
+                        }
+                    };
+                    view! {
+                        <section>
+                            <button type="button" class="review-back" on:click=move |_| selected_alert.set(None)>"Back to queue"</button>
+                            <h2>{format!("{} {}: {}", check.camera.make(), check.camera.model(), check.label)}</h2>
+                            <p class="muted"><code>{check.control.as_str()}</code></p>
+                            <dl class="manual-check-detail">
+                                <dt>"Firmware"</dt>
+                                <dd>{check.firmware.as_str().to_owned()}</dd>
+                                <dt>"Submitted finding"</dt>
+                                <dd>{super::body::finding_text(&check.finding)}</dd>
+                                <dt>"Review status"</dt>
+                                <dd>{manual_check_status_text(&check.status)}</dd>
+                                <dt>"Submission"</dt>
+                                <dd>"One profile's newest active check for this control and firmware."</dd>
+                                <dt>"Owner linkage"</dt>
+                                <dd>{linkage}</dd>
+                                <dt>"Submitted definition digest"</dt>
+                                <dd><code>{definition}</code></dd>
+                                <dt>"Submitted"</dt>
+                                <dd>{ui::timestamp(check.submitted_at)}</dd>
+                            </dl>
+                            <p class="muted">"A moderator decision cites evidence for this control. It does not change the schema or enable RAW decoding or fitting."</p>
+                            <p><A href=crate::base::site_url(&camera_path)>"Open this control's camera review"</A></p>
+                        </section>
+                    }
+                }.into_any()).unwrap_or_else(|| ().into_any()),
                 _ => ().into_any(),
             }
         })}
@@ -842,7 +926,34 @@ fn review_targets(queue: &ReviewQueue, filter: QueueFilter) -> Vec<ReviewTarget>
     if matches!(filter, QueueFilter::All | QueueFilter::SharedCameras) {
         targets.extend((0..queue.serial_reuse.len()).map(ReviewTarget::SerialReuse));
     }
+    if matches!(filter, QueueFilter::All | QueueFilter::CameraChecks) {
+        targets.extend(
+            queue
+                .manual_checks
+                .iter()
+                .enumerate()
+                .filter(|(_, check)| check.status == ManualCheckReviewStatus::Pending)
+                .map(|(index, _)| ReviewTarget::ManualCheck(index)),
+        );
+    }
     targets
+}
+
+fn pending_manual_check_count(queue: &ReviewQueue) -> usize {
+    queue
+        .manual_checks
+        .iter()
+        .filter(|check| check.status == ManualCheckReviewStatus::Pending)
+        .count()
+}
+
+fn manual_check_status_text(status: &ManualCheckReviewStatus) -> &'static str {
+    match status {
+        ManualCheckReviewStatus::Counted => "counted toward agreement",
+        ManualCheckReviewStatus::Pending => "pending review",
+        ManualCheckReviewStatus::StaleDefinition => "older control definition",
+        ManualCheckReviewStatus::Reviewed => "reviewed by moderator evidence",
+    }
 }
 
 fn violation_summary(violation: &looklab_trust::Violation) -> &'static str {

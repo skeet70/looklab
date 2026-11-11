@@ -74,7 +74,7 @@ impl<T> Load<T> {
 }
 
 thread_local! {
-    static SITE_INDEX: std::cell::OnceCell<SiteIndex> = const { std::cell::OnceCell::new() };
+    static SITE_INDEX: std::cell::RefCell<Option<SiteIndex>> = const { std::cell::RefCell::new(None) };
     static REFERENCE_PREVIEW: std::cell::OnceCell<Arc<Vec<u8>>> = const { std::cell::OnceCell::new() };
     static PREPARED_SCENES: std::cell::RefCell<std::collections::VecDeque<(SceneName, bool, PreparedScene)>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
@@ -98,11 +98,15 @@ async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
     serde_json::from_slice(&bytes).map_err(|error| format!("{path}: {error}"))
 }
 
-/// Verifies the index against the deployment's advertised root.
 pub async fn index() -> Result<SiteIndex, String> {
-    if let Some(index) = SITE_INDEX.with(|cache| cache.get().cloned()) {
+    if let Some(index) = SITE_INDEX.with(|cache| cache.borrow().clone()) {
         return Ok(index);
     }
+    fetch_index().await
+}
+
+/// Verifies the index against the deployment's advertised root and replaces the cached copy.
+async fn fetch_index() -> Result<SiteIndex, String> {
     let bytes = get(&publication_url("/data/index.json")).await?;
     let expected = expected_site_root().await?;
     let actual = ArtifactHash::of(&bytes);
@@ -113,9 +117,7 @@ pub async fn index() -> Result<SiteIndex, String> {
     }
     let index: SiteIndex =
         serde_json::from_slice(&bytes).map_err(|error| format!("/data/index.json: {error}"))?;
-    SITE_INDEX.with(|cache| {
-        let _ = cache.set(index.clone());
-    });
+    SITE_INDEX.with(|cache| *cache.borrow_mut() = Some(index.clone()));
     Ok(index)
 }
 
@@ -153,33 +155,57 @@ pub async fn body_optional(make: &str, model: &str) -> Result<Option<BodyPage>, 
     body(make, model).await.map(Some)
 }
 
+enum ManualFetchError {
+    /// The page bytes differ from the index entry.
+    IndexMismatch(String),
+    Other(String),
+}
+
 pub async fn manual(
     make: &str,
     model: &str,
 ) -> Result<Option<looklab_publish::ManualPage>, String> {
     let id = looklab_schema::BodyId::new(&format!("{make}/{model}"))
         .map_err(|error| error.to_string())?;
-    let Some(summary) = index()
-        .await?
-        .manuals
-        .iter()
-        .find(|manual| manual.id == id)
-        .cloned()
-    else {
+    match manual_from(&index().await?, &id, make, model).await {
+        Ok(page) => Ok(page),
+        // A publication since the index was cached replaces the page.
+        Err(ManualFetchError::IndexMismatch(_)) => {
+            manual_from(&fetch_index().await?, &id, make, model)
+                .await
+                .map_err(|error| match error {
+                    ManualFetchError::IndexMismatch(message) | ManualFetchError::Other(message) => {
+                        message
+                    }
+                })
+        }
+        Err(ManualFetchError::Other(message)) => Err(message),
+    }
+}
+
+async fn manual_from(
+    index: &SiteIndex,
+    id: &looklab_schema::BodyId,
+    make: &str,
+    model: &str,
+) -> Result<Option<looklab_publish::ManualPage>, ManualFetchError> {
+    let Some(summary) = index.manuals.iter().find(|manual| manual.id == *id) else {
         return Ok(None);
     };
     let path = summary.artifact.path.as_str();
-    let bytes = get(&publication_url(&format!("/{path}"))).await?;
+    let bytes = get(&publication_url(&format!("/{path}")))
+        .await
+        .map_err(ManualFetchError::Other)?;
     let digest = ArtifactHash::of(&bytes);
     if digest != summary.artifact.sha256 || bytes.len() as u64 != summary.artifact.bytes {
-        return Err(format!(
+        return Err(ManualFetchError::IndexMismatch(format!(
             "{make}/{model}: manual page does not match the site index: expected {}, got {digest}",
             summary.artifact.sha256
-        ));
+        )));
     }
     serde_json::from_slice(&bytes)
         .map(Some)
-        .map_err(|error| format!("/{path}: {error}"))
+        .map_err(|error| ManualFetchError::Other(format!("/{path}: {error}")))
 }
 
 pub async fn look(slug: &str) -> Result<LookPage, String> {
@@ -571,6 +597,8 @@ pub struct ReviewQueue {
     pub serial_reuse: Vec<SerialReuseFlag>,
     #[serde(default)]
     pub nominations: Vec<EndorsementNomination>,
+    #[serde(default)]
+    pub manual_checks: Vec<looklab_schema::ManualCheckReview>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -1218,7 +1246,7 @@ fn json_body<T: Serialize>(value: &T) -> Result<JsValue, String> {
 /// Reports a server rejection or a malformed request.
 pub async fn submit_manual_confirmation(
     body: &[u8],
-) -> Result<looklab_schema::ManualConfirmationSummary, String> {
+) -> Result<looklab_schema::ManualConfirmationSubmission, String> {
     let path = api_url("/api/manual-confirmations");
     let request = Request::post(&path)
         .header("Content-Type", "application/json")

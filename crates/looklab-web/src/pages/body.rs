@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use leptos::prelude::*;
+use leptos_router::components::A;
 use leptos_router::hooks::use_params_map;
 use looklab_publish::{BodyPage, ControlPage, EpochPage, ManualPage};
 use looklab_schema::{
@@ -19,6 +20,13 @@ struct LookGallery {
     index: looklab_publish::SiteIndex,
     scene: Option<std::sync::Arc<looklab_publish::PreparedScene>>,
     preview_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum LiveCounts {
+    Loading,
+    Ready,
+    Failed(String),
 }
 
 #[component]
@@ -288,6 +296,51 @@ fn ManualSection(
     let ready_manual = manual.clone();
     let moderation_manual = manual.clone();
     let summary = RwSignal::new(manual.confirmation.clone());
+    let live = RwSignal::new(if crate::base::server_available() {
+        LiveCounts::Loading
+    } else {
+        LiveCounts::Ready
+    });
+    if crate::base::server_available() {
+        let make = manual.id.make().to_owned();
+        let model = manual.id.model().to_owned();
+        Effect::new(move |_| {
+            let make = make.clone();
+            let model = model.clone();
+            leptos::task::spawn_local_scoped_with_cancellation(async move {
+                match data::manual_summary(&make, &model).await {
+                    // A signed response that landed first already carries newer counts.
+                    Ok(refreshed) if live.get_untracked() == LiveCounts::Loading => {
+                        summary.set(refreshed);
+                        live.set(LiveCounts::Ready);
+                    }
+                    Err(error) if live.get_untracked() == LiveCounts::Loading => {
+                        live.set(LiveCounts::Failed(error));
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+            });
+        });
+        // A summary returned by a signed action is live.
+        Effect::new(move |seen: Option<()>| {
+            summary.track();
+            if seen.is_some() && live.get_untracked() != LiveCounts::Ready {
+                live.set(LiveCounts::Ready);
+            }
+        });
+    }
+    let counts_signal: Signal<bool> = Memo::new(move |_| live.get() == LiveCounts::Ready).into();
+    let counts_ready = move || counts_signal.get();
+    let session = crate::session::use_session();
+    let can_moderate = move || match session.state.get() {
+        crate::session::SessionState::SignedIn(profile) => profile.roles.iter().any(|role| {
+            matches!(
+                role,
+                crate::webauthn::SessionRole::Moderator | crate::webauthn::SessionRole::Admin
+            )
+        }),
+        crate::session::SessionState::SignedOut => false,
+    };
     let reviewed = move || {
         summary.with(|summary| {
             summary
@@ -322,7 +375,11 @@ fn ManualSection(
                 let firmware_actuals = confirmation.firmware.iter().map(|result| {
                     let firmware = result.firmware.as_str().to_owned();
                     let actual = firmware_actual_text(result);
-                    let detail = firmware_detail(result);
+                    let detail = if counts_ready() {
+                        firmware_detail(result)
+                    } else {
+                        None
+                    };
                     let digest = firmware_definition_digest(result);
                     view! {
                         <div>
@@ -339,7 +396,11 @@ fn ManualSection(
                 }).collect_view();
                 let firmware_bases = confirmation.firmware.iter().map(|result| {
                     let firmware = result.firmware.as_str().to_owned();
-                    let basis = firmware_basis_text(result);
+                    let basis = if counts_ready() {
+                        Some(firmware_basis_text(result))
+                    } else {
+                        None
+                    };
                     let contradictions = result.contradictions.iter().map(|contradiction| {
                         view! {
                             <li>{format!("Conflicting report: {}", finding_text(&contradiction.finding))}</li>
@@ -347,7 +408,8 @@ fn ManualSection(
                     }).collect_view();
                     view! {
                         <li>
-                            <strong>{format!("Firmware {firmware}")}</strong>{format!(": {basis}")}
+                            <strong>{format!("Firmware {firmware}")}</strong>
+                            {basis.map(|basis| format!(": {basis}"))}
                             {(!result.contradictions.is_empty()).then(|| view! {
                                 <ul>{contradictions}</ul>
                             })}
@@ -355,7 +417,18 @@ fn ManualSection(
                     }
                 }).collect_view();
                 let control_actual = control_actual_text(&confirmation);
-                let control_basis = confirmation_text(&confirmation);
+                let control_basis = if counts_ready() {
+                    Some(confirmation_text(&confirmation))
+                } else {
+                    None
+                };
+                let intake = if counts_ready()
+                    && (confirmation.intake.recorded > 0 || confirmation.intake.stale > 0)
+                {
+                    Some(intake_text(&confirmation.intake))
+                } else {
+                    None
+                };
                 let moderator = moderator_evidence_text(&confirmation);
                 let manual_note = documentation_note(documented.availability, &confirmation);
                 let citations = documented.citations.iter().map(|citation| {
@@ -388,7 +461,8 @@ fn ManualSection(
                             {manual_note.map(|text| view! { <div class="muted">{text}</div> })}
                         </td>
                         <td>
-                            <div class="muted">{control_basis}</div>
+                            {intake.map(|text| view! { <div class="muted">{text}</div> })}
+                            {control_basis.map(|text| view! { <div class="muted">{text}</div> })}
                             {(!confirmation.firmware.is_empty()).then(|| view! {
                                 <ul>{firmware_bases}</ul>
                             })}
@@ -405,16 +479,33 @@ fn ManualSection(
     view! {
         <section class="manual-documentation" aria-labelledby="documentation">
             <h2 id="documentation">"Documented settings and owner confirmations"</h2>
-            {move || {
-                let current = summary.get();
-                let (label, detail) = coverage_text(&current);
-                view! {
-                    <p><span class="badge">{label}</span></p>
-                    <p class="muted">{detail}</p>
+            {move || match live.get() {
+                LiveCounts::Loading => view! {
+                    <p class="muted">"Loading live owner checks…"</p>
+                }.into_any(),
+                LiveCounts::Failed(error) => view! {
+                    <p class="error" role="alert">
+                        {format!("Live owner checks could not be loaded: {error}")}
+                    </p>
+                }.into_any(),
+                LiveCounts::Ready => {
+                    let current = summary.get();
+                    let (label, detail) = coverage_text(&current);
+                    view! {
+                        <p><span class="badge">{label}</span></p>
+                        <p class="muted">{detail}</p>
+                    }.into_any()
                 }
             }}
             <p class="muted">"From official manuals and firmware notes. Owner-confirmed corrections are shown separately from the manual claim. Documentation does not imply RAW decoding, contribution support or fit eligibility."</p>
             <p class="muted">"Owner agreement counts profiles linked to this camera by contribution metadata. Unlinked checks are saved but do not count toward confirmation."</p>
+            {move || can_moderate().then(|| view! {
+                <p>
+                    <A href=crate::base::site_url("/review?filter=camera-checks")>
+                        "Review received camera checks in the moderation queue"
+                    </A>
+                </p>
+            })}
             {if contribution_supported {
                 ().into_any()
             } else {
@@ -438,7 +529,46 @@ fn ManualSection(
                     }
                 }).collect_view()}
             </ul>
-            <p>{move || format!("{} of {total} documented controls have owner or moderator evidence; {} contradicted.", reviewed(), contradicted())}</p>
+            {move || counts_ready().then(|| view! {
+                <p>{format!(
+                    "{} of {total} documented controls have owner or moderator evidence; {} contradicted.",
+                    reviewed(),
+                    contradicted()
+                )}</p>
+            })}
+            {move || {
+                if !counts_ready() {
+                    return None;
+                }
+                let (recorded, unlinked, stale) = summary.with(|summary| (
+                    summary
+                        .controls
+                        .iter()
+                        .map(|control| control.intake.recorded)
+                        .sum::<u32>(),
+                    summary
+                        .controls
+                        .iter()
+                        .map(|control| control.intake.unlinked)
+                        .sum::<u32>(),
+                    summary
+                        .controls
+                        .iter()
+                        .map(|control| control.intake.stale)
+                        .sum::<u32>(),
+                ));
+                if recorded > 0 || stale > 0 {
+                    Some(view! {
+                        <p class="muted">
+                            {format!(
+                                "{recorded} check(s) received, {unlinked} not linked to a photo of this camera, {stale} against an older definition."
+                            )}
+                        </p>
+                    })
+                } else {
+                    None
+                }
+            }}
             <table class="data-table">
                 <caption>"Documented controls, confirmed actual values and confirmation basis"</caption>
                 <thead>
@@ -453,14 +583,14 @@ fn ManualSection(
                 </thead>
                 <tbody>{rows}</tbody>
             </table>
-            {crate::data::moderation_session_open().then(|| view! {
-                <ManualModerationPanel manual=moderation_manual summary=summary/>
+            {move || (crate::data::moderation_session_open() && counts_signal.get()).then(|| view! {
+                <ManualModerationPanel manual=moderation_manual.clone() summary=summary/>
             })}
             {contribution_supported.then(|| view! {
-                <StandaloneConfirmation manual=ready_manual summary=summary measured_contributions=true/>
+                <StandaloneConfirmation manual=ready_manual summary=summary measured_contributions=true counts_ready=counts_signal/>
             })}
             {standalone.then(|| view! {
-                <StandaloneConfirmation manual=form_manual summary=summary/>
+                <StandaloneConfirmation manual=form_manual summary=summary counts_ready=counts_signal/>
             })}
         </section>
     }
@@ -484,6 +614,35 @@ pub(crate) fn documentation_note(
             "Documentation-derived"
         },
     )
+}
+
+pub(crate) fn confirmation_state_text(state: ConfirmationState) -> &'static str {
+    match state {
+        ConfirmationState::Documented => "documented only",
+        ConfirmationState::Unconfirmed => "unconfirmed",
+        ConfirmationState::Confirmed => "confirmed",
+        ConfirmationState::Contradicted => "contradicted",
+        ConfirmationState::ModeratorConfirmed => "moderator confirmed",
+        ConfirmationState::ModeratorRejected => "moderator rejected",
+    }
+}
+
+pub(crate) fn intake_text(intake: &looklab_schema::ManualControlIntake) -> String {
+    let mut text = if intake.recorded > 0 {
+        format!(
+            "{} current received check(s); {} not linked to a photo of this camera",
+            intake.recorded, intake.unlinked
+        )
+    } else {
+        "No current-definition check received".to_owned()
+    };
+    if intake.stale > 0 {
+        text.push_str(&format!(
+            "; {} against an older control definition",
+            intake.stale
+        ));
+    }
+    text
 }
 
 pub(crate) fn category_text(category: looklab_schema::CapabilityCategory) -> &'static str {
@@ -548,6 +707,33 @@ fn coverage_text(summary: &looklab_schema::ManualConfirmationSummary) -> (&'stat
         .filter(|control| has_human_evidence(control))
         .count();
     if reviewed == 0 {
+        let recorded: u32 = summary
+            .controls
+            .iter()
+            .map(|control| control.intake.recorded)
+            .sum();
+        let unlinked: u32 = summary
+            .controls
+            .iter()
+            .map(|control| control.intake.unlinked)
+            .sum();
+        let stale: u32 = summary
+            .controls
+            .iter()
+            .map(|control| control.intake.stale)
+            .sum();
+        if recorded > 0 {
+            let mut detail = format!(
+                "{recorded} current check(s) were received for these controls; {unlinked} came from profiles without a photo contribution linking them to this camera. None count toward owner agreement."
+            );
+            if stale > 0 {
+                detail.push_str(&format!(
+                    " {stale} check(s) were recorded against an older control definition and are not current evidence."
+                ));
+            }
+            detail.push_str(" Moderators can review the received checks.");
+            return ("Checks received; none counted", detail);
+        }
         return (
             "Documentation-derived only",
             "No owner or moderator evidence is counted for these controls yet.".to_owned(),

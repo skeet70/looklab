@@ -11,8 +11,8 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use looklab_schema::{
-    CapabilityKey, ManualUrl, ModeratorEvidence, ModeratorEvidenceKind, ModeratorFirmwareScope,
-    ModeratorRecord, Sha256Hex,
+    CapabilityKey, ManualConfirmationSubmission, ManualSubmissionReceipt, ManualUrl,
+    ModeratorEvidence, ModeratorEvidenceKind, ModeratorFirmwareScope, ModeratorRecord, Sha256Hex,
 };
 use looklab_upload::{
     AttestationHash, Challenge, ManualConfirmationRequest, ManualModeration,
@@ -262,7 +262,14 @@ pub async fn confirm(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResu
     let summary = manual_confirm::summary(&state.db, camera)
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?;
-    Ok(Json(summary).into_response())
+    let receipt = ManualSubmissionReceipt {
+        camera: camera.id.clone(),
+        owner_linkage: manual_confirm::owner_linkage(&state.db, &camera.id, &credential.id)
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::Internal))?,
+        recorded_checks: u32::try_from(request.confirmation.observations.len()).unwrap_or(u32::MAX),
+    };
+    Ok(Json(ManualConfirmationSubmission { summary, receipt }).into_response())
 }
 
 fn withdrawal_signed(request: &ManualWithdrawalRequest) -> SignedRequestPayload {

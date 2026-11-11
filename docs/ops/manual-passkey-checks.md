@@ -71,10 +71,11 @@ The same failures were also observed against a browser-produced HAR: a state fil
 A documented camera page accepts a signed owner confirmation even without a published input transform. Check that:
 
 - the page labels documentation-derived values **human-unconfirmed** and shows the source citations and firmware scope;
-- a standalone confirmation is accepted, appears in the camera page agreement state, and grants no contribution status or credit;
+- a standalone confirmation is accepted, its receipt states the number of checks recorded and whether the profile is linked to the camera, the camera page shows the checks as received without counting an unlinked profile toward agreement, and it grants no contribution status or credit;
+- a moderator sees the received checks under **Camera checks** in the review queue, and a recorded decision marks the checks it covers as reviewed;
 - the published manual page matches the hash and size listed in the authenticated site index;
 - withdrawal removes the claim from agreement, leaves the signed audit row, and rejects a late confirmation on an existing send;
-- the HAR includes the browser's `GET /api/manual-confirmations/<make>/<model>` refresh after withdrawal; `verify-payload` accepts it, rejects a query string or body, and resolves the camera in the local manual catalog;
+- the HAR includes the browser's `GET /api/manual-confirmations/<make>/<model>` on camera page load and after withdrawal; `verify-payload` accepts it, rejects a query string or body, and resolves the camera in the local manual catalog;
 - an upload from a page built with the previous envelope layout is rejected with HTTP 426 `ENVELOPE_VERSION_UNSUPPORTED`, and the page asks the owner to reload and prepare again rather than retrying the same bytes.
 
 ## What is manual
