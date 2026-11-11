@@ -616,12 +616,14 @@ pub(crate) fn run_look_only_rows(
         let mut previous: Option<(f64, Params)> = None;
         let mut gcv_done = false;
         let mut recent: Vec<f64> = Vec::new();
+        let mut stepped = false;
         let stage_sweeps = if stage.converge {
             options.max_sweeps.max(1)
         } else {
             stage.sweeps.min(options.max_sweeps.max(1))
         };
         for _ in 0..stage_sweeps {
+            stepped = false;
             let samples = problem.samples.len() as f64;
             if *remaining < samples {
                 break;
@@ -737,10 +739,35 @@ pub(crate) fn run_look_only_rows(
                 }
             }
             apply_step(&mut params, &step);
+            stepped = true;
             if let Some(mask) = &residual_mask {
                 mask.pin(&mut params.theta[layout.residual.clone()]);
             }
             damping = (damping * 0.3).max(1e-6);
+        }
+        // A stage ends on a step that no pass has evaluated, and the next stage starts
+        // without an accepted state to revert to. Validate the state the stage leaves
+        // behind on every retained row, and drop the step when it left the domain.
+        if stepped {
+            let samples = problem.samples.len() as f64;
+            if *remaining >= samples {
+                *remaining -= samples;
+                let pass = problem.pass(
+                    &params,
+                    active,
+                    &mut Vec::new(),
+                    false,
+                    false,
+                    false,
+                    IntentFilter::NativeOnly,
+                );
+                evaluations += 1;
+                if pass.infeasible
+                    && let Some((_, before)) = &previous
+                {
+                    params = before.clone();
+                }
+            }
         }
     }
     certify_look(
@@ -13889,5 +13916,168 @@ mod fallback_tests {
         assert_eq!(candidate_x[1], 0.0);
         assert_eq!(candidate_y[0], 0.0);
         assert!((candidate_y[1] - 1.0 / 19.0).abs() <= 1e-12);
+    }
+}
+
+/// A stage boundary must not adopt a step that no pass has evaluated.
+#[cfg(all(test, feature = "synth"))]
+mod look_only_domain_tests {
+    use super::*;
+
+    const CLIP_K: f64 = 0.03;
+    const SEED: u64 = 0x5eed_0b1e;
+
+    fn frozen() -> ActiveColumns {
+        ActiveColumns {
+            image: false,
+            mode: false,
+            wb: false,
+            clip: false,
+            response: false,
+        }
+    }
+
+    /// One image whose black-target rows pull the tone black point down.
+    fn fixture() -> (Vec<FitImage>, Vec<RowModel<'static>>, FitOptions) {
+        let data = crate::synth::dataset(&crate::synth::SynthConfig {
+            seed: SEED,
+            images: 1,
+            samples_per_image: 96,
+            noise_ucs: 0.5,
+            clip_k: CLIP_K,
+            ..crate::synth::SynthConfig::default()
+        });
+        let image = &data.images[0];
+        let mut header = image.samples.header().clone();
+        let mut in_rgb = image.samples.in_rgb().to_vec();
+        let mut out_rgb = image.samples.out_rgb().to_vec();
+        let mut density = image.samples.density_w().to_vec();
+        let mut flags = image.samples.flags().to_vec();
+        for _ in 0..24 {
+            in_rgb.push([1.0e-6, 1.04e-6, 1.04e-6]);
+            out_rgb.push([0.0, 0.0, 0.0]);
+            density.push(1.0);
+            flags.push(looklab_samples::SampleFlags::NONE);
+        }
+        header.n = in_rgb.len() as u32;
+        let samples = looklab_samples::SampleSet::new(header, in_rgb, out_rgb, density, flags)
+            .expect("fixture samples");
+        let mut image = image.clone();
+        image.samples = samples;
+        let rows = vec![RowModel {
+            group: 0,
+            model: None,
+            clip_k: CLIP_K,
+            firmware: [0.0; 2],
+            eligible_transform: image.transform,
+            eligible_hint: image.exposure_hint,
+        }];
+        let options = FitOptions {
+            seed: SEED,
+            max_samples_per_image: usize::MAX,
+            hessian_samples: usize::MAX,
+            run_gcv: false,
+            fit_residual: true,
+            ..FitOptions::default()
+        };
+        (vec![image], rows, options)
+    }
+
+    fn assert_feasible(
+        images: &[FitImage],
+        rows: &[RowModel<'_>],
+        options: &FitOptions,
+        theta: &[f64],
+    ) {
+        let problem = Problem::new_with_rows(images, rows, options).expect("problem");
+        let params = Params {
+            layout: problem.layout.clone(),
+            theta: theta.to_vec(),
+        };
+        let pass = problem.pass(
+            &params,
+            frozen(),
+            &mut Vec::new(),
+            false,
+            false,
+            false,
+            IntentFilter::NativeOnly,
+        );
+        assert!(
+            !pass.infeasible,
+            "the returned look state must stay inside the evaluator domain"
+        );
+    }
+
+    #[test]
+    fn a_stage_exit_step_that_leaves_the_domain_is_dropped() {
+        let (images, rows, options) = fixture();
+        let problem = Problem::new_with_rows(&images, &rows, &options).expect("problem");
+        assert!(
+            problem
+                .samples
+                .iter()
+                .any(|sample| sample.target.ucs.j < 1e-6),
+            "the fixture must retain a black-target row"
+        );
+        let mut remaining = f64::MAX;
+        let result = run_look_only_rows(
+            &images,
+            &options,
+            None,
+            CLIP_K,
+            &rows,
+            None,
+            None,
+            None,
+            &[],
+            &mut remaining,
+        )
+        .expect("the look solve must reject the domain-exiting step instead of failing");
+        assert_feasible(&images, &rows, &options, &result.theta);
+    }
+
+    #[test]
+    fn an_infeasible_seed_state_still_reports_the_row_context() {
+        let (images, rows, options) = fixture();
+        let problem = Problem::new_with_rows(&images, &rows, &options).expect("problem");
+        let mut theta = initial_params(&problem, &options).theta;
+        theta[problem.layout.tone_c0] += 1.0e6;
+        let seed =
+            seed_look_only_params(&problem, &options, None, CLIP_K, &rows, Some(&theta), &[])
+                .expect("seed params");
+        let pass = problem.pass(
+            &seed,
+            frozen(),
+            &mut Vec::new(),
+            false,
+            false,
+            false,
+            IntentFilter::NativeOnly,
+        );
+        assert!(
+            pass.infeasible,
+            "the control seed state must be outside the evaluator domain"
+        );
+        let mut remaining = f64::MAX;
+        let error = match run_look_only_rows(
+            &images,
+            &options,
+            None,
+            CLIP_K,
+            &rows,
+            None,
+            Some(&theta),
+            None,
+            &[],
+            &mut remaining,
+        ) {
+            Ok(_) => panic!("a state that is infeasible before any step must still fail"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, FitError::RowContext(_)),
+            "unexpected error: {error:?}"
+        );
     }
 }
