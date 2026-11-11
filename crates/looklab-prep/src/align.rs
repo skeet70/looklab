@@ -2208,6 +2208,28 @@ mod tests {
     }
 
     #[test]
+    fn a_uniform_same_aspect_crop_recovers_one_scale() {
+        let truth = cropped_truth(0.8, 0.8, 0.03, -0.02);
+        let (raw, jpeg) = make_cropped_pair(RAW_WIDTH, RAW_HEIGHT, 720, 480, truth, tone, scene);
+        let alignment = align(&raw, &jpeg, &AlignParams::default()).expect("alignment");
+        assert!(alignment.central_correlation >= 0.98, "{alignment:?}");
+        assert!(
+            (alignment.scale - truth.scale).abs() < 0.01
+                && (alignment.scale_y - truth.scale_y).abs() < 0.01,
+            "{alignment:?}"
+        );
+        assert!(
+            (alignment.tx - truth.tx).abs() < 0.01 && (alignment.ty - truth.ty).abs() < 0.01,
+            "{alignment:?}"
+        );
+        let error = mapping_error(&alignment, &truth, 720, 480, RAW_WIDTH, RAW_HEIGHT);
+        assert!(
+            error < 0.3,
+            "mapping error {error}, alignment {alignment:?}"
+        );
+    }
+
+    #[test]
     fn an_off_centre_crop_recovers_scales_and_offset() {
         let truth = cropped_truth(0.9, 0.6, 0.05, 0.1);
         let (raw, jpeg) = make_cropped_pair(RAW_WIDTH, RAW_HEIGHT, 900, 400, truth, tone, scene);

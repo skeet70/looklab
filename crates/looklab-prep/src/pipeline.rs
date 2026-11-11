@@ -1182,3 +1182,43 @@ fn exposure_hint_ev(metadata: &ParsedMetadata) -> f32 {
         f64::from(looklab_samples::MAX_EXPOSURE_HINT_EV),
     ) as f32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::align::Alignment;
+
+    #[test]
+    fn an_aspect_crop_excludes_raw_pixels_outside_the_jpeg() {
+        let target = Image3::new(100, 100, vec![[0.1; 3]; 10_000]).expect("target");
+        let alignment = Alignment {
+            scale: 1.0,
+            scale_y: 505.0 / 599.0,
+            rotation_rad: 0.0,
+            tx: 0.0,
+            ty: 0.0,
+            k1: 0.0,
+            k2: 0.0,
+            gain: [0.0; 3],
+            central_correlation: 1.0,
+            residual_px: 0.0,
+        };
+        let outside = jpeg_overlap(&alignment, 900, 506, &target, 900, 600);
+        assert_eq!(outside.len(), 10_000);
+        assert!(outside[0], "the top row is outside a centred 16:9 crop");
+        assert!(
+            outside[99 * 100 + 50],
+            "the bottom row is outside a centred 16:9 crop"
+        );
+        assert!(
+            !outside[50 * 100 + 50],
+            "the centre is inside a centred 16:9 crop"
+        );
+        let count = outside.iter().filter(|value| **value).count();
+        assert!(count > 0 && count < 10_000);
+
+        let mut mask = build_mask(&target, &MaskOptions::default());
+        mask.exclude_outside(&outside);
+        assert!(mask.counts().outside > 0);
+    }
+}
