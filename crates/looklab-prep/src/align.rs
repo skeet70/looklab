@@ -351,7 +351,7 @@ pub(crate) fn align_with_pixel_pitch<R: LinearPixels + ?Sized, J: LinearPixels +
     );
 
     let (central_correlation, central_count, central_eligible) =
-        correlation_at(raw_wb_linear, &score_luma, &alignment, &u, &v, photometry)
+        rank_correlation_at(raw_wb_linear, &score_luma, &alignment, &u, &v, photometry)
             .ok_or(PrepError::AlignNoOverlap)?;
     if central_count == 0
         || (central_count as f64) < params.min_overlap_fraction * central_eligible as f64
@@ -854,6 +854,26 @@ fn correlation_at<R: LinearPixels + ?Sized>(
     ))
 }
 
+/// The acceptance gate's statistic: a monotone tone curve between the two
+/// renderings changes no rank, so Spearman rank correlation is not lowered by
+/// it (Spearman, Am. J. Psychol. 15 (1904) 72-101).
+fn rank_correlation_at<R: LinearPixels + ?Sized>(
+    raw: &R,
+    jpeg_luma: &[f64],
+    alignment: &Alignment,
+    u: &[f64],
+    v: &[f64],
+    photometry: Photometry,
+) -> Option<(f64, usize, usize)> {
+    let (raw_values, jpeg_values, count, eligible) =
+        gate_samples(raw, jpeg_luma, alignment, u, v, photometry)?;
+    Some((
+        rank_correlation(&raw_values, &jpeg_values)?,
+        count,
+        eligible,
+    ))
+}
+
 fn gate_samples<R: LinearPixels + ?Sized>(
     raw: &R,
     jpeg_luma: &[f64],
@@ -919,6 +939,36 @@ fn pearson_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
         return None;
     }
     Some(covariance / (var_left * var_right).sqrt())
+}
+
+fn rank_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
+    if left.len() != right.len() || left.len() < 2 {
+        return None;
+    }
+    if left.iter().chain(right).any(|value| !value.is_finite()) {
+        return Some(f64::NAN);
+    }
+    pearson_correlation(&ranks(left), &ranks(right))
+}
+
+/// Average 1-based ranks; ties share the mean of their positions.
+fn ranks(values: &[f64]) -> Vec<f64> {
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_by(|&left, &right| values[left].total_cmp(&values[right]));
+    let mut out = vec![0.0; values.len()];
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && values[order[end]] == values[order[start]] {
+            end += 1;
+        }
+        let rank = (start + 1 + end) as f64 * 0.5;
+        for slot in &order[start..end] {
+            out[*slot] = rank;
+        }
+        start = end;
+    }
+    out
 }
 
 #[derive(Clone, Copy)]
