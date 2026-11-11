@@ -8,9 +8,9 @@ use looklab_meta::{
     ColorSaturation as MetaSaturation, DevelopmentDynamicRange, DynamicRange as MetaDynamicRange,
     DynamicRangeSetting as MetaDynamicRangeSetting, EffectStrength as MetaEffectStrength,
     FilmMode as MetaFilmMode, FujiTag, GrainRoughness as MetaGrainRoughness,
-    GrainSize as MetaGrainSize, LookSettings as MetaLookSettings,
+    GrainSize as MetaGrainSize, LookSettings as MetaLookSettings, MagentaGreen as MetaMagentaGreen,
     MonochromeFilter as MetaMonochromeFilter, NoiseReduction as MetaNoiseReduction, ParsedPair,
-    ParsedTag, SanitizedMetadata, Sharpness as MetaSharpness,
+    ParsedTag, SanitizedMetadata, Sharpness as MetaSharpness, WarmCool as MetaWarmCool,
     WhiteBalanceMode as MetaWhiteBalanceMode,
 };
 use serde::{Deserialize, Serialize};
@@ -98,6 +98,34 @@ pub struct WhiteBalanceFineTune {
 pub struct WhiteBalanceShift {
     pub red: i32,
     pub blue: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WarmCool(i8);
+
+impl WarmCool {
+    pub const fn new(steps: i8) -> Self {
+        Self(steps)
+    }
+
+    pub const fn steps(self) -> i8 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MagentaGreen(i8);
+
+impl MagentaGreen {
+    pub const fn new(steps: i8) -> Self {
+        Self(steps)
+    }
+
+    pub const fn steps(self) -> i8 {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +250,8 @@ pub struct LookSettings {
     pub dynamic_range_setting: Option<Tagged<DynamicRangeSetting>>,
     pub development_dynamic_range: Option<Tagged<u16>>,
     pub saturation: Option<Tagged<Saturation>>,
+    pub bw_adjustment: Option<Tagged<WarmCool>>,
+    pub bw_magenta_green: Option<Tagged<MagentaGreen>>,
     pub white_balance: Option<Tagged<WhiteBalanceMode>>,
     pub white_balance_fine_tune: Option<WhiteBalanceFineTune>,
     pub highlight_tone: Option<Tagged<f64>>,
@@ -375,6 +405,16 @@ impl From<&ManifestMetadata> for looklab_schema::MakernoteValues {
             put(&mut values, FujiTag::Saturation, look.saturation.as_ref());
             put(
                 &mut values,
+                FujiTag::BwAdjustment,
+                look.bw_adjustment.as_ref(),
+            );
+            put(
+                &mut values,
+                FujiTag::BwMagentaGreen,
+                look.bw_magenta_green.as_ref(),
+            );
+            put(
+                &mut values,
                 FujiTag::WhiteBalance,
                 look.white_balance.as_ref(),
             );
@@ -469,6 +509,14 @@ impl From<&MetaLookSettings> for LookSettings {
                 .development_dynamic_range
                 .map(tagged_development_dynamic_range),
             saturation: look.saturation.map(tagged_saturation),
+            bw_adjustment: look
+                .bw_adjustment
+                .map(|tag| tagged(tag, |value: MetaWarmCool| WarmCool::new(value.steps()))),
+            bw_magenta_green: look.bw_magenta_green.map(|tag| {
+                tagged(tag, |value: MetaMagentaGreen| {
+                    MagentaGreen::new(value.steps())
+                })
+            }),
             white_balance: look.white_balance.map(tagged_white_balance_mode),
             white_balance_fine_tune: look.white_balance_fine_tune.map(fine_tune),
             highlight_tone: look.highlight_tone.map(tagged_tone),

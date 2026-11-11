@@ -34,6 +34,62 @@ fn an_out_of_gamut_node_is_finite() {
     assert!(finite(encoded.to_array()), "{encoded:?}");
 }
 
+#[test]
+fn prediction_margin_is_positive_inside_and_negative_at_the_limit() {
+    use looklab_color::ucs::Ucs;
+    let neutral = looklab_model::neutral_j_prime(0.18);
+    let (margin, gradient) = looklab_model::prediction_margin(Ucs::new(neutral, 0.0, 0.0));
+    assert!(margin > 0.0, "margin {margin}");
+    assert!(gradient.iter().all(|value| value.is_finite()));
+    let limit = looklab_model::neutral_j_prime_max();
+    let (margin, _) = looklab_model::prediction_margin(Ucs::new(limit + 1.0, 0.0, 0.0));
+    assert!(margin <= 0.0, "margin {margin}");
+}
+
+#[test]
+fn prediction_margin_gradient_matches_finite_differences() {
+    use looklab_color::ucs::Ucs;
+    let base = Ucs::new(60.0, 2.0, -1.0);
+    let (margin, gradient) = looklab_model::prediction_margin(base);
+    assert!(margin > 0.0, "margin {margin}");
+    for (axis, analytical) in gradient.iter().enumerate() {
+        let h = 1e-5;
+        let mut plus = base;
+        let mut minus = base;
+        match axis {
+            0 => {
+                plus.j += h;
+                minus.j -= h;
+            }
+            1 => {
+                plus.a += h;
+                minus.a -= h;
+            }
+            _ => {
+                plus.b += h;
+                minus.b -= h;
+            }
+        }
+        let numerical = (looklab_model::prediction_margin(plus).0
+            - looklab_model::prediction_margin(minus).0)
+            / (2.0 * h);
+        let scale = analytical.abs().max(numerical.abs()).max(1e-6);
+        assert!(
+            (analytical - numerical).abs() / scale < 1e-4,
+            "axis {axis}: {analytical} vs {numerical}"
+        );
+    }
+}
+
+#[test]
+fn barrier_is_finite_inside_and_infinite_outside() {
+    assert!(looklab_model::barrier(0.5).is_finite());
+    assert_eq!(looklab_model::barrier(0.0), f64::INFINITY);
+    let (first, second) = looklab_model::barrier_derivatives(0.5);
+    assert!((first + 2.0).abs() < 1e-12);
+    assert!((second - 4.0).abs() < 1e-12);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 use leptos_router::hooks::{use_navigate, use_params_map, use_query_map};
 use looklab_publish::{LookPage, LookVersionPage, PreparedScene, SceneIndex, SiteIndex, WeakSpot};
 use looklab_report::svg::{grl_svg, tint_curve_svg, tone_curve_svg};
@@ -10,12 +11,27 @@ use looklab_report::svg::{grl_svg, tint_curve_svg, tone_curve_svg};
 use crate::data::{self, Load, LoadedVersion};
 use crate::ui;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct VersionDetails {
     version: String,
     changelog: Vec<String>,
     weak_spots: Vec<WeakSpot>,
     notice: Option<String>,
+    canonical: bool,
+    applicability: looklab_schema::Applicability,
+}
+
+impl Default for VersionDetails {
+    fn default() -> Self {
+        Self {
+            version: String::new(),
+            changelog: Vec::new(),
+            weak_spots: Vec::new(),
+            notice: None,
+            canonical: false,
+            applicability: looklab_schema::Applicability::Unassessed,
+        }
+    }
 }
 
 impl VersionDetails {
@@ -25,6 +41,8 @@ impl VersionDetails {
             changelog: version.notes.changelog.clone(),
             weak_spots: version.notes.weak_spots.clone(),
             notice: version.notes.notice.clone(),
+            canonical: version.canonical,
+            applicability: version.applicability.clone(),
         }
     }
 }
@@ -101,8 +119,7 @@ pub fn LookDetail() -> impl IntoView {
 fn LookPageView(page: LookPage) -> impl IntoView {
     let query = use_query_map();
     let navigate = use_navigate();
-    let default_version = page
-        .latest()
+    let default_version = crate::selection::browsable_page_version(&page)
         .map(|version| version.version().to_string())
         .unwrap_or_default();
     let selected = RwSignal::new(
@@ -121,6 +138,9 @@ fn LookPageView(page: LookPage) -> impl IntoView {
     });
     let version_slug = page.slug.to_string();
     let version = RwSignal::new(Load::<Arc<LoadedVersion>>::Loading);
+    let version_scope = RwSignal::new(looklab_publish::SelectionScope::Unassessed);
+    let version_blockers = RwSignal::new(Vec::<String>::new());
+    let card_eligible = RwSignal::new(false);
     let scene_index = RwSignal::new(Load::<SceneIndex>::Loading);
     let scene_name = RwSignal::new(String::new());
     let scene = RwSignal::new(Load::<Arc<PreparedScene>>::Loading);
@@ -145,10 +165,26 @@ fn LookPageView(page: LookPage) -> impl IntoView {
             if version_generation.try_get_untracked() != Some(mine) {
                 return;
             }
-            version.set(match loaded {
-                Ok(loaded) => Load::Ready(Arc::new(loaded)),
-                Err(error) => Load::Failed(error),
-            });
+            match loaded {
+                Ok(loaded) => {
+                    if version_generation.try_get_untracked() == Some(mine)
+                        && let (Ok(index), Ok(page)) =
+                            (data::index().await, data::look(&slug).await)
+                        && let Some(page_version) = page
+                            .versions
+                            .iter()
+                            .find(|entry| entry.version().as_str() == chosen.as_str())
+                    {
+                        let (scope, blockers) =
+                            crate::selection::version_scope(&page, &index, page_version);
+                        version_scope.set(scope);
+                        version_blockers.set(blockers);
+                        card_eligible.set(page_version.card_eligible);
+                    }
+                    version.set(Load::Ready(Arc::new(loaded)));
+                }
+                Err(error) => version.set(Load::Failed(error)),
+            }
         });
     });
 
@@ -282,7 +318,13 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                 {move || match version.get() { Load::Ready(loaded) => {
                     let character = character(&loaded, &character_name, &description);
                     let tags = character.split_once(": ").map(|(_, phrases)| phrases.trim_end_matches('.').replace(", and ", ", ").replace(" and ", ", ").split(", ").take(4).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
-                    view! { <ui::Badge status=loaded.manifest.status/><p class="lede">{character}</p><ul class="character-tags">{tags.into_iter().map(|tag|view! { <li>{tag}</li> }).collect_view()}</ul> }.into_any()
+                    view! {
+                        <ui::Badge status=loaded.manifest.status/>
+                        <span class="muted">{data::selection_scope_label(version_scope.get())}</span>
+                        {version_blockers.get().into_iter().map(|blocker| view! { <p class="notice">{blocker}</p> }).collect_view()}
+                        <p class="lede">{character}</p>
+                        <ul class="character-tags">{tags.into_iter().map(|tag|view! { <li>{tag}</li> }).collect_view()}</ul>
+                    }.into_any()
                 }, _ => ().into_any() }}
                 {move || match index.get() { Load::Ready(index) => {
                     let cameras = index.bodies.iter().filter(|body| body.looks.contains(&origin_slug)).map(|body| format!("{} {}",body.make,body.model)).collect::<Vec<_>>();
@@ -375,20 +417,33 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                 </p>
             </section>
             {move || match version.get() {
-                Load::Ready(loaded) => {
-                    let images = loaded.manifest.provenance.bodies.iter().map(|body| u64::from(body.images)).sum::<u64>();
-                    let contributors = loaded.manifest.provenance.bodies.iter().map(|body| u64::from(body.credentials)).sum::<u64>();
-                    let cameras = loaded.manifest.provenance.bodies.len();
-                    let evidence = format!(
-                        "Based on {images} {} from {contributors} {} on {cameras} {}.",
-                        if images == 1 { "photo" } else { "photos" },
-                        if contributors == 1 { "contributor" } else { "contributors" },
-                        if cameras == 1 { "camera" } else { "cameras" },
-                    );
-                    view! {
-                        <h2>"How we know"</h2>
-                        <p>{evidence}</p>
-                    }.into_any()
+                Load::Ready(loaded) => match &loaded.content {
+                    data::VersionContent::SourcePreview(_) => ().into_any(),
+                    data::VersionContent::Layered(layered) => {
+                        let images = loaded.manifest.provenance.bodies.iter().map(|body| u64::from(body.images)).sum::<u64>();
+                        let contributors = loaded.manifest.provenance.bodies.iter().map(|body| u64::from(body.credentials)).sum::<u64>();
+                        let cameras = loaded.manifest.provenance.bodies.len();
+                        let evidence = format!(
+                            "Based on {images} {} from {contributors} {} on {cameras} {}.",
+                            if images == 1 { "photo" } else { "photos" },
+                            if contributors == 1 { "contributor" } else { "contributors" },
+                            if cameras == 1 { "camera" } else { "cameras" },
+                        );
+                        let approximation = layered.document.file.definition.as_ref().and_then(|definition| {
+                            let declared = definition.declared_base.as_ref()?;
+                            let computation = definition.encoding.base()?;
+                            Some(format!(
+                                "Experimental: the fitted coefficients use {} as an identified approximation of the declared base {}. This is not a claim that the declared base's camera controls or firmware are known.",
+                                data::base_label(computation),
+                                data::base_label(declared),
+                            ))
+                        });
+                        view! {
+                            <h2>"How we know"</h2>
+                            {approximation.map(|note| view! { <p class="notice" role="note">{note}</p> })}
+                            <p>{evidence}</p>
+                        }.into_any()
+                    }
                 }, _ => ().into_any()
             }}
             {move || {
@@ -401,11 +456,12 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                     Load::Ready(index) => {
                         let slug = match_slug.clone();
                         let href = move || crate::base::site_url(&format!(
-                            "/match?camera={}&look={slug}",
+                            "/match?camera={}&look={slug}&version={}",
                             camera.get().map(|id| id.to_string()).unwrap_or_default(),
+                            selected.get(),
                         ));
                         view! {
-                            <h2>"Get this look"</h2>
+                            <h2>"Get this look on your camera"</h2>
                             <ui::CameraPicker cameras=index.bodies selected=camera/>
                             <a class="button" href=href>"Find my settings"</a>
                         }.into_any()
@@ -413,12 +469,23 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                     _ => ().into_any(),
                 }
             }}
-            {move || match version.get() {
-                Load::Ready(loaded) if loaded.manifest.artifacts.iter().any(|artifact| artifact.name.as_str() == looklab_publish::CARD_ARTIFACT) => {
-                    let slug = card_slug.clone();
-                    view! { <p><a href=move || crate::base::site_url(&format!("/match?camera={}&look={slug}&apply=card",camera.get().map(|id| id.to_string()).unwrap_or_default()))>"Use custom firmware →"</a></p> }.into_any()
-                }, _ => ().into_any()
-            }}
+            {move || card_eligible.get().then(|| {
+                let slug = card_slug.clone();
+                view! {
+                    <p>
+                        <button on:click=move |_| {
+                            let slug = slug.clone();
+                            let version = selected.get_untracked();
+                            spawn_local(async move {
+                                if let Ok(bytes) = data::card(&slug, &version, data::CardUse::Download).await {
+                                    let _ = crate::files::download("LOOK0001.LLK", &bytes, "application/octet-stream");
+                                }
+                            });
+                        }>"Download the look's target card (.LLK)"</button>
+                    </p>
+                    <p class="muted">"Target-only card: this download does not use a camera realization, control-response model or matching result. Firmware translation is verified separately and is not guaranteed."</p>
+                }
+            })}
             {move || overview_details.iter().find(|details| details.version == selected.get()).map(|details| view! {
                 {details.notice.clone().map(|notice| view! { <p class="notice">{notice}</p> })}
                 {details.weak_spots.iter().map(|spot| view! {
@@ -470,6 +537,10 @@ fn VersionView(loaded: Arc<LoadedVersion>, details: VersionDetails) -> impl Into
     let gate_checks = manifest.gate_summary.checks.clone();
     let provenance = manifest.provenance.clone();
     let version = manifest.version.to_string();
+    let preview = match &loaded.content {
+        data::VersionContent::Layered(_) => None,
+        data::VersionContent::SourcePreview(preview) => Some(preview.as_ref().clone()),
+    };
 
     view! {
         <div class="version">
@@ -480,6 +551,33 @@ fn VersionView(loaded: Arc<LoadedVersion>, details: VersionDetails) -> impl Into
             </p>
             {details.notice.clone().map(|notice| view! {
                 <p class="notice" role="note">{notice}</p>
+            })}
+            {details.canonical.then(|| view! {
+                <p class="pass">"Canonical family target for this look."</p>
+            })}
+            {(!details.applicability.is_current()).then(|| view! {
+                <p class="notice" role="note">
+                    {format!("This version is {}.", data::applicability_label(&details.applicability))}
+                </p>
+            })}
+            {preview.as_ref().map(|preview| view! {
+                <p class="notice" role="note">{data::source_preview_label(preview)}</p>
+                <section aria-labelledby="source-lut">
+                    <h3 id="source-lut">"Source LUT"</h3>
+                    <dl class="facts">
+                        <dt>"Declared base"</dt>
+                        <dd>{preview.encoding.base().map(data::base_label).unwrap_or_else(|| "scene-referred".to_owned())}</dd>
+                        <dt>"Composition"</dt>
+                        <dd>{data::source_preview_composition(preview)}</dd>
+                        <dt>"Output"</dt>
+                        <dd>"sRGB"</dd>
+                        {preview.emulates.clone().map(|emulates| view! {
+                            <dt>"Reproduces"</dt><dd>{emulation_label(&emulates)}</dd>
+                        })}
+                        <dt>"Source file"</dt>
+                        <dd>{format!("{} · {} bytes · {}", preview.source.name.as_str(), preview.source.bytes, preview.source.sha256.as_str())}</dd>
+                    </dl>
+                </section>
             })}
             <table class="data-table">
                 <caption>{format!("Artifacts in version {version}")}</caption>
@@ -492,33 +590,35 @@ fn VersionView(loaded: Arc<LoadedVersion>, details: VersionDetails) -> impl Into
                 </thead>
                 <tbody>{artifacts}</tbody>
             </table>
-            <ui::Gates checks=gate_checks/>
-            <section aria-labelledby="provenance">
-                <h3 id="provenance">"Provenance"</h3>
-                <ul>
-                    {provenance.bodies.iter().map(|body| {
-                        view! {
-                            <li>
-                                {format!(
-                                    "{} - epochs {} · {} images · {} credentials",
-                                    body.body,
-                                    if body.epochs.is_empty() { "all".to_owned() } else { body.epochs.iter().map(u32::to_string).collect::<Vec<_>>().join(", ") },
-                                    body.images,
-                                    body.credentials,
-                                )}
-                            </li>
-                        }
-                    }).collect_view()}
-                </ul>
-                <dl class="facts">
-                    <dt>"Anchor version"</dt><dd>{provenance.anchor_version.clone()}</dd>
-                    <dt>"Root admissions"</dt><dd>{provenance.root_admissions.len()}</dd>
-                    <dt>"Community snapshot"</dt><dd>{provenance.community_snapshot_version}</dd>
-                    <dt>"Prep versions"</dt><dd>{provenance.prep_versions.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")}</dd>
-                    <dt>"Created"</dt><dd>{provenance.created.clone()}</dd>
-                    <dt>"Software"</dt><dd>{provenance.software.clone()}</dd>
-                </dl>
-            </section>
+            {preview.is_none().then(|| view! {
+                <ui::Gates checks=gate_checks/>
+                <section aria-labelledby="provenance">
+                    <h3 id="provenance">"Provenance"</h3>
+                    <ul>
+                        {provenance.bodies.iter().map(|body| {
+                            view! {
+                                <li>
+                                    {format!(
+                                        "{} - epochs {} · {} images · {} credentials",
+                                        body.body,
+                                        if body.epochs.is_empty() { "all".to_owned() } else { body.epochs.iter().map(u32::to_string).collect::<Vec<_>>().join(", ") },
+                                        body.images,
+                                        body.credentials,
+                                    )}
+                                </li>
+                            }
+                        }).collect_view()}
+                    </ul>
+                    <dl class="facts">
+                        <dt>"Anchor version"</dt><dd>{provenance.anchor_version.clone()}</dd>
+                        <dt>"Root admissions"</dt><dd>{provenance.root_admissions.len()}</dd>
+                        <dt>"Community snapshot"</dt><dd>{provenance.community_snapshot_version}</dd>
+                        <dt>"Prep versions"</dt><dd>{provenance.prep_versions.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")}</dd>
+                        <dt>"Created"</dt><dd>{provenance.created.clone()}</dd>
+                        <dt>"Software"</dt><dd>{provenance.software.clone()}</dd>
+                    </dl>
+                </section>
+            })}
             {if details.changelog.is_empty() {
                 ().into_any()
             } else {
@@ -555,17 +655,29 @@ fn VersionView(loaded: Arc<LoadedVersion>, details: VersionDetails) -> impl Into
 
 #[component]
 fn Measurements(loaded: Arc<LoadedVersion>) -> impl IntoView {
-    let diagnostics = &loaded.diagnostics;
-    let tone = tone_curve_svg(&diagnostics.tone);
-    let tint = tint_curve_svg(&diagnostics.tint);
-    let grl = diagnostics.grl.as_ref().map(grl_svg);
-    view! {
+    match &loaded.content {
+        data::VersionContent::Layered(layered) => {
+            let diagnostics = &layered.diagnostics;
+            let tone = tone_curve_svg(&diagnostics.tone);
+            let tint = tint_curve_svg(&diagnostics.tint);
+            let grl = diagnostics.grl.as_ref().map(grl_svg);
+            view! {
+                <section aria-labelledby="diagnostics">
+                    <h2 id="diagnostics">"Measurements"</h2>
+                    <ui::Plot title="Tone: J′ against scene exposure".to_owned() svg=tone/>
+                    <ui::Plot title="Neutral tint in a′b′".to_owned() svg=tint/>
+                    {grl.map(|svg| view! { <ui::Plot title="Chroma, hue and lightness layers by hue".to_owned() svg=svg/> })}
+                </section>
+            }
+            .into_any()
+        }
+        data::VersionContent::SourcePreview(preview) => view! {
             <section aria-labelledby="diagnostics">
                 <h2 id="diagnostics">"Measurements"</h2>
-                <ui::Plot title="Tone: J′ against scene exposure".to_owned() svg=tone/>
-                <ui::Plot title="Neutral tint in a′b′".to_owned() svg=tint/>
-                {grl.map(|svg| view! { <ui::Plot title="Chroma, hue and lightness layers by hue".to_owned() svg=svg/> })}
+                <p class="muted">{data::source_preview_label(preview)}</p>
             </section>
+        }
+        .into_any(),
     }
 }
 
@@ -576,11 +688,33 @@ fn wb_label(policy: looklab_model::file::WbPolicy) -> &'static str {
     }
 }
 
+fn emulation_label(emulation: &looklab_model::file::LutEmulation) -> String {
+    match emulation {
+        looklab_model::file::LutEmulation::CameraRendering { maker, rendering } => {
+            format!("{maker} {rendering}")
+        }
+        looklab_model::file::LutEmulation::FilmStock { name } => name.clone(),
+    }
+}
+
 pub(crate) fn character(loaded: &LoadedVersion, name: &str, description: &str) -> String {
+    match &loaded.content {
+        data::VersionContent::Layered(layered) => {
+            layered_character(&layered.document, name, description)
+        }
+        data::VersionContent::SourcePreview(preview) => data::source_preview_label(preview),
+    }
+}
+
+fn layered_character(
+    document: &looklab_model::LookDocument,
+    name: &str,
+    description: &str,
+) -> String {
     use looklab_report::compare::{ComparisonInput, FunctionName, compare};
     let probes = looklab_model::probes::v1();
     let reference = looklab_model::Look::colorimetric();
-    let look = crate::diagnostics::DocumentLook::new(&loaded.document, &probes);
+    let look = crate::diagnostics::DocumentLook::new(document, &probes);
     let summary = compare(&ComparisonInput {
         a: &reference,
         b: &look,

@@ -45,8 +45,10 @@ fn entries_strategy() -> impl Strategy<Value = Vec<(u16, support::Value)>> {
 fn fuji_value_strategy() -> impl Strategy<Value = support::FujiValue> {
     prop_oneof![
         "[ -~]{0,16}".prop_map(support::FujiValue::Ascii),
+        any::<u8>().prop_map(support::FujiValue::Byte),
         any::<u16>().prop_map(support::FujiValue::Short),
         any::<i32>().prop_map(support::FujiValue::SLong),
+        any::<i8>().prop_map(support::FujiValue::SByte),
         (any::<i32>(), any::<i32>())
             .prop_map(|(red, blue)| support::FujiValue::SLongPair(red, blue)),
         prop::collection::vec(any::<u8>(), 0..16).prop_map(support::FujiValue::Undefined),
@@ -66,6 +68,8 @@ fn fuji_entries_strategy() -> impl Strategy<Value = Vec<(u16, support::FujiValue
                 Just(0x1040),
                 Just(0x1041),
                 Just(0x1048),
+                Just(0x1049),
+                Just(0x104b),
                 Just(0x1401),
                 Just(0x1438),
                 any::<u16>(),

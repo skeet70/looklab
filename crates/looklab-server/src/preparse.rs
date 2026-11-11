@@ -6,14 +6,17 @@ use looklab_upload::webauthn::{
     MAX_AUTHENTICATOR_DATA, MAX_CLIENT_DATA_JSON, MAX_CREDENTIAL_ID, MAX_SIGNATURE,
 };
 use looklab_upload::{
-    BatchManifest, Limits, MAGIC, ManifestHash, Nonce, POW_K, PowSolutions, VERSION,
-    WebAuthnAssertion,
+    BatchManifest, Challenge, Limits, MAGIC, ManifestHash, Nonce, POW_K, PowSolutions,
+    SendManifest, SendManifestHash, VERSION, WebAuthnAssertion, canonical_send_manifest_bytes,
+    send_manifest_hash,
 };
 use sha2::{Digest, Sha256};
 
 #[derive(Debug)]
 pub struct EnvelopeHeader {
     pub nonce: Nonce,
+    pub send_manifest: SendManifest,
+    pub send_manifest_hash: SendManifestHash,
     pub manifest_hash: ManifestHash,
     pub manifest: BatchManifest,
     pub assertion: WebAuthnAssertion,
@@ -24,6 +27,10 @@ impl EnvelopeHeader {
     pub fn n_images(&self) -> u32 {
         u32::try_from(self.manifest.images.len()).unwrap_or(u32::MAX)
     }
+
+    pub fn pow_challenge(&self) -> Challenge {
+        Challenge::new(&self.nonce, &self.manifest_hash)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -32,6 +39,8 @@ pub enum HeaderError {
     Truncated,
     #[error("the envelope is not an upload envelope")]
     NotAnEnvelope,
+    #[error("unsupported envelope version {0}")]
+    UnsupportedVersion(u16),
     #[error("the manifest exceeds the configured limit")]
     ManifestTooLong,
     #[error("the manifest is not a valid batch manifest")]
@@ -53,17 +62,37 @@ pub fn parse_header(bytes: &[u8], limits: &Limits) -> Result<EnvelopeHeader, Hea
     }
     let version = u16::from_le_bytes([bytes[6], bytes[7]]);
     if version != VERSION {
-        return Err(HeaderError::NotAnEnvelope);
+        return Err(HeaderError::UnsupportedVersion(version));
     }
     let nonce_bytes = take(bytes, 8, 32)?;
     let nonce = Nonce::from_slice(nonce_bytes).ok_or(HeaderError::Truncated)?;
 
-    let manifest_len =
+    let send_manifest_len =
         u32::from_le_bytes(take(bytes, 40, 4)?.try_into().expect("4 bytes")) as usize;
+    if send_manifest_len > limits.max_manifest_bytes {
+        return Err(HeaderError::ManifestTooLong);
+    }
+    let send_manifest_bytes = take(bytes, 44, send_manifest_len)?;
+    let (send_manifest, rest) = postcard::take_from_bytes::<SendManifest>(send_manifest_bytes)
+        .map_err(|_| HeaderError::ManifestInvalid)?;
+    if !rest.is_empty() || canonical_send_manifest_bytes(&send_manifest) != send_manifest_bytes {
+        return Err(HeaderError::ManifestInvalid);
+    }
+    send_manifest
+        .validate(limits.max_batches, limits.max_attestations)
+        .map_err(|_| HeaderError::ManifestInvalid)?;
+    let send_hash = send_manifest_hash(&send_manifest);
+
+    let manifest_offset = 44 + send_manifest_len;
+    let manifest_len = u32::from_le_bytes(
+        take(bytes, manifest_offset, 4)?
+            .try_into()
+            .expect("4 bytes"),
+    ) as usize;
     if manifest_len > limits.max_manifest_bytes {
         return Err(HeaderError::ManifestTooLong);
     }
-    let manifest_bytes = take(bytes, 44, manifest_len)?;
+    let manifest_bytes = take(bytes, manifest_offset + 4, manifest_len)?;
     let (manifest, rest) = postcard::take_from_bytes::<BatchManifest>(manifest_bytes)
         .map_err(|_| HeaderError::ManifestInvalid)?;
     if !rest.is_empty() {
@@ -76,8 +105,11 @@ pub fn parse_header(bytes: &[u8], limits: &Limits) -> Result<EnvelopeHeader, Hea
     hasher.update(manifest_bytes);
     let digest = hasher.finalize();
     let manifest_hash = ManifestHash::from_bytes(digest.into());
+    if !send_manifest.contains(&manifest_hash) {
+        return Err(HeaderError::ManifestInvalid);
+    }
 
-    let mut reader = Reader::new(bytes, 44 + manifest_len);
+    let mut reader = Reader::new(bytes, manifest_offset + 4 + manifest_len);
     let credential_len = usize::from(reader.u8()?);
     if credential_len == 0 || credential_len > MAX_CREDENTIAL_ID {
         return Err(HeaderError::AssertionTooLong);
@@ -98,6 +130,8 @@ pub fn parse_header(bytes: &[u8], limits: &Limits) -> Result<EnvelopeHeader, Hea
 
     Ok(EnvelopeHeader {
         nonce,
+        send_manifest_hash: send_hash,
+        send_manifest,
         manifest_hash,
         manifest,
         assertion: WebAuthnAssertion {

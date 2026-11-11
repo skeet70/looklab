@@ -203,10 +203,11 @@ pub async fn sign_batch(
     let public_key = Object::new();
     set(&public_key, "challenge", &Uint8Array::from(challenge))?;
     set(&public_key, "rpId", &JsValue::from_str(rp_id.as_str()))?;
+    // The server rejects an assertion without the user-verified flag.
     set(
         &public_key,
         "userVerification",
-        &JsValue::from_str("preferred"),
+        &JsValue::from_str("required"),
     )?;
     set(&public_key, "timeout", &JsValue::from_f64(60_000.0))?;
     if let Some(credential_id) = credential_id {
@@ -530,25 +531,70 @@ pub async fn sign_out_everywhere() -> Result<(), SignInError> {
     Ok(())
 }
 
+/// Why the server refused an upload envelope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UploadError {
+    /// The server no longer accepts this page's envelope layout.
+    ReloadRequired,
+    Rejected(String),
+}
+
+impl UploadError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::ReloadRequired => {
+                "This page is out of date. Reload it, then prepare and send your photos again."
+                    .to_owned()
+            }
+            Self::Rejected(message) => message.clone(),
+        }
+    }
+
+    pub fn requires_reload(&self) -> bool {
+        matches!(self, Self::ReloadRequired)
+    }
+}
+
+fn upload_error(status: u16, body: &str) -> UploadError {
+    let code = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("error")?.as_str().map(str::to_owned));
+    if status == 426 || code.as_deref() == Some("ENVELOPE_VERSION_UNSUPPORTED") {
+        return UploadError::ReloadRequired;
+    }
+    if code.as_deref() == Some("CREDENTIAL_BLOCKED") {
+        return UploadError::Rejected(
+            "This profile cannot send new contributions. Existing uploads can still be withdrawn from the status link."
+                .to_owned(),
+        );
+    }
+    UploadError::Rejected(format!("upload: HTTP {status}"))
+}
+
 /// # Errors
 /// Reports a server rejection of the envelope.
-pub async fn upload_envelope(envelope: Vec<u8>) -> Result<UploadReply, String> {
+pub async fn upload_envelope(envelope: Vec<u8>) -> Result<UploadReply, UploadError> {
     let response = Request::post(&api_url("/api/upload"))
         .header("Content-Type", "application/octet-stream")
         .body(Some(JsValue::from(Uint8Array::from(envelope.as_slice()))))
-        .map_err(|error| error.to_string())?
+        .map_err(|error| UploadError::Rejected(error.to_string()))?
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| UploadError::Rejected(error.to_string()))?;
     if !response.ok() {
-        return Err(format!("upload: HTTP {}", response.status()));
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(upload_error(status, &body));
     }
     #[derive(Deserialize)]
     struct Wire {
         status_token: Option<String>,
         contribution_id: String,
     }
-    let wire: Wire = response.json().await.map_err(|error| error.to_string())?;
+    let wire: Wire = response
+        .json()
+        .await
+        .map_err(|error| UploadError::Rejected(error.to_string()))?;
     Ok(UploadReply {
         status_token: wire.status_token,
         contribution_id: wire.contribution_id,
@@ -780,4 +826,25 @@ pub fn decode_base64url(text: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unsupported_envelope_asks_for_a_reload() {
+        let error = upload_error(
+            426,
+            r#"{"error":"ENVELOPE_VERSION_UNSUPPORTED","action":"reload_and_prepare"}"#,
+        );
+        assert_eq!(error, UploadError::ReloadRequired);
+        assert!(error.message().contains("Reload"));
+    }
+
+    #[test]
+    fn another_rejection_keeps_the_status() {
+        let error = upload_error(400, r#"{"error":"MALFORMED_ENVELOPE"}"#);
+        assert_eq!(error, UploadError::Rejected("upload: HTTP 400".to_owned()));
+    }
 }

@@ -38,17 +38,83 @@ pub enum FitError {
     Realization(#[from] looklab_model::realization::RealizationError),
     #[error("hierarchical fit: {0}")]
     Hierarchy(String),
+    #[error("row context: {0}")]
+    RowContext(String),
+    #[error("firmware identity: {0}")]
+    Firmware(String),
+    #[error("component gauge: {0}")]
+    MissingGauge(String),
 }
 
 pub type Result<T, E = FitError> = core::result::Result<T, E>;
 
 /// Body exposure mode; mode 0 is the default mode and carries the `ξ` gauge.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ExposureModeId(pub u32);
 
 /// Effective-contributor id; `σ_v` is fitted per contributor.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct ContributorId(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FitStage {
+    Native,
+    Published,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageWeights {
+    pub trust_weight: f64,
+    pub sample_trust: Option<Vec<f32>>,
+    pub duplicates: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StageImageWeights {
+    /// Native-stage weights for the body and realization block.
+    pub native_body: Option<ImageWeights>,
+    /// Native-stage weights for the family Look block.
+    pub native_look: Option<ImageWeights>,
+    /// Published-stage weights for the body and realization block.
+    pub published_body: Option<ImageWeights>,
+}
+
+impl StageImageWeights {
+    pub fn body(&self, stage: FitStage) -> Option<&ImageWeights> {
+        match stage {
+            FitStage::Native => self.native_body.as_ref(),
+            FitStage::Published => self.published_body.as_ref(),
+        }
+    }
+
+    pub fn look(&self) -> Option<&ImageWeights> {
+        self.native_look.as_ref()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct FitImage {
@@ -58,6 +124,8 @@ pub struct FitImage {
     pub trust_weight: f64,
     /// Per-sample multipliers of `trust_weight` (docs/05 §6 caps are per region).
     pub sample_trust: Option<Vec<f32>>,
+    /// Stage-specific weights override `trust_weight`/`sample_trust` when present.
+    pub stage_weights: StageImageWeights,
     pub exposure_mode: ExposureModeId,
     pub contributor: ContributorId,
     pub settings: Settings,
@@ -74,6 +142,7 @@ impl FitImage {
             exposure_hint: 0.0,
             trust_weight: 1.0,
             sample_trust: None,
+            stage_weights: StageImageWeights::default(),
             exposure_mode: ExposureModeId::default(),
             contributor: ContributorId::default(),
             settings: Settings::default(),
@@ -165,7 +234,7 @@ impl Default for FitOptions {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ImageNuisances {
     /// Log2 exposure offset relative to the body's mode offset.
     pub exposure: f64,
@@ -176,7 +245,7 @@ pub struct ImageNuisances {
     pub weight: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExposureOffset {
     pub mode: ExposureModeId,
     pub offset: f64,
@@ -285,16 +354,167 @@ pub struct PreviousSupport {
     pub bias: Vec<bool>,
 }
 
+/// A finite objective value in nats of the tempered fit objective; it may be negative.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, serde::Serialize)]
+pub struct ObjectiveNats(f64);
+
+impl ObjectiveNats {
+    pub const ZERO: Self = Self(0.0);
+
+    /// Returns `None` for a non-finite value.
+    pub fn checked(value: f64) -> Option<Self> {
+        value.is_finite().then_some(Self(value))
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ObjectiveNats {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <f64 as serde::Deserialize>::deserialize(deserializer)?;
+        Self::checked(value).ok_or_else(|| serde::de::Error::custom("expected a finite objective"))
+    }
+}
+
+/// Number of accepted-state objective samples the final-stage plateau test keeps.
+pub const PLATEAU_SAMPLES: usize = 5;
+
+/// Identity of the objective a [`PlateauHistory`] was accumulated under.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PlateauObjective {
+    /// Stage the samples belong to.
+    pub stage: usize,
+    /// Whether the residual grid was a free block.
+    pub residual: bool,
+    /// Smoothness weights in force at the checkpoint.
+    pub lambdas: StageLambdas,
+    /// Conditional `log sigma` of each contributor at the checkpoint.
+    pub sigma: Vec<f64>,
+    /// Retained eligible rows of the problem.
+    pub samples: usize,
+    /// Rows the eligibility probe dropped.
+    pub excluded: usize,
+}
+
+/// Accepted-state objective samples of the final stage, oldest first.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PlateauHistory {
+    /// Objective the samples were stored under.
+    pub objective: Option<PlateauObjective>,
+    samples: [ObjectiveNats; PLATEAU_SAMPLES],
+    /// Number of valid entries in `samples`.
+    #[serde(default, deserialize_with = "deserialize_plateau_count")]
+    count: usize,
+    /// Whether the checkpoint state has an accepted cost not yet sampled.
+    #[serde(default)]
+    pub pending: bool,
+}
+
+fn deserialize_plateau_count<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let count = <usize as serde::Deserialize>::deserialize(deserializer)?;
+    if count > PLATEAU_SAMPLES {
+        return Err(serde::de::Error::custom("too many plateau samples"));
+    }
+    Ok(count)
+}
+
+impl Default for PlateauHistory {
+    fn default() -> Self {
+        Self {
+            objective: None,
+            samples: [ObjectiveNats::ZERO; PLATEAU_SAMPLES],
+            count: 0,
+            pending: false,
+        }
+    }
+}
+
+impl PlateauHistory {
+    /// Whether the samples may continue an objective with this identity.
+    pub fn compatible(&self, objective: &PlateauObjective) -> bool {
+        self.objective.as_ref() == Some(objective)
+    }
+
+    /// Stored samples, oldest first.
+    pub fn samples(&self) -> &[ObjectiveNats] {
+        &self.samples[..self.count]
+    }
+
+    /// Number of stored samples.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Snapshots the live samples. A non-finite value leaves it empty.
+    pub fn snapshot(samples: &[f64], pending: bool, objective: PlateauObjective) -> Self {
+        let start = samples.len().saturating_sub(PLATEAU_SAMPLES);
+        let mut history = Self {
+            objective: Some(objective),
+            pending,
+            ..Self::default()
+        };
+        for value in &samples[start..] {
+            let Some(sample) = ObjectiveNats::checked(*value) else {
+                return Self::default();
+            };
+            history.samples[history.count] = sample;
+            history.count += 1;
+        }
+        history
+    }
+}
+
+/// Solver generation of a saved [`FitState`].
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct FitStateGeneration(pub u32);
+
+impl FitStateGeneration {
+    /// Stable clipped-white composition and fixed per-image retained rows.
+    pub const CURRENT: Self = Self(6);
+}
+
 /// Everything needed to continue a fit that exhausted its budget.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FitState {
+    #[serde(default)]
+    pub generation: FitStateGeneration,
     pub theta: Vec<f64>,
     pub lambdas: StageLambdas,
     /// Stage to resume at, and the first sweep within it.
     pub stage: usize,
     pub sweep: usize,
+    /// Warm-up LM damping.
     pub damping: f64,
+    /// `None` until the final-stage trust region is initialized.
+    #[serde(default)]
+    pub trust_radius: Option<crate::TrustRadius>,
     pub converged: bool,
+    /// Accepted-state objective samples from the final stage.
+    #[serde(default)]
+    pub plateau: PlateauHistory,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -321,6 +541,116 @@ impl Density {
     }
 }
 
+/// A non-negative energy in nats of the tempered fit objective.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct Nats(f64);
+
+impl Nats {
+    pub const ZERO: Self = Self(0.0);
+
+    /// Returns `None` for a negative or non-finite value.
+    pub fn checked(value: f64) -> Option<Self> {
+        (value.is_finite() && value >= 0.0).then_some(Self(value))
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+/// Where in the fit the reported certificate was computed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CertificateOrigin {
+    /// The final refinement stage certified its own linearization state.
+    FinalStage,
+    /// The returned native objective was recertified after post-fit refinements.
+    PostFitRecertification,
+}
+
+/// Why a stationarity certificate could not resolve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CertificateTermination {
+    /// The linear solve hit its iteration or stall limit.
+    WorkLimit,
+    /// The positive model lost curvature.
+    NonpositiveCurvature,
+    /// A nuisance, border or preconditioner factorization failed.
+    Factorization,
+    /// Non-finite arithmetic in the model or solve.
+    Nonfinite,
+    /// A free coordinate has no strictly positive prior floor.
+    NoPriorFloor,
+    /// The conditional sigma root is not bracketed or not finite.
+    SigmaUnbracketed,
+    /// A residual coordinate outside the free mask is nonzero.
+    PinViolation,
+    /// The resolved bounds straddled the stationarity threshold.
+    BoundNotDecisive,
+    /// The refreshed objective left the evaluator's domain or was not finite.
+    InvalidObjective,
+}
+
+impl CertificateTermination {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WorkLimit => "work-limit",
+            Self::NonpositiveCurvature => "nonpositive-curvature",
+            Self::Factorization => "factorization",
+            Self::Nonfinite => "nonfinite",
+            Self::NoPriorFloor => "no-floor",
+            Self::SigmaUnbracketed => "sigma-unbracketed",
+            Self::PinViolation => "pin-violation",
+            Self::BoundNotDecisive => "bound-not-decisive",
+            Self::InvalidObjective => "invalid-objective",
+        }
+    }
+}
+
+/// First-order, model-scaled stationarity of the free coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StationarityCertificate {
+    /// The certified upper bound on the stationarity energy is at or below 1e-3 nats.
+    CertifiedStationary { upper: Nats },
+    /// A valid lower bound on the stationarity energy exceeds 1e-3 nats.
+    CertifiedNonstationary { lower: Nats },
+    /// Neither conclusion was established.
+    Unresolved { termination: CertificateTermination },
+}
+
+impl StationarityCertificate {
+    pub fn is_certified_stationary(self) -> bool {
+        matches!(self, Self::CertifiedStationary { .. })
+    }
+}
+
+/// Work and explicit residual of a certificate solve.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CertificateWork {
+    pub iterations: usize,
+    /// Explicit relative residual of the complete undamped system after back-substitution.
+    pub relative_residual: Option<f64>,
+    pub dim: usize,
+    pub residual_coordinates: usize,
+}
+
+/// Certified interval on the stationarity energy, retained even when it is not decisive.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StationarityBounds {
+    pub lower: Nats,
+    pub upper: Nats,
+}
+
+/// The last stationarity certification attempt for the returned native objective.
+/// Recipe images are excluded and the Look is frozen for them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StationarityReport {
+    pub origin: CertificateOrigin,
+    pub certificate: StationarityCertificate,
+    pub work: Option<CertificateWork>,
+    /// The interval the certificate was decided from, when both bounds were computed.
+    pub bounds: Option<StationarityBounds>,
+}
+
 /// Objective samples charged to the staged solve, including reference initialization and value-only trials.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
 pub struct SampleEvaluations(u64);
@@ -343,6 +673,18 @@ impl core::ops::AddAssign for SampleEvaluations {
     }
 }
 
+/// Samples a fit dropped because they left the evaluator's domain at some permitted nuisance value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DomainExclusion {
+    /// Exposure `s` bin, quarter stop.
+    pub s_bin: i32,
+    /// Input hue bin, 15 degrees.
+    pub hue_bin: i32,
+    /// Input `sqrt(C)` bin, unit 1.
+    pub chroma_bin: i32,
+    pub samples: usize,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Diagnostics {
     pub sweeps: usize,
@@ -352,6 +694,12 @@ pub struct Diagnostics {
     pub sigma_v: Vec<(ContributorId, f64)>,
     pub gcv: StageLambdas,
     pub hessian_samples: usize,
+    /// Samples excluded before refinement because a permitted nuisance left the evaluator's domain.
+    pub excluded_samples: usize,
+    /// Excluded samples by `(s, hue, chroma)` bin; exclusions reduce coverage evidence.
+    pub excluded_regions: Vec<DomainExclusion>,
+    /// Rows the final-stage curvature operator used: all active rows when they fit the retention bound.
+    pub operator_rows: usize,
     pub objective_samples: usize,
     pub quarantined: usize,
     pub down_weighted: usize,
@@ -359,6 +707,8 @@ pub struct Diagnostics {
     pub grl_precision_ratio: Vec<f64>,
     /// The final refinement stage met its objective and step tolerances.
     pub converged: bool,
+    /// The last stationarity certificate for the returned native objective.
+    pub stationarity: Option<StationarityReport>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -382,4 +732,35 @@ pub struct ImageScores {
     pub image_stats: Vec<ImageFitStats>,
     pub excluded: Vec<ExcludedImage>,
     pub diagnostics: Diagnostics,
+}
+
+#[cfg(test)]
+mod numeric_boundary_tests {
+    use crate::{ObjectiveNats, PlateauHistory};
+    use serde::Deserialize;
+    use serde::de::value::{Error, F64Deserializer};
+
+    #[test]
+    fn deserialized_objectives_preserve_negative_costs_and_reject_nonfinite_values() {
+        let cost = ObjectiveNats::deserialize(F64Deserializer::<Error>::new(-3.5)).unwrap();
+        assert_eq!(cost.get(), -3.5);
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(ObjectiveNats::deserialize(F64Deserializer::<Error>::new(value)).is_err());
+        }
+    }
+
+    #[test]
+    fn checkpoint_history_rejects_an_overfull_sample_count() {
+        let history: PlateauHistory = serde_json::from_str(
+            r#"{"objective":null,"samples":[-5,-4,-3,-2,-1],"count":5,"pending":false}"#,
+        )
+        .unwrap();
+        assert_eq!(history.len(), 5);
+        assert_eq!(history.samples()[4].get(), -1.0);
+        let error = serde_json::from_str::<PlateauHistory>(
+            r#"{"objective":null,"samples":[-5,-4,-3,-2,-1],"count":6,"pending":false}"#,
+        )
+        .unwrap_err();
+        assert_eq!(error.classify(), serde_json::error::Category::Data);
+    }
 }

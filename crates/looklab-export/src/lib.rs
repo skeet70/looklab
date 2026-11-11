@@ -32,13 +32,14 @@ pub use card::{
 };
 pub use cct::{BAKE_CCTS, CctK};
 pub use downstream::{
-    DownstreamModel, OutputSpace, TargetOutput, Transfer, in_gamut, perceptual_clip, ucs_to_xyz,
+    DownstreamModel, OutputSpace, RenderableAppearance, TargetOutput, Transfer, checked_appearance,
+    in_gamut, perceptual_clip, ucs_to_xyz,
 };
 pub use error::{ExportError, Result};
 pub use looklab_schema::{Format, InsertionPoint, Interpolation, Precision};
 pub use lut_look::{
-    DeltaSummary, LutLookError, LutLookImport, LutLookOptions, composed_ucs, definition_delta,
-    import_lut_look, lut_data_from_cube,
+    DeltaSummary, LutLookError, LutLookImport, LutLookOptions, approximation_publishable,
+    composed_ucs, definition_delta, import_lut_look, lut_data_from_cube, preview_composed_encoded,
 };
 pub use native::{NativeDocument, read_native_json, write_native_json};
 pub use sim::{CctReport, DeltaStats, Support, ValidationReport, validate};

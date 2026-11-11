@@ -12,6 +12,7 @@ use looklab_color::ciede2000::delta_e_ciede2000;
 use looklab_color::lab::{Lab, xyz_to_lab};
 use looklab_color::ucs::{Ucs, UcsSpace, delta_e_ucs, ucs_to_jmh};
 use looklab_color::{Illuminant, Xyz};
+use looklab_model::domain_penalty::check_published_paths;
 use looklab_model::probes::{Probe, ProbeGroup, ProbeId, ProbeSet};
 use looklab_model::{LayerValues, Look, LookInput};
 use serde::Serialize;
@@ -161,6 +162,16 @@ pub trait LookFunction {
 impl LookFunction for Look {
     fn predict(&self, xyz: Xyz) -> Ucs {
         self.eval(xyz)
+    }
+
+    fn support(&self, probe: &Probe) -> Support {
+        let input = LookInput::new(probe.xyz);
+        let values = self.layer_values(&input);
+        if check_published_paths(&self.chroma_paths(&input, &values)).is_ok() {
+            Support::Supported
+        } else {
+            Support::Unsupported
+        }
     }
 
     fn layer_values(&self, input: &LookInput) -> Option<LayerValues> {

@@ -112,7 +112,7 @@ pub fn run(args: &ExportArgs) -> Result<()> {
     if report.flagged() && !args.force {
         bail!("export flagged: p95 exceeds 1.0 ΔE at a bake CCT; rerun with --force to write it");
     }
-    write_output(args, &document, &profile, &output, format, cct)
+    write_output(args, &profile, &output, format, cct)
 }
 
 fn ensure_matchable(document: &LookDocument) -> Result<()> {
@@ -162,7 +162,6 @@ fn print_report(report: &ValidationReport) {
 
 fn write_output(
     args: &ExportArgs,
-    document: &LookDocument,
     profile: &InterfaceProfile,
     output: &looklab_export::BakeOutput,
     format: Format,
@@ -176,6 +175,7 @@ fn write_output(
             println!("wrote {} ({} bytes)", args.out.display(), written);
         }
         Format::Cube | Format::Haldclut => {
+            let title = output.profile_id.as_str();
             let published = match output.bake {
                 BakeIlluminant::Single { .. } => vec![(None, output.primary_artifact())],
                 BakeIlluminant::DualInterpolated => output
@@ -194,17 +194,7 @@ fn write_output(
                     Some(suffix) => util::replace_extension(&args.out, &suffix, extension(format)),
                     None => args.out.clone(),
                 };
-                write_artifact(
-                    &path,
-                    artifact,
-                    format,
-                    &format!(
-                        "{} {}",
-                        document.file.look.slug.as_str(),
-                        document.file.look.version.as_str()
-                    ),
-                    insertion.range,
-                )?;
+                write_artifact(&path, artifact, format, title, insertion.range)?;
             }
         }
     }
@@ -275,6 +265,7 @@ mod tests {
                     missing: BaseField::FilmSimulation,
                 },
             },
+            declared_base: None,
             output: OutputEncoding::Srgb,
             lut: lut.record(),
             emulates: None,

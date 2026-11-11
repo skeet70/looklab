@@ -1,0 +1,206 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: fujifilm/x-e2
+  make: Fujifilm
+  model: X-E2
+  sources:
+  - id: xe2-manual
+    kind: owner_manual
+    url: https://dl.fujifilm-x.com/support/manual/x/fujifilm_xe2_manual_en.pdf
+    title: FUJIFILM X-E2 Owner's Manual
+    edition: BL00004756-201 EN, Version 4.00
+    firmware_scope: '4.00'
+  - id: xe2-firmware
+    kind: firmware_notes
+    url: https://fujifilm-x.com/en-us/support/download/firmware/cameras/x-e2/
+    title: X-E2 Firmware update
+    edition: web edition, accessed 2026-11-08
+    firmware_scope: '4.11'
+  capabilities:
+  - key: native_simulations
+    label: FILM SIMULATION
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - PROVIA/STANDARD
+      - Velvia/VIVID
+      - ASTIA/SOFT
+      - CLASSIC CHROME
+      - PRO Neg. Hi
+      - PRO Neg. Std
+      - MONOCHROME
+      - MONOCHROME+Ye
+      - MONOCHROME+R
+      - MONOCHROME+G
+      - SEPIA
+    citations:
+    - source: xe2-manual
+      locator: p. 56 (PDF 72), Film Simulation
+  - key: jpeg_quality
+    label: IMAGE QUALITY
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - FINE
+      - NORMAL
+      - RAW
+      - FINE+RAW
+      - NORMAL+RAW
+    citations:
+    - source: xe2-manual
+      locator: p. 90 (PDF 106), IMAGE QUALITY
+  - key: raw_capture
+    label: RAW RECORDING
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: xe2-manual
+      locator: p. 90 (PDF 106), IMAGE QUALITY (no RAW compression option documented)
+  - key: heif_capture
+    label: HEIF
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: xe2-manual
+      locator: p. 90 (PDF 106), IMAGE QUALITY
+    notes: No HEIF option appears in the documented image-quality formats.
+  - key: in_camera_raw_conversion
+    label: RAW CONVERSION
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: xe2-manual
+      locator: p. 75 (PDF 91), Creating JPEG Copies of RAW Pictures
+  - key: jpeg_color_spaces
+    label: COLOR SPACE
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - Adobe RGB
+    citations:
+    - source: xe2-manual
+      locator: p. 108 (PDF 124), COLOR SPACE
+  - key: white_balance_presets
+    label: WHITE BALANCE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - CUSTOM
+      - COLOR TEMPERATURE
+      - DAYLIGHT
+      - SHADE
+      - FLUORESCENT LIGHT-1
+      - FLUORESCENT LIGHT-2
+      - FLUORESCENT LIGHT-3
+      - INCANDESCENT
+      - UNDERWATER
+    citations:
+    - source: xe2-manual
+      locator: p. 79 (PDF 95), White Balance
+  - key: white_balance_shift
+    label: WB SHIFT
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: R
+      - label: B
+    citations:
+    - source: xe2-manual
+      locator: p. 79 (PDF 95), WB SHIFT fine-tuning dialog
+    notes: Two-axis fine-tuning dialog; the rendered dialog figure shows the grid and current R/B values without numeric limits.
+  - key: dynamic_range
+    label: DYNAMIC RANGE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - 100%
+      - 200%
+      - 400%
+    citations:
+    - source: xe2-manual
+      locator: p. 90 (PDF 106), DYNAMIC RANGE
+    notes: 200% requires ISO 400 or above; 400% requires ISO 800 or above. AUTO selects 100% or 200%.
+  - key: highlight_tone
+    label: HIGHLIGHT TONE
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xe2-manual
+      locator: p. 91 (PDF 107), HIGHLIGHT TONE and SHADOW TONE
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: shadow_tone
+    label: SHADOW TONE
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xe2-manual
+      locator: p. 91 (PDF 107), HIGHLIGHT TONE and SHADOW TONE
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: saturation
+    label: COLOR
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xe2-manual
+      locator: p. 91 (PDF 107), COLOR
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: sharpening
+    label: SHARPNESS
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xe2-manual
+      locator: p. 91 (PDF 107), SHARPNESS
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: noise_reduction
+    label: NOISE REDUCTION
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xe2-manual
+      locator: p. 91 (PDF 107), NOISE REDUCTION
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: film_simulation_bracket
+    label: FILM SIMULATION BKT
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: xe2-manual
+      locator: p. 59 (PDF 75), Bracketing
+  notes:
+  - Manual is Version 4.00 (BL00004756-201 EN); CLASSIC CHROME was added in firmware Ver. 3.00.

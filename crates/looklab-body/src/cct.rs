@@ -211,13 +211,12 @@ impl CameraProfile {
     /// Camera-to-XYZ(D65) at `target`'s white for white-balanced camera RGB.
     /// Interpolation follows DNG 1.6 chapter 6.
     pub fn matrix_at(&self, target: CalibrationIlluminant) -> Result<Mat3> {
-        let white = match self.color.as_slice() {
+        let illuminant = match self.color.as_slice() {
             [] => return Err(BodyError::NoMatrices),
-            [single] => single.illuminant.xy(),
-            _ => target.xy(),
+            [single] => single.illuminant,
+            _ => target,
         };
-        let matrix = self.spec.camera_to_xyz_d65_at_white(white)?;
-        balanced_input_matrix(matrix)
+        camera_to_xyz_at_illuminant(&self.spec, illuminant)
     }
 
     /// The profile's matrices for the two transformer endpoints.
@@ -227,6 +226,14 @@ impl CameraProfile {
             self.matrix_at(CalibrationIlluminant::D65)?,
         ))
     }
+}
+
+/// White-balanced camera RGB to XYZ(D65), DNG 1.6 chapter 6.
+pub fn camera_to_xyz_at_illuminant(
+    spec: &DngColorSpec,
+    illuminant: CalibrationIlluminant,
+) -> Result<Mat3> {
+    balanced_input_matrix(spec.camera_to_xyz_d65_at_white(illuminant.xy())?)
 }
 
 /// `m · diag(m⁻¹ · D65)` for white-balanced camera RGB; `DngInputTransform`

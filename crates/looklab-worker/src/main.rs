@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::Parser;
+use looklab_worker::jobs::JobPayload;
 use looklab_worker::{Worker, WorkerConfig, clock, jobs};
 
 #[derive(Debug, Parser)]
@@ -21,6 +22,12 @@ struct Args {
     /// Body and control-schema snapshots.
     #[arg(long, default_value = "data")]
     data: PathBuf,
+    /// Documentation-derived camera catalog directory.
+    #[arg(long, default_value = "data/manuals")]
+    manuals: PathBuf,
+    /// Approved community snapshots; the DB activation row selects the active one.
+    #[arg(long, default_value = "data/community")]
+    snapshot_dir: PathBuf,
     /// Publication root; receives data/ and site-root.txt.
     #[arg(long, default_value = "site")]
     site: PathBuf,
@@ -46,6 +53,8 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let mut config = WorkerConfig::new(args.db, args.blobs);
     config.data = args.data;
+    config.manuals = args.manuals;
+    config.snapshot_dir = args.snapshot_dir;
     config.site = args.site;
     config.transforms = args.transforms;
     config.seed = args.seed;
@@ -68,6 +77,14 @@ async fn main() -> anyhow::Result<()> {
 async fn schedule_startup(worker: &Worker) -> anyhow::Result<()> {
     let now = clock::now_unix();
     jobs::enqueue_pending_publication(worker.pool(), now).await?;
+    jobs::enqueue_if_idle(
+        worker.pool(),
+        &JobPayload::BlobGc {
+            contribution_id: None,
+        },
+        now,
+    )
+    .await?;
     if !worker.config().site.join("data/index.json").is_file() {
         jobs::request_publish(worker.pool(), now).await?;
     }

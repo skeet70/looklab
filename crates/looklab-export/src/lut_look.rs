@@ -9,8 +9,10 @@ use looklab_color::cam16::ViewingConditions;
 use looklab_color::{Mat3, Rgb, RgbSpace, Xyz};
 use looklab_fit::{FitImage, FitOptions, ProbeUncertainty, fit};
 use looklab_model::baseline::{is_neutral_baseline, neutral_baseline_srgb_v1};
+use looklab_model::domain_penalty::{DomainViolation, check_published_inverse};
 use looklab_model::file::{
-    BaseReference, DeclaredEncoding, LutData, LutDefinition, LutRecord, OutputEncoding,
+    BaseReference, DeclaredEncoding, Gamut, LogTransfer, LutData, LutDefinition, LutRecord,
+    OutputEncoding,
 };
 use looklab_model::probes;
 use looklab_model::{
@@ -25,7 +27,7 @@ use looklab_schema::Interpolation;
 use thiserror::Error;
 
 use crate::artifact::Lut3d;
-use crate::downstream::ucs_to_xyz;
+use crate::downstream::{checked_appearance, ucs_to_xyz};
 use crate::writer::CubeFile;
 
 #[derive(Debug, Error)]
@@ -40,6 +42,8 @@ pub enum LutLookError {
     Samples(#[from] looklab_samples::Error),
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
+    #[error("the published rendering inverse is undefined: {0}")]
+    PublishedInverse(DomainViolation),
     #[error("a display-referred base Look is required")]
     MissingBase,
 }
@@ -87,6 +91,8 @@ pub struct LutLookImport {
     pub supported: usize,
     /// Supported probes whose pre-clip appearance is identifiable.
     pub pre_clip_identified: usize,
+    /// The final refinement stage met its objective and step tolerances.
+    pub converged: bool,
 }
 
 pub fn lut_data_from_cube(cube: &CubeFile) -> Result<LutData> {
@@ -154,7 +160,13 @@ pub fn import_lut_look(
         by_group: report.by_group,
         supported: report.summary.probes,
         pre_clip_identified: report.pre_clip_identified,
+        converged: fitted.converged,
     })
+}
+
+/// The pre-existing LUT publication gate: finite p95 at or below 1.0 ΔE on supported probes.
+pub fn approximation_publishable(report: &DeltaSummary) -> bool {
+    report.probes > 0 && report.p95.is_finite() && report.p95 <= 1.0
 }
 
 /// Support threshold on inherited post-clip σ, in ΔE.
@@ -164,6 +176,7 @@ struct ComposedFit {
     look: looklab_model::Look,
     support: Vec<bool>,
     probes: ProbeUncertainty,
+    converged: bool,
 }
 
 struct ApproximationUncertainty<'a> {
@@ -190,6 +203,7 @@ fn pinned_base_document<'a>(
 struct FitSamples {
     result: looklab_fit::FitResult,
     informative: Vec<Xyz>,
+    encoded: usize,
 }
 
 fn fit_composed(
@@ -203,11 +217,13 @@ fn fit_composed(
     let FitSamples {
         result,
         informative,
+        encoded,
     } = samples;
     let looklab_fit::FitResult {
         mut look,
         realization,
         probes,
+        diagnostics,
         ..
     } = result;
     look.clip = ClipSettings {
@@ -215,11 +231,12 @@ fn fit_composed(
         k: realization.clip_k,
     };
     look.validate()?;
-    let support = probe_support(&informative, points.len(), options.density_floor);
+    let support = probe_support(&informative, encoded, options.density_floor);
     Ok(ComposedFit {
         look,
         support,
         probes,
+        converged: diagnostics.converged,
     })
 }
 
@@ -251,24 +268,12 @@ fn fit_result(
     let mut density = Vec::with_capacity(points.len());
     let mut flags = Vec::with_capacity(points.len());
     let mut informative = Vec::new();
-    let mut neutral_s = Vec::new();
-    let mut neutral_j = Vec::new();
     for xyz in points {
-        let encoded = composed_encoded(lut, definition, base_look, *xyz)?;
-        let input = looklab_model::LookInput::new(*xyz);
-        if input.c_in <= 0.1 {
-            if neutral_s.len() < 3 {
-                eprintln!(
-                    "neutral point y {:.6} s {:.3} encoded {:?} j {:.3}",
-                    xyz.y,
-                    input.s,
-                    encoded,
-                    looklab_ucs(encoded).j
-                );
-            }
-            neutral_s.push(input.s);
-            neutral_j.push(looklab_ucs(encoded).j);
-        }
+        let encoded = match composed_encoded(lut, definition, base_look, *xyz) {
+            Ok(encoded) => encoded,
+            Err(LutLookError::PublishedInverse(_)) => continue,
+            Err(error) => return Err(error),
+        };
         let linear = linear_from_encoded(encoded);
         if [linear.r, linear.g, linear.b]
             .iter()
@@ -281,9 +286,10 @@ fn fit_result(
         density.push(1.0_f32);
         flags.push(SampleFlags::NONE);
     }
+    let encoded = in_rgb.len();
     let samples = SampleSet::new(
         SampleHeader {
-            n: points.len() as u32,
+            n: encoded as u32,
             input_space: InputSpace::CameraRgbWbLinear,
             output_space: OutputSpace::Srgb,
             wb_multipliers: [1.0, 1.0, 1.0],
@@ -328,40 +334,12 @@ fn fit_result(
         recipe_sweeps: 0,
         ..FitOptions::default()
     };
-    let result = match neutral_tone_look(&neutral_s, &neutral_j) {
-        Some(initial) => looklab_fit::fit_with_initial(
-            std::slice::from_ref(&image),
-            &fit_options,
-            &initial,
-        )?,
-        None => fit(std::slice::from_ref(&image), &fit_options)?,
-    };
+    let result = fit(std::slice::from_ref(&image), &fit_options)?;
     Ok(FitSamples {
         result,
         informative,
+        encoded,
     })
-}
-
-/// Starting Look for the seeded fit.
-fn neutral_tone_look(s: &[f64], j_prime: &[f64]) -> Option<looklab_model::Look> {
-    if s.len() < 32 {
-        return None;
-    }
-    let tone = looklab_model::Tone::from_neutral_samples(s, j_prime).ok()?;
-    eprintln!(
-        "seed samples s {:?} j {:?}",
-        s.iter().take(5).collect::<Vec<_>>(),
-        j_prime.iter().take(5).collect::<Vec<_>>()
-    );
-    eprintln!(
-        "seed samples tail s {:?} j {:?}",
-        s.iter().rev().take(5).collect::<Vec<_>>(),
-        j_prime.iter().rev().take(5).collect::<Vec<_>>()
-    );
-    eprintln!("seed tone {tone:?} from {} neutral samples", s.len());
-    let mut look = looklab_model::Look::colorimetric_spline().ok()?;
-    look.tone = tone;
-    Some(look)
 }
 
 /// The composed target appearance of `xyz`, before the output clip.
@@ -381,23 +359,30 @@ fn composed_encoded(
     base_look: Option<&LookDocument>,
     xyz: Xyz,
 ) -> Result<Rgb> {
-    if definition.output != OutputEncoding::Srgb {
+    composed_encoded_parts(
+        lut,
+        &definition.encoding,
+        definition.output,
+        &definition.lut,
+        base_look,
+        xyz,
+    )
+}
+
+fn composed_encoded_parts(
+    lut: &Lut3d,
+    encoding: &DeclaredEncoding,
+    output: OutputEncoding,
+    record: &LutRecord,
+    base_look: Option<&LookDocument>,
+    xyz: Xyz,
+) -> Result<Rgb> {
+    if output != OutputEncoding::Srgb {
         return Err(LutLookError::Unsupported("output encoding"));
     }
-    let input = match &definition.encoding {
+    let input = match encoding {
         DeclaredEncoding::SceneReferred { transfer, gamut } => {
-            if *transfer != looklab_model::LogTransfer::Flog2
-                || *gamut != looklab_model::Gamut::Fgamut
-            {
-                return Err(LutLookError::Unsupported("scene-referred encoding"));
-            }
-            let linear =
-                looklab_color::spaces::fgamut_from_xyz_matrix().mul_vec([xyz.x, xyz.y, xyz.z]);
-            Rgb::new(
-                looklab_color::flog2::encode(linear[0]),
-                looklab_color::flog2::encode(linear[1]),
-                looklab_color::flog2::encode(linear[2]),
-            )
+            scene_referred_encoded(*transfer, *gamut, xyz)?
         }
         DeclaredEncoding::DisplayReferred { base, status } => {
             if !status.is_pinned()
@@ -413,10 +398,63 @@ fn composed_encoded(
             }
         }
     };
-    let code = normalize_domain(input, &definition.lut);
+    let code = normalize_domain(input, record);
     Ok(Rgb::from_array(
         lut.eval(code.to_array(), Interpolation::Tetrahedral),
     ))
+}
+
+fn scene_referred_encoded(transfer: LogTransfer, gamut: Gamut, xyz: Xyz) -> Result<Rgb> {
+    if transfer != LogTransfer::Flog2 || gamut != Gamut::Fgamut {
+        return Err(LutLookError::Unsupported("scene-referred encoding"));
+    }
+    let linear = looklab_color::spaces::fgamut_from_xyz_matrix().mul_vec([xyz.x, xyz.y, xyz.z]);
+    Ok(Rgb::new(
+        looklab_color::flog2::encode(linear[0]),
+        looklab_color::flog2::encode(linear[1]),
+        looklab_color::flog2::encode(linear[2]),
+    ))
+}
+
+/// Composed encoded output of a LUT on an explicit preview baseline.
+pub fn preview_composed_encoded(
+    lut: &Lut3d,
+    encoding: &DeclaredEncoding,
+    output: OutputEncoding,
+    record: &LutRecord,
+    baseline: &BaseReference,
+    base_look: Option<&LookDocument>,
+    xyz: Xyz,
+) -> Result<Rgb> {
+    if output != OutputEncoding::Srgb {
+        return Err(LutLookError::Unsupported("output encoding"));
+    }
+    let input = match encoding {
+        DeclaredEncoding::SceneReferred { transfer, gamut } => {
+            scene_referred_encoded(*transfer, *gamut, xyz)?
+        }
+        DeclaredEncoding::DisplayReferred { .. } => preview_base_encoded(baseline, base_look, xyz)?,
+    };
+    let code = normalize_domain(input, record);
+    Ok(Rgb::from_array(
+        lut.eval(code.to_array(), Interpolation::Tetrahedral),
+    ))
+}
+
+fn preview_base_encoded(
+    base: &BaseReference,
+    base_look: Option<&LookDocument>,
+    xyz: Xyz,
+) -> Result<Rgb> {
+    if is_neutral_baseline(base) {
+        return Ok(neutral_baseline_srgb_v1(
+            RgbSpace::Srgb.xyz_to_rgb_linear(xyz),
+        ));
+    }
+    if matches!(base, BaseReference::Look { .. }) {
+        return base_encoded(base, base_look, xyz);
+    }
+    Err(LutLookError::Unsupported("preview baseline"))
 }
 
 fn base_encoded(base: &BaseReference, base_look: Option<&LookDocument>, xyz: Xyz) -> Result<Rgb> {
@@ -427,7 +465,9 @@ fn base_encoded(base: &BaseReference, base_look: Option<&LookDocument>, xyz: Xyz
     match base {
         BaseReference::Look { .. } => {
             let document = base_look.ok_or(LutLookError::MissingBase)?;
-            let appearance = document.look.eval(xyz);
+            let appearance = checked_appearance(&document.look, xyz)
+                .map_err(LutLookError::PublishedInverse)?
+                .appearance();
             let encoded = document.look.output_encode(appearance, RgbSpace::Srgb);
             let linear = RgbSpace::Srgb.xyz_to_rgb_linear(ucs_to_xyz(encoded));
             Ok(Rgb::new(
@@ -538,8 +578,15 @@ fn approximation_error(
         if !support.get(index).copied().unwrap_or(false) {
             continue;
         }
-        let target = composed_ucs(&lut, definition, base_look, probe.xyz)?;
-        let pre = document.look.eval(probe.xyz);
+        let target = match composed_ucs(&lut, definition, base_look, probe.xyz) {
+            Ok(target) => target,
+            Err(LutLookError::PublishedInverse(_)) => continue,
+            Err(error) => return Err(error),
+        };
+        let pre = match checked_appearance(&document.look, probe.xyz) {
+            Ok(checked) => checked.appearance(),
+            Err(_) => continue,
+        };
         let reliable = match document
             .uncertainty
             .probe_pre_reliable
@@ -620,8 +667,16 @@ pub fn definition_delta(
     let lut_b = lut3d(b)?;
     let mut errors = Vec::new();
     for probe in probes::v1().probes {
-        let ucs_a = composed_ucs(&lut_a, definition_a, base_a, probe.xyz)?;
-        let ucs_b = composed_ucs(&lut_b, definition_b, base_b, probe.xyz)?;
+        let ucs_a = match composed_ucs(&lut_a, definition_a, base_a, probe.xyz) {
+            Ok(value) => value,
+            Err(LutLookError::PublishedInverse(_)) => continue,
+            Err(error) => return Err(error),
+        };
+        let ucs_b = match composed_ucs(&lut_b, definition_b, base_b, probe.xyz) {
+            Ok(value) => value,
+            Err(LutLookError::PublishedInverse(_)) => continue,
+            Err(error) => return Err(error),
+        };
         let dj = ucs_a.j - ucs_b.j;
         let da = ucs_a.a - ucs_b.a;
         let db = ucs_a.b - ucs_b.b;
@@ -695,6 +750,7 @@ fn compose_uncertainty(
     let mut pre_reliable = Vec::with_capacity(count);
     let mut density = Vec::with_capacity(count);
     for (index, probe) in probe_set.probes.iter().enumerate() {
+        let render_feasible = checked_appearance(&document.look, probe.xyz).is_ok();
         let estimate = approximation.probes.probes.get(index);
         let fit_covariance = estimate.and_then(|estimate| {
             covariance_is_finite(estimate.post_covariance).then_some(estimate.post_covariance)
@@ -707,11 +763,12 @@ fn compose_uncertainty(
             .filter(|value| value.is_finite() && *value >= 0.0);
         let inherited = base.and_then(|base| {
             base_probe_covariance(base, index).and_then(|(values, post_clip)| {
+                let checked = checked_appearance(&base.look, probe.xyz).ok()?;
                 let appearance = if post_clip {
                     base.look
-                        .output_encode(base.look.eval(probe.xyz), RgbSpace::Srgb)
+                        .output_encode(checked.appearance(), RgbSpace::Srgb)
                 } else {
-                    base.look.eval(probe.xyz)
+                    checked.appearance()
                 };
                 let encoded = encoded_jacobian(base, appearance, post_clip)?;
                 let encoded_covariance = sandwich(encoded, values)?;
@@ -735,7 +792,8 @@ fn compose_uncertainty(
                 .and_then(|mask| mask.values.get(index))
                 .is_none_or(|value| *value > 0.5)
         });
-        let accepted = known && fit_supported && base_supported && sigma <= support_sigma;
+        let accepted =
+            render_feasible && known && fit_supported && base_supported && sigma <= support_sigma;
         support.push(if accepted { 1.0 } else { 0.0 });
         sigma_post.push(sigma);
         let base_reliable = base.is_none_or(|base| {
@@ -745,7 +803,7 @@ fn compose_uncertainty(
                 .and_then(|values| values.values.get(index))
                 .is_some_and(|value| *value > 0.5)
         });
-        pre_reliable.push(if base_reliable && fit_reliable {
+        pre_reliable.push(if render_feasible && base_reliable && fit_reliable {
             1.0
         } else {
             0.0
@@ -829,16 +887,15 @@ fn encoded_jacobian(
         let mut high = low;
         low[axis] -= COVARIANCE_EPSILON;
         high[axis] += COVARIANCE_EPSILON;
-        let low = encoded_code(
-            base,
-            looklab_color::ucs::Ucs::new(low[0], low[1], low[2]),
-            post_clip,
-        );
-        let high = encoded_code(
-            base,
-            looklab_color::ucs::Ucs::new(high[0], high[1], high[2]),
-            post_clip,
-        );
+        let low = looklab_color::ucs::Ucs::new(low[0], low[1], low[2]);
+        let high = looklab_color::ucs::Ucs::new(high[0], high[1], high[2]);
+        if !post_clip
+            && (check_published_inverse(low).is_err() || check_published_inverse(high).is_err())
+        {
+            return None;
+        }
+        let low = encoded_code(base, low, post_clip);
+        let high = encoded_code(base, high, post_clip);
         if !low.iter().chain(high.iter()).all(|value| value.is_finite()) {
             return None;
         }

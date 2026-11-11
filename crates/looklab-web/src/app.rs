@@ -291,7 +291,7 @@ fn SignInDialog(open: RwSignal<bool>) -> impl IntoView {
     };
     view! {
         <ui::Dialog title="Sign in to looklab".to_owned() open>
-            <p class="muted" hidden=move || !no_platform_store.get()>"This computer can't store passkeys. Your browser will offer to use your phone (scan a QR code) or a security key."</p>
+            <p class="muted" hidden=move || !no_platform_store.get()>{crate::ui::PLATFORM_STORE_UNDETECTED_NOTICE}</p>
             <section class="profile-returning" aria-label="Sign in">
                 <p>"No email or password. Your device keeps a passkey that proves your contributions are yours."</p>
                 <button class="button-primary" disabled=move || busy.get() on:click=move |_| authenticate(SignInAction::Continue)>"Continue with passkey"</button>
@@ -308,7 +308,7 @@ fn SignInDialog(open: RwSignal<bool>) -> impl IntoView {
                 <p id="profile-name-error" class="error" role="alert" hidden=move || name_error.get().is_none()>{move || name_error.get().unwrap_or_default()}</p>
                 <button disabled=move || busy.get() on:click=move |_| authenticate(SignInAction::Create)>"Create a profile"</button>
             </section>
-            <a href=base::site_url("/help/passkeys")>"How this works"</a>
+            <a href=base::site_url("/help/passkeys") on:click=move |_| open.set(false)>"How this works"</a>
             {move || busy.get().then(|| view! {
                 <p role="status">"Follow your browser's passkey prompt."</p>
             })}
@@ -328,14 +328,12 @@ pub(crate) fn MePage() -> impl IntoView {
                 <StatusPage token_override=profile.status_token.as_str().to_owned()/>
                 <crate::pages::match_page::SavedRecipes/>
             }.into_any(),
+            crate::session::SessionState::SignedOut if !session.ready.get() => ui::loading().into_any(),
             crate::session::SessionState::SignedOut => view! {
                 <section class="account-intro">
                     <h1>"Your contributions"</h1>
-                    <p class="lede">"See which photos counted and how they helped build looks. Sign in with your profile, or open your private status link."</p>
+                    <p>"Sign in to see which photos counted and how they helped build looks."</p>
                     <button hidden=!base::server_available() on:click=move |_| session.dialog_open.set(true)>"Sign in"</button>
-                    <p>
-                        <a href=base::site_url("/help/passkeys")>"How sign-in works"</a>
-                    </p>
                 </section>
             }.into_any(),
         }}

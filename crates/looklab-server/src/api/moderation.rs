@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::admin::{self, ModDecision, ModQueue};
 use crate::api::auth;
 use crate::error::{ApiError, ApiResult, ErrorCode};
-use crate::ids::{CredentialId, ProposalId};
+use crate::ids::{ContributionId, CredentialId, ProposalId};
 use crate::rate_limit::Action;
 use crate::state::{AppState, MOD_SESSION_TTL};
 use crate::verify::{RequestDomain, SignedRequestPayload};
@@ -52,7 +52,7 @@ pub async fn session(
 pub async fn queue(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
     let actor = auth::moderator_session(&state, &headers).await?;
     let tier = auth::roles(&state, &actor).await?.tier;
-    let queue: ModQueue = admin::mod_queue(&state.db, tier).await?;
+    let queue: ModQueue = admin::mod_queue(&state.db, tier, state.manuals.catalog()).await?;
     Ok(Json(queue).into_response())
 }
 
@@ -67,6 +67,7 @@ enum ListingAction {
 enum LookAction {
     Listing(ListingAction),
     Revert,
+    ReAnchor,
 }
 
 impl std::str::FromStr for LookAction {
@@ -78,6 +79,7 @@ impl std::str::FromStr for LookAction {
             "remove" => Ok(Self::Listing(ListingAction::Remove)),
             "relist" => Ok(Self::Listing(ListingAction::Relist)),
             "revert" => Ok(Self::Revert),
+            "reanchor" => Ok(Self::ReAnchor),
             _ => Err(()),
         }
     }
@@ -94,7 +96,20 @@ pub struct RevertRequest {
     look: String,
     target_version: u32,
     #[serde(default)]
-    excluded_credentials: Vec<String>,
+    rejected_contributions: Vec<String>,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+pub struct IntakeBlockRequest {
+    credential: String,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+pub struct ReAnchorRequest {
+    look: String,
+    version: u32,
     reason: String,
 }
 
@@ -114,12 +129,11 @@ pub async fn look_listing(
         LookAction::Revert => {
             let request: RevertRequest =
                 serde_json::from_value(payload).map_err(|_| malformed())?;
-            let look = looklab_upload::LookSlug::try_from(request.look)
-                .map_err(|_| malformed())?;
-            let excluded = request
-                .excluded_credentials
+            let look = looklab_upload::LookSlug::try_from(request.look).map_err(|_| malformed())?;
+            let rejected = request
+                .rejected_contributions
                 .iter()
-                .map(|id| CredentialId::try_from(id.as_str()).map_err(|_| malformed()))
+                .map(|id| ContributionId::try_from(id.as_str()).map_err(|_| malformed()))
                 .collect::<Result<Vec<_>, _>>()?;
             let record = admin::revert(
                 &state.db,
@@ -127,7 +141,21 @@ pub async fn look_listing(
                 Actor::Credential(admin::trust_id(&moderator)?),
                 &look,
                 request.target_version,
-                &excluded,
+                &rejected,
+                &request.reason,
+            )
+            .await?;
+            Ok(Json(record).into_response())
+        }
+        LookAction::ReAnchor => {
+            let request: ReAnchorRequest =
+                serde_json::from_value(payload).map_err(|_| malformed())?;
+            let look = looklab_upload::LookSlug::try_from(request.look).map_err(|_| malformed())?;
+            let record = admin::reanchor(
+                &state.db,
+                Actor::Credential(admin::trust_id(&moderator)?),
+                &look,
+                request.version,
                 &request.reason,
             )
             .await?;
@@ -136,8 +164,7 @@ pub async fn look_listing(
         LookAction::Listing(listing) => {
             let request: ListingRequest =
                 serde_json::from_value(payload).map_err(|_| malformed())?;
-            let look = looklab_upload::LookSlug::try_from(request.look)
-                .map_err(|_| malformed())?;
+            let look = looklab_upload::LookSlug::try_from(request.look).map_err(|_| malformed())?;
             let record = match listing {
                 ListingAction::Hide => {
                     admin::hide_look(&state.db, &moderator, &look, &request.reason).await?
@@ -178,4 +205,23 @@ pub async fn decision(
         &payload.reason,
     )
     .await
+}
+
+pub async fn block_intake(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    payload: Result<Json<IntakeBlockRequest>, JsonRejection>,
+) -> ApiResult<Response> {
+    let moderator = auth::moderator_session(&state, &headers).await?;
+    let Json(payload) = payload.map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
+    let credential = CredentialId::try_from(payload.credential.as_str())
+        .map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
+    let record = admin::block_intake(
+        &state.db,
+        Actor::Credential(admin::trust_id(&moderator)?),
+        &credential,
+        &payload.reason,
+    )
+    .await?;
+    Ok(Json(record).into_response())
 }

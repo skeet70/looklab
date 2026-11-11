@@ -10,7 +10,13 @@ use looklab_model::file::{
 };
 use looklab_model::{Look, LookDocument, LookIdentity, LookKind, LookPin, WbPolicy};
 use looklab_publish::{LookListing, LookPage, SiteIndex};
+use looklab_schema::{
+    ArtifactBinding, ArtifactRole, EligibilitySnapshotId, LookId, ModelSubject, PublishedTargetId,
+    Sha256Hex, TargetBasis, TargetEligibility, TargetEligibilityReason, TargetEligibilityStatus,
+    TargetVersion,
+};
 use looklab_server::admin::{self, ManifestArtifact};
+use looklab_server::model_store;
 use looklab_trust::VersionId;
 use looklab_upload::LookSlug;
 use looklab_worker::clock::now_unix;
@@ -24,6 +30,10 @@ const NATIVE: &str = "classic-chrome";
 const MATCHING: &str = "classic-chrome-lut";
 const OTHER: &str = "leica-lut";
 const PREVIEW: &str = "preview-only";
+
+/// Jobs one fixture queue may run before it must settle.
+const DRAIN_JOBS: usize = 64;
+const DRAIN_DEADLINE: Duration = Duration::from_secs(900);
 
 struct Fixture {
     _dir: TempDir,
@@ -59,6 +69,7 @@ impl Fixture {
     async fn worker(&self, site: &Path) -> Worker {
         let mut config = WorkerConfig::new(self.root.join("looklab.sqlite3"), self.blobs.clone());
         config.data = self.data.clone();
+        config.snapshot_dir = self.data.join("community");
         config.transforms = self.root.join("transforms");
         config.site = site.to_owned();
         Worker::open(config).await.expect("worker")
@@ -96,6 +107,7 @@ fn lut_definition(name: &str, emulation: LutEmulation) -> LutDefinition {
             transfer: LogTransfer::Flog2,
             gamut: Gamut::Fgamut,
         },
+        declared_base: None,
         output: OutputEncoding::Srgb,
         lut: LutRecord {
             size: 2,
@@ -154,18 +166,82 @@ fn native_document(maker: &str, name: &str) -> Vec<u8> {
 async fn add_look(fixture: &Fixture, slug: &str, bytes: &[u8]) {
     let sha256 = hex(&Sha256::digest(bytes));
     std::fs::write(fixture.blobs.join(&sha256), bytes).expect("blob");
+    let version = VersionId::new(1);
     admin::write_version_manifest(
         &fixture.pool,
         &LookSlug::try_from(slug.to_owned()).expect("slug"),
-        VersionId::new(1),
+        version,
+        admin::VersionStatus::Published,
         &[ManifestArtifact {
             name: "look.looklab".to_owned(),
-            sha256,
+            sha256: sha256.clone(),
         }],
         &[],
     )
     .await
     .expect("manifest");
+
+    let document = LookDocument::decode(bytes).expect("document");
+    let kind = document.file.look.kind;
+    let look = LookId::new(slug).expect("look");
+    let now = now_unix();
+    let mut conn = fixture.pool.acquire().await.expect("connection");
+    match kind {
+        LookKind::LutDefined => {
+            let matchable = document.is_matchable();
+            model_store::record_target_eligibility(
+                &mut conn,
+                &TargetEligibility {
+                    id: EligibilitySnapshotId::from_digest([0; 32]),
+                    target: PublishedTargetId {
+                        look,
+                        version: TargetVersion::new(version.get()).expect("version"),
+                    },
+                    basis: TargetBasis::LutComposition,
+                    artifacts: vec![ArtifactBinding {
+                        sha256: Sha256Hex::parse(&sha256).expect("digest"),
+                        role: ArtifactRole::Look,
+                    }],
+                    base_pin: None,
+                    support_uncertainty_source: None,
+                    status: if matchable {
+                        TargetEligibilityStatus::Eligible
+                    } else {
+                        TargetEligibilityStatus::Ineligible
+                    },
+                    reasons: if matchable {
+                        Vec::new()
+                    } else {
+                        vec![TargetEligibilityReason::LutImportInvalid]
+                    },
+                    dependencies: Vec::new(),
+                },
+                now,
+            )
+            .await
+            .expect("eligibility");
+        }
+        LookKind::NativeFamily => {
+            let subject = model_store::register_subject(
+                &mut conn,
+                &ModelSubject::SharedFamily { family: look },
+                now,
+            )
+            .await
+            .expect("subject");
+            model_store::record_subject_revision(
+                &mut conn,
+                &subject,
+                version.get(),
+                model_store::SubjectRevisionRole::Target,
+                None,
+                None,
+                now,
+            )
+            .await
+            .expect("target revision");
+        }
+    }
 }
 
 async fn publish(fixture: &Fixture, name: &str) -> (SiteIndex, PathBuf) {
@@ -175,6 +251,8 @@ async fn publish(fixture: &Fixture, name: &str) -> (SiteIndex, PathBuf) {
         db: fixture.root.join("unused.sqlite3"),
         blobs: fixture.blobs.clone(),
         data: fixture.data.clone(),
+        manuals: fixture.data.join("manuals/catalog.yaml"),
+        snapshot_dir: fixture.data.join("community"),
         transforms: fixture.root.join("transforms"),
         out: out.clone(),
     };
@@ -248,7 +326,14 @@ async fn publishing_a_matching_native_look_supersedes_the_lut_and_a_moderator_ca
         .iter()
         .find(|look| look.slug.as_str() == PREVIEW)
         .expect("preview summary");
-    assert!(!preview_summary.latest().expect("version").matchable);
+    let preview_version = preview_summary.latest().expect("version");
+    assert!(!preview_version.matchable);
+    assert!(!preview_version.card_eligible);
+    assert_eq!(
+        preview_version.eligibility_status,
+        Some(TargetEligibilityStatus::Ineligible)
+    );
+    assert!(preview_summary.selected.is_none());
     let superseded = page(&out, MATCHING).expect("lut page");
     assert_eq!(superseded.listing, LookListing::Listed);
     assert_eq!(
@@ -338,7 +423,10 @@ fn read_index(out: &Path) -> SiteIndex {
 
 /// A manifest write queues a LUT rebase job; publication tests settle it first.
 async fn drain_manifest_jobs(worker: &Worker) {
-    worker.run_until_idle().await.expect("manifest jobs");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("manifest jobs");
 }
 
 /// Claims the queued publisher before it takes its snapshot and writes.
@@ -428,7 +516,10 @@ async fn a_superseded_claim_cannot_overwrite_a_newer_publisher() {
     jobs::request_publish(worker.pool(), 0)
         .await
         .expect("publication request");
-    worker.run_until_idle().await.expect("initial publication");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("initial publication");
     assert!(page(&out, OTHER).is_some());
 
     let (stale_job, stale_attempts, _observed) = pause_publisher(&worker).await;
@@ -450,7 +541,13 @@ async fn a_superseded_claim_cannot_overwrite_a_newer_publisher() {
     )
     .await
     .expect("hide");
-    assert_eq!(worker.run_until_idle().await.expect("second publisher"), 1);
+    assert_eq!(
+        worker
+            .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+            .await
+            .expect("second publisher"),
+        1
+    );
     assert!(
         !read_index(&out)
             .looks
@@ -512,6 +609,8 @@ async fn a_second_publisher_waits_for_the_output_lock() {
         db: fixture.root.join("looklab.sqlite3"),
         blobs: fixture.blobs.clone(),
         data: fixture.data.clone(),
+        manuals: fixture.data.join("manuals/catalog.yaml"),
+        snapshot_dir: fixture.data.join("community"),
         transforms: fixture.root.join("transforms"),
         out: out.clone(),
     };
@@ -581,6 +680,8 @@ async fn a_waiting_publisher_leaves_the_current_thread_runtime_free() {
         db: fixture.root.join("unused.sqlite3"),
         blobs: fixture.blobs.clone(),
         data: fixture.data.clone(),
+        manuals: fixture.data.join("manuals/catalog.yaml"),
+        snapshot_dir: fixture.data.join("community"),
         transforms: fixture.root.join("transforms"),
         out: out.clone(),
     };
@@ -655,6 +756,17 @@ async fn a_permanent_publication_failure_waits_for_a_new_request() {
     let out = site.join("data");
     let worker = fixture.worker(&out).await;
     drain_manifest_jobs(&worker).await;
+    let startup_pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs
+         WHERE kind = 'publish_site' AND status IN ('queued', 'running')",
+    )
+    .fetch_one(worker.pool())
+    .await
+    .expect("startup publishers");
+    assert_eq!(
+        startup_pending, 0,
+        "startup assessment and publication work must settle first"
+    );
 
     let blob = fixture.blobs.join(hex(&Sha256::digest(&document)));
     std::fs::write(&blob, b"corrupt").expect("corrupt blob");
@@ -668,19 +780,30 @@ async fn a_permanent_publication_failure_waits_for_a_new_request() {
     for _ in 0..5 {
         assert!(worker.run_once().await.expect("idle").is_none());
     }
-    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'publish_site'")
-        .fetch_one(worker.pool())
-        .await
-        .expect("jobs");
+    let (failed, pending): (i64, i64) = sqlx::query_as(
+        "SELECT
+           COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
+           COALESCE(SUM(CASE WHEN status IN ('queued', 'running') THEN 1 ELSE 0 END), 0)
+         FROM jobs WHERE kind = 'publish_site'",
+    )
+    .fetch_one(worker.pool())
+    .await
+    .expect("publisher jobs");
     assert_eq!(
-        jobs, 1,
+        failed, 1,
+        "a terminal failure must record one failed publisher"
+    );
+    assert_eq!(
+        pending, 0,
         "a terminal failure must not spawn replacement publishers"
     );
-    let (status, attempts): (String, i64) =
-        sqlx::query_as("SELECT status, attempts FROM jobs WHERE kind = 'publish_site'")
-            .fetch_one(worker.pool())
-            .await
-            .expect("job row");
+    let (status, attempts): (String, i64) = sqlx::query_as(
+        "SELECT status, attempts FROM jobs
+         WHERE kind = 'publish_site' AND status = 'failed'",
+    )
+    .fetch_one(worker.pool())
+    .await
+    .expect("failed publisher");
     assert_eq!((status.as_str(), attempts), ("failed", 1));
 
     std::fs::write(&blob, &document).expect("repair blob");
@@ -688,7 +811,10 @@ async fn a_permanent_publication_failure_waits_for_a_new_request() {
         .await
         .expect("repair request");
     assert_eq!(
-        worker.run_until_idle().await.expect("repaired publication"),
+        worker
+            .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+            .await
+            .expect("repaired publication"),
         1
     );
     assert!(page(&out, OTHER).is_some());
@@ -726,7 +852,10 @@ async fn a_hide_during_publication_reaches_the_site_without_another_request() {
     jobs::request_publish(worker.pool(), 0)
         .await
         .expect("publication request");
-    worker.run_until_idle().await.expect("initial publication");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("initial publication");
     assert!(page(&out, OTHER).is_some());
 
     let (job, attempts, observed) = pause_publisher(&worker).await;
@@ -750,7 +879,13 @@ async fn a_hide_during_publication_reaches_the_site_without_another_request() {
             .await
             .expect("complete")
     );
-    assert_eq!(worker.run_until_idle().await.expect("successor"), 1);
+    assert_eq!(
+        worker
+            .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+            .await
+            .expect("successor"),
+        1
+    );
 
     let index = read_index(&out);
     assert!(!index.looks.iter().any(|look| look.slug.as_str() == OTHER));
@@ -784,7 +919,10 @@ async fn a_relist_during_publication_restores_the_site_without_another_request()
     admin::hide_look(worker.pool(), &moderator, &slug, "a rights claim")
         .await
         .expect("hide");
-    worker.run_until_idle().await.expect("initial publication");
+    worker
+        .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+        .await
+        .expect("initial publication");
     assert!(page(&out, OTHER).is_none());
 
     let (job, attempts, observed) = pause_publisher(&worker).await;
@@ -803,7 +941,13 @@ async fn a_relist_during_publication_restores_the_site_without_another_request()
             .await
             .expect("complete")
     );
-    assert_eq!(worker.run_until_idle().await.expect("successor"), 1);
+    assert_eq!(
+        worker
+            .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+            .await
+            .expect("successor"),
+        1
+    );
 
     let index = read_index(&out);
     assert!(index.looks.iter().any(|look| look.slug.as_str() == OTHER));
@@ -830,4 +974,38 @@ async fn credential(db: &SqlitePool) -> looklab_server::CredentialId {
     .await
     .expect("credential");
     id
+}
+
+#[tokio::test]
+async fn a_matchable_lut_without_eligibility_is_not_listed_as_a_target() {
+    let fixture = fixture().await;
+    let bytes = lut_document(
+        OTHER,
+        LutEmulation::FilmStock {
+            name: "Synthetic film".to_owned(),
+        },
+    );
+    assert!(
+        LookDocument::decode(&bytes)
+            .expect("document")
+            .is_matchable()
+    );
+    let sha256 = hex(&Sha256::digest(&bytes));
+    std::fs::write(fixture.blobs.join(&sha256), &bytes).expect("blob");
+    admin::write_version_manifest(
+        &fixture.pool,
+        &LookSlug::try_from(OTHER.to_owned()).expect("slug"),
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &[ManifestArtifact {
+            name: "look.looklab".to_owned(),
+            sha256,
+        }],
+        &[],
+    )
+    .await
+    .expect("manifest");
+    let (index, out) = publish(&fixture, "unassessed-target").await;
+    assert!(!index.looks.iter().any(|look| look.slug.as_str() == OTHER));
+    assert!(page(&out, OTHER).is_none());
 }

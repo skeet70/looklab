@@ -113,6 +113,82 @@ impl<'de> Deserialize<'de> for Region {
     }
 }
 
+/// Chroma at or below which an input is neutral.
+pub const NEUTRAL_CHROMA: f64 = 1e-9;
+
+/// A declared scene cell over the original scene input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SceneCell {
+    Region { region: Region },
+    Neutral { exposure: u8 },
+    OutOfDomain,
+}
+
+impl SceneCell {
+    pub fn from_input(s: f64, chroma: f64, hue: f64) -> Self {
+        if !s.is_finite()
+            || !chroma.is_finite()
+            || !hue.is_finite()
+            || !(EXPOSURE_MIN..=EXPOSURE_MAX).contains(&s)
+        {
+            return Self::OutOfDomain;
+        }
+        let exposure = ((s - EXPOSURE_MIN) / EXPOSURE_STEP)
+            .floor()
+            .clamp(0.0, f64::from(EXPOSURE_CELLS - 1)) as u8;
+        if chroma <= NEUTRAL_CHROMA {
+            return Self::Neutral { exposure };
+        }
+        match Region::from_probe(s, hue) {
+            Ok(region) => Self::Region { region },
+            Err(_) => Self::OutOfDomain,
+        }
+    }
+
+    pub const fn region(self) -> Option<Region> {
+        match self {
+            Self::Region { region } => Some(region),
+            Self::Neutral { .. } | Self::OutOfDomain => None,
+        }
+    }
+}
+
+impl fmt::Display for SceneCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Region { region } => fmt::Display::fmt(region, f),
+            Self::Neutral { exposure } => write!(f, "neutral/e{exposure}"),
+            Self::OutOfDomain => f.write_str("out_of_domain"),
+        }
+    }
+}
+
+impl FromStr for SceneCell {
+    type Err = TrustError;
+
+    fn from_str(text: &str) -> Result<Self> {
+        if text == "out_of_domain" {
+            return Ok(Self::OutOfDomain);
+        }
+        if let Some(exposure) = text.strip_prefix("neutral/e") {
+            let exposure = exposure
+                .parse()
+                .map_err(|_| TrustError::InvalidId(text.to_owned()))?;
+            if exposure >= EXPOSURE_CELLS {
+                return Err(TrustError::InvalidRegion {
+                    hue: HUE_CELLS,
+                    exposure,
+                });
+            }
+            return Ok(Self::Neutral { exposure });
+        }
+        Ok(Self::Region {
+            region: text.parse()?,
+        })
+    }
+}
+
 /// An image's share of its samples per region. Shares sum to 1.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RegionCoverage(std::collections::BTreeMap<Region, f64>);

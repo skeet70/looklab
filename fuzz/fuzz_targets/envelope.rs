@@ -9,6 +9,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(envelope) = parse_envelope_strict(data, &Limits::default()) {
         let bytes = encode_envelope(&EnvelopeParts {
             nonce: envelope.nonce,
+            send_manifest: &envelope.send_manifest,
             manifest: &envelope.manifest,
             assertion: &envelope.assertion,
             pow: &envelope.pow,

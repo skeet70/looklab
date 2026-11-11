@@ -3,9 +3,10 @@
 use looklab_color::linalg::Mat3;
 use looklab_prep::PrepParams;
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, Challenge, CommunitySnapshotVersion, ContributionKind,
-    ControlSettings, FirmwareVersionString, Intent, Limits, ManifestHash, ManifestMetadata, Nonce,
-    POW_K, SimKey,
+    AttestationHash, BatchManifest, BlobKind, BodyId, Challenge, CommunitySnapshotVersion,
+    ContributionKind, ControlSettings, FirmwareVersionString, Intent, Limits, ManifestHash,
+    ManifestMetadata, MonochromeAuthorization, Nonce, POW_K, RenderClass, SendManifest,
+    SendManifestHash, SimKey,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +34,7 @@ pub struct PrepareRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AlignmentSummary {
     pub correlation: f64,
+    /// Median block shift in original RAW pixels.
     pub residual_px: f64,
 }
 
@@ -62,6 +64,8 @@ pub struct ManifestImageInput {
 pub struct BuildManifestRequest {
     pub kind: ContributionKind,
     pub intent: Intent,
+    pub render_class: RenderClass,
+    pub monochrome_authorization: Option<MonochromeAuthorization>,
     pub body: BodyId,
     pub firmware: FirmwareVersionString,
     pub sim: SimKey,
@@ -78,6 +82,21 @@ pub struct BuildManifestResponse {
     pub challenge: Challenge,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BuildSendManifestRequest {
+    pub nonce: Nonce,
+    pub manifest_hashes: Vec<ManifestHash>,
+    #[serde(default)]
+    pub attestation_hashes: Vec<AttestationHash>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildSendManifestResponse {
+    pub send_manifest_bytes: Vec<u8>,
+    pub send_manifest_hash: SendManifestHash,
+    pub challenge: Challenge,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssertionFields {
     pub credential_id: Vec<u8>,
@@ -89,6 +108,7 @@ pub struct AssertionFields {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EncodeEnvelopeRequest {
     pub nonce: Nonce,
+    pub send_manifest_bytes: Vec<u8>,
     pub manifest_bytes: Vec<u8>,
     pub assertion: AssertionFields,
     pub pow: [u64; POW_K],
@@ -100,6 +120,7 @@ pub struct EncodeEnvelopeRequest {
 pub struct EncodeEnvelopeResponse {
     pub envelope: Vec<u8>,
     pub manifest_hash: ManifestHash,
+    pub send_manifest_hash: SendManifestHash,
     pub challenge: Challenge,
 }
 
@@ -141,6 +162,9 @@ pub struct BlobSummary {
 pub struct ParseEnvelopeResponse {
     pub body_bytes: u64,
     pub nonce: Nonce,
+    pub send_manifest: SendManifest,
+    pub send_manifest_bytes: Vec<u8>,
+    pub send_manifest_hash: SendManifestHash,
     pub manifest: BatchManifest,
     pub manifest_bytes: Vec<u8>,
     pub manifest_hash: ManifestHash,
@@ -162,11 +186,21 @@ pub struct VersionResponse {
     pub build_id: [u8; 32],
 }
 
+impl VersionResponse {
+    /// Whether this reply describes the module this build produces.
+    pub fn matches_current(&self) -> bool {
+        self.module_abi_version == crate::MODULE_ABI_VERSION
+            && self.prep_version == crate::PREP_VERSION
+            && self.build_id == crate::build_id()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Response {
     Version(VersionResponse),
     Prepare(PrepareResponse),
     BuildManifest(BuildManifestResponse),
+    BuildSendManifest(BuildSendManifestResponse),
     EncodeEnvelope(EncodeEnvelopeResponse),
     SolvePow(SolvePowResponse),
     ParseEnvelope(Box<ParseEnvelopeResponse>),

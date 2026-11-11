@@ -316,24 +316,48 @@ fn bitid() -> Result<()> {
     let mut rows = Vec::new();
     let mut failures = Vec::new();
     for example in &examples {
-        let packages = ["-p", example.package.as_str()].map(str::to_string);
+        let packages = vec!["-p".to_string(), example.package.clone()];
         let stem = example.stem.as_str();
 
-        let mut build = cargo(&root);
-        build
-            .args(["build", "--quiet", "--release", "--example", stem])
-            .args(packages.iter().map(String::as_str));
-        run_status(
-            &mut build,
-            &format!("building {}/{} for the host", example.package, example.stem),
-        )?;
-        let mut run = cargo(&root);
-        run.args(["run", "--quiet", "--release", "--example", stem])
-            .args(packages.iter().map(String::as_str));
-        let native = run_capture(
-            &mut run,
-            &format!("running {}/{} natively", example.package, example.stem),
-        )?;
+        // The worker's feature set is fixed; the minimal and workspace-unified
+        // native selections bracket what a native build can get.
+        let mut native_outputs = Vec::new();
+        for (label, selection) in [
+            ("workspace", vec!["--workspace".to_string()]),
+            ("package", packages.clone()),
+        ] {
+            let mut build = cargo(&root);
+            build
+                .args(["build", "--quiet", "--release", "--example", stem])
+                .args(selection.iter().map(String::as_str));
+            run_status(
+                &mut build,
+                &format!(
+                    "building {}/{} for the host ({label})",
+                    example.package, example.stem
+                ),
+            )?;
+            let mut run = Command::new(target_dir.join("release").join("examples").join(stem));
+            native_outputs.push(run_capture(
+                &mut run,
+                &format!(
+                    "running {}/{} natively ({label})",
+                    example.package, example.stem
+                ),
+            )?);
+        }
+        let native = &native_outputs[0];
+        if native_outputs[0] != native_outputs[1] {
+            failures.push(format!(
+                "{}/{}: native workspace and package selections differ at {}",
+                example.package,
+                example.stem,
+                first_difference(
+                    &native_outputs[0].lines().collect::<Vec<_>>(),
+                    &native_outputs[1].lines().collect::<Vec<_>>()
+                )
+            ));
+        }
 
         let mut build = cargo(&root);
         build

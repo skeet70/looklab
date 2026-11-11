@@ -19,6 +19,9 @@ pub enum SessionState {
 pub struct SessionContext {
     pub state: RwSignal<SessionState>,
     pub dialog_open: RwSignal<bool>,
+    /// False until the stored token has been checked, or an explicit sign-in or
+    /// sign-out supersedes that check.
+    pub ready: RwSignal<bool>,
     generation: RwSignal<u64>,
     waiters: StoredValue<Vec<js_sys::Function>, LocalStorage>,
 }
@@ -27,6 +30,7 @@ pub fn provide_session() -> SessionContext {
     let context = SessionContext {
         state: RwSignal::new(SessionState::SignedOut),
         dialog_open: RwSignal::new(false),
+        ready: RwSignal::new(false),
         generation: RwSignal::new(0),
         waiters: StoredValue::new_local(Vec::new()),
     };
@@ -54,6 +58,7 @@ pub fn provide_session() -> SessionContext {
         {
             context.state.set(SessionState::SignedIn(session));
         }
+        context.ready.set(true);
     });
     context
 }
@@ -67,7 +72,7 @@ impl SessionContext {
         matches!(self.state.get(), SessionState::SignedIn(session) if session.tier == SessionTier::Seeder || session.roles.iter().any(|role| matches!(role, SessionRole::Moderator | SessionRole::Admin)))
     }
     pub async fn set_signed_in(self, session: Session) -> Result<(), String> {
-        self.generation.update(|generation| *generation += 1);
+        self.supersede_restore();
         idb::put(idb::StorageKey::STATUS_TOKEN, session.status_token.as_str()).await?;
         self.apply_signed_in(session);
         Ok(())
@@ -78,7 +83,7 @@ impl SessionContext {
         {
             return self.set_signed_in(session).await;
         }
-        self.generation.update(|generation| *generation += 1);
+        self.supersede_restore();
         idb::put_and_remove_atomically(
             idb::StorageKey::STATUS_TOKEN,
             session.status_token.as_str(),
@@ -89,6 +94,11 @@ impl SessionContext {
         Ok(())
     }
 
+    fn supersede_restore(self) {
+        self.generation.update(|generation| *generation += 1);
+        self.ready.set(true);
+    }
+
     fn apply_signed_in(self, session: Session) {
         crate::data::close_moderation_session();
         self.state.set(SessionState::SignedIn(session));
@@ -96,7 +106,7 @@ impl SessionContext {
     }
 
     pub async fn sign_out(self) -> Result<(), String> {
-        self.generation.update(|generation| *generation += 1);
+        self.supersede_restore();
         crate::data::close_moderation_session();
         idb::remove(idb::StorageKey::STATUS_TOKEN).await?;
         idb::remove(idb::StorageKey::SESSION).await?;

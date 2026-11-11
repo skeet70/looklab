@@ -88,10 +88,12 @@ fn main() {
 
     for sample in 0..SAMPLES {
         let y = rng.range(0.005, 4.0);
-        let xyz = if sample % 4 == 0 {
-            let white = looklab_model::solve::reference_white();
+        let white = looklab_model::solve::reference_white();
+        let xyz = if sample % 8 == 0 {
+            white.scale(y)
+        } else if sample % 4 == 0 {
             let angle = 2.0 * core::f64::consts::PI * rng.unit();
-            let radius = rng.range(0.0, 0.05);
+            let radius = 0.6 * rng.unit() * rng.unit();
             Xyz::new(
                 y * (white.x + radius * libm::cos(angle)),
                 y,

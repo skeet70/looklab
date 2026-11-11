@@ -1,0 +1,204 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: fujifilm/x-t1
+  make: Fujifilm
+  model: X-T1
+  sources:
+  - id: xt1-manual
+    kind: owner_manual
+    url: https://dl.fujifilm-x.com/support/manual/x/fujifilm_xt1_manual_en.pdf
+    title: FUJIFILM X-T1 Owner's Manual
+    edition: BL04701-101 EN
+    firmware_scope: unspecified
+  - id: xt1-firmware
+    kind: firmware_notes
+    url: https://fujifilm-x.com/en-us/support/download/firmware/cameras/x-t1/
+    title: X-T1 Firmware update
+    edition: web edition, accessed 2026-11-08
+    firmware_scope: '5.52'
+  capabilities:
+  - key: native_simulations
+    label: FILM SIMULATION
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - PROVIA/STANDARD
+      - Velvia/VIVID
+      - ASTIA/SOFT
+      - CLASSIC CHROME
+      - PRO Neg. Hi
+      - PRO Neg. Std
+      - MONOCHROME
+      - MONOCHROME+Ye
+      - MONOCHROME+R
+      - MONOCHROME+G
+      - SEPIA
+    citations:
+    - source: xt1-manual
+      locator: p. 42 (PDF 58), Film Simulation
+    - source: xt1-firmware
+      locator: Ver. 3.00, Classic Chrome Film Simulation mode
+  - key: jpeg_quality
+    label: IMAGE QUALITY
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - FINE
+      - NORMAL
+      - RAW
+      - FINE+RAW
+      - NORMAL+RAW
+    citations:
+    - source: xt1-manual
+      locator: p. 79 (PDF 95), IMAGE QUALITY
+  - key: raw_capture
+    label: RAW RECORDING
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: xt1-manual
+      locator: p. 79 (PDF 95), IMAGE QUALITY (no RAW compression option documented)
+  - key: heif_capture
+    label: HEIF
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: xt1-manual
+      locator: p. 79 (PDF 95), IMAGE QUALITY
+    notes: No HEIF option appears in the documented image-quality formats.
+  - key: in_camera_raw_conversion
+    label: RAW CONVERSION
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: xt1-manual
+      locator: p. 70 (PDF 86), Creating JPEG Copies of RAW Pictures
+  - key: jpeg_color_spaces
+    label: COLOR SPACE
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - Adobe RGB
+    citations:
+    - source: xt1-manual
+      locator: p. 93 (PDF 109), COLOR SPACE
+  - key: white_balance_presets
+    label: WHITE BALANCE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - CUSTOM 1
+      - CUSTOM 2
+      - CUSTOM 3
+      - COLOR TEMPERATURE
+      - DAYLIGHT
+      - SHADE
+      - FLUORESCENT LIGHT-1
+      - FLUORESCENT LIGHT-2
+      - FLUORESCENT LIGHT-3
+      - INCANDESCENT
+      - UNDERWATER
+    citations:
+    - source: xt1-manual
+      locator: p. 43 (PDF 59), White Balance
+    - source: xt1-firmware
+      locator: Ver. 3.00, Three Custom White Balance (CUSTOM WHITE BALANCE expanded from one to three)
+  - key: white_balance_shift
+    label: WB SHIFT
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: R
+      - label: B
+    citations:
+    - source: xt1-manual
+      locator: p. 43 (PDF 59), WB SHIFT fine-tuning dialog
+    notes: Two-axis fine-tuning dialog; the rendered dialog figure shows the grid and current R/B values without numeric limits.
+  - key: dynamic_range
+    label: DYNAMIC RANGE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - 100%
+      - 200%
+      - 400%
+    citations:
+    - source: xt1-manual
+      locator: p. 79 (PDF 95), DYNAMIC RANGE
+    notes: 200% requires ISO 400 or above; 400% requires ISO 800 or above. AUTO selects 100% or 200%.
+  - key: highlight_tone
+    label: HIGHLIGHT TONE
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xt1-manual
+      locator: p. 80 (PDF 96), HIGHLIGHT TONE and SHADOW TONE
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: shadow_tone
+    label: SHADOW TONE
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xt1-manual
+      locator: p. 80 (PDF 96), HIGHLIGHT TONE and SHADOW TONE
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: saturation
+    label: COLOR
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xt1-manual
+      locator: p. 80 (PDF 96), COLOR
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: sharpening
+    label: SHARPNESS
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xt1-manual
+      locator: p. 80 (PDF 96), SHARPNESS
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: noise_reduction
+    label: NOISE REDUCTION
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: xt1-manual
+      locator: p. 80 (PDF 96), NOISE REDUCTION
+    notes: No numeric range printed; the rendered manual page was inspected.
+  notes:
+  - Manual predates CLASSIC CHROME; firmware Ver. 3.00 adds it (X-T1 Graphite Silver Edition at Ver. 2.00).
+  - Firmware Ver. 3.00 expands CUSTOM WHITE BALANCE from one slot to three.

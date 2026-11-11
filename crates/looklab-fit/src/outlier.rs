@@ -107,7 +107,7 @@ fn reason_for(problem: &Problem, pass: &PassOutput, image: usize) -> OutlierReas
             sum_a += w * residual[1];
             sum_b += w * residual[2];
             weight += w;
-            let target = problem.samples[index].target;
+            let target = problem.samples[index].target.ucs;
             let squared =
                 residual[0] * residual[0] + residual[1] * residual[1] + residual[2] * residual[2];
             if target.j > 80.0 {

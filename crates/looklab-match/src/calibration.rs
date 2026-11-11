@@ -38,7 +38,9 @@ pub struct ControlScale {
 
 impl Calibration {
     pub fn is_empty(&self) -> bool {
-        self.sims.is_empty()
+        self.sims
+            .iter()
+            .all(|entry| entry.controls.iter().all(|scale| scale.factor == 1.0))
     }
 
     /// # Errors
@@ -71,6 +73,8 @@ impl Calibration {
                     }),
                 }
             }
+        }
+        for entry in &mut next.sims {
             entry.controls.retain(|scale| scale.factor != 1.0);
         }
         next.sims.retain(|entry| !entry.controls.is_empty());
@@ -179,12 +183,13 @@ impl Calibration {
         let mut calibration = Self {
             sims: sims
                 .into_iter()
-                .map(|(sim, controls)| SimCalibration {
-                    sim,
-                    controls: controls
+                .filter_map(|(sim, controls)| {
+                    let controls: Vec<ControlScale> = controls
                         .into_iter()
+                        .filter(|(_, factor)| *factor != 1.0)
                         .map(|(control, factor)| ControlScale { control, factor })
-                        .collect(),
+                        .collect();
+                    (!controls.is_empty()).then_some(SimCalibration { sim, controls })
                 })
                 .collect(),
         };

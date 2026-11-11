@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde::de::value::SeqAccessDeserializer;
 use serde::de::{self, Visitor};
 
-use crate::ids::{ControlKey, EnumValue};
+use crate::ids::{ControlKey, EnumValue, LookId};
 use crate::makernote::ControlMakernote;
 use crate::rational::Rational;
 
@@ -136,7 +136,7 @@ pub enum ScalarValue {
 }
 
 impl ScalarValue {
-    pub(crate) fn from_raw(value: &str) -> Self {
+    pub fn from_raw(value: &str) -> Self {
         match value {
             "true" | "True" | "TRUE" => Self::Bool(true),
             "false" | "False" | "FALSE" => Self::Bool(false),
@@ -158,6 +158,51 @@ impl<'de> Deserialize<'de> for ScalarValue {
 pub enum Tolerated {
     Any,
     Values(Vec<ScalarValue>),
+}
+
+/// The render families a control applies to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ControlScope {
+    #[default]
+    All,
+    Families(Vec<LookId>),
+}
+
+impl ControlScope {
+    pub fn includes(&self, family: &LookId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Families(families) => families.iter().any(|candidate| candidate == family),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ControlScope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ControlScopeVisitor)
+    }
+}
+
+struct ControlScopeVisitor;
+
+impl<'de> Visitor<'de> for ControlScopeVisitor {
+    type Value = ControlScope;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("`all` or a list of look families")
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        if value == "all" {
+            Ok(ControlScope::All)
+        } else {
+            Err(E::custom("expected `all` or a list of look families"))
+        }
+    }
+
+    fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+        Vec::<LookId>::deserialize(SeqAccessDeserializer::new(seq)).map(ControlScope::Families)
+    }
 }
 
 impl<'de> Deserialize<'de> for Tolerated {
@@ -218,6 +263,7 @@ pub struct Control {
     pub tolerated: Option<Tolerated>,
     pub constraints: Option<Constraints>,
     pub makernote: Option<ControlMakernote>,
+    pub scope: ControlScope,
 }
 
 fn empty_steps() -> core::ops::RangeInclusive<i64> {

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Offline admin path for bootstrap grants ([docs/05 §3]).
+//! Offline admin path for grants and Look anchors.
 
 use std::path::PathBuf;
 
@@ -23,6 +23,8 @@ enum AdminCommand {
     Revoke(RevokeArgs),
     /// List every grant, including revoked ones.
     List(ListArgs),
+    /// Start a Look's cumulative anchor at a released version.
+    ReAnchor(ReAnchorArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -84,6 +86,18 @@ struct ListArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct ReAnchorArgs {
+    #[arg(long)]
+    db: PathBuf,
+    #[arg(long)]
+    look: String,
+    #[arg(long)]
+    version: u32,
+    #[arg(long)]
+    reason: String,
+}
+
 pub fn run(args: &AdminArgs) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -97,6 +111,7 @@ async fn run_async(args: &AdminArgs) -> Result<()> {
         AdminCommand::Grant(args) => grant(args).await,
         AdminCommand::Revoke(args) => revoke(args).await,
         AdminCommand::List(args) => list(args).await,
+        AdminCommand::ReAnchor(args) => reanchor(args).await,
     }
 }
 
@@ -171,6 +186,19 @@ async fn revoke(args: &RevokeArgs) -> Result<()> {
     )
     .await?;
     println!("revoked {} ({})", record.grant_name(), record.id);
+    Ok(())
+}
+
+async fn reanchor(args: &ReAnchorArgs) -> Result<()> {
+    let db = open(&args.db).await?;
+    let look = LookSlug::try_from(args.look.as_str())
+        .with_context(|| format!("{} is not a look slug", args.look))?;
+    let record =
+        looklab_server::admin::reanchor(&db, Actor::Cli, &look, args.version, &args.reason).await?;
+    println!(
+        "anchored {} at version {} ({})",
+        record.look, record.version, record.reason
+    );
     Ok(())
 }
 

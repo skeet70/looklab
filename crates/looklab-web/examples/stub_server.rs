@@ -25,7 +25,6 @@ const POW_DIFFICULTY: f64 = 0.0;
 
 struct Stub {
     dist: PathBuf,
-    origin: String,
     server: Arc<AppState>,
     server_routes: Router,
 }
@@ -83,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         origin: origin.clone(),
         server_secret_path: secret_path,
         bodies_dir: PathBuf::from("data/bodies"),
+        manuals_dir: PathBuf::from("data/manuals"),
         snapshot_dir,
         nonce_ttl: Duration::from_secs(3600),
         registration_ttl: Duration::from_secs(3600),
@@ -102,7 +102,6 @@ async fn main() -> anyhow::Result<()> {
     println!("stub listening on {origin}");
     let stub = Arc::new(Stub {
         dist,
-        origin,
         server,
         server_routes,
     });
@@ -144,7 +143,10 @@ async fn site_root(State(stub): State<Arc<Stub>>) -> Response {
             "root": looklab_publish::ArtifactHash::of(&bytes).as_str(),
         }))
         .into_response(),
-        Err(_) => error_response(StatusCode::SERVICE_UNAVAILABLE, "site data is not published"),
+        Err(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "site data is not published",
+        ),
     }
 }
 
@@ -236,15 +238,23 @@ async fn serve_asset(stub: &Stub, uri: &Uri) -> Response {
     } else {
         stub.dist.join(requested)
     };
-    let file = if candidate.is_file() {
-        candidate
-    } else {
-        stub.dist.join("index.html")
-    };
-    match std::fs::read(&file) {
+    if candidate.is_file() {
+        return asset_response(&candidate);
+    }
+    if requested.is_empty()
+        || requested.starts_with("data/")
+        || Path::new(requested).extension().is_some()
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    asset_response(&stub.dist.join("index.html"))
+}
+
+fn asset_response(file: &Path) -> Response {
+    match std::fs::read(file) {
         Ok(bytes) => (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, content_type(&file))],
+            [(header::CONTENT_TYPE, content_type(file))],
             bytes,
         )
             .into_response(),

@@ -19,17 +19,26 @@ use looklab_samples::{
     PrepVersion, PriorTransformVersion, RerenderGroupId, SampleFlags, SampleHeader, SampleSet,
 };
 use looklab_schema::{
-    Date, FixtureDonation, FixtureLicense, FixtureUpload, LabeledTag, MakernoteValue, Placement,
-    Sha256Hex, frame_fixture_upload,
+    Availability, CapabilityDomain, CapabilityKey, ConfirmationScope, ControlObservation, Date,
+    Finding, FixtureDonation, FixtureLicense, FixtureUpload, LabeledTag, MakernoteValue,
+    ManualCamera, ManualConfirmation, ManualUrl, ModeratorEvidence, ModeratorEvidenceKind,
+    ModeratorFirmwareScope, Placement, ProposalKind, ReportedFirmware, Sha256Hex,
+    frame_fixture_upload, frame_lut_proposal, validate_manual_catalog,
 };
+use looklab_server::body_schema::Bodies;
 use looklab_server::{AppState, Config, PowConfig, router};
 use looklab_upload::{
-    BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion,
-    ContributionKind, ControlEntry, ControlKey, ControlSettings, EnvelopeParts,
-    FirmwareVersionString, Intent, Limits, ManifestHash, ManifestImage, ManifestMetadata, Nonce,
-    PowParams, PowSolutions, RawSerial, SerialHmacKey, SettingSource, SimKey, StepIndex,
-    WebAuthnAssertion, encode_envelope, manifest_hash, parse_render_tag, solve,
+    AttestationHash, BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge,
+    CommunitySnapshotVersion, ContributionKind, ControlEntry, ControlKey, ControlSettings,
+    EnvelopeParts, FirmwareVersionString, Intent, Limits, ManifestHash, ManifestImage,
+    ManifestMetadata, ManualConfirmationRequest, ManualModeration, ManualWithdrawalRequest,
+    MonochromeAuthorization, Nonce, PowParams, PowSolutions, RawSerial, RenderClass,
+    SEND_MANIFEST_VERSION, SendManifest, SerialHmacKey, SettingSource, SimKey, StepIndex,
+    WebAuthnAssertion, canonical_send_manifest_bytes, encode_envelope, manifest_hash,
+    parse_render_tag, send_manifest_hash, solve,
 };
+use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+use p256::elliptic_curve::point::AffineCoordinates;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::SqliteConnectOptions;
@@ -102,8 +111,24 @@ impl TestServer {
     }
 
     async fn start_with_community(build: impl FnOnce(&Path)) -> Self {
-        let _ = logs();
         let dir = tempfile::tempdir().expect("temp dir");
+        let bodies = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies");
+        Self::start_in(dir, bodies, build).await
+    }
+
+    /// Serves a copy of the shipped documents, so a test can add one after a snapshot exists.
+    async fn start_with_shipped_copy() -> Self {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let data = dir.path().join("data");
+        for sub in ["bodies", "interfaces"] {
+            copy_shipped_documents(&shipped.join(sub), &data.join(sub));
+        }
+        Self::start_in(dir, data.join("bodies"), |_| {}).await
+    }
+
+    async fn start_in(dir: TempDir, bodies_dir: PathBuf, build: impl FnOnce(&Path)) -> Self {
+        let _ = logs();
         let secret = dir.path().join("server-secret");
         std::fs::write(&secret, [9u8; 32]).expect("write secret");
         let community = dir.path().join("community");
@@ -115,7 +140,8 @@ impl TestServer {
             rp_id: RP_ID.to_owned(),
             origin: ORIGIN.to_owned(),
             server_secret_path: secret,
-            bodies_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies"),
+            bodies_dir: bodies_dir.clone(),
+            manuals_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/manuals"),
             snapshot_dir: community,
             nonce_ttl: Duration::from_secs(300),
             registration_ttl: Duration::from_secs(300),
@@ -133,11 +159,28 @@ impl TestServer {
                 max_manifest_bytes: 1 << 16,
                 max_images: 8,
                 max_blob_bytes: 1 << 16,
+                max_batches: 8,
+                max_attestations: 8,
             },
         };
         let db_path = config.db_path.clone();
         let blob_dir = config.blob_dir.clone();
         let state = Arc::new(AppState::new(config).await.expect("state"));
+        if let Some(version) = highest_snapshot(&state.config.snapshot_dir) {
+            sqlx::query(
+                "INSERT INTO community_snapshot_activation
+                 (id, version, content_hash, activated_at)
+                 VALUES (1, ?, ?, 0)",
+            )
+            .bind(i64::try_from(version).expect("snapshot version"))
+            .bind("0".repeat(64))
+            .execute(&state.db)
+            .await
+            .expect("fixture activation");
+            *state.bodies.write().await =
+                Bodies::load_active(&bodies_dir, &state.config.snapshot_dir, Some(version))
+                    .expect("fixture bodies");
+        }
         let app = router(state.clone());
         let db = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&db_path))
             .await
@@ -271,6 +314,14 @@ impl TestServer {
         })
     }
 
+    async fn withdrawal_request(&mut self, camera: &BodyId) -> ManualWithdrawalRequest {
+        let mut signed = self
+            .signed_fields("withdraw-manual-confirmation", camera.as_str().as_bytes())
+            .await;
+        signed["camera"] = json!(camera.as_str());
+        serde_json::from_value(signed).expect("withdrawal request")
+    }
+
     async fn post_signed(
         &mut self,
         path: &str,
@@ -286,16 +337,7 @@ impl TestServer {
     }
 
     async fn upload_bytes(&self, bytes: Vec<u8>) -> (StatusCode, Value) {
-        let length = bytes.len();
-        let request = Request::builder()
-            .method("POST")
-            .uri("/api/upload")
-            .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header(header::CONTENT_LENGTH, length)
-            .body(Body::from(bytes))
-            .expect("request");
-        let (status, _, body) = send(&self.app, request).await;
-        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+        upload_request(&self.app, bytes).await
     }
 
     async fn upload_valid(&mut self, serial: Option<&RawSerial>) -> (StatusCode, Value) {
@@ -310,23 +352,17 @@ impl TestServer {
         serial: Option<&RawSerial>,
     ) -> (StatusCode, Value) {
         let nonce = self.nonce().await;
-        let challenge = Challenge::new(&nonce, &manifest_hash(manifest));
+        let pow_challenge = Challenge::new(&nonce, &manifest_hash(manifest));
+        let challenge = send_challenge(&nonce, manifest);
         let assertion = self.assertion(&challenge).await;
         let pow = solve(
-            &challenge,
+            &pow_challenge,
             u32::try_from(manifest.images.len()).expect("image count"),
             &pow_params(),
             0,
         )
         .expect("proof-of-work");
-        let bytes = encode_envelope(&EnvelopeParts {
-            nonce,
-            manifest,
-            assertion: &assertion,
-            pow: &pow,
-            serial,
-            blobs,
-        });
+        let bytes = envelope(nonce, manifest, blobs, serial, &assertion, &pow);
         self.upload_bytes(bytes).await
     }
 
@@ -366,6 +402,7 @@ async fn nonce_advertises_the_configured_parent_rp_id() {
         origin: "https://photos.looklab.example".to_owned(),
         server_secret_path: secret,
         bodies_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies"),
+        manuals_dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/manuals"),
         snapshot_dir: dir.path().join("community"),
         nonce_ttl: Duration::from_secs(300),
         registration_ttl: Duration::from_secs(300),
@@ -383,6 +420,8 @@ async fn nonce_advertises_the_configured_parent_rp_id() {
             max_manifest_bytes: 1 << 16,
             max_images: 8,
             max_blob_bytes: 1 << 16,
+            max_batches: 8,
+            max_attestations: 8,
         },
     };
     let state = Arc::new(AppState::new(config).await.expect("state"));
@@ -460,12 +499,52 @@ async fn send(app: &Router, request: Request<Body>) -> (StatusCode, HeaderMap, B
     (status, headers, body)
 }
 
+async fn upload_request(app: &Router, bytes: Vec<u8>) -> (StatusCode, Value) {
+    let length = bytes.len();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/upload")
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, length)
+        .body(Body::from(bytes))
+        .expect("request");
+    let (status, _, body) = send(app, request).await;
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
 async fn post_json(app: &Router, path: &str, value: &Value) -> (StatusCode, Value) {
     let request = Request::builder()
         .method("POST")
         .uri(path)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_vec(value).expect("json")))
+        .expect("request");
+    let (status, _, body) = send(app, request).await;
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+async fn post_confirmation(
+    app: &Router,
+    request: &ManualConfirmationRequest,
+) -> (StatusCode, Value) {
+    post_canonical(app, "/api/manual-confirmations", request.canonical_bytes()).await
+}
+
+async fn post_withdrawal(app: &Router, request: &ManualWithdrawalRequest) -> (StatusCode, Value) {
+    post_canonical(
+        app,
+        "/api/manual-confirmations/withdraw",
+        request.canonical_bytes(),
+    )
+    .await
+}
+
+async fn post_canonical(app: &Router, path: &str, body: Vec<u8>) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
         .expect("request");
     let (status, _, body) = send(app, request).await;
     (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
@@ -625,14 +704,36 @@ fn declared(key: &str, step: i64) -> ControlEntry {
     entry(key, step, SettingSource::Declared)
 }
 
-fn monochrome_look() -> looklab_upload::LookSettings {
+fn typed_monochrome_look(raw: i64) -> looklab_upload::LookSettings {
+    looklab_upload::LookSettings {
+        saturation: Some(looklab_upload::Tagged {
+            raw,
+            value: Some(looklab_upload::Saturation::Acros(
+                looklab_upload::MonochromeFilter::NoFilter,
+            )),
+        }),
+        ..looklab_upload::LookSettings::default()
+    }
+}
+
+fn mismatched_monochrome_look(raw: i64) -> looklab_upload::LookSettings {
+    looklab_upload::LookSettings {
+        saturation: Some(looklab_upload::Tagged {
+            raw,
+            value: Some(looklab_upload::Saturation::Step(0)),
+        }),
+        ..looklab_upload::LookSettings::default()
+    }
+}
+
+fn monochrome_look(saturation: i64) -> looklab_upload::LookSettings {
     looklab_upload::LookSettings {
         film_mode: Some(looklab_upload::Tagged {
             raw: 0x0000,
             value: None,
         }),
         saturation: Some(looklab_upload::Tagged {
-            raw: 0x0500,
+            raw: saturation,
             value: None,
         }),
         ..looklab_upload::LookSettings::default()
@@ -649,6 +750,23 @@ fn valid_settings() -> ControlSettings {
         ("shadow_tone", 0),
         ("wb_shift_b", 0),
         ("wb_shift_r", 0),
+    ])
+}
+
+fn monochrome_settings(filter: i64) -> ControlSettings {
+    settings_at(&[
+        ("dynamic_range", 0),
+        ("highlight_tone", 0),
+        ("shadow_tone", 0),
+        ("wb_shift_b", 0),
+        ("wb_shift_r", 0),
+        ("mono_filter", filter),
+        ("bw_adjustment", 0),
+        ("bw_magenta_green", 0),
+        ("grain", 0),
+        ("grain_size", 0),
+        ("clarity", 0),
+        ("noise_reduction", 0),
     ])
 }
 
@@ -673,6 +791,38 @@ fn with_source(settings: &ControlSettings, entry: ControlEntry) -> ControlSettin
     ControlSettings::new(entries).expect("settings")
 }
 
+fn highest_snapshot(dir: &Path) -> Option<u64> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let version = path
+                .file_name()?
+                .to_str()?
+                .strip_prefix('v')?
+                .parse()
+                .ok()?;
+            path.is_dir().then_some(version)
+        })
+        .max()
+}
+
+fn copy_shipped_documents(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("shipped documents");
+    for entry in std::fs::read_dir(from).expect("shipped documents") {
+        let path = entry.expect("shipped entry").path();
+        let name = path.file_name().expect("document name");
+        if path.is_dir() {
+            copy_shipped_documents(&path, &to.join(name));
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "yaml")
+        {
+            std::fs::copy(&path, to.join(name)).expect("shipped document");
+        }
+    }
+}
+
 fn write_snapshot(dir: &Path, version: u64, color: &str) {
     let bodies = dir.join(format!("v{version}/bodies"));
     std::fs::create_dir_all(&bodies).expect("snapshot bodies");
@@ -685,6 +835,43 @@ fn write_snapshot(dir: &Path, version: u64, color: &str) {
     )
     .expect("body entity");
     std::fs::write(bodies.join("fujifilm-x-t5.yaml"), snapshot_schema(color)).expect("schema");
+}
+
+/// Keyed by the paths a first snapshot exports.
+fn shipped_baseline_files() -> Vec<(String, Vec<u8>)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(root.join("bodies")).expect("shipped bodies") {
+        let path = entry.expect("body entry").path();
+        if path.extension() != Some(std::ffi::OsStr::new("yaml")) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("body document");
+        let export = if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().ends_with(".body.yaml"))
+        {
+            let body = looklab_schema::validate_body(&text).expect("body");
+            looklab_schema::body_export_path(&body.id)
+        } else {
+            let schema = looklab_schema::validate_control_schema(&text).expect("schema");
+            looklab_schema::schema_export_path(&schema.body)
+        };
+        files.push((export, text.into_bytes()));
+    }
+    for entry in std::fs::read_dir(root.join("interfaces")).expect("shipped interfaces") {
+        let path = entry.expect("interface entry").path();
+        if path.extension() != Some(std::ffi::OsStr::new("yaml")) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("interface document");
+        let profile = looklab_schema::validate_interface_profile(&text).expect("interface");
+        files.push((
+            looklab_schema::interface_export_path(&profile.id),
+            text.into_bytes(),
+        ));
+    }
+    files
 }
 
 fn snapshot_schema(color: &str) -> String {
@@ -754,6 +941,8 @@ fn manifest_at(
     let manifest = BatchManifest {
         kind: ContributionKind::Library,
         intent: Intent::Native,
+        render_class: RenderClass::Colour,
+        monochrome_authorization: None,
         body: BodyId::new("fujifilm/x-t5").expect("body id"),
         firmware_version: FirmwareVersionString::new("2.10").expect("firmware"),
         sim_key: SimKey::new("classic_chrome").expect("sim key"),
@@ -764,6 +953,11 @@ fn manifest_at(
     (manifest, blobs)
 }
 
+fn send_challenge(nonce: &Nonce, manifest: &BatchManifest) -> Challenge {
+    let send = SendManifest::canonical(vec![manifest_hash(manifest)]).expect("send manifest");
+    Challenge::for_send(nonce, &send_manifest_hash(&send))
+}
+
 fn envelope(
     nonce: Nonce,
     manifest: &BatchManifest,
@@ -772,14 +966,63 @@ fn envelope(
     assertion: &WebAuthnAssertion,
     pow: &PowSolutions,
 ) -> Vec<u8> {
+    let send = SendManifest::canonical(vec![manifest_hash(manifest)]).expect("send manifest");
     encode_envelope(&EnvelopeParts {
         nonce,
+        send_manifest: &send,
         manifest,
         assertion,
         pow,
         serial,
         blobs,
     })
+}
+
+fn send_envelope(
+    nonce: Nonce,
+    send: &SendManifest,
+    manifest: &BatchManifest,
+    blobs: &[Vec<u8>],
+    assertion: &WebAuthnAssertion,
+) -> Vec<u8> {
+    let pow = solve(
+        &Challenge::new(&nonce, &manifest_hash(manifest)),
+        u32::try_from(manifest.images.len()).expect("image count"),
+        &pow_params(),
+        0,
+    )
+    .expect("proof-of-work");
+    encode_envelope(&EnvelopeParts {
+        nonce,
+        send_manifest: send,
+        manifest,
+        assertion,
+        pow: &pow,
+        serial: None,
+        blobs,
+    })
+}
+
+fn assertion_from(
+    soft: &mut SoftPasskey,
+    credential_id: &[u8],
+    challenge: &Challenge,
+) -> WebAuthnAssertion {
+    let options = request_options(challenge.as_bytes(), credential_id, true).public_key;
+    let client_data_json = format!(
+        r#"{{"type":"webauthn.get","challenge":"{}","origin":"{ORIGIN}"}}"#,
+        URL_SAFE_NO_PAD.encode(challenge.as_bytes())
+    );
+    let hash = Sha256::digest(client_data_json.as_bytes()).to_vec();
+    let credential = soft
+        .perform_auth(hash, options, 60_000)
+        .expect("software authenticator");
+    WebAuthnAssertion {
+        credential_id: credential.raw_id,
+        authenticator_data: credential.response.authenticator_data,
+        client_data_json: client_data_json.into_bytes(),
+        signature: credential.response.signature,
+    }
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -853,15 +1096,12 @@ async fn happy_path_and_status_feed() {
     let (status, _, body) = server.get(&format!("/status/{token}")).await;
     assert_eq!(status, StatusCode::OK);
     let feed: Value = serde_json::from_slice(&body).expect("status json");
-    assert_eq!(
-        feed["contributions"]
-            .as_array()
-            .expect("contributions")
-            .len(),
-        1
-    );
-    let contribution = &feed["contributions"][0];
+    assert_eq!(feed["activities"].as_array().expect("activities").len(), 1);
+    assert_eq!(feed["activities"][0]["source"], "send");
+    let contribution = &feed["activities"][0]["contributions"][0];
     assert_eq!(contribution["id"], contribution_id);
+    assert_eq!(contribution["render_class"], "colour");
+    assert!(contribution["deferred_until"].is_null());
     assert_eq!(contribution["images"].as_array().expect("images").len(), 2);
     assert_eq!(contribution["images"][0]["status"], "pending");
 
@@ -874,7 +1114,8 @@ async fn happy_path_and_status_feed() {
             .is_some_and(|value| value.starts_with("application/rss+xml"))
     );
     let rss = String::from_utf8(body.to_vec()).expect("rss text");
-    assert!(rss.contains(contribution_id), "rss: {rss}");
+    assert!(rss.contains("<title>Contribution from "), "rss: {rss}");
+    assert!(rss.contains("2 photos"), "rss: {rss}");
 
     let credentials: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM credentials")
         .fetch_one(&server.db)
@@ -907,10 +1148,11 @@ async fn invalid_signature_is_rejected() {
     let mut server = TestServer::start().await;
     let (manifest, blobs) = manifest(valid_settings());
     let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let mut assertion = server.assertion(&challenge).await;
     assertion.signature[0] ^= 0xff;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     let (status, body) = server.upload_bytes(bytes).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -931,13 +1173,7 @@ async fn status_token_is_issued_only_once() {
     let (status, _, body) = server.get(&format!("/status/{token}")).await;
     assert_eq!(status, StatusCode::OK);
     let feed: Value = serde_json::from_slice(&body).expect("status json");
-    assert_eq!(
-        feed["contributions"]
-            .as_array()
-            .expect("contributions")
-            .len(),
-        2
-    );
+    assert_eq!(feed["activities"].as_array().expect("activities").len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -945,9 +1181,10 @@ async fn missing_user_verification_is_rejected() {
     let mut server = TestServer::start().await;
     let (manifest, blobs) = manifest(valid_settings());
     let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion_with_verification(&challenge, false).await;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     let (status, body) = server.upload_bytes(bytes).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -959,15 +1196,182 @@ async fn replayed_nonce_is_rejected() {
     let mut server = TestServer::start().await;
     let (manifest, blobs) = manifest(valid_settings());
     let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion(&challenge).await;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     let (status, _) = server.upload_bytes(bytes.clone()).await;
     assert_eq!(status, StatusCode::CREATED);
     let (status, body) = server.upload_bytes(bytes).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["error"], "NONCE_REPLAYED");
+    assert_eq!(body["error"], "SEND_REPLAYED");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parallel_batch_replay_creates_one_contribution() {
+    let mut server = TestServer::start().await;
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, _) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let body = send_envelope(nonce, &send, &first, &first_blobs, &assertion);
+
+    let (left, right) = tokio::join!(server.upload_bytes(body.clone()), server.upload_bytes(body));
+    let statuses = [left.0, right.0];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CREATED)
+            .count(),
+        1,
+        "{left:?} {right:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CONFLICT
+                || **status == StatusCode::SERVICE_UNAVAILABLE)
+            .count(),
+        1,
+        "{left:?} {right:?}"
+    );
+    let batch_hash = manifest_hash(&first);
+    let contributions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contributions WHERE batch_manifest_hash = ?")
+            .bind(batch_hash.as_bytes().as_slice())
+            .fetch_one(&server.db)
+            .await
+            .expect("contributions");
+    assert_eq!(contributions, 1);
+    let refs: i64 = sqlx::query_scalar("SELECT ref_count FROM blobs WHERE hash = ?")
+        .bind(first.images[0].blob_sha256.as_slice())
+        .fetch_one(&server.db)
+        .await
+        .expect("blob refs");
+    assert_eq!(refs, 1);
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'consistency_score'")
+            .fetch_one(&server.db)
+            .await
+            .expect("jobs");
+    assert_eq!(jobs, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_send_rejects_a_continuation() {
+    let mut server = TestServer::start().await;
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, second_blobs) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let first_body = send_envelope(nonce, &send, &first, &first_blobs, &assertion);
+    assert_eq!(server.upload_bytes(first_body).await.0, StatusCode::CREATED);
+    sqlx::query("UPDATE send_manifests SET expires_at = 0 WHERE nonce = ?")
+        .bind(hex(nonce.as_bytes()))
+        .execute(&server.db)
+        .await
+        .expect("expire send");
+
+    let second_body = send_envelope(nonce, &send, &second, &second_blobs, &assertion);
+    let (status, body) = server.upload_bytes(second_body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "SEND_EXPIRED");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_batches_under_a_fresh_nonce_are_a_new_send() {
+    let mut server = TestServer::start().await;
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, second_blobs) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    for _ in 0..2 {
+        let nonce = server.nonce().await;
+        let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+            .expect("send manifest");
+        let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+        let assertion = server.assertion(&challenge).await;
+        assert_eq!(
+            server
+                .upload_bytes(send_envelope(
+                    nonce,
+                    &send,
+                    &first,
+                    &first_blobs,
+                    &assertion
+                ))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            server
+                .upload_bytes(send_envelope(
+                    nonce,
+                    &send,
+                    &second,
+                    &second_blobs,
+                    &assertion
+                ))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+    }
+    let contributions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contributions")
+        .fetch_one(&server.db)
+        .await
+        .expect("contributions");
+    assert_eq!(contributions, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_credential_cannot_continue_a_bound_send() {
+    let mut server = TestServer::start().await;
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, second_blobs) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    assert_eq!(
+        server
+            .upload_bytes(send_envelope(
+                nonce,
+                &send,
+                &first,
+                &first_blobs,
+                &assertion
+            ))
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+
+    let mut other = SoftPasskey::new(true);
+    let other_id = register(&server.app, &mut other).await;
+    let other_assertion = assertion_from(&mut other, &other_id, &challenge);
+    let (status, body) = server
+        .upload_bytes(send_envelope(
+            nonce,
+            &send,
+            &second,
+            &second_blobs,
+            &other_assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "SEND_CREDENTIAL_MISMATCH");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -975,9 +1379,10 @@ async fn bad_pow_is_rejected() {
     let mut server = TestServer::start().await;
     let (manifest, blobs) = manifest(valid_settings());
     let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion(&challenge).await;
-    let pow = bad_pow(&challenge, 2);
+    let pow = bad_pow(&pow_challenge, 2);
     let bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     let (status, body) = server.upload_bytes(bytes).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -989,9 +1394,10 @@ async fn non_canonical_envelope_is_rejected() {
     let mut server = TestServer::start().await;
     let (manifest, blobs) = manifest(valid_settings());
     let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion(&challenge).await;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let mut bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     bytes.push(0);
     let (status, body) = server.upload_bytes(bytes).await;
@@ -1000,13 +1406,31 @@ async fn non_canonical_envelope_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_old_envelope_version_requests_a_reload() {
+    let mut server = TestServer::start().await;
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
+    let assertion = server.assertion(&challenge).await;
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
+    let mut bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
+    bytes[6..8].copy_from_slice(&3u16.to_le_bytes());
+    let (status, body) = server.upload_bytes(bytes).await;
+    assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "upload: {body}");
+    assert_eq!(body["error"], "ENVELOPE_VERSION_UNSUPPORTED");
+    assert_eq!(body["action"], "reload_and_prepare");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn schema_invalid_settings_are_rejected() {
     let mut server = TestServer::start().await;
     let (manifest, blobs) = manifest(settings_at(&[("highlight_tone", 0)]));
     let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion(&challenge).await;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
     let (status, body) = server.upload_bytes(bytes).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1014,15 +1438,180 @@ async fn schema_invalid_settings_are_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_monochrome_sim_is_rejected() {
+async fn rejected_validation_writes_no_blob_files() {
     let mut server = TestServer::start().await;
-    let (mut manifest, blobs) = manifest(valid_settings());
+    let (invalid_settings, settings_blobs) = manifest(settings_at(&[("highlight_tone", 0)]));
+    let (status, body) = server
+        .upload_manifest(&invalid_settings, &settings_blobs, None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upload: {body}");
+    assert_eq!(body["error"], "SCHEMA_INVALID");
+
+    let (mut unknown_body, body_blobs) = manifest(valid_settings());
+    unknown_body.body = BodyId::new("fujifilm/unknown").expect("body id");
+    let (status, body) = server
+        .upload_manifest(&unknown_body, &body_blobs, None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upload: {body}");
+    assert_eq!(body["error"], "BODY_UNKNOWN");
+
+    assert_eq!(blob_files(&server.blob_dir), 0);
+    assert_eq!(staged_rows(&server.db).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_contribution_removes_its_staged_blobs_and_a_retry_succeeds() {
+    let mut server = TestServer::start().await;
+    sqlx::query(
+        "CREATE TRIGGER reject_contribution BEFORE INSERT ON contributions
+         BEGIN SELECT RAISE(ABORT, 'reject'); END",
+    )
+    .execute(&server.db)
+    .await
+    .expect("trigger");
+
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "upload: {body}");
+    assert_eq!(body["error"], "INTERNAL");
+    assert_eq!(blob_files(&server.blob_dir), 0);
+    assert_eq!(staged_rows(&server.db).await, 0);
+    assert_eq!(blob_rows(&server.db).await, 0);
+
+    sqlx::query("DROP TRIGGER reject_contribution")
+        .execute(&server.db)
+        .await
+        .expect("drop trigger");
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "retry: {body}");
+    assert_eq!(blob_files(&server.blob_dir), 2);
+    assert_eq!(staged_rows(&server.db).await, 0);
+    assert_eq!(blob_rows(&server.db).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_blob_reservation_is_rejected_without_writing_files() {
+    let mut server = TestServer::start().await;
+    sqlx::query(
+        "CREATE TRIGGER expire_staging AFTER INSERT ON blob_staging
+         BEGIN UPDATE blob_staging SET expires_at = 0 WHERE rowid = NEW.rowid; END",
+    )
+    .execute(&server.db)
+    .await
+    .expect("trigger");
+
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "upload: {body}");
+    assert_eq!(body["error"], "BUSY");
+    assert_eq!(blob_files(&server.blob_dir), 0);
+    assert_eq!(staged_rows(&server.db).await, 0);
+
+    sqlx::query("DROP TRIGGER expire_staging")
+        .execute(&server.db)
+        .await
+        .expect("drop trigger");
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "retry: {body}");
+    assert_eq!(blob_files(&server.blob_dir), 2);
+    assert_eq!(staged_rows(&server.db).await, 0);
+}
+
+fn blob_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir).expect("blob dir").count()
+}
+
+async fn staged_rows(db: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM blob_staging")
+        .fetch_one(db)
+        .await
+        .expect("staging rows")
+}
+
+async fn blob_rows(db: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
+        .fetch_one(db)
+        .await
+        .expect("blob rows")
+}
+
+/// A `contribution_images` row: render class, sim, family and mono filter.
+type ContributionImageRow = (String, Option<String>, Option<String>, Option<String>);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_monochrome_batch_is_stored_deferred_with_its_authorization() {
+    let mut server = TestServer::start().await;
+    let (mut manifest, blobs) = manifest(monochrome_settings(1));
     manifest.body = BodyId::new("fujifilm/x-t4").expect("body id");
     manifest.firmware_version = FirmwareVersionString::new("1.00").expect("firmware");
     manifest.sim_key = SimKey::new("acros_ye").expect("sim key");
+    manifest.render_class = RenderClass::Monochrome;
+    manifest.monochrome_authorization = Some(MonochromeAuthorization::ModelDevelopment180Days);
+    for image in &mut manifest.images {
+        image.meta.look = Some(monochrome_look(0x0502));
+    }
+    let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let row: (String, Option<String>, Option<i64>, String, i64) = sqlx::query_as(
+        "SELECT render_class, monochrome_authorization, deferred_until, status, created_at
+         FROM contributions",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("contribution");
+    assert_eq!(row.0, "monochrome");
+    assert_eq!(row.1.as_deref(), Some("model_development_180_days"));
+    let deadline = row.2.expect("deferred deadline");
+    assert_eq!(deadline - row.4, 180 * 86_400);
+    assert_eq!(row.3, "pending");
+
+    let images: Vec<ContributionImageRow> = sqlx::query_as(
+        "SELECT render_class, native_sim, family, mono_filter FROM contribution_images",
+    )
+    .fetch_all(&server.db)
+    .await
+    .expect("images");
+    assert_eq!(images.len(), 2);
+    for (render_class, native_sim, family, filter) in images {
+        assert_eq!(render_class, "monochrome");
+        assert_eq!(native_sim.as_deref(), Some("acros_ye"));
+        assert_eq!(family.as_deref(), Some("acros"));
+        assert_eq!(filter.as_deref(), Some("yellow"));
+    }
+
+    let jobs: Vec<(String,)> = sqlx::query_as("SELECT kind FROM jobs")
+        .fetch_all(&server.db)
+        .await
+        .expect("jobs");
+    assert!(jobs.iter().all(|(kind,)| kind == "hard_delete_blobs"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deferred_batch_must_declare_its_spatial_controls() {
+    let mut server = TestServer::start().await;
+    let incomplete = settings_at(&[
+        ("dynamic_range", 0),
+        ("highlight_tone", 0),
+        ("shadow_tone", 0),
+        ("wb_shift_b", 0),
+        ("wb_shift_r", 0),
+        ("mono_filter", 1),
+        ("bw_adjustment", 0),
+        ("bw_magenta_green", 0),
+        ("clarity", 0),
+        ("noise_reduction", 0),
+    ]);
+    let (mut manifest, blobs) = manifest(incomplete);
+    manifest.body = BodyId::new("fujifilm/x-t4").expect("body id");
+    manifest.firmware_version = FirmwareVersionString::new("1.00").expect("firmware");
+    manifest.sim_key = SimKey::new("acros_ye").expect("sim key");
+    manifest.render_class = RenderClass::Monochrome;
+    manifest.monochrome_authorization = Some(MonochromeAuthorization::ModelDevelopment180Days);
+    for image in &mut manifest.images {
+        image.meta.look = Some(monochrome_look(0x0502));
+    }
     let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "upload: {body}");
-    assert_eq!(body["error"], "MONOCHROME_UNSUPPORTED");
+    assert_eq!(body["error"], "SCHEMA_INVALID");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1033,11 +1622,34 @@ async fn a_monochrome_image_rejects_a_colour_sim_declaration() {
     manifest.firmware_version = FirmwareVersionString::new("1.00").expect("firmware");
     manifest.sim_key = SimKey::new("provia").expect("sim key");
     for image in &mut manifest.images {
-        image.meta.look = Some(monochrome_look());
+        image.meta.look = Some(monochrome_look(0x0500));
     }
     let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "upload: {body}");
-    assert_eq!(body["error"], "MONOCHROME_UNSUPPORTED");
+    assert_eq!(body["error"], "RENDER_CLASS_MISMATCH");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_monochrome_signed_batch_rejects_colour_metadata() {
+    let mut server = TestServer::start().await;
+    let (mut manifest, blobs) = manifest(monochrome_settings(0));
+    manifest.body = BodyId::new("fujifilm/x-t4").expect("body id");
+    manifest.firmware_version = FirmwareVersionString::new("1.00").expect("firmware");
+    manifest.sim_key = SimKey::new("acros").expect("sim key");
+    manifest.render_class = RenderClass::Monochrome;
+    manifest.monochrome_authorization = Some(MonochromeAuthorization::ModelDevelopment180Days);
+    for image in &mut manifest.images {
+        image.meta.look = Some(looklab_upload::LookSettings {
+            film_mode: Some(looklab_upload::Tagged {
+                raw: 0x0000,
+                value: None,
+            }),
+            ..looklab_upload::LookSettings::default()
+        });
+    }
+    let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upload: {body}");
+    assert_eq!(body["error"], "RENDER_CLASS_MISMATCH");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1149,6 +1761,44 @@ async fn a_reproduced_claim_for_an_unmapped_control_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn old_schema_monochrome_metadata_cannot_enter_the_colour_pipeline() {
+    let mut server = TestServer::start_with_community(|dir| {
+        write_snapshot(dir, 2, mapped_color());
+    })
+    .await;
+    for look in [
+        monochrome_look(0x0500),
+        typed_monochrome_look(0x0500),
+        mismatched_monochrome_look(0x0500),
+    ] {
+        let (mut manifest, blobs) = manifest_at(CommunitySnapshotVersion::new(2), valid_settings());
+        for image in &mut manifest.images {
+            image.meta.look = Some(look.clone());
+        }
+        let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "upload: {body}");
+        assert_eq!(body["error"], "RENDER_CLASS_MISMATCH");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_monochrome_signed_sim_rejects_contradicting_metadata() {
+    let mut server = TestServer::start().await;
+    let (mut manifest, blobs) = manifest(monochrome_settings(0));
+    manifest.body = BodyId::new("fujifilm/x-t4").expect("body id");
+    manifest.firmware_version = FirmwareVersionString::new("1.00").expect("firmware");
+    manifest.sim_key = SimKey::new("sepia").expect("sim key");
+    manifest.render_class = RenderClass::Monochrome;
+    manifest.monochrome_authorization = Some(MonochromeAuthorization::ModelDevelopment180Days);
+    for image in &mut manifest.images {
+        image.meta.look = Some(monochrome_look(0x0501));
+    }
+    let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "upload: {body}");
+    assert_eq!(body["error"], "RENDER_CLASS_MISMATCH");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn card_intent_is_stored_with_its_parsed_fields() {
     let mut server = TestServer::start().await;
     let (mut manifest, blobs) = manifest(valid_settings());
@@ -1173,6 +1823,66 @@ async fn card_intent_is_stored_with_its_parsed_fields() {
     let declaration: CardDeclaration =
         serde_json::from_str(row.1.as_deref().expect("card field")).expect("card json");
     assert_eq!(declaration, CardDeclaration::Tagged(render_tag()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deferred_monochrome_card_keeps_card_intent_and_stock_metadata() {
+    let mut server = TestServer::start().await;
+    let (mut manifest, blobs) = manifest(monochrome_settings(1));
+    manifest.body = BodyId::new("fujifilm/x-t4").expect("body id");
+    manifest.firmware_version = FirmwareVersionString::new("1.00").expect("firmware");
+    manifest.sim_key = SimKey::new("provia").expect("stock sim key");
+    manifest.render_class = RenderClass::Monochrome;
+    manifest.monochrome_authorization = Some(MonochromeAuthorization::ModelDevelopment180Days);
+    let tag = monochrome_render_tag();
+    manifest.intent = Intent::Card(CardDeclaration::Tagged(tag.clone()));
+    for image in &mut manifest.images {
+        image.meta.render_tag = Some(tag.clone());
+        image.meta.look = Some(looklab_upload::LookSettings {
+            film_mode: Some(looklab_upload::Tagged {
+                raw: 0x0000,
+                value: None,
+            }),
+            ..looklab_upload::LookSettings::default()
+        });
+    }
+    let (status, body) = server.upload_manifest(&manifest, &blobs, None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let token = body["status_token"].as_str().expect("token");
+
+    let row: (String, String, Option<String>) =
+        sqlx::query_as("SELECT intent, render_class, monochrome_authorization FROM contributions")
+            .fetch_one(&server.db)
+            .await
+            .expect("contribution");
+    assert_eq!(row.0, "card");
+    assert_eq!(row.1, "monochrome");
+    assert_eq!(row.2.as_deref(), Some("model_development_180_days"));
+
+    let images: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT render_class, native_sim, family FROM contribution_images")
+            .fetch_all(&server.db)
+            .await
+            .expect("images");
+    for (render_class, native_sim, family) in images {
+        assert_eq!(render_class, "monochrome");
+        assert_eq!(native_sim.as_deref(), Some("provia"));
+        assert_eq!(family.as_deref(), Some("acros"));
+    }
+
+    let (status, _, body) = server.get(&format!("/status/{token}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let feed: Value = serde_json::from_slice(&body).expect("status json");
+    let contribution = &feed["activities"][0]["contributions"][0];
+    assert_eq!(contribution["render_class"], "monochrome");
+    assert!(contribution["deferred_until"].as_i64().is_some());
+    assert_eq!(contribution["status"], "pending");
+    let (_, _, rss) = server.get(&format!("/status/{token}.rss")).await;
+    let rss = String::from_utf8(rss.to_vec()).expect("rss");
+    assert!(
+        rss.contains("received, awaiting monochrome analysis"),
+        "{rss}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1202,6 +1912,11 @@ fn render_tag() -> looklab_upload::RenderTag {
         .expect("render tag")
 }
 
+fn monochrome_render_tag() -> looklab_upload::RenderTag {
+    parse_render_tag("looklab-card/1 fw=acme-sim/2.0.1 look=acros@1.0.0 cid=0123456789abcdef")
+        .expect("render tag")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn withdrawal_marks_contribution_and_schedules_deletion() {
     let mut server = TestServer::start().await;
@@ -1223,7 +1938,7 @@ async fn withdrawal_marks_contribution_and_schedules_deletion() {
         "authenticator_data": b64(&assertion.authenticator_data),
         "client_data_json": b64(&assertion.client_data_json),
         "signature": b64(&assertion.signature),
-        "contribution_id": contribution_id,
+        "contribution_ids": [contribution_id],
     });
     let (status, body) = post_json(&server.app, "/api/withdraw", &payload).await;
     assert_eq!(status, StatusCode::OK, "withdraw: {body}");
@@ -1231,7 +1946,10 @@ async fn withdrawal_marks_contribution_and_schedules_deletion() {
 
     let feed: Value = serde_json::from_slice(&server.get(&format!("/status/{token}")).await.2)
         .expect("status json");
-    assert_eq!(feed["contributions"][0]["status"], "withdrawn");
+    assert_eq!(
+        feed["activities"][0]["contributions"][0]["status"],
+        "withdrawn"
+    );
 
     let (job_kind, run_after): (String, i64) =
         sqlx::query_as("SELECT kind, run_after FROM jobs WHERE kind = 'hard_delete_blobs'")
@@ -1245,6 +1963,530 @@ async fn withdrawal_marks_contribution_and_schedules_deletion() {
         .await
         .expect("withdrawals");
     assert_eq!(withdrawals, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_profile_cannot_use_any_intake_route_but_can_withdraw() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let token = body["status_token"].as_str().expect("token").to_owned();
+    let contribution_id = body["contribution_id"]
+        .as_str()
+        .expect("contribution")
+        .to_owned();
+    let credential = server.credential_uuid().await;
+    let moderator = server.moderator_token().await;
+    let body_yaml = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
+    let (status, body) = server.submit_proposal("body", body_yaml, &[], true).await;
+    assert_eq!(status, StatusCode::CREATED, "pre-block proposal: {body}");
+    let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    let before: (String, String, f64) =
+        sqlx::query_as("SELECT tier, roles, reputation FROM credentials WHERE id = ?")
+            .bind(&credential)
+            .fetch_one(&server.db)
+            .await
+            .expect("credential before");
+    let (status, blocked) = post_json_with_token(
+        &server.app,
+        "/api/mod/credential/block",
+        &moderator,
+        &json!({"credential": credential.clone(), "reason": "abusive submissions"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "block: {blocked}");
+    let after: (String, String, f64) =
+        sqlx::query_as("SELECT tier, roles, reputation FROM credentials WHERE id = ?")
+            .bind(&credential)
+            .fetch_one(&server.db)
+            .await
+            .expect("credential after");
+    assert_eq!(after, before);
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE type = 'credential_intake_blocked'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("block audit");
+    assert_eq!(audits, 1);
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload FROM audit_log WHERE type = 'credential_intake_blocked' LIMIT 1",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("block audit payload");
+    let payload: Value = serde_json::from_str(&payload).expect("block audit json");
+    assert_eq!(payload["subject"].as_str(), Some(credential.as_str()));
+    assert_eq!(payload["reason"].as_str(), Some("abusive submissions"));
+    let (status, repeated) = post_json_with_token(
+        &server.app,
+        "/api/mod/credential/block",
+        &moderator,
+        &json!({"credential": credential.clone(), "reason": "again"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "repeat block: {repeated}");
+    assert_eq!(repeated["blocked_at"], blocked["blocked_at"]);
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE type = 'credential_intake_blocked'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("block audit after repeat");
+    assert_eq!(audits, 1);
+
+    let contributions_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contributions")
+        .fetch_one(&server.db)
+        .await
+        .expect("contributions before");
+    let unused_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM nonces WHERE used_at IS NULL")
+            .fetch_one(&server.db)
+            .await
+            .expect("unused nonces before");
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "upload: {body}");
+    assert_eq!(body["error"], "CREDENTIAL_BLOCKED");
+    let contributions_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contributions")
+        .fetch_one(&server.db)
+        .await
+        .expect("contributions after");
+    assert_eq!(contributions_after, contributions_before);
+    let unused_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nonces WHERE used_at IS NULL")
+        .fetch_one(&server.db)
+        .await
+        .expect("unused nonces after");
+    assert_eq!(unused_after, unused_before + 1);
+    let staged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blob_staging")
+        .fetch_one(&server.db)
+        .await
+        .expect("staged blobs");
+    assert_eq!(staged, 0);
+
+    let (status, body) = server.submit_proposal("body", body_yaml, &[], true).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "proposal: {body}");
+    assert_eq!(body["error"], "CREDENTIAL_BLOCKED");
+
+    let tags = vec![LabeledTag {
+        tag: "FilmMode".try_into().expect("tag"),
+        value: MakernoteValue(0x0700),
+        label: "classic_chrome".try_into().expect("label"),
+    }];
+    let (status, body) = server.confirm_proposal(&proposal, tags).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "confirmation: {body}");
+    assert_eq!(body["error"], "CREDENTIAL_BLOCKED");
+
+    let cube = lut_test_cube();
+    let bytes = cube.as_bytes();
+    let digest = hex(&Sha256::digest(bytes));
+    let payload = format!(
+        "look: blocked-lut\nname: Blocked LUT\nlicense: {{ own_work: true }}\n\
+         attribution: A contributor\nlut:\n  file: blocked-lut.cube\n  sha256: {digest}\n  \
+         size: {}\nencoding: flog2_fgamut\n",
+        bytes.len()
+    );
+    let (status, body) = server.submit_lut("lut_look", &payload, bytes).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "lut proposal: {body}");
+    assert_eq!(body["error"], "CREDENTIAL_BLOCKED");
+
+    let (status, body) = server
+        .donate_fixture("blocked.raf", b"blocked fixture")
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "fixture: {body}");
+    assert_eq!(body["error"], "CREDENTIAL_BLOCKED");
+
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, body) = post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "confirmation: {body}");
+    assert_eq!(body["error"], "CREDENTIAL_BLOCKED");
+
+    let active: String = sqlx::query_scalar("SELECT status FROM credentials WHERE id = ?")
+        .bind(&credential)
+        .fetch_one(&server.db)
+        .await
+        .expect("credential status");
+    assert_eq!(active, "active");
+
+    let nonce = server.nonce().await;
+    let digest = request_digest(RequestDomain::Withdraw, &contribution_id);
+    let challenge = Challenge::new(&nonce, &digest);
+    let assertion = server.assertion(&challenge).await;
+    let payload = json!({
+        "nonce": b64(nonce.as_bytes()),
+        "credential_id": b64(&assertion.credential_id),
+        "authenticator_data": b64(&assertion.authenticator_data),
+        "client_data_json": b64(&assertion.client_data_json),
+        "signature": b64(&assertion.signature),
+        "contribution_ids": [contribution_id],
+    });
+    let (status, body) = post_json(&server.app, "/api/withdraw", &payload).await;
+    assert_eq!(status, StatusCode::OK, "withdraw: {body}");
+    let feed: Value = serde_json::from_slice(&server.get(&format!("/status/{token}")).await.2)
+        .expect("status json");
+    assert_eq!(
+        feed["activities"][0]["contributions"][0]["status"],
+        "withdrawn"
+    );
+}
+
+async fn upload_two_batch_send(server: &mut TestServer) -> (String, Vec<String>) {
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, second_blobs) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let (status, first_body) = server
+        .upload_bytes(send_envelope(
+            nonce,
+            &send,
+            &first,
+            &first_blobs,
+            &assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "first batch: {first_body}");
+    let token = first_body["status_token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    let (status, second_body) = server
+        .upload_bytes(send_envelope(
+            nonce,
+            &send,
+            &second,
+            &second_blobs,
+            &assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "second batch: {second_body}");
+    let ids = vec![
+        first_body["contribution_id"]
+            .as_str()
+            .expect("first contribution")
+            .to_owned(),
+        second_body["contribution_id"]
+            .as_str()
+            .expect("second contribution")
+            .to_owned(),
+    ];
+    (token, ids)
+}
+
+async fn withdraw_payload(server: &mut TestServer, ids: &[String], signed: &[String]) -> Value {
+    let mut canonical = signed.to_vec();
+    canonical.sort();
+    canonical.dedup();
+    let nonce = server.nonce().await;
+    let digest = request_digest(RequestDomain::Withdraw, &canonical.join("\n"));
+    let challenge = Challenge::new(&nonce, &digest);
+    let assertion = server.assertion(&challenge).await;
+    json!({
+        "nonce": b64(nonce.as_bytes()),
+        "credential_id": b64(&assertion.credential_id),
+        "authenticator_data": b64(&assertion.authenticator_data),
+        "client_data_json": b64(&assertion.client_data_json),
+        "signature": b64(&assertion.signature),
+        "contribution_ids": ids,
+    })
+}
+
+async fn assert_nothing_withdrawn(server: &TestServer, token: &str, expected: usize) {
+    let feed: Value = serde_json::from_slice(&server.get(&format!("/status/{token}")).await.2)
+        .expect("status json");
+    let contributions = feed["activities"]
+        .as_array()
+        .expect("activities")
+        .iter()
+        .flat_map(|activity| activity["contributions"].as_array().expect("contributions"))
+        .collect::<Vec<_>>();
+    assert_eq!(contributions.len(), expected);
+    for contribution in contributions {
+        assert_ne!(contribution["status"], "withdrawn");
+    }
+    let withdrawals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM withdrawals")
+        .fetch_one(&server.db)
+        .await
+        .expect("withdrawals");
+    assert_eq!(withdrawals, 0);
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'hard_delete_blobs'")
+            .fetch_one(&server.db)
+            .await
+            .expect("deletion jobs");
+    assert_eq!(jobs, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_multi_batch_send_reads_as_one_submission() {
+    let mut server = TestServer::start().await;
+    let (token, ids) = upload_two_batch_send(&mut server).await;
+
+    let feed: Value = serde_json::from_slice(&server.get(&format!("/status/{token}")).await.2)
+        .expect("status json");
+    let activities = feed["activities"].as_array().expect("activities");
+    assert_eq!(activities.len(), 1);
+    assert_eq!(activities[0]["source"], "send");
+    assert_eq!(
+        activities[0]["contributions"]
+            .as_array()
+            .expect("contributions")
+            .len(),
+        2
+    );
+
+    sqlx::query("UPDATE contributions SET body_id = 'fujifilm/x-s10' WHERE id = ?")
+        .bind(&ids[1])
+        .execute(&server.db)
+        .await
+        .expect("second camera");
+    let feed: Value = serde_json::from_slice(&server.get(&format!("/status/{token}")).await.2)
+        .expect("status json");
+    let activities = feed["activities"].as_array().expect("activities");
+    assert_eq!(activities.len(), 1, "one send stays one submission");
+    let bodies = activities[0]["contributions"]
+        .as_array()
+        .expect("contributions")
+        .iter()
+        .map(|contribution| contribution["body_id"].as_str().expect("body"))
+        .collect::<Vec<_>>();
+    assert!(bodies.contains(&"fujifilm/x-t5"));
+    assert!(bodies.contains(&"fujifilm/x-s10"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_records_group_by_day_and_camera() {
+    let mut server = TestServer::start().await;
+    let (status, first) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token = first["status_token"].as_str().expect("token").to_owned();
+    let first_id = first["contribution_id"].as_str().expect("contribution");
+    let (status, second) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let second_id = second["contribution_id"].as_str().expect("contribution");
+
+    sqlx::query(
+        "UPDATE contributions SET send_nonce = NULL, created_at = 1_700_000_000 WHERE id IN (?, ?)",
+    )
+    .bind(first_id)
+    .bind(second_id)
+    .execute(&server.db)
+    .await
+    .expect("legacy records");
+
+    let feed: Value = serde_json::from_slice(&server.get(&format!("/status/{token}")).await.2)
+        .expect("status json");
+    let activities = feed["activities"].as_array().expect("activities");
+    assert_eq!(activities.len(), 1);
+    assert_eq!(activities[0]["source"], "activity");
+    assert_eq!(
+        activities[0]["contributions"]
+            .as_array()
+            .expect("contributions")
+            .len(),
+        2
+    );
+
+    sqlx::query("UPDATE contributions SET body_id = 'fujifilm/x-s10' WHERE id = ?")
+        .bind(second_id)
+        .execute(&server.db)
+        .await
+        .expect("second camera");
+    let feed: Value = serde_json::from_slice(&server.get(&format!("/status/{token}")).await.2)
+        .expect("status json");
+    assert_eq!(
+        feed["activities"].as_array().expect("activities").len(),
+        2,
+        "different cameras are different activity"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn group_withdrawal_binds_the_selection_and_checks_every_item() {
+    let mut server = TestServer::start().await;
+    let (token, ids) = upload_two_batch_send(&mut server).await;
+    let mut sorted = ids.clone();
+    sorted.sort();
+
+    let payload = withdraw_payload(&mut server, &ids, std::slice::from_ref(&sorted[0])).await;
+    let (status, body) = post_json(&server.app, "/api/withdraw", &payload).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "SIGNATURE_INVALID");
+    assert_nothing_withdrawn(&server, &token, 2).await;
+
+    let missing = "ffffffff-ffff-4fff-bfff-ffffffffffff".to_owned();
+    let requested = vec![sorted[0].clone(), missing];
+    let payload = withdraw_payload(&mut server, &requested, &requested).await;
+    let (status, body) = post_json(&server.app, "/api/withdraw", &payload).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], "CONTRIBUTION_UNKNOWN");
+    assert_nothing_withdrawn(&server, &token, 2).await;
+
+    let mut unsorted = ids.clone();
+    unsorted.reverse();
+    let payload = withdraw_payload(&mut server, &unsorted, &sorted).await;
+    let (status, body) = post_json(&server.app, "/api/withdraw", &payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let feed: Value = serde_json::from_slice(&server.get(&format!("/status/{token}")).await.2)
+        .expect("status json");
+    let contributions = feed["activities"]
+        .as_array()
+        .expect("activities")
+        .iter()
+        .flat_map(|activity| activity["contributions"].as_array().expect("contributions"))
+        .collect::<Vec<_>>();
+    assert_eq!(contributions.len(), 2);
+    for contribution in contributions {
+        assert_eq!(contribution["status"], "withdrawn");
+    }
+    let withdrawals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM withdrawals")
+        .fetch_one(&server.db)
+        .await
+        .expect("withdrawals");
+    assert_eq!(withdrawals, 2);
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'hard_delete_blobs'")
+            .fetch_one(&server.db)
+            .await
+            .expect("deletion jobs");
+    assert_eq!(jobs, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn group_withdrawal_treats_expired_deferred_members_as_terminal() {
+    let mut server = TestServer::start().await;
+    let (status, colour) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "{colour}");
+    let token = colour["status_token"].as_str().expect("token").to_owned();
+    let colour_id = colour["contribution_id"]
+        .as_str()
+        .expect("colour contribution")
+        .to_owned();
+    let (status, expired) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "{expired}");
+    let expired_id = expired["contribution_id"]
+        .as_str()
+        .expect("expired contribution")
+        .to_owned();
+
+    let send_nonce = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    sqlx::query("UPDATE contributions SET send_nonce = ? WHERE id = ?")
+        .bind(send_nonce)
+        .bind(&colour_id)
+        .execute(&server.db)
+        .await
+        .expect("colour send");
+    sqlx::query(
+        "UPDATE contributions
+         SET send_nonce = ?, render_class = 'monochrome', status = 'withdrawn', deferred_until = 1
+         WHERE id = ?",
+    )
+    .bind(send_nonce)
+    .bind(&expired_id)
+    .execute(&server.db)
+    .await
+    .expect("expired send");
+
+    let feed: Value = serde_json::from_slice(&server.get(&format!("/status/{token}")).await.2)
+        .expect("status json");
+    let activities = feed["activities"].as_array().expect("activities");
+    assert_eq!(activities.len(), 1);
+    assert_eq!(
+        activities[0]["contributions"]
+            .as_array()
+            .expect("contributions")
+            .len(),
+        2
+    );
+
+    let ids = vec![colour_id.clone(), expired_id.clone()];
+    let payload = withdraw_payload(&mut server, &ids, &ids).await;
+    let (status, body) = post_json(&server.app, "/api/withdraw", &payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let feed: Value = serde_json::from_slice(&server.get(&format!("/status/{token}")).await.2)
+        .expect("status json");
+    let contributions = feed["activities"]
+        .as_array()
+        .expect("activities")
+        .iter()
+        .flat_map(|activity| activity["contributions"].as_array().expect("contributions"))
+        .collect::<Vec<_>>();
+    assert_eq!(contributions.len(), 2);
+    for contribution in contributions {
+        assert_eq!(contribution["status"], "withdrawn");
+    }
+    let withdrawals: Vec<String> = sqlx::query_scalar("SELECT contribution_id FROM withdrawals")
+        .fetch_all(&server.db)
+        .await
+        .expect("withdrawals");
+    assert_eq!(withdrawals, [colour_id.as_str()]);
+    let jobs: Vec<String> =
+        sqlx::query_scalar("SELECT payload FROM jobs WHERE kind = 'hard_delete_blobs'")
+            .fetch_all(&server.db)
+            .await
+            .expect("deletion jobs");
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].contains(colour_id.as_str()), "{jobs:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rss_activity_guid_survives_a_new_batch() {
+    let mut server = TestServer::start().await;
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, second_blobs) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let (status, first_body) = server
+        .upload_bytes(send_envelope(
+            nonce,
+            &send,
+            &first,
+            &first_blobs,
+            &assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{first_body}");
+    let token = first_body["status_token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    let first_rss = String::from_utf8(server.get(&format!("/status/{token}.rss")).await.2.to_vec())
+        .expect("rss");
+    let first_guid = rss_guid(&first_rss);
+
+    let (status, second_body) = server
+        .upload_bytes(send_envelope(
+            nonce,
+            &send,
+            &second,
+            &second_blobs,
+            &assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{second_body}");
+    let second_rss =
+        String::from_utf8(server.get(&format!("/status/{token}.rss")).await.2.to_vec())
+            .expect("rss");
+    let second_guid = rss_guid(&second_rss);
+
+    assert_eq!(first_guid, second_guid);
+    assert_eq!(second_rss.matches("<item>").count(), 1);
+}
+
+fn rss_guid(xml: &str) -> String {
+    const START: &str = "<guid isPermaLink=\"false\">";
+    let start = xml.find(START).expect("guid start") + START.len();
+    let end = xml[start..].find("</guid>").expect("guid end") + start;
+    xml[start..end].to_owned()
 }
 
 async fn signed_session_request(server: &mut TestServer, domain: RequestDomain) -> Value {
@@ -1506,6 +2748,291 @@ async fn pending_profile_session_requires_valid_pow_and_persists_nothing_on_fail
     }
 }
 
+/// Backup eligible and backed up, with a zero signature counter.
+struct SyncedPasskey {
+    key: SigningKey,
+    credential_id: Vec<u8>,
+}
+
+impl SyncedPasskey {
+    fn new(credential_id: &[u8]) -> Self {
+        Self {
+            key: SigningKey::from_slice(&[9u8; 32]).expect("valid P-256 scalar"),
+            credential_id: credential_id.to_vec(),
+        }
+    }
+
+    async fn register(&self, app: &Router, display_handle: &str, flags: u8) {
+        let (status, body) = self.register_response(app, display_handle, flags).await;
+        assert_eq!(status, StatusCode::OK, "register finish: {body}");
+    }
+
+    async fn register_response(
+        &self,
+        app: &Router,
+        display_handle: &str,
+        flags: u8,
+    ) -> (StatusCode, Value) {
+        let (status, body) = post_json(
+            app,
+            "/api/passkey/register/start",
+            &json!({ "display_handle": display_handle }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "register start: {body}");
+        let handle = body["handle"].as_str().expect("handle").to_owned();
+        let challenge = body["options"]["publicKey"]["challenge"]
+            .as_str()
+            .expect("challenge");
+        let client_data_json = format!(
+            "{{\"type\":\"webauthn.create\",\"challenge\":\"{challenge}\",\"origin\":\"{ORIGIN}\",\"crossOrigin\":false}}"
+        );
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&Sha256::digest(RP_ID.as_bytes()));
+        auth_data.push(flags);
+        auth_data.extend_from_slice(&0u32.to_be_bytes());
+        auth_data.extend_from_slice(&[0u8; 16]);
+        auth_data.extend_from_slice(
+            &u16::try_from(self.credential_id.len())
+                .expect("credential id fits")
+                .to_be_bytes(),
+        );
+        auth_data.extend_from_slice(&self.credential_id);
+        auth_data.extend_from_slice(&self.cose_key());
+        post_json(
+            app,
+            "/api/passkey/register/finish",
+            &json!({
+                "handle": handle,
+                "credential": {
+                    "id": b64(&self.credential_id),
+                    "rawId": b64(&self.credential_id),
+                    "type": "public-key",
+                    "response": {
+                        "clientDataJSON": b64(client_data_json.as_bytes()),
+                        "attestationObject": b64(&attestation_object(&auth_data)),
+                    },
+                    "clientExtensionResults": {},
+                },
+            }),
+        )
+        .await
+    }
+
+    fn cose_key(&self) -> Vec<u8> {
+        let affine = self.key.verifying_key().as_affine();
+        let mut out = Vec::new();
+        cbor_map(&mut out, 5);
+        out.extend_from_slice(&[0x01, 0x02]);
+        out.extend_from_slice(&[0x03, 0x26]);
+        out.extend_from_slice(&[0x20, 0x01]);
+        out.push(0x21);
+        cbor_bytes(&mut out, affine.x().as_ref());
+        out.push(0x22);
+        cbor_bytes(&mut out, affine.y().as_ref());
+        out
+    }
+
+    fn assertion(&self, challenge: &Challenge, flags: u8) -> Value {
+        let client_data_json = format!(
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"{ORIGIN}\",\"crossOrigin\":false}}",
+            b64(challenge.as_bytes())
+        );
+        let mut authenticator_data = Vec::new();
+        authenticator_data.extend_from_slice(&Sha256::digest(RP_ID.as_bytes()));
+        authenticator_data.push(flags);
+        authenticator_data.extend_from_slice(&0u32.to_be_bytes());
+        let mut message = authenticator_data.clone();
+        message.extend_from_slice(&Sha256::digest(client_data_json.as_bytes()));
+        let signature: Signature = self.key.sign(&message);
+        json!({
+            "credential_id": b64(&self.credential_id),
+            "authenticator_data": b64(&authenticator_data),
+            "client_data_json": b64(client_data_json.as_bytes()),
+            "signature": b64(signature.to_der().as_bytes()),
+        })
+    }
+}
+
+fn cbor_map(out: &mut Vec<u8>, entries: u8) {
+    out.push(0xa0 | entries);
+}
+
+fn cbor_text(out: &mut Vec<u8>, text: &str) {
+    let len = u8::try_from(text.len()).expect("short CBOR text");
+    assert!(len < 24, "CBOR text uses the short form");
+    out.push(0x60 | len);
+    out.extend_from_slice(text.as_bytes());
+}
+
+fn cbor_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u16::try_from(bytes.len()).expect("short CBOR byte string");
+    if len < 24 {
+        out.push(0x40 | len as u8);
+    } else if len < 0x100 {
+        out.push(0x58);
+        out.push(len as u8);
+    } else {
+        out.push(0x59);
+        out.extend_from_slice(&len.to_be_bytes());
+    }
+    out.extend_from_slice(bytes);
+}
+
+fn attestation_object(auth_data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    cbor_map(&mut out, 3);
+    cbor_text(&mut out, "fmt");
+    cbor_text(&mut out, "none");
+    cbor_text(&mut out, "attStmt");
+    cbor_map(&mut out, 0);
+    cbor_text(&mut out, "authData");
+    cbor_bytes(&mut out, auth_data);
+    out
+}
+
+fn synced_session_request(
+    nonce: &Nonce,
+    challenge: &Challenge,
+    assertion: Value,
+    pow: bool,
+) -> Value {
+    let mut body = assertion;
+    body["nonce"] = json!(b64(nonce.as_bytes()));
+    if pow {
+        body["pow"] = json!(
+            solve(challenge, 1, &pow_params(), 0)
+                .expect("pow")
+                .as_array()
+        );
+    }
+    body
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_synced_zero_counter_profile_completes_registration_and_session() {
+    let server = TestServer::start().await;
+    let passkey = SyncedPasskey::new(b"synced-profile");
+    passkey.register(&server.app, "Jake!", 0x5d).await;
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x1d),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["display_handle"], "Jake!");
+    assert_eq!(body["tier"], "new");
+    assert_eq!(body["roles"], json!([]));
+    let token = body["status_token"]
+        .as_str()
+        .expect("status token")
+        .to_owned();
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x1d),
+        false,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["display_handle"], "Jake!");
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::SessionRevoke, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x1d),
+        false,
+    );
+    let (status, body) = post_json(&server.app, "/api/session/revoke", &request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let restore = Request::builder()
+        .uri("/api/session")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("restore request");
+    let (status, _, body) = send(&server.app, restore).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let error: Value = serde_json::from_slice(&body).expect("error response");
+    assert_eq!(error["error"], "TOKEN_UNKNOWN");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_credential_id_an_assertion_cannot_carry_is_rejected_at_registration() {
+    let server = TestServer::start().await;
+    let empty = SyncedPasskey::new(b"");
+    let (status, body) = empty.register_response(&server.app, "Jake!", 0x5d).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "MALFORMED_ENVELOPE");
+
+    let longest = SyncedPasskey::new(&[3u8; looklab_upload::webauthn::MAX_CREDENTIAL_ID]);
+    let (status, body) = longest.register_response(&server.app, "Jake!", 0x5d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        longest.assertion(&challenge, 0x1d),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let longer = SyncedPasskey::new(&[4u8; looklab_upload::webauthn::MAX_CREDENTIAL_ID + 1]);
+    let (status, body) = longer.register_response(&server.app, "Jake!", 0x5d).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "MALFORMED_ENVELOPE");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assertion_without_user_verification_is_rejected() {
+    let server = TestServer::start().await;
+    let passkey = SyncedPasskey::new(b"unverified-profile");
+    passkey.register(&server.app, "Jake!", 0x5d).await;
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x19),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "SIGNATURE_INVALID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assertion_with_backup_state_but_no_eligibility_is_rejected() {
+    let server = TestServer::start().await;
+    let passkey = SyncedPasskey::new(b"device-bound-profile");
+    passkey.register(&server.app, "Jake!", 0x45).await;
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x15),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "SIGNATURE_INVALID");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn audit_log_is_append_only() {
     let server = TestServer::start().await;
@@ -1559,9 +3086,10 @@ async fn nothing_sensitive_reaches_disk_logs_or_responses() {
     let nonce = nonce_from_json(&body);
 
     let (manifest, blobs) = manifest(valid_settings());
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion(&challenge).await;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let bytes = envelope(nonce, &manifest, &blobs, Some(&serial), &assertion, &pow);
     let (status, body) = tcp_request(
         addr,
@@ -1587,10 +3115,11 @@ async fn nothing_sensitive_reaches_disk_logs_or_responses() {
     assert_eq!(status, 201);
     responses.push(body.clone());
     let nonce = nonce_from_json(&body);
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let mut assertion = server.assertion(&challenge).await;
     assertion.signature[0] ^= 0xff;
-    let pow = solve(&challenge, 2, &pow_params(), 0).expect("pow");
+    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
     let (status, body) = tcp_request(
         addr,
         "POST",
@@ -1606,9 +3135,10 @@ async fn nothing_sensitive_reaches_disk_logs_or_responses() {
     assert_eq!(status, 201);
     responses.push(body.clone());
     let nonce = nonce_from_json(&body);
-    let challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
+    let challenge = send_challenge(&nonce, &manifest);
     let assertion = server.assertion(&challenge).await;
-    let pow = bad_pow(&challenge, 2);
+    let pow = bad_pow(&pow_challenge, 2);
     let (status, body) = tcp_request(
         addr,
         "POST",
@@ -1669,6 +3199,15 @@ async fn nothing_sensitive_reaches_disk_logs_or_responses() {
     assert_absent("logs", &log_bytes, &hmac_needles);
     assert_absent("logs", &log_bytes, &key_needles);
     assert_absent("logs", &log_bytes, &sentinel_needles);
+    for address in [
+        "::1",
+        "2001:db8::1",
+        "2001:db8:0:0:0:0:0:1",
+        "::ffff:192.0.2.1",
+    ] {
+        assert!(contains_ipv6(&format!("peer=[{address}]:443")));
+    }
+    assert!(!contains_ipv6("looklab_server::error: request failed"));
     for run in text_runs(&log_bytes) {
         assert!(!contains_ipv4(&run), "IPv4 address in logs: {run}");
         assert!(!contains_ipv6(&run), "IPv6 address in logs: {run}");
@@ -1870,58 +3409,14 @@ fn contains_ipv4(text: &str) -> bool {
 }
 
 fn contains_ipv6(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        let starts_hex = bytes[index].is_ascii_hexdigit() || bytes[index] == b':';
-        if !starts_hex {
-            index += 1;
-            continue;
-        }
-        let start = index;
-        while index < bytes.len()
-            && (bytes[index].is_ascii_hexdigit() || bytes[index] == b':' || bytes[index] == b'.')
-        {
-            index += 1;
-        }
-        let token = &text[start..index];
-        if (token.matches(':').count() >= 3 || token.contains("::")) && valid_ipv6(token) {
-            return true;
-        }
-    }
-    false
-}
-
-fn valid_ipv6(token: &str) -> bool {
-    if token.is_empty() {
-        return false;
-    }
-    let (head, tail) = match token.split_once("::") {
-        Some((head, tail)) => {
-            if tail.contains("::") {
-                return false;
-            }
-            (head, Some(tail))
-        }
-        None => (token, None),
-    };
-    let head_groups: Vec<&str> = if head.is_empty() {
-        Vec::new()
-    } else {
-        head.split(':').collect()
-    };
-    let tail_groups: Vec<&str> = match tail {
-        Some("") => Vec::new(),
-        Some(tail) => tail.split(':').collect(),
-        None => Vec::new(),
-    };
-    let groups: Vec<&str> = head_groups.into_iter().chain(tail_groups).collect();
-    let total = groups.len() + usize::from(tail.is_some());
-    if total > 8 {
-        return false;
-    }
-    groups.iter().all(|group| {
-        !group.is_empty() && group.len() <= 4 && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+    text.split(|character: char| {
+        !character.is_ascii_alphanumeric() && !matches!(character, ':' | '.' | '_')
+    })
+    .any(|token| {
+        token
+            .trim_end_matches('.')
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok()
     })
 }
 
@@ -2017,6 +3512,54 @@ async fn grants_endorsements_and_root_admissions_are_logged_and_published() {
     );
 
     let scope = json!({ "rules": [{ "body": "fujifilm/x-t5", "look": Value::Null }] });
+    sqlx::query("UPDATE contributions SET render_class = 'monochrome' WHERE id = ?")
+        .bind(&contribution_id)
+        .execute(&server.db)
+        .await
+        .expect("deferred contribution");
+    let image_id: String =
+        sqlx::query_scalar("SELECT id FROM contribution_images WHERE contribution_id = ? LIMIT 1")
+            .bind(&contribution_id)
+            .fetch_one(&server.db)
+            .await
+            .expect("image");
+    let deferred_scope_bytes = serde_json::to_vec(&scope).expect("scope");
+    for reference in [
+        format!("contribution:{contribution_id}"),
+        format!("image:{image_id}"),
+        "contribution:not-a-uuid".to_owned(),
+        format!("contribution:{}", uuid::Uuid::new_v4()),
+    ] {
+        let deferred_evidence = vec![reference];
+        let deferred_bytes = serde_json::to_vec(&deferred_evidence).expect("deferred evidence");
+        let digest = bind_fields(&[
+            endorsed.as_bytes(),
+            &deferred_scope_bytes,
+            b"reviewed chart",
+            &deferred_bytes,
+        ]);
+        let (status, body) = server
+            .post_signed(
+                "/api/seeder/endorse",
+                "endorse",
+                &digest,
+                json!({
+                    "subject": endorsed,
+                    "scope": scope.clone(),
+                    "reason": "reviewed chart",
+                    "evidence": deferred_evidence,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "deferred endorse: {body}");
+        assert_eq!(body["error"], "MALFORMED_ENVELOPE");
+    }
+    sqlx::query("UPDATE contributions SET render_class = 'colour' WHERE id = ?")
+        .bind(&contribution_id)
+        .execute(&server.db)
+        .await
+        .expect("colour contribution");
+
     let evidence = vec!["chart-session-1"];
     let scope_bytes = serde_json::to_vec(&scope).expect("scope");
     let evidence_bytes = serde_json::to_vec(&evidence).expect("evidence");
@@ -2083,6 +3626,7 @@ async fn grants_endorsements_and_root_admissions_are_logged_and_published() {
         &server.db,
         &look,
         looklab_trust::VersionId::new(1),
+        looklab_server::admin::VersionStatus::Published,
         &artifacts,
         std::slice::from_ref(&root_typed),
     )
@@ -2237,8 +3781,9 @@ async fn moderator_session_serves_the_queue_and_records_decisions() {
             "INSERT INTO contributions
              (id, credential_id, batch_manifest_hash, signature, pow, kind, serial_hmac, intent,
               body_id, firmware_version, sim_key, settings, status, created_at)
-             VALUES (?, ?, x'00', x'00', 'pow', 'chart', x'abab', 'native',
-                     'fujifilm/x-t5', '2.10', 'classic-chrome', '{}', 'pending', 0)",
+             VALUES (?, ?, x'00', x'00', 'pow', 'chart',
+                     x'0101010101010101010101010101010101010101010101010101010101010101',
+                     'native', 'fujifilm/x-t5', '2.10', 'classic-chrome', '{}', 'pending', 0)",
         )
         .bind(id.as_str())
         .bind(credential)
@@ -2381,11 +3926,28 @@ async fn moderator_revert_route_republishes_and_requests_a_refit() {
         &server.db,
         &look,
         looklab_trust::VersionId::new(1),
+        admin::VersionStatus::Published,
         &artifacts,
         &[],
     )
     .await
     .expect("version 1");
+    sqlx::query(
+        "INSERT INTO model_subjects (key, kind, family, created_at)
+         VALUES ('shared_family:classic-chrome', 'shared_family', 'classic-chrome', 0)
+         ON CONFLICT(key) DO NOTHING",
+    )
+    .execute(&server.db)
+    .await
+    .expect("subject");
+    sqlx::query(
+        "INSERT INTO model_subject_revisions (subject_key, revision, role, recorded_at)
+         VALUES ('shared_family:classic-chrome', 1, 'target', 0)
+         ON CONFLICT(subject_key, revision) DO NOTHING",
+    )
+    .execute(&server.db)
+    .await
+    .expect("accepted marker");
 
     let (status, reply) = server
         .revert_look(
@@ -2393,7 +3955,7 @@ async fn moderator_revert_route_republishes_and_requests_a_refit() {
             json!({
                 "look": "classic-chrome",
                 "target_version": 1,
-                "excluded_credentials": [],
+                "rejected_contributions": [],
                 "reason": "restore the released fit",
             }),
         )
@@ -2411,11 +3973,10 @@ async fn moderator_revert_route_republishes_and_requests_a_refit() {
     .expect("new manifest");
     assert_eq!(manifests, 1);
 
-    let audit: String =
-        sqlx::query_scalar("SELECT type FROM audit_log ORDER BY seq DESC LIMIT 1")
-            .fetch_one(&server.db)
-            .await
-            .expect("audit");
+    let audit: String = sqlx::query_scalar("SELECT type FROM audit_log ORDER BY seq DESC LIMIT 1")
+        .fetch_one(&server.db)
+        .await
+        .expect("audit");
     assert_eq!(audit, "revert");
     let queued: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM jobs WHERE kind = 'revert_refit' AND status = 'queued'",
@@ -2515,6 +4076,7 @@ async fn admin_and_public_endpoints_publish_no_secrets() {
         &server.db,
         &look,
         looklab_trust::VersionId::new(1),
+        looklab_server::admin::VersionStatus::Published,
         &[ManifestArtifact {
             name: "look.json".to_owned(),
             sha256: "cd".repeat(32),
@@ -2618,15 +4180,16 @@ struct MessageSigningBody<'a> {
 }
 
 impl TestServer {
-    async fn submit_proposal(
+    async fn signed_proposal_body(
         &mut self,
-        kind: &str,
+        kind: ProposalKind,
         payload: &str,
         fixtures: &[FixtureDonation],
         pow_ok: bool,
-    ) -> (StatusCode, Value) {
+    ) -> Value {
+        let kind_text = kind.to_string();
         let signing = ProposalSigningBody {
-            kind,
+            kind: &kind_text,
             payload,
             fixtures,
         };
@@ -2640,7 +4203,47 @@ impl TestServer {
         } else {
             bad_pow(&challenge, 1)
         };
-        let body = json!({
+        json!({
+            "kind": kind,
+            "payload": payload,
+            "fixtures": serde_json::to_value(fixtures).expect("fixtures json"),
+            "pow": pow.as_array().to_vec(),
+            "nonce": b64(nonce.as_bytes()),
+            "credential_id": b64(&assertion.credential_id),
+            "authenticator_data": b64(&assertion.authenticator_data),
+            "client_data_json": b64(&assertion.client_data_json),
+            "signature": b64(&assertion.signature),
+        })
+    }
+
+    async fn submit_proposal(
+        &mut self,
+        kind: &str,
+        payload: &str,
+        fixtures: &[FixtureDonation],
+        pow_ok: bool,
+    ) -> (StatusCode, Value) {
+        let kind = kind.parse::<ProposalKind>().expect("proposal kind");
+        let body = self
+            .signed_proposal_body(kind, payload, fixtures, pow_ok)
+            .await;
+        post_json(&self.app, "/api/proposals", &body).await
+    }
+
+    async fn submit_lut(&mut self, kind: &str, payload: &str, bytes: &[u8]) -> (StatusCode, Value) {
+        let fixtures: &[FixtureDonation] = &[];
+        let signing = ProposalSigningBody {
+            kind,
+            payload,
+            fixtures,
+        };
+        let signed_bytes = serde_json::to_vec(&signing).expect("signing body");
+        let nonce = self.nonce().await;
+        let digest = action_digest("proposal", &signed_bytes);
+        let challenge = Challenge::new(&nonce, &digest);
+        let assertion = self.assertion(&challenge).await;
+        let pow = solve(&challenge, 1, &pow_params(), 0).expect("proof-of-work");
+        let header = json!({
             "kind": kind,
             "payload": payload,
             "fixtures": serde_json::to_value(fixtures).expect("fixtures json"),
@@ -2651,7 +4254,16 @@ impl TestServer {
             "client_data_json": b64(&assertion.client_data_json),
             "signature": b64(&assertion.signature),
         });
-        post_json(&self.app, "/api/proposals", &body).await
+        let header = serde_json::to_vec(&header).expect("header");
+        let body = frame_lut_proposal(&header, bytes).expect("frame");
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/proposals/lut")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(body))
+            .expect("request");
+        let (status, _, body) = send(&self.app, request).await;
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
     }
 
     async fn donate_fixture(&mut self, file: &str, bytes: &[u8]) -> (StatusCode, Value) {
@@ -2715,9 +4327,19 @@ impl TestServer {
     }
 
     async fn decide(&self, token: &str, proposal: &str, reason: &str) -> (StatusCode, Value) {
+        self.decide_with(token, proposal, "approve", reason).await
+    }
+
+    async fn decide_with(
+        &self,
+        token: &str,
+        proposal: &str,
+        decision: &str,
+        reason: &str,
+    ) -> (StatusCode, Value) {
         let decision = json!({
             "proposal_id": proposal,
-            "decision": "approve",
+            "decision": decision,
             "reason": reason,
         });
         let request = Request::builder()
@@ -2931,6 +4553,61 @@ async fn proposal_decision_writes_a_validated_snapshot() {
             .join(looklab_schema::body_export_path(&body.id))
             .is_file()
     );
+    assert!(
+        snapshot
+            .join(looklab_schema::body_export_path(
+                &looklab_schema::BodyId::new("fujifilm/x-t4").expect("body id")
+            ))
+            .is_file()
+    );
+    let profile = looklab_schema::validate_interface_profile(include_str!(
+        "../../../data/interfaces/example-app-lut3d-v1.yaml"
+    ))
+    .expect("interface");
+    assert!(
+        snapshot
+            .join(looklab_schema::interface_export_path(&profile.id))
+            .is_file()
+    );
+
+    let (published, blobs) = manifest_at(CommunitySnapshotVersion::new(1), valid_settings());
+    let (status, body) = server.upload_manifest(&published, &blobs, None).await;
+    assert_eq!(status, StatusCode::CREATED, "v1 upload: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_requests_a_catalog_publication_without_a_fit() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let (status, body) = server
+        .submit_proposal(
+            "body",
+            include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml"),
+            &[],
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "submit: {body}");
+    let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+
+    let token = server.moderator_token().await;
+    let (status, body) = server.decide(&token, &proposal, "validated locally").await;
+    assert_eq!(status, StatusCode::OK, "decision: {body}");
+
+    let generation: i64 = sqlx::query_scalar("SELECT generation FROM publication WHERE id = 1")
+        .fetch_one(&server.db)
+        .await
+        .expect("publication generation");
+    assert_eq!(generation, 1, "approval records a publication request");
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'publish_site' AND status = 'queued'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("publish job");
+    assert_eq!(queued, 1, "approval queues a catalog publisher");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3030,6 +4707,69 @@ makernote: { tag: FilmMode, value: 1792 }
     assert!(manifest.contains("file = \"fujifilm-x-t5-1.00.raf\""));
     assert!(manifest.contains("license = \"CC0-1.0\""));
     assert!(manifest.contains("Donated by tester on 2026-11-04"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_proposal_body_cannot_be_replayed() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let profile = include_str!("../../../data/interfaces/example-app-lut3d-v1.yaml");
+    let body = server
+        .signed_proposal_body(ProposalKind::InterfaceProfile, profile, &[], true)
+        .await;
+    let (status, response) = post_json(&server.app, "/api/proposals", &body).await;
+    assert_eq!(status, StatusCode::CREATED, "first: {response}");
+    let (status, response) = post_json(&server.app, "/api/proposals", &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "replay: {response}");
+    assert_eq!(response["error"], "NONCE_REPLAYED");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_fixture_donation_keeps_its_file_for_the_worker_sweep() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let bytes = b"looklab fixture bytes";
+    sqlx::query(
+        "CREATE TRIGGER reject_fixture BEFORE INSERT ON fixture_uploads
+         BEGIN SELECT RAISE(ABORT, 'reject'); END",
+    )
+    .execute(&server.db)
+    .await
+    .expect("trigger");
+
+    let (status, body) = server.donate_fixture("looklab-test.raf", bytes).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "donation: {body}"
+    );
+    let hash = hex(&Sha256::digest(bytes));
+    assert!(server.blob_dir.join(&hash).exists());
+    let staged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blob_staging")
+        .fetch_one(&server.db)
+        .await
+        .expect("reservation");
+    assert_eq!(staged, 1);
+    let fixtures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fixture_uploads")
+        .fetch_one(&server.db)
+        .await
+        .expect("fixture rows");
+    assert_eq!(fixtures, 0);
+
+    sqlx::query("DROP TRIGGER reject_fixture")
+        .execute(&server.db)
+        .await
+        .expect("drop trigger");
+    let (status, body) = server.donate_fixture("looklab-test.raf", bytes).await;
+    assert_eq!(status, StatusCode::CREATED, "retry: {body}");
+    assert!(server.blob_dir.join(&hash).exists());
+    let fixtures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fixture_uploads")
+        .fetch_one(&server.db)
+        .await
+        .expect("fixture rows");
+    assert_eq!(fixtures, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3147,6 +4887,400 @@ makernote: { tag: FilmMode, value: 1792 }
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_first_schema_needs_a_registered_body_and_then_publishes() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let (status, _, body) = server.get("/api/body-context").await;
+    assert_eq!(status, StatusCode::OK, "body context: {body:?}");
+    let context: Value = serde_json::from_slice(&body).expect("body context json");
+    assert!(
+        !context["bodies"]
+            .as_array()
+            .expect("bodies")
+            .iter()
+            .any(|body| body["id"] == "fujifilm/x-m1")
+    );
+
+    let schema = "\
+body: fujifilm/x-m1
+epochs:
+- id: 1
+  firmware: { from: \"1.00\", to: \"1.99\" }
+  native_sims: []
+  exposure_modes: []
+  controls: []
+  solve_plan: []
+";
+    let (status, body) = server
+        .submit_proposal("schema_change", schema, &[], true)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "schema submit: {body}");
+    let schema_proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    let token = server.moderator_token().await;
+    let (status, body) = server
+        .decide(&token, &schema_proposal, "the body is not registered")
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "schema before body: {body}"
+    );
+    assert!(!server.dir.path().join("community/v1").exists());
+
+    let body_yaml = "\
+id: fujifilm/x-m1
+make: Fujifilm
+model: X-M1
+exif_aliases:
+- X-M1
+kind: camera
+capabilities:
+  in_camera_raw_conversion: true
+  jpeg_color_spaces: []
+  heif: false
+status: proposed
+mapping_status: provisional
+";
+    let (status, body) = server.submit_proposal("body", body_yaml, &[], true).await;
+    assert_eq!(status, StatusCode::CREATED, "body submit: {body}");
+    let body_proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    let (status, body) = server
+        .decide(&token, &body_proposal, "register the body")
+        .await;
+    assert_eq!(status, StatusCode::OK, "body decision: {body}");
+    assert_eq!(body["snapshot"]["version"], 1);
+
+    let (status, _, body) = server.get("/api/body-context").await;
+    assert_eq!(status, StatusCode::OK, "body context: {body:?}");
+    let context: Value = serde_json::from_slice(&body).expect("body context json");
+    assert!(
+        context["bodies"]
+            .as_array()
+            .expect("bodies")
+            .iter()
+            .any(|body| body["id"] == "fujifilm/x-m1")
+    );
+
+    let (status, body) = server
+        .submit_proposal("schema_change", schema, &[], true)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "schema submit: {body}");
+    let schema_proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    let (status, body) = server
+        .decide(
+            &token,
+            &schema_proposal,
+            "first schema for the registered body",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "schema decision: {body}");
+    assert_eq!(body["snapshot"]["version"], 2);
+    let body_id = BodyId::new("fujifilm/x-m1").expect("body id");
+    assert!(
+        server
+            .dir
+            .path()
+            .join("community/v2")
+            .join(looklab_schema::schema_export_path(&body_id))
+            .is_file()
+    );
+
+    let (status, _, body) = server.get("/api/body-context").await;
+    assert_eq!(status, StatusCode::OK, "body context: {body:?}");
+    let context: Value = serde_json::from_slice(&body).expect("body context json");
+    assert!(
+        !context["bodies"]
+            .as_array()
+            .expect("bodies")
+            .iter()
+            .any(|body| body["id"] == "fujifilm/x-m1")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_schema_reaches_a_body_shipped_after_the_active_snapshot() {
+    let mut server = TestServer::start_with_shipped_copy().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let (status, body) = server
+        .submit_proposal(
+            "body",
+            include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml"),
+            &[],
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "body submit: {body}");
+    let body_proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    let token = server.moderator_token().await;
+    let (status, body) = server
+        .decide(&token, &body_proposal, "seed the first snapshot")
+        .await;
+    assert_eq!(status, StatusCode::OK, "body decision: {body}");
+    assert_eq!(body["snapshot"]["version"], 1);
+
+    std::fs::write(
+        server
+            .state
+            .config
+            .bodies_dir
+            .join("fujifilm-x-m2.body.yaml"),
+        "\
+id: fujifilm/x-m2
+make: Fujifilm
+model: X-M2
+exif_aliases:
+- X-M2
+kind: camera
+capabilities:
+  in_camera_raw_conversion: true
+  jpeg_color_spaces: []
+  heif: false
+status: proposed
+mapping_status: provisional
+",
+    )
+    .expect("shipped body entity");
+
+    let (status, _, body) = server.get("/api/body-context").await;
+    assert_eq!(status, StatusCode::OK, "body context: {body:?}");
+    let context: Value = serde_json::from_slice(&body).expect("body context json");
+    assert!(
+        context["bodies"]
+            .as_array()
+            .expect("bodies")
+            .iter()
+            .any(|body| body["id"] == "fujifilm/x-m2"),
+        "the shipped registration is offered for a first schema"
+    );
+
+    let schema = "\
+body: fujifilm/x-m2
+epochs:
+- id: 1
+  firmware: { from: \"1.00\", to: \"1.99\" }
+  native_sims: []
+  exposure_modes: []
+  controls: []
+  solve_plan: []
+";
+    let (status, body) = server
+        .submit_proposal("schema_change", schema, &[], true)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "schema submit: {body}");
+    let schema_proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    let (status, body) = server
+        .decide(
+            &token,
+            &schema_proposal,
+            "first schema for the shipped body",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "schema decision: {body}");
+    assert_eq!(body["snapshot"]["version"], 2);
+
+    let body_id = BodyId::new("fujifilm/x-m2").expect("body id");
+    let v2 = server.dir.path().join("community/v2");
+    assert!(
+        v2.join(looklab_schema::body_export_path(&body_id))
+            .is_file(),
+        "the new snapshot carries the shipped registration"
+    );
+    assert!(
+        v2.join(looklab_schema::schema_export_path(&body_id))
+            .is_file()
+    );
+    let failures = looklab_schema::validate_snapshot_dir(&v2).expect("snapshot walk");
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(
+        !server
+            .dir
+            .path()
+            .join("community/v1")
+            .join(looklab_schema::body_export_path(&body_id))
+            .exists(),
+        "the older snapshot keeps its documents"
+    );
+
+    let (status, _, body) = server.get("/api/body-context").await;
+    assert_eq!(status, StatusCode::OK, "body context: {body:?}");
+    let context: Value = serde_json::from_slice(&body).expect("body context json");
+    assert!(
+        !context["bodies"]
+            .as_array()
+            .expect("bodies")
+            .iter()
+            .any(|body| body["id"] == "fujifilm/x-m2")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approved_snapshot_survives_a_failed_publication_transition() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let payload = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
+    let (status, body) = server.submit_proposal("body", payload, &[], true).await;
+    assert_eq!(status, StatusCode::CREATED, "submit: {body}");
+    let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    let token = server.moderator_token().await;
+    sqlx::query(
+        "CREATE TRIGGER fail_snapshot_transition
+         BEFORE UPDATE OF publication ON proposals
+         WHEN NEW.publication = 'published'
+         BEGIN SELECT RAISE(ABORT, 'publication fault'); END",
+    )
+    .execute(&server.db)
+    .await
+    .expect("publication fault");
+    let (status, body) = server.decide(&token, &proposal, "validated locally").await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "decision: {body}"
+    );
+    let activation: (i64, String) = sqlx::query_as(
+        "SELECT version, content_hash FROM community_snapshot_activation WHERE id = 1",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("active snapshot");
+    assert_eq!(activation.0, 1);
+    let recorded: (i64, String) =
+        sqlx::query_as("SELECT published_version, published_hash FROM proposals WHERE id = ?")
+            .bind(&proposal)
+            .fetch_one(&server.db)
+            .await
+            .expect("recorded snapshot identity");
+    assert_eq!(recorded.0, activation.0);
+    assert_eq!(recorded.1, activation.1);
+
+    let (approved, blobs) = manifest_at(CommunitySnapshotVersion::new(1), valid_settings());
+    let (status, body) = server.upload_manifest(&approved, &blobs, None).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "approved snapshot upload: {body}"
+    );
+
+    sqlx::query("DROP TRIGGER fail_snapshot_transition")
+        .execute(&server.db)
+        .await
+        .expect("remove publication fault");
+    let (status, body) = server.submit_proposal("body", payload, &[], true).await;
+    assert_eq!(status, StatusCode::CREATED, "next submit: {body}");
+    let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    let (status, body) = server.decide(&token, &proposal, "validated locally").await;
+    assert_eq!(status, StatusCode::OK, "next decision: {body}");
+    assert_eq!(body["snapshot"]["version"], 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_activation_keeps_the_target_unexposed() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let payload = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
+    let (status, body) = server.submit_proposal("body", payload, &[], true).await;
+    assert_eq!(status, StatusCode::CREATED, "submit: {body}");
+    let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    let token = server.moderator_token().await;
+    sqlx::query(
+        "CREATE TRIGGER fail_snapshot_activation
+         BEFORE INSERT ON community_snapshot_activation
+         BEGIN SELECT RAISE(ABORT, 'activation fault'); END",
+    )
+    .execute(&server.db)
+    .await
+    .expect("activation fault");
+    let (status, body) = server.decide(&token, &proposal, "validated locally").await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "decision: {body}"
+    );
+    let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM community_snapshot_activation")
+        .fetch_one(&server.db)
+        .await
+        .expect("activation rows");
+    assert_eq!(active, 0);
+    assert!(server.dir.path().join("community/v1").is_dir());
+    let (approved, blobs) = manifest_at(CommunitySnapshotVersion::new(1), valid_settings());
+    let (status, body) = server.upload_manifest(&approved, &blobs, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unexposed: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_snapshot_does_not_replace_a_newer_activation() {
+    let mut server = TestServer::start().await;
+    sqlx::query(
+        "INSERT INTO community_snapshot_activation
+         (id, version, content_hash, activated_at)
+         VALUES (1, 2, ?, 0)",
+    )
+    .bind("0".repeat(64))
+    .execute(&server.db)
+    .await
+    .expect("newer activation");
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let payload = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
+    let (status, body) = server.submit_proposal("body", payload, &[], true).await;
+    assert_eq!(status, StatusCode::CREATED, "submit: {body}");
+    let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    let token = server.moderator_token().await;
+    let (status, body) = server.decide(&token, &proposal, "validated locally").await;
+    assert_eq!(status, StatusCode::OK, "decision: {body}");
+    let active: i64 =
+        sqlx::query_scalar("SELECT version FROM community_snapshot_activation WHERE id = 1")
+            .fetch_one(&server.db)
+            .await
+            .expect("active snapshot");
+    assert_eq!(active, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrelated_reload_fault_preserves_the_approved_target() {
+    let mut server = TestServer::start().await;
+    let (status, body) = server.upload_valid(None).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let payload = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
+    let token = server.moderator_token().await;
+    for (index, expected) in [("first", 1), ("second", 2)] {
+        let (status, body) = server.submit_proposal("body", payload, &[], true).await;
+        assert_eq!(status, StatusCode::CREATED, "{index} submit: {body}");
+        let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+        let (status, body) = server.decide(&token, &proposal, "validated locally").await;
+        assert_eq!(status, StatusCode::OK, "{index} decision: {body}");
+        assert_eq!(body["snapshot"]["version"], expected);
+    }
+    let v1 = server.dir.path().join("community/v1");
+    assert!(v1.is_dir());
+    std::fs::write(v1.join("bodies/fujifilm-x-t5.yaml"), b"not: a schema\n")
+        .expect("corrupt retained snapshot");
+
+    let (status, body) = server.submit_proposal("body", payload, &[], true).await;
+    assert_eq!(status, StatusCode::CREATED, "third submit: {body}");
+    let proposal = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    let (status, body) = server.decide(&token, &proposal, "validated locally").await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "third decision: {body}"
+    );
+    assert!(server.dir.path().join("community/v3").is_dir());
+    let active: i64 =
+        sqlx::query_scalar("SELECT version FROM community_snapshot_activation WHERE id = 1")
+            .fetch_one(&server.db)
+            .await
+            .expect("active snapshot");
+    assert_eq!(active, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_pending_publication_is_retried_before_the_next_decision() {
     let mut server = TestServer::start().await;
     let (status, body) = server.upload_valid(None).await;
@@ -3155,16 +5289,16 @@ async fn a_pending_publication_is_retried_before_the_next_decision() {
 
     let body_yaml = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
     let body = looklab_schema::validate_body(body_yaml).expect("body");
-    let files = vec![
-        (
-            looklab_schema::body_export_path(&body.id),
-            body_yaml.as_bytes().to_vec(),
-        ),
-        (
-            looklab_schema::FIXTURE_MANIFEST.to_owned(),
-            looklab_schema::fixture_manifest_toml(&[]).into_bytes(),
-        ),
-    ];
+    let mut files = shipped_baseline_files();
+    files.retain(|(path, _)| path != &looklab_schema::body_export_path(&body.id));
+    files.push((
+        looklab_schema::body_export_path(&body.id),
+        body_yaml.as_bytes().to_vec(),
+    ));
+    files.push((
+        looklab_schema::FIXTURE_MANIFEST.to_owned(),
+        looklab_schema::fixture_manifest_toml(&[]).into_bytes(),
+    ));
     let hash = looklab_schema::content_hash(&files);
     let unpublished = looklab_server::ProposalId::new();
     sqlx::query(
@@ -3293,4 +5427,2354 @@ mapping_status: provisional
 ";
     let (status, body) = server.submit_proposal("body", anchored, &[], true).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "aliased body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continuation_keeps_the_newer_assertion_state() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, second_blobs) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    assert_eq!(
+        server
+            .upload_bytes(send_envelope(
+                nonce,
+                &send,
+                &first,
+                &first_blobs,
+                &assertion
+            ))
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+
+    let newer = signed_session_request(&mut server, RequestDomain::Session).await;
+    let (status, body) = post_json(&server.app, "/api/session", &newer).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        server
+            .upload_bytes(send_envelope(
+                nonce,
+                &send,
+                &second,
+                &second_blobs,
+                &assertion
+            ))
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+
+    let credential_json: String = sqlx::query_scalar("SELECT webauthn_credential FROM credentials")
+        .fetch_one(&server.db)
+        .await
+        .expect("credential");
+    let passkey: webauthn_rs::prelude::Passkey =
+        serde_json::from_str(&credential_json).expect("stored passkey");
+    let credential: webauthn_rs::prelude::Credential = passkey.into();
+    assert_eq!(credential.counter, 2);
+
+    // SoftPasskey cannot emit two assertions with the same counter, so the
+    // equal-counter transition is covered by the store CAS tests.
+    let follow_on = signed_session_request(&mut server, RequestDomain::Session).await;
+    let (status, body) = post_json(&server.app, "/api/session", &follow_on).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+fn documented_camera(id: &str) -> ManualCamera {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../data/manuals")
+        .join(format!("{}.yaml", id.replace('/', "-")));
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let catalog = validate_manual_catalog(&source).expect("manual catalog");
+    catalog
+        .camera(&BodyId::new(id).expect("body id"))
+        .cloned()
+        .expect("documented camera")
+}
+
+fn confirmation_for(camera: &ManualCamera, key: &str, firmware: &str) -> ManualConfirmation {
+    confirmation_with(camera, key, firmware, Finding::Matches)
+}
+
+fn confirmation_with(
+    camera: &ManualCamera,
+    key: &str,
+    firmware: &str,
+    finding: Finding,
+) -> ManualConfirmation {
+    let capability = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key.as_str() == key)
+        .unwrap_or_else(|| panic!("control {key}"));
+    ManualConfirmation {
+        version: looklab_schema::MANUAL_CONFIRMATION_VERSION,
+        camera: camera.id.clone(),
+        camera_digest: camera.definition_digest(),
+        firmware: ReportedFirmware::new(firmware).expect("firmware"),
+        scope: ConfirmationScope::Controls {
+            keys: vec![capability.key],
+        },
+        observations: vec![ControlObservation {
+            key: capability.key,
+            definition_digest: capability.definition_digest(camera),
+            finding,
+        }],
+    }
+}
+
+fn confirmation_request(
+    nonce: &Nonce,
+    send: &SendManifest,
+    assertion: &WebAuthnAssertion,
+    confirmation: &ManualConfirmation,
+) -> ManualConfirmationRequest {
+    ManualConfirmationRequest {
+        nonce: b64(nonce.as_bytes()),
+        credential_id: b64(&assertion.credential_id),
+        authenticator_data: b64(&assertion.authenticator_data),
+        client_data_json: b64(&assertion.client_data_json),
+        signature: b64(&assertion.signature),
+        send_manifest: b64(&canonical_send_manifest_bytes(send)),
+        confirmation: confirmation.clone(),
+    }
+}
+
+fn envelope_with_send(
+    nonce: Nonce,
+    send: &SendManifest,
+    manifest: &BatchManifest,
+    blobs: &[Vec<u8>],
+    serial: Option<&RawSerial>,
+    assertion: &WebAuthnAssertion,
+) -> Vec<u8> {
+    let pow = solve(
+        &Challenge::new(&nonce, &manifest_hash(manifest)),
+        u32::try_from(manifest.images.len()).expect("image count"),
+        &pow_params(),
+        0,
+    )
+    .expect("proof-of-work");
+    encode_envelope(&EnvelopeParts {
+        nonce,
+        send_manifest: send,
+        manifest,
+        assertion,
+        pow: &pow,
+        serial,
+        blobs,
+    })
+}
+
+async fn standalone_confirmation_request(
+    server: &mut TestServer,
+    confirmation: &ManualConfirmation,
+) -> ManualConfirmationRequest {
+    let nonce = server.nonce().await;
+    let digest = confirmation.digest();
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    confirmation_request(&nonce, &send, &assertion, confirmation)
+}
+
+async fn synced_confirmation_request(
+    server: &mut TestServer,
+    passkey: &SyncedPasskey,
+    confirmation: &ManualConfirmation,
+) -> ManualConfirmationRequest {
+    let nonce = server.nonce().await;
+    let digest = confirmation.digest();
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = passkey.assertion(&challenge, 0x1d);
+    ManualConfirmationRequest {
+        nonce: b64(nonce.as_bytes()),
+        credential_id: assertion["credential_id"]
+            .as_str()
+            .expect("credential id")
+            .to_owned(),
+        authenticator_data: assertion["authenticator_data"]
+            .as_str()
+            .expect("authenticator data")
+            .to_owned(),
+        client_data_json: assertion["client_data_json"]
+            .as_str()
+            .expect("client data")
+            .to_owned(),
+        signature: assertion["signature"]
+            .as_str()
+            .expect("signature")
+            .to_owned(),
+        send_manifest: b64(&canonical_send_manifest_bytes(&send)),
+        confirmation: confirmation.clone(),
+    }
+}
+
+async fn post_standalone_confirmation(
+    server: &mut TestServer,
+    confirmation: &ManualConfirmation,
+) -> StatusCode {
+    let request = standalone_confirmation_request(server, confirmation).await;
+    post_confirmation(&server.app, &request).await.0
+}
+
+async fn post_standalone_confirmation_response(
+    server: &mut TestServer,
+    confirmation: &ManualConfirmation,
+) -> (StatusCode, Value) {
+    let request = standalone_confirmation_request(server, confirmation).await;
+    post_confirmation(&server.app, &request).await
+}
+
+async fn insert_serial_contribution(db: &SqlitePool, id: &str, credential: &str, hmac: [u8; 32]) {
+    sqlx::query(
+        "INSERT INTO contributions
+         (id, credential_id, batch_manifest_hash, signature, pow, kind, serial_hmac, intent,
+          body_id, firmware_version, sim_key, settings, status, created_at)
+         VALUES (?, ?, x'00', x'00', 'pow', 'chart', ?, 'native',
+                 'fujifilm/x-t5', '2.10', 'classic-chrome', '{}', 'pending', 0)",
+    )
+    .bind(id)
+    .bind(credential)
+    .bind(hmac.to_vec())
+    .execute(db)
+    .await
+    .expect("contribution");
+}
+
+async fn insert_confirmation(
+    db: &SqlitePool,
+    credential: &str,
+    camera: &ManualCamera,
+    key: &str,
+    finding: &str,
+    payload: u8,
+    created_at: i64,
+) {
+    insert_confirmation_with_firmware(
+        db,
+        credential,
+        camera,
+        key,
+        &ReportedFirmware::new("2.10").expect("firmware"),
+        finding,
+        payload,
+        created_at,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_confirmation_with_firmware(
+    db: &SqlitePool,
+    credential: &str,
+    camera: &ManualCamera,
+    key: &str,
+    firmware: &ReportedFirmware,
+    finding: &str,
+    payload: u8,
+    created_at: i64,
+) {
+    let capability = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key.as_str() == key)
+        .expect("control");
+    let result = sqlx::query(
+        "INSERT INTO manual_confirmations
+         (credential_id, camera_id, camera_digest, firmware, scope_kind, scope_json,
+          payload_digest, assertion_hash, send_nonce, created_at)
+         VALUES (?, ?, ?, ?, 'controls', '{}', ?, x'00', NULL, ?)",
+    )
+    .bind(credential)
+    .bind(camera.id.as_str())
+    .bind(camera.definition_digest().as_bytes().as_slice())
+    .bind(firmware.as_str())
+    .bind([payload; 32].to_vec())
+    .bind(created_at)
+    .execute(db)
+    .await
+    .expect("confirmation");
+    sqlx::query(
+        "INSERT INTO manual_observations
+         (confirmation_id, capability_key, definition_digest, finding_json)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(result.last_insert_rowid())
+    .bind(key)
+    .bind(capability.definition_digest(camera).as_bytes().as_slice())
+    .bind(finding)
+    .execute(db)
+    .await
+    .expect("observation");
+    sqlx::query(
+        "INSERT INTO manual_confirmation_occurrences (confirmation_id, send_nonce, received_at)
+         VALUES (?, ?, ?)",
+    )
+    .bind(result.last_insert_rowid())
+    .bind(format!("seed-{payload:02x}"))
+    .bind(created_at)
+    .execute(db)
+    .await
+    .expect("occurrence");
+}
+
+fn summary_control<'a>(summary: &'a Value, key: &str) -> &'a Value {
+    summary["controls"]
+        .as_array()
+        .expect("controls")
+        .iter()
+        .find(|control| control["key"] == key)
+        .unwrap_or_else(|| panic!("control {key}"))
+}
+
+async fn manual_summary(server: &TestServer, make: &str, model: &str) -> Value {
+    let camera = looklab_schema::body_id_from_name(make, model).expect("camera id");
+    let (status, _, body) = server
+        .get(&format!("/api/manual-confirmations/{}", camera.as_str()))
+        .await;
+    assert_eq!(status, StatusCode::OK, "summary: {body:?}");
+    serde_json::from_slice(&body).expect("summary json")
+}
+
+async fn moderation_queue(server: &TestServer, token: &str) -> Value {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/mod/queue")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("queue request");
+    let (status, _, body) = send(&server.app, request).await;
+    assert_eq!(status, StatusCode::OK, "queue: {body:?}");
+    serde_json::from_slice(&body).expect("queue json")
+}
+
+async fn post_json_with_token(
+    app: &Router,
+    path: &str,
+    token: &str,
+    value: &Value,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(value).expect("json")))
+        .expect("request");
+    let (status, _, body) = send(app, request).await;
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+async fn post_signed_with_token(
+    server: &mut TestServer,
+    path: &str,
+    token: &str,
+    domain: &str,
+    payload: &[u8],
+    mut body: Value,
+) -> (StatusCode, Value) {
+    let signed = server.signed_fields(domain, payload).await;
+    for (key, value) in signed.as_object().expect("signed object") {
+        body[key.as_str()] = value.clone();
+    }
+    post_json_with_token(&server.app, path, token, &body).await
+}
+
+#[tokio::test]
+async fn manual_routes_lookup_catalog_camera_ids() {
+    let server = TestServer::start().await;
+    let (status, _, bytes) = server.get("/api/manuals/canon/eos-r5").await;
+    assert_eq!(status, StatusCode::OK);
+    let page: looklab_publish::ManualPage = serde_json::from_slice(&bytes).expect("manual page");
+    assert_eq!(page.id.as_str(), "canon/eos-r5");
+    assert!(!page.preparation.is_ready());
+    let (status, _, bytes) = server.get("/api/manual-confirmations/canon/eos-r5").await;
+    assert_eq!(status, StatusCode::OK);
+    let summary: looklab_schema::ManualConfirmationSummary =
+        serde_json::from_slice(&bytes).expect("manual summary");
+    assert!(!summary.human_confirmed());
+}
+
+#[tokio::test]
+async fn manual_confirmation_after_photos_reuses_the_send_assertion() {
+    let mut server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        vec![manifest_hash(&manifest)],
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let serial = RawSerial::from_envelope_ascii(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server
+        .upload_bytes(envelope_with_send(
+            nonce,
+            &send,
+            &manifest,
+            &blobs,
+            Some(&serial),
+            &assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, summary) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {summary}");
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "unconfirmed");
+    assert_eq!(control["agreeing_groups"], 1);
+
+    let hmac = serial.hmac(&server.state.secret.hmac_key(), "Fujifilm", "X-T5");
+    let summary_text = serde_json::to_string(&summary).expect("summary text");
+    assert!(!summary_text.contains(SERIAL));
+    assert!(!summary_text.contains(&hex(hmac.as_bytes())));
+
+    let (status, _) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let contribution = body["contribution_id"]
+        .as_str()
+        .expect("contribution id")
+        .to_owned();
+    let mut withdraw = server
+        .signed_fields("withdraw", contribution.as_bytes())
+        .await;
+    withdraw["contribution_ids"] = json!([contribution]);
+    let (status, response) = post_json(&server.app, "/api/withdraw", &withdraw).await;
+    assert_eq!(status, StatusCode::OK, "withdraw: {response}");
+    let withdrawn: Option<i64> =
+        sqlx::query_scalar("SELECT withdrawn_at FROM manual_confirmations LIMIT 1")
+            .fetch_one(&server.db)
+            .await
+            .expect("withdrawn");
+    assert!(withdrawn.is_some());
+}
+
+#[tokio::test]
+async fn withdrawn_send_rejects_a_late_confirmation() {
+    let mut server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        vec![manifest_hash(&manifest)],
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let serial = RawSerial::from_envelope_ascii(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server
+        .upload_bytes(envelope_with_send(
+            nonce,
+            &send,
+            &manifest,
+            &blobs,
+            Some(&serial),
+            &assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let contribution = body["contribution_id"]
+        .as_str()
+        .expect("contribution id")
+        .to_owned();
+    let mut withdraw = server
+        .signed_fields("withdraw", contribution.as_bytes())
+        .await;
+    withdraw["contribution_ids"] = json!([contribution]);
+    let (status, response) = post_json(&server.app, "/api/withdraw", &withdraw).await;
+    assert_eq!(status, StatusCode::OK, "withdraw: {response}");
+
+    let (status, _) = post_confirmation(
+        &server.app,
+        &confirmation_request(&nonce, &send, &assertion, &confirmation),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn standalone_attestation_only_send_is_valid_and_replays_rejected() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, summary) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {summary}");
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        0
+    );
+
+    let (status, _) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn standalone_confirmation_exposes_unlinked_intake_and_moderator_review() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+
+    let (status, submitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {submitted}");
+    assert_eq!(submitted["receipt"]["camera"], "fujifilm/x-t5");
+    assert_eq!(submitted["receipt"]["owner_linkage"], "unlinked");
+    assert_eq!(submitted["receipt"]["recorded_checks"], 1);
+    let control = summary_control(&submitted, "native_simulations");
+    assert_eq!(control["intake"]["recorded"], 1);
+    assert_eq!(control["intake"]["unlinked"], 1);
+    assert_eq!(control["intake"]["stale"], 0);
+    assert_eq!(control["agreeing_groups"], 0);
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manual_confirmations")
+        .fetch_one(&server.db)
+        .await
+        .expect("confirmations");
+    assert_eq!(stored, 1);
+    let observations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manual_observations")
+        .fetch_one(&server.db)
+        .await
+        .expect("observations");
+    assert_eq!(observations, 1);
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 1);
+    let check = &checks[0];
+    assert_eq!(check["camera"], "fujifilm/x-t5");
+    assert_eq!(check["control"], "native_simulations");
+    assert_eq!(check["firmware"], "2.10");
+    assert_eq!(check["finding"]["kind"], "matches");
+    assert_eq!(check["owner_linkage"], "unlinked");
+    assert_eq!(check["status"], "pending");
+    assert!(check.get("credential_id").is_none());
+    assert!(check.get("identity_group").is_none());
+
+    let (status, resent) = post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "resend: {resent}");
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["recorded"], 1);
+    assert_eq!(control["intake"]["unlinked"], 1);
+    assert_eq!(control["agreeing_groups"], 0);
+    let queue = moderation_queue(&server, &token).await;
+    assert_eq!(
+        queue["manual_checks"]
+            .as_array()
+            .expect("manual checks")
+            .len(),
+        1
+    );
+    let occurrences: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM manual_confirmation_occurrences")
+            .fetch_one(&server.db)
+            .await
+            .expect("occurrences");
+    assert_eq!(occurrences, 2);
+
+    let request = server.withdrawal_request(&camera.id).await;
+    let (status, _) = post_withdrawal(&server.app, &request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["recorded"], 0);
+    assert_eq!(control["intake"]["unlinked"], 0);
+    assert_eq!(control["agreeing_groups"], 0);
+    let queue = moderation_queue(&server, &token).await;
+    assert!(
+        queue["manual_checks"]
+            .as_array()
+            .expect("manual checks")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn stale_definition_checks_stay_out_of_current_intake() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let credential = server.credential_uuid().await;
+    insert_confirmation(
+        &server.db,
+        &credential,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"matches"}"#,
+        40,
+        0,
+    )
+    .await;
+    sqlx::query("UPDATE manual_observations SET definition_digest = x'0000000000000000000000000000000000000000000000000000000000000000'")
+        .execute(&server.db)
+        .await
+        .expect("stale digest");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["recorded"], 0);
+    assert_eq!(control["intake"]["stale"], 1);
+    assert_eq!(control["agreeing_groups"], 0);
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["status"], "stale_definition");
+}
+
+#[tokio::test]
+async fn moderator_watermark_separates_later_same_second_checks() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &confirmation).await,
+        StatusCode::OK
+    );
+
+    let token = server.moderator_token().await;
+    let key = CapabilityKey::NativeSimulations;
+    let capability = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control");
+    let definition_digest = capability.definition_digest(&camera);
+    let moderation = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest,
+        confirmed: true,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Physical,
+            url: None,
+            description: "body review".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::exact("2.10").expect("scope"),
+        },
+    };
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": true,
+        "evidence": {
+            "kind": "physical",
+            "description": "body review",
+            "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        },
+    });
+    let path = "/api/manual-confirmations/Fujifilm/X-T5/native_simulations/moderate";
+    let (status, summary) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &moderation.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "moderate: {summary}");
+
+    let decision_created: i64 = sqlx::query_scalar(
+        "SELECT created_at FROM manual_moderator_confirmations
+         WHERE camera_id = ? AND capability_key = 'native_simulations'
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(camera.id.as_str())
+    .fetch_one(&server.db)
+    .await
+    .expect("moderator record");
+
+    let later_passkey = SyncedPasskey::new(b"later-owner");
+    later_passkey
+        .register(&server.app, "Later Owner", 0x5d)
+        .await;
+    let later_confirmation = confirmation_with(
+        &camera,
+        "native_simulations",
+        "2.10",
+        Finding::Corrected {
+            availability: Availability::Unavailable,
+            domain: CapabilityDomain::Unspecified,
+        },
+    );
+    let later = synced_confirmation_request(&mut server, &later_passkey, &later_confirmation).await;
+    let (status, submitted) = post_confirmation(&server.app, &later).await;
+    assert_eq!(status, StatusCode::OK, "later: {submitted}");
+
+    let later_occurrence: i64 =
+        sqlx::query_scalar("SELECT MAX(id) FROM manual_confirmation_occurrences")
+            .fetch_one(&server.db)
+            .await
+            .expect("later occurrence");
+    sqlx::query("UPDATE manual_confirmation_occurrences SET received_at = ? WHERE id = ?")
+        .bind(decision_created)
+        .bind(later_occurrence)
+        .execute(&server.db)
+        .await
+        .expect("colliding timestamp");
+    let later_received: i64 =
+        sqlx::query_scalar("SELECT received_at FROM manual_confirmation_occurrences WHERE id = ?")
+            .bind(later_occurrence)
+            .fetch_one(&server.db)
+            .await
+            .expect("later timestamp");
+    assert_eq!(later_received, decision_created);
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "moderator_confirmed");
+    assert_eq!(control["intake"]["recorded"], 2);
+    assert_eq!(control["intake"]["unlinked"], 2);
+
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 2);
+    let earlier = checks
+        .iter()
+        .find(|check| check["finding"]["kind"] == "matches")
+        .expect("earlier matching check");
+    let later = checks
+        .iter()
+        .find(|check| check["finding"]["kind"] == "corrected")
+        .expect("later corrected check");
+    assert_eq!(earlier["status"], "reviewed");
+    assert_eq!(later["status"], "pending");
+    assert!(
+        checks
+            .iter()
+            .all(|check| check["owner_linkage"] == "unlinked")
+    );
+}
+
+#[tokio::test]
+async fn owner_withdraws_standalone_confirmation() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, _) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["recorded"], 1);
+    assert_eq!(control["intake"]["unlinked"], 1);
+    assert_eq!(control["agreeing_groups"], 0);
+
+    let credential = server.credential_uuid().await;
+    insert_serial_contribution(&server.db, "contrib-owner", &credential, [7; 32]).await;
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["recorded"], 1);
+    assert_eq!(control["intake"]["unlinked"], 0);
+    assert_eq!(control["agreeing_groups"], 1);
+
+    let request = server.withdrawal_request(&camera.id).await;
+    let (status, _) = post_withdrawal(&server.app, &request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let audit: String = sqlx::query_scalar(
+        "SELECT payload FROM audit_log WHERE type = 'manual_confirmation_withdrawal'
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("withdrawal audit");
+    let audit: Value = serde_json::from_str(&audit).expect("audit json");
+    assert_eq!(audit["camera"], camera.id.as_str());
+    assert_eq!(audit["withdrawn"], 1);
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["recorded"], 0);
+    assert_eq!(control["intake"]["unlinked"], 0);
+    assert_eq!(control["agreeing_groups"], 0);
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, submitted) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(submitted["receipt"]["owner_linkage"], "linked");
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["recorded"], 1);
+    assert_eq!(control["intake"]["unlinked"], 0);
+    assert_eq!(control["agreeing_groups"], 1);
+}
+
+#[tokio::test]
+async fn owner_withdrawal_fences_a_mixed_send_without_dropping_photos() {
+    let mut server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        vec![manifest_hash(&manifest)],
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let serial = RawSerial::from_envelope_ascii(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server
+        .upload_bytes(envelope_with_send(
+            nonce,
+            &send,
+            &manifest,
+            &blobs,
+            Some(&serial),
+            &assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let contribution = body["contribution_id"]
+        .as_str()
+        .expect("contribution id")
+        .to_owned();
+
+    let withdraw = server.withdrawal_request(&camera.id).await;
+    let (status, body) = post_withdrawal(&server.app, &withdraw).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "withdraw: {body}");
+
+    let delayed = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, body) = post_confirmation(&server.app, &delayed).await;
+    assert_eq!(status, StatusCode::CONFLICT, "delayed: {body}");
+
+    let contribution_status: String =
+        sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
+            .bind(&contribution)
+            .fetch_one(&server.db)
+            .await
+            .expect("contribution");
+    assert_ne!(contribution_status, "withdrawn");
+    let send_withdrawn: Option<i64> =
+        sqlx::query_scalar("SELECT withdrawn_at FROM send_manifests WHERE nonce = ?")
+            .bind(hex(nonce.as_bytes()))
+            .fetch_one(&server.db)
+            .await
+            .expect("send");
+    assert_eq!(send_withdrawn, None);
+
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let fresh = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, summary) = post_confirmation(&server.app, &fresh).await;
+    assert_eq!(status, StatusCode::OK, "fresh: {summary}");
+}
+
+#[tokio::test]
+async fn manual_withdrawal_rejects_noncanonical_bytes_and_undocumented_cameras() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &confirmation).await,
+        StatusCode::OK
+    );
+    let credential = server.credential_uuid().await;
+    insert_serial_contribution(&server.db, "contrib-owner", &credential, [7; 32]).await;
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        1
+    );
+
+    let request = server.withdrawal_request(&camera.id).await;
+    let mut noncanonical = request.canonical_bytes();
+    noncanonical.insert(1, b' ');
+    let (status, _) = post_canonical(
+        &server.app,
+        "/api/manual-confirmations/withdraw",
+        noncanonical,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let unknown_camera = BodyId::new("unknown/camera").expect("body id");
+    let unknown = server.withdrawal_request(&unknown_camera).await;
+    let (status, _) = post_withdrawal(&server.app, &unknown).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        1
+    );
+    let withdrawals: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE type = 'manual_confirmation_withdrawal'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("withdrawal audits");
+    assert_eq!(withdrawals, 0);
+}
+
+#[tokio::test]
+async fn manual_confirmation_rejects_invalid_structure_before_persistence() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let valid = confirmation_for(&camera, "native_simulations", "2.10");
+
+    let mut version = valid.clone();
+    version.version += 1;
+    let mut empty = valid.clone();
+    empty.observations.clear();
+    let mut duplicate = valid.clone();
+    let first = duplicate.observations[0].clone();
+    duplicate.observations.push(first);
+    let mut mismatched = valid;
+    mismatched.scope = ConfirmationScope::Controls {
+        keys: vec![CapabilityKey::ExposureCompensation],
+    };
+
+    for confirmation in [version, empty, duplicate, mismatched] {
+        assert_eq!(
+            post_standalone_confirmation(&mut server, &confirmation).await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let nonce = server.nonce().await;
+    let digest = confirmation.digest();
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let mut noncanonical = request.canonical_bytes();
+    noncanonical.insert(1, b' ');
+    let (status, _) = post_canonical(&server.app, "/api/manual-confirmations", noncanonical).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manual_confirmations")
+        .fetch_one(&server.db)
+        .await
+        .expect("manual confirmations");
+    assert_eq!(stored, 0);
+    let sends: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM send_manifests")
+        .fetch_one(&server.db)
+        .await
+        .expect("send manifests");
+    assert_eq!(sends, 0);
+}
+
+#[tokio::test]
+async fn confirmation_before_photos_reserves_the_declared_batches() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        vec![manifest_hash(&manifest)],
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (status, summary) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {summary}");
+
+    let serial = RawSerial::from_envelope_ascii(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server
+        .upload_bytes(envelope_with_send(
+            nonce,
+            &send,
+            &manifest,
+            &blobs,
+            Some(&serial),
+            &assertion,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+}
+
+#[tokio::test]
+async fn manual_confirmation_rejects_unbound_manifests_and_content() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+
+    let nonce = server.nonce().await;
+    let batch_only = SendManifest::canonical(vec![ManifestHash::from_bytes(*digest.as_bytes())])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&batch_only));
+    let assertion = server.assertion(&challenge).await;
+    let (status, _) = post_confirmation(
+        &server.app,
+        &confirmation_request(&nonce, &batch_only, &assertion, &confirmation),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let nonce = server.nonce().await;
+    let same = ManifestHash::from_bytes([9u8; 32]);
+    let overlapping = SendManifest {
+        version: SEND_MANIFEST_VERSION,
+        batches: vec![same],
+        attestations: vec![AttestationHash::from_bytes(*same.as_bytes())],
+    };
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&overlapping));
+    let assertion = server.assertion(&challenge).await;
+    let (status, _) = post_confirmation(
+        &server.app,
+        &confirmation_request(&nonce, &overlapping, &assertion, &confirmation),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+
+    let mut altered = serde_json::to_value(confirmation_request(
+        &nonce,
+        &send,
+        &assertion,
+        &confirmation,
+    ))
+    .expect("confirmation json");
+    altered["confirmation"]["firmware"] = json!("9.99");
+    let (status, _) = post_json(&server.app, "/api/manual-confirmations", &altered).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let mut extra = serde_json::to_value(confirmation_request(
+        &nonce,
+        &send,
+        &assertion,
+        &confirmation,
+    ))
+    .expect("confirmation json");
+    extra["unbound"] = json!(true);
+    let (status, _) = post_json(&server.app, "/api/manual-confirmations", &extra).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn manual_confirmation_policy_counts_identity_groups() {
+    let server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    for index in 0..3u8 {
+        let credential = server.add_credential().await;
+        insert_serial_contribution(
+            &server.db,
+            &format!("contrib-{index}"),
+            &credential,
+            [index + 1; 32],
+        )
+        .await;
+        insert_confirmation(
+            &server.db,
+            &credential,
+            &camera,
+            "native_simulations",
+            r#"{"kind":"matches"}"#,
+            index,
+            i64::from(index),
+        )
+        .await;
+    }
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "confirmed");
+    assert_eq!(control["agreeing_groups"], 3);
+
+    let shared = server.add_credential().await;
+    insert_serial_contribution(&server.db, "contrib-shared", &shared, [1; 32]).await;
+    insert_confirmation(
+        &server.db,
+        &shared,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"matches"}"#,
+        10,
+        10,
+    )
+    .await;
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        3
+    );
+
+    let contradicting = server.add_credential().await;
+    insert_serial_contribution(&server.db, "contrib-contra", &contradicting, [4; 32]).await;
+    insert_confirmation(
+        &server.db,
+        &contradicting,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"corrected","availability":"unavailable","domain":{"type":"unspecified"}}"#,
+        11,
+        11,
+    )
+    .await;
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "contradicted");
+    assert_eq!(control["agreeing_groups"], 3);
+    assert!(
+        !control["contradictions"]
+            .as_array()
+            .expect("contradictions")
+            .is_empty()
+    );
+
+    insert_confirmation(
+        &server.db,
+        &contradicting,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"matches"}"#,
+        12,
+        12,
+    )
+    .await;
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "confirmed"
+    );
+}
+
+#[tokio::test]
+async fn repeated_payload_after_a_correction_uses_the_new_occurrence() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let credential = server.credential_uuid().await;
+    insert_serial_contribution(&server.db, "contrib-occ", &credential, [9; 32]).await;
+    for index in 0..2u8 {
+        let other = server.add_credential().await;
+        insert_serial_contribution(
+            &server.db,
+            &format!("contrib-occ-{index}"),
+            &other,
+            [index + 1; 32],
+        )
+        .await;
+        insert_confirmation(
+            &server.db,
+            &other,
+            &camera,
+            "native_simulations",
+            r#"{"kind":"matches"}"#,
+            index,
+            i64::from(index),
+        )
+        .await;
+    }
+    let matches = confirmation_for(&camera, "native_simulations", "2.10");
+    let corrected = confirmation_with(
+        &camera,
+        "native_simulations",
+        "2.10",
+        Finding::Corrected {
+            availability: looklab_schema::Availability::Unavailable,
+            domain: looklab_schema::CapabilityDomain::Unspecified,
+        },
+    );
+
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &matches).await,
+        StatusCode::OK
+    );
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "confirmed"
+    );
+
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &corrected).await,
+        StatusCode::OK
+    );
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "contradicted"
+    );
+
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &matches).await,
+        StatusCode::OK
+    );
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "confirmed"
+    );
+}
+
+#[tokio::test]
+async fn same_second_linked_claims_order_by_occurrence_and_tombstone() {
+    let server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    for index in 0..2u8 {
+        let other = server.add_credential().await;
+        insert_serial_contribution(
+            &server.db,
+            &format!("contrib-same-{index}"),
+            &other,
+            [index + 1; 32],
+        )
+        .await;
+        insert_confirmation(
+            &server.db,
+            &other,
+            &camera,
+            "native_simulations",
+            r#"{"kind":"matches"}"#,
+            index,
+            i64::from(index),
+        )
+        .await;
+    }
+    let first = server.add_credential().await;
+    let second = server.add_credential().await;
+    insert_serial_contribution(&server.db, "contrib-link-a", &first, [7; 32]).await;
+    insert_serial_contribution(&server.db, "contrib-link-b", &second, [7; 32]).await;
+    insert_confirmation(
+        &server.db,
+        &first,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"matches"}"#,
+        21,
+        5,
+    )
+    .await;
+    insert_confirmation(
+        &server.db,
+        &second,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"corrected","availability":"unavailable","domain":{"type":"unspecified"}}"#,
+        22,
+        5,
+    )
+    .await;
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "contradicted"
+    );
+
+    sqlx::query(
+        "UPDATE manual_confirmation_occurrences SET withdrawn_at = 1 WHERE send_nonce = 'seed-16'",
+    )
+    .execute(&server.db)
+    .await
+    .expect("withdraw occurrence");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "unconfirmed");
+    assert_eq!(control["agreeing_groups"], 2);
+}
+
+#[tokio::test]
+async fn latest_claims_keep_each_reported_firmware_version() {
+    let server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    for index in 0..3u8 {
+        let credential = server.add_credential().await;
+        insert_serial_contribution(
+            &server.db,
+            &format!("contrib-fw-{index}"),
+            &credential,
+            [5 + index; 32],
+        )
+        .await;
+        for (offset, version) in ["2.10", "3.00"].into_iter().enumerate() {
+            insert_confirmation_with_firmware(
+                &server.db,
+                &credential,
+                &camera,
+                "native_simulations",
+                &ReportedFirmware::new(version).expect("firmware"),
+                r#"{"kind":"matches"}"#,
+                30 + 2 * index + offset as u8,
+                offset as i64,
+            )
+            .await;
+        }
+    }
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    let firmware = control["firmware"].as_array().expect("firmware");
+    assert_eq!(firmware.len(), 2);
+    assert_eq!(firmware[0]["firmware"], "2.10");
+    assert_eq!(firmware[1]["firmware"], "3.00");
+    assert_eq!(firmware[0]["agreeing_groups"], 3);
+    assert_eq!(firmware[1]["agreeing_groups"], 3);
+    assert_eq!(control["state"], "confirmed");
+}
+
+#[tokio::test]
+async fn fresh_credentials_without_serial_evidence_cannot_form_a_quorum() {
+    let server = TestServer::start().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    for index in 0..3u8 {
+        let credential = server.add_credential().await;
+        insert_confirmation(
+            &server.db,
+            &credential,
+            &camera,
+            "native_simulations",
+            r#"{"kind":"matches"}"#,
+            index,
+            i64::from(index),
+        )
+        .await;
+    }
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "unconfirmed");
+    assert_eq!(control["agreeing_groups"], 0);
+}
+
+#[tokio::test]
+async fn moderator_evidence_is_role_gated_and_audited() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    server
+        .set_credential_tier_roles(&server.credential_id, "new", "[\"moderator\"]")
+        .await;
+    let signed = server.signed_fields("mod-session", &[]).await;
+    let (status, session) = post_json(&server.app, "/api/mod/session", &signed).await;
+    assert_eq!(status, StatusCode::OK, "session: {session}");
+    let token = session["session_token"]
+        .as_str()
+        .expect("session token")
+        .to_owned();
+    let path = "/api/manual-confirmations/Fujifilm/X-T5/native_simulations/moderate";
+    let camera = documented_camera("fujifilm/x-t5");
+    let key = CapabilityKey::NativeSimulations;
+    let definition_digest = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control")
+        .definition_digest(&camera);
+    let firmware = ModeratorFirmwareScope::exact("2.10").expect("firmware scope");
+
+    let missing_url_evidence = ModeratorEvidence {
+        kind: ModeratorEvidenceKind::Video,
+        url: None,
+        description: "menu walkthrough".to_owned(),
+        firmware_scope: firmware.clone(),
+    };
+    let missing_url = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest,
+        confirmed: true,
+        evidence: missing_url_evidence,
+    };
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": true,
+        "evidence": {
+            "kind": "video",
+            "description": "menu walkthrough",
+            "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        },
+    });
+    let (status, _) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &missing_url.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let decision_evidence = ModeratorEvidence {
+        kind: ModeratorEvidenceKind::Video,
+        url: Some(ManualUrl::new("https://example.com/review").expect("evidence url")),
+        description: "menu walkthrough".to_owned(),
+        firmware_scope: firmware,
+    };
+    let decision = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest,
+        confirmed: true,
+        evidence: decision_evidence,
+    };
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": true,
+        "evidence": {
+            "kind": "video",
+            "url": "https://example.com/review",
+            "description": "menu walkthrough",
+            "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        },
+    });
+    let (status, summary) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &decision.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "moderate: {summary}");
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "moderator_confirmed"
+    );
+    let audit: String = sqlx::query_scalar(
+        "SELECT payload FROM audit_log WHERE type = 'manual_moderator_confirmation'
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("moderator audit");
+    let audit: Value = serde_json::from_str(&audit).expect("audit json");
+    assert_eq!(audit["firmware_scope"]["kind"], "exact");
+    assert_eq!(audit["firmware_scope"]["firmware"], "2.10");
+
+    let standing: (String, String) =
+        sqlx::query_as("SELECT tier, roles FROM credentials WHERE credential_id = ?")
+            .bind(&server.credential_id)
+            .fetch_one(&server.db)
+            .await
+            .expect("standing");
+    assert_eq!(standing, ("new".to_owned(), "[\"moderator\"]".to_owned()));
+
+    server
+        .set_credential_tier_roles(&server.credential_id, "new", "[]")
+        .await;
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": true,
+        "evidence": {
+            "kind": "video",
+            "url": "https://example.com/review",
+            "description": "menu walkthrough",
+            "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        },
+    });
+    let (status, _) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &decision.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn moderator_decision_rejects_a_changed_control_definition() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    server
+        .set_credential_tier_roles(&server.credential_id, "new", "[\"moderator\"]")
+        .await;
+    let signed = server.signed_fields("mod-session", &[]).await;
+    let (status, session) = post_json(&server.app, "/api/mod/session", &signed).await;
+    assert_eq!(status, StatusCode::OK, "session: {session}");
+    let token = session["session_token"]
+        .as_str()
+        .expect("session token")
+        .to_owned();
+    let camera = documented_camera("fujifilm/x-t5");
+    let key = CapabilityKey::NativeSimulations;
+    let stale = Sha256Hex::from_bytes([0; 32]);
+    let moderation = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest: stale,
+        confirmed: true,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Physical,
+            url: None,
+            description: "body review".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::unspecified(),
+        },
+    };
+    let body = json!({
+        "definition_digest": stale,
+        "confirmed": true,
+        "evidence": {
+            "kind": "physical",
+            "description": "body review",
+            "firmware_scope": {"kind": "unspecified"},
+        },
+    });
+    let path = "/api/manual-confirmations/Fujifilm/X-T5/native_simulations/moderate";
+    let (status, _) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &moderation.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manual_moderator_confirmations")
+        .fetch_one(&server.db)
+        .await
+        .expect("moderator rows");
+    assert_eq!(stored, 0);
+}
+
+fn client_error_report(release: &str) -> Value {
+    json!({
+        "version": 1,
+        "kind": "console_error",
+        "error_type": "TypeError",
+        "page": "home",
+        "release": release,
+        "frames": [{"asset": "pkg/looklab-site.js", "line": 123, "column": 45}],
+    })
+}
+
+async fn post_client_error(app: &Router, body: Vec<u8>) -> StatusCode {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/client-errors")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("request");
+    send(app, request).await.0
+}
+
+#[tokio::test]
+async fn client_error_reports_are_accepted_without_a_public_read() {
+    let server = TestServer::start().await;
+    let release = "a".repeat(64);
+    let status = post_client_error(
+        &server.app,
+        serde_json::to_vec(&client_error_report(&release)).expect("json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let rows: Vec<(String, String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT release, kind, error_type, page, frames, received_at FROM client_errors",
+    )
+    .fetch_all(&server.db)
+    .await
+    .expect("client error rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, release);
+    assert_eq!(rows[0].1, "console_error");
+    assert_eq!(rows[0].2, "TypeError");
+    assert_eq!(rows[0].3, "home");
+    assert_eq!(
+        rows[0].4,
+        r#"[{"asset":"pkg/looklab-site.js","line":123,"column":45}]"#
+    );
+    assert!(rows[0].5 > 0);
+    let (status, _, _) = server.get("/api/client-errors").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn client_error_reports_require_json_media_type() {
+    let server = TestServer::start().await;
+    let release = "9".repeat(64);
+    let body = serde_json::to_vec(&client_error_report(&release)).expect("json");
+    for content_type in [
+        None,
+        Some("text/plain"),
+        Some("application/x-www-form-urlencoded"),
+        Some("application/jsonx"),
+        Some("json"),
+        Some("application/json, text/plain"),
+    ] {
+        let mut builder = Request::builder().method("POST").uri("/api/client-errors");
+        if let Some(content_type) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, content_type);
+        }
+        let request = builder.body(Body::from(body.clone())).expect("request");
+        let (status, _, _) = send(&server.app, request).await;
+        assert_eq!(
+            status,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "content type {content_type:?}"
+        );
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM client_errors")
+        .fetch_one(&server.db)
+        .await
+        .expect("client error rows");
+    assert_eq!(stored, 0);
+    for content_type in [
+        "application/json",
+        "application/json; charset=utf-8",
+        "Application/JSON;charset=UTF-8",
+        "application/json ; charset=\"utf-8\"",
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/client-errors")
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body.clone()))
+            .expect("request");
+        let (status, _, _) = send(&server.app, request).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "content type {content_type}"
+        );
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM client_errors")
+        .fetch_one(&server.db)
+        .await
+        .expect("client error rows");
+    assert_eq!(stored, 4);
+}
+
+#[tokio::test]
+async fn client_error_reports_accept_every_allowed_asset() {
+    let server = TestServer::start().await;
+    let release = "b".repeat(64);
+    for asset in [
+        "errors.js",
+        "pkg/looklab-site.js",
+        "pkg/looklab-site-0123abcd.wasm",
+        "workers/prep-worker.js",
+        "workers/match-worker.js",
+        "workers/scene-worker.js",
+        "generated/wasm/looklab_prep_module.wasm",
+        "generated/wasm/looklab_scene_module.wasm",
+        "generated/wasm/looklab_match.wasm",
+    ] {
+        let mut value = client_error_report(&release);
+        value["frames"] = json!([{"asset": asset, "line": 0, "column": 0}]);
+        let status =
+            post_client_error(&server.app, serde_json::to_vec(&value).expect("json")).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "asset {asset}");
+    }
+    let mut twelve = client_error_report(&release);
+    twelve["frames"] = Value::Array(
+        (0..12)
+            .map(|_| json!({"asset": "pkg/looklab-site.js", "line": 1, "column": 2}))
+            .collect(),
+    );
+    assert_eq!(
+        post_client_error(&server.app, serde_json::to_vec(&twelve).expect("json")).await,
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn client_error_reports_reject_invalid_fields_and_assets() {
+    let server = TestServer::start().await;
+    let release = "c".repeat(64);
+    let mut invalid = Vec::new();
+    let mut unknown_field = client_error_report(&release);
+    unknown_field["message"] = json!("private text");
+    invalid.push(unknown_field);
+    let mut unknown_frame_field = client_error_report(&release);
+    unknown_frame_field["frames"][0]["message"] = json!("private text");
+    invalid.push(unknown_frame_field);
+    let mut version = client_error_report(&release);
+    version["version"] = json!(2);
+    invalid.push(version);
+    let mut kind = client_error_report(&release);
+    kind["kind"] = json!("panic");
+    invalid.push(kind);
+    let mut error_type = client_error_report(&release);
+    error_type["error_type"] = json!("UriError");
+    invalid.push(error_type);
+    let mut page = client_error_report(&release);
+    page["page"] = json!("admin");
+    invalid.push(page);
+    let mut uppercase_release = client_error_report(&release);
+    uppercase_release["release"] = json!("A".repeat(64));
+    invalid.push(uppercase_release);
+    let mut short_release = client_error_report(&release);
+    short_release["release"] = json!("a".repeat(63));
+    invalid.push(short_release);
+    let mut too_many_frames = client_error_report(&release);
+    too_many_frames["frames"] = Value::Array(
+        (0..13)
+            .map(|_| json!({"asset": "pkg/looklab-site.js", "line": 1, "column": 2}))
+            .collect(),
+    );
+    invalid.push(too_many_frames);
+    for asset in [
+        "pkg/../errors.js",
+        "pkg/sub/looklab-site.js",
+        "pkg/looklab-site.css",
+        "pkg/",
+        "workers/other-worker.js",
+        "https://looklab.example/pkg/looklab-site.js",
+        "pkg/looklab-site.js?cache=1",
+    ] {
+        let mut value = client_error_report(&release);
+        value["frames"] = json!([{"asset": asset, "line": 1, "column": 2}]);
+        invalid.push(value);
+    }
+    let mut negative_line = client_error_report(&release);
+    negative_line["frames"][0]["line"] = json!(-1);
+    invalid.push(negative_line);
+    let mut overflowing_line = client_error_report(&release);
+    overflowing_line["frames"][0]["line"] = json!(4_294_967_296u64);
+    invalid.push(overflowing_line);
+    for value in invalid {
+        let status =
+            post_client_error(&server.app, serde_json::to_vec(&value).expect("json")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "value {value}");
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM client_errors")
+        .fetch_one(&server.db)
+        .await
+        .expect("client error rows");
+    assert_eq!(stored, 0);
+    assert!(!contains(&log_bytes(), b"private text"));
+}
+
+#[tokio::test]
+async fn oversized_client_error_reports_are_rejected() {
+    let server = TestServer::start().await;
+    let mut body = serde_json::to_vec(&client_error_report(&"d".repeat(64))).expect("json");
+    body.resize(16 * 1024 + 1, b' ');
+    let status = post_client_error(&server.app, body).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM client_errors")
+        .fetch_one(&server.db)
+        .await
+        .expect("client error rows");
+    assert_eq!(stored, 0);
+}
+
+#[tokio::test]
+async fn client_error_reports_share_one_global_quota() {
+    let server = TestServer::start().await;
+    let release = "e".repeat(64);
+    let body = serde_json::to_vec(&client_error_report(&release)).expect("json");
+    let mut accepted = 0i64;
+    let mut rejected = false;
+    for _ in 0..70 {
+        match post_client_error(&server.app, body.clone()).await {
+            StatusCode::NO_CONTENT => accepted += 1,
+            StatusCode::TOO_MANY_REQUESTS => {
+                rejected = true;
+                break;
+            }
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert!(rejected, "the global quota never rejected a report");
+    assert!(accepted >= 60, "only {accepted} reports were admitted");
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM client_errors")
+        .fetch_one(&server.db)
+        .await
+        .expect("client error rows");
+    assert_eq!(stored, accepted);
+}
+
+#[tokio::test]
+async fn client_error_reports_never_reach_the_logs() {
+    let server = TestServer::start().await;
+    let release = "f".repeat(64);
+    let mut value = client_error_report(&release);
+    value["frames"] =
+        json!([{"asset": "generated/wasm/looklab_match.wasm", "line": 7, "column": 9}]);
+    assert_eq!(
+        post_client_error(&server.app, serde_json::to_vec(&value).expect("json")).await,
+        StatusCode::NO_CONTENT
+    );
+    let logs = log_bytes();
+    assert!(!contains(&logs, release.as_bytes()));
+    assert!(!contains(&logs, b"generated/wasm/looklab_match.wasm"));
+    assert!(!contains(&logs, b"console_error"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_lut_upload_is_stored_and_approval_queues_one_import() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let cube = "\
+TITLE \"Test\"
+LUT_3D_SIZE 2
+DOMAIN_MIN 0.0 0.0 0.0
+DOMAIN_MAX 1.0 1.0 1.0
+0.0 0.0 0.0
+1.0 0.0 0.0
+0.0 1.0 0.0
+1.0 1.0 0.0
+0.0 0.0 1.0
+1.0 0.0 1.0
+0.0 1.0 1.0
+1.0 1.0 1.0
+";
+    let bytes = cube.as_bytes();
+    let digest = hex(&Sha256::digest(bytes));
+    let payload = format!(
+        "look: test-lut\nname: Test LUT\nlicense: {{ own_work: true }}\n\
+         attribution: A contributor\nlut:\n  file: test-lut.cube\n  sha256: {digest}\n  \
+         size: {}\nencoding: flog2_fgamut\n",
+        bytes.len()
+    );
+    let (status, body) = server.submit_lut("lut_look", &payload, bytes).await;
+    assert_eq!(status, StatusCode::CREATED, "submit: {body}");
+    let id = body["view"]["id"].as_str().expect("proposal id").to_owned();
+    let uploads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM lut_uploads u
+         JOIN credentials c ON c.id = u.credential_id
+         WHERE c.credential_id = ?",
+    )
+    .bind(server.credential_id.as_slice())
+    .fetch_one(&server.db)
+    .await
+    .expect("uploads");
+    assert_eq!(uploads, 1);
+
+    let token = server.moderator_token().await;
+    let (status, decision) = server.decide(&token, &id, "import it").await;
+    assert_eq!(status, StatusCode::OK, "decision: {decision}");
+    let jobs: Vec<(String, String)> =
+        sqlx::query_as("SELECT kind, payload FROM jobs WHERE kind = 'lut_import'")
+            .fetch_all(&server.db)
+            .await
+            .expect("jobs");
+    assert_eq!(jobs.len(), 1);
+    assert!(jobs[0].1.contains(&id));
+
+    let (status, _, body) = server.get(&format!("/api/proposals/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let view: Value = serde_json::from_slice(&body).expect("view");
+    assert_eq!(view["status"], "approved");
+    assert_eq!(view["import"]["state"], "queued");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lut_submission_rejects_bad_bytes_and_duplicate_links() {
+    const SCHEMA: &str = include_str!("../../../data/bodies/fujifilm-x-t5.yaml");
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let cube = lut_test_cube();
+    let bytes = cube.as_bytes();
+    let digest = hex(&Sha256::digest(bytes));
+    let payload = |sha256: &str| {
+        format!(
+            "look: test-lut\nname: Test LUT\nlicense: {{ own_work: true }}\n\
+             attribution: A contributor\nlut:\n  file: test-lut.cube\n  sha256: {sha256}\n  \
+             size: {}\nencoding: flog2_fgamut\n",
+            bytes.len()
+        )
+    };
+
+    let (status, body) = server
+        .submit_lut("lut_look", &payload(&"00".repeat(32)), bytes)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "digest: {body}");
+    assert_eq!(body["error"], "SCHEMA_INVALID");
+
+    let (status, body) = server.submit_lut("schema_change", SCHEMA, bytes).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "attachment: {body}");
+    assert_eq!(body["error"], "SCHEMA_INVALID");
+
+    let frame = frame_lut_proposal(br#"{"kind":"lut_look"}"#, bytes).expect("frame");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/proposals/lut")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(frame))
+        .expect("request");
+    let (status, _, _) = send(&server.app, request).await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let (status, body) = server
+        .submit_lut("lut_look", &payload(&digest), bytes)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "first: {body}");
+    let (status, body) = server
+        .submit_lut("lut_look", &payload(&digest), bytes)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "duplicate: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lut_submission_admits_declared_body_and_family_bases() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let cube = lut_test_cube();
+    let bytes = cube.as_bytes();
+    let digest = hex(&Sha256::digest(bytes));
+    let payload = |look: &str, base: &str| {
+        format!(
+            "look: {look}\nname: Test LUT\nlicense: {{ own_work: true }}\n\
+             attribution: A contributor\nlut:\n  file: test-lut.cube\n  sha256: {digest}\n  \
+             size: {}\nencoding: !display\n  base:\n{base}",
+            bytes.len()
+        )
+    };
+    let body_base = payload(
+        "body-base",
+        "      kind: body_realization\n      body: fujifilm/x-t5\n      \
+         renderer: x_raw_studio\n      film_simulation: classic_chrome\n      \
+         dynamic_range: dr400\n",
+    );
+    let (status, body) = server.submit_lut("lut_look", &body_base, bytes).await;
+    assert_eq!(status, StatusCode::CREATED, "body base: {body}");
+
+    let inconsistent = payload(
+        "inconsistent-base",
+        "      kind: body_realization\n      body: fujifilm/x-t5\n      \
+         renderer: x_raw_studio\n      film_simulation: no_such_sim\n      \
+         dynamic_range: dr400\n",
+    );
+    let (status, body) = server.submit_lut("lut_look", &inconsistent, bytes).await;
+    assert_eq!(status, StatusCode::CREATED, "inconsistent base: {body}");
+
+    let family_base = payload(
+        "family-base",
+        "      kind: family_rendering\n      maker: Fujifilm\n      rendering: Classic Chrome\n",
+    );
+    let (status, body) = server.submit_lut("lut_look", &family_base, bytes).await;
+    assert_eq!(status, StatusCode::CREATED, "family base: {body}");
+
+    let unknown_body = payload(
+        "unknown-body",
+        "      kind: body_realization\n      body: fujifilm/no-such-body\n      renderer: x_raw_studio\n",
+    );
+    let (status, body) = server.submit_lut("lut_look", &unknown_body, bytes).await;
+    assert_eq!(status, StatusCode::CREATED, "unknown body: {body}");
+}
+
+fn lut_test_cube() -> &'static str {
+    "\
+TITLE \"Test\"
+LUT_3D_SIZE 2
+DOMAIN_MIN 0.0 0.0 0.0
+DOMAIN_MAX 1.0 1.0 1.0
+0.0 0.0 0.0
+1.0 0.0 0.0
+0.0 1.0 0.0
+1.0 1.0 0.0
+0.0 0.0 1.0
+1.0 0.0 1.0
+0.0 1.0 1.0
+1.0 1.0 1.0
+"
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rejecting_one_shared_lut_keeps_the_other_reference() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let bytes = lut_test_cube().as_bytes();
+    let digest = hex(&Sha256::digest(bytes));
+    let payload = |look: &str| {
+        format!(
+            "look: {look}\nname: {look}\nlicense: {{ own_work: true }}\n\
+             attribution: A contributor\nlut:\n  file: shared.cube\n  sha256: {digest}\n  \
+             size: {}\nencoding: flog2_fgamut\n",
+            bytes.len()
+        )
+    };
+    let (status, first) = server
+        .submit_lut("lut_look", &payload("shared-a"), bytes)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "first: {first}");
+    let (status, second) = server
+        .submit_lut("lut_look", &payload("shared-b"), bytes)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "second: {second}");
+    let first = first["view"]["id"].as_str().expect("first id").to_owned();
+    let second = second["view"]["id"].as_str().expect("second id").to_owned();
+    let token = server.moderator_token().await;
+    let (status, body) = server
+        .decide_with(&token, &first, "reject", "duplicate")
+        .await;
+    assert_eq!(status, StatusCode::OK, "reject: {body}");
+    let first_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM lut_uploads WHERE proposal_id = ?")
+            .bind(&first)
+            .fetch_one(&server.db)
+            .await
+            .expect("first rows");
+    assert_eq!(first_rows, 0);
+    let second_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM lut_uploads WHERE proposal_id = ?")
+            .bind(&second)
+            .fetch_one(&server.db)
+            .await
+            .expect("second rows");
+    assert_eq!(second_rows, 1);
+    let referenced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blob_references WHERE hash = ?")
+        .bind(&digest)
+        .fetch_one(&server.db)
+        .await
+        .expect("references");
+    assert_eq!(referenced, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_credential_pending_lut_storage_is_bounded() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let credential: String =
+        sqlx::query_scalar("SELECT id FROM credentials WHERE credential_id = ?")
+            .bind(server.credential_id.as_slice())
+            .fetch_one(&server.db)
+            .await
+            .expect("credential");
+    for index in 0..2u8 {
+        let id = format!("quota-{index}");
+        sqlx::query(
+            "INSERT INTO proposals
+             (id, credential_id, type, payload, human_summary, evidence, status, created_at)
+             VALUES (?, ?, 'lut_look', '{}', 'x', '[]', 'pending', 0)",
+        )
+        .bind(&id)
+        .bind(&credential)
+        .execute(&server.db)
+        .await
+        .expect("proposal");
+        sqlx::query(
+            "INSERT INTO lut_uploads
+             (proposal_id, sha256, credential_id, file, size, created_at)
+             VALUES (?, ?, ?, 'quota.cube', ?, 0)",
+        )
+        .bind(&id)
+        .bind(vec![index; 32])
+        .bind(&credential)
+        .bind(32i64 * 1024 * 1024)
+        .execute(&server.db)
+        .await
+        .expect("upload");
+    }
+    let bytes = lut_test_cube().as_bytes();
+    let digest = hex(&Sha256::digest(bytes));
+    let payload = format!(
+        "look: quota-lut\nname: Quota LUT\nlicense: {{ own_work: true }}\n\
+         attribution: A contributor\nlut:\n  file: quota.cube\n  sha256: {digest}\n  \
+         size: {}\nencoding: flog2_fgamut\n",
+        bytes.len()
+    );
+    let (status, body) = server.submit_lut("lut_look", &payload, bytes).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "quota: {body}");
+    assert_eq!(body["error"], "SCHEMA_INVALID");
+}
+
+#[tokio::test]
+async fn legacy_persistent_bounties_are_fenced_but_coverage_survives() {
+    let server = TestServer::start().await;
+    for (id, reason) in [
+        (
+            "legacy-persistent",
+            r#"{ "kind": "persistent_residual", "gap": 1.0, "attribution": "unassessed" }"#,
+        ),
+        (
+            "legacy-coverage",
+            r#"{ "kind": "unverified_region", "sigma": 1.0 }"#,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO bounties (
+                 id, target_look, look_version, body_id, region, metric, expected_variance_reduction,
+                 reason, status, created_at
+             ) VALUES (?, 'classic-chrome', 1, 'fujifilm/x-t4', 'h1/e1',
+                       'looklab-scoring-metric/legacy-pre-clip/1', 1.0, ?, 'open', 0)",
+        )
+        .bind(id)
+        .bind(reason)
+        .execute(&server.db)
+        .await
+        .expect("legacy bounty");
+    }
+    let (status, _, bytes) = server.get("/bounties.json?body=fujifilm%2Fx-t4").await;
+    assert_eq!(status, StatusCode::OK);
+    let reply: serde_json::Value = serde_json::from_slice(&bytes).expect("bounties json");
+    let bounties = reply["bounties"].as_array().expect("bounties");
+    assert_eq!(bounties.len(), 1, "{reply}");
+    assert_eq!(bounties[0]["reason"]["kind"], "unverified_region");
+}
+
+#[tokio::test]
+async fn encoded_camera_filters_select_report_free_evidence_requests() {
+    let server = TestServer::start().await;
+    let mut conn = server.db.acquire().await.expect("connection");
+    for body in ["fujifilm/x-t4", "sony/a7"] {
+        let subject = looklab_schema::ModelSubject::BodyRealization {
+            realization: looklab_schema::BodyRealizationId {
+                body: looklab_schema::BodyId::new(body).expect("body"),
+                epoch: looklab_schema::ControlEpochId::new(1),
+                native_sim: looklab_schema::SimKey::new("provia").expect("sim"),
+            },
+        };
+        let key = looklab_server::model_store::register_subject(&mut conn, &subject, 0)
+            .await
+            .expect("subject");
+        looklab_server::model_store::record_active_evidence_request(
+            &mut conn,
+            &key,
+            looklab_schema::QualificationCapability::NativePrediction,
+            &looklab_schema::EvidenceRequest {
+                kind: looklab_schema::EvidenceRequestKind::MissingIndependentCaptures,
+                detail: "Add independent RAW captures with their in-camera JPEGs.".to_owned(),
+            },
+            Some(1),
+            0,
+        )
+        .await
+        .expect("request");
+    }
+    drop(conn);
+    let request = Request::builder()
+        .uri("/bounties.json?body=fujifilm%2Fx-t4")
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, bytes) = send(&server.app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    #[derive(serde::Deserialize)]
+    struct Reply {
+        evidence_requests: Vec<looklab_schema::EvidenceRequestWire>,
+    }
+    let reply: Reply = serde_json::from_slice(&bytes).expect("reply");
+    let bodies: Vec<_> = reply
+        .evidence_requests
+        .iter()
+        .map(|request| request.body().map(|body| body.as_str()))
+        .collect();
+    assert_eq!(bodies, [Some("fujifilm/x-t4")]);
+    assert!(matches!(
+        reply.evidence_requests[0].origin,
+        looklab_schema::EvidenceRequestOrigin::PreCandidate
+    ));
+    assert_eq!(reply.evidence_requests[0].observed_groups, Some(1));
+}
+
+#[tokio::test]
+async fn unbound_legacy_recipe_settings_do_not_poison_current_authority() {
+    let server = TestServer::start().await;
+    let look = looklab_schema::LookId::new("upgrade-legacy").expect("look");
+    let target_version = looklab_schema::TargetVersion::new(7).expect("version");
+    let realization = looklab_schema::BodyRealizationId {
+        body: looklab_schema::BodyId::new("fujifilm/x-t4").expect("body"),
+        epoch: looklab_schema::ControlEpochId::new(1),
+        native_sim: looklab_schema::SimKey::new("classic_chrome").expect("sim"),
+    };
+    let subject_key = looklab_schema::ModelSubject::BodyRealization {
+        realization: realization.clone(),
+    }
+    .key();
+    let version = looklab_schema::BodyRealizationVersionId {
+        realization,
+        version: looklab_schema::RealizationVersion::new(1).expect("realization version"),
+        target: looklab_schema::FamilyTargetId {
+            family: look.clone(),
+            version: target_version,
+        },
+    };
+    let revision = looklab_schema::RealizationRevisionId::for_version(&version);
+    let target_key = format!("{}@7", look.as_str());
+    let hash = "a".repeat(64);
+    sqlx::query(
+        "INSERT INTO look_versions (id, look, version, status, changelog, created_at)
+         VALUES ('upgrade-legacy-v7', ?, 7, 'published', NULL, 0)",
+    )
+    .bind(look.as_str())
+    .execute(&server.db)
+    .await
+    .expect("look version");
+    sqlx::query(
+        "INSERT INTO model_body_states (
+             body, version, stage, profile_sha256, input_transform_sha256,
+             body_params_sha256, gauge_sha256, created_at
+         ) VALUES ('fujifilm/x-t4', 1, 'published', NULL, ?, ?, ?, 0)",
+    )
+    .bind(&hash)
+    .bind(&hash)
+    .bind(&hash)
+    .execute(&server.db)
+    .await
+    .expect("body state");
+    sqlx::query(
+        "INSERT INTO model_subjects (key, kind, family, body, epoch, native_sim, created_at)
+         VALUES (?, 'body_realization', NULL, 'fujifilm/x-t4', 1, 'classic_chrome', 0)",
+    )
+    .bind(subject_key.as_str())
+    .execute(&server.db)
+    .await
+    .expect("subject");
+    sqlx::query(
+        "INSERT INTO model_realization_revisions (
+             id, subject_key, body, version, family, target_version, body_state_version,
+             input_transform_version, realization_params_version, control_response_version,
+             clip_k, status, status_reason, numerical, release_gates, created_at
+         ) VALUES (?, ?, 'fujifilm/x-t4', 1, 'upgrade-legacy', 7, 1, 1, 1, 1,
+                   0.03, 'candidate', NULL, 'passed', 'passed', 0)",
+    )
+    .bind(revision.as_str())
+    .bind(subject_key.as_str())
+    .execute(&server.db)
+    .await
+    .expect("realization revision");
+    sqlx::query(
+        "INSERT INTO model_family_heads (
+             family, head_version, source_limited, numerical, release_gates, report_id,
+             assessed_generation, applicability, invalidated_reason, updated_at
+         ) VALUES ('upgrade-legacy', 7, 0, 'passed', 'passed', NULL, 0, 'current', NULL, 0)",
+    )
+    .execute(&server.db)
+    .await
+    .expect("family head");
+    sqlx::query(
+        "INSERT INTO model_current_projections (
+             subject_key, \"use\", capability, scope_key, selected_report_id,
+             selected_candidate_kind, selected_candidate_id, selected_candidate_target,
+             selected_candidate_version, pending_generation, applicability,
+             invalidated_reason, updated_at
+         ) VALUES (?, 'experimental_match', 'native_prediction', 'all', NULL,
+                   'body_realization', ?, ?, 1, 0, 'current', NULL, 0)",
+    )
+    .bind(subject_key.as_str())
+    .bind(revision.as_str())
+    .bind(&target_key)
+    .execute(&server.db)
+    .await
+    .expect("projection");
+    sqlx::query(
+        "INSERT INTO recipe_scores (
+             id, body_id, epoch, base_sim, settings, target_look, metric, predicted_de,
+             predicted_sigma, measured_de, measured_sigma, n_verifications,
+             input_transform_version, control_response_version, look_version,
+             source_realization, source_body_state, source_report, source_scope, updated_at
+         ) VALUES (
+             'current-recipe', 'fujifilm/x-t4', 1, 'classic_chrome', '[]',
+             'upgrade-legacy', 'looklab-scoring-metric/rendered-post-clip/1', 1.0,
+             NULL, 1.0, 0.5, 1, 1, 1, 7, ?, 1, NULL, 'experimental', 0
+         )",
+    )
+    .bind(revision.as_str())
+    .execute(&server.db)
+    .await
+    .expect("current score");
+    sqlx::query(
+        "INSERT INTO recipe_scores (
+             id, body_id, epoch, base_sim, settings, target_look, predicted_de,
+             predicted_sigma, measured_de, measured_sigma, n_verifications,
+             input_transform_version, control_response_version, look_version,
+             source_realization, source_body_state, source_report, source_scope, updated_at
+         ) VALUES (
+             'legacy-recipe', 'fujifilm/x-t4', 1, 'classic_chrome', '{}',
+             'upgrade-legacy', 3.75, NULL, 4.0, 0.5, 2, 0, 0, 7, NULL, NULL, NULL, NULL, 0
+         )",
+    )
+    .execute(&server.db)
+    .await
+    .expect("legacy score");
+
+    let (status, _, bytes) = server
+        .get("/api/recipes?body=fujifilm%2Fx-t4&look=upgrade-legacy")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let reply: serde_json::Value = serde_json::from_slice(&bytes).expect("recipes json");
+    assert_eq!(reply.as_array().map(Vec::len), Some(1), "{reply}");
+    assert_eq!(reply[0]["entries"][0]["model_versions"]["look"], 7);
+
+    sqlx::query(
+        "UPDATE model_family_heads
+         SET applicability = 'invalidated', invalidated_reason = 'withdrawal'
+         WHERE family = 'upgrade-legacy'",
+    )
+    .execute(&server.db)
+    .await
+    .expect("invalidate head");
+    let (status, _, bytes) = server
+        .get("/api/recipes?body=fujifilm%2Fx-t4&look=upgrade-legacy")
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let reply: serde_json::Value = serde_json::from_slice(&bytes).expect("recipes json");
+    assert_eq!(reply, serde_json::json!([]));
 }

@@ -191,21 +191,7 @@ fn find_patch<'a>(
 }
 
 fn slug(name: &str) -> String {
-    let mut out = String::new();
-    let mut previous_dash = false;
-    for character in name.chars() {
-        if character.is_ascii_alphanumeric() {
-            out.push(character.to_ascii_lowercase());
-            previous_dash = false;
-        } else if !previous_dash && !out.is_empty() {
-            out.push('-');
-            previous_dash = true;
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out
+    looklab_schema::slug_from_name(name)
 }
 
 #[derive(Deserialize)]

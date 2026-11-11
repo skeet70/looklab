@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Offline operator commands: state initialisation and the first admin grant.
+//! Offline operator commands: state initialisation, the first admin grant and
+//! diagnostic retrieval.
+
+use std::io::Write;
 
 use looklab_trust::{Actor, Grant};
 use sqlx::SqlitePool;
 
 use crate::admin::{self, GrantRecord};
+use crate::client_errors::{self, BuildId, ErrorType, Frame, Page, ReportKind, StoredReport};
 use crate::config::{Config, ConfigError, ServerSecret};
 use crate::db::{self, DbError};
 use crate::ids::CredentialId;
+use crate::proposals::rfc3339;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OperatorError {
@@ -33,6 +38,8 @@ pub enum OperatorError {
     Inactive(String),
     #[error("stored credential status `{0}` is unknown")]
     UnknownStatus(String),
+    #[error("output: {0}")]
+    Output(#[from] serde_json::Error),
 }
 
 /// A display name accepted by passkey registration.
@@ -41,8 +48,9 @@ pub struct DisplayHandle(String);
 
 impl DisplayHandle {
     pub fn parse(value: &str) -> Option<Self> {
-        let valid =
-            !value.is_empty() && value.chars().count() <= 64 && !value.chars().any(char::is_control);
+        let valid = !value.is_empty()
+            && value.chars().count() <= 64
+            && !value.chars().any(char::is_control);
         valid.then(|| Self(value.to_owned()))
     }
 
@@ -121,16 +129,13 @@ pub async fn bootstrap_admin(
 ) -> Result<GrantRecord, OperatorError> {
     let pool = db::open(&config.db_path).await?;
     let subject = resolve(&pool, subject).await?;
-    let record = admin::grant_credential(&pool, Actor::Cli, &subject, Grant::Admin, None, reason)
-        .await?;
+    let record =
+        admin::grant_credential(&pool, Actor::Cli, &subject, Grant::Admin, None, reason).await?;
     pool.close().await;
     Ok(record)
 }
 
-async fn resolve(
-    pool: &SqlitePool,
-    subject: AdminSubject,
-) -> Result<CredentialId, OperatorError> {
+async fn resolve(pool: &SqlitePool, subject: AdminSubject) -> Result<CredentialId, OperatorError> {
     match subject {
         AdminSubject::Credential(subject) => {
             ensure_active(pool, &subject).await?;
@@ -163,11 +168,10 @@ async fn resolve(
 }
 
 async fn ensure_active(pool: &SqlitePool, subject: &CredentialId) -> Result<(), OperatorError> {
-    let status: Option<String> =
-        sqlx::query_scalar("SELECT status FROM credentials WHERE id = ?")
-            .bind(subject.as_str())
-            .fetch_optional(pool)
-            .await?;
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM credentials WHERE id = ?")
+        .bind(subject.as_str())
+        .fetch_optional(pool)
+        .await?;
     let Some(status) = status else {
         return Err(OperatorError::NoSuchCredential(subject.to_string()));
     };
@@ -177,4 +181,73 @@ async fn ensure_active(pool: &SqlitePool, subject: &CredentialId) -> Result<(), 
         CredentialStatus::Active => Ok(()),
         CredentialStatus::Revoked => Err(OperatorError::Inactive(subject.to_string())),
     }
+}
+
+/// Reads diagnostic reports through a read-only connection.
+///
+/// # Errors
+/// The database is missing, unreadable or holds a malformed row.
+pub async fn client_error_reports(
+    config: &Config,
+    limit: usize,
+    release: Option<&BuildId>,
+) -> Result<Vec<StoredReport>, OperatorError> {
+    let pool = db::open_read_only(&config.db_path).await?;
+    let reports = client_errors::recent(&pool, limit, release).await;
+    pool.close().await;
+    reports.map_err(Into::into)
+}
+
+#[derive(serde::Serialize)]
+struct ClientErrorOutput<'a> {
+    received_at: i64,
+    timestamp: String,
+    release: &'a BuildId,
+    page: Page,
+    kind: ReportKind,
+    error_type: ErrorType,
+    frames: &'a [Frame],
+}
+
+/// Writes reports newest first as text blocks or a JSON array.
+///
+/// # Errors
+/// Writing the stream fails.
+pub fn write_client_error_reports(
+    mut out: impl Write,
+    reports: &[StoredReport],
+    json: bool,
+) -> Result<(), OperatorError> {
+    if json {
+        let rows: Vec<ClientErrorOutput<'_>> = reports
+            .iter()
+            .map(|report| ClientErrorOutput {
+                received_at: report.received_at,
+                timestamp: rfc3339(report.received_at),
+                release: &report.release,
+                page: report.page,
+                kind: report.kind,
+                error_type: report.error_type,
+                frames: &report.frames,
+            })
+            .collect();
+        serde_json::to_writer_pretty(&mut out, &rows)?;
+        writeln!(out)?;
+    } else {
+        for report in reports {
+            writeln!(
+                out,
+                "{} release={} page={} kind={} type={}",
+                rfc3339(report.received_at),
+                report.release,
+                report.page,
+                report.kind,
+                report.error_type
+            )?;
+            for frame in &report.frames {
+                writeln!(out, "  {frame}")?;
+            }
+        }
+    }
+    Ok(())
 }

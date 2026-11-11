@@ -7,6 +7,8 @@ pub enum PrepError {
     DecodeJpeg(String),
     #[error("JPEG structure is invalid: {0}")]
     JpegStructure(&'static str),
+    #[error("JPEG colour profile is neither sRGB nor Adobe RGB")]
+    UnsupportedColorProfile,
     #[error("image has no pixels")]
     ImageEmpty,
     #[error("image dimensions overflow")]
@@ -15,6 +17,8 @@ pub enum PrepError {
     AlignNoOverlap,
     #[error("central correlation {correlation:.4} is below the {minimum:.2} threshold")]
     AlignLowCorrelation { correlation: f64, minimum: f64 },
+    #[error("re-render {index} does not align with the RAW: {message}")]
+    MemberAlignment { index: usize, message: String },
     #[error("RAW decoding failed: {0}")]
     RawDecode(#[from] looklab_raw::RawError),
     #[error("metadata parsing failed: {0}")]

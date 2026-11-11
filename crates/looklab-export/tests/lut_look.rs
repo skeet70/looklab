@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use looklab_color::ucs::Ucs;
 use looklab_color::{Rgb, RgbSpace};
 use looklab_export::card::{CardError, CardMeta, CardOptions, read_card, write_card};
 use looklab_export::{
-    CubeFile, Lut3d, LutLookOptions, definition_delta, import_lut_look, lut_data_from_cube,
-    read_cube, ucs_to_xyz, write_cube,
+    CubeFile, Lut3d, LutLookError, LutLookOptions, RenderableAppearance, checked_appearance,
+    composed_ucs, definition_delta, import_lut_look, lut_data_from_cube, read_cube, ucs_to_xyz,
+    write_cube,
 };
-use looklab_match::{Emphasis, MatchError, PreparedTarget, TargetSpec};
+use looklab_match::{
+    Emphasis, MatchError, OutputPin, PreparedTarget, TargetAppearance, TargetSpec,
+};
+use looklab_model::basis::{TONE_COEFS, ToneBasis};
 use looklab_model::file::{
     BaseField, BaseReference, BaseStatus, DeclaredEncoding, Gamut, LicenseRecord, LogTransfer,
     LookVersion, LutData, LutDefinition, LutRecord, OutputEncoding, Slug,
@@ -62,6 +67,7 @@ fn definition() -> LutDefinition {
             transfer: LogTransfer::Flog2,
             gamut: Gamut::Fgamut,
         },
+        declared_base: None,
         output: OutputEncoding::Srgb,
         lut: LutRecord {
             size: 3,
@@ -176,6 +182,67 @@ fn a_stored_lut_with_a_non_finite_value_is_rejected() {
     let _ = LutData::new(3, [0.0; 3], [1.0; 3], values).expect_err("non-finite LUT");
 }
 
+#[test]
+fn a_feasible_published_render_is_checked_and_an_infeasible_one_is_rejected() {
+    let probe = probes::v1().probes[0].xyz;
+    let look = Look::colorimetric_spline().expect("look");
+    let checked = checked_appearance(&look, probe).expect("feasible published render");
+    assert!(matches!(
+        checked,
+        RenderableAppearance::Interior(inverse) if inverse.minimum_margin > 0.0
+    ));
+
+    let mut shifted = Look::colorimetric_spline().expect("look");
+    shifted.color.lambda.plane.fill(400.0);
+    let error = checked_appearance(&shifted, probe).expect_err("infeasible published render");
+    assert!(matches!(
+        error.kind,
+        looklab_model::domain_penalty::DomainViolationKind::Lightness { .. }
+    ));
+}
+
+#[test]
+fn neutral_black_is_a_rendering_boundary_without_an_interior_certificate() {
+    let black = RenderableAppearance::try_from(Ucs::new(0.0, 0.0, 0.0))
+        .expect("neutral-black rendering boundary");
+    assert!(matches!(black, RenderableAppearance::NeutralBlack));
+    for invalid in [
+        Ucs::new(-1.0, 0.0, 0.0),
+        Ucs::new(0.0, 1.0, 0.0),
+        Ucs::new(0.0, 0.0, 1.0),
+    ] {
+        assert!(matches!(
+            RenderableAppearance::try_from(invalid)
+                .expect_err("invalid nonblack appearance")
+                .kind,
+            looklab_model::domain_penalty::DomainViolationKind::Lightness { .. }
+        ));
+    }
+}
+
+#[test]
+fn a_base_with_an_infeasible_published_render_is_a_typed_error() {
+    let cube = cube();
+    let definition = measured_definition(&cube);
+    let lut = Lut3d {
+        size: 3,
+        data: cube.lut.data.clone(),
+        shaper: None,
+    };
+    let probe = probes::v1().probes[0].xyz;
+    let feasible =
+        LookDocument::from_look(base_identity(), Look::colorimetric_spline().expect("look"))
+            .expect("base");
+    composed_ucs(&lut, &definition, Some(&feasible), probe).expect("feasible base");
+
+    let mut look = Look::colorimetric_spline().expect("look");
+    look.color.lambda.plane.fill(400.0);
+    let infeasible = LookDocument::from_look(base_identity(), look).expect("base");
+    let error =
+        composed_ucs(&lut, &definition, Some(&infeasible), probe).expect_err("infeasible base");
+    assert!(matches!(error, LutLookError::PublishedInverse(_)));
+}
+
 fn bt709_decode(code: f64) -> f64 {
     if code < 0.081 {
         code / 4.5
@@ -246,6 +313,7 @@ fn synthetic_definition(cube: &CubeFile) -> LutDefinition {
             base: BaseReference::neutral_baseline(),
             status: BaseStatus::Pinned,
         },
+        declared_base: None,
         output: OutputEncoding::Srgb,
         lut: lut.record(),
         emulates: None,
@@ -279,16 +347,96 @@ fn a_synthetic_lut_from_a_layered_look_is_recovered() {
 fn lowered_white_look() -> Look {
     const PLATEAU_Y: f64 = 0.793_361_860_471;
     let s_plateau = libm::log2(PLATEAU_Y / 0.18);
-    let mut s = Vec::new();
-    let mut j_prime = Vec::new();
+    let basis = ToneBasis::new();
+    let mut normal = [[0.0_f64; TONE_COEFS + 1]; TONE_COEFS + 1];
+    let mut rhs = [0.0_f64; TONE_COEFS + 1];
     for step in 0..=240 {
-        let value = -10.0 + 15.5 * step as f64 / 240.0;
-        s.push(value);
-        j_prime.push(neutral_j_prime(0.18 * libm::pow(2.0, value.min(s_plateau))));
+        let s = -10.0 + 15.5 * step as f64 / 240.0;
+        let value = neutral_j_prime(0.18 * libm::pow(2.0, s.min(s_plateau)));
+        let mut row = [1.0_f64; TONE_COEFS + 1];
+        row[1..].copy_from_slice(&basis.values(s));
+        for (a, row_a) in row.iter().enumerate() {
+            rhs[a] += row_a * value;
+            for (b, row_b) in row.iter().enumerate() {
+                normal[a][b] += row_a * row_b;
+            }
+        }
     }
     let mut look = Look::colorimetric();
-    look.tone = Tone::from_neutral_samples(&s, &j_prime).expect("monotone tone");
+    look.tone = monotone_tone(&normal, &rhs).expect("monotone tone");
     look
+}
+
+/// Active-set least squares for `c0 + Σ β_k I_k` with `β ≥ 0`.
+fn monotone_tone(
+    normal: &[[f64; TONE_COEFS + 1]; TONE_COEFS + 1],
+    rhs: &[f64; TONE_COEFS + 1],
+) -> Option<Tone> {
+    let mut active = [true; TONE_COEFS];
+    loop {
+        let index: Vec<usize> = (0..TONE_COEFS).filter(|k| active[*k]).collect();
+        let variables: Vec<usize> = std::iter::once(0)
+            .chain(index.iter().map(|k| k + 1))
+            .collect();
+        let mut system = [[0.0_f64; TONE_COEFS + 2]; TONE_COEFS + 1];
+        for (a, variable_a) in variables.iter().enumerate() {
+            for (b, variable_b) in variables.iter().enumerate() {
+                system[a][b] = normal[*variable_a][*variable_b];
+            }
+            system[a][a] += 1.0e-12;
+            system[a][variables.len()] = rhs[*variable_a];
+        }
+        let solution = solve_dense(&mut system, variables.len())?;
+        let mut worst = None;
+        let mut most_negative = 0.0;
+        for (slot, coefficient) in index.iter().enumerate() {
+            if solution[slot + 1] < most_negative {
+                most_negative = solution[slot + 1];
+                worst = Some(*coefficient);
+            }
+        }
+        match worst {
+            Some(coefficient) => active[coefficient] = false,
+            None => {
+                let mut beta = [0.0_f64; TONE_COEFS];
+                for (slot, coefficient) in index.iter().enumerate() {
+                    beta[*coefficient] = solution[slot + 1];
+                }
+                return Tone::spline(solution[0], beta).ok();
+            }
+        }
+    }
+}
+
+fn solve_dense(a: &mut [[f64; TONE_COEFS + 2]; TONE_COEFS + 1], size: usize) -> Option<Vec<f64>> {
+    for column in 0..size {
+        let pivot = (column + 1..size).fold(column, |best, row| {
+            if a[row][column].abs() > a[best][column].abs() {
+                row
+            } else {
+                best
+            }
+        });
+        if a[pivot][column].abs() < 1.0e-18 {
+            return None;
+        }
+        a.swap(column, pivot);
+        let diagonal = a[column][column];
+        for entry in &mut a[column][column..=size] {
+            *entry /= diagonal;
+        }
+        let pivot_row = a[column][column..=size].to_vec();
+        for (row, values) in a.iter_mut().enumerate() {
+            if row == column {
+                continue;
+            }
+            let factor = values[column];
+            for (entry, pivot_entry) in values[column..=size].iter_mut().zip(&pivot_row) {
+                *entry -= factor * pivot_entry;
+            }
+        }
+    }
+    Some(a.iter().take(size).map(|row| row[size]).collect())
 }
 
 #[test]
@@ -296,7 +444,7 @@ fn a_lowered_white_lut_imports_within_the_gate() {
     let generated = synthetic_cube(&lowered_white_look());
     let white = generated.lut.data.last().expect("white node");
     assert!(
-        (white[0] - 0.903).abs() < 0.01 && (white[1] - 0.903).abs() < 0.01,
+        (white[0] - 0.8898).abs() < 0.01 && (white[1] - 0.8898).abs() < 0.01,
         "the control LUT must lower white, got {white:?}"
     );
     let text = write_cube(&generated.lut, "lowered-white", [0.0, 1.0]);
@@ -418,6 +566,7 @@ fn measured_definition(cube: &CubeFile) -> LutDefinition {
             },
             status: BaseStatus::Pinned,
         },
+        declared_base: None,
         output: OutputEncoding::Srgb,
         lut: lut.record(),
         emulates: None,
@@ -482,6 +631,7 @@ fn a_measured_base_inherits_uncertainty_through_the_lut() {
     let target = PreparedTarget::new(TargetSpec {
         probes: &probe_set,
         function: &decoded.look,
+        appearance: TargetAppearance::Rendered(OutputPin::from_document(&decoded).expect("output")),
         uncertainty: Some(&decoded.uncertainty),
         emphasis: Emphasis::Balanced,
         tau: 1.0,
@@ -525,6 +675,9 @@ fn a_measured_base_without_uncertainty_is_not_matchable() {
         PreparedTarget::new(TargetSpec {
             probes: &probe_set,
             function: &decoded.look,
+            appearance: TargetAppearance::Rendered(
+                OutputPin::from_document(&decoded).expect("output"),
+            ),
             uncertainty: Some(&decoded.uncertainty),
             emphasis: Emphasis::Balanced,
             tau: 1.0,
@@ -576,6 +729,7 @@ fn assert_import_uncertainty(document: &LookDocument) {
     let target = PreparedTarget::new(TargetSpec {
         probes: &probe_set,
         function: &document.look,
+        appearance: TargetAppearance::Rendered(OutputPin::from_document(document).expect("output")),
         uncertainty: Some(&document.uncertainty),
         emphasis: Emphasis::Balanced,
         tau: 1.0,

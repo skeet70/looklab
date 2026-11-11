@@ -111,6 +111,14 @@ pub enum AuditEvent {
         decision: Decision,
         reason: String,
     },
+    ProposalExpired {
+        proposal: ProposalRef,
+        reason: String,
+    },
+    ProposalLegacyRejected {
+        proposal: ProposalRef,
+        reason: String,
+    },
     ReAnchor {
         look: LookRef,
         version: VersionRef,
@@ -119,7 +127,14 @@ pub enum AuditEvent {
     Revert {
         look: LookRef,
         to_version: VersionRef,
-        excluded: Vec<CredentialRef>,
+        rejected: Vec<ContributionRef>,
+        legacy_excluded: Vec<CredentialRef>,
+        held: bool,
+        reason: String,
+    },
+    CredentialIntakeBlocked {
+        moderator: CredentialRef,
+        subject: CredentialRef,
         reason: String,
     },
     Split {
@@ -147,8 +162,11 @@ impl AuditEvent {
             Self::Endorsement { .. } => "endorsement",
             Self::RootAdmission { .. } => "root_admission",
             Self::ModerationDecision { .. } => "moderation_decision",
+            Self::ProposalExpired { .. } => "proposal_expired",
+            Self::ProposalLegacyRejected { .. } => "proposal_legacy_rejected",
             Self::ReAnchor { .. } => "re_anchor",
             Self::Revert { .. } => "revert",
+            Self::CredentialIntakeBlocked { .. } => "credential_intake_blocked",
             Self::Split { .. } => "split",
             Self::LookListing { .. } => "look_listing",
             Self::Release { .. } => "release",

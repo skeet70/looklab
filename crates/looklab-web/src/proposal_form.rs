@@ -2,10 +2,17 @@
 //! Parsing helpers shared by the proposal form and the confirmation form.
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
+use looklab_publish::{LookStatus, LookVisibility, SOURCE_LUT_ARTIFACT, SiteIndex};
 use looklab_schema::{
-    Date, FixtureDonation, FixtureLicense, LabeledFile, LabeledTag, MakernoteTag, MakernoteValue,
-    MappingInference, Placement, Sha256Hex, SimKey, infer_mapping, validate_confirmation,
+    Affects, Body, BodyId, BodyKind, BodyStatus, Capabilities, ColorSpace, ControlChange,
+    ControlDefinition, ControlKey, ControlSchema, ControlType, Date, EnumValue, FirmwareVersion,
+    FixtureDonation, FixtureLicense, LabeledFile, LabeledTag, LicenseDeclaration, LutEmulationDecl,
+    LutEncoding, LutFile, LutLookProposal, LutLookVersion, Makernote, MakernoteTag, MakernoteValue,
+    MappingInference, MappingProposal, MappingStatus, NativeSim, Placement, Range, Rational,
+    ScalarValue, Sha256Hex, SimKey, Tolerated, encode_proposal, infer_mapping,
+    validate_confirmation,
 };
 
 pub fn kind_label(kind: looklab_schema::ProposalKind) -> &'static str {
@@ -47,6 +54,7 @@ pub fn menu_summary(
     };
     looklab_schema::ProposalSummary::with_details(headline, details)
 }
+
 use sha2::{Digest, Sha256};
 
 pub fn file_menu_value(bytes: &[u8]) -> Result<String, String> {
@@ -242,9 +250,695 @@ pub fn donation(
     Ok(donation)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct BodyDraft {
+    pub make: String,
+    pub model: String,
+    pub kind: BodyKind,
+    pub mapping_status: MappingStatus,
+    pub in_camera_raw_conversion: bool,
+    pub jpeg_color_spaces: Vec<String>,
+    pub heif: bool,
+    pub exif_aliases: Vec<String>,
+}
+
+impl BodyDraft {
+    /// # Errors
+    /// A name that reduces to an empty slug, or a color space with whitespace.
+    pub fn payload(&self) -> Result<String, String> {
+        let id = looklab_schema::body_id_from_name(&self.make, &self.model)
+            .map_err(|error| error.to_string())?;
+        let spaces = self
+            .jpeg_color_spaces
+            .iter()
+            .map(|space| ColorSpace::try_from(space.clone()).map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let body = Body {
+            id,
+            make: self.make.trim().to_owned(),
+            model: self.model.trim().to_owned(),
+            exif_aliases: self.exif_aliases.clone(),
+            kind: self.kind,
+            capabilities: Capabilities {
+                in_camera_raw_conversion: self.in_camera_raw_conversion,
+                jpeg_color_spaces: spaces,
+                heif: self.heif,
+            },
+            status: BodyStatus::Proposed,
+            mapping_status: self.mapping_status,
+        };
+        encode_proposal(&body).map_err(join_validation)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MappingDraft {
+    pub body: BodyId,
+    pub epoch: u32,
+    pub sim_key: SimKey,
+    pub look: looklab_schema::LookId,
+    pub firmware_from: FirmwareVersion,
+    pub tag: MakernoteTag,
+    pub value: u64,
+    pub monochrome: bool,
+}
+
+impl MappingDraft {
+    /// # Errors
+    /// A payload the YAML serializer rejects.
+    pub fn payload(&self) -> Result<String, String> {
+        let proposal = MappingProposal {
+            body: self.body.clone(),
+            epoch: self.epoch,
+            sim_key: self.sim_key.clone(),
+            look: self.look.clone(),
+            firmware_from: self.firmware_from.clone(),
+            firmware_to: None,
+            makernote: Makernote {
+                tag: self.tag.clone(),
+                value: MakernoteValue(self.value),
+            },
+            monochrome: self.monochrome,
+        };
+        encode_proposal(&proposal).map_err(join_validation)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LutLookDraft {
+    pub look: looklab_schema::LookId,
+    pub name: String,
+    pub license: LicenseDeclaration,
+    pub attribution: String,
+    pub lut: LutFile,
+    pub encoding: LutEncoding,
+    pub emulates: Option<LutEmulationDecl>,
+}
+
+impl LutLookDraft {
+    /// # Errors
+    /// A payload the YAML serializer rejects.
+    pub fn payload(&self) -> Result<String, String> {
+        let proposal = LutLookProposal {
+            look: self.look.clone(),
+            name: self.name.clone(),
+            license: self.license.clone(),
+            attribution: self.attribution.clone(),
+            lut: self.lut.clone(),
+            encoding: self.encoding.clone(),
+            emulates: self.emulates.clone(),
+        };
+        encode_proposal(&proposal).map_err(join_validation)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CubeSummary {
+    pub title: Option<String>,
+    pub size: u32,
+    pub domain: [f64; 2],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LutFileDraft {
+    pub name: String,
+    pub bytes: Vec<u8>,
+    pub sha256: Sha256Hex,
+    pub summary: CubeSummary,
+}
+
+impl LutFileDraft {
+    pub fn file(&self) -> LutFile {
+        LutFile {
+            file: self.name.clone(),
+            sha256: self.sha256,
+            size: self.bytes.len() as u64,
+        }
+    }
+}
+
+/// # Errors
+/// A file that is not a supported 3D `.cube`, or one over the 16 MiB cap.
+pub fn parse_cube(name: String, bytes: Vec<u8>) -> Result<LutFileDraft, String> {
+    if bytes.len() as u64 > looklab_schema::MAX_LUT_BYTES {
+        return Err("Choose a .cube file under 16 MiB.".to_owned());
+    }
+    looklab_schema::FixtureFileName::parse(&name)
+        .map_err(|_| "Choose a .cube file with a plain file name.".to_owned())?;
+    if !name.ends_with(".cube") {
+        return Err("Choose a .cube file.".to_owned());
+    }
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| "This .cube file is not text.".to_owned())?;
+    let cube = looklab_export::read_cube(text).map_err(|error| error.to_string())?;
+    looklab_export::lut_data_from_cube(&cube).map_err(|error| error.to_string())?;
+    let title = text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("TITLE")
+            .map(|value| value.trim().trim_matches('"').to_owned())
+            .filter(|value| !value.is_empty())
+    });
+    let sha256 = digest(&bytes)?;
+    Ok(LutFileDraft {
+        name,
+        bytes,
+        sha256,
+        summary: CubeSummary {
+            title,
+            size: cube.lut.size,
+            domain: cube.domain,
+        },
+    })
+}
+
+/// # Errors
+/// The base schema or an edit fails validation.
+pub fn schema_payload(
+    base: &str,
+    edits: &[(u32, ControlChange)],
+) -> Result<String, Vec<looklab_schema::ValidationError>> {
+    looklab_schema::apply_control_changes(base, edits)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimIdentity {
+    pub epoch: u32,
+    pub key: SimKey,
+}
+
+pub fn inferred_makernote(text: &str, name: &str) -> Option<(MakernoteTag, u64)> {
+    let key = looklab_schema::sim_key_from_name(name).ok()?;
+    let inference = parse_labeled_files(text).ok()?;
+    let best = inference.best()?;
+    let value = best.value_for(&key)?;
+    Some((best.tag.clone(), value.0))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SimSuggestion {
+    pub identity: SimIdentity,
+    pub firmware_from: String,
+    pub firmware_to: String,
+    pub look: looklab_schema::LookId,
+    pub monochrome: bool,
+}
+
+/// Every existing simulation in this camera whose key or Look link the name reaches.
+pub fn suggest_sims(schema: &ControlSchema, name: &str) -> Vec<SimSuggestion> {
+    let Ok(key) = looklab_schema::sim_key_from_name(name) else {
+        return Vec::new();
+    };
+    let Ok(look) = looklab_schema::look_id_from_name(name) else {
+        return Vec::new();
+    };
+    schema
+        .epochs
+        .iter()
+        .flat_map(|epoch| {
+            epoch
+                .native_sims
+                .iter()
+                .filter(|sim| sim.key == key || sim.look == look)
+                .map(|sim| SimSuggestion {
+                    identity: SimIdentity {
+                        epoch: epoch.id,
+                        key: sim.key.clone(),
+                    },
+                    firmware_from: epoch.firmware.from.as_str().to_owned(),
+                    firmware_to: epoch.firmware.to.as_str().to_owned(),
+                    look: sim.look.clone(),
+                    monochrome: sim.monochrome,
+                })
+        })
+        .collect()
+}
+
+pub fn sim_correction(
+    schema: &ControlSchema,
+    identity: &SimIdentity,
+    target_epoch: u32,
+) -> Result<NativeSim, String> {
+    let source = schema
+        .epochs
+        .iter()
+        .find(|epoch| epoch.id == identity.epoch)
+        .ok_or_else(|| "Choose the simulation to correct.".to_owned())?;
+    let sim = source
+        .native_sims
+        .iter()
+        .find(|sim| sim.key == identity.key)
+        .ok_or_else(|| "Choose the simulation to correct.".to_owned())?;
+    let target = schema
+        .epochs
+        .iter()
+        .find(|epoch| epoch.id == target_epoch)
+        .ok_or_else(|| "Choose a firmware range.".to_owned())?;
+    if target
+        .native_sims
+        .iter()
+        .any(|existing| existing.key == sim.key)
+    {
+        return Err(
+            "That simulation is already available in this firmware range. Choose the range where it actually appeared."
+                .to_owned(),
+        );
+    }
+    Ok(sim.clone())
+}
+
+pub fn parse_rational(value: &str) -> Result<Rational, String> {
+    Rational::parse(value).map_err(|error| error.to_string())
+}
+
+pub fn parse_step(value: &str) -> Result<Rational, String> {
+    Rational::parse_step(value).map_err(|error| error.to_string())
+}
+
+pub fn parse_enum_values(value: &str) -> Result<Vec<EnumValue>, String> {
+    value
+        .split([',', ' ', '\n'])
+        .filter(|value| !value.is_empty())
+        .map(|value| EnumValue::new(value).map_err(|error| error.to_string()))
+        .collect()
+}
+
+pub fn parse_affects(value: &str) -> Result<Vec<Affects>, String> {
+    value
+        .split([',', ' ', '\n'])
+        .filter(|value| !value.is_empty())
+        .map(|value| Affects::from_str(value).map_err(|()| format!("Unknown effect `{value}`.")))
+        .collect()
+}
+
+pub fn parse_scalar(value: &str, kind: ControlType) -> Result<ScalarValue, String> {
+    match kind {
+        ControlType::Int | ControlType::Decimal => Rational::parse(value)
+            .map(ScalarValue::Number)
+            .map_err(|error| error.to_string()),
+        ControlType::Enum => EnumValue::new(value.trim())
+            .map(|value| ScalarValue::Text(value.to_string()))
+            .map_err(|error| error.to_string()),
+        ControlType::Bool => match value.trim() {
+            "true" => Ok(ScalarValue::Bool(true)),
+            "false" => Ok(ScalarValue::Bool(false)),
+            _ => Err("Enter true or false.".to_owned()),
+        },
+    }
+}
+
+/// An absent field stays absent; only written text produces an edit.
+///
+/// # Errors
+/// Non-empty text with no value tokens.
+pub fn parse_optional_tolerated(value: &str) -> Result<Option<Tolerated>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed == "any" {
+        return Ok(Some(Tolerated::Any));
+    }
+    let values = trimmed
+        .split([',', ' '])
+        .filter(|value| !value.is_empty())
+        .map(ScalarValue::from_raw)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return Err("Enter tolerated values, `any`, or leave the field blank.".to_owned());
+    }
+    Ok(Some(Tolerated::Values(values)))
+}
+
+pub fn scalar_text(value: &ScalarValue) -> String {
+    match value {
+        ScalarValue::Bool(value) => value.to_string(),
+        ScalarValue::Number(value) => value.to_string(),
+        ScalarValue::Text(value) => value.clone(),
+    }
+}
+
+pub fn tolerated_text(value: &Tolerated) -> String {
+    match value {
+        Tolerated::Any => "any".to_owned(),
+        Tolerated::Values(values) => values
+            .iter()
+            .map(scalar_text)
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
+pub fn control_kind(kind: ControlType) -> &'static str {
+    match kind {
+        ControlType::Int => "Whole numbers",
+        ControlType::Decimal => "Decimals",
+        ControlType::Enum => "Menu choices",
+        ControlType::Bool => "On or off",
+    }
+}
+
+/// One published Look version the importer can resolve as a display base.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BaseLookVersion {
+    pub look: looklab_schema::LookId,
+    pub version: LutLookVersion,
+    pub name: String,
+    pub matchable: bool,
+}
+
+pub fn base_look_versions(index: &SiteIndex) -> Vec<BaseLookVersion> {
+    index
+        .looks
+        .iter()
+        .filter(|look| look.visibility == LookVisibility::Public)
+        .flat_map(|look| {
+            look.versions
+                .iter()
+                .filter(|version| admissible_base_version(version))
+                .filter_map(|version| {
+                    Some(BaseLookVersion {
+                        look: looklab_schema::LookId::new(look.slug.as_str()).ok()?,
+                        version: LutLookVersion::new(version.version.as_str()).ok()?,
+                        name: look.name.clone(),
+                        matchable: version.matchable,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn admissible_base_version(version: &looklab_publish::VersionSummary) -> bool {
+    matches!(version.status, LookStatus::Published | LookStatus::Rooted)
+        && !matches!(
+            &version.applicability,
+            looklab_schema::Applicability::Invalidated { .. }
+        )
+        && (version.matchable || version.artifact.as_str() == SOURCE_LUT_ARTIFACT)
+}
+
+/// A neutral baseline row, unless the index already publishes that Look version.
+pub fn neutral_base(versions: &[BaseLookVersion]) -> Option<BaseLookVersion> {
+    let look = looklab_schema::LookId::new("looklab-neutral-srgb-v1").ok()?;
+    if versions.iter().any(|version| version.look == look) {
+        return None;
+    }
+    Some(BaseLookVersion {
+        look,
+        version: LutLookVersion::new("1.0.0").ok()?,
+        name: "Neutral baseline".to_owned(),
+        matchable: true,
+    })
+}
+
+/// A control to add to an epoch that does not declare it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ControlDefinitionDraft {
+    pub key: ControlKey,
+    pub kind: ControlType,
+    pub range: Option<Range>,
+    pub step: Option<Rational>,
+    pub default: Option<ScalarValue>,
+    pub values: Option<Vec<EnumValue>>,
+    pub look_affecting: bool,
+    pub affects: Vec<Affects>,
+    pub spatial: bool,
+    pub tolerated: Option<Tolerated>,
+}
+
+pub fn control_definition(draft: ControlDefinitionDraft) -> ControlDefinition {
+    ControlDefinition {
+        key: draft.key,
+        kind: draft.kind,
+        range: draft.range,
+        step: draft.step,
+        default: draft.default,
+        values: draft.values,
+        look_affecting: draft.look_affecting,
+        affects: draft.affects,
+        spatial: draft.spatial,
+        tolerated: draft.tolerated,
+    }
+}
+
+fn join_validation(errors: Vec<looklab_schema::ValidationError>) -> String {
+    errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn today() -> String {
     let iso = js_sys::Date::new_0().to_iso_string();
     iso.as_string()
         .and_then(|text| text.get(0..10).map(str::to_owned))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_epoch_schema() -> ControlSchema {
+        let yaml = r#"
+body: fujifilm/x-s10
+epochs:
+  - id: 1
+    firmware: { from: "1.00", to: "1.99" }
+    native_sims:
+      - key: provia
+        look: provia
+        makernote: { tag: FilmMode, value: 0x0000 }
+    exposure_modes: []
+    controls: []
+    solve_plan: []
+  - id: 2
+    firmware: { from: "2.00", to: "2.99" }
+    native_sims:
+      - key: provia
+        look: provia
+        makernote: { tag: FilmMode, value: 0x0000 }
+    exposure_modes: []
+    controls: []
+    solve_plan: []
+"#;
+        looklab_schema::validate_control_schema(yaml).expect("schema")
+    }
+
+    fn two_epoch_schema_with_another_second_sim() -> ControlSchema {
+        let yaml = r#"
+body: fujifilm/x-s10
+epochs:
+  - id: 1
+    firmware: { from: "1.00", to: "1.99" }
+    native_sims:
+      - key: provia
+        look: provia
+        makernote: { tag: FilmMode, value: 0x0000 }
+    exposure_modes: []
+    controls: []
+    solve_plan: []
+  - id: 2
+    firmware: { from: "2.00", to: "2.99" }
+    native_sims:
+      - key: classic_chrome
+        look: classic-chrome
+        makernote: { tag: FilmMode, value: 0x0600 }
+    exposure_modes: []
+    controls: []
+    solve_plan: []
+"#;
+        looklab_schema::validate_control_schema(yaml).expect("schema")
+    }
+
+    #[test]
+    fn labeling_files_infers_the_current_sim_value() {
+        let text = "provia FilmMode=0x0000\nacros FilmMode=0x0500";
+        let (tag, value) = inferred_makernote(text, "acros").expect("inferred makernote");
+        assert_eq!(tag.as_str(), "FilmMode");
+        assert_eq!(value, 0x0500);
+    }
+
+    #[test]
+    fn a_target_epoch_that_already_lists_the_sim_is_not_a_correction() {
+        let schema = two_epoch_schema();
+        let identity = SimIdentity {
+            epoch: 1,
+            key: SimKey::new("provia").expect("key"),
+        };
+        assert!(sim_correction(&schema, &identity, 2).is_err());
+    }
+
+    #[test]
+    fn a_target_epoch_without_the_sim_accepts_the_correction() {
+        let schema = two_epoch_schema_with_another_second_sim();
+        let identity = SimIdentity {
+            epoch: 1,
+            key: SimKey::new("provia").expect("key"),
+        };
+        assert!(sim_correction(&schema, &identity, 2).is_ok());
+    }
+
+    #[test]
+    fn a_sim_key_in_two_epochs_keeps_both_identities() {
+        let suggestions = suggest_sims(&two_epoch_schema(), "provia");
+        assert_eq!(suggestions.len(), 2);
+        assert_eq!(suggestions[0].identity.epoch, 1);
+        assert_eq!(suggestions[1].identity.epoch, 2);
+        assert_eq!(suggestions[0].identity.key, suggestions[1].identity.key);
+    }
+
+    #[test]
+    fn the_neutral_baseline_is_not_offered_twice() {
+        let neutral = neutral_base(&[]).expect("neutral baseline");
+        assert!(neutral_base(std::slice::from_ref(&neutral)).is_none());
+    }
+
+    #[test]
+    fn base_options_include_source_only_previews_without_test_fixtures() {
+        use looklab_model::file::{LookKind, LookVersion, Slug, WbPolicy};
+        use looklab_publish::{
+            ArtifactHash, ArtifactName, DOCUMENT_ARTIFACT, LookStatus, LookSummary, LookVisibility,
+            SOURCE_LUT_ARTIFACT, SiteIndex, SitePath, VersionSummary,
+        };
+
+        fn version(
+            matchable: bool,
+            artifact: &str,
+            status: LookStatus,
+            applicability: looklab_schema::Applicability,
+        ) -> VersionSummary {
+            VersionSummary {
+                version: LookVersion::new("1.0.0").expect("version"),
+                status,
+                matchable,
+                card_eligible: false,
+                approximated: false,
+                applicability,
+                eligibility_status: None,
+                card: None,
+                manifest: SitePath::new("looks/test/1.0.0/manifest.json").expect("manifest"),
+                manifest_sha256: ArtifactHash::of(b"manifest"),
+                manifest_bytes: 8,
+                artifact: ArtifactName::new(artifact).expect("artifact"),
+                sha256: ArtifactHash::of(b"artifact"),
+                bytes: 8,
+            }
+        }
+
+        fn look(
+            slug: &str,
+            visibility: LookVisibility,
+            versions: Vec<VersionSummary>,
+        ) -> LookSummary {
+            LookSummary {
+                slug: Slug::new(slug).expect("slug"),
+                name: slug.to_owned(),
+                kind: LookKind::LutDefined,
+                wb_policy: WbPolicy::Adaptive,
+                visibility,
+                head: None,
+                selected: None,
+                versions,
+            }
+        }
+
+        let mut ineligible = version(
+            true,
+            DOCUMENT_ARTIFACT,
+            LookStatus::Published,
+            looklab_schema::Applicability::Current,
+        );
+        ineligible.eligibility_status = Some(looklab_schema::TargetEligibilityStatus::Ineligible);
+        let index = SiteIndex {
+            format: looklab_publish::SITE_FORMAT.to_owned(),
+            community_snapshot_version: 0,
+            bodies: Vec::new(),
+            manuals: Vec::new(),
+            interfaces: Vec::new(),
+            input_transforms: Vec::new(),
+            looks: vec![
+                look(
+                    "layered",
+                    LookVisibility::Public,
+                    vec![version(
+                        true,
+                        DOCUMENT_ARTIFACT,
+                        LookStatus::Published,
+                        looklab_schema::Applicability::Current,
+                    )],
+                ),
+                look(
+                    "source-preview",
+                    LookVisibility::Public,
+                    vec![version(
+                        false,
+                        SOURCE_LUT_ARTIFACT,
+                        LookStatus::Published,
+                        looklab_schema::Applicability::Current,
+                    )],
+                ),
+                look(
+                    "fixture-preview",
+                    LookVisibility::TestFixture,
+                    vec![version(
+                        false,
+                        SOURCE_LUT_ARTIFACT,
+                        LookStatus::Published,
+                        looklab_schema::Applicability::Current,
+                    )],
+                ),
+                look(
+                    "invalidated-preview",
+                    LookVisibility::Public,
+                    vec![version(
+                        false,
+                        SOURCE_LUT_ARTIFACT,
+                        LookStatus::Published,
+                        looklab_schema::Applicability::Invalidated {
+                            reason: looklab_schema::InvalidationReason::Withdrawal,
+                        },
+                    )],
+                ),
+                look(
+                    "provisional",
+                    LookVisibility::Public,
+                    vec![version(
+                        true,
+                        DOCUMENT_ARTIFACT,
+                        LookStatus::Provisional,
+                        looklab_schema::Applicability::Current,
+                    )],
+                ),
+                look(
+                    "ineligible-target",
+                    LookVisibility::Public,
+                    vec![ineligible],
+                ),
+            ],
+            scenes: Vec::new(),
+            reports: Vec::new(),
+            eligibility: Vec::new(),
+            current: Vec::new(),
+            bundles: Vec::new(),
+            reference_preview: None,
+        };
+
+        let bases = base_look_versions(&index);
+        let names: Vec<&str> = bases.iter().map(|base| base.look.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["layered", "source-preview", "ineligible-target"]
+        );
+        assert!(bases[0].matchable);
+        assert!(!bases[1].matchable);
+        assert!(bases[2].matchable);
+    }
+
+    #[test]
+    fn an_absent_tolerated_field_stays_absent() {
+        assert_eq!(parse_optional_tolerated(""), Ok(None));
+        assert_eq!(parse_optional_tolerated("any"), Ok(Some(Tolerated::Any)));
+    }
 }

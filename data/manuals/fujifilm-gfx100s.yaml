@@ -1,0 +1,333 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: fujifilm/gfx100s
+  make: Fujifilm
+  model: GFX 100S
+  sources:
+  - id: gfx100s-manual
+    kind: owner_manual
+    url: https://fujifilm-dsc.com/en/manual/gfx100s/
+    title: FUJIFILM GFX 100S Owner's Manual
+    edition: BL00005110-202 EN
+    firmware_scope: unspecified
+  - id: gfx100s-firmware
+    kind: firmware_notes
+    url: https://fujifilm-x.com/en-us/support/download/firmware/cameras/gfx100s/
+    title: GFX 100S Firmware update
+    edition: web edition, accessed 2026-11-08
+    firmware_scope: '2.13'
+  capabilities:
+  - key: native_simulations
+    label: FILM SIMULATION
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - PROVIA/STANDARD
+      - Velvia/VIVID
+      - ASTIA/SOFT
+      - CLASSIC CHROME
+      - PRO Neg. Hi
+      - PRO Neg. Std
+      - CLASSIC Neg.
+      - NOSTALGIC Neg.
+      - ETERNA/CINEMA
+      - ETERNA BLEACH BYPASS
+      - ACROS
+      - ACROS+Ye
+      - ACROS+R
+      - ACROS+G
+      - MONOCHROME
+      - MONOCHROME+Ye
+      - MONOCHROME+R
+      - MONOCHROME+G
+      - SEPIA
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > FILM SIMULATION (menu_shooting/image_quality_setting)
+    notes: ACROS and MONOCHROME are documented with filter variants in a footnote.
+  - key: jpeg_quality
+    label: IMAGE QUALITY
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - SUPER FINE
+      - FINE
+      - NORMAL
+      - RAW
+      - SUPER FINE+RAW
+      - FINE+RAW
+      - NORMAL+RAW
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > IMAGE QUALITY (menu_shooting/image_quality_setting)
+  - key: heif_capture
+    label: HEIF
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > IMAGE QUALITY (menu_shooting/image_quality_setting)
+    notes: No HEIF option appears in the documented image-quality formats.
+  - key: in_camera_raw_conversion
+    label: RAW CONVERSION
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: gfx100s-manual
+      locator: PLAY BACK MENU > RAW CONVERSION (playback/menu_playback)
+  - key: jpeg_color_spaces
+    label: COLOR SPACE
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - Adobe RGB
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > COLOR SPACE (menu_shooting/image_quality_setting)
+  - key: white_balance_presets
+    label: WHITE BALANCE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - WHITE PRIORITY
+      - AUTO
+      - AMBIENCE PRIORITY
+      - CUSTOM 1
+      - CUSTOM 2
+      - CUSTOM 3
+      - COLOR TEMPERATURE
+      - DAYLIGHT
+      - SHADE
+      - FLUORESCENT LIGHT-1
+      - FLUORESCENT LIGHT-2
+      - FLUORESCENT LIGHT-3
+      - INCANDESCENT
+      - UNDERWATER
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > WHITE BALANCE (menu_shooting/image_quality_setting)
+  - key: white_balance_shift
+    label: WB SHIFT
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: R
+      - label: B
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > WHITE BALANCE > Fine-Tuning White Balance (menu_shooting/image_quality_setting)
+    notes: Two-axis fine-tuning dialog; the rendered dialog figure shows the grid and current R/B values without numeric limits.
+  - key: dynamic_range
+    label: DYNAMIC RANGE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - 100%
+      - 200%
+      - 400%
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > DYNAMIC RANGE (menu_shooting/image_quality_setting)
+    notes: 200% is available from ISO 200 to ISO 12800; 400% from ISO 400 to ISO 12800. AUTO selects 100% or 200%.
+  - key: tone_curve
+    label: TONE CURVE
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: HIGHLIGHTS
+        min: -2
+        max: 4
+        step: 1
+      - label: SHADOWS
+        min: -2
+        max: 4
+        step: 1
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > TONE CURVE (menu_shooting/image_quality_setting)
+    notes: HIGHLIGHTS and SHADOWS are each adjustable from -2 to +4.
+  - key: saturation
+    label: COLOR
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > COLOR (menu_shooting/image_quality_setting)
+  - key: sharpening
+    label: SHARPNESS
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > SHARPNESS (menu_shooting/image_quality_setting)
+  - key: noise_reduction
+    label: HIGH ISO NR
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > HIGH ISO NR (menu_shooting/image_quality_setting)
+  - key: grain
+    label: GRAIN EFFECT
+    category: spatial
+    availability: available
+    domain:
+      type: enum
+      values:
+      - STRONG
+      - WEAK
+      - 'OFF'
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > GRAIN EFFECT > ROUGHNESS (menu_shooting/image_quality_setting)
+  - key: grain_size
+    label: SIZE
+    category: spatial
+    availability: available
+    domain:
+      type: enum
+      values:
+      - LARGE
+      - SMALL
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > GRAIN EFFECT > SIZE (menu_shooting/image_quality_setting)
+  - key: clarity
+    label: CLARITY
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: -5
+      max: 5
+      step: 1
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > CLARITY (menu_shooting/image_quality_setting)
+  - key: color_chrome_effect
+    label: COLOR CHROME EFFECT
+    category: unknown
+    availability: available
+    domain:
+      type: enum
+      values:
+      - STRONG
+      - WEAK
+      - 'OFF'
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > COLOR CHROME EFFECT (menu_shooting/image_quality_setting)
+  - key: color_chrome_fx_blue
+    label: COLOR CHROME FX BLUE
+    category: unknown
+    availability: available
+    domain:
+      type: enum
+      values:
+      - STRONG
+      - WEAK
+      - 'OFF'
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > COLOR CHROME FX BLUE (menu_shooting/image_quality_setting)
+  - key: monochrome_toning
+    label: MONOCHROMATIC COLOR
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: WC
+      - label: MG
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > MONOCHROMATIC COLOR (menu_shooting/image_quality_setting)
+    notes: Two-axis warm-cool and green-magenta dialog; the rendered figure shows the grid and current WC/MG values without numeric limits.
+  - key: dynamic_range_priority
+    label: D RANGE PRIORITY
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - STRONG
+      - WEAK
+      - 'OFF'
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > D RANGE PRIORITY (menu_shooting/image_quality_setting)
+    notes: When set to other than OFF, TONE CURVE and DYNAMIC RANGE are adjusted automatically.
+  - key: raw_compression
+    label: RECORDING TYPE
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - UNCOMPRESSED
+      - LOSSLESS
+      - COMPRESSED
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > RECORDING TYPE (menu_shooting/image_quality_setting)
+  - key: raw_bit_depth
+    label: OUTPUT DEPTH(bit)
+    category: capture
+    availability: available
+    domain:
+      type: integer
+      min: 14
+      max: 16
+      step: 2
+    citations:
+    - source: gfx100s-manual
+      locator: IMAGE QUALITY SETTING > OUTPUT DEPTH(bit) (menu_shooting/image_quality_setting)
+  - key: film_simulation_bracket
+    label: FILM SIMULATION BKT
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: gfx100s-manual
+      locator: Bracketing > FILM SIMULATION BKT (taking_photo/bracketing)
+  notes:
+  - TONE CURVE replaces separate HIGHLIGHT TONE and SHADOW TONE controls.

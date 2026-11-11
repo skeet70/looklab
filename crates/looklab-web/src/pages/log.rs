@@ -59,6 +59,12 @@ pub(super) fn event_sentence(event: &AuditEvent) -> String {
                 Decision::RequestInfo => "requested information on",
             }
         ),
+        AuditEvent::ProposalExpired { proposal, reason } => {
+            format!("Proposal {proposal} expired before moderation: {reason}")
+        }
+        AuditEvent::ProposalLegacyRejected { proposal, reason } => {
+            format!("Proposal {proposal} was rejected during migration: {reason}")
+        }
         AuditEvent::ReAnchor {
             look,
             version,
@@ -67,9 +73,36 @@ pub(super) fn event_sentence(event: &AuditEvent) -> String {
         AuditEvent::Revert {
             look,
             to_version,
+            rejected,
+            legacy_excluded,
+            held,
             reason,
-            ..
-        } => format!("{look} returned to version {to_version}: {reason}"),
+        } => {
+            let rejected = if rejected.is_empty() {
+                String::new()
+            } else {
+                format!(" and rejected {} contribution(s)", rejected.len())
+            };
+            let legacy = if legacy_excluded.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " under the previous credential-exclusion policy ({} credential(s))",
+                    legacy_excluded.len()
+                )
+            };
+            let held = if *held {
+                " as a historical copy that needs rebuilding"
+            } else {
+                ""
+            };
+            format!("{look} returned to version {to_version}{held}{rejected}{legacy}: {reason}")
+        }
+        AuditEvent::CredentialIntakeBlocked {
+            moderator,
+            subject,
+            reason,
+        } => format!("{moderator} blocked {subject} from new contributions: {reason}"),
         AuditEvent::Split { kind, detail } => format!(
             "{} separated: {detail}",
             match kind {
@@ -100,8 +133,8 @@ pub fn CommunityPage() -> impl IntoView {
         <div class="community-page">
             <header class="community-hero">
                 <p class="eyebrow">"Community"</p>
-                <h1>"Better looks, built together"</h1>
-                <p class="lede">"Share what your camera can do. Help everyone find a closer match."</p>
+                <h1>"How the community decides"</h1>
+                <p class="lede">"Camera data changes through public proposals. Moderators check the evidence, and every decision is logged."</p>
                 <a class="button" href=crate::base::site_url("/community/propose")>
                     "Propose a change"
                 </a>
@@ -427,6 +460,7 @@ enum LiveEventKind {
     ProposalOpened,
     ReAnchor,
     Revert,
+    CredentialIntakeBlocked,
     Split,
     ReleaseManifest,
     #[serde(other)]
@@ -597,11 +631,33 @@ async fn load_activity() -> Result<Vec<ActivityItem>, String> {
                         None,
                         ActivityFilter::All,
                     ),
+                    AuditEvent::CredentialIntakeBlocked {
+                        moderator,
+                        subject,
+                        reason,
+                    } => (
+                        format!("{moderator} blocked {subject} from new contributions."),
+                        reason.clone(),
+                        None,
+                        ActivityFilter::All,
+                    ),
                     AuditEvent::Split { detail, .. } => (
                         "Camera data was separated for review.".to_owned(),
                         detail.clone(),
                         None,
                         ActivityFilter::All,
+                    ),
+                    AuditEvent::ProposalExpired { proposal, reason } => (
+                        "A proposal expired before moderation.".to_owned(),
+                        reason.clone(),
+                        Some(proposal.clone()),
+                        ActivityFilter::Decisions,
+                    ),
+                    AuditEvent::ProposalLegacyRejected { proposal, reason } => (
+                        "A proposal was rejected during migration.".to_owned(),
+                        reason.clone(),
+                        Some(proposal.clone()),
+                        ActivityFilter::Decisions,
                     ),
                 };
                 ActivityItem {
@@ -714,6 +770,10 @@ async fn load_activity() -> Result<Vec<ActivityItem>, String> {
                 ),
                 LiveEventKind::Revert => (
                     format!("{look} returned to an earlier version."),
+                    ActivityFilter::All,
+                ),
+                LiveEventKind::CredentialIntakeBlocked => (
+                    format!("{actor} blocked a contributor from new contributions."),
                     ActivityFilter::All,
                 ),
                 LiveEventKind::Split => (

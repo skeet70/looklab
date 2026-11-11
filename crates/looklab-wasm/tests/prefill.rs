@@ -76,7 +76,7 @@ fn prefill_for<'a>(
     prefill_settings_parsed(schema, &[raw, render]).expect("prefill")
 }
 
-fn control<'a>(prefill: &'a looklab_wasm::SettingsPrefill, key: &str) -> Option<i64> {
+fn control(prefill: &looklab_wasm::SettingsPrefill, key: &str) -> Option<i64> {
     prefill
         .controls
         .iter()
@@ -153,6 +153,15 @@ fn a_shared_raw_reads_each_renders_own_sim_and_settings() {
     assert_eq!(provia_prefill.firmware, "1.10");
     assert_eq!(control(&provia_prefill, "color"), None);
     assert!(provia_prefill.monochrome.is_empty());
+    assert_eq!(
+        provia_prefill.render_class,
+        Some(looklab_schema::RenderClass::Colour)
+    );
+    assert_eq!(
+        provia_prefill.family.as_ref().map(|family| family.as_str()),
+        Some("provia")
+    );
+    assert_eq!(provia_prefill.mono_filter, None);
 
     let velvia_prefill = prefill_for(
         schema,
@@ -175,6 +184,18 @@ fn a_shared_raw_reads_each_renders_own_sim_and_settings() {
         ("RENDER-ACROS.JPG", &acros_meta),
     );
     assert_eq!(acros_prefill.sim.as_deref(), Some("acros"));
+    assert_eq!(
+        acros_prefill.render_class,
+        Some(looklab_schema::RenderClass::Monochrome)
+    );
+    assert_eq!(
+        acros_prefill.family.as_ref().map(|family| family.as_str()),
+        Some("acros")
+    );
+    assert_eq!(
+        acros_prefill.mono_filter,
+        Some(looklab_schema::MonoFilter::None)
+    );
     assert_eq!(
         acros_prefill.monochrome,
         vec![looklab_wasm::MonochromeRender {

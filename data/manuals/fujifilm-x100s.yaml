@@ -1,0 +1,206 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: fujifilm/x100s
+  make: Fujifilm
+  model: X100S
+  sources:
+  - id: x100s-manual
+    kind: owner_manual
+    url: https://dl.fujifilm-x.com/support/manual/x/fujifilm_x100s_manual_en.pdf
+    title: FUJIFILM X100S Owner's Manual
+    edition: BL02401-102 EN
+    firmware_scope: unspecified
+  - id: x100s-firmware
+    kind: firmware_notes
+    url: https://fujifilm-x.com/en-us/support/download/firmware/cameras/x100s/
+    title: X100S Firmware update
+    edition: web edition, accessed 2026-11-08
+    firmware_scope: '1.21'
+  capabilities:
+  - key: native_simulations
+    label: FILM SIMULATION
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - PROVIA/STANDARD
+      - Velvia/VIVID
+      - ASTIA/SOFT
+      - PRO Neg. Hi
+      - PRO Neg. Std
+      - MONOCHROME
+      - MONOCHROME+Ye
+      - MONOCHROME+R
+      - MONOCHROME+G
+      - SEPIA
+      default: PROVIA/STANDARD
+    citations:
+    - source: x100s-manual
+      locator: p. 55 (PDF 69), Film Simulation
+  - key: jpeg_quality
+    label: IMAGE QUALITY
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - FINE
+      - NORMAL
+      - RAW
+      - FINE+RAW
+      - NORMAL+RAW
+    citations:
+    - source: x100s-manual
+      locator: p. 73 (PDF 87), IMAGE QUALITY
+  - key: raw_capture
+    label: RAW RECORDING
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: x100s-manual
+      locator: p. 73 (PDF 87), IMAGE QUALITY (no RAW compression option documented)
+  - key: heif_capture
+    label: HEIF
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: x100s-manual
+      locator: p. 73 (PDF 87), IMAGE QUALITY
+    notes: No HEIF option appears in the documented image-quality formats.
+  - key: in_camera_raw_conversion
+    label: RAW CONVERSION
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: x100s-manual
+      locator: p. 63 (PDF 77), Recording Pictures in RAW Format; p. 81 (PDF 95), RAW CONVERSION
+  - key: jpeg_color_spaces
+    label: COLOR SPACE
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - Adobe RGB
+      default: sRGB
+    citations:
+    - source: x100s-manual
+      locator: p. 91 (PDF 105), COLOR SPACE
+  - key: white_balance_presets
+    label: WHITE BALANCE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - CUSTOM
+      - COLOR TEMPERATURE
+      - DAYLIGHT
+      - SHADE
+      - FLUORESCENT LIGHT-1
+      - FLUORESCENT LIGHT-2
+      - FLUORESCENT LIGHT-3
+      - INCANDESCENT
+      - UNDERWATER
+    citations:
+    - source: x100s-manual
+      locator: p. 42 (PDF 56), White Balance
+  - key: white_balance_shift
+    label: WB SHIFT
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: R
+      - label: B
+    citations:
+    - source: x100s-manual
+      locator: p. 42 (PDF 56), WB SHIFT fine-tuning dialog
+    notes: Two-axis fine-tuning dialog; the rendered dialog figure shows the grid and current R/B values without numeric limits.
+  - key: dynamic_range
+    label: DYNAMIC RANGE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - 100%
+      - 200%
+      - 400%
+      default: 100%
+    citations:
+    - source: x100s-manual
+      locator: p. 73 (PDF 87), DYNAMIC RANGE
+    notes: 200% requires ISO 400 or above; 400% requires ISO 800 or above. AUTO selects 100% or 200%.
+  - key: highlight_tone
+    label: HIGHLIGHT TONE
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: x100s-manual
+      locator: p. 74 (PDF 88), HIGHLIGHT TONE and SHADOW TONE
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: shadow_tone
+    label: SHADOW TONE
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: x100s-manual
+      locator: p. 74 (PDF 88), HIGHLIGHT TONE and SHADOW TONE
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: saturation
+    label: COLOR
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: x100s-manual
+      locator: p. 74 (PDF 88), COLOR
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: sharpening
+    label: SHARPNESS
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: x100s-manual
+      locator: p. 74 (PDF 88), SHARPNESS
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: noise_reduction
+    label: NOISE REDUCTION
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: x100s-manual
+      locator: p. 74 (PDF 88), NOISE REDUCTION
+    notes: No numeric range printed; the rendered manual page was inspected.
+  - key: film_simulation_bracket
+    label: FILM SIMULATION BKT
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: x100s-manual
+      locator: p. 56 (PDF 70), Bracketing

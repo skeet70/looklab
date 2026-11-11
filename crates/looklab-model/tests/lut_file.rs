@@ -2,8 +2,8 @@
 
 use looklab_model::file::{
     BaseField, BaseReference, BaseStatus, CameraRendering, DeclaredEncoding, DynamicRange, Gamut,
-    LicenseRecord, LogTransfer, LutData, LutDefinition, LutEmulation, LutRecord, MatchRefusal,
-    OutputEncoding,
+    LicenseRecord, LogTransfer, LookVersion, LutData, LutDefinition, LutEmulation, LutRecord,
+    MatchRefusal, OutputEncoding, Slug,
 };
 use looklab_model::{
     Look, LookDocument, LookIdentity, LookKind, ProbeScalars, UncertaintyData, WbPolicy,
@@ -40,6 +40,7 @@ fn scene_definition() -> LutDefinition {
             transfer: LogTransfer::Flog2,
             gamut: Gamut::Fgamut,
         },
+        declared_base: None,
         output: OutputEncoding::Srgb,
         lut: LutRecord {
             size: 2,
@@ -226,6 +227,40 @@ fn x_e3_base_resolution_rejects_eterna_and_keeps_provia() {
 }
 
 #[test]
+fn proposal_bases_preserve_unmeasured_and_incomplete_states() {
+    let family = looklab_schema::LutBase::FamilyRendering {
+        maker: looklab_schema::MakerName::new("Fujifilm").expect("maker"),
+        rendering: looklab_schema::RenderingName::new("Classic Chrome").expect("rendering"),
+        dynamic_range: Some(looklab_schema::LutDynamicRange::Dr400),
+        notes: "intended".to_owned(),
+    };
+    let reference = BaseReference::try_from(&family).expect("family base");
+    assert_eq!(
+        reference.resolve_status(None),
+        BaseStatus::BaseIdentifiedUnmeasured
+    );
+
+    let body = looklab_schema::LutBase::BodyRealization {
+        body: looklab_schema::BodyId::new("fujifilm/x-e3").expect("body"),
+        renderer: looklab_schema::LutRenderer::XRawStudio,
+        film_simulation: None,
+        dynamic_range: None,
+        notes: String::new(),
+    };
+    let reference = BaseReference::try_from(&body).expect("body base");
+    let schema = looklab_schema::validate_control_schema(include_str!(
+        "../../../data/bodies/fujifilm-x-e3.yaml"
+    ))
+    .expect("x-e3 schema");
+    assert_eq!(
+        reference.resolve_status(Some(&schema)),
+        BaseStatus::BaseIncomplete {
+            missing: BaseField::FilmSimulation
+        }
+    );
+}
+
+#[test]
 fn native_rendering_round_trips_and_lut_defined_looks_cannot_declare_one() {
     let rendering = CameraRendering {
         maker: "Fujifilm".to_owned(),
@@ -283,4 +318,32 @@ fn camera_rendering_supersession_matches_normalized_labels() {
         "ricoh",
         "Cinema (Green)"
     ));
+}
+
+#[test]
+fn declared_base_records_an_approximate_computation_base() {
+    let computation = BaseReference::Look {
+        slug: Slug::new("native-rendering").expect("slug"),
+        version: LookVersion::new("2.0.0").expect("version"),
+    };
+    let declared = BaseReference::FamilyRendering {
+        maker: "Fujifilm".to_string(),
+        rendering: "Classic Chrome".to_string(),
+        dynamic_range: None,
+        notes: String::new(),
+    };
+    let mut definition = scene_definition();
+    definition.encoding = DeclaredEncoding::DisplayReferred {
+        base: computation.clone(),
+        status: BaseStatus::Pinned,
+    };
+    definition.declared_base = Some(declared);
+    definition.validate().expect("approximate computation base");
+
+    definition.declared_base = Some(computation);
+    assert!(definition.validate().is_err());
+
+    let mut scene = scene_definition();
+    scene.declared_base = Some(BaseReference::neutral_baseline());
+    assert!(scene.validate().is_err());
 }

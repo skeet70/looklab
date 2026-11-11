@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use looklab_color::{Rgb, RgbSpace, Xyz};
-use looklab_export::DeltaStats;
+use looklab_export::{DeltaStats, checked_appearance};
 use looklab_fit::{ExposureModeId, FitImage, FitOptions, FitResult, OutlierReason, Verdict, fit};
 use looklab_model::file::{BodyProvenance, Provenance, RootProvenance};
 use looklab_model::solve::ucs_of_xyz;
@@ -244,8 +244,13 @@ fn print_held_out(document: &LookDocument, result: &FitResult, held_out: &[(Stri
         let set = &image.samples;
         let space = rgb_space(set.header().output_space);
         let mut errors = Vec::with_capacity(set.n());
+        let mut skipped = 0usize;
         for (in_rgb, out_rgb) in set.in_rgb().iter().zip(set.out_rgb()) {
             let xyz = Xyz::from_array(image.transform.mul_vec(in_rgb.map(f64::from)));
+            if checked_appearance(&document.look, xyz).is_err() {
+                skipped += 1;
+                continue;
+            }
             let predicted = output_encode_clip(document.look.eval(xyz), space, clip_k);
             let target_xyz = space.rgb_linear_to_xyz(Rgb::from_array(out_rgb.map(f64::from)));
             let target = ucs_of_xyz(target_xyz);
@@ -255,8 +260,13 @@ fn print_held_out(document: &LookDocument, result: &FitResult, held_out: &[(Stri
             }
         }
         let stats = DeltaStats::from_values(errors);
+        let skipped = if skipped > 0 {
+            format!(", skipped {skipped}")
+        } else {
+            String::new()
+        };
         println!(
-            "  held-out {name}: n {} median {:.2} p95 {:.2} max {:.2}",
+            "  held-out {name}: n {} median {:.2} p95 {:.2} max {:.2}{skipped}",
             stats.count, stats.median, stats.p95, stats.max
         );
     }

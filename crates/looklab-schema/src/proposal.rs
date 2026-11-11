@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::body::{Body, MappingStatus, validate_body};
 use crate::control::{Control, ControlType};
 use crate::error::{ErrorKind, ValidationError};
-use crate::ids::{BodyId, LookId, MakernoteTag, ProposalRef, SimKey};
+use crate::ids::{BodyId, IdError, LookId, MakernoteTag, ProposalRef, SimKey};
 use crate::interface::{InterfaceProfile, validate_interface_profile};
 use crate::rational::Rational;
 use crate::schema::{
@@ -25,10 +25,16 @@ const MAX_TAGS_PER_CONFIRMATION: usize = 32;
 
 pub const MAX_FIXTURE_BYTES: u64 = 64 * 1024 * 1024;
 pub const FIXTURE_UPLOAD_MAGIC: &[u8] = b"looklab-fixture-1";
+pub const LUT_UPLOAD_MAGIC: &[u8] = b"looklab-proposal-lut-1";
+pub const MAX_LUT_BYTES: u64 = 16 * 1024 * 1024;
+/// Pending LUT bytes across proposals.
+pub const MAX_CREDENTIAL_LUT_BYTES: u64 = 64 * 1024 * 1024;
+/// The fixed neutral baseline Look; a custom look may not publish under this link.
+pub const RESERVED_LUT_LOOK_SLUG: &str = "looklab-neutral-srgb-v1";
 pub const FIXTURE_UPLOAD_HEADER_MAX: usize = 16 * 1024;
 
 /// Makernote tags a confirmation may carry.
-pub const CONFIRMATION_TAGS: [&str; 13] = [
+pub const CONFIRMATION_TAGS: [&str; 15] = [
     "FilmMode",
     "DynamicRange",
     "DynamicRangeSetting",
@@ -37,6 +43,8 @@ pub const CONFIRMATION_TAGS: [&str; 13] = [
     "GrainRoughness",
     "ColorChromeEffect",
     "ColorChromeFxBlue",
+    "BWAdjustment",
+    "BWMagentaGreen",
     "WhiteBalance",
     "WhiteBalanceFineTune",
     "HighlightTone",
@@ -130,6 +138,14 @@ impl FromStr for ProposalKind {
     }
 }
 
+/// The canonical JSON signed for a proposal submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ProposalSigningBody<'a> {
+    pub kind: ProposalKind,
+    pub payload: &'a str,
+    pub fixtures: &'a [FixtureDonation],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidatedPayload {
     Body(Body),
@@ -153,6 +169,16 @@ impl ValidatedPayload {
             Self::EpochSplit(_) => ProposalKind::EpochSplit,
             Self::LookSplit(_) => ProposalKind::LookSplit,
             Self::GateOverride(_) => ProposalKind::GateOverride,
+        }
+    }
+
+    pub const fn confirmation(&self) -> ProposalConfirmation {
+        match self {
+            Self::Body(body) if matches!(body.kind, crate::BodyKind::Camera) => {
+                ProposalConfirmation::CameraMenu
+            }
+            Self::SchemaChange(_) | Self::Mapping(_) => ProposalConfirmation::CameraMenu,
+            _ => ProposalConfirmation::Unavailable,
         }
     }
 
@@ -207,6 +233,12 @@ fn structured<T: serde::de::DeserializeOwned>(payload: &str) -> Result<T, Vec<Va
     serde_norway::from_str(payload).map_err(ValidationError::syntax)
 }
 
+/// # Errors
+/// A payload the YAML serializer rejects.
+pub fn encode_proposal<T: Serialize>(payload: &T) -> Result<String, Vec<ValidationError>> {
+    serde_norway::to_string(payload).map_err(ValidationError::syntax)
+}
+
 fn invalid(path: &str, expected: &'static str) -> Vec<ValidationError> {
     vec![ValidationError::new(
         path,
@@ -214,8 +246,7 @@ fn invalid(path: &str, expected: &'static str) -> Vec<ValidationError> {
     )]
 }
 
-/// A proposed native-sim makernote mapping for one epoch.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MappingProposal {
     pub body: BodyId,
@@ -271,19 +302,348 @@ pub fn mapping_status_supported(body: &Body, fixtures: &[FixtureDonation]) -> bo
             .any(|fixture| body.matches_fixture(&fixture.make, &fixture.model))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LutLookProposal {
     pub look: LookId,
     pub name: String,
     pub license: LicenseDeclaration,
     pub attribution: String,
+    pub lut: LutFile,
+    pub encoding: LutEncoding,
+    #[serde(default)]
+    pub emulates: Option<LutEmulationDecl>,
+}
+
+/// A `.cube` file the submitter uploaded before this proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LutFile {
+    pub file: String,
+    pub sha256: Sha256Hex,
+    pub size: u64,
+}
+
+impl LutFile {
+    /// # Errors
+    /// A path-free `.cube` name, or a size outside the 16 MiB cap.
+    pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
+        let mut errors = Vec::new();
+        if FixtureFileName::parse(&self.file).is_err() || !self.file.ends_with(".cube") {
+            errors.extend(invalid("file", "a plain .cube file name"));
+        }
+        if self.size == 0 || self.size > MAX_LUT_BYTES {
+            errors.extend(invalid("size", "a size between 1 byte and 16 MiB"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// The declared input encoding of a custom-look LUT.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum LutEncoding {
+    Flog2Fgamut,
+    Display { base: LutBase },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NameError {
+    #[error("the name is empty")]
+    Empty,
+    #[error("the name exceeds {max} characters")]
+    TooLong { max: usize },
+}
+
+macro_rules! name_newtype {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+        #[serde(try_from = "String")]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, NameError> {
+                let mut value = value.into();
+                value.truncate(value.trim_end().len());
+                let leading = value.len() - value.trim_start().len();
+                drop(value.drain(..leading));
+                if value.is_empty() {
+                    return Err(NameError::Empty);
+                }
+                if value.chars().count() > MAX_NAME_CHARS {
+                    return Err(NameError::TooLong {
+                        max: MAX_NAME_CHARS,
+                    });
+                }
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = NameError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl core::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+    };
+}
+
+name_newtype!(MakerName);
+name_newtype!(RenderingName);
+
+/// The rendering a display-referred LUT expects as its input.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LutBase {
+    Look {
+        look: LookId,
+        version: LutLookVersion,
+    },
+    BodyRealization {
+        body: BodyId,
+        renderer: LutRenderer,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        film_simulation: Option<SimKey>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dynamic_range: Option<LutDynamicRange>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        notes: String,
+    },
+    FamilyRendering {
+        maker: MakerName,
+        rendering: RenderingName,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dynamic_range: Option<LutDynamicRange>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        notes: String,
+    },
+}
+
+/// A declared rendering engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LutRenderer {
+    #[serde(rename = "x_raw_studio")]
+    XRawStudio,
+}
+
+impl LutRenderer {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::XRawStudio => "x_raw_studio",
+        }
+    }
+}
+
+/// A declared dynamic-range setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LutDynamicRange {
+    Dr100,
+    Dr200,
+    Dr400,
+}
+
+impl LutDynamicRange {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dr100 => "dr100",
+            Self::Dr200 => "dr200",
+            Self::Dr400 => "dr400",
+        }
+    }
+}
+
+impl core::fmt::Display for LutDynamicRange {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for LutDynamicRange {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "dr100" => Ok(Self::Dr100),
+            "dr200" => Ok(Self::Dr200),
+            "dr400" => Ok(Self::Dr400),
+            _ => Err(()),
+        }
+    }
+}
+
+const MAX_BASE_NOTES_CHARS: usize = 500;
+
+impl LutBase {
+    /// # Errors
+    /// An invalid Look slug or over-long notes.
+    pub fn validate(&self, path: &str) -> Result<(), Vec<ValidationError>> {
+        let mut errors = Vec::new();
+        match self {
+            Self::Look { look, .. } => {
+                if crate::ids::validate_slug(look.as_str()).is_err() {
+                    errors.extend(invalid(
+                        &format!("{path}.look"),
+                        "a lowercase slug of at most 64 bytes",
+                    ));
+                }
+            }
+            Self::BodyRealization { notes, .. } | Self::FamilyRendering { notes, .. } => {
+                if !notes.trim().is_empty() && notes.trim().chars().count() > MAX_BASE_NOTES_CHARS {
+                    errors.extend(invalid(&format!("{path}.notes"), "shorter text"));
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Look { look, version } => format!("{look}@{version}"),
+            Self::BodyRealization {
+                body,
+                renderer,
+                film_simulation,
+                dynamic_range,
+                ..
+            } => {
+                let mut text = format!("{body} via {}", renderer.as_str());
+                if let Some(sim) = film_simulation {
+                    text.push_str(&format!(", {sim}"));
+                }
+                if let Some(dynamic_range) = dynamic_range {
+                    text.push_str(&format!(", {}", dynamic_range.as_str()));
+                }
+                text
+            }
+            Self::FamilyRendering {
+                maker,
+                rendering,
+                dynamic_range,
+                ..
+            } => {
+                let mut text = format!("{maker} {rendering}");
+                if let Some(dynamic_range) = dynamic_range {
+                    text.push_str(&format!(", {}", dynamic_range.as_str()));
+                }
+                text
+            }
+        }
+    }
+}
+
+impl LutEncoding {
+    /// # Errors
+    /// An invalid declared base.
+    pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
+        match self {
+            Self::Flog2Fgamut => Ok(()),
+            Self::Display { base } => base.validate("encoding.base"),
+        }
+    }
+}
+
+/// A published Look version a display-referred LUT names as its base.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct LutLookVersion(String);
+
+impl LutLookVersion {
+    /// # Errors
+    /// Empty, whitespace-bearing or over-long text.
+    pub fn new(value: &str) -> Result<Self, IdError> {
+        if value.is_empty() {
+            return Err(IdError::Empty);
+        }
+        if value.chars().any(char::is_whitespace) {
+            return Err(IdError::Whitespace);
+        }
+        if value.len() > 64 {
+            return Err(IdError::TooLong {
+                len: value.len(),
+                max: 64,
+            });
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for LutLookVersion {
+    type Error = IdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(&value)
+    }
+}
+
+impl From<LutLookVersion> for String {
+    fn from(value: LutLookVersion) -> Self {
+        value.0
+    }
+}
+
+impl core::fmt::Display for LutLookVersion {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// What a custom-look LUT reproduces, when it is not an original grade.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LutEmulationDecl {
+    CameraRendering { maker: String, rendering: String },
+    FilmStock { name: String },
+}
+
+impl LutEmulationDecl {
+    fn validate(&self, errors: &mut Vec<ValidationError>) {
+        let path = "emulates";
+        match self {
+            Self::CameraRendering { maker, rendering } => {
+                check_text(maker, &format!("{path}.maker"), MAX_NAME_CHARS, errors);
+                check_text(
+                    rendering,
+                    &format!("{path}.rendering"),
+                    MAX_NAME_CHARS,
+                    errors,
+                );
+            }
+            Self::FilmStock { name } => {
+                check_text(name, &format!("{path}.name"), MAX_NAME_CHARS, errors);
+            }
+        }
+    }
 }
 
 impl LutLookProposal {
     /// # Errors
-    /// Empty or over-long name and attribution, or a license declaration that
-    /// neither claims the work nor names a source license.
+    /// Empty or over-long name and attribution, a license declaration that
+    /// neither claims the work nor names a source license, or an invalid LUT file.
     pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
         check_text(&self.name, "name", MAX_NAME_CHARS, &mut errors);
@@ -294,6 +654,24 @@ impl LutLookProposal {
             &mut errors,
         );
         errors.extend(self.license.validate());
+        if crate::ids::validate_slug(self.look.as_str()).is_err() {
+            errors.extend(invalid("look", "a lowercase slug of at most 64 bytes"));
+        }
+        if self.look.as_str() == RESERVED_LUT_LOOK_SLUG {
+            errors.extend(invalid(
+                "look",
+                "a name other than the reserved neutral baseline",
+            ));
+        }
+        if let Err(lut) = self.lut.validate() {
+            errors.extend(lut);
+        }
+        if let Some(emulates) = &self.emulates {
+            emulates.validate(&mut errors);
+        }
+        if let Err(encoding) = self.encoding.validate() {
+            errors.extend(encoding);
+        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -303,7 +681,7 @@ impl LutLookProposal {
 }
 
 /// Exactly one of "this is my work" and a named source license.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LicenseDeclaration {
     #[serde(default)]
@@ -351,7 +729,7 @@ impl LicenseDeclaration {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EpochSplitProposal {
     pub body: BodyId,
@@ -382,7 +760,7 @@ impl EpochSplitProposal {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LookSplitProposal {
     pub look: LookId,
@@ -407,7 +785,7 @@ impl LookSplitProposal {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GateOverrideProposal {
     pub look: LookId,
@@ -739,10 +1117,10 @@ impl FixtureUpload {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum FixtureFrameError {
-    #[error("the fixture upload frame is malformed")]
+pub enum UploadFrameError {
+    #[error("the upload frame is malformed")]
     Malformed,
-    #[error("the fixture upload header is {0} bytes, over the limit")]
+    #[error("the upload header is {0} bytes, over the limit")]
     HeaderTooLarge(usize),
 }
 
@@ -750,17 +1128,21 @@ pub enum FixtureFrameError {
 ///
 /// # Errors
 /// An empty or over-long header.
-pub fn frame_fixture_upload(header: &[u8], bytes: &[u8]) -> Result<Vec<u8>, FixtureFrameError> {
+pub fn frame_upload(
+    magic: &[u8],
+    header: &[u8],
+    bytes: &[u8],
+) -> Result<Vec<u8>, UploadFrameError> {
     if header.is_empty() {
-        return Err(FixtureFrameError::Malformed);
+        return Err(UploadFrameError::Malformed);
     }
     if header.len() > FIXTURE_UPLOAD_HEADER_MAX {
-        return Err(FixtureFrameError::HeaderTooLarge(header.len()));
+        return Err(UploadFrameError::HeaderTooLarge(header.len()));
     }
     let length =
-        u32::try_from(header.len()).map_err(|_| FixtureFrameError::HeaderTooLarge(header.len()))?;
-    let mut out = Vec::with_capacity(FIXTURE_UPLOAD_MAGIC.len() + 4 + header.len() + bytes.len());
-    out.extend_from_slice(FIXTURE_UPLOAD_MAGIC);
+        u32::try_from(header.len()).map_err(|_| UploadFrameError::HeaderTooLarge(header.len()))?;
+    let mut out = Vec::with_capacity(magic.len() + 4 + header.len() + bytes.len());
+    out.extend_from_slice(magic);
     out.extend_from_slice(&length.to_le_bytes());
     out.extend_from_slice(header);
     out.extend_from_slice(bytes);
@@ -769,34 +1151,60 @@ pub fn frame_fixture_upload(header: &[u8], bytes: &[u8]) -> Result<Vec<u8>, Fixt
 
 /// # Errors
 /// A missing magic, an empty or over-long header, or a truncated frame.
-pub fn split_fixture_upload(body: &[u8]) -> Result<(&[u8], &[u8]), FixtureFrameError> {
-    let magic = FIXTURE_UPLOAD_MAGIC.len();
-    if body.len() < magic + 4 || &body[..magic] != FIXTURE_UPLOAD_MAGIC {
-        return Err(FixtureFrameError::Malformed);
+pub fn split_upload<'a>(
+    magic: &[u8],
+    body: &'a [u8],
+) -> Result<(&'a [u8], &'a [u8]), UploadFrameError> {
+    if body.len() < magic.len() + 4 || &body[..magic.len()] != magic {
+        return Err(UploadFrameError::Malformed);
     }
     let length = u32::from_le_bytes(
-        body[magic..magic + 4]
+        body[magic.len()..magic.len() + 4]
             .try_into()
-            .map_err(|_| FixtureFrameError::Malformed)?,
+            .map_err(|_| UploadFrameError::Malformed)?,
     ) as usize;
     if length == 0 {
-        return Err(FixtureFrameError::Malformed);
+        return Err(UploadFrameError::Malformed);
     }
     if length > FIXTURE_UPLOAD_HEADER_MAX {
-        return Err(FixtureFrameError::HeaderTooLarge(length));
+        return Err(UploadFrameError::HeaderTooLarge(length));
     }
-    let start = magic + 4;
+    let start = magic.len() + 4;
     let end = start
         .checked_add(length)
-        .ok_or(FixtureFrameError::Malformed)?;
+        .ok_or(UploadFrameError::Malformed)?;
     if body.len() < end {
-        return Err(FixtureFrameError::Malformed);
+        return Err(UploadFrameError::Malformed);
     }
     Ok((&body[start..end], &body[end..]))
 }
 
+/// # Errors
+/// An empty or over-long header.
+pub fn frame_fixture_upload(header: &[u8], bytes: &[u8]) -> Result<Vec<u8>, UploadFrameError> {
+    frame_upload(FIXTURE_UPLOAD_MAGIC, header, bytes)
+}
+
+/// # Errors
+/// A missing magic, an empty or over-long header, or a truncated frame.
+pub fn split_fixture_upload(body: &[u8]) -> Result<(&[u8], &[u8]), UploadFrameError> {
+    split_upload(FIXTURE_UPLOAD_MAGIC, body)
+}
+
+/// # Errors
+/// An empty or over-long header.
+pub fn frame_lut_proposal(header: &[u8], bytes: &[u8]) -> Result<Vec<u8>, UploadFrameError> {
+    frame_upload(LUT_UPLOAD_MAGIC, header, bytes)
+}
+
+/// # Errors
+/// A missing magic, an empty or over-long header, or a truncated frame.
+pub fn split_lut_proposal(body: &[u8]) -> Result<(&[u8], &[u8]), UploadFrameError> {
+    split_upload(LUT_UPLOAD_MAGIC, body)
+}
+
 /// A lowercase SHA-256 digest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Sha256Hex([u8; 32]);
 
@@ -814,6 +1222,10 @@ impl Sha256Hex {
             *slot = (high << 4) | low;
         }
         Ok(Self(bytes))
+    }
+
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 
     pub const fn as_bytes(&self) -> &[u8; 32] {
@@ -1044,6 +1456,23 @@ impl ProposalStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProposalImportState {
+    Queued,
+    Running,
+    Failed { reason: String },
+    Published { look: LookId, version: u32 },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalConfirmation {
+    #[default]
+    Unavailable,
+    CameraMenu,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProposalView {
     pub id: ProposalRef,
@@ -1053,6 +1482,22 @@ pub struct ProposalView {
     #[serde(default)]
     pub evidence: Vec<Evidence>,
     pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<ProposalImportState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposalDetailView {
+    pub proposal: ProposalView,
+    pub confirmation: ProposalConfirmation,
+}
+
+impl ProposalDetailView {
+    pub const fn can_confirm_camera_menu(&self) -> bool {
+        self.proposal.status.is_open()
+            && matches!(self.confirmation, ProposalConfirmation::CameraMenu)
+    }
 }
 
 /// Exact: `0.5` stays `0.5`, never `1/2`.

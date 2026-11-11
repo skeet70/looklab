@@ -480,10 +480,7 @@ fn non_default_images_reduce_theta_uncertainty() {
     let extended = fit_controlled(with_non_default, &dataset.schema, 1, &sim(), &production)
         .expect("joint fit");
     assert!(base.diagnostics.converged, "default fit did not converge");
-    assert!(
-        extended.diagnostics.converged,
-        "joint fit did not converge"
-    );
+    assert!(extended.diagnostics.converged, "joint fit did not converge");
     let base_trace = trace(&base.probes);
     let extended_trace = trace(&extended.probes);
     println!("theta probe covariance trace: {base_trace:.4} -> {extended_trace:.4}");
@@ -667,6 +664,42 @@ fn capped_hessian_rows_converge_on_a_noisy_fit() {
         ));
     }
     assert!(median(errors) <= 2.5);
+}
+
+#[test]
+fn capped_hessian_rows_still_use_the_full_operator_row_set() {
+    let dataset = controlled_dataset(&config());
+    let library = library_settings();
+    let train = &dataset.images[..library.len()];
+    let capped = FitOptions {
+        hessian_samples: 997,
+        ..options()
+    };
+    let result =
+        fit_controlled(train, &dataset.schema, 1, &sim(), &capped).expect("capped-row fit");
+    assert_eq!(result.diagnostics.hessian_samples, capped.hessian_samples);
+    assert_eq!(
+        result.diagnostics.operator_rows, result.diagnostics.objective_samples,
+        "final-stage curvature operator did not use the full active row set"
+    );
+}
+
+#[test]
+fn an_exhausted_budget_never_reports_convergence() {
+    let dataset = controlled_dataset(&config());
+    let library = library_settings();
+    let train = &dataset.images[..library.len()];
+    let exhausted = FitOptions {
+        sweep_budget: 0.0,
+        ..options()
+    };
+    let result =
+        fit_controlled(train, &dataset.schema, 1, &sim(), &exhausted).expect("budget-limited fit");
+    assert!(
+        !result.diagnostics.converged,
+        "a fit that spent its whole budget certified stationarity after {} evaluations",
+        result.diagnostics.evaluations
+    );
 }
 
 #[test]

@@ -6,16 +6,33 @@
     rust-overlay.url = "github:oxalica/rust-overlay";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
     flake-utils.url = "github:numtide/flake-utils";
+    crane.url = "github:ipetkov/crane";
+    disko.url = "github:nix-community/disko";
+    disko.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { nixpkgs, rust-overlay, flake-utils, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs = inputs@{
+    self,
+    nixpkgs,
+    rust-overlay,
+    flake-utils,
+    crane,
+    disko,
+    ...
+  }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
         rusttoolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         nightly = pkgs.rust-bin.nightly.latest.default.override {
           extensions = [ "rust-src" "llvm-tools-preview" ];
+        };
+        looklab = import ./nix/packages.nix {
+          inherit pkgs crane;
+          lib = pkgs.lib;
+          src = ./.;
         };
 
         # colour-science is not in nixpkgs; pinned from PyPI for tools/golden only.
@@ -62,23 +79,6 @@
           else
             looklab_build_root=$PWD
           fi
-          export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$looklab_build_root/target}"
-          export LOOKLAB_UI_TARGET_DIR="''${LOOKLAB_UI_TARGET_DIR:-$looklab_build_root/target-ui}"
-          unset looklab_git_dir looklab_build_root looklab_checkout looklab_cache looklab_local looklab_cargo_root looklab_ui_root
-        '';
-      in
-      {
-        devShells.default = pkgs.mkShell {
-          buildInputs = [ rusttoolchain ] ++ common;
-          shellHook = buildShellHook;
-        };
-        # Golden-vector generation (dev-time only).
-        devShells.golden = pkgs.mkShell {
-          buildInputs = [ goldenPython pkgs.libraw ];
-        };
-        # cargo-fuzz needs a nightly compiler for sanitizer instrumentation.
-        devShells.fuzz = pkgs.mkShell {
-          buildInputs = [ nightly pkgs.cargo-fuzz pkgs.git ];
           looklab_build_root=$(realpath -m -- "$looklab_build_root")
           if [ -z "''${LOOKLAB_ISOLATED_BUILD_OWNER:-}" ]; then
             looklab_cargo_root=$(realpath -m -- "''${CARGO_TARGET_DIR:-$looklab_build_root/target}")
@@ -102,7 +102,43 @@
               done
             fi
           fi
+          export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$looklab_build_root/target}"
+          export LOOKLAB_UI_TARGET_DIR="''${LOOKLAB_UI_TARGET_DIR:-$looklab_build_root/target-ui}"
+          unset looklab_git_dir looklab_build_root looklab_checkout looklab_cache looklab_local looklab_cargo_root looklab_ui_root
+        '';
+      in
+      {
+        devShells.default = pkgs.mkShell {
+          buildInputs = [ rusttoolchain ] ++ common;
           shellHook = buildShellHook;
         };
-      });
+        # Golden-vector generation (dev-time only).
+        devShells.golden = pkgs.mkShell {
+          buildInputs = [ goldenPython pkgs.libraw ];
+        };
+        # cargo-fuzz needs a nightly compiler for sanitizer instrumentation.
+        devShells.fuzz = pkgs.mkShell {
+          buildInputs = [ nightly pkgs.cargo-fuzz pkgs.git ];
+          shellHook = buildShellHook;
+        };
+
+        packages = looklab.packages;
+      }
+    )
+    // {
+      nixosModules.looklab = import ./nix/looklab/module.nix { inherit self; };
+
+      nixosConfigurations.looklab-ovh = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          disko.nixosModules.disko
+          self.nixosModules.looklab
+          ./nix/hosts/looklab-ovh.nix
+        ];
+      };
+
+      checks.x86_64-linux.looklab-deploy = import ./nix/looklab/test.nix {
+        inherit self nixpkgs;
+      };
+    };
 }

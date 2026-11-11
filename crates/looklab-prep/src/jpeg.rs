@@ -111,6 +111,8 @@ impl JpegPlane {
     }
 }
 
+// The stored plane keeps its un-oriented size; the trait reports the displayed size.
+#[allow(clippy::misnamed_getters)]
 impl LinearPixels for JpegPlane {
     fn width(&self) -> u32 {
         self.oriented_width
@@ -170,6 +172,7 @@ fn linear_lut(space: OutputSpace) -> [f32; 256] {
 }
 
 pub(crate) fn decode_jpeg_plane(bytes: &[u8]) -> Result<JpegPlane, PrepError> {
+    let (space, space_assumed) = detect_space(bytes)?;
     let options = DecoderOptions::default()
         .jpeg_set_out_colorspace(ColorSpace::RGB)
         .set_use_unsafe(false);
@@ -193,7 +196,6 @@ pub(crate) fn decode_jpeg_plane(bytes: &[u8]) -> Result<JpegPlane, PrepError> {
         return Err(PrepError::JpegStructure("decoded sample count mismatch"));
     }
 
-    let (space, space_assumed) = detect_space(bytes);
     Ok(JpegPlane {
         width,
         height,
@@ -219,7 +221,7 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<DecodedJpeg, PrepError> {
         .ok_or(PrepError::ImageTooLarge)?;
     let mut data = Vec::with_capacity(count);
     let mut code_values_near_clip = Vec::with_capacity(count);
-    for codes in plane.data.chunks_exact(3) {
+    for codes in plane.data.as_chunks::<3>().0 {
         code_values_near_clip.push(codes.iter().any(|&value| value >= 250 || value <= 2));
         data.push([
             plane.lut[usize::from(codes[0])],
@@ -237,9 +239,10 @@ pub fn decode_jpeg(bytes: &[u8]) -> Result<DecodedJpeg, PrepError> {
 }
 
 /// Collects EXIF and ICC colour-space hints from the JPEG segment list.
-fn detect_space(bytes: &[u8]) -> (OutputSpace, bool) {
+/// An explicit ICC profile that cannot be identified as sRGB or Adobe RGB is an error.
+fn detect_space(bytes: &[u8]) -> Result<(OutputSpace, bool), PrepError> {
     let mut exif_colorspace = None;
-    let mut icc = Vec::new();
+    let mut icc = IccChunks::default();
     let mut index = 2_usize;
     while index + 4 <= bytes.len() {
         if bytes[index] != 0xFF {
@@ -270,10 +273,8 @@ fn detect_space(bytes: &[u8]) -> (OutputSpace, bool) {
                 }
             }
             0xE2 => {
-                if let Some(chunk) = payload.strip_prefix(b"ICC_PROFILE\0")
-                    && let Some(profile) = chunk.get(2..)
-                {
-                    icc.extend_from_slice(profile);
+                if let Some(chunk) = payload.strip_prefix(b"ICC_PROFILE\0") {
+                    icc.push(chunk)?;
                 }
             }
             _ => {}
@@ -281,28 +282,277 @@ fn detect_space(bytes: &[u8]) -> (OutputSpace, bool) {
         index = next + length;
     }
 
-    let icc_adobe = contains(&icc, b"Adobe RGB");
-    let icc_srgb = contains(&icc, b"sRGB") || contains(&icc, b"sRGB IEC61966");
-    if icc_adobe {
-        (OutputSpace::AdobeRgb, false)
-    } else if icc_srgb {
-        (OutputSpace::Srgb, false)
+    if let Some(space) = icc.space()? {
+        Ok((space, false))
     } else if let Some(value) = exif_colorspace {
-        match value {
+        Ok(match value {
             1 => (OutputSpace::Srgb, false),
             2 => (OutputSpace::AdobeRgb, false),
             _ => (OutputSpace::Srgb, true),
-        }
+        })
     } else {
-        (OutputSpace::Srgb, true)
+        Ok((OutputSpace::Srgb, true))
     }
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+#[derive(Default)]
+struct IccChunks<'a> {
+    total: Option<u8>,
+    chunks: Vec<Option<&'a [u8]>>,
+}
+
+impl<'a> IccChunks<'a> {
+    /// `chunk` is the APP2 payload after the `ICC_PROFILE\0` signature.
+    fn push(&mut self, chunk: &'a [u8]) -> Result<(), PrepError> {
+        let Some((&sequence, rest)) = chunk.split_first() else {
+            return Err(PrepError::UnsupportedColorProfile);
+        };
+        let Some((&total, data)) = rest.split_first() else {
+            return Err(PrepError::UnsupportedColorProfile);
+        };
+        if sequence == 0 || total == 0 || sequence > total || data.is_empty() {
+            return Err(PrepError::UnsupportedColorProfile);
+        }
+        if self.total.is_some_and(|known| known != total) {
+            return Err(PrepError::UnsupportedColorProfile);
+        }
+        self.total = Some(total);
+        let slots = usize::from(total);
+        if self.chunks.len() < slots {
+            self.chunks.resize(slots, None);
+        }
+        if self.chunks[usize::from(sequence - 1)]
+            .replace(data)
+            .is_some()
+        {
+            return Err(PrepError::UnsupportedColorProfile);
+        }
+        Ok(())
+    }
+
+    fn space(&self) -> Result<Option<OutputSpace>, PrepError> {
+        if self.total.is_none() {
+            return Ok(None);
+        }
+        if self.chunks.iter().any(Option::is_none) {
+            return Err(PrepError::UnsupportedColorProfile);
+        }
+        let capacity = self
+            .chunks
+            .iter()
+            .filter_map(|chunk| *chunk)
+            .map(|data| data.len())
+            .sum();
+        let mut profile = Vec::with_capacity(capacity);
+        for chunk in &self.chunks {
+            if let Some(data) = *chunk {
+                profile.extend_from_slice(data);
+            }
+        }
+        identify_space(&profile)
+            .map(Some)
+            .ok_or(PrepError::UnsupportedColorProfile)
+    }
+}
+
+fn identify_space(profile: &[u8]) -> Option<OutputSpace> {
+    if profile.len() < 132 {
+        return None;
+    }
+    if profile.get(36..40)? != b"acsp".as_slice() {
+        return None;
+    }
+    if profile.get(16..20)? != b"RGB ".as_slice() {
+        return None;
+    }
+    let declared = usize::try_from(read_u32(profile, 0)?).ok()?;
+    if declared != profile.len() {
+        return None;
+    }
+    let tags = usize::try_from(read_u32(profile, 128)?).ok()?;
+    let table_end = 132_usize.checked_add(tags.checked_mul(12)?)?;
+    if table_end > declared {
+        return None;
+    }
+    let mut description = None;
+    for index in 0..tags {
+        let entry = 132 + index * 12;
+        if profile.get(entry..entry + 4)? != b"desc".as_slice() {
+            continue;
+        }
+        if description.is_some() {
+            return None;
+        }
+        let offset = usize::try_from(read_u32(profile, entry + 4)?).ok()?;
+        let size = usize::try_from(read_u32(profile, entry + 8)?).ok()?;
+        description = Some(profile.get(offset..offset.checked_add(size)?)?);
+    }
+    description_space(description?)
+}
+
+fn description_space(tag: &[u8]) -> Option<OutputSpace> {
+    match tag.get(..4)? {
+        b"desc" => text_description_space(tag),
+        b"mluc" => multi_localized_space(tag),
+        _ => None,
+    }
+}
+
+fn text_description_space(tag: &[u8]) -> Option<OutputSpace> {
+    let ascii_count = usize::try_from(read_u32(tag, 8)?).ok()?;
+    let ascii = tag.get(12..12usize.checked_add(ascii_count)?)?;
+    let unicode_count_at = 12usize.checked_add(ascii_count)?.checked_add(4)?;
+    let unicode_count = usize::try_from(read_u32(tag, unicode_count_at)?).ok()?;
+    let unicode_start = unicode_count_at.checked_add(4)?;
+    let unicode_end = unicode_start.checked_add(unicode_count.checked_mul(2)?)?;
+    let unicode = tag.get(unicode_start..unicode_end)?;
+
+    let mut space = None;
+    observe_description(&mut space, ascii_recognized(ascii))?;
+    observe_description(&mut space, utf16_recognized(unicode))?;
+    space
+}
+
+fn multi_localized_space(tag: &[u8]) -> Option<OutputSpace> {
+    let count = usize::try_from(read_u32(tag, 8)?).ok()?;
+    let record_size = usize::try_from(read_u32(tag, 12)?).ok()?;
+    if record_size < 12 {
+        return None;
+    }
+    let records_end = 16usize.checked_add(count.checked_mul(record_size)?)?;
+    if records_end > tag.len() {
+        return None;
+    }
+    let mut space = None;
+    for index in 0..count {
+        let record = 16 + index * record_size;
+        let record = tag.get(record..record.checked_add(12)?)?;
+        let length = usize::try_from(read_u32(record, 4)?).ok()?;
+        let offset = usize::try_from(read_u32(record, 8)?).ok()?;
+        let bytes = tag.get(offset..offset.checked_add(length)?)?;
+        observe_description(&mut space, utf16_recognized(bytes))?;
+    }
+    space
+}
+
+enum Recognized {
+    Empty,
+    Space(OutputSpace),
+    Unknown,
+}
+
+fn observe_description(space: &mut Option<OutputSpace>, description: Recognized) -> Option<()> {
+    match description {
+        Recognized::Empty => Some(()),
+        Recognized::Unknown => None,
+        Recognized::Space(candidate) => {
+            if space.is_some_and(|known| known != candidate) {
+                return None;
+            }
+            *space = Some(candidate);
+            Some(())
+        }
+    }
+}
+
+fn ascii_recognized(bytes: &[u8]) -> Recognized {
+    let text = trim_ascii(bytes);
+    if text.is_empty() {
+        Recognized::Empty
+    } else {
+        name_space_bytes(text)
+    }
+}
+
+fn name_space_bytes(bytes: &[u8]) -> Recognized {
+    if (starts_with_bytes(bytes, b"Adobe RGB") && is_name_separator_byte(bytes.get(9).copied()))
+        || (starts_with_bytes(bytes, b"AdobeRGB") && is_name_separator_byte(bytes.get(8).copied()))
+    {
+        Recognized::Space(OutputSpace::AdobeRgb)
+    } else if starts_with_bytes(bytes, b"sRGB") && is_name_separator_byte(bytes.get(4).copied()) {
+        Recognized::Space(OutputSpace::Srgb)
+    } else {
+        Recognized::Unknown
+    }
+}
+
+fn starts_with_bytes(bytes: &[u8], name: &[u8]) -> bool {
+    bytes.len() >= name.len() && bytes[..name.len()].eq_ignore_ascii_case(name)
+}
+
+fn is_name_separator_byte(byte: Option<u8>) -> bool {
+    byte.is_none_or(|byte| byte == 0 || byte == b'(' || byte.is_ascii_whitespace())
+}
+
+const NAME_SCAN_UNITS: usize = 16;
+
+fn utf16_recognized(bytes: &[u8]) -> Recognized {
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Recognized::Unknown;
+    }
+    let mut start = 0;
+    while start < pairs.len() && is_ignorable_unit(u16::from_be_bytes(pairs[start])) {
+        start += 1;
+        if start >= NAME_SCAN_UNITS && start < pairs.len() {
+            return Recognized::Unknown;
+        }
+    }
+    if start == pairs.len() {
+        return Recognized::Empty;
+    }
+    let end = (start + NAME_SCAN_UNITS).min(pairs.len());
+    let mut units = [0_u16; NAME_SCAN_UNITS];
+    for (unit, pair) in units.iter_mut().zip(&pairs[start..end]) {
+        *unit = u16::from_be_bytes(*pair);
+    }
+    name_space_units(&units[..end - start])
+}
+
+fn name_space_units(units: &[u16]) -> Recognized {
+    if (starts_with_units(units, b"Adobe RGB") && is_name_separator_unit(units.get(9).copied()))
+        || (starts_with_units(units, b"AdobeRGB") && is_name_separator_unit(units.get(8).copied()))
+    {
+        Recognized::Space(OutputSpace::AdobeRgb)
+    } else if starts_with_units(units, b"sRGB") && is_name_separator_unit(units.get(4).copied()) {
+        Recognized::Space(OutputSpace::Srgb)
+    } else {
+        Recognized::Unknown
+    }
+}
+
+fn starts_with_units(units: &[u16], name: &[u8]) -> bool {
+    units.len() >= name.len()
+        && units[..name.len()].iter().zip(name).all(|(&unit, &byte)| {
+            unit <= u16::from(u8::MAX) && (unit as u8).eq_ignore_ascii_case(&byte)
+        })
+}
+
+fn is_name_separator_unit(unit: Option<u16>) -> bool {
+    unit.is_none_or(|unit| unit <= u16::from(u8::MAX) && is_name_separator_byte(Some(unit as u8)))
+}
+
+fn is_ignorable_unit(unit: u16) -> bool {
+    unit == 0
+        || unit == 0xFEFF
+        || (unit <= u16::from(u8::MAX) && (unit as u8).is_ascii_whitespace())
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| *byte != 0 && !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| *byte != 0 && !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let value = bytes.get(offset..offset.checked_add(4)?)?;
+    Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
 }
 
 fn exif_color_space(tiff: &[u8]) -> Option<u16> {

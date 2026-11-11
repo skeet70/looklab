@@ -3,16 +3,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use looklab_upload::{ManifestHash, Nonce};
 use sqlx::SqlitePool;
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use webauthn_rs::prelude::{Passkey, Url, WebauthnBuilder};
 use webauthn_rs_core::{WebauthnCore, proto::RegistrationState};
 
 use crate::blob::{BlobError, BlobStore, FsBlobStore};
 use crate::body_schema::{Bodies, BodiesError};
 use crate::config::{Config, ConfigError, ServerSecret};
-use crate::db::{DbError, open};
+use crate::db::{DbError, now_unix, open};
 use crate::ids::{CredentialId, RandomError, RegistrationHandle, StatusToken, TokenHash};
+use crate::manuals::{Manuals, ManualsError};
 use crate::rate_limit::RateLimiter;
 use crate::trust::{DefaultTrustPolicy, TrustPolicy};
 
@@ -26,6 +28,8 @@ pub enum StateError {
     Blob(#[from] BlobError),
     #[error(transparent)]
     Bodies(#[from] BodiesError),
+    #[error(transparent)]
+    Manuals(#[from] ManualsError),
     #[error("WebAuthn configuration: {0}")]
     Webauthn(String),
 }
@@ -33,6 +37,7 @@ pub enum StateError {
 #[derive(Debug)]
 pub struct PendingRegistration {
     created: Instant,
+    promoting: bool,
     stage: PendingStage,
 }
 
@@ -51,9 +56,242 @@ enum PendingStage {
 const MAX_PENDING_REGISTRATIONS: usize = 1024;
 const UPLOAD_MEMORY_BUDGET: u64 = 1 << 30;
 
+const MAX_BATCH_ATTEMPTS: u8 = 3;
+const MAX_BATCH_ENTRIES: usize = 4096;
+
 fn upload_slots(max_body_bytes: usize) -> usize {
     let per_upload = 2 * max_body_bytes.max(1) as u64;
     usize::try_from((UPLOAD_MEMORY_BUDGET / per_upload).clamp(1, 16)).unwrap_or(1)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionError {
+    Stale,
+    Busy,
+}
+
+pub struct PendingPromotion {
+    pending: Arc<Mutex<HashMap<RegistrationHandle, PendingRegistration>>>,
+    handle: RegistrationHandle,
+    passkey: Passkey,
+    display_handle: Option<String>,
+    committing: bool,
+    finished: bool,
+}
+
+impl PendingPromotion {
+    pub fn passkey(&self) -> &Passkey {
+        &self.passkey
+    }
+
+    pub fn display_handle(&self) -> Option<&str> {
+        self.display_handle.as_deref()
+    }
+
+    pub fn finish(mut self) {
+        finish_promotion(&self.pending, &self.handle);
+        self.finished = true;
+    }
+
+    /// Removes the pending entry even when the commit outcome is unknown.
+    pub async fn commit(
+        mut self,
+        tx: sqlx::Transaction<'static, sqlx::Sqlite>,
+    ) -> Result<(), sqlx::Error> {
+        self.committing = true;
+        let outcome = tx.commit().await;
+        self.finish();
+        outcome
+    }
+}
+
+impl Drop for PendingPromotion {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if self.committing {
+            finish_promotion(&self.pending, &self.handle);
+        } else {
+            cancel_promotion(&self.pending, &self.handle);
+        }
+    }
+}
+
+fn begin_promotion(
+    pending: &Arc<Mutex<HashMap<RegistrationHandle, PendingRegistration>>>,
+    original: &Passkey,
+    verified: &Passkey,
+) -> Result<PendingPromotion, PromotionError> {
+    let Ok(mut entries) = pending.lock() else {
+        return Err(PromotionError::Busy);
+    };
+    let original = serde_json::to_string(original).map_err(|_| PromotionError::Stale)?;
+    let credential_id = verified.cred_id().as_slice();
+    for (handle, entry) in entries.iter_mut() {
+        if let PendingStage::Credential {
+            passkey: stored,
+            display_handle,
+        } = &mut entry.stage
+            && stored.cred_id().as_slice() == credential_id
+        {
+            if entry.promoting {
+                return Err(PromotionError::Busy);
+            }
+            if serde_json::to_string(&**stored).ok().as_deref() != Some(original.as_str()) {
+                return Err(PromotionError::Stale);
+            }
+            **stored = verified.clone();
+            entry.promoting = true;
+            return Ok(PendingPromotion {
+                pending: Arc::clone(pending),
+                handle: handle.clone(),
+                passkey: verified.clone(),
+                display_handle: display_handle.clone(),
+                committing: false,
+                finished: false,
+            });
+        }
+    }
+    Err(PromotionError::Stale)
+}
+
+fn purge_pending(pending: &mut HashMap<RegistrationHandle, PendingRegistration>, ttl: Duration) {
+    pending.retain(|_, entry| entry.promoting || entry.created.elapsed() < ttl);
+}
+
+fn finish_promotion(
+    pending: &Mutex<HashMap<RegistrationHandle, PendingRegistration>>,
+    handle: &RegistrationHandle,
+) {
+    let Ok(mut entries) = pending.lock() else {
+        return;
+    };
+    if entries.get(handle).is_some_and(|entry| entry.promoting) {
+        entries.remove(handle);
+    }
+}
+
+fn cancel_promotion(
+    pending: &Mutex<HashMap<RegistrationHandle, PendingRegistration>>,
+    handle: &RegistrationHandle,
+) {
+    let Ok(mut entries) = pending.lock() else {
+        return;
+    };
+    if let Some(entry) = entries.get_mut(handle)
+        && entry.promoting
+    {
+        entry.promoting = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BatchKey {
+    nonce: Nonce,
+    manifest_hash: ManifestHash,
+}
+
+impl BatchKey {
+    fn new(nonce: &[u8; 32], manifest_hash: &[u8; 32]) -> Self {
+        Self {
+            nonce: Nonce::from_bytes(*nonce),
+            manifest_hash: ManifestHash::from_bytes(*manifest_hash),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct BatchAdmission {
+    entries: Mutex<HashMap<BatchKey, BatchEntry>>,
+}
+
+#[derive(Debug)]
+struct BatchEntry {
+    in_flight: bool,
+    failures: u8,
+    expires_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchAdmissionError {
+    InFlight,
+    Exhausted,
+    Capacity,
+}
+
+pub struct BatchAttempt<'a> {
+    admission: &'a BatchAdmission,
+    key: BatchKey,
+    finished: bool,
+}
+
+impl BatchAdmission {
+    /// One in-flight attempt per pending batch, and at most
+    /// [`MAX_BATCH_ATTEMPTS`] failed attempts before a new send is required.
+    pub fn try_begin(
+        &self,
+        nonce: &[u8; 32],
+        batch: &[u8; 32],
+        expires_at: i64,
+    ) -> Result<BatchAttempt<'_>, BatchAdmissionError> {
+        let key = BatchKey::new(nonce, batch);
+        let Ok(mut entries) = self.entries.lock() else {
+            return Err(BatchAdmissionError::InFlight);
+        };
+        let now = now_unix();
+        if entries.len() >= MAX_BATCH_ENTRIES {
+            entries.retain(|_, entry| entry.in_flight || entry.expires_at >= now);
+        }
+        if !entries.contains_key(&key) && entries.len() >= MAX_BATCH_ENTRIES {
+            return Err(BatchAdmissionError::Capacity);
+        }
+        let entry = entries.entry(key).or_insert(BatchEntry {
+            in_flight: false,
+            failures: 0,
+            expires_at,
+        });
+        entry.expires_at = entry.expires_at.max(expires_at);
+        if entry.in_flight {
+            return Err(BatchAdmissionError::InFlight);
+        }
+        if entry.failures >= MAX_BATCH_ATTEMPTS {
+            return Err(BatchAdmissionError::Exhausted);
+        }
+        entry.in_flight = true;
+        Ok(BatchAttempt {
+            admission: self,
+            key,
+            finished: false,
+        })
+    }
+
+    fn record_failure(&self, key: BatchKey) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        if let Some(entry) = entries.get_mut(&key) {
+            entry.failures = entry.failures.saturating_add(1);
+            entry.in_flight = false;
+        }
+    }
+}
+
+impl BatchAttempt<'_> {
+    pub fn succeed(mut self) {
+        if let Ok(mut entries) = self.admission.entries.lock() {
+            entries.remove(&self.key);
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for BatchAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.admission.record_failure(self.key);
+        }
+    }
 }
 
 pub const MOD_SESSION_TTL: Duration = Duration::from_secs(15 * 60);
@@ -131,12 +369,14 @@ pub struct AppState {
     pub blobs: Arc<dyn BlobStore>,
     pub webauthn: WebauthnCore,
     pub secret: ServerSecret,
-    pub bodies: Bodies,
+    pub bodies: RwLock<Bodies>,
+    pub manuals: Arc<Manuals>,
     pub rate_limiter: RateLimiter,
     pub trust: Arc<dyn TrustPolicy>,
     pub upload_slots: Arc<Semaphore>,
     pub mod_sessions: ModSessions,
-    pending: Mutex<HashMap<RegistrationHandle, PendingRegistration>>,
+    pub batch_admission: BatchAdmission,
+    pending: Arc<Mutex<HashMap<RegistrationHandle, PendingRegistration>>>,
 }
 
 impl core::fmt::Debug for AppState {
@@ -154,8 +394,16 @@ impl AppState {
         config.normalize_origin()?;
         config.validate()?;
         let db = open(&config.db_path).await?;
+        let active = crate::store::active_snapshot_identity(&db)
+            .await
+            .map_err(crate::db::DbError::from)?;
         let blobs: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(&config.blob_dir)?);
-        let bodies = Bodies::load(&config.bodies_dir, &config.snapshot_dir)?;
+        let bodies = RwLock::new(Bodies::load_active(
+            &config.bodies_dir,
+            &config.snapshot_dir,
+            active.map(|(version, _)| version),
+        )?);
+        let manuals = Arc::new(Manuals::load(&config.manuals_dir)?);
         let secret = ServerSecret::load_or_create(&config.server_secret_path)?;
         let origin =
             Url::parse(&config.origin).map_err(|error| StateError::Webauthn(error.to_string()))?;
@@ -178,11 +426,13 @@ impl AppState {
             webauthn,
             secret,
             bodies,
+            manuals,
             rate_limiter: RateLimiter::default(),
             trust,
             upload_slots: Arc::new(Semaphore::new(slots)),
             mod_sessions: ModSessions::default(),
-            pending: Mutex::new(HashMap::new()),
+            batch_admission: BatchAdmission::default(),
+            pending: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -203,6 +453,7 @@ impl AppState {
             handle,
             PendingRegistration {
                 created: Instant::now(),
+                promoting: false,
                 stage: PendingStage::Challenge {
                     registration: Box::new(registration),
                     display_handle,
@@ -261,6 +512,7 @@ impl AppState {
             handle,
             PendingRegistration {
                 created: Instant::now(),
+                promoting: false,
                 stage: PendingStage::Credential {
                     passkey: Box::new(passkey),
                     display_handle,
@@ -286,13 +538,23 @@ impl AppState {
         })
     }
 
+    /// Advances the pending passkey `original` was verified against and
+    /// reserves it until the returned token finishes or drops.
+    pub fn begin_promotion(
+        &self,
+        original: &Passkey,
+        verified: &Passkey,
+    ) -> Result<PendingPromotion, PromotionError> {
+        begin_promotion(&self.pending, original, verified)
+    }
+
     pub fn remove_pending_credential(&self, credential_id: &[u8]) {
         let Ok(mut pending) = self.pending.lock() else {
             return;
         };
         pending.retain(|_, entry| match &entry.stage {
             PendingStage::Credential { passkey, .. } => {
-                passkey.cred_id().as_slice() != credential_id
+                entry.promoting || passkey.cred_id().as_slice() != credential_id
             }
             PendingStage::Challenge { .. } => true,
         });
@@ -306,7 +568,190 @@ impl AppState {
     }
 
     fn purge_locked(&self, pending: &mut HashMap<RegistrationHandle, PendingRegistration>) {
-        let ttl = self.config.registration_ttl;
-        pending.retain(|_, entry| entry.created.elapsed() < ttl);
+        purge_pending(pending, self.config.registration_ttl);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use webauthn_rs_core::proto::{
+        AttestationFormat, COSEAlgorithm, COSEEC2Key, COSEKey, COSEKeyType, Credential, ECDSACurve,
+        ParsedAttestation, RegisteredExtensions, UserVerificationPolicy,
+    };
+
+    fn passkey(counter: u32, backup_state: bool) -> Passkey {
+        Credential {
+            cred_id: vec![1, 2, 3, 4],
+            cred: COSEKey {
+                type_: COSEAlgorithm::ES256,
+                key: COSEKeyType::EC_EC2(COSEEC2Key {
+                    curve: ECDSACurve::SECP256R1,
+                    x: vec![0; 32],
+                    y: vec![0; 32],
+                }),
+            },
+            counter,
+            transports: None,
+            user_verified: true,
+            backup_eligible: false,
+            backup_state,
+            registration_policy: UserVerificationPolicy::Required,
+            extensions: RegisteredExtensions::none(),
+            attestation: ParsedAttestation::default(),
+            attestation_format: AttestationFormat::None,
+        }
+        .into()
+    }
+
+    fn pending(passkey: Passkey) -> Arc<Mutex<HashMap<RegistrationHandle, PendingRegistration>>> {
+        let handle = RegistrationHandle::generate().expect("handle");
+        Arc::new(Mutex::new(HashMap::from([(
+            handle,
+            PendingRegistration {
+                created: Instant::now(),
+                promoting: false,
+                stage: PendingStage::Credential {
+                    passkey: Box::new(passkey),
+                    display_handle: None,
+                },
+            },
+        )])))
+    }
+
+    fn key(index: usize) -> ([u8; 32], [u8; 32]) {
+        let index = u64::try_from(index).expect("index");
+        let mut nonce = [0u8; 32];
+        nonce[..8].copy_from_slice(&index.to_be_bytes());
+        let mut batch = [0u8; 32];
+        batch[8..16].copy_from_slice(&index.to_be_bytes());
+        (nonce, batch)
+    }
+
+    #[test]
+    fn an_exhausted_batch_survives_admission_churn() {
+        let admission = BatchAdmission::default();
+        let expires = now_unix() + 3600;
+        let exhausted = key(0);
+        for _ in 0..MAX_BATCH_ATTEMPTS {
+            drop(
+                admission
+                    .try_begin(&exhausted.0, &exhausted.1, expires)
+                    .expect("admission"),
+            );
+        }
+        assert_eq!(
+            admission
+                .try_begin(&exhausted.0, &exhausted.1, expires)
+                .err(),
+            Some(BatchAdmissionError::Exhausted)
+        );
+
+        let mut index = 1;
+        loop {
+            let (nonce, batch) = key(index);
+            match admission.try_begin(&nonce, &batch, expires) {
+                Ok(attempt) => drop(attempt),
+                Err(BatchAdmissionError::Capacity) => break,
+                Err(error) => panic!("unexpected admission error: {error:?}"),
+            }
+            index += 1;
+        }
+
+        assert_eq!(
+            admission
+                .try_begin(&exhausted.0, &exhausted.1, expires)
+                .err(),
+            Some(BatchAdmissionError::Exhausted)
+        );
+        let (nonce, batch) = key(index + 1);
+        assert_eq!(
+            admission.try_begin(&nonce, &batch, expires).err(),
+            Some(BatchAdmissionError::Capacity)
+        );
+    }
+
+    #[test]
+    fn a_pending_promotion_rejects_concurrent_mutation() {
+        let original = passkey(1, false);
+        let pending = pending(original.clone());
+        let promotion =
+            begin_promotion(&pending, &original, &passkey(2, false)).expect("promotion");
+        assert_eq!(
+            begin_promotion(&pending, &original, &passkey(3, false)).err(),
+            Some(PromotionError::Busy)
+        );
+        drop(promotion);
+        assert!(begin_promotion(&pending, &passkey(2, false), &passkey(3, false)).is_ok());
+    }
+
+    #[test]
+    fn a_stale_pending_promotion_is_rejected() {
+        let original = passkey(1, false);
+        let pending = pending(original.clone());
+        let promotion =
+            begin_promotion(&pending, &original, &passkey(2, false)).expect("promotion");
+        drop(promotion);
+        assert_eq!(
+            begin_promotion(&pending, &original, &passkey(3, false)).err(),
+            Some(PromotionError::Stale)
+        );
+    }
+
+    #[test]
+    fn a_finished_pending_promotion_is_removed() {
+        let original = passkey(1, false);
+        let pending = pending(original.clone());
+        begin_promotion(&pending, &original, &passkey(2, false))
+            .expect("promotion")
+            .finish();
+        assert_eq!(
+            begin_promotion(&pending, &passkey(2, false), &passkey(3, false)).err(),
+            Some(PromotionError::Stale)
+        );
+    }
+
+    #[test]
+    fn a_dropped_committing_promotion_removes_the_shadow() {
+        let original = passkey(1, false);
+        let pending = pending(original.clone());
+        let mut promotion =
+            begin_promotion(&pending, &original, &passkey(2, false)).expect("promotion");
+        promotion.committing = true;
+        drop(promotion);
+        assert!(pending.lock().expect("pending").is_empty());
+    }
+
+    #[test]
+    fn a_zero_counter_pending_promotion_is_applied() {
+        let original = passkey(0, false);
+        let pending = pending(original.clone());
+        assert!(begin_promotion(&pending, &original, &passkey(0, true)).is_ok());
+    }
+
+    #[test]
+    fn a_promoting_entry_survives_expiry_until_the_promotion_ends() {
+        let original = passkey(1, false);
+        let pending = pending(original.clone());
+        let ttl = Duration::from_secs(60);
+        {
+            let mut entries = pending.lock().expect("pending");
+            for entry in entries.values_mut() {
+                entry.created = Instant::now() - ttl - Duration::from_secs(1);
+            }
+        }
+        let promotion =
+            begin_promotion(&pending, &original, &passkey(2, false)).expect("promotion");
+        {
+            let mut entries = pending.lock().expect("pending");
+            purge_pending(&mut entries, ttl);
+            assert_eq!(entries.len(), 1);
+        }
+        drop(promotion);
+        {
+            let mut entries = pending.lock().expect("pending");
+            purge_pending(&mut entries, ttl);
+            assert!(entries.is_empty());
+        }
     }
 }

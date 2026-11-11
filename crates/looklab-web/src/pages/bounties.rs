@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use leptos::prelude::*;
 use looklab_publish::SiteIndex;
+use looklab_schema::{EvidenceRequestOrigin, EvidenceRequestWire, ModelSubject};
 use looklab_trust::Bounty;
 
 use crate::data::{self, Load};
@@ -48,6 +49,7 @@ impl Impact {
 #[derive(Clone)]
 struct WantedShots {
     bounties: Vec<Bounty>,
+    requests: Vec<EvidenceRequestWire>,
     index: Arc<SiteIndex>,
 }
 
@@ -77,14 +79,19 @@ pub(super) fn WantedCards(
         }
         leptos::task::spawn_local_scoped_with_cancellation(async move {
             let result = async {
-                let mut bounties = data::bounties().await?;
+                let wanted = data::wanted().await?;
+                let mut bounties = wanted.bounties;
                 bounties.sort_by(|left, right| {
                     right
                         .expected_variance_reduction
                         .total_cmp(&left.expected_variance_reduction)
                 });
                 let index = Arc::new(data::index().await?);
-                Ok::<_, String>(WantedShots { bounties, index })
+                Ok::<_, String>(WantedShots {
+                    bounties,
+                    requests: wanted.evidence_requests,
+                    index,
+                })
             }
             .await;
             state.set(match result {
@@ -100,26 +107,95 @@ pub(super) fn WantedCards(
         match state.get() {
             Load::Loading => ui::loading().into_any(),
             Load::Failed(error) => ui::failure(&error).into_any(),
-            Load::Ready(wanted) if wanted.bounties.is_empty() => view! {
-                <ui::EmptyState
-                    title="No wanted shots right now".to_owned()
-                    message="You can still help by sharing photos you already have.".to_owned()
-                >
-                    {show_actions.then(|| view! {
-                        <a href=crate::base::site_url("/contribute")>"Share photos"</a>
-                    })}
-                </ui::EmptyState>
+            Load::Ready(wanted)
+                if wanted.bounties.is_empty() && wanted.requests.is_empty() =>
+            {
+                view! {
+                    <ui::EmptyState
+                        title="No wanted shots right now".to_owned()
+                        message="You can still help by sharing photos you already have.".to_owned()
+                    >
+                        {show_actions.then(|| view! {
+                            <a href=crate::base::site_url("/contribute")>"Share photos"</a>
+                        })}
+                    </ui::EmptyState>
+                }
+                .into_any()
             }
-            .into_any(),
             Load::Ready(wanted) => view! {
                 <div class="wanted-grid">
                     {wanted.bounties.into_iter().take(limit).map(|bounty| view! {
                         <WantedCard bounty index=wanted.index.clone() show_action=show_actions/>
                     }).collect_view()}
+                    {wanted.requests.into_iter().take(limit).map(|request| view! {
+                        <EvidenceRequestCard request index=wanted.index.clone() show_action=show_actions/>
+                    }).collect_view()}
                 </div>
             }
             .into_any(),
         }
+    }
+}
+
+#[component]
+fn EvidenceRequestCard(
+    request: EvidenceRequestWire,
+    index: Arc<SiteIndex>,
+    show_action: bool,
+) -> impl IntoView {
+    let camera = request
+        .body()
+        .map(|id| {
+            index
+                .bodies
+                .iter()
+                .find(|camera| &camera.id == id)
+                .map(|camera| format!("{} {}", camera.make, camera.model))
+                .unwrap_or_else(|| "the requested camera".to_owned())
+        })
+        .unwrap_or_else(|| "any supported camera".to_owned());
+    let look = match &request.subject {
+        ModelSubject::SharedFamily { family } => index
+            .looks
+            .iter()
+            .find(|look| look.slug.as_str() == family.as_str())
+            .map(|look| look.name.clone())
+            .unwrap_or_else(|| "the requested look".to_owned()),
+        ModelSubject::BodyRealization { .. } => "its camera model".to_owned(),
+    };
+    let capability = match request.capability {
+        looklab_schema::QualificationCapability::NativePrediction => "camera response",
+        looklab_schema::QualificationCapability::ControlsMatching => "settings and controls",
+        looklab_schema::QualificationCapability::CrossBodyAdmission => "cross-camera agreement",
+    };
+    let origin = match &request.origin {
+        EvidenceRequestOrigin::Report { .. } => "From a published assessment",
+        EvidenceRequestOrigin::PreCandidate => "Before a model is published",
+    };
+    let context = match (request.epoch(), request.native_sim()) {
+        (Some(epoch), Some(sim)) => format!("Firmware epoch {} · {}", epoch.get(), sim.as_str()),
+        _ => String::new(),
+    };
+    view! {
+        <article class="wanted-card">
+            <p class="help-meta">"5 to 10 minutes · " {origin}</p>
+            <h2>{format!("Help measure {capability} for {look}")}</h2>
+            <p>{format!("{camera}. {context}")}</p>
+            <p>{request.detail.clone()}</p>
+            {request.observed_groups.map(|groups| view! {
+                <p class="muted">{format!("{groups} independent groups observed so far.")}</p>
+            })}
+            {show_action.then(|| view! {
+                <a href=crate::base::site_url("/contribute")>"Add your photos →"</a>
+            })}
+            <ui::Disclosure summary="Technical details".to_owned()>
+                <p>{format!("Request kind: {}", request.kind.as_str())}</p>
+                {request.report().map(|report| view! {
+                    <p>{format!("Assessment report {report}.")}</p>
+                })}
+                <p>{format!("Subject: {}", request.subject_key().as_str())}</p>
+            </ui::Disclosure>
+        </article>
     }
 }
 

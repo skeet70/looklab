@@ -7,7 +7,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::error::ValidationError;
-use crate::{validate_body, validate_control_schema, validate_interface_profile};
+use crate::{
+    validate_body, validate_control_schema, validate_interface_profile, validate_manual_catalog,
+};
 
 #[derive(Debug, Clone)]
 pub struct FileErrors {
@@ -37,6 +39,7 @@ pub fn validate_dir(root: impl AsRef<Path>) -> io::Result<Vec<FileErrors>> {
             Kind::Body => validate_body(&yaml).err(),
             Kind::Schema => validate_control_schema(&yaml).err(),
             Kind::Interface => validate_interface_profile(&yaml).err(),
+            Kind::Manual => validate_manual_catalog(&yaml).err(),
         };
         if let Some(errors) = errors
             && !errors.is_empty()
@@ -54,6 +57,7 @@ pub(crate) enum Kind {
     Body,
     Schema,
     Interface,
+    Manual,
 }
 
 pub(crate) fn classify(path: &Path) -> Option<Kind> {
@@ -66,6 +70,7 @@ pub(crate) fn classify(path: &Path) -> Option<Kind> {
         "bodies" if name.ends_with(".body.yaml") => Some(Kind::Body),
         "bodies" => Some(Kind::Schema),
         "interfaces" => Some(Kind::Interface),
+        "manuals" => Some(Kind::Manual),
         _ => None,
     }
 }

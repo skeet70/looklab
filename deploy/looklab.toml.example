@@ -6,6 +6,7 @@ db_path = "/var/lib/looklab/looklab.sqlite3"
 blob_dir = "/var/lib/looklab/blobs"
 server_secret_path = "/var/lib/looklab/server-secret"
 bodies_dir = "/var/lib/looklab/data/bodies"
+manuals_dir = "/var/lib/looklab/data/manuals"
 snapshot_dir = "/var/lib/looklab/community"
 
 # The browser origin and its registrable RP ID. Both are pinned for the life of

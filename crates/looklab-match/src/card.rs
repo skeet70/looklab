@@ -4,21 +4,66 @@ use core::fmt;
 
 use looklab_color::Xyz;
 use looklab_color::ucs::{Ucs, delta_e_ucs};
-use looklab_model::realization::Realization;
+use looklab_model::realization::{Realization, Settings};
 use looklab_model::{LayerValues, Look, LookInput, ProbeSet};
 use looklab_report::compare::LookFunction;
 use looklab_report::summary::{HueRegion, summary_line};
 use looklab_report::{ComparisonInput, FunctionName, LayerContribution, LayerId, compare};
 use looklab_schema::{ControlKey, SimKey};
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::metric::{AssessmentStatus, OutputContext, ScoringMetric, TargetAppearance};
 use crate::model::MatchModel;
 use crate::optimizer::{Suggestion, quantile};
 use crate::settings::Plan;
 use crate::target::PreparedTarget;
 
-/// Probes above this ΔE are reported as unreachable regions.
-pub const UNREACHABLE_DE: f64 = 2.0;
+/// The numerical tolerance a reachability witness must meet at every declared point.
+pub const REACHABILITY_TOLERANCE_DE: f64 = 2.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsSupport {
+    Assessed,
+    Extrapolated,
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachabilityStatus {
+    Reachable,
+    Partial,
+    NoRecipeFound,
+    Unassessed,
+}
+
+impl ReachabilityStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reachable => "reachable",
+            Self::Partial => "partial",
+            Self::NoRecipeFound => "no_recipe_found",
+            Self::Unassessed => "unassessed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Reachability {
+    pub witness: Settings,
+    pub tolerance: f64,
+    pub declared: usize,
+    pub evaluated: usize,
+    pub assessed: usize,
+    pub within_tolerance: usize,
+    pub within_assessed: usize,
+    pub settings: SettingsSupport,
+    pub domain_assessed: bool,
+    pub uncertainty: AssessmentStatus,
+    pub status: ReachabilityStatus,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ControlEntry {
@@ -29,8 +74,8 @@ pub struct ControlEntry {
     pub affects: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct UnreachableRegion {
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MissedRegion {
     pub region: String,
     pub layer: String,
     pub remaining_delta_e: f64,
@@ -69,19 +114,28 @@ pub struct Confidence {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SettingsCard {
     pub sim: SimKey,
+    pub metric: ScoringMetric,
+    pub output: Option<OutputContext>,
     pub entries: Vec<ControlEntry>,
     pub exposure_note: Option<String>,
     pub median_delta_e: f64,
     pub p95_delta_e: f64,
     pub sigma_band: Option<f64>,
+    pub joint_uncertainty: AssessmentStatus,
     pub residual_summary: String,
-    pub unreachable: Vec<UnreachableRegion>,
+    pub reachability: Reachability,
+    pub missed: Vec<MissedRegion>,
     pub confidence: Confidence,
 }
 
 impl SettingsCard {
     pub fn render_text(&self) -> String {
         let mut out = format!("base sim: {}\n", self.sim);
+        out.push_str(&format!("metric: {}\n", self.metric.identity()));
+        match &self.output {
+            Some(context) => out.push_str(&format!("output: {}\n", context.canonical())),
+            None => out.push_str("output: not rendered\n"),
+        }
         for entry in &self.entries {
             out.push_str(&format!("  {}: {}", entry.key, entry.value));
             if entry.changed {
@@ -103,9 +157,25 @@ impl SettingsCard {
             )),
         }
         out.push_str(&format!("residual: {}\n", self.residual_summary));
-        for region in &self.unreachable {
+        let joint = match self.joint_uncertainty {
+            AssessmentStatus::Assessed => "assessed",
+            AssessmentStatus::Partial => "partial",
+            AssessmentStatus::Unassessed => "unassessed (no target/camera cross-covariance)",
+        };
+        out.push_str(&format!("joint uncertainty: {joint}\n"));
+        out.push_str(&format!(
+            "reachability: {} ({} of {} declared points assessed, {} within {:.2} ΔE; {} evaluated, {} within tolerance)\n",
+            self.reachability.status.as_str(),
+            self.reachability.assessed,
+            self.reachability.declared,
+            self.reachability.within_assessed,
+            self.reachability.tolerance,
+            self.reachability.evaluated,
+            self.reachability.within_tolerance
+        ));
+        for region in &self.missed {
             out.push_str(&format!(
-                "unreachable: {} {} can't be reduced enough; remaining error {:.1} ΔE ({} probes)\n",
+                "missed: {} {} exceeds the tolerance at {:.1} ΔE ({} probes)\n",
                 region.region, region.layer, region.remaining_delta_e, region.probes
             ));
         }
@@ -123,12 +193,29 @@ pub fn settings_card(
     model: &MatchModel,
     suggestion: &Suggestion,
 ) -> Result<SettingsCard> {
+    settings_card_with_support(target, plan, model, suggestion, None)
+}
+
+pub fn settings_card_with_support(
+    target: &PreparedTarget<'_>,
+    plan: &Plan,
+    model: &MatchModel,
+    suggestion: &Suggestion,
+    support: Option<&crate::domain::AssessedDomain>,
+) -> Result<SettingsCard> {
+    let metric = target.metric();
     let realization = model.realize(&suggestion.settings)?;
     let mut deltas = Vec::with_capacity(target.supported.len());
     let mut traces = Vec::with_capacity(target.supported.len());
+    let mut assessed_flags = Vec::with_capacity(target.supported.len());
     for index in &target.supported {
         let probe = &target.probes.probes[*index];
-        let prediction = model.input_ucs(&realization, probe.xyz, [0.0, 0.0], 0.0);
+        assessed_flags.push(match support {
+            Some(domain) => crate::domain::AssessedDomain::cell_of(probe)
+                .is_some_and(|cell| domain.supports(&cell)),
+            None => true,
+        });
+        let prediction = model.scored_ucs(metric, &realization, probe.xyz);
         let expected = target.target[*index];
         let delta = [
             prediction.j - expected.j,
@@ -140,22 +227,24 @@ pub fn settings_card(
             model,
             &realization,
             &suggestion.settings,
+            metric,
             probe.xyz,
         )?);
     }
     let mut sorted = deltas.clone();
     sorted.sort_by(f64::total_cmp);
-    let band = if model.covariance.is_none() || traces.is_empty() {
-        None
-    } else {
-        Some(
-            traces
-                .iter()
-                .map(|trace| trace.max(0.0).sqrt())
-                .sum::<f64>()
-                / traces.len() as f64,
-        )
-    };
+    let band =
+        if model.covariance.is_none() || traces.is_empty() || traces.iter().any(Option::is_none) {
+            None
+        } else {
+            Some(
+                traces
+                    .iter()
+                    .map(|trace| trace.unwrap_or(0.0).max(0.0).sqrt())
+                    .sum::<f64>()
+                    / traces.len() as f64,
+            )
+        };
 
     let filtered = ProbeSet {
         version: target.probes.version,
@@ -171,15 +260,21 @@ pub fn settings_card(
             let realized = RealizedFunction {
                 model,
                 realization: &realization,
+                metric,
+            };
+            let target_function = AppearanceFunction {
+                look,
+                appearance: target.appearance,
             };
             let comparison = compare(&ComparisonInput {
-                a: look,
+                a: &target_function,
                 b: &realized,
                 probes: &filtered,
                 a_name: &FunctionName::new("target"),
                 b_name: &FunctionName::new(model.sim().to_string()),
             });
-            let attribution = realized_attribution(look, model, &realization, &filtered);
+            let attribution =
+                realized_attribution(look, target.appearance, model, &realization, &filtered);
             let summary = summary_line(
                 &FunctionName::new("target"),
                 &FunctionName::new(model.sim().to_string()),
@@ -204,10 +299,15 @@ pub fn settings_card(
         .map(|entry| layer_noun(entry.layer).to_string())
         .unwrap_or_else(|| "color".to_string());
 
+    let domain_assessed =
+        support.is_some_and(|domain| domain.combinations().contains(&suggestion.settings));
     let mut regions: Vec<(String, Vec<f64>)> = Vec::new();
     for (slot, index) in target.supported.iter().enumerate() {
+        if !domain_assessed || !assessed_flags[slot] {
+            continue;
+        }
         let delta = deltas[slot];
-        if delta <= UNREACHABLE_DE {
+        if delta <= REACHABILITY_TOLERANCE_DE {
             continue;
         }
         let probe = &target.probes.probes[*index];
@@ -222,11 +322,11 @@ pub fn settings_card(
             None => regions.push((region, vec![delta])),
         }
     }
-    let mut unreachable: Vec<UnreachableRegion> = regions
+    let mut missed: Vec<MissedRegion> = regions
         .into_iter()
         .map(|(region, mut values)| {
             values.sort_by(f64::total_cmp);
-            UnreachableRegion {
+            MissedRegion {
                 region,
                 layer: layer.clone(),
                 remaining_delta_e: quantile(&values, 0.95),
@@ -234,8 +334,59 @@ pub fn settings_card(
             }
         })
         .collect();
-    unreachable.sort_by(|left, right| right.remaining_delta_e.total_cmp(&left.remaining_delta_e));
-    unreachable.truncate(3);
+    missed.sort_by(|left, right| right.remaining_delta_e.total_cmp(&left.remaining_delta_e));
+    missed.truncate(3);
+
+    let declared = target.declared_points;
+    let evaluated = target.supported.len();
+    let within_tolerance = deltas
+        .iter()
+        .filter(|delta| **delta <= REACHABILITY_TOLERANCE_DE)
+        .count();
+    let settings = settings_support(model, plan, &suggestion.settings);
+    let assessed = if domain_assessed {
+        assessed_flags.iter().filter(|assessed| **assessed).count()
+    } else {
+        0
+    };
+    let within_assessed = if domain_assessed {
+        deltas
+            .iter()
+            .zip(&assessed_flags)
+            .filter(|(delta, assessed)| **assessed && **delta <= REACHABILITY_TOLERANCE_DE)
+            .count()
+    } else {
+        0
+    };
+    let status = if assessed == 0 {
+        if within_tolerance < evaluated {
+            ReachabilityStatus::NoRecipeFound
+        } else {
+            ReachabilityStatus::Unassessed
+        }
+    } else if within_assessed < assessed {
+        ReachabilityStatus::NoRecipeFound
+    } else if assessed < declared
+        || settings != SettingsSupport::Assessed
+        || target.target_uncertainty != AssessmentStatus::Assessed
+    {
+        ReachabilityStatus::Partial
+    } else {
+        ReachabilityStatus::Reachable
+    };
+    let reachability = Reachability {
+        witness: suggestion.settings.clone(),
+        tolerance: REACHABILITY_TOLERANCE_DE,
+        declared,
+        evaluated,
+        assessed,
+        within_tolerance,
+        within_assessed,
+        settings,
+        domain_assessed,
+        uncertainty: target.target_uncertainty,
+        status,
+    };
 
     let entries = plan
         .controls
@@ -255,15 +406,20 @@ pub fn settings_card(
 
     let exposure_note = exposure_note(plan, &suggestion.settings);
     let confidence = confidence(target, plan, model, &suggestion.settings);
+    let output = target.optional_output_context(model, &suggestion.settings)?;
     Ok(SettingsCard {
         sim: model.sim().clone(),
+        metric,
+        output,
         entries,
         exposure_note,
         median_delta_e: quantile(&sorted, 0.5),
         p95_delta_e: quantile(&sorted, 0.95),
         sigma_band: band,
+        joint_uncertainty: AssessmentStatus::Unassessed,
         residual_summary,
-        unreachable,
+        reachability,
+        missed,
         confidence,
     })
 }
@@ -271,11 +427,31 @@ pub fn settings_card(
 struct RealizedFunction<'a> {
     model: &'a MatchModel,
     realization: &'a Realization,
+    metric: ScoringMetric,
+}
+
+struct AppearanceFunction<'a> {
+    look: &'a Look,
+    appearance: TargetAppearance,
+}
+
+impl LookFunction for AppearanceFunction<'_> {
+    fn predict(&self, xyz: Xyz) -> Ucs {
+        self.appearance.render(self.look.eval(xyz))
+    }
+
+    fn layer_values(&self, input: &LookInput) -> Option<LayerValues> {
+        Some(self.look.layer_values(input))
+    }
+
+    fn look(&self) -> Option<&Look> {
+        Some(self.look)
+    }
 }
 
 impl LookFunction for RealizedFunction<'_> {
     fn predict(&self, xyz: Xyz) -> Ucs {
-        self.model.input_ucs(self.realization, xyz, [0.0, 0.0], 0.0)
+        self.model.scored_ucs(self.metric, self.realization, xyz)
     }
 
     fn layer_values(&self, input: &LookInput) -> Option<LayerValues> {
@@ -290,6 +466,7 @@ impl LookFunction for RealizedFunction<'_> {
 
 fn realized_attribution(
     target: &Look,
+    appearance: TargetAppearance,
     model: &MatchModel,
     realization: &Realization,
     probes: &ProbeSet,
@@ -297,11 +474,20 @@ fn realized_attribution(
     if probes.probes.is_empty() {
         return Vec::new();
     }
-    let realized = RealizedFunction { model, realization };
+    let realized = RealizedFunction {
+        model,
+        realization,
+        metric: appearance.metric(),
+    };
     let baseline = probes
         .probes
         .iter()
-        .map(|probe| delta_e_ucs(target.eval(probe.xyz), realized.predict(probe.xyz)))
+        .map(|probe| {
+            delta_e_ucs(
+                appearance.render(target.eval(probe.xyz)),
+                realized.predict(probe.xyz),
+            )
+        })
         .sum::<f64>()
         / probes.probes.len() as f64;
     let mut contributions = Vec::with_capacity(LayerId::ALL.len());
@@ -310,7 +496,10 @@ fn realized_attribution(
         let mut error = 0.0_f64;
         for probe in &probes.probes {
             let warped = model.input_xyz(realization, probe.xyz);
-            error += delta_e_ucs(hybrid.eval(warped), realized.predict(probe.xyz));
+            error += delta_e_ucs(
+                appearance.render(hybrid.eval(warped)),
+                realized.predict(probe.xyz),
+            );
         }
         contributions.push(LayerContribution {
             layer,
@@ -320,7 +509,10 @@ fn realized_attribution(
     let mut input_error = 0.0_f64;
     for probe in &probes.probes {
         let warped = model.input_xyz(realization, probe.xyz);
-        input_error += delta_e_ucs(target.eval(warped), realized.predict(probe.xyz));
+        input_error += delta_e_ucs(
+            appearance.render(target.eval(warped)),
+            realized.predict(probe.xyz),
+        );
     }
     let input_contribution = (baseline - input_error / probes.probes.len() as f64).max(0.0);
     if input_contribution > 0.0
@@ -399,19 +591,26 @@ fn exposure_note(plan: &Plan, settings: &looklab_model::realization::Settings) -
     }
 }
 
-fn confidence(
-    target: &PreparedTarget<'_>,
+struct SettingsEvidence {
+    covered: usize,
+    extrapolated: usize,
+    missing: usize,
+}
+
+fn settings_evidence(
     plan: &Plan,
     model: &MatchModel,
     settings: &looklab_model::realization::Settings,
-) -> Confidence {
-    let mut covered = 0_usize;
-    let mut extrapolated = 0_usize;
-    let mut missing = 0_usize;
+) -> SettingsEvidence {
+    let mut evidence = SettingsEvidence {
+        covered: 0,
+        extrapolated: 0,
+        missing: 0,
+    };
     for control in plan.stage_controls() {
         let domain = &plan.domains[control];
         let Some(support) = model.crm.support.observed(&domain.key) else {
-            missing += 1;
+            evidence.missing += 1;
             continue;
         };
         let has_nondefault = support
@@ -419,34 +618,77 @@ fn confidence(
             .iter()
             .any(|value| value != domain.default_value());
         if !has_nondefault {
-            missing += 1;
+            evidence.missing += 1;
             continue;
         }
         let value = plan.value(control, settings);
         if model.crm.support.value_inflation(support, &value) > 1.0 {
-            extrapolated += 1;
+            evidence.extrapolated += 1;
         } else {
-            covered += 1;
+            evidence.covered += 1;
         }
     }
+    evidence
+}
+
+fn settings_support(
+    model: &MatchModel,
+    plan: &Plan,
+    settings: &looklab_model::realization::Settings,
+) -> SettingsSupport {
+    let evidence = settings_evidence(plan, model, settings);
+    if evidence.missing > 0 {
+        SettingsSupport::Missing
+    } else if evidence.extrapolated > 0 {
+        SettingsSupport::Extrapolated
+    } else {
+        SettingsSupport::Assessed
+    }
+}
+
+fn confidence(
+    target: &PreparedTarget<'_>,
+    plan: &Plan,
+    model: &MatchModel,
+    settings: &looklab_model::realization::Settings,
+) -> Confidence {
+    let SettingsEvidence {
+        covered,
+        extrapolated,
+        missing,
+    } = settings_evidence(plan, model, settings);
     let planned = plan.plan_controls.len();
     let fraction = target.support_fraction();
-    let level =
-        if covered == planned && extrapolated == 0 && fraction >= 0.9 && model.covariance.is_some()
-        {
-            ConfidenceLevel::High
-        } else if covered + extrapolated >= planned.div_ceil(2) && fraction >= 0.6 {
-            ConfidenceLevel::Medium
-        } else {
-            ConfidenceLevel::Low
-        };
+    let target_uncertainty = target.target_uncertainty == AssessmentStatus::Assessed;
+    let level = if covered == planned
+        && extrapolated == 0
+        && fraction >= 0.9
+        && model.covariance.is_some()
+        && target_uncertainty
+    {
+        ConfidenceLevel::High
+    } else if target_uncertainty && covered + extrapolated >= planned.div_ceil(2) && fraction >= 0.6
+    {
+        ConfidenceLevel::Medium
+    } else {
+        ConfidenceLevel::Low
+    };
+    let support = if target_uncertainty {
+        format!("{:.0}% of probes are supported", fraction * 100.0)
+    } else {
+        "probe support is unassessed".to_string()
+    };
     let reason = format!(
-        "{covered} of {planned} solve-plan controls have nondefault observed responses; {extrapolated} recommended values extrapolate; {missing} controls lack nondefault support; {:.0}% of probes are supported{}",
-        fraction * 100.0,
+        "{covered} of {planned} solve-plan controls have nondefault observed responses; {extrapolated} recommended values extrapolate; {missing} controls lack nondefault support; {support}{}{}",
         if model.covariance.is_none() {
             "; no control-response covariance, so the predicted band is unavailable"
         } else {
             ""
+        },
+        if target_uncertainty {
+            ""
+        } else {
+            "; target probe uncertainty is unassessed for this metric"
         }
     );
     Confidence { level, reason }

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use looklab_color::WhiteRelativeXyz;
 use looklab_color::Xyz;
 use looklab_color::cam16::{Cam16Model, Chroma, Jmh, Surround, ViewingConditions};
 use looklab_color::ucs::{
@@ -408,6 +409,213 @@ fn reference_neutral_has_zero_ucs_chroma() {
 }
 
 #[test]
+fn opponent_chroma_maps_reproduce_cam16_ucs() {
+    let conditions = ViewingConditions::reference();
+    let model = Cam16Model::new(&conditions);
+    let scale = model.neutral_chroma_scale(conditions.white.scale(0.18), 2.0);
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    for _ in 0..200 {
+        let xyz = Xyz::new(
+            0.05 + 1.2 * next(),
+            0.05 + 1.2 * next(),
+            0.05 + 1.2 * next(),
+        );
+        let opponent = model.cone_opponent(xyz);
+        let n = [
+            scale * opponent.a / opponent.denominator,
+            scale * opponent.b / opponent.denominator,
+        ];
+        let cam = model.xyz_to_cam16(xyz);
+        let ucs = jmh_to_ucs(
+            Jmh {
+                j: cam.j,
+                m: cam.m,
+                h: cam.h,
+            },
+            UcsSpace::Ucs,
+        );
+        let phi = model.ucs_chroma_from_opponent(n, ucs.j, scale);
+        assert!(close(phi[0], ucs.a, 1e-9), "a' {} vs {}", phi[0], ucs.a);
+        assert!(close(phi[1], ucs.b, 1e-9), "b' {} vs {}", phi[1], ucs.b);
+        let psi = model.opponent_chroma_from_ucs([ucs.a, ucs.b], ucs.j, scale);
+        assert!(close(psi[0], n[0], 1e-9), "n_a {} vs {}", psi[0], n[0]);
+        assert!(close(psi[1], n[1], 1e-9), "n_b {} vs {}", psi[1], n[1]);
+        let back = model.opponent_chroma_to_xyz(n, ucs.j, scale);
+        assert!(close(back.x, xyz.x, 1e-7), "X {} vs {}", back.x, xyz.x);
+        assert!(close(back.y, xyz.y, 1e-7), "Y {} vs {}", back.y, xyz.y);
+        assert!(close(back.z, xyz.z, 1e-7), "Z {} vs {}", back.z, xyz.z);
+    }
+}
+
+#[test]
+fn opponent_chroma_jacobian_matches_finite_difference() {
+    let conditions = ViewingConditions::reference();
+    let model = Cam16Model::new(&conditions);
+    let scale = model.neutral_chroma_scale(conditions.white.scale(0.18), 2.0);
+    let h = 1e-6;
+    for n in [[0.3, -0.2], [1.1, 0.7], [-0.5, 1.4], [0.05, 0.02]] {
+        let j_prime = 55.0;
+        let (jacobian, gradient) = model.ucs_chroma_from_opponent_jacobian(n, j_prime, scale);
+        for axis in 0..2 {
+            let mut plus = n;
+            let mut minus = n;
+            plus[axis] += h;
+            minus[axis] -= h;
+            let a = model.ucs_chroma_from_opponent(plus, j_prime, scale);
+            let b = model.ucs_chroma_from_opponent(minus, j_prime, scale);
+            for row in 0..2 {
+                let numerical = (a[row] - b[row]) / (2.0 * h);
+                let scale = numerical.abs().max(1.0);
+                assert!(
+                    (jacobian[row][axis] - numerical).abs() < 1e-6 * scale,
+                    "n {n:?} row {row} axis {axis}: {} vs {numerical}",
+                    jacobian[row][axis]
+                );
+            }
+        }
+        let a = model.ucs_chroma_from_opponent(n, j_prime + h, scale);
+        let b = model.ucs_chroma_from_opponent(n, j_prime - h, scale);
+        for row in 0..2 {
+            let numerical = (a[row] - b[row]) / (2.0 * h);
+            let scale = numerical.abs().max(1.0);
+            assert!(
+                (gradient[row] - numerical).abs() < 1e-6 * scale,
+                "n {n:?} row {row}: {} vs {numerical}",
+                gradient[row]
+            );
+        }
+    }
+}
+
+#[test]
+fn opponent_chroma_jacobian_is_nan_at_neutral_internal_chroma() {
+    let conditions = ViewingConditions::reference();
+    let model = Cam16Model::new(&conditions);
+    let scale = model.neutral_chroma_scale(conditions.white.scale(0.18), 2.0);
+    let (jacobian, gradient) = model.ucs_chroma_from_opponent_jacobian([0.0, 0.0], 55.0, scale);
+    assert!(jacobian.iter().flatten().all(|value| value.is_nan()));
+    assert!(gradient.iter().all(|value| value.is_nan()));
+}
+
+#[test]
+fn cartesian_opponent_responses_match_the_ucs_inverse_and_differences() {
+    let conditions = ViewingConditions::reference();
+    let model = Cam16Model::new(&conditions);
+    let scale = model.neutral_chroma_scale(conditions.white.scale(0.18), 2.0);
+    for j_prime in [20.0, 50.0, 80.0] {
+        for n in [
+            [0.0, 0.0],
+            [0.3, -0.2],
+            [1.1, 0.7],
+            [-0.5, 1.4],
+            [0.05, 0.02],
+        ] {
+            let direct = model.opponent_chroma_response_derivatives(n, j_prime, scale);
+            let xyz = model.opponent_chroma_to_xyz(n, j_prime, scale);
+            let forward = model.cone_opponent(xyz).rgb_a;
+            let chroma = model.ucs_chroma_from_opponent(n, j_prime, scale);
+            let jmh = ucs_to_jmh(Ucs::new(j_prime, chroma[0], chroma[1]), UcsSpace::Ucs);
+            let round_trip = model.inverse_responses(jmh);
+            for channel in 0..3 {
+                let magnitude = round_trip[channel].abs().max(1e-3);
+                assert!(
+                    (direct.responses[channel] - round_trip[channel]).abs() / magnitude < 1e-6,
+                    "j {j_prime} n {n:?} channel {channel}: {} vs {}",
+                    direct.responses[channel],
+                    round_trip[channel]
+                );
+                assert!(
+                    (direct.responses[channel] - forward[channel]).abs() / magnitude < 1e-6,
+                    "forward j {j_prime} n {n:?} channel {channel}: {} vs {}",
+                    direct.responses[channel],
+                    forward[channel]
+                );
+            }
+            let step = 1e-6;
+            for axis in 0..3 {
+                let plus = if axis == 0 {
+                    model.opponent_chroma_response_derivatives(n, j_prime + step, scale)
+                } else {
+                    let mut moved = n;
+                    moved[axis - 1] += step;
+                    model.opponent_chroma_response_derivatives(moved, j_prime, scale)
+                };
+                let minus = if axis == 0 {
+                    model.opponent_chroma_response_derivatives(n, j_prime - step, scale)
+                } else {
+                    let mut moved = n;
+                    moved[axis - 1] -= step;
+                    model.opponent_chroma_response_derivatives(moved, j_prime, scale)
+                };
+                for channel in 0..3 {
+                    let numerical =
+                        (plus.responses[channel] - minus.responses[channel]) / (2.0 * step);
+                    let analytic = direct.first[channel][axis];
+                    let magnitude = analytic.abs().max(numerical.abs()).max(1e-6);
+                    assert!(
+                        (analytic - numerical).abs() / magnitude < 1e-5,
+                        "j {j_prime} n {n:?} channel {channel} axis {axis}: {analytic} vs {numerical}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ucs_response_derivatives_match_differences() {
+    let model = Cam16Model::new(&ViewingConditions::reference());
+    for (j_prime, chroma) in [(50.0, [30.0, -20.0]), (80.0, [-5.0, 8.0])] {
+        let direct = model.ucs_chroma_response_derivatives(chroma, j_prime);
+        let value = |j: f64, a: f64, b: f64| {
+            model.inverse_responses(ucs_to_jmh(Ucs::new(j, a, b), UcsSpace::Ucs))
+        };
+        let base = value(j_prime, chroma[0], chroma[1]);
+        for (channel, base_response) in base.iter().enumerate() {
+            let magnitude = base_response.abs().max(1e-3);
+            assert!(
+                (direct.responses[channel] - *base_response).abs() / magnitude < 1e-12,
+                "j {j_prime} chroma {chroma:?} channel {channel}: {} vs {}",
+                direct.responses[channel],
+                base_response
+            );
+        }
+        let step = 1e-6;
+        for axis in 0..3 {
+            let plus = if axis == 0 {
+                value(j_prime + step, chroma[0], chroma[1])
+            } else if axis == 1 {
+                value(j_prime, chroma[0] + step, chroma[1])
+            } else {
+                value(j_prime, chroma[0], chroma[1] + step)
+            };
+            let minus = if axis == 0 {
+                value(j_prime - step, chroma[0], chroma[1])
+            } else if axis == 1 {
+                value(j_prime, chroma[0] - step, chroma[1])
+            } else {
+                value(j_prime, chroma[0], chroma[1] - step)
+            };
+            for channel in 0..3 {
+                let numerical = (plus[channel] - minus[channel]) / (2.0 * step);
+                let analytic = direct.first[channel][axis];
+                let magnitude = analytic.abs().max(numerical.abs()).max(1e-6);
+                assert!(
+                    (analytic - numerical).abs() / magnitude < 1e-5,
+                    "j {j_prime} chroma {chroma:?} channel {channel} axis {axis}: {analytic} vs {numerical}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn computed_adaptation_matches_documented_reference_value() {
     let conditions = ViewingConditions {
         discount_illuminant: false,
@@ -446,4 +654,28 @@ proptest! {
         prop_assert!((ba - sa).abs() <= 1e-9 * sa.abs().max(1e-3), "a: {} vs {}", ba, sa);
         prop_assert!((bb - sb).abs() <= 1e-9 * sb.abs().max(1e-3), "b: {} vs {}", bb, sb);
     }
+}
+
+#[test]
+fn near_neutral_departure_keeps_the_forward_chroma() {
+    let model = Cam16Model::new(&ViewingConditions::reference());
+
+    let neutral = model.xyz_departure_to_cam16(WhiteRelativeXyz::from_array([0.0, 0.0, 0.0]));
+    assert_eq!(neutral.j, 100.0);
+    assert_eq!(neutral.c, 0.0);
+    assert_eq!(neutral.m, 0.0);
+
+    let departure = WhiteRelativeXyz::from_array([1.0e-16, -2.0e-16, 3.0e-17]);
+    let cam = model.xyz_departure_to_cam16(departure);
+    let ucs = jmh_to_ucs(
+        Jmh {
+            j: cam.j,
+            m: cam.m,
+            h: cam.h,
+        },
+        UcsSpace::Ucs,
+    );
+    assert!(ucs.a.is_finite() && ucs.b.is_finite());
+    assert!(ucs.a != 0.0 || ucs.b != 0.0);
+    assert!(cam.c > 0.0 && cam.c.is_finite());
 }

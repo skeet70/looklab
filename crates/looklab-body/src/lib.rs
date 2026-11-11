@@ -18,8 +18,8 @@ pub use anchor::{
     chart_anchor_terms,
 };
 pub use cct::{
-    CCT_A, CCT_D65, CalibrationIlluminant, CameraProfile, Cct, camera_to_xyz_at_wb, estimate_cct,
-    neutral_from_wb,
+    CCT_A, CCT_D65, CalibrationIlluminant, CameraProfile, Cct, camera_to_xyz_at_illuminant,
+    camera_to_xyz_at_wb, estimate_cct, neutral_from_wb,
 };
 pub use chart::{ChartError, ChartReference, chart_error};
 pub use delta::{Cov6, Delta6, PARAMETERS};

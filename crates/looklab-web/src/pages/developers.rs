@@ -56,13 +56,12 @@ fn ConformanceDownload() -> impl IntoView {
     let archive = RwSignal::new(data::Load::Loading);
     spawn_local(async move {
         let result = async {
-            let response =
-                gloo_net::http::Request::get(&publication_url(
-                    "/data/developers/conformance-v1.json",
-                ))
-                    .send()
-                    .await
-                    .map_err(|error| error.to_string())?;
+            let response = gloo_net::http::Request::get(&publication_url(
+                "/data/developers/conformance-v1.json",
+            ))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
             if !response.ok() {
                 return Err(format!("HTTP {}", response.status()));
             }
@@ -148,7 +147,7 @@ async fn check_tag(outcome: RenderTagOutcome) -> (TagStatus, String) {
         RenderTagOutcome::Malformed => (TagStatus::Malformed, "Malformed render tag. Check the exact field order, spacing and allowed characters in the specification.".to_owned()),
         RenderTagOutcome::Valid(tag) => {
             let fields = format!("Firmware: {} / {}\nLook: {} @ {}\nContent id prefix: {}", tag.firmware_id, tag.firmware_version, tag.look_slug, tag.look_version, tag.cid_prefix_hex());
-            let result = match data::card(tag.look_slug.as_str(), tag.look_version.as_str()).await {
+            let result = match data::card(tag.look_slug.as_str(), tag.look_version.as_str(), data::CardUse::VerifyRenderTag).await {
                 Ok(bytes) => match read_card(&bytes) {
                     Ok(card) if card.cid_prefix() == tag.cid_prefix => "Matches the published card. The card was checked against its version manifest.".to_owned(),
                     Ok(_) => "Content id mismatch. This render uses a different card and cannot count for the named version.".to_owned(),
@@ -461,10 +460,7 @@ pub fn PipelinesPage() -> impl IntoView {
             </section>
             <section>
                 <h2>"Published profiles"</h2>
-                <EmptyState
-                    title="No profiles published in this site data".to_owned()
-                    message="An approved editing-app profile describes a supported pipeline and includes its round-trip report.".to_owned()
-                />
+                <PublishedProfiles/>
                 <p>
                     <a href="https://github.com/skeet70/looklab/tree/main/data/interfaces">
                         "Browse interface profiles in the repository"
@@ -483,6 +479,104 @@ pub fn PipelinesPage() -> impl IntoView {
                     </a>
                 </p>
             </section>
+        </article>
+    }
+}
+
+#[component]
+fn PublishedProfiles() -> impl IntoView {
+    let catalog = RwSignal::new(data::Load::Loading);
+    leptos::task::spawn_local_scoped_with_cancellation(async move {
+        catalog.set(match data::index().await {
+            Ok(index) => data::Load::Ready(index.interfaces),
+            Err(error) => data::Load::Failed(error),
+        });
+    });
+    view! {
+        {move || match catalog.get() {
+            data::Load::Loading => crate::ui::loading().into_any(),
+            data::Load::Failed(error) => crate::ui::failure(&error).into_any(),
+            data::Load::Ready(entries) if entries.is_empty() => view! {
+                <EmptyState
+                    title="No profiles published in this site data".to_owned()
+                    message="Approved editing-app profiles include a pipeline definition and its reference round-trip report.".to_owned()
+                />
+            }.into_any(),
+            data::Load::Ready(entries) => view! {
+                <div class="profile-catalog">
+                    {entries.into_iter().map(|entry| view! { <PublishedProfile entry/> }).collect_view()}
+                </div>
+            }.into_any(),
+        }}
+    }
+}
+
+#[component]
+fn PublishedProfile(entry: looklab_publish::InterfaceProfileEntry) -> impl IntoView {
+    let state = RwSignal::new(None::<Result<std::sync::Arc<data::LoadedInterface>, String>>);
+    let loading = RwSignal::new(false);
+    let name = entry.name.clone();
+    let pin = leptos::prelude::StoredValue::new(entry);
+    let load = move |_| {
+        if loading.get_untracked() {
+            return;
+        }
+        loading.set(true);
+        let entry = pin.get_value();
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
+            state.set(Some(
+                data::interface_profile(&entry)
+                    .await
+                    .map(std::sync::Arc::new),
+            ));
+            loading.set(false);
+        });
+    };
+    view! {
+        <article>
+            <h3>{name}</h3>
+            <p>"A software pipeline definition, not a photo-editing preset."</p>
+            <button type="button" disabled=move || loading.get() on:click=load>
+                "View pipeline and reference check"
+            </button>
+            {move || loading.get().then(|| view! { <p role="status">"Checking published profile artifacts…"</p> })}
+            {move || state.get().map(|result| match result {
+                Err(error) => crate::ui::failure(&error).into_any(),
+                Ok(profile) => {
+                    let definition = profile.clone();
+                    let report = profile.clone();
+                    let source = match &profile.manifest.provenance {
+                        looklab_publish::InterfaceProvenance::Bootstrap => "Bundled pipeline definition.",
+                        looklab_publish::InterfaceProvenance::Approved { .. } => "Community proposal approved by a moderator.",
+                    };
+                    let report_status = if profile.report.flagged {
+                        "The reference check exceeds the export error limit."
+                    } else {
+                        "The reference check passes the export error limit."
+                    };
+                    view! {
+                        <p>{source}</p>
+                        <p>{report_status}" This is a simulated pipeline check, not verification of an editing app or camera."</p>
+                        <p>{format!("{} reference probes; {} clipped targets.", profile.report.probes, profile.report.target_clipped)}</p>
+                        <div class="field-row">
+                            <button type="button" on:click=move |_| {
+                                if let Err(error) = crate::files::download("profile.yaml", definition.definition.as_bytes(), "application/yaml") {
+                                    state.set(Some(Err(error)));
+                                }
+                            }>"Download pipeline definition"</button>
+                            <button type="button" on:click=move |_| {
+                                if let Err(error) = crate::files::download("reference-report.json", &report.report_bytes, "application/json") {
+                                    state.set(Some(Err(error)));
+                                }
+                            }>"Download reference report"</button>
+                            <a href=site_url("/match?apply=software")>"Use an editing-app profile"</a>
+                        </div>
+                        <Disclosure summary="Profile identity".to_owned()>
+                            <p>{format!("{} · definition format version {} · revision {}", profile.manifest.id, profile.manifest.version, profile.pin.manifest_sha256)}</p>
+                        </Disclosure>
+                    }.into_any()
+                }
+            })}
         </article>
     }
 }

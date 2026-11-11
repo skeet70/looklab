@@ -90,6 +90,7 @@ struct FileConfig {
     origin: String,
     server_secret_path: PathBuf,
     bodies_dir: PathBuf,
+    manuals_dir: PathBuf,
     snapshot_dir: PathBuf,
     nonce_ttl_seconds: u64,
     registration_ttl_seconds: u64,
@@ -109,6 +110,8 @@ struct LimitsFile {
     max_manifest_bytes: usize,
     max_images: usize,
     max_blob_bytes: usize,
+    max_batches: usize,
+    max_attestations: usize,
 }
 
 impl Default for LimitsFile {
@@ -119,6 +122,8 @@ impl Default for LimitsFile {
             max_manifest_bytes: limits.max_manifest_bytes,
             max_images: limits.max_images,
             max_blob_bytes: limits.max_blob_bytes,
+            max_batches: limits.max_batches,
+            max_attestations: limits.max_attestations,
         }
     }
 }
@@ -130,6 +135,8 @@ impl LimitsFile {
             max_manifest_bytes: self.max_manifest_bytes,
             max_images: self.max_images,
             max_blob_bytes: self.max_blob_bytes,
+            max_batches: self.max_batches,
+            max_attestations: self.max_attestations,
         }
     }
 }
@@ -144,6 +151,7 @@ impl Default for FileConfig {
             origin: "https://looklab.example".to_owned(),
             server_secret_path: PathBuf::from("server-secret"),
             bodies_dir: PathBuf::from("data/bodies"),
+            manuals_dir: PathBuf::from("data/manuals"),
             snapshot_dir: PathBuf::from("data/community"),
             nonce_ttl_seconds: 0,
             registration_ttl_seconds: 0,
@@ -166,6 +174,7 @@ pub struct Config {
     pub origin: String,
     pub server_secret_path: PathBuf,
     pub bodies_dir: PathBuf,
+    pub manuals_dir: PathBuf,
     pub snapshot_dir: PathBuf,
     pub nonce_ttl: Duration,
     pub registration_ttl: Duration,
@@ -236,6 +245,9 @@ impl Config {
         }
         if let Some(value) = env("LOOKLAB_BODIES_DIR") {
             self.bodies_dir = PathBuf::from(value);
+        }
+        if let Some(value) = env("LOOKLAB_MANUALS_DIR") {
+            self.manuals_dir = PathBuf::from(value);
         }
         if let Some(value) = env("LOOKLAB_SNAPSHOT_DIR") {
             self.snapshot_dir = PathBuf::from(value);
@@ -371,6 +383,7 @@ impl FileConfig {
             origin: self.origin,
             server_secret_path: self.server_secret_path,
             bodies_dir: self.bodies_dir,
+            manuals_dir: self.manuals_dir,
             snapshot_dir: self.snapshot_dir,
             nonce_ttl: Duration::from_secs(nonce_ttl),
             registration_ttl: Duration::from_secs(registration_ttl),

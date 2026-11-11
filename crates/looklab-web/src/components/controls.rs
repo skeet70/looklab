@@ -14,6 +14,7 @@ use web_sys::{File, HtmlInputElement};
 
 static NEXT_TABS_ID: AtomicUsize = AtomicUsize::new(0);
 static NEXT_CAMERA_ID: AtomicUsize = AtomicUsize::new(0);
+static NEXT_STEPPER_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CameraOptionIndex(usize);
@@ -360,8 +361,9 @@ pub fn CameraPicker(
                 let plan = looklab_wasm::inspect_files(&[(file.name(), bytes)]).map_err(|_| "Could not read camera information. Choose your camera by name.".to_owned())?;
                 let fact = plan.facts.first().ok_or_else(|| "No camera information found. Choose your camera by name.".to_owned())?;
                 let (Some(make), Some(model)) = (&fact.make, &fact.model) else { return Err("No camera information found. Choose your camera by name.".to_owned()); };
-                cameras.with_value(|cameras| cameras.iter().find(|camera| camera.make.eq_ignore_ascii_case(make.trim()) && camera.model.eq_ignore_ascii_case(model.trim())).map(|camera| (camera.id.clone(), format!("Detected {} {}. Nothing was uploaded.", camera.make, camera.model))))
-                    .ok_or_else(|| format!("Detected {make} {model}, which is not listed yet. Choose a supported camera."))
+                let identity = looklab_prep::CameraIdentity::new(make, model);
+                cameras.with_value(|cameras| cameras.iter().find(|camera| identity.as_ref().is_some_and(|identity| identity.matches(&camera.make, &camera.model))).map(|camera| (camera.id.clone(), format!("Detected {} {}. Nothing was uploaded.", camera.make, camera.model))))
+                    .ok_or_else(|| format!("Detected {make} {model}, which is not ready for matching yet. Choose a supported camera."))
             }.await;
             match result {
                 Ok((id, note)) => {
@@ -477,20 +479,21 @@ pub struct WizardStep {
     pub summary: Option<String>,
 }
 
-/// Wizard navigation with completed-step summaries.
 #[component]
 pub fn Stepper(
     steps: Vec<WizardStep>,
     current: RwSignal<StepIndex>,
+    furthest: RwSignal<StepIndex>,
     #[prop(into, default = Signal::derive(|| true))] can_advance: Signal<bool>,
     #[prop(into, default = Signal::derive(|| false))] locked: Signal<bool>,
+    #[prop(into, default = Signal::derive(|| false))] finished: Signal<bool>,
     #[prop(into, default = Signal::derive(Vec::new))] summaries: Signal<Vec<Option<String>>>,
     #[prop(optional)] children: Option<Children>,
     #[prop(optional)] on_finish: Option<Callback<()>>,
     #[prop(default = "Finish".to_owned())] finish_label: String,
 ) -> impl IntoView {
     let count = steps.len();
-    let furthest = RwSignal::new(current.get_untracked());
+    let instance = NEXT_STEPPER_ID.fetch_add(1, Ordering::Relaxed);
     let final_step = Signal::derive(move || current.get().0.saturating_add(1) >= count);
     Effect::new(move |_| {
         let step = current.get();
@@ -500,56 +503,84 @@ pub fn Stepper(
         <div class="stepper">
             <nav aria-label="Progress">
                 <ol>{steps.into_iter().enumerate().map(|(index, step)| {
+                    let title = step.title.clone();
                     let summary = Signal::derive(move || {
                         summaries.with(|summaries| summaries.get(index).cloned().flatten())
                             .or_else(|| step.summary.clone())
                     });
+                    let complete = move || index < furthest.get().0;
+                    let state = move || {
+                        if current.get().0 == index {
+                            "current"
+                        } else if complete() {
+                            "complete"
+                        } else {
+                            "upcoming"
+                        }
+                    };
+                    let marker = Signal::derive(move || {
+                        if complete() { "✓".to_owned() } else { (index + 1).to_string() }
+                    });
+                    let summary_id = format!("stepper-{instance}-step-{index}");
+                    let described_by = summary_id.clone();
                     view! {
-                        <li aria-current=move || (current.get().0 == index).then_some("step")>
+                        <li class="step-item" data-state=state
+                            aria-current=move || { (current.get().0 == index).then_some("step") }>
                             <button
                                 type="button"
+                                class="step-link"
+                                aria-describedby=move || complete().then(|| described_by.clone())
                                 disabled=move || { locked.get() || index > furthest.get().0 }
                                 on:click=move |_| {
                                     if !locked.get_untracked() { current.set(StepIndex(index)); }
                                 }
                             >
-                                {step.title}
+                                <span class="step-marker" aria-hidden="true">{marker}</span>
+                                <span class="step-title">{title}</span>
                             </button>
-                            {move || (index < furthest.get().0).then(|| summary.get()).flatten().map(|summary| view! {
-                                <span class="step-summary">{summary}</span>
+                            {move || complete().then(|| view! {
+                                <span class="step-summary" id=summary_id.clone()>
+                                    <span class="visually-hidden">"Completed. "</span>
+                                    {move || summary.get().unwrap_or_default()}
+                                </span>
                             })}
                         </li>
                     }
                 }).collect_view()}</ol>
             </nav>
             {children.map(|children| children())}
-            <div class="stepper-actions">
-                <button
-                    type="button"
-                    disabled=move || locked.get() || current.get().0 == 0
-                    on:click=move |_| {
-                        if !locked.get_untracked() {
-                            current.update(|step| step.0 = step.0.saturating_sub(1));
+            {move || (!finished.get()).then(|| {
+                let finish_label = finish_label.clone();
+                view! {
+                <div class="stepper-actions">
+                    <button
+                        type="button"
+                        disabled=move || locked.get() || current.get().0 == 0
+                        on:click=move |_| {
+                            if !locked.get_untracked() {
+                                current.update(|step| step.0 = step.0.saturating_sub(1));
+                            }
                         }
-                    }
-                >
-                    "Back"
-                </button>
-                <button type="button" disabled=move || { locked.get() || !can_advance.get() || count == 0 || (final_step.get() && on_finish.is_none()) }
-                    on:click=move |_| {
-                        if locked.get_untracked() { return; }
-                        let next = current.get_untracked().0.saturating_add(1);
-                        if next < count {
-                            current.set(StepIndex(next));
-                        } else if count > 0
-                            && let Some(finish) = on_finish
-                        {
-                            finish.run(());
-                        }
-                    }>
-                    {move || if final_step.get() && on_finish.is_some() { finish_label.clone() } else { "Next".to_owned() }}
-                </button>
-            </div>
+                    >
+                        "Back"
+                    </button>
+                    <button type="button" disabled=move || { locked.get() || !can_advance.get() || count == 0 || (final_step.get() && on_finish.is_none()) }
+                        on:click=move |_| {
+                            if locked.get_untracked() { return; }
+                            let next = current.get_untracked().0.saturating_add(1);
+                            if next < count {
+                                current.set(StepIndex(next));
+                            } else if count > 0
+                                && let Some(finish) = on_finish
+                            {
+                                finish.run(());
+                            }
+                        }>
+                        {move || if final_step.get() && on_finish.is_some() { finish_label.clone() } else { "Next".to_owned() }}
+                    </button>
+                </div>
+                }
+            })}
         </div>
     }
 }
@@ -722,12 +753,14 @@ pub fn DropZone(
             <p>{prompt}</p>
             <input node_ref=files type="file" multiple accept=accept hidden disabled=move || disabled.get()
                 on:change=move |event| { if !disabled.get() { on_files.run(files_from_input(&event)); } }/>
-            <button type="button" disabled=move || disabled.get() on:click=move |_| { if let Some(input) = files.get() { input.click(); } }>"Choose files"</button>
-            {folders.then(|| view! {
-                <input node_ref=directory type="file" multiple prop:webkitdirectory=true hidden disabled=move || disabled.get()
-                    on:change=move |event| { if !disabled.get() { on_files.run(files_from_input(&event)); } }/>
-                <button type="button" disabled=move || disabled.get() on:click=move |_| { if let Some(input) = directory.get() { input.click(); } }>"Choose folder"</button>
-            })}
+            <div class="field-row">
+                <button type="button" disabled=move || disabled.get() on:click=move |_| { if let Some(input) = files.get() { input.click(); } }>"Choose files"</button>
+                {folders.then(|| view! {
+                    <input node_ref=directory type="file" multiple prop:webkitdirectory=true hidden disabled=move || disabled.get()
+                        on:change=move |event| { if !disabled.get() { on_files.run(files_from_input(&event)); } }/>
+                    <button type="button" disabled=move || disabled.get() on:click=move |_| { if let Some(input) = directory.get() { input.click(); } }>"Choose folder"</button>
+                })}
+            </div>
             {move || error.get().map(|error| view! { <p role="alert">{error}</p> })}
         </section>
     }

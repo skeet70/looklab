@@ -121,6 +121,21 @@ impl Rational {
         self.num == 0
     }
 
+    pub fn checked_sub(&self, other: &Self) -> Option<Self> {
+        let num = (self.num as i128)
+            .checked_mul(other.den as i128)?
+            .checked_sub((other.num as i128).checked_mul(self.den as i128)?)?;
+        let den = (self.den as u128).checked_mul(other.den as u128)?;
+        let divisor = gcd(num.unsigned_abs(), den);
+        let magnitude = i64::try_from(num.unsigned_abs() / divisor).ok()?;
+        let num = if num.is_negative() {
+            -magnitude
+        } else {
+            magnitude
+        };
+        Self::new(num, u64::try_from(den / divisor).ok()?).ok()
+    }
+
     pub fn div_exact(&self, divisor: &Self) -> Option<i64> {
         if divisor.num == 0 {
             return None;

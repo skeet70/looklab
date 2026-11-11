@@ -5,6 +5,8 @@
 pub enum WorkerError {
     #[error("database: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("model store: {0}")]
+    ModelStore(#[from] looklab_server::model_store::StoreError),
     #[error("database: {0}")]
     Open(#[from] looklab_server::DbError),
     #[error("json: {0}")]
@@ -37,10 +39,14 @@ pub enum WorkerError {
     Admin(#[from] looklab_server::admin::AdminError),
     #[error("data: {0}")]
     Data(String),
+    #[error("{}: a body input transform is required", path.display())]
+    TransformUnavailable { path: std::path::PathBuf },
     #[error(
         "release {version} predates the relative exposure gauge; a moderator-approved audited re-anchor and refit is required"
     )]
     MigrationRequired { version: u32 },
+    #[error("{look} {version} has no recoverable release provenance")]
+    MissingProvenance { look: String, version: u32 },
     #[error("job: {0}")]
     Job(String),
 }
@@ -49,8 +55,23 @@ impl WorkerError {
     /// True when retrying cannot change the outcome.
     pub fn permanent(&self) -> bool {
         match self {
-            Self::Data(_) | Self::Job(_) | Self::MigrationRequired { .. } | Self::Lut(_) => true,
+            Self::Data(_)
+            | Self::Job(_)
+            | Self::MigrationRequired { .. }
+            | Self::MissingProvenance { .. }
+            | Self::Lut(_)
+            | Self::TransformUnavailable { .. } => true,
             Self::Admin(error) => !matches!(error, looklab_server::admin::AdminError::Database(_)),
+            Self::ModelStore(error) => matches!(
+                error,
+                looklab_server::model_store::StoreError::InvalidInput(_)
+                    | looklab_server::model_store::StoreError::Value(_)
+                    | looklab_server::model_store::StoreError::Report(_)
+                    | looklab_server::model_store::StoreError::UnknownFamilyTarget(_)
+                    | looklab_server::model_store::StoreError::SchemaBodyMismatch { .. }
+                    | looklab_server::model_store::StoreError::UnknownEpoch { .. }
+                    | looklab_server::model_store::StoreError::UnknownNativeSim { .. }
+            ),
             _ => false,
         }
     }

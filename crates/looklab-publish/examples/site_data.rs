@@ -26,10 +26,11 @@ use looklab_publish::{
     BodyPage, BodyUse, CARD_ARTIFACT, ConformanceEntry, CredentialRef, CredentialTier,
     DOCUMENT_ARTIFACT, Decision, ExcludedSim, GateCheck, GateSummary, InputTransformPage,
     LicensePage, LookListing, LookPage, LookRef, LookStatus, LookVersionPage, MatchBundle,
-    MatchSim, PREVIEW_LUT_ARTIFACT, ProposalRef, ProvenanceSummary, RealizationNote, Role, Scene,
-    SimExclusion, SiteData, SitePath, Timestamp, TransformSource, VersionNotes, VersionRef,
-    WeakSpot, bake_lut, bake_preview_lut, body_artifact, bundle_artifact, sim_artifacts,
-    transform_artifact, write_conformance_pack, write_site,
+    MatchSim, PREVIEW_LUT_ARTIFACT, PreparationPage, ProposalRef, ProvenanceSummary,
+    RealizationNote, Role, SYNTHETIC_SAMPLE_GATE, Scene, SimExclusion, SiteData, SitePath,
+    Timestamp, TransformSource, VersionNotes, VersionRef, WeakSpot, bake_lut, bake_preview_lut,
+    body_artifact, bundle_artifact, sim_artifacts, transform_artifact, write_conformance_pack,
+    write_site,
 };
 use looklab_report::compare::{ComparisonInput, FunctionName, compare};
 use looklab_schema::{BodyId, SimKey, validate_body, validate_control_schema};
@@ -141,9 +142,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let site = SiteData {
         community_snapshot_version: 0,
         bodies,
+        manuals: Vec::new(),
+        interfaces: Vec::new(),
+        input_transforms: Vec::new(),
         looks,
         audit_log: AuditLog::new(audit),
         scenes: canonical_scenes()?,
+        reports: Vec::new(),
+        eligibility: Vec::new(),
+        current: Vec::new(),
+        bundles: Vec::new(),
         reference_preview: Some(ArtifactBlob::new(
             ArtifactName::new("neutral.lut33")?,
             bake_lut(&Look::colorimetric(), |xyz| xyz),
@@ -215,6 +223,7 @@ fn source_body() -> Result<BodyPage, Box<dyn Error>> {
     let schema = validate_control_schema(include_str!("../../../data/bodies/fujifilm-x-t5.yaml"))
         .map_err(|errors| format!("schema: {errors:?}"))?;
     let extras = BodyExtras {
+        preparation: PreparationPage::ready(),
         input_transform: Some(InputTransformPage {
             version: 7,
             source: TransformSource::Chart,
@@ -246,6 +255,7 @@ fn fixture_body() -> Result<BodyPage, Box<dyn Error>> {
     let schema = validate_control_schema(&controls)
         .map_err(|errors| format!("fixture schema: {errors:?}"))?;
     let extras = BodyExtras {
+        preparation: PreparationPage::ready(),
         input_transform: None,
         realization_notes: vec![RealizationNote {
             epoch: None,
@@ -377,6 +387,7 @@ fn community_look(dir: &Path, spec: CommunityLookSpec<'_>) -> Result<LookPage, B
             attribution: DONOR_ATTRIBUTION.to_owned(),
         },
         encoding,
+        declared_base: None,
         output: OutputEncoding::Srgb,
         lut: LutRecord {
             size: lut.size,
@@ -413,7 +424,7 @@ fn community_look(dir: &Path, spec: CommunityLookSpec<'_>) -> Result<LookPage, B
         artifacts.push(ArtifactBlob::new(ArtifactName::new(CARD_ARTIFACT)?, card));
     }
     let p95 = imported.approximation.p95;
-    let approximation_ok = p95.is_finite() && p95 <= 1.0;
+    let approximation_ok = looklab_export::approximation_publishable(&imported.approximation);
     let mut checks = vec![
         GateCheck {
             name: "license declaration".to_owned(),
@@ -488,6 +499,8 @@ fn community_look(dir: &Path, spec: CommunityLookSpec<'_>) -> Result<LookPage, B
         }),
         listing: LookListing::Listed,
         superseded_by: None,
+        head: None,
+        selected: None,
         versions: vec![version],
     })
 }
@@ -534,7 +547,7 @@ fn synthetic_looks(bodies: &[BodyPage]) -> Result<Vec<LookPage>, Box<dyn Error>>
             SyntheticLook::NeutralStudio,
             CoverageGap::SaturatedReds,
             "Red highlights reach the soft clip earlier than the source scene.",
-            Some("This version was produced by a revert to an earlier fit; the excluded credential is listed in the audit log.".to_owned()),
+            Some("This version was produced by a revert to an earlier fit; the rejected contributions are listed in the audit log.".to_owned()),
         ),
     ];
     let mut looks = Vec::new();
@@ -611,7 +624,7 @@ fn synthetic_looks(bodies: &[BodyPage]) -> Result<Vec<LookPage>, Box<dyn Error>>
         artifacts.extend(sample_match_artifacts(&document, bodies)?);
         let mut gate_summary = gates()?;
         gate_summary.checks.push(GateCheck {
-            name: "Sample settings models".into(),
+            name: SYNTHETIC_SAMPLE_GATE.into(),
             passed: true,
             detail: Some("Synthetic camera response data for UI demonstrations, not measured camera recipes.".into()),
         });
@@ -650,6 +663,8 @@ fn synthetic_looks(bodies: &[BodyPage]) -> Result<Vec<LookPage>, Box<dyn Error>>
             }),
             listing: LookListing::Listed,
             superseded_by: None,
+            head: None,
+            selected: None,
             versions: vec![version],
         });
     }
@@ -733,6 +748,10 @@ fn sample_match_artifacts(
                     base: names.base,
                     crm: names.crm,
                     covariance: Some(names.covariance),
+                    realization: None,
+                    target: None,
+                    scope: None,
+                    artifacts: Vec::new(),
                 });
             }
             let bundle = MatchBundle::new(body.clone(), epoch.id, sims, excluded)?;

@@ -21,11 +21,15 @@ pub mod state;
 pub mod weight;
 
 pub use bounty::{
-    Attribution, Bounty, BountyReason, BountyStatus, BountyTarget, BountyVerification,
-    EpochOrdinal, JacobianDirections, ModelVersions, RecipeKey, RecipeLeaderboard,
-    RecipePrediction, RecipeScore, RegionResidual, RegionUncertainty, ResidualObservation,
-    VerifiedRecipe, analyze_residuals, leaderboards, rank_bounties, region_uncertainties,
-    resolution_status, resolve_bounty, score_recipe,
+    Attribution, AttributionEvidence, AttributionResponse, Bounty, BountyReason, BountyStatus,
+    BountyTarget, BountyVerification, ColourCondition, ConditionWeight, ConditionalCellMoment,
+    DeclaredCondition, EpochOrdinal, JointResidualCovariance, ModelVersions, REACHABILITY_DELTA_E,
+    Reachability, ReachabilityClaim, ReachabilityPoint, ReachabilityWitness, RecipeKey,
+    RecipeLeaderboard, RecipePrediction, RecipeScore, RecipeSource, RegionConditionScope,
+    RegionResidual, RegionUncertainty, RegionalSigma, ResidualObservation, VerifiedRecipe,
+    analyze_conditional_cells, analyze_residuals, leaderboards, parse_scoring_metric,
+    rank_bounties, reachability_from_witness, region_uncertainties, resolution_status,
+    resolve_bounty, score_recipe, scoring_metric_name, unreachable_from_bound,
 };
 pub use error::{Result, TrustError};
 pub use evidence::{EvidenceGrid, coverage_gain, evidence};
@@ -36,11 +40,16 @@ pub use gates::{
     convert_exposure_gauge, exposure_gauge_excluded, gate_release,
 };
 pub use ids::{
-    ArtifactHash, CredentialId, EffectiveContributorId, ImageRef, SerialLink, SerialReuse,
-    VersionId, resolve_effective_contributors, serial_reuse,
+    ArtifactHash, ContributionId, CredentialId, EffectiveContributorId, ImageRef, SerialLink,
+    SerialReuse, VersionId, resolve_effective_contributors, serial_reuse,
 };
+pub use looklab_model::{OutputContext, OutputPin};
+pub use looklab_schema::{AssessmentStatus, ScoringMetric};
 pub use params::TrustParams;
-pub use region::{EXPOSURE_CELLS, EXPOSURE_MAX, EXPOSURE_MIN, HUE_CELLS, Region, RegionCoverage};
+pub use region::{
+    EXPOSURE_CELLS, EXPOSURE_MAX, EXPOSURE_MIN, HUE_CELLS, NEUTRAL_CHROMA, Region, RegionCoverage,
+    SceneCell,
+};
 pub use reputation::{
     REPUTATION_MAX, REPUTATION_MIN, REPUTATION_NEUTRAL, Reputation, ReputationUpdate,
 };

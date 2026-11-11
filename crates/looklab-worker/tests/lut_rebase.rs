@@ -5,7 +5,8 @@ use looklab_export::{CubeFile, Lut3d, LutLookOptions, import_lut_look};
 use looklab_model::file::{BaseReference, BaseStatus, LookVersion, Slug};
 #[cfg(feature = "integration")]
 use looklab_model::file::{
-    CameraRendering, DeclaredEncoding, DynamicRange, LicenseRecord, LutDefinition, OutputEncoding,
+    BodyProvenance, CameraRendering, DeclaredEncoding, DynamicRange, LicenseRecord, LutDefinition,
+    OutputEncoding, Provenance, RootProvenance,
 };
 #[cfg(feature = "integration")]
 use looklab_model::{
@@ -34,6 +35,12 @@ const BASE: &str = "classic-chrome";
 #[cfg(feature = "integration")]
 const RENDERING: &str = "Classic Chrome";
 
+/// Jobs one fixture queue may run before it must settle.
+#[cfg(feature = "integration")]
+const DRAIN_JOBS: usize = 64;
+#[cfg(feature = "integration")]
+const DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(900);
+
 struct Fixture {
     _dir: TempDir,
     worker: Worker,
@@ -45,6 +52,7 @@ async fn fixture() -> Fixture {
     let mut config =
         WorkerConfig::new(dir.path().join("looklab.sqlite3"), dir.path().join("blobs"));
     config.data = data;
+    config.snapshot_dir = config.data.join("community");
     config.site = dir.path().join("site");
     config.transforms = dir.path().join("transforms");
     std::fs::create_dir_all(&config.transforms).expect("transform dir");
@@ -123,6 +131,7 @@ fn lut_document(
             attribution: "donor".to_owned(),
         },
         encoding: DeclaredEncoding::DisplayReferred { base, status },
+        declared_base: None,
         output: OutputEncoding::Srgb,
         lut: lut.record(),
         emulates: None,
@@ -161,6 +170,7 @@ fn pending_family_lut() -> LookDocument {
             base: family(RENDERING, None),
             status: BaseStatus::BaseIdentifiedUnmeasured,
         },
+        declared_base: None,
         output: OutputEncoding::Srgb,
         lut: lut.record(),
         emulates: None,
@@ -262,21 +272,78 @@ async fn publish(worker: &Worker, slug: &str, version: u32, document: &LookDocum
     looklab_worker::lut_rebase::record_lut_pin(worker.pool(), &look, version, document)
         .await
         .expect("pin");
+    let mut document = document.clone();
+    let base = document.file.provenance.base.clone();
+    document.file.provenance = Provenance {
+        bodies: vec![BodyProvenance {
+            body: "fujifilm/x-t5".to_owned(),
+            epoch_map_version: 0,
+            epochs: vec![1],
+            input_transform_version: 1,
+            realization_params_version: 0,
+            control_response_version: 1,
+            clip_k: document.look.clip.k,
+            images: 1,
+            credentials: 1,
+        }],
+        root: RootProvenance {
+            admissions: Vec::new(),
+            anchor_version: format!("{version}.0.0"),
+        },
+        base,
+        needs_rebase: false,
+        community_snapshot_version: 7,
+        prep_versions: vec![1],
+        created: "2026-01-01T00:00:00Z".to_owned(),
+        software: "looklab-worker test".to_owned(),
+    };
     let bytes = document.encode().expect("encode");
     let sha256 = hex(&Sha256::digest(&bytes));
     std::fs::write(worker.config().blobs.join(&sha256), &bytes).expect("blob");
+    looklab_worker::lut_rebase::record_lut_pin(worker.pool(), &look, version, &document)
+        .await
+        .expect("pin");
     admin::write_version_manifest(
         worker.pool(),
         &look,
         VersionId::new(version),
+        admin::VersionStatus::Published,
         &[ManifestArtifact {
             name: "look.looklab".to_owned(),
-            sha256,
+            sha256: sha256.clone(),
         }],
         &[],
     )
     .await
     .expect("manifest");
+    let basis = match document.file.look.kind {
+        LookKind::NativeFamily => looklab_schema::TargetBasis::NativeFamily,
+        LookKind::LutDefined => looklab_schema::TargetBasis::LutComposition,
+    };
+    let mut conn = worker.pool().acquire().await.expect("connection");
+    looklab_server::model_store::record_target_eligibility(
+        &mut conn,
+        &looklab_schema::TargetEligibility {
+            id: looklab_schema::EligibilitySnapshotId::from_digest([0; 32]),
+            target: looklab_schema::PublishedTargetId {
+                look: looklab_schema::LookId::new(look.as_str()).expect("look id"),
+                version: looklab_schema::TargetVersion::new(version).expect("version"),
+            },
+            basis,
+            artifacts: vec![looklab_schema::ArtifactBinding {
+                sha256: looklab_schema::Sha256Hex::parse(&sha256).expect("digest"),
+                role: looklab_schema::ArtifactRole::Look,
+            }],
+            base_pin: None,
+            support_uncertainty_source: None,
+            status: looklab_schema::TargetEligibilityStatus::Eligible,
+            reasons: Vec::new(),
+            dependencies: Vec::new(),
+        },
+        looklab_worker::clock::now_unix(),
+    )
+    .await
+    .expect("eligibility");
 }
 
 #[cfg(feature = "integration")]
@@ -319,6 +386,7 @@ fn broken_lut_document(slug: &str) -> LookDocument {
             base: family(RENDERING, None),
             status: BaseStatus::BaseIdentifiedUnmeasured,
         },
+        declared_base: None,
         output: OutputEncoding::Srgb,
         lut: lut.record(),
         emulates: None,
@@ -333,7 +401,7 @@ fn broken_lut_document(slug: &str) -> LookDocument {
 
 #[cfg(feature = "integration")]
 async fn drain(worker: &Worker) {
-    loop {
+    for _ in 0..DRAIN_JOBS {
         sqlx::query("DELETE FROM jobs WHERE kind = 'publish_site' AND status = 'queued'")
             .execute(worker.pool())
             .await
@@ -344,11 +412,12 @@ async fn drain(worker: &Worker) {
             Err(error) => panic!("job failed: {error}"),
         }
     }
+    panic!("queue did not settle after {DRAIN_JOBS} jobs");
 }
 
 #[cfg(feature = "integration")]
 async fn drain_fails(worker: &Worker) -> bool {
-    loop {
+    for _ in 0..DRAIN_JOBS {
         sqlx::query("DELETE FROM jobs WHERE kind = 'publish_site' AND status = 'queued'")
             .execute(worker.pool())
             .await
@@ -359,6 +428,7 @@ async fn drain_fails(worker: &Worker) -> bool {
             Err(_) => return true,
         }
     }
+    panic!("queue did not settle after {DRAIN_JOBS} jobs");
 }
 
 #[cfg(feature = "integration")]
@@ -388,6 +458,36 @@ async fn established() -> Fixture {
         "no pending work after publishing the source and base"
     );
     drain(&fixture.worker).await;
+    if looklab_worker::db::manifest_artifacts(fixture.worker.pool(), LUT, 2)
+        .await
+        .expect("manifest check")
+        .is_none()
+    {
+        let pending = admin::pending_lut_rebases(fixture.worker.pool())
+            .await
+            .expect("pending");
+        let gate = looklab_worker::db::gate_failure_pending(fixture.worker.pool(), LUT, 2)
+            .await
+            .expect("gate");
+        let pin = admin::lut_base_pin(fixture.worker.pool(), &look_slug(LUT), 1)
+            .await
+            .expect("pin");
+        let renderings: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM lut_native_renderings WHERE look = ?")
+                .bind(BASE)
+                .fetch_one(fixture.worker.pool())
+                .await
+                .expect("renderings");
+        let jobs: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, attempts FROM jobs WHERE kind = 'lut_rebase' ORDER BY created_at",
+        )
+        .fetch_all(fixture.worker.pool())
+        .await
+        .expect("jobs");
+        panic!(
+            "LUT v2 missing after established: pending={pending:?} gate={gate} pin={pin:?} base_renderings={renderings} jobs={jobs:?}"
+        );
+    }
     fixture
 }
 
@@ -596,6 +696,8 @@ async fn a_later_base_version_creates_a_candidate_without_touching_old_bytes() {
         serde_json::from_slice(&artifact(&fixture.worker, LUT, 3, "release.json").await)
             .expect("release");
     assert_eq!(release["anchor"], 1);
+    assert_eq!(release["provenance"]["community_snapshot_version"], 7);
+    assert_eq!(document.file.provenance.community_snapshot_version, 7);
 }
 
 #[tokio::test]
@@ -762,6 +864,10 @@ async fn revoked_ancestry_keeps_dependents_blocked() {
     )
     .await
     .expect("revocation");
+    sqlx::query("DELETE FROM jobs WHERE kind = 'nightly_refit' AND status = 'queued'")
+        .execute(fixture.worker.pool())
+        .await
+        .expect("clear nightly refit");
     drain(&fixture.worker).await;
 
     assert!(
@@ -908,7 +1014,13 @@ async fn a_committed_candidate_requests_publication_before_later_failures() {
     publish(&fixture.worker, BASE, 1, &base).await;
     publish(&fixture.worker, BASE, 2, &native("2.0.0", 0.005)).await;
 
-    assert!(fixture.worker.run_until_idle().await.is_err());
+    assert!(
+        fixture
+            .worker
+            .run_until_idle_bounded(DRAIN_JOBS, DRAIN_DEADLINE)
+            .await
+            .is_err()
+    );
     assert!(published(&fixture.worker, LUT, 2).await.is_matchable());
     let queued: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM jobs WHERE kind = 'publish_site' AND status = 'queued'",

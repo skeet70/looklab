@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Browser checks: worker round trip, match/permalink, contribute upload with HAR, page screenshots.
 
-import { copyFile, link, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, cp, link, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -22,6 +22,7 @@ const USAGE = `usage: node site/checks/e2e.mjs [options]
   --out DIR                    artifact directory (default /tmp/looklab-e2e)
   --state DIR                  stub server state, must match --state (default /tmp/looklab-stub-state)
   --raw FILE --jpeg FILE       the contribution files
+  --extra FILE                 one more file in the drop (repeatable)
   --body ID --firmware V --sim KEY
   --controls "key=step,..."    control steps, comma separated
   --fail-draft-blobs 1         make IndexedDB Blob writes throw, to check the
@@ -56,6 +57,7 @@ const options = {
   state: '/tmp/looklab-stub-state',
   raw: 'fixtures/cache/fujifilm-x-s10.raf',
   jpeg: 'fixtures/generated/fujifilm-x-s10.jpg',
+  extra: [],
   body: 'fujifilm/x-s10',
   firmware: '1.00',
   sim: 'provia',
@@ -86,7 +88,9 @@ for (let index = 2; index < process.argv.length; index += 1) {
     ? Number(value)
     : key === 'fail-draft-blobs'
       ? value === '1' || value === 'true'
-      : value;
+      : key === 'extra'
+        ? [...options.extra, value]
+        : value;
 }
 
 const playwrightModule = process.env.PLAYWRIGHT_MODULE;
@@ -112,6 +116,59 @@ function check(condition, message) {
     throw new Error(message);
   }
   console.log(`ok ${message}`);
+}
+
+/// A copy of the fixture JPEG whose Fujifilm makernote sets `tag` to `value`.
+async function renderWithTag(name, tag, value) {
+  const path = `${options.out}/${name}.jpg`;
+  const bytes = await readFile(options.jpeg);
+  let index = 2;
+  let tiffStart = -1;
+  while (index + 4 <= bytes.length) {
+    if (bytes[index] !== 0xff) break;
+    const marker = bytes[index + 1];
+    if (marker === 0xda || marker === 0xd9) break;
+    const length = bytes.readUInt16BE(index + 2);
+    if (marker === 0xe1 && bytes.toString('latin1', index + 4, index + 10) === 'Exif\0\0') {
+      tiffStart = index + 10;
+      break;
+    }
+    index += 2 + length;
+  }
+  if (tiffStart < 0) throw new Error('the fixture JPEG has no EXIF segment');
+  const patched = Buffer.from(bytes);
+  const little = patched.toString('latin1', tiffStart, tiffStart + 2) === 'II';
+  const u16 = (at) => (little ? patched.readUInt16LE(at) : patched.readUInt16BE(at));
+  const u32 = (at) => (little ? patched.readUInt32LE(at) : patched.readUInt32BE(at));
+  const ifd0 = tiffStart + u32(tiffStart + 4);
+  const count0 = u16(ifd0);
+  let exifIfd = null;
+  for (let entry = 0; entry < count0; entry += 1) {
+    const at = ifd0 + 2 + entry * 12;
+    if (u16(at) === 0x8769) exifIfd = tiffStart + u32(at + 8);
+  }
+  const ifd = exifIfd ?? ifd0;
+  const count = u16(ifd);
+  for (let entry = 0; entry < count; entry += 1) {
+    const at = ifd + 2 + entry * 12;
+    if (u16(at) !== 0x927c || u16(at + 2) !== 7) continue;
+    const note = tiffStart + u32(at + 8);
+    if (patched.toString('latin1', note, note + 8) !== 'FUJIFILM') {
+      throw new Error('the MakerNote is not Fujifilm');
+    }
+    const startOf = patched.readUInt32LE(note + 8);
+    const entries = patched.readUInt16LE(note + startOf);
+    for (let field = 0; field < entries; field += 1) {
+      const fieldAt = note + startOf + 2 + field * 12;
+      if (patched.readUInt16LE(fieldAt) !== tag) continue;
+      if (little) patched.writeUInt16LE(value, fieldAt + 8);
+      else patched.writeUInt16BE(value, fieldAt + 8);
+      await writeFile(path, patched);
+      return path;
+    }
+    throw new Error(`the Fujifilm makernote has no tag ${tag.toString(16)}`);
+  }
+  throw new Error('the EXIF has no MakerNote');
 }
 
 async function addVirtualAuthenticator(page) {
@@ -156,6 +213,15 @@ async function open(viewport, harPath) {
       : {}),
   });
   const page = await context.newPage();
+  await page.addInitScript(() => {
+    window.__looklabWebauthnGets = 0;
+    const proto = CredentialsContainer.prototype;
+    const get = proto.get;
+    proto.get = function (...args) {
+      window.__looklabWebauthnGets = (window.__looklabWebauthnGets ?? 0) + 1;
+      return get.apply(this, args);
+    };
+  });
   if (options['fail-draft-blobs']) {
     await page.addInitScript(() => {
       const put = IDBObjectStore.prototype.put;
@@ -177,18 +243,24 @@ async function open(viewport, harPath) {
     }
     const data = request.postDataBuffer();
     if (data) {
-      bodies.set(`${request.method()} ${request.url()}`, data.toString('base64'));
+      const key = `${request.method()} ${request.url()}`;
+      const list = bodies.get(key) ?? [];
+      list.push(data.toString('base64'));
+      bodies.set(key, list);
     }
   });
   const problems = [];
+  const expectedMissingResources = new Set();
   page.on('pageerror', (error) => problems.push(String(error)));
   page.on('console', (message) => {
-    if (message.type() === 'error') {
-      problems.push(message.text());
+    const expectedNetworkFailure = expectedMissingResources.has(message.location().url) && message.args().length === 0;
+    if (message.type() === 'error' && !expectedNetworkFailure) {
+      const detail = `${message.text()} (${message.location().url})`;
+      problems.push(detail.replace(/(\/status\/)[A-Za-z0-9_-]+(?:\.rss)?/g, '$1[private]'));
     }
   });
   const authenticator = await addVirtualAuthenticator(page);
-  return { browser, context, page, problems, bodies, authenticator };
+  return { browser, context, page, problems, bodies, authenticator, expectedMissingResources };
 }
 
 async function close(session) {
@@ -354,8 +426,8 @@ async function contribute(size) {
     const catalog = await (await page.request.get(`${options.origin}/data/index.json`)).json();
     const wantedLook = catalog.looks.find(look => look.visibility !== 'test_fixture');
     const wantedCamera = catalog.bodies.find(camera => camera.kind === 'camera');
-    check(Boolean(wantedLook && wantedCamera), `${size}: wanted-shot fixture uses published names`);
-    const wantedBounties = [0.01, 0.1, 0.5, 0.9].map((reduction, index) => ({
+    check(Boolean(wantedCamera), `${size}: wanted-shot fixture uses a published camera`);
+    const wantedBounties = wantedLook ? [0.01, 0.1, 0.5, 0.9].map((reduction, index) => ({
       look: wantedLook.slug,
       look_version: 1,
       body: wantedCamera.id,
@@ -363,7 +435,7 @@ async function contribute(size) {
       expected_variance_reduction: reduction,
       reason: { kind: 'unverified_region', sigma: 0.2 },
       status: 'open',
-    }));
+    })) : [];
     await page.route('**/bounties.json', route => route.fulfill({ json: { bounties: wantedBounties } }));
     const guideNames = [
       'Share photos you already have',
@@ -381,9 +453,14 @@ async function contribute(size) {
       await dialog.waitFor();
       check(await dialog.getByRole('list').first().getByRole('listitem').count() >= 3, `${size}: ${name} has numbered guidance`);
       if (index === 1) {
-        await dialog.getByRole('article').nth(2).waitFor();
-        check(await dialog.getByRole('article').count() === 3, `${size}: wanted guide shows the top three requests`);
-        check(await dialog.getByRole('article').first().textContent().then(text => text.includes(wantedLook.name) && text.includes(`${wantedCamera.make} ${wantedCamera.model}`)), `${size}: wanted guide shows published look and camera names`);
+        if (wantedLook) {
+          await dialog.getByRole('article').nth(2).waitFor();
+          check(await dialog.getByRole('article').count() === 3, `${size}: wanted guide shows the top three requests`);
+          check(await dialog.getByRole('article').first().textContent().then(text => text.includes(wantedLook.name) && text.includes(`${wantedCamera.make} ${wantedCamera.model}`)), `${size}: wanted guide shows published look and camera names`);
+        } else {
+          await dialog.getByRole('heading', { name: 'No wanted shots right now', exact: true }).waitFor();
+          check(await dialog.getByRole('article').count() === 0, `${size}: a catalog without looks has no wanted-shot requests`);
+        }
       }
       if (index === 3) {
         const { createHash } = await import('node:crypto');
@@ -438,9 +515,41 @@ async function contribute(size) {
       page.waitForEvent('filechooser'),
       page.getByRole('dialog', { name: guideNames[0], exact: true }).getByRole('button', { name: 'Choose photos', exact: true }).click(),
     ]);
-    await chooser.setFiles([options.raw, options.jpeg]);
+    const velvia = await renderWithTag('render-velvia', 0x1401, 0x0200);
+    const acros = await renderWithTag('render-acros', 0x1003, 0x0500);
+    const acrosYellow = await renderWithTag('render-acros-ye', 0x1003, 0x0502);
+    const sepia = await renderWithTag('render-sepia', 0x1003, 0x0310);
+    const dropped = [
+      options.raw,
+      options.jpeg,
+      velvia,
+      acros,
+      acrosYellow,
+      sepia,
+      ...options.extra,
+    ];
+    summary.files = [
+      options.raw,
+      options.jpeg,
+      velvia,
+      acros,
+      acrosYellow,
+      sepia,
+    ];
+    await chooser.setFiles(dropped);
     await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).waitFor({ timeout: 120_000 });
     await capture('contribute-1-drop');
+    const stepItems = page.locator('.stepper .step-item');
+    check(await stepItems.count() === 6, `${size}: the stepper lists six steps`);
+    check(await stepItems.first().getAttribute('data-state') === 'complete', `${size}: the drop step is marked complete`);
+    check(await stepItems.nth(1).getAttribute('aria-current') === 'step', `${size}: the current step carries aria-current="step"`);
+    check(await stepItems.nth(2).getAttribute('data-state') === 'upcoming', `${size}: later steps are marked upcoming`);
+    const firstSummary = (await stepItems.first().locator('.step-summary').textContent()).trim();
+    const pairCount = Number((await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).textContent()).trim().split(' ')[0]);
+    check(firstSummary.includes(`${pairCount} ${pairCount === 1 ? 'pair' : 'pairs'}`), `${size}: a completed step keeps its summary (${JSON.stringify(firstSummary)})`);
+    const describedBy = await stepItems.first().locator('.step-link').getAttribute('aria-describedby');
+    check(Boolean(describedBy) && await page.locator(`#${describedBy}`).count() === 1, `${size}: a completed step is described by its summary`);
+    check(await stepItems.nth(2).locator('.step-summary').count() === 0, `${size}: an upcoming step has no summary`);
     if (options['fail-draft-blobs']) {
       await page.getByText("This browser couldn't keep a local draft").waitFor({ timeout: 30_000 });
     }
@@ -450,6 +559,9 @@ async function contribute(size) {
     }
     summary.draft_unavailable = draftUnavailable;
 
+    await page.locator('.batch-choice').filter({
+      has: page.locator('.batch-choice-title', { hasText: /^Batch \d+: \d+ photos, Provia$/ }),
+    }).click();
     await page.fill('#body-id', options.body);
     await page.fill('#firmware', options.firmware);
     await page.fill('#sim', options.sim);
@@ -463,15 +575,98 @@ async function contribute(size) {
     }
     await page.click('summary:has-text("Processing options")');
     await page.selectOption('#workers', String(options.workers));
+    const declarations = new Set();
+    for (const [label, filter] of [['Acros', 'none'], ['Acros Ye', 'yellow'], ['Sepia', 'toning']]) {
+      const batch = page.locator('.batch-choice').filter({
+        has: page.locator('.batch-choice-title', {
+          hasText: new RegExp(`^Batch \\d+: \\d+ photos, ${label}$`),
+        }),
+      });
+      await batch.waitFor();
+      await batch.click();
+      const optIn = page.getByRole('checkbox', { name: 'Contribute these B&W renders for monochrome model development' });
+      await optIn.waitFor();
+      check(!(await optIn.isChecked()), `${size}: ${label} B&W opt-in starts unchecked`);
+      const promise = await page.locator('.monochrome-opt-in').innerText();
+      check(
+        promise.includes('180 days') && promise.includes('withdraw') && promise.includes('No published Look is promised'),
+        `${size}: ${label} opt-in states purpose, retention, withdrawal and no Look promise`,
+      );
+      check(
+        (await page.locator('.batch-editor').innerText()).includes('Normalized family:'),
+        `${size}: ${label} shows the normalized family beside the native sim`,
+      );
+      if (filter === 'yellow') {
+        check(
+          (await page.locator('.batch-editor').innerText()).includes('Normalized monochrome filter: Yellow'),
+          `${size}: Acros Ye keeps its normalized filter`,
+        );
+      }
+      const unmappedLabels = page.locator('.unmapped-controls .menu-setting');
+      for (let index = 0; index < await unmappedLabels.count(); index += 1) {
+        const field = unmappedLabels.nth(index);
+        const key = (await field.textContent()).trim().replaceAll(' ', '_');
+        await field.locator('input').fill('0');
+        declarations.add(key);
+      }
+    }
+    await page.getByRole('button', { name: 'Process locally', exact: true }).click();
+    await page.getByRole('heading', { name: /Review what/ }).waitFor({ timeout: 900_000 });
+    check((await page.locator('.payload-summary').textContent()).includes('from 2 photos'), `${size}: preparation leaves out B&W without consent`);
+    await page.getByRole('button', { name: 'Continue to send', exact: true }).click();
+    const progress = page.getByRole('navigation', { name: 'Progress' });
+    await progress.getByRole('button', { name: 'Check groups', exact: true }).click();
+    for (const label of ['Acros', 'Acros Ye', 'Sepia']) {
+      await page.locator('.batch-choice').filter({
+        has: page.locator('.batch-choice-title', {
+          hasText: new RegExp(`^Batch \\d+: \\d+ photos, ${label}$`),
+        }),
+      }).click();
+      await page.getByRole('checkbox', {
+        name: 'Contribute these B&W renders for monochrome model development',
+      }).check();
+    }
+    await capture('contribute-consent-changed');
+    check(await progress.getByRole('button', { name: 'Review', exact: true }).isDisabled(), `${size}: changed B&W selection requires fresh preparation before review`);
+    check(await progress.getByRole('button', { name: 'Send', exact: true }).isDisabled(), `${size}: changed B&W selection cannot reuse the previous send step`);
+    if (!draftUnavailable) {
+      await page.getByRole('link', { name: 'looklab', exact: true }).click();
+      await page.waitForURL((url) => url.pathname === '/');
+      await page.goto(`${options.origin}/contribute`);
+      await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).waitFor({ timeout: 30_000 });
+      check(await progress.getByRole('button', { name: 'Review', exact: true }).isDisabled(), `${size}: a restored changed selection still needs preparation`);
+      for (const label of ['Acros', 'Acros Ye', 'Sepia']) {
+        await page.locator('.batch-choice').filter({
+          has: page.locator('.batch-choice-title', {
+            hasText: new RegExp(`^Batch \\d+: \\d+ photos, ${label}$`),
+          }),
+        }).click();
+        check(await page.getByRole('checkbox', {
+          name: 'Contribute these B&W renders for monochrome model development',
+        }).isChecked(), `${size}: ${label} consent survives draft restoration`);
+      }
+    }
+
+    summary.declarations = [...declarations];
     await capture('contribute-2-confirm');
 
+    const prepModule = '**/generated/wasm/looklab_prep_module.wasm';
+    const slowPrep = async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      await route.continue();
+    };
+    await page.route(prepModule, slowPrep);
     const started = Date.now();
     await page.click('button:has-text("Process locally")');
+    await page.getByText(/Processing photo \d+ of \d+/).waitFor({ timeout: 60_000 });
     await capture('contribute-processing');
     await page.waitForSelector('h2:has-text("Review what")', { timeout: 900_000 });
+    await page.unroute(prepModule, slowPrep);
     summary.prep_millis = Date.now() - started;
     await capture('contribute-3-inspector');
     check((await page.locator('.payload-summary').textContent()).includes('No pixels, no location'), `${size}: upload summary explains privacy`);
+    check(await page.locator('details.excluded-files').count() === 0, `${size}: every selected render was prepared`);
+    check((await page.locator('.payload-summary').textContent()).includes('from 5 photos'), `${size}: the inspector counts all five renders`);
     await page.locator('summary:has-text("See exactly")').focus();
     await page.keyboard.press('Enter');
     await capture('contribute-inspector-expanded');
@@ -487,17 +682,18 @@ async function contribute(size) {
         : [];
     });
 
-    const [seedDownload] = await Promise.all([
-      page.waitForEvent('download'),
-      page.click('button:has-text("Export seed file")'),
-    ]);
-    summary.seeds = `${options.out}/seeds-${size}.json`;
-    await seedDownload.saveAs(summary.seeds);
     const [payloadDownload] = await Promise.all([
       page.waitForEvent('download'),
       page.click('button:has-text("Download payload")'),
     ]);
     await payloadDownload.saveAs(`${options.out}/payload-${size}.json`);
+    const payload = JSON.parse(await readFile(`${options.out}/payload-${size}.json`, 'utf8'));
+    const metadataKeys = payload.images.flatMap((image) => Object.keys(image.metadata ?? {}));
+    check(!metadataKeys.some((key) => /seed|authorization|source|makernote_blob/i.test(key)), `${size}: the inspector adds no consent, seed or source data`);
+    check(
+      payload.images.every((image) => Object.keys(image).sort().join(',') === 'blob_bytes,metadata,removed,rerender_group'),
+      `${size}: the inspector payload keeps its existing shape`,
+    );
     if (!draftUnavailable) {
       const beforeResume = await page.locator('.payload-summary').textContent();
       await page.reload();
@@ -509,22 +705,46 @@ async function contribute(size) {
     await page.bringToFront();
     await page.click('button:has-text("Continue to send")');
     await capture('contribute-send');
+    const [seedDownload] = await Promise.all([
+      page.waitForEvent('download'),
+      page.click('button:has-text("Export seed file")'),
+    ]);
+    summary.seeds = `${options.out}/seeds-${size}.json`;
+    await seedDownload.saveAs(summary.seeds);
+    await page.getByRole('button', { name: 'Sign in', exact: true }).first().click();
+    await page.getByRole('button', { name: 'Create a profile', exact: true }).click();
+    await page
+      .getByRole('dialog', { name: 'Sign in to looklab' })
+      .waitFor({ state: 'hidden', timeout: 60_000 });
+    await page.locator('.account-menu summary').waitFor({ timeout: 60_000 });
+    await page.evaluate(() => { window.__looklabWebauthnGets = 0; });
+    const uploads = [];
+    const onUpload = (response) => {
+      if (response.request().method() === 'POST' && new URL(response.url()).pathname === '/api/upload') {
+        uploads.push(response);
+      }
+    };
+    page.on('response', onUpload);
     await page.click('button:has-text("Send contribution")');
-    await page.waitForSelector('dialog[open]');
-    const upload = page.waitForResponse(
-      (response) =>
-        response.request().method() === 'POST' &&
-        new URL(response.url()).pathname === '/api/upload',
-      { timeout: 300_000 },
-    );
-    await page.click('dialog button:has-text("Create a profile")');
-    const uploadResponse = await upload;
-    check(uploadResponse.status() === 201, `${size}: upload was accepted`);
-    const { contribution_id: contributionId } = await uploadResponse.json();
-    check(Boolean(contributionId), `${size}: upload returns a contribution id`);
-    await page.getByRole('heading', { name: 'Thanks for helping build looks', exact: true }).waitFor({ timeout: 300_000 });
+    await page.getByRole('heading', { name: 'Thanks, your samples are in', exact: true }).waitFor({ timeout: 300_000 });
+    page.off('response', onUpload);
+    check(uploads.length === 5, `${size}: all five batches were uploaded`);
+    const uploadBodies = await Promise.all(uploads.map(async (response) => {
+      check(response.status() === 201, `${size}: every batch was accepted`);
+      return response.json();
+    }));
+    const contributionId = uploadBodies[0].contribution_id;
+    check(Boolean(contributionId), `${size}: every batch returns a contribution id`);
+    const gets = await page.evaluate(() => window.__looklabWebauthnGets);
+    check(gets === 1, `${size}: exactly one WebAuthn get for five batches (${gets})`);
     await capture('contribute-4-upload');
-    check(await page.getByRole('button', { name: 'Back', exact: true }).isDisabled(), `${size}: completed upload cannot go back`);
+    const done = page.locator('.contribution-done');
+    const doneText = await done.textContent();
+    check(!/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(doneText), `${size}: the Done view shows no contribution ids`);
+    check(await done.getByRole('link', { name: 'Your contributions', exact: true }).isVisible(), `${size}: the Done view links to Your contributions`);
+    check(await page.locator('.stepper-actions').count() === 0, `${size}: Back and Next are gone after the send`);
+    check(await stepItems.nth(5).getAttribute('aria-current') === 'step', `${size}: Done is the current step`);
+    check(await page.locator('.stepper .step-item[data-state=complete]').count() === 5, `${size}: five steps are marked complete`);
     check(await page.getByRole('navigation', { name: 'Progress' }).getByRole('button', { name: 'Send', exact: true }).isDisabled(), `${size}: completed batch cannot reopen Send`);
     check(problems.length === 0, `${options.browser} ${size}: no page errors during contribute`);
 
@@ -540,12 +760,64 @@ async function contribute(size) {
     const feedResponse = await feed;
     check(feedResponse.ok(), `${size}: contribution feed loads`);
     const feedBody = await feedResponse.json();
-    check(Array.isArray(feedBody.contributions), `${size}: contribution feed returns contributions`);
-    const persisted = feedBody.contributions.find((contribution) => contribution.id === contributionId);
-    check(Boolean(persisted), `${size}: contribution feed lists the uploaded batch`);
-    check(Array.isArray(persisted.images) && persisted.images.length === 1, `${size}: contribution feed contains the one uploaded image`);
-    await page.getByRole('heading', { name: `Contribution ${contributionId}`, exact: true }).waitFor({ timeout: 60_000 });
+    check(Array.isArray(feedBody.activities), `${size}: contribution feed returns activities`);
+    check(feedBody.activities.length === 1 && feedBody.activities[0].source === 'send', `${size}: one send reads as one submission`);
+    const contributions = feedBody.activities.flatMap((activity) => activity.contributions);
+    const persisted = uploadBodies.map((body) =>
+      contributions.find((contribution) => contribution.id === body.contribution_id),
+    );
+    check(persisted.every(Boolean), `${size}: contribution feed lists every batch`);
+    check(
+      persisted.every((contribution) => Array.isArray(contribution.images) && contribution.images.length === 1),
+      `${size}: each batch contributes its one render`,
+    );
+    const monochromeContributions = persisted.filter(
+      (contribution) => contribution.render_class === 'monochrome',
+    );
+    check(monochromeContributions.length === 3, `${size}: the feed names three monochrome batches`);
+    check(
+      monochromeContributions.every((contribution) => typeof contribution.deferred_until === 'number'),
+      `${size}: every monochrome batch carries its deferred deadline`,
+    );
+    const activity = page.locator('.contribution-activity');
+    await activity.waitFor({ timeout: 60_000 });
+    check(await activity.count() === 1, `${size}: history shows one submission card`);
+    const primary = await activity.innerText();
+    check(!/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(primary), `${size}: primary history hides internal ids`);
+    check(await activity.getByRole('button', { name: 'Withdraw these photos', exact: true }).count() === 1, `${size}: submission has one withdrawal action`);
     await page.screenshot({ path: `${options.out}/contributions-${size}.png`, fullPage: true });
+    await activity.getByText('Technical details', { exact: true }).click();
+    for (const contribution of persisted) {
+      await activity.getByRole('rowheader', { name: contribution.id, exact: true }).waitFor();
+    }
+    await page.screenshot({ path: `${options.out}/contributions-technical-${size}.png`, fullPage: true });
+    await activity.getByText('Technical details', { exact: true }).click();
+    const getsBeforeWithdrawal = await page.evaluate(() => window.__looklabWebauthnGets);
+    const withdrawalResponse = page.waitForResponse(
+      (response) => response.request().method() === 'POST' && new URL(response.url()).pathname === '/api/withdraw',
+      { timeout: 60_000 },
+    );
+    await activity.getByRole('button', { name: 'Withdraw these photos', exact: true }).click();
+    const withdrawn = await withdrawalResponse;
+    check(withdrawn.ok() && (await withdrawn.json()).status === 'withdrawn', `${size}: submission withdrawal succeeds`);
+    check(
+      (await page.evaluate(() => window.__looklabWebauthnGets)) - getsBeforeWithdrawal === 1,
+      `${size}: withdrawing all photos uses one passkey confirmation`,
+    );
+    const reloadedFeed = page.waitForResponse(
+      (response) => response.request().method() === 'GET' && response.url() === feedResponse.url(),
+      { timeout: 60_000 },
+    );
+    await page.reload();
+    const afterWithdrawal = await (await reloadedFeed).json();
+    const withdrawnById = new Map(afterWithdrawal.activities.flatMap((entry) => entry.contributions).map((entry) => [entry.id, entry]));
+    check(
+      uploadBodies.every((entry) => withdrawnById.get(entry.contribution_id)?.status === 'withdrawn'),
+      `${size}: withdrawal persists for every submitted photo`,
+    );
+    await page.locator('.contribution-activity').waitFor({ timeout: 60_000 });
+    check(await page.getByRole('button', { name: 'Withdraw these photos', exact: true }).count() === 0, `${size}: withdrawn submission has no active withdrawal action`);
+    await page.screenshot({ path: `${options.out}/contributions-withdrawn-${size}.png`, fullPage: true });
     summary.contribution_id = contributionId;
     return summary;
   } catch (error) {
@@ -577,6 +849,7 @@ async function verifyContributionPayload(size, summary) {
   await mkdir(`${snapshot}/bodies`, { recursive: true });
   await writeFile(`${snapshot}/bodies/${filename}.body.yaml`, JSON.stringify(entity));
   await writeFile(`${snapshot}/bodies/${filename}.yaml`, schema);
+  await cp(`${options.state}/community`, `${snapshot}/community`, { recursive: true });
   const args = [
     'verify-payload',
     '--seeds', summary.seeds,
@@ -587,12 +860,13 @@ async function verifyContributionPayload(size, summary) {
     '--data', snapshot,
     '--kind', 'library',
     '--intent', 'native',
+    '--monochrome-authorization', 'model-development-180-days',
+    ...(summary.declarations ?? []).flatMap((key) => ['--declare-setting', `${key}=0`]),
     '--pow-memory-kib', '8',
     '--pow-iterations', '1',
     '--pow-difficulty', '0',
     '--state', state,
-    options.raw,
-    options.jpeg,
+    ...(summary.files ?? [options.raw, options.jpeg]),
   ];
   try {
     const output = execFileSync(options.verifier, args, { cwd: REPO_ROOT, encoding: 'utf8' });
@@ -610,7 +884,8 @@ async function patchHar(path, bodies) {
   const har = JSON.parse(await readFile(path, 'utf8'));
   let patched = 0;
   for (const entry of har.log.entries) {
-    const body = bodies.get(`${entry.request.method} ${entry.request.url}`);
+    const list = bodies.get(`${entry.request.method} ${entry.request.url}`);
+    const body = list?.shift();
     if (!body) {
       continue;
     }
@@ -864,7 +1139,10 @@ async function propose(size) {
     const profileCredential = profileRequest.postDataJSON().credential_id;
     await page.locator('dialog').waitFor({ state: 'hidden', timeout: 60_000 });
     await page.selectOption('#kind', 'body');
-    await page.setInputFiles('section[aria-labelledby="fixtures"] input[type=file]:not([webkitdirectory])', [fixture]);
+    await page.fill('#body-make', 'Fujifilm');
+    await page.fill('#body-model', 'X-E5');
+    await page.selectOption('#body-mapping', 'fixture_backed');
+    await page.setInputFiles('section[aria-labelledby="evidence-heading"] input[type=file]:not([webkitdirectory])', [fixture]);
     await page.waitForSelector('#donate-0', { timeout: 60_000 });
     await page.check('#donate-0');
     await page.screenshot({ path: `${options.out}/propose-${size}.png`, fullPage: true });
@@ -967,6 +1245,69 @@ async function propose(size) {
     await writeFile(`${options.out}/proposal-errors-${size}.json`, JSON.stringify(problems, null, 2));
     check(problems.length === 0, `${options.browser} ${size}: no page errors during the proposal flow`);
     return { id, version };
+  } finally {
+    await close(session);
+  }
+}
+
+async function propose_edges(size) {
+  const session = await open(VIEWPORTS[size]);
+  const { page, problems } = session;
+  try {
+    await page.goto(`${options.origin}/community/propose?kind=lut_look`);
+    await page.waitForSelector('#lut-name', { timeout: 60_000 });
+    await page.click('#submit-proposal');
+    await page.waitForSelector('section[aria-labelledby="submit"] .error', { timeout: 60_000 });
+    check((await page.locator('#payload-yaml').inputValue()).trim() === '', `${options.browser} ${size}: a missing .cube produces a form error, not an empty payload`);
+    await page.selectOption('#lut-encoding', 'display');
+    await page.waitForSelector('#lut-base-look', { timeout: 60_000 });
+    const index = await (await page.request.get(`${options.origin}/data/index.json`)).json();
+    const bases = index.looks
+      .filter((look) => (look.visibility ?? 'public') === 'public')
+      .flatMap((look) => look.versions.filter((version) => (version.matchable ?? true) && ['published', 'rooted'].includes(version.status)).map((version) => `${look.slug}@${version.version}`));
+    const neutral = bases.some((base) => base.startsWith('looklab-neutral-srgb-v1@'));
+    const expected = bases.length + (neutral ? 0 : 1);
+    const offered = await page.locator('#lut-base-look option:not([value=""])').count();
+    check(offered === expected, `${options.browser} ${size}: display bases offer ${expected} importer-supported versions`);
+
+    await page.goto(`${options.origin}/community/propose?kind=mapping`);
+    await page.waitForSelector('#mapping-camera', { timeout: 60_000 });
+    await page.selectOption('#mapping-camera', 'fujifilm/x-s10');
+    await page.getByLabel('Correct when an existing simulation became available').check();
+    await page.waitForSelector('#mapping-existing', { timeout: 60_000 });
+    await page.selectOption('#mapping-existing', { index: 1 });
+    const sourceEpoch = await page.locator('#mapping-existing option').nth(1).getAttribute('data-epoch');
+    await page.selectOption('#mapping-epoch', sourceEpoch);
+    check((await page.locator('#payload-yaml').inputValue()).trim() === '', `${options.browser} ${size}: correcting to the source firmware range produces no payload`);
+
+    await page.goto(`${options.origin}/community/propose?kind=schema_change`);
+    await page.waitForSelector('#schema-camera', { timeout: 60_000 });
+    await page.selectOption('#schema-camera', 'fujifilm/x-s10');
+    await page.waitForSelector('#schema-epoch', { timeout: 60_000 });
+    check((await page.locator('fieldset input[type=checkbox]').count()) > 0, `${options.browser} ${size}: controls are an explicit multi-select`);
+    await page.getByLabel(/dynamic_range/).check();
+    await page.waitForSelector('#edit-dynamic_range-default', { timeout: 60_000 });
+    check(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${options.browser} ${size}: the existing-control editor fits the viewport`);
+    await page.fill('#edit-dynamic_range-default', 'dr200');
+    await page.getByRole('button', { name: 'Add this change', exact: true }).click();
+    check((await page.locator('#payload-yaml').inputValue()).includes('dr200'), `${options.browser} ${size}: an existing-control edit reaches the payload`);
+    await page.locator('details.disclosure', { hasText: 'Add a control this camera does not list' }).locator('summary').click();
+    await page.fill('#add-key', 'phone_test_control');
+    await page.selectOption('#add-type', 'int');
+    await page.fill('#add-min', '0');
+    await page.fill('#add-max', '1');
+    await page.fill('#add-step', '1');
+    await page.fill('#add-default', '0');
+    await page.click('#add-control');
+    check((await page.locator('#payload-yaml').inputValue()).includes('phone_test_control'), `${options.browser} ${size}: the separate add-control draft reaches the payload`);
+    check(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${options.browser} ${size}: the add-control form fits the viewport`);
+    await page.selectOption('#schema-camera', '');
+    await page.waitForSelector('#schema-epoch', { state: 'detached', timeout: 60_000 });
+    check((await page.locator('#payload-yaml').inputValue()).trim() === '', `${options.browser} ${size}: clearing the camera clears the control payload`);
+    await page.screenshot({ path: `${options.out}/propose-edges-${size}.png`, fullPage: true });
+    await writeFile(`${options.out}/propose-edges-errors-${size}.json`, JSON.stringify(problems, null, 2));
+    check(problems.length === 0, `${options.browser} ${size}: no page errors during proposal edge flows`);
+    return { bases: expected };
   } finally {
     await close(session);
   }
@@ -1272,17 +1613,20 @@ async function account() {
     throw new Error('the account flow needs the Chromium CDP authenticator; use --browser chromium');
   }
   const session = await open(VIEWPORTS.desktop);
-  const { page, context, browser: engineBrowser, problems } = session;
+  const { page, context, browser: engineBrowser, problems, expectedMissingResources } = session;
   const { cdp, authenticatorId } = session.authenticator;
+  const signInDialog = page.getByRole('dialog', { name: 'Sign in to looklab', exact: true });
+  const accountMenu = page.getByRole('button', { name: 'River Photographer', exact: true });
   await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
   let second;
   try {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: options.origin });
     await page.goto(`${options.origin}/me`);
     await page.getByRole('button', { name: 'Sign in', exact: true }).first().focus();
     await page.keyboard.press('Enter');
-    await page.getByRole('dialog').waitFor();
+    await signInDialog.waitFor();
     await page.keyboard.press('Escape');
-    check(await page.getByRole('dialog').count() === 0, 'Escape closes sign-in dialog');
+    check(await signInDialog.count() === 0, 'Escape closes sign-in dialog');
     await page.getByRole('button', { name: 'Sign in', exact: true }).first().click();
     for (const [size, viewport] of Object.entries(VIEWPORTS)) {
       await page.setViewportSize(viewport);
@@ -1311,32 +1655,68 @@ async function account() {
     const firstProfile = await (await created).json();
     const activationRequest = (await activation).postDataJSON();
     check(Array.isArray(activationRequest.pow) && activationRequest.pow.length === 16, 'New profile activation sends the server-required work proof');
-    await page.locator('dialog').waitFor({ state: 'hidden' });
-    check(await page.locator('.account-menu summary').getAttribute('aria-label') === 'River Photographer', 'Optional display name reaches account menu');
-    await page.locator('.account-menu summary').focus();
+    await signInDialog.waitFor({ state: 'hidden' });
+    check(await accountMenu.isVisible(), 'Optional display name reaches account menu');
+    await accountMenu.focus();
     await page.keyboard.press('Enter');
-    check(await page.locator('.account-menu summary').getAttribute('aria-expanded') === 'true', 'Enter opens the account menu');
+    check(await accountMenu.getAttribute('aria-expanded') === 'true', 'Enter opens the account menu');
     await page.getByRole('link', { name: 'Your contributions', exact: true }).focus();
     await page.keyboard.press('Escape');
-    check(await page.locator('.account-menu summary').getAttribute('aria-expanded') === 'false', 'Escape closes the account menu');
-    check(await page.locator('.account-menu summary').evaluate((element) => element === document.activeElement), 'Escape returns focus to the account menu button');
+    check(await accountMenu.getAttribute('aria-expanded') === 'false', 'Escape closes the account menu');
+    check(await accountMenu.evaluate((element) => element === document.activeElement), 'Escape returns focus to the account menu button');
     await page.keyboard.press('Space');
-    check(await page.locator('.account-menu summary').getAttribute('aria-expanded') === 'true', 'Space opens the account menu');
+    check(await accountMenu.getAttribute('aria-expanded') === 'true', 'Space opens the account menu');
     await page.keyboard.press('Escape');
-    await page.locator('.account-menu summary').click();
+    await accountMenu.click();
     check(await page.getByRole('link', { name: 'Review', exact: true }).count() === 0, 'Ordinary profile has no Review link');
     await page.getByRole('button', { name: 'Sign out', exact: true }).click();
     await page.goto(`${options.origin}/status/${firstProfile.status_token}`);
     await page.waitForURL(`${options.origin}/me`);
-    await page.getByRole('link', { name: 'Private status link to bookmark' }).waitFor();
-    check(await page.locator('.account-menu summary').isVisible(), 'Private status link signs this browser in and opens /me');
-    await page.locator('.account-menu summary').click();
+    await page.getByRole('button', { name: 'Private status link', exact: true }).waitFor();
+    check(await accountMenu.isVisible(), 'Private status link signs this browser in and opens /me');
+    check(await page.getByRole('dialog', { name: 'Private status link', exact: true }).count() === 0, 'Private link details stay closed until requested');
+    check(await page.locator('main a[href$="/help/passkeys"]').count() === 0, 'Signed-in /me does not repeat sign-in help');
+    await page.getByRole('button', { name: 'Private status link', exact: true }).click();
+    const linkDialog = page.getByRole('dialog', { name: 'Private status link', exact: true });
+    await linkDialog.waitFor();
+    check(page.url() === `${options.origin}/me`, 'Private link dialog opens without leaving /me');
+    const privateLink = await linkDialog.getByLabel('Private status link').inputValue();
+    check(privateLink === `${options.origin}/status/${firstProfile.status_token}`, 'Private link dialog shows the full capability URL');
+    await linkDialog.getByRole('button', { name: 'Copy link', exact: true }).click();
+    const copied = await page.waitForFunction((expected) => navigator.clipboard.readText().then((text) => text === expected), privateLink).then(() => true, () => false);
+    check(copied, 'Copy link puts the private URL on the clipboard');
+    await page.keyboard.press('Escape');
+    await linkDialog.waitFor({ state: 'hidden' });
+    check(page.url() === `${options.origin}/me`, 'Closing the private link dialog leaves /me open');
+    check(await page.getByRole('heading', { name: 'Your contributions', exact: true }).isVisible(), 'Closing the private link dialog leaves /me usable');
+    const rssLink = page.getByRole('link', { name: 'Subscribe with RSS', exact: true });
+    const rssHref = await rssLink.getAttribute('href');
+    const rssResponse = page.waitForResponse((response) => new URL(response.url()).pathname === `/status/${firstProfile.status_token}.rss`).catch(() => null);
+    const rssDownload = page.waitForEvent('download').catch(() => null);
+    await rssLink.evaluate((anchor) => anchor.click());
+    check((await Promise.race([rssResponse, rssDownload])) !== null, 'RSS link navigates to the feed instead of the SPA status route');
+    const feed = await page.request.get(new URL(rssHref, options.origin).href);
+    check(feed.status() === 200, 'RSS feed responds');
+    check((feed.headers()['content-type'] ?? '').startsWith('application/rss+xml'), 'RSS feed uses the feed media type');
+    check((await feed.text()).includes('<rss version="2.0">'), 'RSS feed returns feed data');
+    await page.goto(`${options.origin}/me`);
+    await page.getByRole('button', { name: 'Private status link', exact: true }).waitFor();
+    const independent = await engineBrowser.newContext({ viewport: VIEWPORTS.mobile });
+    const independentPage = await independent.newPage();
+    const independentFeed = independentPage.waitForResponse((response) => new URL(response.url()).pathname === `/status/${firstProfile.status_token}` && (response.headers()['content-type'] ?? '').startsWith('application/json'));
+    await independentPage.goto(privateLink);
+    await independentPage.waitForURL(`${options.origin}/me`);
+    await independentPage.getByRole('heading', { name: 'Your contributions', exact: true }).waitFor();
+    check(await independentPage.locator('.account-menu summary').isVisible(), 'Copied private link signs in a separate browser');
+    check((await independentFeed).ok(), 'Copied private link loads the contribution feed in a separate browser');
+    await independent.close();
+    await accountMenu.click();
     await page.getByRole('button', { name: 'Sign out', exact: true }).click();
     await page.getByRole('button', { name: 'Sign in', exact: true }).first().click();
     const resumed = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/session');
     await page.getByRole('button', { name: 'Continue with passkey', exact: true }).click();
     const resumedProfile = await (await resumed).json();
-    await page.locator('dialog').waitFor({ state: 'hidden' });
+    await signInDialog.waitFor({ state: 'hidden' });
     check((await page.request.get(`${options.origin}/status/${firstProfile.status_token}`)).ok(), 'Local sign-out preserves existing status link');
     const credentials = await cdp.send('WebAuthn.getCredentials', { authenticatorId });
     const credential = credentials.credentials[0];
@@ -1354,7 +1734,7 @@ async function account() {
     const otherResponse = other.waitForResponse((response) => new URL(response.url()).pathname === '/api/session');
     await other.getByRole('button', { name: 'Continue with passkey', exact: true }).click();
     const otherProfile = await (await otherResponse).json();
-    await other.locator('dialog').waitFor({ state: 'hidden' });
+    await other.getByRole('dialog', { name: 'Sign in to looklab', exact: true }).waitFor({ state: 'hidden' });
     check((await page.request.get(`${options.origin}/status/${resumedProfile.status_token}`)).ok(), 'Second browser leaves first session signed in');
     check((await other.request.get(`${options.origin}/status/${otherProfile.status_token}`)).ok(), 'Second browser has its own valid session');
     // Virtual authenticators do not share signature counters.
@@ -1364,16 +1744,16 @@ async function account() {
     const credentialId = Buffer.from(credential.credentialId, 'base64').toString('base64url');
     check((await page.request.post(`${options.origin}/api/__stub/moderator/${credentialId}`)).ok(), 'Stub moderator grant succeeds');
     await page.reload();
-    await page.locator('.account-menu summary').waitFor();
-    await page.locator('.account-menu summary').click();
+    await accountMenu.waitFor();
+    await accountMenu.click();
     check(await page.getByRole('link', { name: 'Review', exact: true }).isVisible(), 'Reload refreshes newly granted roles without another passkey prompt');
-    await page.locator('.account-menu summary').click();
-    await page.locator('.account-menu summary').click();
+    await accountMenu.click();
+    await accountMenu.click();
     await page.getByRole('button', { name: 'Sign out', exact: true }).click();
     await page.getByRole('button', { name: 'Sign in', exact: true }).first().click();
     await page.getByRole('button', { name: 'Continue with passkey', exact: true }).click();
-    await page.locator('dialog').waitFor({ state: 'hidden' });
-    await page.locator('.account-menu summary').click();
+    await signInDialog.waitFor({ state: 'hidden' });
+    await accountMenu.click();
     check(await page.getByRole('link', { name: 'Review', exact: true }).isVisible(), 'Moderator sees Review in account menu');
     for (const [size, viewport] of Object.entries(VIEWPORTS)) {
       await page.setViewportSize(viewport);
@@ -1387,13 +1767,22 @@ async function account() {
         }
       }
     }
-    await page.locator('.account-menu summary').click();
+    await accountMenu.click();
     await page.getByRole('button', { name: 'Sign out everywhere', exact: true }).click();
-    await page.locator('.header-account').waitFor();
-    check(!(await other.request.get(`${options.origin}/status/${otherProfile.status_token}`)).ok(), 'Sign out everywhere revokes second browser');
-    check(!(await page.request.get(`${options.origin}/status/${resumedProfile.status_token}`)).ok(), 'Sign out everywhere revokes first browser');
+    await page.getByRole('button', { name: 'Sign in', exact: true }).first().waitFor();
+    check((await other.request.get(`${options.origin}/status/${otherProfile.status_token}`)).status() === 404, 'Sign out everywhere revokes second browser');
+    check((await page.request.get(`${options.origin}/status/${resumedProfile.status_token}`)).status() === 404, 'Sign out everywhere revokes first browser');
+    const revokedLink = `${options.origin}/status/${firstProfile.status_token}`;
+    const restoreUrl = `${options.origin}/api/session`;
+    expectedMissingResources.add(restoreUrl);
+    const revokedRestore = page.waitForResponse((response) => response.url() === restoreUrl && response.request().method() === 'GET');
+    await page.goto(revokedLink);
+    check((await revokedRestore).status() === 404, 'Revoked capability cannot restore a session');
+    await page.getByRole('alert').waitFor();
+    check(page.url() === `${options.origin}/status/${firstProfile.status_token}`, 'Revoked status link does not sign the browser in');
+    check(await page.getByRole('button', { name: 'Sign in', exact: true }).first().isVisible(), 'Revoked status link leaves the browser signed out');
     await other.reload();
-    await other.locator('.header-account').waitFor();
+    await other.getByRole('button', { name: 'Sign in', exact: true }).first().waitFor();
     check(problems.length === 0, `Account browser console: ${problems.join('; ')}`);
     return { created: true, signedInAgain: true, independentSessions: true, revokedEverywhere: true, moderatorMenu: true };
   } finally {
@@ -1432,6 +1821,7 @@ if (options.flow === 'all' || options.flow === 'propose') {
   for (const entry of result.proposals) {
     validateSnapshot(`${options.state}/community/v${entry.version}`);
   }
+  result.propose_edges = [await propose_edges('desktop'), await propose_edges('mobile')];
 }
 if (options.flow === 'flatness') {
   result.flatness = await flatness();

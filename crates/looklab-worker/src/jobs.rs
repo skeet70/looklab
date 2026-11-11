@@ -2,7 +2,11 @@
 
 use core::fmt;
 
-use looklab_server::ContributionId;
+use looklab_schema::{
+    DependencyGeneration, DomainId, ModelSubject, ModelVersionId, PendingGeneration,
+    QualificationCapability, RuleRevision, Sha256Hex, SourceRef,
+};
+use looklab_server::{ContributionId, ProposalId};
 use looklab_upload::BodyId;
 use serde::{Deserialize, Serialize};
 use sqlx::{SqliteConnection, SqlitePool};
@@ -46,7 +50,9 @@ pub enum JobKind {
     CardVerification,
     PublishSite,
     LutRebase,
+    LutImport,
     RevertRefit,
+    ModelAssessment,
     Other(String),
 }
 
@@ -62,7 +68,9 @@ impl JobKind {
             "card_verification" => Self::CardVerification,
             "publish_site" => Self::PublishSite,
             "lut_rebase" => Self::LutRebase,
+            "lut_import" => Self::LutImport,
             "revert_refit" => Self::RevertRefit,
+            "model_assessment" => Self::ModelAssessment,
             other => Self::Other(other.to_owned()),
         }
     }
@@ -77,8 +85,51 @@ impl JobKind {
             Self::CardVerification => "card_verification",
             Self::PublishSite => "publish_site",
             Self::LutRebase => "lut_rebase",
+            Self::LutImport => "lut_import",
             Self::RevertRefit => "revert_refit",
+            Self::ModelAssessment => "model_assessment",
             Self::Other(value) => value,
+        }
+    }
+}
+
+/// The fitter, evaluator and model identities an assessment job was queued under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssessmentSources {
+    pub fitter: SourceRef,
+    pub evaluator: SourceRef,
+    pub model: SourceRef,
+}
+
+/// A versioned qualification assessment over exact candidate and dependency pins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AssessmentJob {
+    Camera {
+        subject: ModelSubject,
+        candidate: ModelVersionId,
+        capability: QualificationCapability,
+        domain: DomainId,
+        dependencies: Vec<DependencyGeneration>,
+        pending: PendingGeneration,
+        seeds: Vec<u64>,
+        #[serde(default)]
+        reassess_selected: bool,
+        sources: AssessmentSources,
+    },
+    Engine {
+        engine: SourceRef,
+        rule_revision: RuleRevision,
+        reference: Option<Sha256Hex>,
+        dependencies: Vec<DependencyGeneration>,
+        sources: AssessmentSources,
+    },
+}
+
+impl AssessmentJob {
+    pub fn sources(&self) -> &AssessmentSources {
+        match self {
+            Self::Camera { sources, .. } | Self::Engine { sources, .. } => sources,
         }
     }
 }
@@ -99,7 +150,13 @@ pub enum JobPayload {
     CardVerification,
     PublishSite,
     LutRebase,
+    LutImport {
+        proposal_id: ProposalId,
+    },
     RevertRefit,
+    ModelAssessment {
+        request: Box<AssessmentJob>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -119,6 +176,11 @@ struct BlobGcWire {
     contribution_id: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct LutImportWire {
+    proposal_id: String,
+}
+
 impl JobPayload {
     pub fn kind(&self) -> JobKind {
         match self {
@@ -130,7 +192,9 @@ impl JobPayload {
             Self::CardVerification => JobKind::CardVerification,
             Self::PublishSite => JobKind::PublishSite,
             Self::LutRebase => JobKind::LutRebase,
+            Self::LutImport { .. } => JobKind::LutImport,
             Self::RevertRefit => JobKind::RevertRefit,
+            Self::ModelAssessment { .. } => JobKind::ModelAssessment,
         }
     }
 
@@ -154,6 +218,10 @@ impl JobPayload {
             Self::BlobGc { contribution_id } => serde_json::to_string(&BlobGcWire {
                 contribution_id: contribution_id.as_ref().map(|id| id.as_str().to_owned()),
             })?,
+            Self::LutImport { proposal_id } => serde_json::to_string(&LutImportWire {
+                proposal_id: proposal_id.as_str().to_owned(),
+            })?,
+            Self::ModelAssessment { request } => serde_json::to_string(request)?,
         };
         Ok((self.kind(), payload))
     }
@@ -194,7 +262,16 @@ impl JobPayload {
             JobKind::CardVerification => Self::CardVerification,
             JobKind::PublishSite => Self::PublishSite,
             JobKind::LutRebase => Self::LutRebase,
+            JobKind::LutImport => {
+                let wire: LutImportWire = serde_json::from_str(payload)?;
+                let proposal_id = ProposalId::try_from(wire.proposal_id)
+                    .map_err(|_| WorkerError::Job("invalid proposal id".to_owned()))?;
+                Self::LutImport { proposal_id }
+            }
             JobKind::RevertRefit => Self::RevertRefit,
+            JobKind::ModelAssessment => Self::ModelAssessment {
+                request: Box::new(serde_json::from_str(payload)?),
+            },
             JobKind::Other(kind) => {
                 return Err(WorkerError::Job(format!("unknown job kind `{kind}`")));
             }
@@ -232,6 +309,10 @@ pub struct JobOwnership {
 }
 
 impl JobOwnership {
+    pub fn server_id(&self) -> looklab_server::JobId {
+        looklab_server::JobId::try_from(self.id.as_str()).expect("worker job ids are UUIDs")
+    }
+
     /// Fails when the lease expired and another attempt now owns the job.
     pub async fn check(&self, pool: &SqlitePool) -> Result<()> {
         if owns(pool, &self.id, self.attempts).await? {
@@ -418,7 +499,7 @@ pub async fn enqueue_if_idle(
     Ok(Some(insert(&mut conn, &kind, &encoded, run_after).await?))
 }
 
-async fn insert(
+pub(crate) async fn insert(
     conn: &mut SqliteConnection,
     kind: &JobKind,
     payload: &str,
@@ -534,4 +615,34 @@ pub async fn nightly_due(pool: &SqlitePool, now: i64, interval: i64) -> Result<b
     .fetch_one(pool)
     .await?;
     Ok(last.is_none_or(|last| now - last >= interval))
+}
+
+/// Whether no blob sweep is queued or running and the last one is older than `interval`.
+pub async fn blob_gc_due(pool: &SqlitePool, now: i64, interval: i64) -> Result<bool> {
+    let last: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(created_at) FROM jobs
+         WHERE kind = 'blob_gc'
+           AND status IN ('queued', 'running', 'done', 'failed')",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(last.is_none_or(|last| now - last >= interval))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lut_import_job_round_trips_its_proposal() {
+        let payload = JobPayload::LutImport {
+            proposal_id: ProposalId::new(),
+        };
+        let (kind, encoded) = payload.encode().expect("encode");
+        assert_eq!(kind, JobKind::LutImport);
+        assert_eq!(
+            JobPayload::decode(&kind, &encoded).expect("decode"),
+            payload
+        );
+    }
 }

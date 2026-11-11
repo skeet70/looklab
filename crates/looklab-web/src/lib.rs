@@ -13,6 +13,7 @@ pub mod pages;
 pub(crate) mod prefetch;
 pub mod proposal_form;
 pub mod request_digest;
+mod selection;
 pub mod session;
 pub mod ui;
 pub mod webauthn;

@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use looklab_upload::Nonce;
+use std::collections::{BTreeSet, HashMap};
+
+use looklab_upload::{BodyId, LookSlug, MonochromeAuthorization, Nonce, RenderClass, SimKey};
 use serde::Serialize;
-use sqlx::{SqliteConnection, SqlitePool};
+use sha2::{Digest, Sha256};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 use webauthn_rs::prelude::Passkey;
 
+use crate::blob::{BlobHash, BlobStore};
 use crate::db::now_unix;
 use crate::ids::{
-    ContributionId, ContributionImageId, CredentialId, JobId, TokenHash, WithdrawalId,
+    BlobAttemptId, ContributionId, ContributionImageId, CredentialId, DeferredExpiryId, JobId,
+    TokenHash, WithdrawalId,
 };
 use crate::trust::{CredentialStanding, Tier};
 
@@ -98,7 +103,9 @@ impl ContributionKind {
 pub enum JobKind {
     ConsistencyScore,
     HardDeleteBlobs,
+    NightlyRefit,
     PublishSite,
+    LutImport,
     RevertRefit,
 }
 
@@ -107,13 +114,36 @@ impl JobKind {
         match self {
             Self::ConsistencyScore => "consistency_score",
             Self::HardDeleteBlobs => "hard_delete_blobs",
+            Self::NightlyRefit => "nightly_refit",
             Self::PublishSite => "publish_site",
+            Self::LutImport => "lut_import",
             Self::RevertRefit => "revert_refit",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JobStatus {
+    Queued,
+    Running,
+    Done,
+    Failed,
+}
+
+impl JobStatus {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "done" => Some(Self::Done),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum IntentKind {
     Native,
     Recipe,
@@ -128,6 +158,15 @@ impl IntentKind {
             Self::Card => "card",
         }
     }
+
+    pub fn from_db(value: &str) -> Option<Self> {
+        match value {
+            "native" => Some(Self::Native),
+            "recipe" => Some(Self::Recipe),
+            "card" => Some(Self::Card),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,9 +178,19 @@ pub enum ConsumeNonce {
 }
 
 #[derive(Debug)]
+pub struct CredentialRevision(String);
+
+impl CredentialRevision {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug)]
 pub struct StoredCredential {
     pub id: CredentialId,
     pub passkey: Passkey,
+    pub revision: CredentialRevision,
     pub standing: CredentialStanding,
 }
 
@@ -204,6 +253,268 @@ pub async fn consume_nonce(db: &SqlitePool, nonce: &Nonce) -> Result<ConsumeNonc
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredSend {
+    pub manifest_hash: [u8; 32],
+    pub credential_id: Vec<u8>,
+    pub assertion_hash: [u8; 32],
+    pub expires_at: i64,
+    pub completed_at: Option<i64>,
+    pub withdrawn_at: Option<i64>,
+}
+
+pub async fn find_send(db: &SqlitePool, nonce: &Nonce) -> Result<Option<StoredSend>, sqlx::Error> {
+    type SendRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, Option<i64>, Option<i64>);
+    let row: Option<SendRow> = sqlx::query_as(
+        "SELECT manifest_hash, credential_id, assertion_hash, expires_at, completed_at,
+                withdrawn_at
+         FROM send_manifests WHERE nonce = ?",
+    )
+    .bind(hex(nonce.as_bytes()))
+    .fetch_optional(db)
+    .await?;
+    row.map(|row| {
+        let manifest_hash = <[u8; 32]>::try_from(row.0)
+            .map_err(|_| sqlx::Error::Protocol("send manifest hash is not 32 bytes".to_owned()))?;
+        let assertion_hash = <[u8; 32]>::try_from(row.2)
+            .map_err(|_| sqlx::Error::Protocol("assertion hash is not 32 bytes".to_owned()))?;
+        Ok(StoredSend {
+            manifest_hash,
+            credential_id: row.1,
+            assertion_hash,
+            expires_at: row.3,
+            completed_at: row.4,
+            withdrawn_at: row.5,
+        })
+    })
+    .transpose()
+}
+
+/// `None` when the send instance does not list the batch, otherwise whether it
+/// already arrived.
+pub async fn find_send_batch(
+    db: &SqlitePool,
+    nonce: &Nonce,
+    batch: &[u8; 32],
+) -> Result<Option<Option<i64>>, sqlx::Error> {
+    let row: Option<(Option<i64>,)> = sqlx::query_as(
+        "SELECT received_at FROM send_manifest_batches
+         WHERE send_nonce = ? AND batch_manifest_hash = ?",
+    )
+    .bind(hex(nonce.as_bytes()))
+    .bind(batch.as_slice())
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|row| row.0))
+}
+
+/// `None` when the send does not list the attestation, otherwise whether it
+/// already arrived.
+pub async fn find_send_attestation(
+    db: &SqlitePool,
+    nonce: &Nonce,
+    attestation: &[u8; 32],
+) -> Result<Option<Option<i64>>, sqlx::Error> {
+    let row: Option<(Option<i64>,)> = sqlx::query_as(
+        "SELECT received_at FROM send_manifest_attestations
+         WHERE send_nonce = ? AND attestation_hash = ?",
+    )
+    .bind(hex(nonce.as_bytes()))
+    .bind(attestation.as_slice())
+    .fetch_optional(db)
+    .await?;
+    Ok(row.map(|row| row.0))
+}
+
+/// Moves one attestation from pending to received and completes the send once
+/// every declared batch and attestation has arrived. Exactly one caller can win.
+pub async fn mark_send_attestation_received(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    nonce: &Nonce,
+    attestation: &[u8; 32],
+    confirmation: i64,
+) -> Result<bool, sqlx::Error> {
+    let key = hex(nonce.as_bytes());
+    let now = now_unix();
+    let affected = sqlx::query(
+        "UPDATE send_manifest_attestations SET received_at = ?, confirmation_id = ?
+         WHERE send_nonce = ? AND attestation_hash = ? AND received_at IS NULL
+           AND EXISTS (SELECT 1 FROM send_manifests
+                       WHERE nonce = ? AND withdrawn_at IS NULL AND expires_at >= ?)",
+    )
+    .bind(now)
+    .bind(confirmation)
+    .bind(&key)
+    .bind(attestation.as_slice())
+    .bind(&key)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if affected != 1 {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE send_manifests SET completed_at = ?
+         WHERE nonce = ? AND completed_at IS NULL
+           AND received_count >= batch_count
+           AND NOT EXISTS (SELECT 1 FROM send_manifest_attestations
+                           WHERE send_nonce = ? AND received_at IS NULL)",
+    )
+    .bind(now)
+    .bind(&key)
+    .bind(&key)
+    .execute(&mut **tx)
+    .await?;
+    Ok(true)
+}
+
+pub struct NewSend<'a> {
+    pub manifest_hash: &'a [u8; 32],
+    pub nonce: &'a Nonce,
+    pub credential_id: &'a [u8],
+    pub assertion_hash: &'a [u8; 32],
+    pub batch_hashes: &'a [[u8; 32]],
+    pub attestation_hashes: &'a [[u8; 32]],
+}
+
+pub enum EstablishSend {
+    Established,
+    Existing(StoredSend),
+    Unknown,
+    Expired,
+    Replayed,
+}
+
+/// Consumes the nonce and inserts the send binding in one transaction. A
+/// competing request sees the winning row as [`EstablishSend::Existing`].
+pub async fn establish_send(
+    db: &SqlitePool,
+    send: &NewSend<'_>,
+) -> Result<EstablishSend, sqlx::Error> {
+    let key = hex(send.nonce.as_bytes());
+    let now = now_unix();
+    let mut tx = db.begin().await?;
+    let affected = sqlx::query(
+        "UPDATE nonces SET used_at = ? WHERE nonce = ? AND used_at IS NULL AND expires_at > ?",
+    )
+    .bind(now)
+    .bind(&key)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if affected == 1 {
+        let expires_at: i64 = sqlx::query_scalar("SELECT expires_at FROM nonces WHERE nonce = ?")
+            .bind(&key)
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO send_manifests
+             (nonce, manifest_hash, credential_id, assertion_hash, batch_count, received_count,
+              created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+        )
+        .bind(&key)
+        .bind(send.manifest_hash.as_slice())
+        .bind(send.credential_id)
+        .bind(send.assertion_hash.as_slice())
+        .bind(i64::try_from(send.batch_hashes.len()).unwrap_or(i64::MAX))
+        .bind(now)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+        for hash in send.batch_hashes {
+            sqlx::query(
+                "INSERT INTO send_manifest_batches (send_nonce, batch_manifest_hash)
+                 VALUES (?, ?)",
+            )
+            .bind(&key)
+            .bind(hash.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
+        for hash in send.attestation_hashes {
+            sqlx::query(
+                "INSERT INTO send_manifest_attestations (send_nonce, attestation_hash)
+                 VALUES (?, ?)",
+            )
+            .bind(&key)
+            .bind(hash.as_slice())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        return Ok(EstablishSend::Established);
+    }
+    tx.rollback().await?;
+    let row: Option<(Option<i64>, i64)> =
+        sqlx::query_as("SELECT used_at, expires_at FROM nonces WHERE nonce = ?")
+            .bind(&key)
+            .fetch_optional(db)
+            .await?;
+    Ok(match row {
+        None => EstablishSend::Unknown,
+        Some((Some(_), _)) => match find_send(db, send.nonce).await? {
+            Some(existing) => EstablishSend::Existing(existing),
+            None => EstablishSend::Replayed,
+        },
+        Some((None, expires_at)) if expires_at <= now => EstablishSend::Expired,
+        Some((None, _)) => EstablishSend::Unknown,
+    })
+}
+
+/// Moves one batch from pending to received if the send is still open and
+/// unexpired; exactly one caller can win.
+pub async fn mark_send_batch_received(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    nonce: &Nonce,
+    batch: &[u8; 32],
+    contribution: &ContributionId,
+) -> Result<bool, sqlx::Error> {
+    let key = hex(nonce.as_bytes());
+    let now = now_unix();
+    let affected = sqlx::query(
+        "UPDATE send_manifest_batches SET received_at = ?, contribution_id = ?
+         WHERE send_nonce = ? AND batch_manifest_hash = ? AND received_at IS NULL
+           AND EXISTS (SELECT 1 FROM send_manifests
+                       WHERE nonce = ? AND completed_at IS NULL AND withdrawn_at IS NULL
+                         AND expires_at >= ?)",
+    )
+    .bind(now)
+    .bind(contribution.as_str())
+    .bind(&key)
+    .bind(batch.as_slice())
+    .bind(&key)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(affected == 1)
+}
+
+pub async fn increment_send_received(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    nonce: &Nonce,
+) -> Result<(), sqlx::Error> {
+    let key = hex(nonce.as_bytes());
+    sqlx::query(
+        "UPDATE send_manifests
+         SET received_count = received_count + 1,
+             completed_at = CASE WHEN received_count + 1 >= batch_count
+                                  AND NOT EXISTS (SELECT 1 FROM send_manifest_attestations
+                                                  WHERE send_nonce = ? AND received_at IS NULL)
+                                 THEN ? ELSE completed_at END
+         WHERE nonce = ?",
+    )
+    .bind(&key)
+    .bind(now_unix())
+    .bind(&key)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn find_credential(
     db: &SqlitePool,
     raw_id: &[u8],
@@ -228,6 +539,7 @@ pub async fn find_credential(
     Ok(Some(StoredCredential {
         id: CredentialId::try_from(id).map_err(|_| CredentialLoadError::Corrupt)?,
         passkey,
+        revision: CredentialRevision(passkey_json),
         standing,
     }))
 }
@@ -237,6 +549,26 @@ pub async fn credential_exists(db: &SqlitePool, raw_id: &[u8]) -> Result<bool, s
         .bind(raw_id)
         .fetch_one(db)
         .await?;
+    Ok(count > 0)
+}
+
+pub async fn intake_blocked(
+    db: &SqlitePool,
+    credential: &CredentialId,
+) -> Result<bool, sqlx::Error> {
+    let mut conn = db.acquire().await?;
+    intake_blocked_conn(&mut conn, credential).await
+}
+
+pub async fn intake_blocked_conn(
+    conn: &mut SqliteConnection,
+    credential: &CredentialId,
+) -> Result<bool, sqlx::Error> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM credential_intake_blocks WHERE credential_id = ?")
+            .bind(credential.as_str())
+            .fetch_one(&mut *conn)
+            .await?;
     Ok(count > 0)
 }
 
@@ -334,29 +666,37 @@ pub async fn insert_credential(
     Ok(())
 }
 
-pub async fn update_credential_passkey_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    credential_id: &CredentialId,
-    passkey: &Passkey,
-) -> Result<(), sqlx::Error> {
-    let passkey_json = serde_json::to_string(passkey)
-        .map_err(|_| sqlx::Error::Protocol("passkey does not serialize".to_owned()))?;
-    sqlx::query("UPDATE credentials SET webauthn_credential = ? WHERE id = ?")
-        .bind(passkey_json)
-        .bind(credential_id.as_str())
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialUpdate {
+    Applied,
+    Stale,
 }
 
+/// Replaces the state `original` was verified against; `Stale` means another
+/// assertion changed it first.
 pub async fn update_credential_passkey(
     db: &SqlitePool,
     credential_id: &CredentialId,
     passkey: &Passkey,
-) -> Result<(), sqlx::Error> {
-    let mut tx = db.begin().await?;
-    update_credential_passkey_tx(&mut tx, credential_id, passkey).await?;
-    tx.commit().await
+    revision: &CredentialRevision,
+) -> Result<CredentialUpdate, sqlx::Error> {
+    let passkey_json = serde_json::to_string(passkey)
+        .map_err(|_| sqlx::Error::Protocol("passkey does not serialize".to_owned()))?;
+    let updated = sqlx::query(
+        "UPDATE credentials SET webauthn_credential = ?
+         WHERE id = ? AND webauthn_credential = ?",
+    )
+    .bind(passkey_json)
+    .bind(credential_id.as_str())
+    .bind(revision.as_str())
+    .execute(db)
+    .await?
+    .rows_affected();
+    Ok(if updated == 1 {
+        CredentialUpdate::Applied
+    } else {
+        CredentialUpdate::Stale
+    })
 }
 
 pub struct NewImage {
@@ -366,12 +706,17 @@ pub struct NewImage {
     pub rerender_group: Option<String>,
     /// `(control key, source)` JSON ([docs/03 §1]).
     pub setting_source: String,
+    pub render_class: RenderClass,
+    pub native_sim: Option<looklab_upload::SimKey>,
+    pub family: Option<looklab_schema::LookId>,
+    pub mono_filter: Option<looklab_schema::MonoFilter>,
 }
 
 pub struct NewContribution {
     pub id: ContributionId,
     pub credential_id: CredentialId,
     pub manifest_hash: [u8; 32],
+    pub send_nonce: Nonce,
     pub signature: Vec<u8>,
     pub pow: String,
     pub kind: ContributionKind,
@@ -383,6 +728,11 @@ pub struct NewContribution {
     pub firmware_version: String,
     pub sim_key: String,
     pub settings_json: String,
+    pub normalized_settings: looklab_upload::ControlSettings,
+    pub community_snapshot_version: looklab_upload::CommunitySnapshotVersion,
+    pub render_class: RenderClass,
+    pub monochrome_authorization: Option<MonochromeAuthorization>,
+    pub deferred_until: Option<i64>,
     pub images: Vec<NewImage>,
 }
 
@@ -390,15 +740,19 @@ pub async fn insert_contribution(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     contribution: &NewContribution,
 ) -> Result<(), sqlx::Error> {
+    let identity_before = crate::model_events::prepare_identity_link(tx, contribution).await?;
     sqlx::query(
         "INSERT INTO contributions
-         (id, credential_id, batch_manifest_hash, signature, pow, kind, serial_hmac, intent,
-          target_look_id, card, body_id, firmware_version, sim_key, settings, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+         (id, credential_id, batch_manifest_hash, send_nonce, signature, pow, kind,
+          serial_hmac, intent, target_look_id, card, body_id, firmware_version, sim_key, settings,
+          normalized_settings, community_snapshot_version, render_class,
+          monochrome_authorization, deferred_until, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
     )
     .bind(contribution.id.as_str())
     .bind(contribution.credential_id.as_str())
     .bind(contribution.manifest_hash.as_slice())
+    .bind(hex(contribution.send_nonce.as_bytes()))
     .bind(contribution.signature.as_slice())
     .bind(&contribution.pow)
     .bind(contribution.kind.as_str())
@@ -410,6 +764,14 @@ pub async fn insert_contribution(
     .bind(&contribution.firmware_version)
     .bind(&contribution.sim_key)
     .bind(&contribution.settings_json)
+    .bind(
+        serde_json::to_string(&contribution.normalized_settings)
+            .map_err(|_| sqlx::Error::Protocol("settings do not serialize".to_owned()))?,
+    )
+    .bind(i64::try_from(contribution.community_snapshot_version.get()).unwrap_or(i64::MAX))
+    .bind(render_class_str(contribution.render_class))
+    .bind(contribution.monochrome_authorization.map(authorization_str))
+    .bind(contribution.deferred_until)
     .bind(now_unix())
     .execute(&mut **tx)
     .await?;
@@ -426,8 +788,8 @@ pub async fn insert_contribution(
         sqlx::query(
             "INSERT INTO contribution_images
              (id, contribution_id, samples_hash, n_samples, meta, rerender_group, setting_source,
-              status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+              render_class, native_sim, family, mono_filter, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
         )
         .bind(id.as_str())
         .bind(contribution.id.as_str())
@@ -436,10 +798,171 @@ pub async fn insert_contribution(
         .bind(&image.meta_json)
         .bind(image.rerender_group.as_deref())
         .bind(&image.setting_source)
+        .bind(render_class_str(image.render_class))
+        .bind(
+            image
+                .native_sim
+                .as_ref()
+                .map(looklab_upload::SimKey::as_str),
+        )
+        .bind(image.family.as_ref().map(looklab_schema::LookId::as_str))
+        .bind(image.mono_filter.map(mono_filter_str))
         .execute(&mut **tx)
         .await?;
     }
+    crate::model_events::finish_identity_link(tx, identity_before, now_unix()).await?;
+    if let Some(due_at) = contribution.deferred_until {
+        schedule_deferred_expiry(tx, &contribution.id, due_at).await?;
+    }
     Ok(())
+}
+
+async fn schedule_deferred_expiry(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    contribution_id: &ContributionId,
+    due_at: i64,
+) -> Result<(), sqlx::Error> {
+    let expiry_id = DeferredExpiryId::new();
+    sqlx::query(
+        "INSERT INTO deferred_expiries (id, contribution_id, due_at, status)
+         VALUES (?, ?, ?, 'pending')",
+    )
+    .bind(expiry_id.as_str())
+    .bind(contribution_id.as_str())
+    .bind(due_at)
+    .execute(&mut **tx)
+    .await?;
+    let payload = serde_json::to_string(&BlobDeletionPayload { contribution_id })
+        .map_err(|_| sqlx::Error::Protocol("job payload does not serialize".to_owned()))?;
+    enqueue_job(tx, JobKind::HardDeleteBlobs, &payload, due_at).await?;
+    Ok(())
+}
+
+pub(crate) fn render_class_from_db(value: &str) -> Option<RenderClass> {
+    match value {
+        "colour" => Some(RenderClass::Colour),
+        "monochrome" => Some(RenderClass::Monochrome),
+        _ => None,
+    }
+}
+
+fn render_class_str(class: RenderClass) -> &'static str {
+    match class {
+        RenderClass::Colour => "colour",
+        RenderClass::Monochrome => "monochrome",
+    }
+}
+
+fn authorization_str(authorization: MonochromeAuthorization) -> &'static str {
+    match authorization {
+        MonochromeAuthorization::ModelDevelopment180Days => "model_development_180_days",
+    }
+}
+
+fn mono_filter_str(filter: looklab_schema::MonoFilter) -> &'static str {
+    match filter {
+        looklab_schema::MonoFilter::None => "none",
+        looklab_schema::MonoFilter::Yellow => "yellow",
+        looklab_schema::MonoFilter::Red => "red",
+        looklab_schema::MonoFilter::Green => "green",
+    }
+}
+
+/// Uploads past this age are rejected and swept instead of published.
+pub const STAGED_TTL_SECONDS: i64 = 600;
+
+/// Commits the hashes this attempt will write, before any file is created.
+pub async fn stage_blobs(
+    db: &SqlitePool,
+    attempt: &BlobAttemptId,
+    hashes: &[[u8; 32]],
+    expires_at: i64,
+) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let now = now_unix();
+    for hash in hashes {
+        sqlx::query(
+            "INSERT INTO blob_staging (attempt_id, hash, staged_at, expires_at)
+             VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        )
+        .bind(attempt.as_str())
+        .bind(hash.as_slice())
+        .bind(now)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
+/// True when every hash this attempt staged is still inside its lifetime.
+pub async fn reservation_live(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attempt: &BlobAttemptId,
+    expected: usize,
+) -> Result<bool, sqlx::Error> {
+    let live: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM blob_staging WHERE attempt_id = ? AND expires_at > ?",
+    )
+    .bind(attempt.as_str())
+    .bind(now_unix())
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(usize::try_from(live).ok() == Some(expected))
+}
+
+/// Deletes the attempt's reservations in the caller's transaction.
+pub async fn clear_staged(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attempt: &BlobAttemptId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM blob_staging WHERE attempt_id = ?")
+        .bind(attempt.as_str())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Drops the attempt's reservation and unlinks files no other record names.
+pub async fn discard_staged(
+    db: &SqlitePool,
+    blobs: &dyn BlobStore,
+    attempt: &BlobAttemptId,
+    hashes: &[[u8; 32]],
+) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    clear_staged(&mut tx, attempt).await?;
+    for hash in hashes.iter().collect::<BTreeSet<_>>() {
+        if blob_referenced(&mut tx, hash).await? {
+            continue;
+        }
+        blobs
+            .delete(BlobHash::from_bytes(*hash))
+            .map_err(|error| sqlx::Error::Io(std::io::Error::other(error)))?;
+    }
+    tx.commit().await
+}
+
+/// Expires the attempt's reservation; the worker sweep removes its files.
+pub async fn abandon_staged(db: &SqlitePool, attempt: &BlobAttemptId) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("UPDATE blob_staging SET expires_at = 0 WHERE attempt_id = ?")
+        .bind(attempt.as_str())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
+pub async fn blob_referenced(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    hash: &[u8; 32],
+) -> Result<bool, sqlx::Error> {
+    let referenced: i64 =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM blob_references WHERE hash = ?)")
+            .bind(hex(hash))
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok(referenced != 0)
 }
 
 #[derive(Serialize)]
@@ -468,6 +991,18 @@ pub async fn enqueue_job(
     Ok(id)
 }
 
+/// The durable active community snapshot identity.
+pub async fn active_snapshot_identity(
+    db: &SqlitePool,
+) -> Result<Option<(u64, String)>, sqlx::Error> {
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT version, content_hash FROM community_snapshot_activation WHERE id = 1",
+    )
+    .fetch_optional(db)
+    .await?;
+    Ok(row.and_then(|(version, hash)| u64::try_from(version).ok().map(|version| (version, hash))))
+}
+
 /// Persists the request while a publisher is queued or running; a running one
 /// enqueues its successor when it completes.
 pub async fn request_publication(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
@@ -487,38 +1022,117 @@ pub async fn request_publication(conn: &mut SqliteConnection) -> Result<(), sqlx
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ScopedUse {
+    pub report: looklab_schema::ModelReportId,
+    pub capability: looklab_schema::QualificationCapability,
+    pub outcome: looklab_schema::AssessmentOutcome,
+    pub selection: Option<looklab_schema::SelectionScope>,
+    pub applicability: looklab_schema::Applicability,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ImageFeed {
     pub id: ContributionImageId,
     pub status: ImageStatus,
     pub reason: Option<String>,
     pub rms_de: Option<f64>,
+    #[serde(default)]
+    pub uses: Vec<ScopedUse>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ContributionFeed {
     pub id: ContributionId,
     pub status: ContributionStatus,
+    pub render_class: RenderClass,
+    pub deferred_until: Option<i64>,
     pub created_at: i64,
+    pub body_id: BodyId,
+    pub intent: IntentKind,
+    pub target_look: Option<LookSlug>,
+    pub sim_key: SimKey,
     pub images: Vec<ImageFeed>,
+    #[serde(default)]
+    pub uses: Vec<ScopedUse>,
+    #[serde(skip)]
+    send_nonce: Option<Nonce>,
 }
 
-type FeedRow = (
-    String,
-    String,
-    i64,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<f64>,
-);
+/// A send groups by its signed nonce; records received before sends were
+/// grouped have none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivitySource {
+    Send,
+    Activity,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActivityFeed {
+    pub source: ActivitySource,
+    pub created_at: i64,
+    pub contributions: Vec<ContributionFeed>,
+    #[serde(skip)]
+    pub(crate) identity: ActivityIdentity,
+}
+
+#[derive(Debug)]
+pub(crate) struct ActivityIdentity(sha2::digest::Output<Sha256>);
+
+impl std::fmt::Display for ActivityIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::LowerHex::fmt(&self.0, formatter)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum ActivityKey {
+    Send(Nonce),
+    Activity { day: i64, body: BodyId },
+}
+
+fn stored_send_nonce(value: &str) -> Result<Nonce, sqlx::Error> {
+    let invalid = || sqlx::Error::Protocol("stored send nonce is invalid".to_owned());
+    if value.len() != 64 {
+        return Err(invalid());
+    }
+    let mut bytes = [0; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let pair = value.get(index * 2..index * 2 + 2).ok_or_else(invalid)?;
+        *byte = u8::from_str_radix(pair, 16).map_err(|_| invalid())?;
+    }
+    Ok(Nonce::from_bytes(bytes))
+}
+
+#[derive(sqlx::FromRow)]
+struct FeedRow {
+    contribution_id: String,
+    contribution_status: String,
+    render_class: String,
+    deferred_until: Option<i64>,
+    created_at: i64,
+    send_nonce: Option<String>,
+    body_id: String,
+    intent: String,
+    target_look_id: Option<String>,
+    sim_key: String,
+    image_id: Option<String>,
+    image_status: Option<String>,
+    reason: Option<String>,
+    rms_de: Option<f64>,
+}
 
 pub async fn status_feed(
     db: &SqlitePool,
     credential_id: &CredentialId,
-) -> Result<Vec<ContributionFeed>, sqlx::Error> {
+) -> Result<Vec<ActivityFeed>, sqlx::Error> {
     let rows: Vec<FeedRow> = sqlx::query_as(
-        "SELECT c.id, c.status, c.created_at, i.id, i.status, i.status_reason, i.rms_de
+        "SELECT c.id AS contribution_id, c.status AS contribution_status,
+                c.render_class, c.deferred_until, c.created_at, c.send_nonce,
+                c.body_id, c.intent, c.target_look_id, c.sim_key,
+                i.id AS image_id, i.status AS image_status, i.status_reason AS reason,
+                i.rms_de
          FROM contributions c
          LEFT JOIN contribution_images i ON i.contribution_id = c.id
          WHERE c.credential_id = ?
@@ -528,91 +1142,374 @@ pub async fn status_feed(
     .fetch_all(db)
     .await?;
 
-    let mut feed: Vec<ContributionFeed> = Vec::new();
-    for (contribution_id, status, created_at, image_id, image_status, reason, rms_de) in rows {
-        let id = ContributionId::try_from(contribution_id)
+    let mut contributions: Vec<ContributionFeed> = Vec::new();
+    for row in rows {
+        let id = ContributionId::try_from(row.contribution_id)
             .map_err(|_| sqlx::Error::Protocol("contribution id is not a UUID".to_owned()))?;
-        let status = ContributionStatus::from_db(&status)
-            .ok_or_else(|| sqlx::Error::Protocol("unknown contribution status".to_owned()))?;
-        let entry = match feed.last_mut() {
+        let entry = match contributions.last_mut() {
             Some(entry) if entry.id == id => entry,
             _ => {
-                feed.push(ContributionFeed {
+                contributions.push(ContributionFeed {
                     id,
-                    status,
-                    created_at,
+                    status: ContributionStatus::from_db(&row.contribution_status).ok_or_else(
+                        || sqlx::Error::Protocol("unknown contribution status".to_owned()),
+                    )?,
+                    render_class: render_class_from_db(&row.render_class)
+                        .ok_or_else(|| sqlx::Error::Protocol("unknown render class".to_owned()))?,
+                    deferred_until: row.deferred_until,
+                    created_at: row.created_at,
+                    body_id: BodyId::try_from(row.body_id).map_err(|_| {
+                        sqlx::Error::Protocol("contribution body id is invalid".to_owned())
+                    })?,
+                    intent: IntentKind::from_db(&row.intent).ok_or_else(|| {
+                        sqlx::Error::Protocol("unknown contribution intent".to_owned())
+                    })?,
+                    target_look: row
+                        .target_look_id
+                        .map(LookSlug::try_from)
+                        .transpose()
+                        .map_err(|_| {
+                            sqlx::Error::Protocol("contribution target look is invalid".to_owned())
+                        })?,
+                    sim_key: SimKey::try_from(row.sim_key).map_err(|_| {
+                        sqlx::Error::Protocol("contribution sim key is invalid".to_owned())
+                    })?,
                     images: Vec::new(),
+                    uses: Vec::new(),
+                    send_nonce: row
+                        .send_nonce
+                        .as_deref()
+                        .map(stored_send_nonce)
+                        .transpose()?,
                 });
-                feed.last_mut().expect("just pushed")
+                contributions.last_mut().expect("just pushed")
             }
         };
-        if let (Some(image_id), Some(image_status)) = (image_id, image_status) {
+        if let (Some(image_id), Some(image_status)) = (row.image_id, row.image_status) {
             entry.images.push(ImageFeed {
                 id: ContributionImageId::try_from(image_id).map_err(|_| {
                     sqlx::Error::Protocol("contribution image id is not a UUID".to_owned())
                 })?,
                 status: ImageStatus::from_db(&image_status)
                     .ok_or_else(|| sqlx::Error::Protocol("unknown image status".to_owned()))?,
-                reason,
-                rms_de,
+                reason: row.reason,
+                rms_de: row.rms_de,
+                uses: Vec::new(),
             });
         }
     }
-    Ok(feed)
+
+    for contribution in &mut contributions {
+        let target = looklab_schema::ContributionRef::new(contribution.id.as_str())
+            .map_err(|_| sqlx::Error::Protocol("contribution id is invalid".to_owned()))?;
+        contribution.uses = scoped_uses(db, ScopedTarget::Contribution(&target)).await?;
+        for image in &mut contribution.images {
+            let target = looklab_schema::ImageRef::new(image.id.as_str())
+                .map_err(|_| sqlx::Error::Protocol("image id is invalid".to_owned()))?;
+            image.uses = scoped_uses(db, ScopedTarget::Image(&target)).await?;
+        }
+    }
+
+    let mut groups: HashMap<ActivityKey, ActivityFeed> = HashMap::new();
+    for contribution in contributions {
+        let key = match contribution.send_nonce {
+            Some(nonce) => ActivityKey::Send(nonce),
+            None => ActivityKey::Activity {
+                day: contribution.created_at.div_euclid(86_400),
+                body: contribution.body_id.clone(),
+            },
+        };
+        let source = match &key {
+            ActivityKey::Send(_) => ActivitySource::Send,
+            ActivityKey::Activity { .. } => ActivitySource::Activity,
+        };
+        let created_at = contribution.created_at;
+        let activity = groups.entry(key).or_insert_with_key(|key| ActivityFeed {
+            source,
+            created_at,
+            contributions: Vec::new(),
+            identity: activity_identity(credential_id, key),
+        });
+        activity.created_at = activity.created_at.min(created_at);
+        activity.contributions.push(contribution);
+    }
+    let mut activities: Vec<(ActivityKey, ActivityFeed)> = groups.into_iter().collect();
+    activities.sort_by(|(left_key, left), (right_key, right)| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| left_key.cmp(right_key))
+    });
+    Ok(activities
+        .into_iter()
+        .map(|(_, activity)| activity)
+        .collect())
+}
+
+#[derive(Clone, Copy)]
+enum ScopedTarget<'a> {
+    Image(&'a looklab_schema::ImageRef),
+    Contribution(&'a looklab_schema::ContributionRef),
+}
+
+impl ScopedTarget<'_> {
+    fn kind(self) -> looklab_schema::DependencyKind {
+        match self {
+            Self::Image(_) => looklab_schema::DependencyKind::Image,
+            Self::Contribution(_) => looklab_schema::DependencyKind::Contribution,
+        }
+    }
+
+    fn target(&self) -> &str {
+        match self {
+            Self::Image(image) => image.as_str(),
+            Self::Contribution(contribution) => contribution.as_str(),
+        }
+    }
+
+    fn evaluated(self, evidence: &crate::model_store::EvidenceMembership) -> bool {
+        match self {
+            Self::Image(image) => evidence
+                .evaluated_images
+                .iter()
+                .any(|evaluated| evaluated == image),
+            Self::Contribution(contribution) => evidence
+                .evaluated_contributions
+                .iter()
+                .any(|evaluated| evaluated == contribution),
+        }
+    }
+}
+
+async fn scoped_uses(
+    db: &SqlitePool,
+    target: ScopedTarget<'_>,
+) -> Result<Vec<ScopedUse>, sqlx::Error> {
+    let mut conn = db.acquire().await?;
+    let rows = sqlx::query(
+        "SELECT r.id, r.capability, r.outcome,
+                MAX(CASE
+                    WHEN p.\"use\" = 'qualified_match' AND p.selected_report_id = r.id
+                         AND r.outcome = 'pass' THEN 2
+                    WHEN p.\"use\" = 'experimental_match'
+                         AND p.selected_candidate_kind = r.candidate_kind
+                         AND p.selected_candidate_id = r.candidate_id
+                         AND p.selected_candidate_target = r.candidate_target
+                         AND p.selected_candidate_version = r.candidate_version
+                         AND r.outcome = 'pass'
+                         AND (
+                           (p.selected_candidate_kind = 'body_realization'
+                            AND EXISTS (
+                              SELECT 1 FROM model_realization_revisions rr
+                              WHERE rr.id = p.selected_candidate_id
+                                AND rr.numerical = 'passed'
+                                AND rr.release_gates = 'passed'
+                                AND rr.status = 'candidate'))
+                           OR
+                           (p.selected_candidate_kind = 'shared_family'
+                            AND EXISTS (
+                              SELECT 1 FROM model_family_heads fh
+                              WHERE fh.family || '@' || fh.head_version = p.selected_candidate_id
+                                AND fh.head_version = p.selected_candidate_version
+                                AND fh.numerical = 'passed'
+                                AND fh.release_gates = 'passed'
+                                AND fh.applicability = 'current'))
+                         ) THEN 1
+                    ELSE 0 END) AS selection
+         FROM model_dependencies d
+         JOIN model_reports r ON r.id = d.owner_id
+         LEFT JOIN model_current_projections p
+                ON p.subject_key = r.subject_key
+               AND p.capability = r.capability
+               AND p.applicability = 'current'
+         WHERE d.owner_kind = 'report' AND d.kind = ? AND d.target = ?
+         GROUP BY r.id, r.capability, r.outcome
+         ORDER BY r.id",
+    )
+    .bind(target.kind().as_str())
+    .bind(target.target())
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut uses = Vec::with_capacity(rows.len());
+    for row in rows {
+        let report_text = row.try_get::<String, _>("id")?;
+        let report = looklab_schema::ModelReportId::parse(&report_text)
+            .map_err(|_| sqlx::Error::Protocol("stored report id is invalid".to_owned()))?;
+        let evidence = crate::model_store::report_evidence(&mut conn, &report)
+            .await
+            .map_err(|_| sqlx::Error::Protocol("stored report evidence is invalid".to_owned()))?;
+        let evaluated = evidence.is_some_and(|evidence| target.evaluated(&evidence));
+        if !evaluated {
+            continue;
+        }
+        let capability = looklab_schema::QualificationCapability::parse(
+            row.try_get::<String, _>("capability")?.as_str(),
+        )
+        .map_err(|_| sqlx::Error::Protocol("stored capability is invalid".to_owned()))?;
+        let outcome =
+            looklab_schema::AssessmentOutcome::parse(row.try_get::<String, _>("outcome")?.as_str())
+                .map_err(|_| {
+                    sqlx::Error::Protocol("stored report outcome is invalid".to_owned())
+                })?;
+        let selection = match row.try_get::<i64, _>("selection")? {
+            2 => Some(looklab_schema::SelectionScope::Qualified),
+            1 => Some(looklab_schema::SelectionScope::Experimental),
+            _ => None,
+        };
+        let selection = match selection {
+            Some(_)
+                if !crate::model_store::report_applicable(&mut conn, &report)
+                    .await
+                    .map_err(|_| {
+                        sqlx::Error::Protocol("stored report applicability is invalid".to_owned())
+                    })? =>
+            {
+                None
+            }
+            selection => selection,
+        };
+        uses.push(ScopedUse {
+            report,
+            capability,
+            outcome,
+            selection,
+            applicability: if selection.is_some() {
+                looklab_schema::Applicability::Current
+            } else {
+                looklab_schema::Applicability::Unassessed
+            },
+        });
+    }
+    Ok(uses)
+}
+
+fn activity_identity(credential_id: &CredentialId, key: &ActivityKey) -> ActivityIdentity {
+    let mut hasher = Sha256::new();
+    hasher.update(b"looklab-activity-v1:");
+    hasher.update(credential_id.as_str().as_bytes());
+    hasher.update(b":");
+    match key {
+        ActivityKey::Send(nonce) => {
+            hasher.update(b"send:");
+            hasher.update(nonce.as_bytes());
+        }
+        ActivityKey::Activity { day, body } => {
+            hasher.update(b"activity:");
+            hasher.update(day.to_be_bytes());
+            hasher.update(b":");
+            hasher.update(body.as_str().as_bytes());
+        }
+    }
+    ActivityIdentity(hasher.finalize())
 }
 
 pub async fn withdraw(
     db: &SqlitePool,
-    contribution_id: &ContributionId,
+    contribution_ids: &[ContributionId],
     credential_id: &CredentialId,
     delete_after: i64,
 ) -> Result<Option<i64>, sqlx::Error> {
     let mut tx = db.begin().await?;
-    let row: Option<(String, String)> =
-        sqlx::query_as("SELECT credential_id, status FROM contributions WHERE id = ?")
-            .bind(contribution_id.as_str())
-            .fetch_optional(&mut *tx)
-            .await?;
-    let Some((owner, status)) = row else {
-        return Ok(None);
-    };
-    if owner != credential_id.as_str() {
-        return Ok(None);
-    }
-    let status = ContributionStatus::from_db(&status)
-        .ok_or_else(|| sqlx::Error::Protocol("unknown contribution status".to_owned()))?;
-    if status == ContributionStatus::Withdrawn {
-        let existing: Option<(i64,)> =
-            sqlx::query_as("SELECT delete_after FROM withdrawals WHERE contribution_id = ?")
-                .bind(contribution_id.as_str())
-                .fetch_optional(&mut *tx)
-                .await?;
-        return Ok(existing.map(|(delete_after,)| delete_after));
-    }
+    let mut delete_afters = Vec::with_capacity(contribution_ids.len());
+    let mut send_nonces = BTreeSet::new();
+    for contribution_id in contribution_ids {
+        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT credential_id, status, send_nonce FROM contributions WHERE id = ?",
+        )
+        .bind(contribution_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((owner, status, send_nonce)) = row else {
+            return Ok(None);
+        };
+        if owner != credential_id.as_str() {
+            return Ok(None);
+        }
+        if let Some(nonce) = send_nonce {
+            send_nonces.insert(nonce);
+        }
+        let status = ContributionStatus::from_db(&status)
+            .ok_or_else(|| sqlx::Error::Protocol("unknown contribution status".to_owned()))?;
+        if status == ContributionStatus::Withdrawn {
+            let existing: Option<(i64,)> =
+                sqlx::query_as("SELECT delete_after FROM withdrawals WHERE contribution_id = ?")
+                    .bind(contribution_id.as_str())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            match existing {
+                Some((existing,)) => delete_afters.push(existing),
+                None => delete_afters.push(now_unix()),
+            }
+            continue;
+        }
 
-    sqlx::query(
-        "UPDATE contributions SET status = 'withdrawn' WHERE id = ? AND status != 'withdrawn'",
-    )
-    .bind(contribution_id.as_str())
-    .execute(&mut *tx)
-    .await?;
-    let withdrawal_id = WithdrawalId::new();
-    sqlx::query(
-        "INSERT INTO withdrawals (id, contribution_id, credential_id, requested_at, delete_after, status)
-         VALUES (?, ?, ?, ?, ?, 'pending')",
-    )
-    .bind(withdrawal_id.as_str())
-    .bind(contribution_id.as_str())
-    .bind(credential_id.as_str())
-    .bind(now_unix())
-    .bind(delete_after)
-    .execute(&mut *tx)
-    .await?;
-    let payload = serde_json::to_string(&BlobDeletionPayload { contribution_id })
-        .map_err(|_| sqlx::Error::Protocol("job payload does not serialize".to_owned()))?;
-    enqueue_job(&mut tx, JobKind::HardDeleteBlobs, &payload, delete_after).await?;
+        sqlx::query(
+            "UPDATE contributions SET status = 'withdrawn' WHERE id = ? AND status != 'withdrawn'",
+        )
+        .bind(contribution_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        crate::model_events::contribution_withdrawn(&mut tx, contribution_id, now_unix()).await?;
+        let withdrawal_id = WithdrawalId::new();
+        sqlx::query(
+            "INSERT INTO withdrawals (id, contribution_id, credential_id, requested_at, delete_after, status)
+             VALUES (?, ?, ?, ?, ?, 'pending')",
+        )
+        .bind(withdrawal_id.as_str())
+        .bind(contribution_id.as_str())
+        .bind(credential_id.as_str())
+        .bind(now_unix())
+        .bind(delete_after)
+        .execute(&mut *tx)
+        .await?;
+        let payload = serde_json::to_string(&BlobDeletionPayload { contribution_id })
+            .map_err(|_| sqlx::Error::Protocol("job payload does not serialize".to_owned()))?;
+        enqueue_job(&mut tx, JobKind::HardDeleteBlobs, &payload, delete_after).await?;
+        delete_afters.push(delete_after);
+    }
+    for nonce in send_nonces {
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM contributions WHERE send_nonce = ? AND status != 'withdrawn'",
+        )
+        .bind(&nonce)
+        .fetch_one(&mut *tx)
+        .await?;
+        if remaining == 0 {
+            let now = now_unix();
+            sqlx::query(
+                "UPDATE send_manifests SET withdrawn_at = ?
+                 WHERE nonce = ? AND withdrawn_at IS NULL",
+            )
+            .bind(now)
+            .bind(&nonce)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE manual_confirmation_occurrences SET withdrawn_at = ?
+                 WHERE send_nonce = ? AND withdrawn_at IS NULL",
+            )
+            .bind(now)
+            .bind(&nonce)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE manual_confirmations SET withdrawn_at = ?
+                 WHERE id IN (SELECT confirmation_id FROM manual_confirmation_occurrences
+                              WHERE send_nonce = ?)
+                   AND withdrawn_at IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM manual_confirmation_occurrences
+                                   WHERE confirmation_id = manual_confirmations.id
+                                     AND withdrawn_at IS NULL)",
+            )
+            .bind(now)
+            .bind(&nonce)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    request_publication(&mut tx).await?;
     tx.commit().await?;
-    Ok(Some(delete_after))
+    Ok(delete_afters.into_iter().max())
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -621,4 +1518,351 @@ fn hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use webauthn_rs_core::proto::{
+        AttestationFormat, COSEAlgorithm, COSEEC2Key, COSEKey, COSEKeyType, Credential, ECDSACurve,
+        ParsedAttestation, RegisteredExtensions, UserVerificationPolicy,
+    };
+
+    fn passkey(counter: u32, backup_state: bool) -> Passkey {
+        Credential {
+            cred_id: vec![1, 2, 3, 4],
+            cred: COSEKey {
+                type_: COSEAlgorithm::ES256,
+                key: COSEKeyType::EC_EC2(COSEEC2Key {
+                    curve: ECDSACurve::SECP256R1,
+                    x: vec![0; 32],
+                    y: vec![0; 32],
+                }),
+            },
+            counter,
+            transports: None,
+            user_verified: true,
+            backup_eligible: false,
+            backup_state,
+            registration_policy: UserVerificationPolicy::Required,
+            extensions: RegisteredExtensions::none(),
+            attestation: ParsedAttestation::default(),
+            attestation_format: AttestationFormat::None,
+        }
+        .into()
+    }
+
+    const RAW_ID: [u8; 4] = [1, 2, 3, 4];
+
+    async fn database() -> (tempfile::TempDir, SqlitePool, CredentialId) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = crate::db::open(&dir.path().join("looklab.sqlite3"))
+            .await
+            .expect("database");
+        let credential_id = CredentialId::new();
+        let mut tx = db.begin().await.expect("transaction");
+        insert_credential(&mut tx, &credential_id, &RAW_ID, &passkey(0, false), None)
+            .await
+            .expect("credential");
+        tx.commit().await.expect("commit");
+        (dir, db, credential_id)
+    }
+
+    async fn revision(db: &SqlitePool) -> CredentialRevision {
+        find_credential(db, &RAW_ID)
+            .await
+            .expect("credential")
+            .expect("credential")
+            .revision
+    }
+
+    async fn stored_state(db: &SqlitePool) -> (u32, bool) {
+        let stored = find_credential(db, &RAW_ID)
+            .await
+            .expect("credential")
+            .expect("credential");
+        let credential = Credential::from(stored.passkey);
+        (credential.counter, credential.backup_state)
+    }
+
+    #[tokio::test]
+    async fn a_stale_credential_update_is_rejected() {
+        let (_dir, db, credential_id) = database().await;
+        let original = revision(&db).await;
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(7, false), &original)
+                .await
+                .expect("newer update"),
+            CredentialUpdate::Applied
+        );
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(5, true), &original)
+                .await
+                .expect("stale update"),
+            CredentialUpdate::Stale
+        );
+        assert_eq!(stored_state(&db).await, (7, false));
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_credential_update_is_rejected() {
+        let (_dir, db, credential_id) = database().await;
+        let original = revision(&db).await;
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(1, false), &original)
+                .await
+                .expect("first update"),
+            CredentialUpdate::Applied
+        );
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(1, true), &original)
+                .await
+                .expect("duplicate update"),
+            CredentialUpdate::Stale
+        );
+        assert_eq!(stored_state(&db).await, (1, false));
+    }
+
+    #[tokio::test]
+    async fn a_zero_counter_credential_update_is_persisted() {
+        let (_dir, db, credential_id) = database().await;
+        let original = revision(&db).await;
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(0, true), &original)
+                .await
+                .expect("zero counter update"),
+            CredentialUpdate::Applied
+        );
+        assert_eq!(stored_state(&db).await, (0, true));
+    }
+
+    fn feed_report(
+        image: &looklab_schema::ImageRef,
+        contribution: &looklab_schema::ContributionRef,
+    ) -> (
+        looklab_schema::ModelReport,
+        Vec<looklab_schema::DependencyRef>,
+    ) {
+        use looklab_schema::{
+            AssessmentOutcome, CellId, CombinationBasis, DependencyKind, DependencyRef,
+            DependencyTarget, DomainId, FamilyTargetId, LookId, MetricKey, ModelReport,
+            ModelSubject, ModelVersionId, OutputEncoding, ProbeSetId, QualificationCapability,
+            ReportMetrics, ReportProvenance, ReportScope, RuleRevision, SettingCombination,
+            Sha256Hex, SourceRef, SupportedMask, TargetVersion,
+        };
+        let family = LookId::new("classic-chrome").expect("look");
+        let target = FamilyTargetId {
+            family: family.clone(),
+            version: TargetVersion::new(1).expect("version"),
+        };
+        let scope = ReportScope {
+            points: vec![looklab_schema::AssessedPoint {
+                settings: SettingCombination::new(),
+                firmware: None,
+                wb_mode: None,
+            }],
+            combination_basis: CombinationBasis::Enumerated,
+            defaults_assessed: true,
+            output_encoding: OutputEncoding::Srgb,
+            colour_cells: vec![CellId::new("cell-0").expect("cell")],
+            exposure_cells: Vec::new(),
+            assessed_bodies: vec![looklab_schema::BodyId::new("fujifilm/x-t5").expect("body")],
+            assessed_domain: DomainId::new("test").expect("domain"),
+        };
+        let mut metrics = ReportMetrics::new();
+        metrics.insert(MetricKey::MedianDe, 1.0);
+        metrics.insert(MetricKey::Coverage, 1.0);
+        metrics.insert(MetricKey::AssessedCells, 1.0);
+        metrics.insert(MetricKey::SupportedCells, 1.0);
+        let mut mask = SupportedMask::new();
+        mask.insert(CellId::new("cell-0").expect("cell"));
+        let report = ModelReport {
+            subject: ModelSubject::SharedFamily {
+                family: family.clone(),
+            },
+            candidate: ModelVersionId::SharedFamily { target },
+            capability: QualificationCapability::NativePrediction,
+            scope,
+            provenance: ReportProvenance {
+                rule_revision: RuleRevision::new("test/1").expect("rule"),
+                fitter: SourceRef::new("fit@1").expect("fitter"),
+                evaluator: SourceRef::new("eval@1").expect("evaluator"),
+                model: SourceRef::new("model@1").expect("model"),
+                probe_set: ProbeSetId::new("v1").expect("probes"),
+                effective_options: Sha256Hex::from_bytes([0; 32]),
+                partition_policy: Sha256Hex::from_bytes([1; 32]),
+                assessment_seeds: vec![1],
+            },
+            outcome: AssessmentOutcome::Pass,
+            metrics,
+            supported_mask: mask,
+            limitations: Vec::new(),
+            evidence_requests: Vec::new(),
+        };
+        let dependencies = vec![
+            DependencyRef::required(DependencyKind::Image, DependencyTarget::image(image)),
+            DependencyRef::required(
+                DependencyKind::Contribution,
+                DependencyTarget::contribution(contribution),
+            ),
+        ];
+        (report, dependencies)
+    }
+
+    #[tokio::test]
+    async fn scoped_uses_requires_evaluated_provenance_and_applicability() {
+        let (_dir, db, credential_id) = database().await;
+        let contribution_id = ContributionId::new();
+        let image_id = ContributionImageId::new();
+        let mut conn = db.acquire().await.expect("connection");
+        sqlx::query(
+            "INSERT INTO contributions
+             (id, credential_id, batch_manifest_hash, signature, pow, kind, intent,
+              body_id, firmware_version, sim_key, settings, status, created_at)
+             VALUES (?, ?, ?, ?, 'pow', 'library', 'native', 'fujifilm/x-t5',
+                     '1.0', 'classic_chrome', '[]', 'pending', 0)",
+        )
+        .bind(contribution_id.as_str())
+        .bind(credential_id.as_str())
+        .bind([0u8; 32].as_slice())
+        .bind([0u8; 1].as_slice())
+        .execute(&mut *conn)
+        .await
+        .expect("contribution");
+        sqlx::query(
+            "INSERT INTO contribution_images
+             (id, contribution_id, samples_hash, n_samples, meta, status)
+             VALUES (?, ?, ?, 1, '{}', 'pending')",
+        )
+        .bind(image_id.as_str())
+        .bind(contribution_id.as_str())
+        .bind([1u8; 32].as_slice())
+        .execute(&mut *conn)
+        .await
+        .expect("image");
+        let image = looklab_schema::ImageRef::new(image_id.as_str()).expect("image ref");
+        let contribution = looklab_schema::ContributionRef::new(contribution_id.as_str())
+            .expect("contribution ref");
+        let (report, dependencies) = feed_report(&image, &contribution);
+        let empty = crate::model_store::EvidenceMembership {
+            evaluated_images: Vec::new(),
+            ..Default::default()
+        };
+        let empty_report =
+            crate::model_store::insert_report(&mut conn, &report, &dependencies, &[], &empty, 0)
+                .await
+                .expect("empty report");
+        let evaluated = crate::model_store::EvidenceMembership {
+            evaluated_images: vec![image.clone()],
+            evaluated_contributions: vec![contribution.clone()],
+            ..Default::default()
+        };
+        let evaluated_report = crate::model_store::insert_report(
+            &mut conn,
+            &report,
+            &dependencies,
+            &[],
+            &evaluated,
+            0,
+        )
+        .await
+        .expect("evaluated report");
+        sqlx::query(
+            "INSERT INTO look_versions (id, look, version, status, created_at)
+             VALUES ('classic-chrome-1', 'classic-chrome', 1, 'published', 0)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("look version");
+        sqlx::query(
+            "INSERT INTO model_family_heads
+             (family, head_version, source_limited, numerical, release_gates, report_id,
+              assessed_generation, applicability, invalidated_reason, updated_at)
+             VALUES ('classic-chrome', 1, 0, 'passed', 'passed', NULL, 0, 'current', NULL, 0)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("family head");
+        sqlx::query(
+            "INSERT INTO model_current_projections
+             (subject_key, \"use\", capability, scope_key, selected_report_id,
+              selected_candidate_kind, selected_candidate_id, selected_candidate_target,
+              selected_candidate_version, pending_generation, applicability, updated_at)
+             VALUES (?, 'experimental_match', 'native_prediction', ?, NULL, 'shared_family',
+                     ?, ?, 1, 0, 'current', 0)",
+        )
+        .bind(report.subject.key().as_str())
+        .bind(report.scope.key().as_str())
+        .bind(report.candidate.candidate_id())
+        .bind(report.candidate.candidate_id())
+        .execute(&mut *conn)
+        .await
+        .expect("projection");
+        drop(conn);
+        let feed = status_feed(&db, &credential_id).await.expect("feed");
+        let entry = feed
+            .iter()
+            .flat_map(|activity| &activity.contributions)
+            .find(|entry| entry.id == contribution_id)
+            .expect("contribution feed");
+        assert_eq!(entry.uses.len(), 1);
+        assert_eq!(entry.uses[0].report, evaluated_report);
+        assert_ne!(entry.uses[0].report, empty_report);
+        assert_eq!(
+            entry.uses[0].selection,
+            Some(looklab_schema::SelectionScope::Experimental)
+        );
+        let image_entry = entry
+            .images
+            .iter()
+            .find(|entry| entry.id == image_id)
+            .expect("image feed");
+        assert_eq!(image_entry.uses.len(), 1);
+        assert_eq!(
+            image_entry.uses[0].selection,
+            Some(looklab_schema::SelectionScope::Experimental)
+        );
+        let mut conn = db.acquire().await.expect("connection");
+        crate::model_store::invalidate(
+            &mut conn,
+            &dependencies[0],
+            looklab_schema::InvalidationReason::EvidenceLoss,
+            1,
+        )
+        .await
+        .expect("invalidate");
+        drop(conn);
+        let feed = status_feed(&db, &credential_id).await.expect("feed");
+        let entry = feed
+            .iter()
+            .flat_map(|activity| &activity.contributions)
+            .find(|entry| entry.id == contribution_id)
+            .expect("contribution feed");
+        assert_eq!(entry.uses.len(), 1);
+        assert_eq!(entry.uses[0].selection, None);
+        assert_eq!(
+            entry.uses[0].applicability,
+            looklab_schema::Applicability::Unassessed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_counter_assertion_keeps_the_stored_counter() {
+        let (_dir, db, credential_id) = database().await;
+        let original = revision(&db).await;
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(7, false), &original)
+                .await
+                .expect("counted update"),
+            CredentialUpdate::Applied
+        );
+        let current = revision(&db).await;
+        assert_eq!(
+            update_credential_passkey(&db, &credential_id, &passkey(7, true), &current)
+                .await
+                .expect("zero counter update"),
+            CredentialUpdate::Applied
+        );
+        assert_eq!(stored_state(&db).await, (7, true));
+    }
 }

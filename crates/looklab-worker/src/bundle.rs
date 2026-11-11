@@ -1,251 +1,457 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Match bundle assembly for a new Look release (docs/03 §5, docs/04 §2).
-//! Each matchable version fixes one bundle per body epoch in its manifest.
+//! Camera bundle assembly (docs/03 §5, docs/04 §2).
+//!
+//! Bundles publish independently of Look versions. A revision pins every
+//! selected realization's family target, parameters and artifact hashes.
 
-use std::collections::BTreeMap;
-
-use looklab_publish::{
-    ArtifactBlob, ExcludedSim, MatchBundle, MatchSim, ProvenanceSummary, SimExclusion,
-    body_artifact, bundle_artifact, sim_artifacts, transform_artifact,
+use looklab_publish::{ArtifactBlob, ArtifactName};
+use looklab_schema::{
+    ArtifactBinding, ArtifactRole, BodyId, BodyRealizationId, BodyStateVersion, BundleExclusion,
+    BundleExclusionReason, BundleSimEntry, ControlEpochId, MatchBundleRevision, ModelSubject,
+    ModelVersionId, ProjectionUse, PublishedTargetId, QualificationCapability,
+    RealizationRevisionId, RealizationStatus, SelectionScope, Sha256Hex, SourceRef,
+    TargetEligibilityStatus,
 };
-use looklab_schema::{Body, BodyId, BodyKind, BodyStatus, Epoch, SimKey};
-use looklab_server::admin::{self, ListingState, LookListingRecord, ManifestArtifact};
-use looklab_upload::LookSlug;
+use looklab_server::model_store::{self, StoredRealizationRevision};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqlitePool};
+use sqlx::SqlitePool;
 
-use crate::body::{BodyResources, DataDir, TransformDir};
+use crate::body::DataDir;
 use crate::config::WorkerConfig;
 use crate::db;
 use crate::error::{Result, WorkerError};
-use crate::refit::{CRM_ARTIFACT, LOOK_ARTIFACT};
 
-/// The Look version being published, whose artifacts are not stored yet.
-pub(crate) struct Candidate<'a> {
-    pub body: &'a BodyId,
-    pub epoch: u32,
-    pub sim: &'a SimKey,
-    pub look: &'a LookSlug,
-    pub base: &'a [u8],
-    pub crm: &'a [u8],
+/// A revision plus its artifact bytes, ready for the bundle registry.
+pub(crate) struct AssembledBundle {
+    pub manifest: MatchBundleRevision,
+    pub blobs: Vec<ArtifactBlob>,
+    pub scope: SelectionScope,
 }
 
-impl Candidate<'_> {
-    fn matches(&self, body: &BodyId, epoch: u32, look: &LookSlug, sim: &SimKey) -> bool {
-        self.body == body && self.epoch == epoch && self.look == look && self.sim == sim
-    }
-}
-
-/// Every bundle artifact for the body epochs in `provenance`.
-pub(crate) async fn for_release(
-    pool: &SqlitePool,
-    config: &WorkerConfig,
-    provenance: &ProvenanceSummary,
-    candidate: &Candidate<'_>,
-) -> Result<Vec<ArtifactBlob>> {
-    let listings = load_listings(pool).await?;
-    let data = DataDir::new(&config.data);
-    let mut blobs = Vec::new();
-    for use_ in &provenance.bodies {
-        let body_id = BodyId::new(&use_.body)
-            .map_err(|_| WorkerError::Data(format!("invalid body id `{}`", use_.body)))?;
-        let resources = data.load(&body_id)?;
-        if !bundled_body(&resources.body) {
-            continue;
-        }
-        for epoch_id in &use_.epochs {
-            let Some(epoch) = resources
-                .schema
-                .epochs
-                .iter()
-                .find(|epoch| epoch.id == *epoch_id)
-            else {
-                continue;
+impl AssembledBundle {
+    fn artifact_bindings(&self) -> Vec<ArtifactBinding> {
+        let mut bindings = Vec::new();
+        for blob in &self.blobs {
+            let role = match blob.name.as_str() {
+                "body.yaml" => Some(ArtifactRole::Manifest),
+                "transform.yaml" => Some(ArtifactRole::InputTransform),
+                "profile.yaml" => Some(ArtifactRole::CalibrationProfile),
+                "body_params.json" => Some(ArtifactRole::BodyRealizationParams),
+                "gauge.json" => Some(ArtifactRole::Gauge),
+                _ => None,
             };
-            assemble(
-                pool, config, &listings, &resources, epoch, candidate, &mut blobs,
-            )
-            .await?;
+            if let Some(role) = role
+                && let Ok(hash) = Sha256Hex::parse(&db::hex(&Sha256::digest(&blob.bytes)))
+            {
+                bindings.push(ArtifactBinding { sha256: hash, role });
+            }
         }
+        for sim in &self.manifest.sims {
+            bindings.push(ArtifactBinding {
+                sha256: sim.base_artifact,
+                role: ArtifactRole::Look,
+            });
+            bindings.push(ArtifactBinding {
+                sha256: sim.control_response,
+                role: ArtifactRole::ControlResponse,
+            });
+            if let Some(covariance) = sim.covariance {
+                bindings.push(ArtifactBinding {
+                    sha256: covariance,
+                    role: ArtifactRole::Covariance,
+                });
+            }
+            if let Some(params) = sim.realization_params {
+                bindings.push(ArtifactBinding {
+                    sha256: params,
+                    role: ArtifactRole::RealizationParams,
+                });
+            }
+        }
+        bindings
     }
-    Ok(blobs)
 }
 
-fn bundled_body(body: &Body) -> bool {
-    body.status == BodyStatus::Active && body.kind == BodyKind::Camera
-}
-
-async fn load_listings(pool: &SqlitePool) -> Result<BTreeMap<String, LookListingRecord>> {
-    Ok(admin::look_listings(pool)
-        .await?
-        .into_iter()
-        .map(|record| (record.look.as_str().to_owned(), record))
-        .collect())
-}
-
-fn listed(listings: &BTreeMap<String, LookListingRecord>, look: &LookSlug) -> bool {
-    match listings.get(look.as_str()).map(|record| record.listing) {
-        Some(ListingState::Hidden | ListingState::Removed) => false,
-        Some(ListingState::Listed) | None => true,
-    }
-}
-
-/// Adds every artifact of one `(body, epoch)` bundle.
-async fn assemble(
+/// # Errors
+/// Propagates assembly, storage or serialization failures.
+pub(crate) async fn record_epoch_revision(
     pool: &SqlitePool,
     config: &WorkerConfig,
-    listings: &BTreeMap<String, LookListingRecord>,
-    resources: &BodyResources,
-    epoch: &Epoch,
-    candidate: &Candidate<'_>,
-    blobs: &mut Vec<ArtifactBlob>,
-) -> Result<()> {
-    if epoch.native_sims.is_empty() {
-        return Ok(());
+    snapshot_version: u64,
+    snapshot_root: &std::path::Path,
+    body: &BodyId,
+    epoch: u32,
+    body_state_version: BodyStateVersion,
+) -> Result<Option<(looklab_schema::MatchBundleRevisionId, SelectionScope)>> {
+    let Some(assembled) = assemble_epoch(
+        pool,
+        config,
+        snapshot_version,
+        snapshot_root,
+        body,
+        epoch,
+        body_state_version,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    persist_blobs(config, &assembled.blobs)?;
+    let manifest = assembled.manifest.manifest();
+    let artifacts = assembled.artifact_bindings();
+    let scope = assembled.scope;
+    let mut tx = model_store::begin_immediate(pool).await?;
+    let id = model_store::insert_bundle_revision(
+        &mut tx,
+        &model_store::NewBundleRevision {
+            body,
+            epoch,
+            manifest: &manifest,
+            artifacts: &artifacts,
+            dependencies: &[],
+        },
+        crate::clock::now_unix(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some((id, scope)))
+}
+
+struct Selected {
+    revision: StoredRealizationRevision,
+    scope: SelectionScope,
+}
+
+/// # Errors
+/// Propagates storage, blob or transform failures.
+pub(crate) async fn assemble_epoch(
+    pool: &SqlitePool,
+    config: &WorkerConfig,
+    snapshot_version: u64,
+    snapshot_root: &std::path::Path,
+    body: &BodyId,
+    epoch: u32,
+    body_state_version: BodyStateVersion,
+) -> Result<Option<AssembledBundle>> {
+    let resources = DataDir::new(snapshot_root).load(body)?;
+    let Some(control_epoch) = resources
+        .schema
+        .epochs
+        .iter()
+        .find(|candidate| candidate.id == epoch)
+    else {
+        return Ok(None);
+    };
+    if control_epoch.native_sims.is_empty() {
+        return Ok(None);
     }
-    let body = &resources.body.id;
-    let transform = TransformDir::new(&config.transforms).snapshot(body)?;
-    blobs.push(ArtifactBlob::new(
-        body_artifact(body, epoch.id)?,
-        resources.schema.source().as_bytes().to_vec(),
-    ));
-    blobs.push(ArtifactBlob::new(
-        transform_artifact(body, epoch.id)?,
-        transform,
-    ));
+    let mut conn = pool.acquire().await?;
+    let Some(state) = model_store::body_state(&mut conn, body, body_state_version).await? else {
+        return Ok(None);
+    };
+    drop(conn);
+    if state.stage != looklab_schema::BodyStateStage::Published {
+        return Err(WorkerError::Data(format!(
+            "{body} body state {} is not the published stage",
+            body_state_version.get()
+        )));
+    }
+    let schema_bytes = resources.schema.source().as_bytes().to_vec();
+    let mut blobs = vec![ArtifactBlob::new(
+        ArtifactName::new("body.yaml")?,
+        schema_bytes,
+    )];
+    read_pin(
+        config,
+        &state.pins.input_transform,
+        "transform.yaml",
+        &mut blobs,
+    )?;
+    if let Some(profile) = &state.pins.profile {
+        read_pin(config, profile, "profile.yaml", &mut blobs)?;
+    }
+    read_pin(
+        config,
+        &state.pins.body_params,
+        "body_params.json",
+        &mut blobs,
+    )?;
+    read_pin(config, &state.pins.gauge, "gauge.json", &mut blobs)?;
+    let body_params = state.pins.body_params.sha256;
     let mut sims = Vec::new();
     let mut excluded = Vec::new();
-    for sim in &epoch.native_sims {
-        let look = LookSlug::new(sim.look.as_str()).map_err(|_| {
-            WorkerError::Data(format!(
-                "native sim has an invalid Look `{}`",
-                sim.look.as_str()
-            ))
-        })?;
-        if !candidate.matches(body, epoch.id, &look, &sim.key) && !listed(listings, &look) {
-            excluded.push(ExcludedSim {
-                sim: sim.key.clone(),
-                reason: SimExclusion::NoPublishedLook,
+    let mut transform_version = None;
+    let mut params_version = None;
+    let mut qualified = true;
+    for native in &control_epoch.native_sims {
+        let selected = match select(pool, body, epoch, &native.key).await? {
+            Ok(selected) => selected,
+            Err(reason) => {
+                excluded.push(BundleExclusion {
+                    native_sim: native.key.clone(),
+                    reason,
+                });
+                continue;
+            }
+        };
+        if selected.revision.subject.body != *body
+            || selected.revision.subject.epoch.get() != epoch
+            || selected.revision.subject.native_sim != native.key
+            || selected.revision.target.family.as_str() != native.look.as_str()
+        {
+            excluded.push(BundleExclusion {
+                native_sim: native.key.clone(),
+                reason: BundleExclusionReason::IncompatibleRevision,
             });
             continue;
         }
-        match source(pool, config, body, epoch.id, &look, &sim.key, candidate).await? {
-            Source::Ready { base, crm } => {
-                let names = sim_artifacts(body, epoch.id, &sim.key)?;
-                blobs.push(ArtifactBlob::new(names.base.clone(), base));
-                blobs.push(ArtifactBlob::new(names.crm.clone(), crm));
-                sims.push(MatchSim {
-                    sim: sim.key.clone(),
-                    base: names.base,
-                    crm: names.crm,
-                    covariance: None,
-                });
+        let compatible = transform_version
+            .is_none_or(|version| version == selected.revision.input_transform_version)
+            && params_version
+                .is_none_or(|version| version == selected.revision.realization_params_version);
+        if !compatible {
+            excluded.push(BundleExclusion {
+                native_sim: native.key.clone(),
+                reason: BundleExclusionReason::IncompatibleRevision,
+            });
+            continue;
+        }
+        match bundle_sim(
+            config,
+            native.key.clone(),
+            selected,
+            body_params,
+            &mut blobs,
+        ) {
+            Ok((sim, transform, params, scope)) => {
+                transform_version.get_or_insert(transform);
+                params_version.get_or_insert(params);
+                qualified &= scope == SelectionScope::Qualified;
+                sims.push(sim);
             }
-            Source::NoLook => excluded.push(ExcludedSim {
-                sim: sim.key.clone(),
-                reason: SimExclusion::NoPublishedLook,
-            }),
-            Source::NoResponse => excluded.push(ExcludedSim {
-                sim: sim.key.clone(),
-                reason: SimExclusion::NoResponse,
+            Err(reason) => excluded.push(BundleExclusion {
+                native_sim: native.key.clone(),
+                reason,
             }),
         }
     }
-    let bundle = MatchBundle::new(body.clone(), epoch.id, sims, excluded)?;
-    blobs.push(ArtifactBlob::new(
-        bundle_artifact(body, epoch.id)?,
-        bundle.to_json()?,
-    ));
+    if sims.is_empty() {
+        return Ok(None);
+    }
+    let (Some(transform_version), Some(params_version)) = (transform_version, params_version)
+    else {
+        return Ok(None);
+    };
+    let manifest = MatchBundleRevision {
+        id: looklab_schema::MatchBundleRevisionId::from_digest([0; 32]),
+        body: body.clone(),
+        epoch: ControlEpochId::new(epoch),
+        schema_snapshot_version: snapshot_version,
+        input_transform_version: transform_version,
+        body_state_version,
+        body_realization_params_version: params_version,
+        sims,
+        excluded,
+        manifest_hash: looklab_schema::MatchBundleRevisionId::from_digest([0; 32]),
+        producer: SourceRef::new(format!("looklab-worker/{}", env!("CARGO_PKG_VERSION")))
+            .map_err(|error| WorkerError::Data(error.to_string()))?,
+        created_at: crate::clock::now_unix(),
+    }
+    .sealed();
+    Ok(Some(AssembledBundle {
+        manifest,
+        blobs,
+        scope: if qualified {
+            SelectionScope::Qualified
+        } else {
+            SelectionScope::Experimental
+        },
+    }))
+}
+
+fn digest(bytes: &[u8]) -> Result<Sha256Hex> {
+    Ok(Sha256Hex::from_bytes(Sha256::digest(bytes).into()))
+}
+
+fn persist_blobs(config: &WorkerConfig, blobs: &[ArtifactBlob]) -> Result<()> {
+    use looklab_server::{BlobHash, BlobStore as _, FsBlobStore};
+
+    let store =
+        FsBlobStore::new(&config.blobs).map_err(|error| WorkerError::Data(error.to_string()))?;
+    for blob in blobs {
+        let hash = BlobHash::of(&blob.bytes);
+        let path = config.blobs.join(hash.to_hex());
+        match std::fs::read(&path) {
+            Ok(existing) if existing == blob.bytes => continue,
+            Ok(_) => {
+                return Err(WorkerError::Data(format!(
+                    "{}: stored bytes do not match their content address",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                store
+                    .put(hash, &blob.bytes)
+                    .map_err(|error| WorkerError::Data(error.to_string()))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(())
 }
 
-enum Source {
-    Ready { base: Vec<u8>, crm: Vec<u8> },
-    NoLook,
-    NoResponse,
-}
-
-/// The sim's published realization on `body` for `epoch`, or the in-memory candidate.
-async fn source(
-    pool: &SqlitePool,
+fn read_pin(
     config: &WorkerConfig,
-    body: &BodyId,
-    epoch: u32,
-    look: &LookSlug,
-    sim: &SimKey,
-    candidate: &Candidate<'_>,
-) -> Result<Source> {
-    if candidate.matches(body, epoch, look, sim) {
-        return Ok(Source::Ready {
-            base: candidate.base.to_vec(),
-            crm: candidate.crm.to_vec(),
-        });
-    }
-    let rows = sqlx::query(
-        "SELECT m.artifacts FROM look_versions v
-         JOIN version_manifests m ON m.look_version_id = v.id
-         WHERE v.look = ? AND v.status IN ('published', 'rooted')
-           AND EXISTS (
-             SELECT 1 FROM release_body_params p
-             WHERE p.look = v.look AND p.version = v.version
-               AND p.body = ? AND p.stage = 'native')
-         ORDER BY v.version DESC",
-    )
-    .bind(look.as_str())
-    .bind(body.as_str())
-    .fetch_all(pool)
-    .await?;
-    if rows.is_empty() {
-        return Ok(Source::NoLook);
-    }
-    let mut unusable = false;
-    for row in &rows {
-        let artifacts: Vec<ManifestArtifact> =
-            serde_json::from_str(&row.get::<String, _>("artifacts"))?;
-        let (Some(crm), Some(base)) = (
-            artifact(&artifacts, CRM_ARTIFACT),
-            artifact(&artifacts, LOOK_ARTIFACT),
-        ) else {
-            unusable = true;
-            continue;
-        };
-        let crm_bytes = read_blob(config, crm)?;
-        let Ok(model) = looklab_model::realization::decode_crm(&crm_bytes) else {
-            unusable = true;
-            continue;
-        };
-        if model.body != *body || model.epoch != epoch {
-            continue;
-        }
-        if model.base_sim != *sim {
-            return Ok(Source::NoResponse);
-        }
-        return Ok(Source::Ready {
-            base: read_blob(config, base)?,
-            crm: crm_bytes,
-        });
-    }
-    Ok(if unusable {
-        Source::NoResponse
-    } else {
-        Source::NoLook
-    })
-}
-
-fn artifact<'a>(artifacts: &'a [ManifestArtifact], name: &str) -> Option<&'a ManifestArtifact> {
-    artifacts.iter().find(|artifact| artifact.name == name)
-}
-
-fn read_blob(config: &WorkerConfig, artifact: &ManifestArtifact) -> Result<Vec<u8>> {
-    let path = config.blobs.join(&artifact.sha256);
+    binding: &ArtifactBinding,
+    name: &str,
+    blobs: &mut Vec<ArtifactBlob>,
+) -> Result<()> {
+    let hash = binding.sha256.to_hex();
+    let path = config.blobs.join(&hash);
     let bytes = std::fs::read(&path)
         .map_err(|error| WorkerError::Data(format!("{}: {error}", path.display())))?;
-    let digest = db::hex(&Sha256::digest(&bytes));
-    if digest != artifact.sha256 {
+    let actual = digest(&bytes)?.to_hex();
+    if actual != hash {
         return Err(WorkerError::Data(format!(
-            "{}: bytes hash to {digest}, manifest records {}",
-            artifact.name, artifact.sha256
+            "{}: bytes hash to {actual}, the body state pins {hash}",
+            path.display()
         )));
     }
-    Ok(bytes)
+    blobs.push(ArtifactBlob::new(ArtifactName::new(name)?, bytes));
+    Ok(())
+}
+
+fn bundle_sim(
+    config: &WorkerConfig,
+    sim: looklab_schema::SimKey,
+    selected: Selected,
+    body_params: Sha256Hex,
+    blobs: &mut Vec<ArtifactBlob>,
+) -> std::result::Result<(BundleSimEntry, u32, u32, SelectionScope), BundleExclusionReason> {
+    let Selected { revision, scope } = selected;
+    let base = binding(&revision, ArtifactRole::Look)
+        .ok_or(BundleExclusionReason::NoPublishedRealization)?;
+    let crm = binding(&revision, ArtifactRole::ControlResponse)
+        .ok_or(BundleExclusionReason::NoControlResponse)?;
+    let covariance = binding(&revision, ArtifactRole::Covariance);
+    let realization_params = binding(&revision, ArtifactRole::RealizationParams)
+        .ok_or(BundleExclusionReason::IncompatibleRevision)?;
+    for binding in [Some(base), Some(crm), covariance, Some(realization_params)]
+        .into_iter()
+        .flatten()
+    {
+        read(config, binding, blobs)?;
+    }
+    Ok((
+        BundleSimEntry {
+            native_sim: sim,
+            realization: revision.id.clone(),
+            family_version: revision.target.clone(),
+            base_artifact: base.sha256,
+            control_response: crm.sha256,
+            covariance: covariance.map(|binding| binding.sha256),
+            control_response_version: revision.control_response_version,
+            clip_k: revision.clip_k,
+            realization_params_version: revision.realization_params_version,
+            body_params: Some(body_params),
+            realization_params: Some(realization_params.sha256),
+        },
+        revision.input_transform_version,
+        revision.realization_params_version,
+        scope,
+    ))
+}
+
+fn binding(revision: &StoredRealizationRevision, role: ArtifactRole) -> Option<&ArtifactBinding> {
+    revision
+        .artifacts
+        .iter()
+        .find(|binding| binding.role == role)
+}
+
+fn read(
+    config: &WorkerConfig,
+    binding: &ArtifactBinding,
+    blobs: &mut Vec<ArtifactBlob>,
+) -> std::result::Result<(), BundleExclusionReason> {
+    let hash = binding.sha256.to_hex();
+    if blobs.iter().any(|blob| blob.name.as_str() == hash.as_str()) {
+        return Ok(());
+    }
+    let path = config.blobs.join(&hash);
+    let bytes = std::fs::read(&path).map_err(|_| BundleExclusionReason::IncompatibleRevision)?;
+    if db::hex(&Sha256::digest(&bytes)) != hash {
+        return Err(BundleExclusionReason::IncompatibleRevision);
+    }
+    let name =
+        ArtifactName::new(hash.clone()).map_err(|_| BundleExclusionReason::IncompatibleRevision)?;
+    blobs.push(ArtifactBlob::new(name, bytes));
+    Ok(())
+}
+
+async fn select(
+    pool: &SqlitePool,
+    body: &BodyId,
+    epoch: u32,
+    sim: &looklab_schema::SimKey,
+) -> Result<std::result::Result<Selected, BundleExclusionReason>> {
+    let subject = ModelSubject::BodyRealization {
+        realization: BodyRealizationId {
+            body: body.clone(),
+            epoch: ControlEpochId::new(epoch),
+            native_sim: sim.clone(),
+        },
+    }
+    .key();
+    let mut conn = pool.acquire().await?;
+    let projections =
+        model_store::current_projections(&mut conn, &subject, ProjectionUse::QualifiedMatch)
+            .await?;
+    let qualified = projections.iter().find_map(|projection| {
+        (projection.capability == QualificationCapability::ControlsMatching
+            && projection.applicability.is_current())
+        .then(|| projection.selected_candidate.clone())
+        .flatten()
+    });
+    let mut revisions = model_store::realization_revisions(&mut conn, Some(&subject)).await?;
+    revisions.sort_by_key(|revision| revision.version);
+    let had_revisions = !revisions.is_empty();
+    let qualified_position = match qualified {
+        Some(ModelVersionId::BodyRealization { realization }) => {
+            revisions.iter().position(|revision| {
+                RealizationRevisionId::for_version(&realization) == revision.id
+                    && revision.status == RealizationStatus::Candidate
+                    && revision.safety.accepted()
+            })
+        }
+        _ => None,
+    };
+    if let Some(position) = qualified_position {
+        let revision = revisions.remove(position);
+        return Ok(Ok(Selected {
+            revision,
+            scope: SelectionScope::Qualified,
+        }));
+    }
+    for revision in revisions.into_iter().rev() {
+        if revision.status != RealizationStatus::Candidate || !revision.safety.accepted() {
+            continue;
+        }
+        let published = PublishedTargetId::from(&revision.target);
+        let eligible = model_store::target_eligibility(&mut conn, &published)
+            .await?
+            .is_some_and(|eligibility| eligibility.status == TargetEligibilityStatus::Eligible);
+        if !eligible {
+            continue;
+        }
+        return Ok(Ok(Selected {
+            revision,
+            scope: SelectionScope::Experimental,
+        }));
+    }
+    Ok(Err(if had_revisions {
+        BundleExclusionReason::IncompatibleRevision
+    } else {
+        BundleExclusionReason::NoPublishedRealization
+    }))
 }

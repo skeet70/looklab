@@ -5,7 +5,9 @@ pub mod admin;
 mod api;
 mod audit;
 mod blob;
+mod body_context;
 pub mod body_schema;
+pub mod client_errors;
 mod config;
 mod db;
 mod error;
@@ -29,16 +31,35 @@ use axum::{Router, middleware};
 use tokio::net::TcpListener;
 use tracing::Instrument as _;
 
+pub use blob::{BlobError, BlobHash, BlobStore, FsBlobStore, write_guarded};
 pub use config::{Config, CorsOrigin, PowConfig, SiteConfig};
 pub use db::{DbError, open as open_database};
 pub use ids::{
-    ContributionId, CredentialId, EndorsementId, GrantId, LookVersionId, ModerationDecisionId,
-    ProposalId, RootAdmissionId, StatusToken,
+    ContributionId, CredentialId, EndorsementId, GrantId, JobId, LookVersionId,
+    ModerationDecisionId, ProposalId, RootAdmissionId, StatusToken,
 };
+pub use proposals::expire_stale_lut_uploads;
 pub use state::{AppState, ModSessions};
+pub use store::active_snapshot_identity;
 pub use store::request_publication;
 pub use trust::{CredentialStanding, DefaultTrustPolicy, Tier, TrustPolicy};
+
+/// Reads the live confirmation state used by publication.
+///
+/// # Errors
+/// A stored confirmation row is unreadable.
+pub async fn manual_summary(
+    db: &sqlx::SqlitePool,
+    camera: &looklab_schema::ManualCamera,
+) -> Result<looklab_schema::ManualConfirmationSummary, sqlx::Error> {
+    manual_confirm::summary(db, camera).await
+}
 pub use verify::{RequestDomain, request_digest};
+
+pub mod manual_confirm;
+pub mod manuals;
+mod model_events;
+pub mod model_store;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -52,6 +73,27 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(api::passkey::register_finish),
         )
         .route("/api/upload", post(api::upload::upload))
+        .route("/api/client-errors", post(api::client_errors::report))
+        .route("/api/body-context", get(api::body_context::registered))
+        .route("/api/manuals/{make}/{model}", get(api::manual::page))
+        .route(
+            "/api/manual-confirmations/{make}/{model}",
+            get(api::manual::summary),
+        )
+        .route(
+            "/api/manual-confirmations",
+            post(api::manual::confirm).layer(DefaultBodyLimit::max(
+                looklab_schema::MAX_CONFIRMATION_BYTES + 128 * 1024,
+            )),
+        )
+        .route(
+            "/api/manual-confirmations/withdraw",
+            post(api::manual::withdraw_confirmation),
+        )
+        .route(
+            "/api/manual-confirmations/{make}/{model}/{key}/moderate",
+            post(api::manual::moderate),
+        )
         .route(
             "/api/session",
             post(api::status::session).get(api::status::restore_session),
@@ -74,6 +116,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/mod/look/{action}",
             post(api::moderation::look_listing),
         )
+        .route(
+            "/api/mod/credential/block",
+            post(api::moderation::block_intake),
+        )
         .route("/api/proposals", post(api::proposals::submit))
         .route("/api/proposals/confirm", post(api::proposals::confirm))
         .route("/api/proposals/thread", post(api::proposals::thread))
@@ -82,6 +128,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(api::proposals::proposer_message),
         )
         .route("/api/proposals/{id}", get(api::proposals::proposal))
+        .route("/api/proposals/{id}/detail", get(api::proposals::detail))
         .route("/api/mod/proposal/{id}", get(api::proposals::mod_proposal))
         .route(
             "/api/mod/proposal-message",
@@ -98,6 +145,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/api/fixtures/manifest.toml",
             get(api::proposals::fixture_manifest),
+        )
+        .route(
+            "/api/proposals/lut",
+            post(api::proposals::submit_lut).layer(DefaultBodyLimit::max(
+                usize::try_from(looklab_schema::MAX_LUT_BYTES).unwrap_or(usize::MAX)
+                    + looklab_schema::FIXTURE_UPLOAD_HEADER_MAX
+                    + 32,
+            )),
         )
         .route("/api/recipes", get(api::bounties::recipes))
         .route("/api/cards/verification", get(api::cards::verifications))

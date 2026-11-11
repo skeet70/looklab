@@ -8,6 +8,10 @@ pub struct WorkerConfig {
     pub blobs: PathBuf,
     /// Body and control-schema snapshots (`data/bodies`).
     pub data: PathBuf,
+    /// Documentation-derived camera catalog directory.
+    pub manuals: PathBuf,
+    /// Approved community snapshots (`data/community/v<version>`).
+    pub snapshot_dir: PathBuf,
     /// Publication root passed to [`looklab_publish::write_site`]; receives `data/`.
     pub site: PathBuf,
     /// Fixed camera-to-XYZ matrices, one `<make>-<model>.yaml` per body.
@@ -30,6 +34,8 @@ impl WorkerConfig {
             db: db.into(),
             blobs: blobs.into(),
             data: PathBuf::from("data"),
+            manuals: PathBuf::from("data/manuals"),
+            snapshot_dir: PathBuf::from("data/community"),
             site: PathBuf::from("site"),
             transforms: PathBuf::from("data/transforms"),
             seed: 0x5eed_1a5e,

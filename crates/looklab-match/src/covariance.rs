@@ -11,6 +11,7 @@ use looklab_model::{CoefTerm, Look, LookInput, realization};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{MatchError, Result};
+use crate::metric::ScoringMetric;
 use crate::model::MatchModel;
 
 pub const MAX_RANK: usize = 20;
@@ -51,6 +52,11 @@ impl SparseDelta {
             }
         }
         out
+    }
+
+    pub fn project_checked(&self, jacobian: &[CoefTerm]) -> Option<[f64; 3]> {
+        let out = self.project(jacobian);
+        out.iter().all(|value| value.is_finite()).then_some(out)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -276,22 +282,59 @@ fn jacobi(matrix: &mut [Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
 }
 
 /// `tr Cov_pred(k,u,p)`, including the extrapolation inflation of docs/04 §2.
-pub fn predicted_trace(model: &MatchModel, settings: &Settings, xyz: Xyz) -> Result<f64> {
+pub fn predicted_trace(
+    model: &MatchModel,
+    settings: &Settings,
+    metric: ScoringMetric,
+    xyz: Xyz,
+) -> Result<Option<f64>> {
     let realization = model.realize(settings)?;
-    trace_with(model, &realization, settings, xyz)
+    trace_with(model, &realization, settings, metric, xyz)
+}
+
+/// `tr Cov_pred(k,u,p)`, or `None` where the rendered derivative is unavailable.
+pub fn realized_trace(
+    model: &MatchModel,
+    realization: &realization::Realization,
+    settings: &Settings,
+    metric: ScoringMetric,
+    xyz: Xyz,
+) -> Result<Option<f64>> {
+    trace_with(model, realization, settings, metric, xyz)
 }
 
 pub(crate) fn trace_with(
     model: &MatchModel,
     realization: &realization::Realization,
     settings: &Settings,
+    metric: ScoringMetric,
     xyz: Xyz,
-) -> Result<f64> {
+) -> Result<Option<f64>> {
     if model.groups.is_empty() {
-        return Ok(0.0);
+        return Ok(Some(0.0));
+    }
+    let mut active = false;
+    for group in &model.groups {
+        if value_weight(&model.crm, settings, &group.key, &group.value) != 0.0 {
+            active = true;
+            break;
+        }
+    }
+    if !active {
+        return Ok(Some(0.0));
     }
     let input = LookInput::new(model.input_xyz(realization, xyz));
     let jacobian = realization.look.coef_jacobian(&input);
+    let render_jacobian = match metric {
+        ScoringMetric::LegacyPreClipV1 => None,
+        ScoringMetric::RenderedPostClipV1 => {
+            let pre = model.pre_clip_ucs(realization, xyz, [0.0, 0.0], 0.0);
+            match model.output_pin(realization).render_jacobian(pre) {
+                Some(jacobian) => Some(jacobian),
+                None => return Ok(None),
+            }
+        }
+    };
     let mut trace = 0.0_f64;
     let mut derivatives: Option<([f64; 3], [f64; 3], [f64; 3])> = None;
     for group in &model.groups {
@@ -300,12 +343,19 @@ pub(crate) fn trace_with(
             continue;
         }
         for term in &group.terms {
-            let mut vector = term.delta.project(&jacobian);
+            let Some(mut vector) = term.delta.project_checked(&jacobian) else {
+                return Ok(None);
+            };
+            if let Some(render_jacobian) = &render_jacobian {
+                vector = render_jacobian.mul_vec(vector);
+            }
             if term.wb != [0.0, 0.0] {
                 let (d_r, d_b, _) = match derivatives {
                     Some(value) => value,
                     None => {
-                        let value = wb_derivatives(model, realization, xyz);
+                        let Some(value) = wb_derivatives(model, realization, metric, xyz) else {
+                            return Ok(None);
+                        };
                         derivatives = Some(value);
                         value
                     }
@@ -318,7 +368,7 @@ pub(crate) fn trace_with(
             trace += weight * weight * term.eigenvalue * norm;
         }
     }
-    Ok(trace * model.crm.support.inflation(settings))
+    Ok(Some(trace * model.crm.support.inflation(settings)))
 }
 
 fn value_weight(
@@ -338,14 +388,18 @@ fn value_weight(
 fn wb_derivatives(
     model: &MatchModel,
     realization: &realization::Realization,
+    metric: ScoringMetric,
     xyz: Xyz,
-) -> ([f64; 3], [f64; 3], [f64; 3]) {
+) -> Option<([f64; 3], [f64; 3], [f64; 3])> {
     let step = 1e-4;
-    let base = model.input_ucs(realization, xyz, [0.0, 0.0], 0.0);
-    let red = model.input_ucs(realization, xyz, [step, 0.0], 0.0);
-    let blue = model.input_ucs(realization, xyz, [0.0, step], 0.0);
-    let exposure = model.input_ucs(realization, xyz, [0.0, 0.0], step);
-    (
+    let evaluate = |wb: [f64; 2], exposure: f64| {
+        model.try_scored_ucs_shifted(metric, realization, xyz, wb, exposure)
+    };
+    let base = evaluate([0.0, 0.0], 0.0)?;
+    let red = evaluate([step, 0.0], 0.0)?;
+    let blue = evaluate([0.0, step], 0.0)?;
+    let exposure = evaluate([0.0, 0.0], step)?;
+    Some((
         [
             (red.j - base.j) / step,
             (red.a - base.a) / step,
@@ -361,5 +415,5 @@ fn wb_derivatives(
             (exposure.a - base.a) / step,
             (exposure.b - base.b) / step,
         ],
-    )
+    ))
 }

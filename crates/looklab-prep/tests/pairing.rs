@@ -4,7 +4,7 @@ use looklab_meta::{
     CaptureTime, ExifData, FujiMakernote, ImageNumber, LookSettings, ParsedMetadata, ParsedTag,
     SubSec,
 };
-use looklab_prep::{JpegRole, LocalImageKey, PairingFile, UnpairedReason, pair};
+use looklab_prep::{CameraIdentity, JpegRole, LocalImageKey, PairingFile, UnpairedReason, pair};
 
 fn key(name: &str) -> LocalImageKey {
     LocalImageKey::new(name).expect("valid file name")
@@ -402,6 +402,61 @@ fn unsupported_file_kinds_are_reported() {
         outcome.unpaired[0].reason,
         UnpairedReason::UnsupportedFileKind
     );
+}
+
+#[test]
+fn a_raw_model_that_repeats_the_make_pairs_with_the_bare_model() {
+    let raw = file(
+        "B_31325.3FR",
+        &metadata(
+            "Hasselblad",
+            "Hasselblad X2D II 100C",
+            Some(capture(9, None)),
+            None,
+            None,
+        ),
+    );
+    let jpeg = file(
+        "B_31325.JPG",
+        &metadata(
+            "Hasselblad",
+            "X2D II 100C",
+            Some(capture(9, None)),
+            None,
+            None,
+        ),
+    );
+    let outcome = pair(&[raw, jpeg]);
+    assert_eq!(outcome.pairs.len(), 1);
+    assert_eq!(outcome.pairs[0].raw, key("B_31325.3FR"));
+    assert_eq!(outcome.pairs[0].jpegs[0].key, key("B_31325.JPG"));
+    assert!(outcome.unpaired.is_empty());
+}
+
+#[test]
+fn a_model_that_repeats_the_make_normalises_to_the_bare_model() {
+    let hasselblad = CameraIdentity::new("Hasselblad", "Hasselblad X2D II 100C").expect("identity");
+    assert_eq!(hasselblad.make(), "hasselblad");
+    assert_eq!(hasselblad.model(), "x2d ii 100c");
+    assert!(hasselblad.matches("Hasselblad", "X2D II 100C"));
+    assert!(hasselblad.matches("  hasselblad ", " HASSELBLAD X2D II 100C "));
+    assert!(!hasselblad.matches("Hasselblad", "X1D II 50C"));
+
+    let fuji = CameraIdentity::new("FUJIFILM", "X-S10").expect("identity");
+    assert_eq!((fuji.make(), fuji.model()), ("fujifilm", "x-s10"));
+    assert!(fuji.matches("Fujifilm", "X-S10"));
+    assert!(!fuji.matches("FUJIFILM", "X-S10 II"));
+
+    let same = CameraIdentity::new("Hasselblad", "Hasselblad").expect("identity");
+    assert_eq!(same.model(), "hasselblad");
+    assert!(same.matches("Hasselblad", "Hasselblad"));
+}
+
+#[test]
+fn camera_matching_keeps_make_and_model_separate() {
+    let identity = CameraIdentity::new("Maker Camera", "Model").expect("identity");
+    assert!(identity.matches("MAKER CAMERA", "Model"));
+    assert!(!identity.matches("Maker", "Camera Model"));
 }
 
 #[test]

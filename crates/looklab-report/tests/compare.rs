@@ -567,3 +567,17 @@ fn worst_probes_are_ordered_and_hue_bins_cover_the_circle() {
     );
     assert_eq!(hue_bins().len(), 24);
 }
+
+#[test]
+fn an_infeasible_published_render_is_unsupported() {
+    let probe_set = looklab_model::probes::v1();
+    let probe = probe_set
+        .probes
+        .iter()
+        .find(|probe| probe.id == ProbeId::new("gray-s+0.00"))
+        .expect("neutral probe");
+    assert_eq!(base_look().support(probe), Support::Supported);
+    let mut shifted = base_look();
+    shifted.color.lambda.plane.fill(400.0);
+    assert_eq!(shifted.support(probe), Support::Unsupported);
+}

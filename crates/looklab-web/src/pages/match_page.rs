@@ -8,7 +8,7 @@ use crate::{match_data, ui};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::{use_params_map, use_query_map};
-use looklab_match::Permalink;
+use looklab_match::{AssessmentStatus, Permalink, ReachabilityStatus, SettingsSupport};
 use looklab_schema::BodyId;
 use looklab_wasm::{MatchInputs, MatchReply, decode_match_reply, encode_match_request};
 use std::sync::Arc;
@@ -50,6 +50,130 @@ impl Application {
     }
 }
 
+/// What the published catalog can offer the camera match wizard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatchAvailability {
+    /// At least one public look has a matchable version.
+    Matchable,
+    /// Public looks are published, but none has a matchable version.
+    PreviewOnly,
+    /// No public look has a published version.
+    NoPublishedLooks,
+}
+
+impl MatchAvailability {
+    fn of(index: &looklab_publish::SiteIndex) -> Self {
+        if super::looks::CatalogAvailability::of(index)
+            == super::looks::CatalogAvailability::NoPublishedLooks
+        {
+            return Self::NoPublishedLooks;
+        }
+        if index.looks.iter().any(|look| {
+            look.visibility == looklab_publish::LookVisibility::Public
+                && crate::selection::catalog_version(look).is_some_and(|version| version.matchable)
+        }) {
+            Self::Matchable
+        } else {
+            Self::PreviewOnly
+        }
+    }
+}
+
+fn camera_output_encodings(
+    body: &looklab_publish::BodyPage,
+) -> Vec<looklab_schema::OutputEncoding> {
+    let mut choices = vec![looklab_schema::OutputEncoding::Srgb];
+    for space in &body.capabilities.jpeg_color_spaces {
+        if let Ok(encoding) = looklab_schema::OutputEncoding::parse(space)
+            && !choices.contains(&encoding)
+        {
+            choices.push(encoding);
+        }
+    }
+    choices
+}
+
+fn output_encoding_label(encoding: looklab_schema::OutputEncoding) -> &'static str {
+    match encoding {
+        looklab_schema::OutputEncoding::Srgb => "sRGB",
+        looklab_schema::OutputEncoding::AdobeRgb => "Adobe RGB",
+        looklab_schema::OutputEncoding::Rec2020 => "Rec. 2020",
+        looklab_schema::OutputEncoding::DisplayP3 => "Display P3",
+        looklab_schema::OutputEncoding::ProPhoto => "ProPhoto RGB",
+    }
+}
+
+fn reachability_text(reachability: &looklab_wasm::dto::ReachabilityDto) -> String {
+    let base = if reachability.assessed == 0 {
+        match reachability.status {
+            ReachabilityStatus::NoRecipeFound => format!(
+                "No recipe found: {} of {} rendered points stay within {:.1} ΔE; no assessed target uncertainty or validated domain covers these points.",
+                reachability.within_tolerance, reachability.evaluated, reachability.tolerance
+            ),
+            _ => "Reachability is unassessed: no assessed target uncertainty or validated domain covers these points.".to_owned(),
+        }
+    } else {
+        match reachability.status {
+            ReachabilityStatus::Reachable => format!(
+                "One settings recipe is predicted to stay within {:.1} ΔE at every assessed point ({} of {} assessed).",
+                reachability.tolerance, reachability.within_assessed, reachability.declared
+            ),
+            ReachabilityStatus::Partial => format!(
+                "Partial predicted reachability: {} of {} assessed points stay within {:.1} ΔE with one settings recipe.",
+                reachability.within_assessed, reachability.declared, reachability.tolerance
+            ),
+            ReachabilityStatus::NoRecipeFound => format!(
+                "No recipe found: {} of {} assessed points stay within {:.1} ΔE with one settings recipe.",
+                reachability.within_assessed, reachability.assessed, reachability.tolerance
+            ),
+            ReachabilityStatus::Unassessed => {
+                "Reachability is unassessed for these points.".to_owned()
+            }
+        }
+    };
+    let rendered = format!(
+        "Rendered evaluation: {} of {} evaluated points within {:.1} ΔE.",
+        reachability.within_tolerance, reachability.evaluated, reachability.tolerance
+    );
+    let settings = match reachability.settings {
+        SettingsSupport::Assessed => "settings support assessed",
+        SettingsSupport::Extrapolated => "settings support extrapolated",
+        SettingsSupport::Missing => "settings support missing",
+    };
+    let domain = if reachability.domain_assessed {
+        "validated assessment domain"
+    } else {
+        "no validated assessment domain"
+    };
+    let uncertainty = match reachability.uncertainty {
+        AssessmentStatus::Assessed => "target uncertainty assessed",
+        AssessmentStatus::Partial => "target uncertainty partial",
+        AssessmentStatus::Unassessed => "target uncertainty unassessed",
+    };
+    format!("{base} {rendered} Evidence: {settings}; {domain}; {uncertainty}.")
+}
+
+fn joint_uncertainty_text(status: AssessmentStatus) -> &'static str {
+    match status {
+        AssessmentStatus::Assessed => "Joint prediction-minus-target uncertainty is assessed.",
+        AssessmentStatus::Partial => {
+            "Joint prediction-minus-target uncertainty is partially assessed."
+        }
+        AssessmentStatus::Unassessed => {
+            "Joint prediction-minus-target uncertainty is unassessed: no target/camera cross-covariance."
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MatchCompletion {
+    reply: MatchReply,
+    inputs: MatchInputs,
+    scope: looklab_publish::SelectionScope,
+    blockers: Vec<String>,
+    camera_model_provenance: looklab_publish::CameraModelProvenance,
+}
+
 #[component]
 pub fn MatchPage() -> impl IntoView {
     let query = use_query_map();
@@ -61,14 +185,26 @@ pub fn MatchPage() -> impl IntoView {
     let epoch = RwSignal::new(None::<u32>);
     let emphasis = RwSignal::new(looklab_match::Emphasis::Balanced);
     let step = RwSignal::new(ui::StepIndex(0));
+    let furthest = RwSignal::new(ui::StepIndex(0));
     let application = RwSignal::new(Application::Camera);
     let scene = RwSignal::new(None::<Arc<looklab_publish::PreparedScene>>);
     let scene_error = RwSignal::new(None::<String>);
     let auto_run = RwSignal::new(false);
     let running = RwSignal::new(false);
-    let reply = RwSignal::new(None::<MatchReply>);
+    let reply = RwSignal::new(None::<MatchCompletion>);
     let error = RwSignal::new(None::<String>);
+    let blockers = RwSignal::new(Vec::<String>::new());
+    let mode = RwSignal::new(looklab_publish::SelectionScope::Qualified);
+    let target_version = RwSignal::new(None::<String>);
+    let wb_modes = RwSignal::new(Vec::<looklab_schema::WbModeKey>::new());
+    let firmwares = RwSignal::new(Vec::<looklab_schema::FirmwareId>::new());
+    let wb_choice = RwSignal::new(None::<looklab_schema::WbModeKey>);
+    let fw_choice = RwSignal::new(None::<looklab_schema::FirmwareId>);
+    let output_encoding = RwSignal::new(looklab_schema::OutputEncoding::Srgb);
     let run = Callback::new(move |()| {
+        if application.get_untracked() != Application::Camera {
+            return;
+        }
         if running.get_untracked() {
             return;
         }
@@ -89,29 +225,60 @@ pub fn MatchPage() -> impl IntoView {
             return;
         }
         let application_value = application.get_untracked();
+        let mode_value = mode.get_untracked();
+        let wb_value = wb_choice.get_untracked();
+        let fw_value = fw_choice.get_untracked();
+        let output_value = output_encoding.get_untracked();
         running.set(true);
         error.set(None);
+        blockers.set(Vec::new());
         spawn_local(async move {
             let result = async {
                 let index = data::index().await?;
+                let requested = query.get_untracked().get("version");
                 let version = index
                     .looks
                     .iter()
                     .find(|look| look.slug == slug)
-                    .and_then(|look| look.latest())
+                    .and_then(|look| match requested.as_deref() {
+                        Some(version) => look
+                            .versions
+                            .iter()
+                            .find(|entry| entry.version.as_str() == version),
+                        None => crate::selection::catalog_version(look),
+                    })
                     .filter(|version| version.matchable)
                     .ok_or("Choose a matchable published look.")?
                     .version
                     .to_string();
+                target_version.set(Some(version.clone()));
                 let loaded = data::match_version(slug.as_str(), &version).await?;
-                let inputs = match_data::inputs_for_camera(
-                    &loaded,
-                    &camera_id,
-                    &emphasis_value,
-                    epoch_value,
-                    0x5eed_1234,
-                )?;
-                match_worker(&inputs).await
+                let page = data::look(slug.as_str()).await?;
+                let Some(body_page) = body.get_untracked() else {
+                    return Err("Camera settings are not loaded.".to_owned());
+                };
+                let scoped = match_data::inputs_for_camera(match_data::MatchRequest {
+                    version: &loaded,
+                    page: &page,
+                    body_page: &body_page,
+                    camera: &camera_id,
+                    emphasis: &emphasis_value,
+                    epoch: epoch_value,
+                    seed: 0x5eed_1234,
+                    mode: mode_value,
+                    wb_mode: wb_value,
+                    firmware: fw_value,
+                    output_encoding: output_value,
+                })
+                .await?;
+                let reply = match_worker(&scoped.inputs).await?;
+                Ok::<_, String>(MatchCompletion {
+                    reply,
+                    inputs: scoped.inputs,
+                    scope: scoped.scope,
+                    blockers: scoped.blockers,
+                    camera_model_provenance: scoped.camera_model_provenance,
+                })
             }
             .await;
             if camera.is_disposed() {
@@ -184,6 +351,9 @@ pub fn MatchPage() -> impl IntoView {
         body.set(None);
         epoch.set(None);
         camera_error.set(None);
+        if application.get() != Application::Camera {
+            return;
+        }
         let Some(chosen) = chosen else {
             return;
         };
@@ -213,7 +383,38 @@ pub fn MatchPage() -> impl IntoView {
                 .is_some_and(|page| Some(&page.id) == selected_camera.as_ref())
     });
     Effect::new(move |_| {
-        if auto_run.get() && choices_ready.get() {
+        let Some(page) = body.get() else {
+            wb_modes.set(Vec::new());
+            firmwares.set(Vec::new());
+            wb_choice.set(None);
+            fw_choice.set(None);
+            return;
+        };
+        let Some(epoch_value) = epoch.get() else {
+            return;
+        };
+        spawn_local(async move {
+            let Ok(index) = data::index().await else {
+                return;
+            };
+            if let Ok((wb, fw)) = data::bundle_modes(&index, &page, epoch_value).await {
+                wb_choice.set(if wb.len() == 1 {
+                    Some(wb[0].clone())
+                } else {
+                    None
+                });
+                fw_choice.set(if fw.len() == 1 {
+                    Some(fw[0].clone())
+                } else {
+                    None
+                });
+                wb_modes.set(wb);
+                firmwares.set(fw);
+            }
+        });
+    });
+    Effect::new(move |_| {
+        if application.get() == Application::Camera && auto_run.get() && choices_ready.get() {
             auto_run.set(false);
             run.run(());
         }
@@ -221,24 +422,62 @@ pub fn MatchPage() -> impl IntoView {
     view! {
         <div class="match-page">
         <header class="match-heading">
-            <p class="eyebrow">"Made for your camera"</p>
+            <p class="eyebrow">"Tuned for your camera"</p>
             <h1>"Get the look"</h1>
-            <p class="lede">"Choose a look. Get a recipe you can take out shooting."</p>
+            <p class="lede">"Dial it in. Take it out into the world."</p>
         </header>
+        <OutputMethodPicker application on_change=Callback::new(move |choice| {
+            application.set(choice);
+            reply.set(None);
+            error.set(None);
+            auto_run.set(false);
+            step.set(ui::StepIndex(0));
+            furthest.set(ui::StepIndex(0));
+        })/>
         {move || if let Some(value) = reply.get() { view! {
             <button class="secondary" on:click=move |_| reply.set(None)>
                 "Change choices"
             </button>
-            <MatchResult reply=value application=application.get()/>
+            <MatchResult reply=value.reply inputs=value.inputs application=application.get() scope=value.scope blockers=value.blockers camera_model_provenance=value.camera_model_provenance/>
         }.into_any() } else { match state.get() {
             Load::Loading => ui::loading().into_any(), Load::Failed(error) => ui::failure(&error).into_any(),
             Load::Ready(index) => {
                 crate::prefetch::route_rendered();
-                let items = index.looks.iter().filter(|look| look.visibility == looklab_publish::LookVisibility::Public).filter_map(|look| look.latest().filter(|version| version.matchable).map(|version| ui::LookCardItem {
-                    slug: look.slug.clone(), version: version.version.clone(), name: look.name.clone(),
-                    origin: ui::LookOrigin::BuiltIn { cameras: index.bodies.iter().filter(|body| body.looks.contains(&look.slug)).map(|body| format!("{} {}", body.make, body.model)).collect() },
-                    character: String::new(), status: version.status, lut: None,
-                })).collect::<Vec<_>>();
+                // Non-camera output resolves and validates its own target, independent of camera availability.
+                if application.get() != Application::Camera {
+                    let requested = match query.get_untracked().get("version")
+                        .map(looklab_model::file::LookVersion::new).transpose()
+                    {
+                        Ok(version) => version,
+                        Err(error) => return ui::failure(&format!("Invalid target version: {error}")).into_any(),
+                    };
+                    return view! {
+                        <TargetOutput index selected scene application=application.get() requested/>
+                    }.into_any();
+                }
+                let availability = MatchAvailability::of(&index);
+                if availability == MatchAvailability::NoPublishedLooks {
+                    return ui::no_published_looks().into_any();
+                }
+                if availability == MatchAvailability::PreviewOnly {
+                    return view! {
+                        <ui::EmptyState title="No looks are ready for matching yet".to_owned() message="Matching becomes available when a look has enough supported data. Share RAW and JPEG pairs to help build it.".to_owned()>
+                            <p class="field-row">
+                                <a class="button" href=crate::base::site_url("/contribute")>"Share photos you already have"</a>
+                                <a href=crate::base::site_url("/about/how-it-works")>"How looks are made →"</a>
+                            </p>
+                        </ui::EmptyState>
+                    }.into_any();
+                }
+                let items = index.looks.iter().filter(|look| look.visibility == looklab_publish::LookVisibility::Public).filter_map(|look| {
+                    let version = crate::selection::catalog_version(look).filter(|version| version.matchable)?;
+                    let (scope, blockers) = crate::selection::catalog_scope(look);
+                    Some(ui::LookCardItem {
+                        slug: look.slug.clone(), version: version.version.clone(), name: look.name.clone(),
+                        origin: ui::LookOrigin::BuiltIn { cameras: index.bodies.iter().filter(|body| body.looks.contains(&look.slug)).map(|body| format!("{} {}", body.make, body.model)).collect() },
+                        character: String::new(), status: version.status, scope, blockers, lut: None,
+                    })
+                }).collect::<Vec<_>>();
                 let items = StoredValue::new(items);
                 view! {
                     <fieldset class="match-wizard" aria-label="Look choices" disabled=move || running.get()>
@@ -246,9 +485,9 @@ pub fn MatchPage() -> impl IntoView {
                         steps=vec![
                             ui::WizardStep { title: "Your camera".into(), summary: None },
                             ui::WizardStep { title: "The look".into(), summary: None },
-                            ui::WizardStep { title: "How to apply it".into(), summary: None },
                         ]
                         current=step
+                        furthest
                         can_advance=Signal::derive(move || choices_ready.get() && !running.get())
                         locked=running
                         on_finish=run
@@ -282,6 +521,33 @@ pub fn MatchPage() -> impl IntoView {
                                 </select>
                             </label>
                             <p class="muted">"Not sure? Pick the newest. This is an early estimate for the selected firmware range."</p>
+                        })}
+                        {move || body.get().map(|body| {
+                            let choices = camera_output_encodings(&body);
+                            if choices.len() <= 1 {
+                                view! {
+                                    <p class="muted">{format!("Camera output encoding: {}.", output_encoding_label(choices[0]))}</p>
+                                }.into_any()
+                            } else {
+                                view! {
+                                    <label>
+                                        "Which camera output encoding do you shoot?"
+                                        <select
+                                            prop:value=move || output_encoding.get().as_str().to_owned()
+                                            on:change=move |event| {
+                                                if let Ok(value) = looklab_schema::OutputEncoding::parse(&event_target_value(&event)) {
+                                                    output_encoding.set(value);
+                                                }
+                                            }
+                                        >
+                                            {choices.into_iter().map(|choice| view! {
+                                                <option value=choice.as_str().to_owned()>{output_encoding_label(choice)}</option>
+                                            }).collect_view()}
+                                        </select>
+                                    </label>
+                                    <p class="muted">"sRGB is the default recipe output. Adobe RGB is only offered when this camera records it."</p>
+                                }.into_any()
+                            }
                         })}
                     </section>
                     <section class="match-step" hidden=move || step.get().0 != 1>
@@ -318,47 +584,215 @@ pub fn MatchPage() -> impl IntoView {
                                 </select>
                             </label>
                         </ui::Disclosure>
+                        {move || {
+                            let modes = wb_modes.get();
+                            if modes.len() <= 1 {
+                                return modes.first().map(|mode| view! {
+                                    <p class="muted">{format!("White balance: {}", mode.as_str())}</p>
+                                }).into_any();
+                            }
+                            view! {
+                                <label>
+                                    "Which white balance did you shoot?"
+                                    <select on:change=move |event| {
+                                        wb_choice.set(looklab_schema::WbModeKey::new(event_target_value(&event)).ok());
+                                    }>
+                                        <option value="">"Choose one"</option>
+                                        {modes.into_iter().map(|mode| view! {
+                                            <option value=mode.as_str().to_owned()>{mode.as_str().to_owned()}</option>
+                                        }).collect_view()}
+                                    </select>
+                                </label>
+                            }.into_any()
+                        }}
+                        {move || {
+                            let firmwares = firmwares.get();
+                            if firmwares.len() <= 1 {
+                                return firmwares.first().map(|firmware| view! {
+                                    <p class="muted">{format!("Firmware: {}", firmware.as_text())}</p>
+                                }).into_any();
+                            }
+                            view! {
+                                <label>
+                                    "Which firmware is on your camera?"
+                                    <select on:change=move |event| {
+                                        fw_choice.set(looklab_schema::FirmwareId::parse(&event_target_value(&event)).ok());
+                                    }>
+                                        <option value="">"Choose one"</option>
+                                        {firmwares.into_iter().map(|firmware| view! {
+                                            <option value=firmware.as_text()>{firmware.as_text()}</option>
+                                        }).collect_view()}
+                                    </select>
+                                </label>
+                            }.into_any()
+                        }}
                     </section>
-                    <section class="match-step" hidden=move || step.get().0 != 2>
-                        <h2>"How will you apply it?"</h2>
-                        <div class="match-methods">
-                            <button
-                                aria-pressed=move || (application.get() == Application::Camera).to_string()
-                                on:click=move |_| application.set(Application::Camera)
-                            >
-                                <strong>"In-camera settings"</strong>
-                                <span>"A menu-by-menu recipe for your camera."</span>
-                            </button>
-                            <button
-                                aria-pressed=move || (application.get() == Application::Card).to_string()
-                                on:click=move |_| application.set(Application::Card)
-                            >
-                                <strong>"Custom firmware"</strong>
-                                <span>"A card file for firmware that loads looklab looks."</span>
-                            </button>
-                            <button
-                                aria-pressed=move || (application.get() == Application::Software).to_string()
-                                on:click=move |_| application.set(Application::Software)
-                            >
-                                <strong>"Other software"</strong>
-                                <span>"A color lookup table for compatible software."</span>
-                            </button>
-                    </div></section>
                     </ui::Stepper>
                     </fieldset>
                 }.into_any()
             }
         } }}
         {move || running.get().then(|| view! { <p role="status">"Finding your camera’s closest match…"</p> })}
-        {move || error.get().map(|message| ui::failure(&message))}
+        {move || error.get().map(|message| view! {
+            <div class="error" role="alert">
+                <strong>"No recipe found for these choices."</strong>
+                <p>{message}</p>
+                <ul>{blockers.get().into_iter().map(|blocker| view! { <li>{blocker}</li> }).collect_view()}</ul>
+                <p>"Custom firmware can still load this look's target card; it does not use a camera realization."</p>
+                {selected.get().zip(target_version.get()).and_then(|(slug, version)| {
+                    looklab_model::file::LookVersion::new(version).ok().map(|version| view! {
+                        <TargetCardDownload slug version/>
+                    })
+                })}
+                <p class="field-row">
+                    <a href=crate::base::site_url("/contribute")>"Share photos to help build this camera's model"</a>
+                    {move || (mode.get() == looklab_publish::SelectionScope::Qualified).then(|| view! {
+                        <button class="secondary" on:click=move |_| {
+                            mode.set(looklab_publish::SelectionScope::Experimental);
+                            run.run(());
+                        }>"Try experimental matching"</button>
+                    })}
+                </p>
+            </div>
+        })}
         </div>
     }
 }
 
 #[component]
+fn OutputMethodPicker(
+    application: RwSignal<Application>,
+    on_change: Callback<Application>,
+) -> impl IntoView {
+    view! {
+        <section aria-label="How to apply the look">
+            <h2>"How will you apply it?"</h2>
+            <div class="match-methods">
+                {[
+                    (Application::Camera, "In-camera settings", "A menu-by-menu recipe for your camera."),
+                    (Application::Card, "Custom firmware", "A target card for firmware that loads looklab looks."),
+                    (Application::Software, "Editing app", "An export for a published software pipeline."),
+                ].into_iter().map(move |(choice, label, detail)| view! {
+                    <button
+                        type="button"
+                        aria-pressed=move || (application.get() == choice).to_string()
+                        on:click=move |_| on_change.run(choice)
+                    >
+                        <strong>{label}</strong>
+                        <span>{detail}</span>
+                    </button>
+                }).collect_view()}
+            </div>
+        </section>
+    }
+}
+
+#[component]
+fn TargetOutput(
+    index: looklab_publish::SiteIndex,
+    selected: RwSignal<Option<looklab_model::file::Slug>>,
+    scene: RwSignal<Option<Arc<looklab_publish::PreparedScene>>>,
+    application: Application,
+    requested: Option<looklab_model::file::LookVersion>,
+) -> impl IntoView {
+    let requested = RwSignal::new(requested);
+    let items = index
+        .looks
+        .iter()
+        .filter(|look| look.visibility == looklab_publish::LookVisibility::Public)
+        .filter_map(|look| {
+            let version = crate::selection::catalog_version(look)?;
+            if !version.permits_new_outputs() {
+                return None;
+            }
+            if !(match application {
+                Application::Card => version.card_eligible,
+                Application::Software => version.matchable,
+                Application::Camera => false,
+            }) {
+                return None;
+            }
+            let (scope, blockers) = crate::selection::catalog_scope(look);
+            Some(ui::LookCardItem {
+                slug: look.slug.clone(),
+                version: version.version.clone(),
+                name: look.name.clone(),
+                origin: match look.kind {
+                    looklab_model::LookKind::NativeFamily => ui::LookOrigin::BuiltIn {
+                        cameras: Vec::new(),
+                    },
+                    looklab_model::LookKind::LutDefined => ui::LookOrigin::Custom {
+                        author: "the community".to_owned(),
+                    },
+                },
+                character: String::new(),
+                status: version.status,
+                scope,
+                blockers,
+                lut: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    // An explicit version pin resolves below even when no public item is discoverable.
+    if items.is_empty() && requested.get_untracked().is_none() {
+        return view! {
+            <ui::EmptyState
+                title="No target downloads are published yet".to_owned()
+                message="Published target downloads do not depend on an in-camera settings model.".to_owned()
+            />
+        }.into_any();
+    }
+    let catalog = StoredValue::new(index);
+    view! {
+        <section class="match-download">
+            <h2>"Which look?"</h2>
+            <ui::LookPicker items scene=scene.get() on_select=Callback::new(move |item: ui::LookCardItem| {
+                requested.set(None);
+                selected.set(Some(item.slug));
+            })/>
+            {move || {
+                let Some(slug) = selected.get() else {
+                    return view! { <p>"Choose a target look."</p> }.into_any();
+                };
+                let target = catalog.with_value(|index| index.looks.iter().find(|look| look.slug == slug).cloned());
+                let Some(target) = target else {
+                    return ui::failure("This look is not in the published catalog.").into_any();
+                };
+                let chosen = match requested.get() {
+                    Some(version) => target.versions.iter().find(|entry| entry.version == version),
+                    None => crate::selection::catalog_version(&target),
+                };
+                let Some(version) = chosen else {
+                    return ui::failure("The requested target version is not published.").into_any();
+                };
+                match application {
+                    Application::Card => view! {
+                        <h3>{target.name.clone()}</h3>
+                        <p>"The firmware translates this body-agnostic target into its own pipeline. No camera model, settings fit or control-response model is required."</p>
+                        <TargetCardDownload slug version=version.version.clone()/>
+                    }.into_any(),
+                    Application::Software => view! {
+                        <super::software_export::SoftwareExportPanel
+                            index=catalog.get_value() slug version=version.version.clone()
+                        />
+                    }.into_any(),
+                    Application::Camera => ().into_any(),
+                }
+            }}
+        </section>
+    }.into_any()
+}
+
+#[component]
 fn MatchResult(
     reply: MatchReply,
+    inputs: MatchInputs,
     #[prop(default = Application::Camera)] application: Application,
+    #[prop(default = looklab_publish::SelectionScope::Unassessed)]
+    scope: looklab_publish::SelectionScope,
+    #[prop(default = Vec::new())] blockers: Vec<String>,
+    #[prop(default = looklab_publish::CameraModelProvenance::Unknown)]
+    camera_model_provenance: looklab_publish::CameraModelProvenance,
 ) -> impl IntoView {
     let preview =
         RwSignal::new(Load::<(Arc<Vec<u8>>, Arc<looklab_publish::PreparedScene>)>::Loading);
@@ -441,6 +875,11 @@ fn MatchResult(
     let card = reply.card.clone();
     let export_slug = reply.target_slug.to_string();
     let export_version = reply.target_version.to_string();
+    let software_href = crate::base::site_url(&format!(
+        "/match?apply=software&look={}&version={}",
+        crate::base::query_component(reply.target_slug.as_str()),
+        crate::base::query_component(reply.target_version.as_str())
+    ));
     let excluded = excluded_note(&reply.excluded);
     let session = crate::session::use_session();
     let copy = move |_| {
@@ -469,29 +908,36 @@ fn MatchResult(
         let slug = export_slug.clone();
         let version = export_version.clone();
         spawn_local(async move {
-            let result = data::card(&slug, &version).await.and_then(|bytes| {
-                crate::files::download("LOOK0001.LLK", &bytes, "application/octet-stream")
-            });
+            let result = data::card(&slug, &version, data::CardUse::Download)
+                .await
+                .and_then(|bytes| {
+                    crate::files::download("LOOK0001.LLK", &bytes, "application/octet-stream")
+                });
             if let Err(error) = result {
                 message.set(Some(error));
             }
         });
     };
-    let download_table = move |_| {
-        if let Load::Ready((lut, _)) = preview.get_untracked() {
-            let result = preview_cube(&lut).and_then(|text| {
-                crate::files::download("looklab.cube", text.as_bytes(), "text/plain")
-            });
-            if let Err(error) = result {
-                message.set(Some(error));
-            }
-        }
-    };
     view! {
         <section class="match-result">
             <h2>{move || heading.get()}</h2>
+            <p class="muted">{data::selection_scope_label(scope)}</p>
+            <p class="muted">{format!("Scoring metric: {}.", reply.card.metric.identity())}</p>
             {excluded.map(|note| view! { <p class="muted">{note}</p> })}
-            <ui::Notice message="Sample data: these settings use a simulated camera model, not measured camera response. Do not treat this demonstration as a tested recipe.".to_owned()/>
+            {blockers.into_iter().map(|blocker| view! { <p class="notice">{blocker}</p> }).collect_view()}
+            {(camera_model_provenance == looklab_publish::CameraModelProvenance::Synthetic).then(|| view! {
+                <ui::Notice message="Sample data: these settings use a simulated camera model, not measured camera response. Do not treat this demonstration as a tested recipe.".to_owned()/>
+            })}
+            <ui::Disclosure summary="Details".to_owned()>
+                {reply.selection.as_ref().map(|selection| view! {
+                    <p>{format!(
+                        "Selection: {} · bundle {} · {} pinned reports",
+                        selection.mode.as_str(),
+                        selection.bundle.to_hex(),
+                        selection.reports.len()
+                    )}</p>
+                })}
+            </ui::Disclosure>
             {move || match preview.get() {
                 Load::Loading => ui::loading().into_any(),
                 Load::Failed(error) => view! { <PreviewFailure error/> }.into_any(),
@@ -528,6 +974,7 @@ fn MatchResult(
             {(application == Application::Card).then(|| view! {
                 <section class="match-download">
                     <h3>"Card file"</h3>
+                    <p>"This is the look's target card, not a camera realization. It does not use this camera's model or settings. Firmware translation is verified separately and is not guaranteed."</p>
                     <p>"Use firmware that supports looklab cards. Copy this file to your card’s look folder, then choose it in the firmware’s look menu."</p>
                     <a href=crate::base::site_url("/developers")>
                         "Compatible firmware and installation help"
@@ -537,25 +984,12 @@ fn MatchResult(
             })}
             {(application == Application::Software).then(|| view! {
                 <section class="match-download">
-                    <h3>"Other software"</h3>
-                    <p>"For software that accepts a scene-linear color workflow. This table is not for applying directly to a finished JPEG."</p>
-                    <button
-                        disabled=move || !matches!(preview.get(), Load::Ready(_))
-                        on:click=download_table
-                    >
-                        "Download color table (.cube)"
-                    </button>
-                    <p class="muted">"Colors outside the measured range are an estimate."</p>
-                    <ui::Disclosure summary="Details".to_owned()>
-                        <p>"Input: shaped scene-linear Rec.2020 using looklab’s preview shaper. Output: encoded sRGB. The table has 33 points per axis. Use tetrahedral interpolation, with no additional display transform."</p>
-                        <p>"The download checks the table’s dimensions and rejects non-finite values. This is not an editing-app profile or an independently validated pipeline export."</p>
-                        <a href=crate::base::site_url("/developers/pipelines")>
-                            "Input conversion and compatible pipelines"
-                        </a>
-                    </ui::Disclosure>
+                    <h3>"Editing-app export"</h3>
+                    <p>"Choose a published pipeline to build and validate an export for this target version."</p>
+                    <a class="button" href=software_href>"Choose an editing-app pipeline"</a>
                 </section>
             })}
-            <InlineVerification permalink/>
+            <InlineVerification inputs=inputs.clone()/>
         </section>
     }
 }
@@ -586,9 +1020,33 @@ fn recipe_text(
     settings: &looklab_model::realization::Settings,
 ) -> String {
     let mut text = format!(
-        "looklab settings\nFilm simulation: {}\n",
-        sim_name(&card.sim)
+        "looklab settings\nFilm simulation: {}\nScoring metric: {}\n",
+        sim_name(&card.sim),
+        card.metric.identity()
     );
+    match card.output {
+        Some(context) => text.push_str(&format!(
+            "Camera output encoding: {}\n",
+            context.camera.encoding.as_str()
+        )),
+        None => text.push_str("Historical pre-clip recipe: no output encoding recorded.\n"),
+    }
+    text.push_str(&format!(
+        "Reachability: {}\n",
+        reachability_text(&card.reachability)
+    ));
+    match card.sigma_band {
+        Some(band) => text.push_str(&format!(
+            "Predicted median ΔE {:.2}; p95 {:.2}; mean-model marginal band ±{:.2}.\n",
+            card.median_delta_e, card.p95_delta_e, band
+        )),
+        None => text.push_str(&format!(
+            "Predicted median ΔE {:.2}; p95 {:.2}; mean-model marginal band unavailable.\n",
+            card.median_delta_e, card.p95_delta_e
+        )),
+    }
+    text.push_str(joint_uncertainty_text(card.joint_uncertainty));
+    text.push('\n');
     for entry in &card.entries {
         text.push_str(&format!(
             "{}: {}\n",
@@ -606,20 +1064,21 @@ pub fn Card(
     #[prop(default = looklab_model::realization::Settings::new())]
     settings: looklab_model::realization::Settings,
 ) -> impl IntoView {
-    let band = card.sigma_band.unwrap_or(0.0);
-    let estimate = ui::ClosenessEstimate::new(
-        card.median_delta_e,
-        [
-            (card.median_delta_e - band).max(0.0),
-            card.median_delta_e + band,
-        ],
-        card.p95_delta_e.max(card.median_delta_e),
-        if card.confidence == looklab_wasm::dto::ConfidenceDto::Low {
-            ui::EstimateConfidence::EarlyEstimate
-        } else {
-            ui::EstimateConfidence::Established
-        },
-    );
+    let estimate = card.sigma_band.and_then(|band| {
+        ui::ClosenessEstimate::new(
+            card.median_delta_e,
+            [
+                (card.median_delta_e - band).max(0.0),
+                card.median_delta_e + band,
+            ],
+            card.p95_delta_e.max(card.median_delta_e),
+            if card.confidence == looklab_wasm::dto::ConfidenceDto::Low {
+                ui::EstimateConfidence::EarlyEstimate
+            } else {
+                ui::EstimateConfidence::Established
+            },
+        )
+    });
     let entries = card.entries.clone();
     let settings = StoredValue::new(settings);
     let exposure = card
@@ -628,7 +1087,7 @@ pub fn Card(
         .find(|entry| entry.key.as_str() == "exposure_compensation" && entry.changed)
         .cloned();
     let mut regions = card
-        .unreachable
+        .missed
         .iter()
         .filter(|region| {
             ui::DeltaE::new(region.remaining_delta_e)
@@ -639,10 +1098,43 @@ pub fn Card(
         .collect::<Vec<_>>();
     regions.sort_unstable();
     regions.dedup();
+    let regions_text = if card.reachability.assessed == 0 {
+        "No assessed regions are available; the rendered evaluation is descriptive only.".to_owned()
+    } else if regions.is_empty() {
+        "Nothing noticeable is predicted to differ.".to_owned()
+    } else {
+        format!("Differences may remain in {}.", regions.join(", "))
+    };
+    let reachability = reachability_text(&card.reachability);
+    let metric = card.metric.identity();
+    let band_text = match card.sigma_band {
+        Some(band) => format!(
+            "Predicted median ΔE {:.2}; p95 {:.2}; mean-model marginal band ±{:.2}.",
+            card.median_delta_e, card.p95_delta_e, band
+        ),
+        None => format!(
+            "Predicted median ΔE {:.2}; p95 {:.2}; mean-model marginal band unavailable.",
+            card.median_delta_e, card.p95_delta_e
+        ),
+    };
+    let output = match card.output {
+        Some(context) => format!(
+            "Target {} at clip {:.3}; camera {} at clip {:.3}.",
+            context.target.encoding.as_str(),
+            context.target.clip_k,
+            context.camera.encoding.as_str(),
+            context.camera.clip_k
+        ),
+        None => "Historical pre-clip metric; no output context was recorded.".to_owned(),
+    };
     view! {
         <article class="recipe-card">
             <header>
                 <p class="eyebrow">"Your settings"</p>
+                <p class="muted">{match card.output {
+                    Some(context) => format!("Camera output encoding: {}.", context.camera.encoding.as_str()),
+                    None => "Historical pre-clip recipe: no camera output encoding was recorded.".to_owned(),
+                }}</p>
                 <h3>"Take this recipe shooting"</h3>
                 {estimate.map(|estimate| view! { <ui::Closeness estimate/> })}
             </header>
@@ -683,20 +1175,19 @@ pub fn Card(
                 })
             })}
             <h4>"What won’t match exactly"</h4>
+            <p>{reachability}</p>
             <p>"Lighting and scene colors can change the match. The split preview shows the differences predicted at these settings."</p>
-            <p>{if regions.is_empty() {
-                "Nothing noticeable is predicted to differ.".to_owned()
-            } else {
-                format!("Differences may remain in {}.", regions.join(", "))
-            }}</p>
+            <p>{regions_text}</p>
             <p class="muted">{match card.confidence {
                 looklab_wasm::dto::ConfidenceDto::High => "The model has stronger support for these settings.",
                 looklab_wasm::dto::ConfidenceDto::Medium => "This is an estimate. Check a few of your own shots.",
                 looklab_wasm::dto::ConfidenceDto::Low => "Early estimate. More shared photos would improve this recipe.",
             }}</p>
             <ui::Disclosure summary="Details".to_owned()>
-                <p>{format!("Predicted median ΔE {:.2}; p95 {:.2}; 90% band ±{:.2}.",
-                    card.median_delta_e, card.p95_delta_e, band)}</p>
+                <p>{format!("Scoring metric: {metric}.")}</p>
+                <p>{output}</p>
+                <p>{band_text}</p>
+                <p>{joint_uncertainty_text(card.joint_uncertainty)}</p>
                 {card.exposure_note.map(|note| view! { <p>{note}</p> })}
                 <p>{card.residual_summary}</p>
                 <p>{card.confidence_reason}</p>
@@ -711,7 +1202,15 @@ pub fn MatchResultPage() -> impl IntoView {
     let query = use_query_map();
     let application =
         Memo::new(move |_| Application::from_query(query.get().get("apply").as_deref()));
-    let state = RwSignal::new(Load::<MatchReply>::Loading);
+    let state = RwSignal::new(
+        Load::<(
+            MatchReply,
+            MatchInputs,
+            looklab_publish::SelectionScope,
+            Vec<String>,
+            looklab_publish::CameraModelProvenance,
+        )>::Loading,
+    );
     let pending_target = RwSignal::new(None::<(Arc<Vec<u8>>, Arc<looklab_publish::PreparedScene>)>);
     let generation = RwSignal::new(0_u32);
     Effect::new(move |_| {
@@ -727,8 +1226,14 @@ pub fn MatchResultPage() -> impl IntoView {
                 let text =
                     String::from_utf8(bytes).map_err(|_| "This share link is not readable.")?;
                 let pinned = Permalink::parse(&text).map_err(|error| error.to_string())?;
+                let replay = query.get().get("replay").as_deref() == Some("1");
+                let scoped = if replay {
+                    match_data::replay_inputs_from_permalink(&pinned).await?
+                } else {
+                    match_data::inputs_from_permalink(&pinned).await?
+                };
                 let target_slug = pinned.target_slug.clone();
-                let target_version = pinned.target_version.clone();
+                let target_version = scoped.target_version.to_string();
                 spawn_local(async move {
                     let photo = async {
                         let index = data::index().await?;
@@ -749,12 +1254,35 @@ pub fn MatchResultPage() -> impl IntoView {
                         let _ = pending_target.try_set(Some(photo));
                     }
                 });
-                let inputs = match_data::inputs_from_permalink(&pinned).await?;
-                let reply = match_worker(&inputs).await?;
-                if reply.permalink != pinned.canonical() {
-                    return Err("These pinned versions no longer reproduce this recipe.".into());
+                let reply = match_worker(&scoped.inputs).await?;
+                if reply.target_slug.as_str() != pinned.target_slug.as_str()
+                    || reply.target_version != scoped.target_version
+                {
+                    return Err(
+                        "The accepted target changed while this recipe loaded. Reload to try again."
+                            .into(),
+                    );
                 }
-                Ok(reply)
+                if replay && reply.permalink != pinned.canonical() {
+                    return Err(
+                        "These pinned versions no longer reproduce the recorded recipe.".into(),
+                    );
+                }
+                let mut blockers = scoped.blockers;
+                if replay {
+                    blockers.insert(
+                        0,
+                        "This is a pinned internal replay of the calculation as recorded."
+                            .to_owned(),
+                    );
+                }
+                Ok((
+                    reply,
+                    scoped.inputs,
+                    scoped.scope,
+                    blockers,
+                    scoped.camera_model_provenance,
+                ))
             }
             .await;
             state.set(match result {
@@ -774,9 +1302,14 @@ pub fn MatchResultPage() -> impl IntoView {
                         <p>"Target look. Your camera’s result will appear when the calculation finishes."</p>
                     })}
                 }.into_any(),
-                Load::Failed(error) => ui::failure(&error).into_any(),
-                Load::Ready(reply) => view! {
-                    <MatchResult reply application=application.get()/>
+                Load::Failed(error) => view! {
+                    <div class="error" role="alert">
+                        <strong>"This recipe could not be replayed."</strong>
+                        <p>{error}</p>
+                    </div>
+                }.into_any(),
+                Load::Ready((reply, inputs, scope, blockers, camera_model_provenance)) => view! {
+                    <MatchResult reply inputs=inputs application=application.get() scope=scope blockers=blockers camera_model_provenance=camera_model_provenance/>
                 }.into_any(),
             }}
         </div>
@@ -796,11 +1329,11 @@ async fn match_worker(inputs: &MatchInputs) -> Result<MatchReply, String> {
 }
 
 #[component]
-fn InlineVerification(permalink: String) -> impl IntoView {
+fn InlineVerification(inputs: MatchInputs) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let outcome = RwSignal::new(None::<looklab_wasm::VerifyReply>);
-    let permalink = StoredValue::new(permalink);
+    let inputs = StoredValue::new(inputs);
     let receive = Callback::new(move |files: Vec<web_sys::File>| {
         if busy.get_untracked() {
             return;
@@ -816,8 +1349,7 @@ fn InlineVerification(permalink: String) -> impl IntoView {
                 if pairing.groups.is_empty() { return Err("Add the original RAW files alongside these JPEGs so their colors can be measured.".into()); }
                 let (groups, _, failures) = crate::pages::contribute::run_files(&pairing, &local, crate::worker::default_worker_count()).await?;
                 if groups.is_empty() { return Err(failures.first().map(|failure| failure.message.clone()).unwrap_or_else(|| "Add the original RAW files alongside these JPEGs so their colors can be measured.".into())); }
-                let pinned = Permalink::parse(&permalink.get_value()).map_err(|error| error.to_string())?;
-                let inputs = match_data::inputs_from_permalink(&pinned).await?;
+                let inputs = inputs.get_value();
                 let request = looklab_wasm::encode_verify_request(&looklab_wasm::VerifyRequestMessage { inputs, observed_blobs: groups.iter().flat_map(|group| group.blobs.iter().cloned()).collect() });
                 let worker = MatchWorker::spawn()?;
                 let bytes = worker.run_verify(&request).await.map_err(|failure| failure.0)?;
@@ -837,7 +1369,7 @@ fn InlineVerification(permalink: String) -> impl IntoView {
                 <p>"Shoot two to four photos at these settings. Drop the JPEGs and their original RAW files here to measure the match and get an improved suggestion. Your photos stay on this device."</p>
                 <ui::DropZone
                     on_files=receive
-                    accept=".jpg,.jpeg,.raf,.dng,.arw,.cr2,.nef,.orf,.rw2".to_owned()
+                    accept=crate::files::camera_originals_accept_attribute()
                     folders=false
                     prompt="Drop your JPEGs and original RAW files here. Nothing is uploaded.".to_owned()
                     disabled=busy
@@ -846,17 +1378,41 @@ fn InlineVerification(permalink: String) -> impl IntoView {
         {move || error.get().map(|message| view! { <p role="alert">{message}</p> })}
         {move || outcome.get().map(|reply| {
             let measured = ui::DeltaE::new(reply.first_measured.median).map(ui::closeness_level).map(|level| level.label()).unwrap_or("Not enough measurements");
+            let status = match reply.first_measured.status {
+                AssessmentStatus::Assessed => {
+                    "Joint conditional-mean uncertainty is assessed for these captured colours."
+                }
+                AssessmentStatus::Partial => {
+                    "Partial assessment: some declared settings or contributor cells are assessed; significance is not complete."
+                }
+                AssessmentStatus::Unassessed => {
+                    "Descriptive only: joint uncertainty and significance are unassessed for these captured colours."
+                }
+            };
+            let metric = reply.first_measured.metric.identity();
+            let prediction_band = match reply.first.sigma_band {
+                Some(band) => format!("mean-model marginal ±{band:.2}"),
+                None => "mean-model marginal unavailable".to_owned(),
+            };
+            let output = match reply.first.output {
+                Some(context) => format!(
+                    "Camera output encoding: {}.",
+                    context.camera.encoding.as_str()
+                ),
+                None => "Historical pre-clip measurement: no output encoding was recorded.".to_owned(),
+            };
             view! {
-                <h3>"Your measured match"</h3>
-                <p>{format!("{measured}, based on your photos. The improved suggestion is below.")}</p>
+                <h3>"Your measured colours"</h3>
+                <p>{format!("{measured}, based on your photos. {status}")}</p>
                 <ui::Disclosure summary="Measurement details".to_owned()>
+                    <p>{format!("Scoring metric: {metric}.")}</p>
+                    <p>{output}</p>
                     <p>{format!(
-                        "Measured median ΔE {:.2}, p95 {:.2}, from {} color samples. The original prediction was {:.2} ±{:.2}. These photos may not cover every color or lighting condition.",
+                        "Measured median ΔE {:.2}, p95 {:.2}, from {} color samples. The original prediction was {:.2} with {prediction_band}. These photos may not cover every color or lighting condition.",
                         reply.first_measured.median,
                         reply.first_measured.p95,
                         reply.first_measured.count,
                         reply.first.median_delta_e,
-                        reply.first.sigma_band,
                     )}</p>
                 </ui::Disclosure>
                 <Card card=reply.card settings=reply.second.settings/>
@@ -944,43 +1500,6 @@ async fn camera_page(id: &BodyId) -> Result<looklab_publish::BodyPage, String> {
     data::body(make, model).await
 }
 
-fn preview_cube(bytes: &[u8]) -> Result<String, String> {
-    if bytes.len() != looklab_publish::LUT_BYTES {
-        return Err("This color table has the wrong dimensions.".into());
-    }
-    let nodes = bytes.as_chunks::<12>().0;
-    let mut data = Vec::with_capacity(nodes.len());
-    for b in 0..33 {
-        for g in 0..33 {
-            for r in 0..33 {
-                let node = &nodes[(r * 33 + g) * 33 + b];
-                let channel = |offset| {
-                    f32::from_le_bytes([
-                        node[offset],
-                        node[offset + 1],
-                        node[offset + 2],
-                        node[offset + 3],
-                    ])
-                };
-                data.push([channel(0), channel(4), channel(8)]);
-            }
-        }
-    }
-    if data.iter().flatten().any(|value| !value.is_finite()) {
-        return Err("This color table contains invalid values.".into());
-    }
-    let lut = looklab_export::Lut3d {
-        size: 33,
-        data,
-        shaper: None,
-    };
-    Ok(looklab_export::write_cube(
-        &lut,
-        "looklab shaped scene Rec2020 to encoded sRGB",
-        [0.0, 1.0],
-    ))
-}
-
 fn excluded_note(excluded: &[looklab_publish::ExcludedSim]) -> Option<String> {
     if excluded.is_empty() {
         return None;
@@ -991,6 +1510,19 @@ fn excluded_note(excluded: &[looklab_publish::ExcludedSim]) -> Option<String> {
             let reason = match entry.reason {
                 looklab_publish::SimExclusion::NoPublishedLook => "no published look",
                 looklab_publish::SimExclusion::NoResponse => "no published response",
+                looklab_publish::SimExclusion::NoRealization => "no selected realization",
+                looklab_publish::SimExclusion::UnacceptedRealization => {
+                    "the realization is not numerically valid or gate-passing"
+                }
+                looklab_publish::SimExclusion::TargetIneligible => {
+                    "the pinned target is not eligible"
+                }
+                looklab_publish::SimExclusion::UnassessedRealization => {
+                    "only unassessed legacy artifacts exist"
+                }
+                looklab_publish::SimExclusion::MissingFirmware => {
+                    "the realization has no offsets for the requested firmware"
+                }
             };
             format!("{} ({reason})", sim_name(&entry.sim))
         })
@@ -1065,6 +1597,73 @@ fn region_name(region: &str) -> String {
         "green" => "greens".to_owned(),
         "yellow" => "yellows".to_owned(),
         other => other.replace('_', " "),
+    }
+}
+
+#[component]
+fn TargetCardDownload(
+    slug: looklab_model::file::Slug,
+    version: looklab_model::file::LookVersion,
+) -> impl IntoView {
+    let message = RwSignal::new(None::<String>);
+    let available = RwSignal::new(None::<bool>);
+    let scope = RwSignal::new(None::<(looklab_publish::SelectionScope, Vec<String>)>);
+    let check_slug = slug.clone();
+    let check_version = version.clone();
+    Effect::new(move |_| {
+        let slug = check_slug.clone();
+        let version = check_version.clone();
+        leptos::task::spawn_local_scoped_with_cancellation(async move {
+            let ready = match data::current_index().await {
+                Ok(index) => index
+                    .looks
+                    .iter()
+                    .find(|look| look.slug == slug)
+                    .is_some_and(|look| {
+                        let eligible = look.versions.iter().any(|entry| {
+                            entry.version == version
+                                && entry.card_eligible
+                                && entry.permits_new_outputs()
+                        });
+                        if eligible {
+                            scope.set(Some(crate::selection::catalog_version_scope(
+                                look, &version,
+                            )));
+                        }
+                        eligible
+                    }),
+                Err(_) => false,
+            };
+            available.set(Some(ready));
+        });
+    });
+    let download = Callback::new(move |()| {
+        let slug = slug.clone();
+        let version = version.clone();
+        spawn_local(async move {
+            let result = data::card(slug.as_str(), version.as_str(), data::CardUse::Download)
+                .await
+                .and_then(|bytes| {
+                    crate::files::download("LOOK0001.LLK", &bytes, "application/octet-stream")
+                });
+            if let Err(error) = result {
+                message.set(Some(error));
+            }
+        });
+    });
+    view! {
+        {move || scope.get().map(|(scope, blockers)| view! {
+            <p class="muted">{data::selection_scope_label(scope)}</p>
+            {blockers.into_iter().map(|blocker| view! { <p class="notice">{blocker}</p> }).collect_view()}
+        })}
+        {move || (available.get() == Some(true)).then(|| view! {
+            <button on:click=move |_| download.run(())>"Download the look's target card (.LLK)"</button>
+            <p class="muted">"Verified against the target version manifest. This download does not use a camera realization, control-response model or matching result."</p>
+        })}
+        {move || (available.get() == Some(false)).then(|| view! {
+            <p class="muted">"This look version has no publishable target card."</p>
+        })}
+        {move || message.get().map(|message| view! { <p role="alert">{message}</p> })}
     }
 }
 

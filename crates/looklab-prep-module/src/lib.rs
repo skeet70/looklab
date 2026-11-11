@@ -11,31 +11,43 @@ pub use error::ModuleError;
 pub use looklab_prep::PREP_VERSION;
 pub use types::{
     AlignmentSummary, AssertionFields, BlobSummary, BuildManifestRequest, BuildManifestResponse,
-    EncodeEnvelopeRequest, EncodeEnvelopeResponse, ManifestImageInput, ParseEnvelopeRequest,
-    ParseEnvelopeResponse, PowParamsSpec, PrepareRequest, PrepareResponse, PreparedImageView,
-    PriorTransformSpec, Response, SolvePowRequest, SolvePowResponse, VersionRequest,
-    VersionResponse,
+    BuildSendManifestRequest, BuildSendManifestResponse, EncodeEnvelopeRequest,
+    EncodeEnvelopeResponse, ManifestImageInput, ParseEnvelopeRequest, ParseEnvelopeResponse,
+    PowParamsSpec, PrepareRequest, PrepareResponse, PreparedImageView, PriorTransformSpec,
+    Response, SolvePowRequest, SolvePowResponse, VersionRequest, VersionResponse,
 };
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const MODULE_ABI_VERSION: u32 = 1;
+/// Version of the postcard request and response contract behind `ll_call`.
+pub const MODULE_ABI_VERSION: u32 = 2;
 
 const BUILD_ID_TABLE: &[u8] = concat!(
     "looklab-prep-module/",
     env!("CARGO_PKG_VERSION"),
     "\0ll_alloc\0ll_free\0ll_call\0",
-    "version\0prepare\0build_manifest\0encode_envelope\0solve_pow\0parse_envelope\0",
-    "abi=1\0prep=1",
+    "version\0prepare\0build_manifest\0build_send_manifest\0encode_envelope\0solve_pow\0parse_envelope\0",
 )
 .as_bytes();
 
 pub fn build_id() -> [u8; 32] {
-    let digest = Sha256::digest(BUILD_ID_TABLE);
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&digest);
-    bytes
+    let mut hasher = Sha256::new();
+    hasher.update(BUILD_ID_TABLE);
+    for (label, version) in [
+        ("abi", MODULE_ABI_VERSION),
+        ("prep", PREP_VERSION),
+        ("envelope", u32::from(looklab_upload::VERSION)),
+        (
+            "send_manifest",
+            u32::from(looklab_upload::SEND_MANIFEST_VERSION),
+        ),
+    ] {
+        hasher.update(label.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(version.to_le_bytes());
+    }
+    hasher.finalize().into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +59,7 @@ pub enum Function {
     EncodeEnvelope = 4,
     SolvePow = 5,
     ParseEnvelope = 6,
+    BuildSendManifest = 7,
 }
 
 impl Function {
@@ -62,6 +75,7 @@ impl Function {
             4 => Self::EncodeEnvelope,
             5 => Self::SolvePow,
             6 => Self::ParseEnvelope,
+            7 => Self::BuildSendManifest,
             _ => return None,
         })
     }
@@ -87,6 +101,11 @@ pub fn dispatch(fn_id: u32, input: &[u8]) -> Vec<u8> {
         Some(Function::BuildManifest) => {
             request::<BuildManifestRequest>(Function::BuildManifest, input)
                 .and_then(|request| ops::build_manifest(request).map(Response::BuildManifest))
+        }
+        Some(Function::BuildSendManifest) => {
+            request::<BuildSendManifestRequest>(Function::BuildSendManifest, input).and_then(
+                |request| ops::build_send_manifest(request).map(Response::BuildSendManifest),
+            )
         }
         Some(Function::EncodeEnvelope) => {
             request::<EncodeEnvelopeRequest>(Function::EncodeEnvelope, input)

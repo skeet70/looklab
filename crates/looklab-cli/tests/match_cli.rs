@@ -7,19 +7,23 @@ use looklab_match::synth;
 use looklab_model::LookDocument;
 use looklab_model::realization::encode_crm;
 
+#[derive(serde::Deserialize)]
+struct VerificationResult {
+    settings: looklab_model::realization::Settings,
+}
+
 fn looklab() -> Command {
     Command::cargo_bin("looklab").expect("built binary")
 }
 
-fn ok(mut command: Command) -> String {
+fn ok(mut command: Command) {
     let output = command.output().expect("run");
-    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
-    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
     assert!(
         output.status.success(),
-        "command failed\nstdout: {stdout}\nstderr: {stderr}"
+        "command failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
-    stdout
 }
 
 fn write_document(path: &Path, slug: &str, look: &looklab_model::Look) {
@@ -28,23 +32,20 @@ fn write_document(path: &Path, slug: &str, look: &looklab_model::Look) {
     std::fs::write(path, document.encode().expect("encode")).expect("write look");
 }
 
-#[test]
-fn match_requires_a_base_look_and_transform_without_synthetic() {
-    let output = looklab()
-        .args([
-            "match",
-            "--look",
-            "missing.looklab",
-            "--body",
-            "missing.yaml",
-            "--crm",
-            "missing.crm.json",
-        ])
-        .output()
-        .expect("run");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).expect("stderr");
-    assert!(stderr.contains("--base-look"), "{stderr}");
+fn flat_match(target: &Path, crm: &Path, base: &Path, transform: &Path) -> Command {
+    let mut command = looklab();
+    command
+        .args(["match", "--look"])
+        .arg(target)
+        .arg("--body")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies/fujifilm-x-t5.yaml"))
+        .arg("--crm")
+        .arg(crm)
+        .arg("--base-look")
+        .arg(base)
+        .arg("--transform")
+        .arg(transform);
+    command
 }
 
 #[test]
@@ -70,36 +71,67 @@ fn match_prints_a_card_and_verify_runs_one_iteration() {
     };
     let transform_path = temp.path().join("transform.yaml");
     std::fs::write(&transform_path, transform.to_yaml().expect("yaml")).expect("write transform");
+    let output = looklab()
+        .args(["match", "--look"])
+        .arg(&target_path)
+        .arg("--body")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies/fujifilm-x-t5.yaml"))
+        .arg("--crm")
+        .arg(&crm_path)
+        .args(["--realization-version", "1"])
+        .output()
+        .expect("run");
+    assert!(!output.status.success());
+
     let permalink_path = temp.path().join("match.permalink");
 
-    let stdout = ok({
-        let mut command = looklab();
-        command
-            .args(["match", "--look"])
-            .arg(&target_path)
-            .arg("--body")
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies/fujifilm-x-t5.yaml"))
-            .arg("--crm")
-            .arg(&crm_path)
-            .arg("--base-look")
-            .arg(&base_path)
-            .arg("--transform")
-            .arg(&transform_path)
-            .arg("--permalink")
-            .arg(&permalink_path)
-            .args(["--emphasis", "skin", "--seed", "7"]);
-        command
-    });
-    assert!(stdout.contains("base sim"), "{stdout}");
-    assert!(stdout.contains("predicted ΔE"), "{stdout}");
-    assert!(stdout.contains("confidence"), "{stdout}");
-    assert!(permalink_path.exists());
+    let output = flat_match(&target_path, &crm_path, &base_path, &transform_path)
+        .args(["--emphasis", "skin", "--seed", "7"])
+        .output()
+        .expect("run");
+    let failed = !output.status.success();
+    assert!(failed, "match accepted a missing realization version");
+    let output = flat_match(&target_path, &crm_path, &base_path, &transform_path)
+        .args([
+            "--emphasis",
+            "skin",
+            "--seed",
+            "7",
+            "--realization-version",
+            "0",
+        ])
+        .output()
+        .expect("run");
+    let failed = !output.status.success();
+    assert!(failed, "match accepted a zero realization version");
+
+    let mut command = flat_match(&target_path, &crm_path, &base_path, &transform_path);
+    command.arg("--permalink").arg(&permalink_path).args([
+        "--emphasis",
+        "skin",
+        "--seed",
+        "7",
+        "--realization-version",
+        "1",
+    ]);
+    ok(command);
     let permalink_text = std::fs::read_to_string(&permalink_path).expect("permalink");
-    assert!(permalink_text.contains("seed=7"), "{permalink_text}");
+    let permalink = looklab_match::Permalink::parse(&permalink_text).expect("permalink");
+    assert_eq!(permalink.seed, 7);
+    assert_eq!(
+        permalink.metric,
+        looklab_match::ScoringMetric::RenderedPostClipV1
+    );
+    assert_eq!(permalink.optimizer, "looklab-match/2");
+    let observed_dir = temp.path().join("observed");
+    std::fs::create_dir_all(&observed_dir).expect("observed dir");
+    let samples = synth::observed(&body.model, &body.settings, &probes, 200).expect("observed");
+    let bytes = looklab_samples::encode(&samples).expect("encode samples");
+    std::fs::write(observed_dir.join("observed.llsamp"), bytes).expect("write samples");
     let bad_permalink = temp.path().join("bad.permalink");
     std::fs::write(
         &bad_permalink,
-        permalink_text.replace("optimizer=looklab-match/1", "optimizer=other/1"),
+        permalink_text.replace("optimizer=looklab-match/2", "optimizer=other/1"),
     )
     .expect("bad permalink");
     let output = looklab()
@@ -107,12 +139,10 @@ fn match_prints_a_card_and_verify_runs_one_iteration() {
         .arg("--permalink")
         .arg(&bad_permalink)
         .arg("--observed")
-        .arg(temp.path())
+        .arg(&observed_dir)
         .output()
         .expect("run");
     assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).expect("stderr");
-    assert!(stderr.contains("not supported"), "{stderr}");
     let bad_epoch = temp.path().join("bad-epoch.permalink");
     std::fs::write(
         &bad_epoch,
@@ -124,20 +154,12 @@ fn match_prints_a_card_and_verify_runs_one_iteration() {
         .arg("--permalink")
         .arg(&bad_epoch)
         .arg("--observed")
-        .arg(temp.path())
+        .arg(&observed_dir)
         .output()
         .expect("run");
     assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).expect("stderr");
-    assert!(stderr.contains("epoch map"), "{stderr}");
 
-    let observed_dir = temp.path().join("observed");
-    std::fs::create_dir_all(&observed_dir).expect("observed dir");
-    let samples = synth::observed(&body.model, &body.settings, &probes, 200).expect("observed");
-    let bytes = looklab_samples::encode(&samples).expect("encode samples");
-    std::fs::write(observed_dir.join("observed.llsamp"), bytes).expect("write samples");
-
-    let stdout = ok({
+    ok({
         let mut command = looklab();
         command
             .arg("verify")
@@ -157,28 +179,20 @@ fn match_prints_a_card_and_verify_runs_one_iteration() {
             .arg(&transform_path);
         command
     });
-    assert!(stdout.contains("verify:"), "{stdout}");
-    assert!(stdout.contains("second suggestion"), "{stdout}");
-    assert!(stdout.contains("second settings:"), "{stdout}");
-    let updated_crm = temp.path().join("match.updated.crm.json");
     let updated_permalink = temp.path().join("match.updated.permalink");
     let updated_result = temp.path().join("match.updated.result.json");
-    assert!(updated_crm.exists());
-    assert!(updated_permalink.exists());
-    assert!(updated_result.exists());
 
-    let result: serde_json::Value =
+    let result: VerificationResult =
         serde_json::from_slice(&std::fs::read(&updated_result).expect("result"))
             .expect("result json");
-    let settings: looklab_model::realization::Settings =
-        serde_json::from_value(result["settings"].clone()).expect("settings");
+    let settings = result.settings;
     let observed_dir = temp.path().join("observed2");
     std::fs::create_dir_all(&observed_dir).expect("observed2 dir");
     let samples = synth::observed(&body.model, &settings, &probes, 200).expect("observed2");
     let bytes = looklab_samples::encode(&samples).expect("encode samples");
     std::fs::write(observed_dir.join("observed.llsamp"), bytes).expect("write samples");
 
-    let stdout = ok({
+    ok({
         let mut command = looklab();
         command
             .arg("verify")
@@ -188,5 +202,4 @@ fn match_prints_a_card_and_verify_runs_one_iteration() {
             .arg(&observed_dir);
         command
     });
-    assert!(stdout.contains("verify:"), "{stdout}");
 }

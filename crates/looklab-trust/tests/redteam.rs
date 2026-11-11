@@ -849,6 +849,9 @@ fn reverting_and_excluding_restores_the_pre_attack_version() {
     let truth = sim.truth().clone();
     let attack = hue_band_look(&truth, 0, &[3], 1.0);
     let attacker = credential(950);
+    let good = Batch::new(&truth, ContributionKind::Library);
+    sim.add(attacker, good).expect("good attacker image");
+    let good_contribution = sim.pool().last().expect("good contribution").contribution;
     for index in 0..4 {
         let batch = Batch {
             images: 1,
@@ -872,14 +875,22 @@ fn reverting_and_excluding_restores_the_pre_attack_version() {
         "the attack did not move the published version"
     );
 
-    let reverted = sim.revert(pre_attack, [attacker]).expect("revert");
+    let rejected: Vec<_> = sim
+        .contributions_for(attacker)
+        .into_iter()
+        .filter(|id| *id != good_contribution)
+        .collect();
+    assert_eq!(rejected.len(), 4, "each attacker batch is one contribution");
+    let rejected_images: BTreeSet<ImageRef> = sim
+        .pool()
+        .iter()
+        .filter(|image| rejected.contains(&image.contribution))
+        .map(|image| image.id.clone())
+        .collect();
+    let reverted = sim.revert(pre_attack, rejected.clone()).expect("revert");
     let target = sim.version(pre_attack).expect("pre-attack version");
     assert_eq!(reverted.plan.publish_as_new, target.content);
-    assert_eq!(reverted.plan.refit_excluding, vec![attacker]);
-    assert!(
-        reverted.plan.excluded_contributors_of_target.is_empty(),
-        "the exclusion removed a contributor the target did not have"
-    );
+    assert_eq!(reverted.plan.rejected_contributions, rejected);
     assert_eq!(
         sim.version(reverted.restored).expect("restored").content,
         target.content
@@ -894,6 +905,24 @@ fn reverting_and_excluding_restores_the_pre_attack_version() {
         reverted.refit.published,
         "the refit without the attacker failed: {:?}",
         reverted.refit.gate.violations
+    );
+    assert!(
+        reverted
+            .refit
+            .weights
+            .images
+            .iter()
+            .all(|image| !rejected_images.contains(&image.id)),
+        "rejected contributions must not enter the refit"
+    );
+    assert!(
+        reverted
+            .refit
+            .weights
+            .images
+            .iter()
+            .any(|image| image.credential == attacker),
+        "the same profile's good contribution must remain in the refit"
     );
     let restored = sim.published().expect("published").id;
     let drift = sim.shifts(restored, pre_attack);

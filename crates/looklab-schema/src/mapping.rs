@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
-use crate::ids::{MakernoteTag, SimKey};
+use crate::ids::{LookId, MakernoteTag, SimKey};
+use crate::render::RenderClass;
 use crate::schema::MakernoteValue;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -42,6 +43,12 @@ pub enum MappingError {
     UnknownSim,
     #[error("several native simulations match the file's makernotes")]
     AmbiguousSim,
+    #[error("`{family}` renders {resolved} but the card declares {declared}")]
+    RenderClassConflict {
+        family: LookId,
+        declared: RenderClass,
+        resolved: RenderClass,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

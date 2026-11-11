@@ -36,6 +36,18 @@
 
 The **CLI** (`looklab-cli`) runs the same core crates natively. It's the Phase 1 deliverable, the dev and power-user tool, and the recommended path for privacy-sensitive users who don't want to trust a served client ([06 §5](06-privacy-and-payload.md)).
 
+### Shared targets and camera realizations
+
+One common model/evaluator/fitter serves all bodies. A native-family target has a stable family identity and immutable coefficient versions. Camera input calibration precedes that Look in the forward model; body realization, firmware and control-response parameters describe its camera rendering ([02 §§1–2, §4](02-color-pipeline.md)). They are learned data, not separate camera algorithms or canonical targets.
+
+Camera-realization revisions are scoped by `(body, epoch, native_sim)` and pin exact target, input-transform and native/recipe parameter/CRM artifacts. Separate their attempts, histories and current selections from family-target revisions ([03 §1](03-data-model.md#1-entities)). New target versions schedule dependent realization work; they do not retarget old models through a latest-version lookup.
+
+Eligible evidence on any supported body may seed one provisional family target under existing resource/trust/gauge policy. Its explicit seed cohort can continue improving that source-limited target. Additional experimental bodies consume pinned references and remain outside qualified shared fitting until admission. Isolation precedes graph construction, weighting and contributor-noise estimation; it also covers gauges, warm starts and reputation state ([05 §8](05-trust-and-integrity.md#8-release-gates-and-rollback)).
+
+Keep preparation, numerical validity, empirical qualification, publication and rooted trust independent. Versioned scoped reports and queryable dependencies drive automatic assessment, promotion, invalidation and wanted shots through the existing SQLite jobs and publication-generation mechanism. Append-only arrivals queue successors without starving valid snapshots; invalidated inputs and concurrent selected-predecessor changes fence selection. Do not add another scheduler or per-camera qualification code.
+
+The reference-body working baseline does not make other cameras ineligible for safe experimental use. Qualified multi-body activation retains the common engine and cross-body evidence gates ([09](09-roadmap.md)); missing observations are not waived. The [implementation plan](model-qualification-plan.md) records source-inspection gaps and acceptance cases, not proof that runtime qualification has passed.
+
 ## Cargo workspace
 
 ```
@@ -126,7 +138,9 @@ N = clamp(floor(total_budget / 1 GB), 1, 2)
 2. `meta` parses and sanitizes. `raw` decodes. `prep` aligns, masks and samples. Re-render groups share one sample set.
 3. The payload inspector shows exactly what will upload. The user confirms with their passkey; the batch manifest hash is signed through a WebAuthn challenge.
 4. The server verifies the signature and proof-of-work, validates the schema, HMACs the serial, stores the blob, and enqueues consistency scoring.
-5. The worker refits affected bodies and Looks in batches, applies weights and caps, runs the gates, and writes release manifests to the audit log. The static site republishes.
+5. The worker resolves authoritative subject/resource/evidence snapshots, applies eligibility before graphs and weights, then fits canonical targets from their explicit cohorts and camera realizations against pinned targets. Native and recipe stages remain separate.
+6. Independent assessment produces immutable scoped reports and missing-evidence requests. The worker runs numerical, uncertainty and release gates, then commits eligible artifacts/report selections with lease, invalidating-dependency and selected-predecessor checks ([05 §8](05-trust-and-integrity.md#8-release-gates-and-rollback)).
+7. The static publication root binds artifacts, report associations and current applicability notices. Changes publish even without new Look bytes; events arriving during a run retain successor work. Clients preserve scope and experimental status through compare, match and downloads.
 
 ## Licensing
 

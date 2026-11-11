@@ -31,6 +31,24 @@ pub async fn open(path: &Path) -> Result<SqlitePool, DbError> {
         .connect_with(options)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
+    crate::proposals::migrate_legacy_lut_proposals(&pool).await?;
+    Ok(pool)
+}
+
+/// Opens a database without running migrations.
+///
+/// # Errors
+/// The file is missing or cannot be opened.
+pub async fn open_read_only(path: &Path) -> Result<SqlitePool, DbError> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .create_if_missing(false)
+        .busy_timeout(Duration::from_secs(5));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
     Ok(pool)
 }
 

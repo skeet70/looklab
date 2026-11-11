@@ -134,13 +134,17 @@ pub(crate) fn conjugate_gradient(
     tolerance: f64,
 ) {
     conjugate_gradient_preconditioned(
-        dim, apply,
+        dim,
+        apply,
         |residual, z| {
             for i in 0..dim {
                 z[i] = residual[i] / diagonal[i].max(1e-12);
             }
         },
-        rhs, x, max_iterations, tolerance,
+        rhs,
+        x,
+        max_iterations,
+        tolerance,
     );
 }
 
@@ -167,7 +171,10 @@ pub(crate) fn conjugate_gradient_preconditioned(
     direction.copy_from_slice(&z);
     let mut rz = dot(&residual, &z);
     let target = rz * tolerance * tolerance;
-    let mut report = CgReport { iterations: 0, positive_curvature: true };
+    let mut report = CgReport {
+        iterations: 0,
+        positive_curvature: true,
+    };
     for _ in 0..max_iterations {
         if rz <= target || rz <= 0.0 {
             break;
@@ -198,6 +205,10 @@ pub(crate) fn conjugate_gradient_preconditioned(
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GcvChoice {
     pub lambda: f64,
+    /// Candidates whose system factored; zero means the diagonal fallback ran.
+    pub admissible: usize,
+    /// `trace(H)/trace(P)`, the unit of the λ grid.
+    pub scale: f64,
 }
 
 /// Generalized cross-validation over eight log-spaced `λ`, with a Hutchinson trace estimate.
@@ -218,11 +229,25 @@ pub(crate) fn select_lambda(
     let trace_h: f64 = (0..n).map(|i| hessian[i * n + i]).sum();
     let trace_s: f64 = (0..n).map(|i| penalty[i * n + i]).sum();
     if !(trace_h.is_finite() && trace_h > 0.0) || !(trace_s.is_finite() && trace_s > 0.0) {
-        return GcvChoice { lambda: 0.0 };
+        return GcvChoice {
+            lambda: 0.0,
+            admissible: 0,
+            scale: 0.0,
+        };
     }
     let scale = trace_h / trace_s;
-    let mut best = GcvChoice { lambda: 0.0 };
+    // An indefinite corrected Hessian makes the admissible λ set an artifact of which
+    // candidates happen to factor.
+    let definite = {
+        let mut probe = hessian.to_vec();
+        for (index, curvature) in fixed_curvature.iter().enumerate() {
+            probe[index * n + index] += curvature;
+        }
+        factor_in_place(&mut probe, n)
+    };
+    let mut best = f64::NAN;
     let mut best_score = f64::INFINITY;
+    let mut admissible = 0usize;
     let mut rng = crate::problem::Xorshift::new(seed ^ 0x9e37_79b9_7f4a_7c15);
     let probe_vectors: Vec<Vec<f64>> = (0..probes)
         .map(|_| {
@@ -232,6 +257,9 @@ pub(crate) fn select_lambda(
         })
         .collect();
     for step in 0..8 {
+        if !definite {
+            break;
+        }
         let lambda = scale * libm::pow(10.0, -4.0 + step as f64);
         let mut a = hessian.to_vec();
         for index in 0..n * n {
@@ -267,14 +295,43 @@ pub(crate) fn select_lambda(
         if denominator <= 0.0 {
             continue;
         }
+        admissible += 1;
         let score = (fitted.max(1e-12) / observations) / (denominator * denominator);
+        if crate::fit::fit_diag() {
+            eprintln!(
+                "fit gcv candidate lambda {lambda:.6e} fitted {fitted:.6e} dof {dof:.6e} score {score:.6e}"
+            );
+        }
         if score.is_finite() && score < best_score {
             best_score = score;
-            let _ = dof;
-            best = GcvChoice { lambda };
+            best = lambda;
         }
     }
-    best
+    if admissible == 0 {
+        // The corrected Hessian is indefinite, so no dense candidate decides the scale.
+        let diagonal: Vec<f64> = (0..n).map(|i| hessian[i * n + i]).collect();
+        let penalty_diagonal: Vec<f64> = (0..n).map(|i| penalty[i * n + i]).collect();
+        let choice = select_lambda_diagonal(
+            &diagonal,
+            fixed_curvature,
+            &penalty_diagonal,
+            gradient,
+            fixed_gradient,
+            theta0,
+            rss,
+            observations,
+        );
+        return GcvChoice {
+            lambda: choice.lambda,
+            admissible,
+            scale,
+        };
+    }
+    GcvChoice {
+        lambda: if best.is_nan() { 0.0 } else { best },
+        admissible,
+        scale,
+    }
 }
 
 /// Diagonal-only GCV, for the matrix-free residual block.
@@ -292,10 +349,18 @@ pub(crate) fn select_lambda_diagonal(
     let trace_h: f64 = hessian_diagonal.iter().sum();
     let trace_s: f64 = penalty_diagonal.iter().sum();
     if !(trace_h.is_finite() && trace_h > 0.0) || !(trace_s.is_finite() && trace_s > 0.0) {
-        return GcvChoice { lambda: 0.0 };
+        return GcvChoice {
+            lambda: 0.0,
+            admissible: 0,
+            scale: 0.0,
+        };
     }
     let scale = trace_h / trace_s;
-    let mut best = GcvChoice { lambda: 0.0 };
+    let mut best = GcvChoice {
+        lambda: 0.0,
+        admissible: 0,
+        scale,
+    };
     let mut best_score = f64::INFINITY;
     for step in 0..8 {
         let lambda = scale * libm::pow(10.0, -4.0 + step as f64);
@@ -320,10 +385,19 @@ pub(crate) fn select_lambda_diagonal(
             continue;
         }
         let score = (fitted.max(1e-12) / observations) / (denominator * denominator);
+        if crate::fit::fit_diag() {
+            eprintln!(
+                "fit gcv diagonal candidate lambda {lambda:.6e} fitted {fitted:.6e} dof {dof:.6e} score {score:.6e}"
+            );
+        }
         if score.is_finite() && score < best_score {
             best_score = score;
             let _ = dof;
-            best = GcvChoice { lambda };
+            best = GcvChoice {
+                lambda,
+                admissible: 0,
+                scale,
+            };
         }
     }
     best

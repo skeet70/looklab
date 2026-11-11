@@ -157,6 +157,39 @@ fn grant_key(grant: Grant) -> &'static str {
     }
 }
 
+const MAX_EVIDENCE_REFS: usize = 20;
+
+fn evidence_refs(text: &str) -> Result<Vec<EvidenceRef>, String> {
+    let mut refs = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let reference = normalize_evidence(line)?;
+        if seen.insert(reference.clone()) {
+            refs.push(EvidenceRef::new(reference));
+        }
+    }
+    if refs.len() > MAX_EVIDENCE_REFS {
+        return Err(format!(
+            "Use at most {MAX_EVIDENCE_REFS} evidence references."
+        ));
+    }
+    Ok(refs)
+}
+
+fn normalize_evidence(line: &str) -> Result<String, String> {
+    for prefix in ["contribution:", "image:"] {
+        if let Some(id) = line.strip_prefix(prefix) {
+            return uuid::Uuid::parse_str(id)
+                .map(|id| format!("{prefix}{}", id.hyphenated()))
+                .map_err(|_| format!("{line}: expected {prefix}<uuid>"));
+        }
+    }
+    if let Ok(id) = uuid::Uuid::parse_str(line) {
+        return Ok(id.hyphenated().to_string());
+    }
+    Ok(line.to_owned())
+}
+
 fn bind(parts: &[&[u8]]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(parts.iter().map(|part| 8 + part.len()).sum());
     for part in parts {
@@ -260,6 +293,7 @@ pub(super) fn TrustActions(seeder: bool, admin: bool) -> impl IntoView {
     let catalog_error = RwSignal::new(None::<String>);
     let target_error = RwSignal::new(None::<String>);
     let scope_error = RwSignal::new(None::<String>);
+    let evidence_error = RwSignal::new(None::<String>);
     let reason_error = RwSignal::new(None::<String>);
     let status = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
@@ -275,6 +309,7 @@ pub(super) fn TrustActions(seeder: bool, admin: bool) -> impl IntoView {
     let preview = move |_| {
         target_error.set(None);
         scope_error.set(None);
+        evidence_error.set(None);
         reason_error.set(None);
         error.set(None);
         status.set(None);
@@ -317,19 +352,24 @@ pub(super) fn TrustActions(seeder: bool, admin: bool) -> impl IntoView {
             };
         let target_text = target.get_untracked();
         let reason = Reason(reason_text.clone());
+        let evidence_list = if action == ActionKind::Endorse {
+            match evidence_refs(&evidence.get_untracked()) {
+                Ok(refs) => refs,
+                Err(message) => {
+                    evidence_error.set(Some(message));
+                    return;
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let built = (|| {
             Ok::<_, String>(match action {
                 ActionKind::Endorse => ActionBody::Endorse {
                     subject: SubjectId::parse(&target_text)?,
                     scope: parsed_scope.clone().ok_or("Choose a scope.")?,
                     reason,
-                    evidence: evidence
-                        .get_untracked()
-                        .lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .map(EvidenceRef::new)
-                        .collect(),
+                    evidence: evidence_list,
                 },
                 ActionKind::RevokeEndorsement => ActionBody::RevokeEndorsement {
                     subject: SubjectId::parse(&target_text)?,
@@ -454,32 +494,34 @@ pub(super) fn TrustActions(seeder: bool, admin: bool) -> impl IntoView {
                 preview(event);
             }>
                 <fieldset disabled=move || busy.get()>
-                    <label>
-                        "Action"
-                        <select prop:value=move || kind.get().key() on:change=move |event| {
-                            if let Some(action) = ActionKind::parse(&event_target_value(&event))
-                                .filter(|action| action.allowed(seeder, admin))
-                            {
-                                kind.set(action);
-                            }
-                        }>
-                            {[ActionKind::Endorse, ActionKind::RevokeEndorsement,
-                                ActionKind::AdmitRoot, ActionKind::RevokeRoot,
-                                ActionKind::Grant, ActionKind::RevokeGrant]
-                                .into_iter()
-                                .filter(|action| action.allowed(seeder, admin))
-                                .map(|action| view! {
-                                    <option value=action.key()>{action.label()}</option>
-                                }).collect_view()}
-                        </select>
-                    </label>
-                    <label>
-                        "Public display name or record label (optional)"
-                        <input
-                            prop:value=move || public_label.get()
-                            on:input=move |event| public_label.set(event_target_value(&event))
-                        />
-                    </label>
+                    <div class="review-form-grid">
+                        <label>
+                            "Action"
+                            <select prop:value=move || kind.get().key() on:change=move |event| {
+                                if let Some(action) = ActionKind::parse(&event_target_value(&event))
+                                    .filter(|action| action.allowed(seeder, admin))
+                                {
+                                    kind.set(action);
+                                }
+                            }>
+                                {[ActionKind::Endorse, ActionKind::RevokeEndorsement,
+                                    ActionKind::AdmitRoot, ActionKind::RevokeRoot,
+                                    ActionKind::Grant, ActionKind::RevokeGrant]
+                                    .into_iter()
+                                    .filter(|action| action.allowed(seeder, admin))
+                                    .map(|action| view! {
+                                        <option value=action.key()>{action.label()}</option>
+                                    }).collect_view()}
+                            </select>
+                        </label>
+                        <label>
+                            "Public display name or record label (optional)"
+                            <input
+                                prop:value=move || public_label.get()
+                                on:input=move |event| public_label.set(event_target_value(&event))
+                            />
+                        </label>
+                    </div>
                     <ui::Disclosure summary="Technical details".to_owned() open=true>
                         <label>
                             {move || match kind.get() {
@@ -529,34 +571,36 @@ pub(super) fn TrustActions(seeder: bool, admin: bool) -> impl IntoView {
                             "Unrestricted grant"
                         </label>
                         <div hidden=move || kind.get() == ActionKind::Grant && unrestricted.get()>
-                            <label>
-                                "Camera"
-                                <select
-                                    prop:value=move || body.get()
-                                    on:change=move |event| body.set(event_target_value(&event))
-                                >
-                                    <option value="">"Any camera"</option>
-                                    {move || catalog.get().map(|index| index.bodies.into_iter()
-                                        .map(|camera| view! {
-                                            <option value=camera.id.to_string()>
-                                                {format!("{} {}", camera.make, camera.model)}
-                                            </option>
-                                        }).collect_view())}
-                                </select>
-                            </label>
-                            <label>
-                                "Look"
-                                <select
-                                    prop:value=move || look.get()
-                                    on:change=move |event| look.set(event_target_value(&event))
-                                >
-                                    <option value="">"Any look"</option>
-                                    {move || catalog.get().map(|index| index.looks.into_iter()
-                                        .map(|look| view! {
-                                            <option value=look.slug.to_string()>{look.name}</option>
-                                        }).collect_view())}
-                                </select>
-                            </label>
+                            <div class="review-form-grid">
+                                <label>
+                                    "Camera"
+                                    <select
+                                        prop:value=move || body.get()
+                                        on:change=move |event| body.set(event_target_value(&event))
+                                    >
+                                        <option value="">"Any camera"</option>
+                                        {move || catalog.get().map(|index| index.bodies.into_iter()
+                                            .map(|camera| view! {
+                                                <option value=camera.id.to_string()>
+                                                    {format!("{} {}", camera.make, camera.model)}
+                                                </option>
+                                            }).collect_view())}
+                                    </select>
+                                </label>
+                                <label>
+                                    "Look"
+                                    <select
+                                        prop:value=move || look.get()
+                                        on:change=move |event| look.set(event_target_value(&event))
+                                    >
+                                        <option value="">"Any look"</option>
+                                        {move || catalog.get().map(|index| index.looks.into_iter()
+                                            .map(|look| view! {
+                                                <option value=look.slug.to_string()>{look.name}</option>
+                                            }).collect_view())}
+                                    </select>
+                                </label>
+                            </div>
                             <p class="muted">
                                 "Both choices must match. Any camera and any look covers all contributions."
                             </p>
@@ -570,14 +614,23 @@ pub(super) fn TrustActions(seeder: bool, admin: bool) -> impl IntoView {
                             <p class="error" role="alert">{message}</p>
                         })}
                     </div>
-                    <label hidden=move || kind.get() != ActionKind::Endorse>
-                        "Evidence references (one per line, optional)"
+                    <div hidden=move || kind.get() != ActionKind::Endorse>
+                        <label for="endorse-evidence">
+                            "Evidence references (one per line, optional)"
+                        </label>
                         <textarea
+                            id="endorse-evidence"
                             rows="2"
                             prop:value=move || evidence.get()
                             on:input=move |event| evidence.set(event_target_value(&event))
                         ></textarea>
-                    </label>
+                        <p class="muted">
+                            "Use contribution:<uuid>, image:<uuid>, or a bare contribution or image id. Chart-session labels are also kept as human evidence. Deferred monochrome contributions and their images cannot be endorsed."
+                        </p>
+                        {move || evidence_error.get().map(|message| view! {
+                            <p class="error" role="alert">{message}</p>
+                        })}
+                    </div>
                     <label>
                         "Public reason (required)"
                         <textarea
@@ -631,5 +684,61 @@ pub(super) fn TrustActions(seeder: bool, admin: bool) -> impl IntoView {
                 </p>
             })}
         </section>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_evidence_is_normalized_and_deduplicated() {
+        let refs = evidence_refs(
+            "contribution:01234567-89ab-cdef-0123-456789abcdef\n\
+             image:0123456789abcdef0123456789abcdef\n\
+             0123456789abcdef0123456789abcdef\n\
+             contribution:0123456789abcdef0123456789abcdef",
+        )
+        .expect("valid evidence");
+
+        assert_eq!(
+            refs.iter().map(EvidenceRef::as_str).collect::<Vec<_>>(),
+            vec![
+                "contribution:01234567-89ab-cdef-0123-456789abcdef",
+                "image:01234567-89ab-cdef-0123-456789abcdef",
+                "01234567-89ab-cdef-0123-456789abcdef",
+            ]
+        );
+    }
+
+    #[test]
+    fn human_evidence_labels_pass_through() {
+        let refs = evidence_refs("chart-session-1\n\n  field-note: white end clipped  ")
+            .expect("human labels are allowed");
+        assert_eq!(
+            refs.iter().map(EvidenceRef::as_str).collect::<Vec<_>>(),
+            vec!["chart-session-1", "field-note: white end clipped"]
+        );
+    }
+
+    #[test]
+    fn malformed_internal_evidence_is_rejected() {
+        assert!(evidence_refs("contribution:not-a-uuid").is_err());
+        assert!(evidence_refs("image:1234").is_err());
+        assert!(evidence_refs("contribution:").is_err());
+    }
+
+    #[test]
+    fn empty_evidence_sends_nothing() {
+        assert!(evidence_refs(" \n\t ").expect("empty evidence").is_empty());
+    }
+
+    #[test]
+    fn too_many_evidence_references_are_rejected() {
+        let text = (0..=MAX_EVIDENCE_REFS)
+            .map(|index| format!("chart-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(evidence_refs(&text).is_err());
     }
 }

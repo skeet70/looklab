@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The Body entity file.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ValidationError;
 use crate::ids::{BodyId, IdError};
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Body {
     pub id: BodyId,
@@ -20,7 +20,7 @@ pub struct Body {
     pub mapping_status: MappingStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capabilities {
     pub in_camera_raw_conversion: bool,
@@ -28,7 +28,7 @@ pub struct Capabilities {
     pub heif: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(try_from = "String")]
 pub struct ColorSpace(String);
 
@@ -52,21 +52,21 @@ impl TryFrom<String> for ColorSpace {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BodyKind {
     Camera,
     Software,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BodyStatus {
     Proposed,
     Active,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MappingStatus {
     Provisional,

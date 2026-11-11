@@ -2,66 +2,16 @@
 //! Proposal validation, menu-level summaries, confirmations and fixture consent.
 
 use looklab_schema::{
-    Date, Evidence, FixtureDonation, FixtureLicense, LabeledTag, LicenseDeclaration, MappingError,
-    Placement, ProposalKind, ProposalSummary, Sha256Hex, ValidatedPayload, fixture_manifest_toml,
-    fixture_source, frame_fixture_upload, infer_mapping, split_fixture_upload, validate_proposal,
+    ControlChange, ControlEdit, ControlKey, Date, Evidence, FixtureDonation, FixtureLicense,
+    LUT_UPLOAD_MAGIC, LabeledTag, LicenseDeclaration, MAX_LUT_BYTES, MappingError, Placement,
+    ProposalKind, Rational, Sha256Hex, apply_control_changes, body_id_from_name,
+    fixture_manifest_toml, fixture_source, frame_fixture_upload, frame_lut_proposal, infer_mapping,
+    look_id_from_name, sim_key_from_name, split_fixture_upload, split_lut_proposal,
+    validate_control_schema, validate_proposal,
 };
 
 const BODY: &str = include_str!("../../../data/bodies/fujifilm-x-t5.body.yaml");
 const SCHEMA: &str = include_str!("../../../data/bodies/fujifilm-x-t5.yaml");
-const INTERFACE: &str = include_str!("../../../data/interfaces/example-app-lut3d-v1.yaml");
-
-fn summary_of(kind: ProposalKind, payload: &str) -> ProposalSummary {
-    validate_proposal(kind, payload)
-        .expect("valid payload")
-        .summary()
-}
-
-#[test]
-fn a_body_proposal_summarizes_in_menu_terms() {
-    let summary = summary_of(ProposalKind::Body, BODY);
-    assert_eq!(summary.headline, "adds Fujifilm X-T5 as a camera body");
-    assert!(summary.text().contains("body id: fujifilm/x-t5"));
-    assert!(summary.text().contains("mapping: provisional"));
-}
-
-#[test]
-fn a_schema_change_lists_the_menu_level_control_changes() {
-    let summary = summary_of(ProposalKind::SchemaChange, SCHEMA);
-    assert_eq!(summary.headline, "updates the X-T5 control schema");
-    assert!(
-        summary
-            .details
-            .contains(&"Highlight tone goes -2 to +4 in half steps".to_owned()),
-        "{:?}",
-        summary.details
-    );
-    assert!(
-        summary
-            .details
-            .contains(&"Dynamic range offers dr100, dr200, dr400".to_owned())
-    );
-}
-
-#[test]
-fn a_mapping_proposal_names_the_simulation_model_and_firmware() {
-    let payload = "\
-body: fujifilm/x-t5
-epoch: 2
-sim_key: reala_ace
-look: reala-ace
-firmware_from: \"2.00\"
-makernote: { tag: FilmMode, value: 0x0700 }
-";
-    let summary = summary_of(ProposalKind::Mapping, payload);
-    assert_eq!(summary.headline, "adds Reala Ace to X-T5 firmware 2.00+");
-    assert!(
-        summary
-            .details
-            .contains(&"makernote: FilmMode = 0x0700".to_owned())
-    );
-}
-
 #[test]
 fn a_mapping_with_an_inverted_firmware_range_is_rejected() {
     let payload = "\
@@ -84,6 +34,8 @@ look: my-lut
 name: My LUT
 license: { own_work: false }
 attribution: A contributor
+lut: { file: my-lut.cube, sha256: 0000000000000000000000000000000000000000000000000000000000000000, size: 1024 }
+encoding: flog2_fgamut
 ";
     let errors = validate_proposal(ProposalKind::LutLook, no_license).unwrap_err();
     assert_eq!(errors[0].path, "license");
@@ -93,11 +45,10 @@ look: my-lut
 name: My LUT
 license: { own_work: true }
 attribution: A contributor
+lut: { file: my-lut.cube, sha256: 0000000000000000000000000000000000000000000000000000000000000000, size: 1024 }
+encoding: flog2_fgamut
 ";
-    let summary = summary_of(ProposalKind::LutLook, valid);
-    assert_eq!(summary.headline, "adds the LUT-defined look My LUT");
-    assert!(summary.text().contains("license: the submitter's own work"));
-    assert!(summary.text().contains("published under CC0-1.0"));
+    validate_proposal(ProposalKind::LutLook, valid).expect("licensed LUT");
 
     let licensed = LicenseDeclaration {
         own_work: false,
@@ -105,59 +56,89 @@ attribution: A contributor
         source_url: None,
     };
     assert!(licensed.validate().is_empty());
-    assert!(licensed.describe().contains("CC-BY-4.0"));
 }
 
 #[test]
-fn an_interface_profile_summarizes_its_insertion_point() {
-    let summary = summary_of(ProposalKind::InterfaceProfile, INTERFACE);
-    assert_eq!(
-        summary.headline,
-        "adds the Example editor 3D LUT module software interface profile"
-    );
+fn a_malformed_display_lut_base_is_rejected() {
+    let digest = "00".repeat(32);
+    let payload = |base: &str| {
+        format!(
+            "look: my-lut\nname: My LUT\nlicense: {{ own_work: true }}\n\
+             attribution: A contributor\nlut: {{ file: my-lut.cube, sha256: {digest}, size: 1024 }}\n\
+             encoding: !display\n  base:\n{base}"
+        )
+    };
+    validate_proposal(
+        ProposalKind::LutLook,
+        &payload(
+            "      kind: family_rendering\n      maker: Fujifilm\n      rendering: Classic Chrome\n",
+        ),
+    )
+    .expect("valid family declaration");
     assert!(
-        summary
-            .text()
-            .contains("accepts: cube, Hald clut, native JSON")
+        validate_proposal(
+            ProposalKind::LutLook,
+            &payload(
+                "      kind: family_rendering\n      maker: \" \"\n      rendering: Classic Chrome\n",
+            ),
+        )
+        .is_err()
     );
-    assert!(summary.text().contains("bodies: Model-A"));
+
+    assert!(
+        validate_proposal(
+            ProposalKind::LutLook,
+            &payload(&format!(
+                "      kind: family_rendering\n      maker: {}\n      rendering: Classic Chrome\n",
+                "m".repeat(201)
+            )),
+        )
+        .is_err()
+    );
+
+    let bad_look = validate_proposal(
+        ProposalKind::LutLook,
+        &payload("      kind: look\n      look: BadLook\n      version: 1.0.0\n"),
+    )
+    .unwrap_err();
+    assert_eq!(bad_look[0].path, "encoding.base.look");
+
+    let long_notes = validate_proposal(
+        ProposalKind::LutLook,
+        &payload(&format!(
+            "      kind: family_rendering\n      maker: Fujifilm\n      rendering: Classic Chrome\n      notes: {}\n",
+            "n".repeat(501)
+        )),
+    )
+    .unwrap_err();
+    assert_eq!(long_notes[0].path, "encoding.base.notes");
 }
 
 #[test]
-fn an_epoch_split_names_the_firmware_boundary() {
-    let payload = "\
-body: fujifilm/x-t5
-from_epoch: 1
-new_epoch: 2
-split_at: \"2.00\"
-";
-    let summary = summary_of(ProposalKind::EpochSplit, payload);
-    assert_eq!(
-        summary.headline,
-        "splits X-T5 into a new epoch at firmware 2.00"
-    );
-}
+fn a_display_lut_base_rejects_fields_from_another_kind() {
+    let digest = "00".repeat(32);
+    let payload = |base: &str| {
+        format!(
+            "look: my-lut\nname: My LUT\nlicense: {{ own_work: true }}\n\
+             attribution: A contributor\nlut: {{ file: my-lut.cube, sha256: {digest}, size: 1024 }}\n\
+             encoding: !display\n  base:\n{base}"
+        )
+    };
+    for base in [
+        "      kind: look\n      look: my-base\n      version: 1.0.0\n      body: fujifilm/x-t5\n",
+        "      kind: body_realization\n      body: fujifilm/x-t5\n      renderer: x_raw_studio\n      maker: Fujifilm\n",
+        "      kind: family_rendering\n      maker: Fujifilm\n      rendering: Classic Chrome\n      body: fujifilm/x-t5\n",
+        "      kind: family_rendering\n      maker: Fujifilm\n      rendering: Classic Chrome\n      unknown: value\n",
+    ] {
+        assert!(validate_proposal(ProposalKind::LutLook, &payload(base)).is_err());
+    }
 
-#[test]
-fn a_look_split_and_a_gate_override_have_summaries() {
-    let split = summary_of(
-        ProposalKind::LookSplit,
-        "look: classic-chrome\nnew_look: classic-chrome-mono\nname: Classic Chrome Mono\n",
+    let status = format!(
+        "look: my-lut\nname: My LUT\nlicense: {{ own_work: true }}\n\
+         attribution: A contributor\nlut: {{ file: my-lut.cube, sha256: {digest}, size: 1024 }}\n\
+         encoding: !display\n  base:\n      kind: look\n      look: my-base\n      version: 1.0.0\n  status:\n    kind: pinned\n"
     );
-    assert_eq!(
-        split.headline,
-        "splits classic-chrome into classic-chrome-mono"
-    );
-
-    let gate = summary_of(
-        ProposalKind::GateOverride,
-        "look: classic-chrome\nversion: 3\njustification: new root session\n",
-    );
-    assert_eq!(
-        gate.headline,
-        "overrides the release gate for classic-chrome version 3"
-    );
-    assert!(gate.text().contains("new root session"));
+    assert!(validate_proposal(ProposalKind::LutLook, &status).is_err());
 }
 
 #[test]
@@ -406,12 +387,114 @@ fn a_body_document_that_is_not_valid_is_rejected() {
 }
 
 #[test]
-fn validation_does_not_mutate_the_summary_for_the_same_payload() {
-    let first = summary_of(ProposalKind::SchemaChange, SCHEMA);
-    let second = summary_of(ProposalKind::SchemaChange, SCHEMA);
-    assert_eq!(first, second);
-    match validate_proposal(ProposalKind::SchemaChange, SCHEMA).expect("valid") {
-        ValidatedPayload::SchemaChange(schema) => assert_eq!(schema.body.as_str(), "fujifilm/x-t5"),
-        other => panic!("unexpected payload {other:?}"),
-    }
+fn a_custom_look_cannot_take_the_reserved_baseline_or_exceed_the_slug_limit() {
+    let payload = |look: &str| {
+        format!(
+            "look: {look}\nname: My LUT\nlicense: {{ own_work: true }}\n\
+             attribution: A contributor\nlut:\n  file: my-lut.cube\n  sha256: {}\n  \
+             size: 4096\nencoding: flog2_fgamut\n",
+            "ab".repeat(32)
+        )
+    };
+    let reserved = validate_proposal(
+        ProposalKind::LutLook,
+        &payload(looklab_schema::RESERVED_LUT_LOOK_SLUG),
+    )
+    .unwrap_err();
+    assert_eq!(reserved[0].path, "look");
+    let too_long = validate_proposal(ProposalKind::LutLook, &payload(&"a".repeat(65))).unwrap_err();
+    assert_eq!(too_long[0].path, "look");
+}
+
+#[test]
+fn a_lut_frame_carries_the_header_and_file_and_rejects_other_magics() {
+    let header = br#"{"kind":"lut_look"}"#;
+    let frame = frame_lut_proposal(header, b"cube bytes").expect("frame");
+    let (parsed, bytes) = split_lut_proposal(&frame).expect("split");
+    assert_eq!(parsed, header);
+    assert_eq!(bytes, b"cube bytes");
+    let fixture = frame_fixture_upload(header, b"cube bytes").expect("fixture frame");
+    assert!(split_lut_proposal(&fixture).is_err());
+    let start = LUT_UPLOAD_MAGIC.len() + 4;
+    assert!(split_lut_proposal(&frame[..start + 1]).is_err());
+}
+
+#[test]
+fn a_lut_file_outside_the_upload_bounds_is_rejected() {
+    let payload = |file: &str, size: u64| {
+        format!(
+            "look: my-lut\nname: My LUT\nlicense: {{ own_work: true }}\nattribution: A contributor\n\
+             lut:\n  file: {file}\n  sha256: {}\n  size: {size}\nencoding: flog2_fgamut\n",
+            "ab".repeat(32)
+        )
+    };
+    let oversized = validate_proposal(
+        ProposalKind::LutLook,
+        &payload("my-lut.cube", MAX_LUT_BYTES + 1),
+    )
+    .unwrap_err();
+    assert_eq!(oversized[0].path, "size");
+    let empty = validate_proposal(ProposalKind::LutLook, &payload("my-lut.cube", 0)).unwrap_err();
+    assert_eq!(empty[0].path, "size");
+    let wrong_extension =
+        validate_proposal(ProposalKind::LutLook, &payload("my-lut.txt", 4096)).unwrap_err();
+    assert_eq!(wrong_extension[0].path, "file");
+}
+
+#[test]
+fn a_control_change_sets_only_the_requested_field() {
+    let key = ControlKey::new("highlight_tone").expect("control key");
+    let step = Rational::new(1, 4).expect("step");
+    let updated = apply_control_changes(
+        SCHEMA,
+        &[(
+            1,
+            ControlChange::Set {
+                key,
+                edits: vec![ControlEdit::Step(step)],
+            },
+        )],
+    )
+    .expect("updated schema");
+    let schema = validate_control_schema(&updated).expect("valid schema");
+    let control = schema.epochs[0]
+        .controls
+        .iter()
+        .find(|control| control.key.as_str() == "highlight_tone")
+        .expect("control");
+    assert_eq!(control.step, Some(step));
+    assert_eq!(
+        control.range.as_ref().expect("range").max,
+        Rational::new(4, 1).expect("max")
+    );
+    assert!(control.look_affecting);
+}
+
+#[test]
+fn a_control_change_rejects_a_control_the_epoch_does_not_declare() {
+    let key = ControlKey::new("not_a_control").expect("control key");
+    let change = ControlChange::Set {
+        key,
+        edits: vec![ControlEdit::LookAffecting(true)],
+    };
+    assert!(apply_control_changes(SCHEMA, &[(1, change)]).is_err());
+}
+
+#[test]
+fn names_reduce_to_stable_ids_and_an_empty_name_is_rejected() {
+    assert_eq!(
+        look_id_from_name("My LUT!").expect("look").as_str(),
+        "my-lut"
+    );
+    assert_eq!(
+        body_id_from_name("Fujifilm", "X-T5")
+            .expect("body")
+            .as_str(),
+        "fujifilm/x-t5"
+    );
+    assert_eq!(
+        sim_key_from_name("Reala Ace").expect("sim").as_str(),
+        "reala_ace"
+    );
+    assert!(look_id_from_name("---").is_err());
 }

@@ -4,6 +4,107 @@
 let instance = null;
 let poisoned = false;
 let readyPromise = null;
+let diagnostics = null;
+
+const nativeStackGetter = (() => {
+  try {
+    for (let object = new Error(); object; object = Object.getPrototypeOf(object)) {
+      const descriptor = Object.getOwnPropertyDescriptor(object, "stack");
+      if (descriptor) return typeof descriptor.get === "function" ? descriptor.get : null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+})();
+
+function errorTypeOf(error) {
+  try {
+    for (let object = error; object; object = Object.getPrototypeOf(object)) {
+      const descriptor = Object.getOwnPropertyDescriptor(object, "name");
+      if (descriptor) {
+        return typeof descriptor.value === "string" ? descriptor.value : "Unknown";
+      }
+    }
+  } catch {
+    return "Unknown";
+  }
+  return "Unknown";
+}
+
+function stackOf(error) {
+  if (!(error instanceof Error)) return "";
+  try {
+    for (let object = error; object; object = Object.getPrototypeOf(object)) {
+      const descriptor = Object.getOwnPropertyDescriptor(object, "stack");
+      if (!descriptor) continue;
+      if (typeof descriptor.value === "string") return descriptor.value;
+      if (!nativeStackGetter || descriptor.get !== nativeStackGetter) return "";
+      const prepare = Object.getOwnPropertyDescriptor(Error, "prepareStackTrace");
+      if (prepare && (!("value" in prepare) || prepare.value !== undefined)) return "";
+      for (const key of ["name", "message"]) {
+        for (let owner = error; owner; owner = Object.getPrototypeOf(owner)) {
+          const property = Object.getOwnPropertyDescriptor(owner, key);
+          if (!property) continue;
+          if (!("value" in property) || typeof property.value !== "string") return "";
+          break;
+        }
+      }
+      const stack = nativeStackGetter.call(error);
+      return typeof stack === "string" ? stack : "";
+    }
+  } catch {}
+  return "";
+}
+
+function frameLines(stack) {
+  if (typeof stack !== "string") return "";
+  return stack
+    .split("\n")
+    .filter((line) => {
+      const text = line.trim();
+      return (
+        text.startsWith("at ") ||
+        /^\S*@[^\s@]+:\d+:\d+$/.test(text) ||
+        /wasm-function\[\d+\]:0x[0-9a-f]+/i.test(text)
+      );
+    })
+    .join("\n");
+}
+
+function describe(error) {
+  if (!(error instanceof Error)) return { errorType: "Unknown", stack: "" };
+  return { errorType: errorTypeOf(error), stack: frameLines(stackOf(error)) };
+}
+
+function reportClientError(kind, error, location) {
+  if (!diagnostics) return;
+  try {
+    const { errorType, stack } = describe(error);
+    self.postMessage({
+      type: "client-error",
+      kind,
+      errorType,
+      stack,
+      wasmAsset: diagnostics.wasmAsset,
+      asset: location && typeof location.asset === "string" ? location.asset : "",
+      line: location && Number.isInteger(location.line) ? location.line : 0,
+      column: location && Number.isInteger(location.column) ? location.column : 0,
+    });
+  } catch {}
+}
+
+self.addEventListener("error", (event) => {
+  reportClientError("exception", event.error, {
+    asset: event.filename,
+    line: event.lineno,
+    column: event.colno,
+  });
+});
+
+self.addEventListener("unhandledrejection", (event) => {
+  reportClientError("unhandled_rejection", event.reason, null);
+});
 
 async function load(url) {
   const response = await fetch(url);
@@ -37,6 +138,11 @@ self.onmessage = async (event) => {
   const message = event.data;
   try {
     if (message.type === "init") {
+      if (message.diagnostics) {
+        diagnostics = {
+          wasmAsset: typeof message.url === "string" ? message.url : "",
+        };
+      }
       readyPromise = load(message.url);
       instance = await readyPromise;
       poisoned = false;
@@ -59,6 +165,7 @@ self.onmessage = async (event) => {
     );
   } catch (error) {
     console.error("worker error", error);
+    reportClientError("console_error", error, null);
     poisoned = true;
     self.postMessage({
       type: "error",

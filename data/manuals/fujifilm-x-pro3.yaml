@@ -1,0 +1,314 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: fujifilm/x-pro3
+  make: Fujifilm
+  model: X-Pro3
+  sources:
+  - id: xpro3-manual
+    kind: owner_manual
+    url: https://fujifilm-dsc.com/en/manual/x-pro3/
+    title: FUJIFILM X-Pro3 Owner's Manual
+    edition: BL00005035-204 EN
+    firmware_scope: unspecified
+  - id: xpro3-firmware
+    kind: firmware_notes
+    url: https://fujifilm-x.com/en-us/support/download/firmware/cameras/x-pro3/
+    title: X-Pro3 Firmware update
+    edition: web edition, accessed 2026-11-08
+    firmware_scope: '2.00'
+  capabilities:
+  - key: native_simulations
+    label: FILM SIMULATION
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - PROVIA/STANDARD
+      - Velvia/VIVID
+      - ASTIA/SOFT
+      - CLASSIC CHROME
+      - PRO Neg. Hi
+      - PRO Neg. Std
+      - CLASSIC Neg.
+      - ETERNA/CINEMA
+      - ACROS
+      - ACROS+Ye
+      - ACROS+R
+      - ACROS+G
+      - MONOCHROME
+      - MONOCHROME+Ye
+      - MONOCHROME+R
+      - MONOCHROME+G
+      - SEPIA
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > FILM SIMULATION (menu_shooting/image_quality_setting)
+    notes: ACROS and MONOCHROME are documented with yellow (Ye), red (R) and green (G) filter variants in a footnote.
+  - key: jpeg_quality
+    label: IMAGE QUALITY
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - FINE
+      - NORMAL
+      - RAW
+      - FINE+RAW
+      - NORMAL+RAW
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > IMAGE QUALITY (menu_shooting/image_quality_setting)
+  - key: raw_capture
+    label: RAW RECORDING
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - UNCOMPRESSED
+      - LOSSLESS COMPRESSED
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > RAW RECORDING (menu_shooting/image_quality_setting)
+  - key: heif_capture
+    label: HEIF
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > IMAGE QUALITY (menu_shooting/image_quality_setting)
+    notes: No HEIF option appears in the documented image-quality formats.
+  - key: in_camera_raw_conversion
+    label: RAW CONVERSION
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: xpro3-manual
+      locator: PLAY BACK MENU > RAW CONVERSION (playback/menu_playback)
+  - key: jpeg_color_spaces
+    label: COLOR SPACE
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - Adobe RGB
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > COLOR SPACE (menu_shooting/image_quality_setting)
+  - key: white_balance_presets
+    label: WHITE BALANCE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - CUSTOM 1
+      - CUSTOM 2
+      - CUSTOM 3
+      - COLOR TEMPERATURE
+      - DAYLIGHT
+      - SHADE
+      - FLUORESCENT LIGHT-1
+      - FLUORESCENT LIGHT-2
+      - FLUORESCENT LIGHT-3
+      - INCANDESCENT
+      - UNDERWATER
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > WHITE BALANCE (menu_shooting/image_quality_setting)
+  - key: white_balance_shift
+    label: WB SHIFT
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: R
+      - label: B
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > WHITE BALANCE > Fine-Tuning White Balance (menu_shooting/image_quality_setting)
+    notes: Two-axis fine-tuning dialog; the rendered dialog figure shows the grid and current R/B values without numeric limits.
+  - key: dynamic_range
+    label: DYNAMIC RANGE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - 100%
+      - 200%
+      - 400%
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > DYNAMIC RANGE (menu_shooting/image_quality_setting)
+    notes: 200% requires ISO 320 or above; 400% requires ISO 640 or above. AUTO selects 100% or 200%.
+  - key: tone_curve
+    label: TONE CURVE
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: HIGHLIGHTS
+        min: -2
+        max: 4
+        step: 1
+      - label: SHADOWS
+        min: -2
+        max: 4
+        step: 1
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > TONE CURVE (menu_shooting/image_quality_setting)
+    notes: HIGHLIGHTS and SHADOWS are each adjustable from -2 to +4.
+  - key: saturation
+    label: COLOR
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > COLOR (menu_shooting/image_quality_setting)
+  - key: sharpening
+    label: SHARPNESS
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > SHARPNESS (menu_shooting/image_quality_setting)
+  - key: noise_reduction
+    label: NOISE REDUCTION
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > NOISE REDUCTION (menu_shooting/image_quality_setting)
+  - key: grain
+    label: GRAIN EFFECT
+    category: spatial
+    availability: available
+    domain:
+      type: enum
+      values:
+      - STRONG
+      - WEAK
+      - 'OFF'
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > GRAIN EFFECT > ROUGHNESS (menu_shooting/image_quality_setting)
+  - key: grain_size
+    label: SIZE
+    category: spatial
+    availability: available
+    domain:
+      type: enum
+      values:
+      - LARGE
+      - SMALL
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > GRAIN EFFECT > SIZE (menu_shooting/image_quality_setting)
+  - key: clarity
+    label: CLARITY
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: -5
+      max: 5
+      step: 1
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > CLARITY (menu_shooting/image_quality_setting)
+  - key: color_chrome_effect
+    label: COLOR CHROME EFFECT
+    category: unknown
+    availability: available
+    domain:
+      type: enum
+      values:
+      - STRONG
+      - WEAK
+      - 'OFF'
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > COLOR CHROME EFFECT (menu_shooting/image_quality_setting)
+  - key: color_chrome_fx_blue
+    label: COLOR CHROME FX BLUE
+    category: unknown
+    availability: available
+    domain:
+      type: enum
+      values:
+      - STRONG
+      - WEAK
+      - 'OFF'
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > COLOR CHROME FX BLUE (menu_shooting/image_quality_setting)
+  - key: monochrome_toning
+    label: MONOCHROMATIC COLOR
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: WC
+      - label: MG
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > MONOCHROMATIC COLOR (menu_shooting/image_quality_setting)
+    notes: Two-axis warm-cool and green-magenta dialog; the rendered figure shows the grid and current WC/MG values without numeric limits.
+  - key: dynamic_range_priority
+    label: D RANGE PRIORITY
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - STRONG
+      - WEAK
+      - 'OFF'
+    citations:
+    - source: xpro3-manual
+      locator: IMAGE QUALITY SETTING > D RANGE PRIORITY (menu_shooting/image_quality_setting)
+    notes: When set to other than OFF, HIGHLIGHT TONE, SHADOW TONE and DYNAMIC RANGE are adjusted automatically.
+  - key: film_simulation_bracket
+    label: FILM SIMULATION BKT
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: xpro3-manual
+      locator: Bracketing > FILM SIMULATION BKT (taking_photo/bracketing)
+  notes:
+  - TONE CURVE replaces separate HIGHLIGHT TONE and SHADOW TONE controls.

@@ -99,11 +99,55 @@ impl FsBlobStore {
     }
 }
 
+fn write_temporary(path: &std::path::Path, bytes: &[u8]) -> Result<(), BlobError> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn verify_existing(path: &std::path::Path, hash: BlobHash, bytes: &[u8]) -> Result<(), BlobError> {
+    let existing = std::fs::read(path)?;
+    if BlobHash::of(&existing) != hash || existing != bytes {
+        return Err(BlobError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "existing blob content does not match its hash",
+        )));
+    }
+    Ok(())
+}
+
+/// Writes under a transaction the blocking task owns.
+pub async fn write_guarded<T, F>(
+    tx: sqlx::Transaction<'static, sqlx::Sqlite>,
+    write: F,
+) -> Result<(sqlx::Transaction<'static, sqlx::Sqlite>, T), BlobError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> (T, Result<(), BlobError>) + Send + 'static,
+{
+    let (tx, output, written) = tokio::task::spawn_blocking(move || {
+        let (output, written) = write();
+        (tx, output, written)
+    })
+    .await
+    .map_err(|error| BlobError::Io(std::io::Error::other(error)))?;
+    written?;
+    Ok((tx, output))
+}
+
 impl BlobStore for FsBlobStore {
     fn put(&self, hash: BlobHash, bytes: &[u8]) -> Result<(), BlobError> {
         let path = self.path(hash);
         if path.exists() {
-            return Ok(());
+            return verify_existing(&path, hash, bytes);
         }
         let unique = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let temporary = self.root.join(format!(
@@ -112,25 +156,15 @@ impl BlobStore for FsBlobStore {
             std::process::id(),
             unique
         ));
-        let mut file = std::fs::File::create(&temporary)?;
-        {
-            use std::io::Write as _;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-        }
-        drop(file);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-        }
-        match std::fs::rename(&temporary, &path) {
-            Ok(()) => {}
-            Err(_) if path.exists() => {
-                let _ = std::fs::remove_file(&temporary);
+        let result = write_temporary(&temporary, bytes).and_then(|()| {
+            match std::fs::rename(&temporary, &path) {
+                Ok(()) => Ok(()),
+                Err(_) if path.exists() => verify_existing(&path, hash, bytes),
+                Err(error) => Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
-        }
+        });
+        let _ = std::fs::remove_file(&temporary);
+        result?;
         if let Ok(directory) = std::fs::File::open(&self.root) {
             let _ = directory.sync_all();
         }
@@ -151,5 +185,68 @@ impl BlobStore for FsBlobStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::write_guarded;
+
+    struct Release(std::sync::mpsc::Sender<()>);
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_writer_holds_the_transaction_until_the_write_returns() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("looklab.sqlite3");
+        let pool = crate::db::open(&path).await.expect("database");
+        let tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("transaction");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_guard = Release(release_tx.clone());
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(write_guarded(tx, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+            let _ = finished_tx.send(());
+            ((), Ok(()))
+        }));
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("writer entered")
+            .expect("entered signal");
+        task.abort();
+        let _ = task.await;
+
+        let contender = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .busy_timeout(Duration::from_millis(100)),
+        )
+        .await
+        .expect("contender");
+        let locked = contender.begin_with("BEGIN IMMEDIATE").await.is_err();
+        release_tx.send(()).expect("release writer");
+        assert!(
+            locked,
+            "a cancelled request must not release the write lock while the writer runs"
+        );
+        tokio::time::timeout(Duration::from_secs(5), finished_rx)
+            .await
+            .expect("writer finished")
+            .expect("finished signal");
+        drop(release_guard);
+        contender.close().await;
+        pool.close().await;
     }
 }

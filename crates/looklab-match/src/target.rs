@@ -2,12 +2,15 @@
 
 use looklab_color::Xyz;
 use looklab_color::ucs::Ucs;
+use looklab_model::domain_penalty::check_published_paths;
 use looklab_model::file::UncertaintyData;
 use looklab_model::{Look, LookInput, ProbeGroup, ProbeSet};
 
 use crate::emphasis::Emphasis;
 use crate::error::{MatchError, Result};
 use crate::linear::ProbeSubset;
+use crate::metric::{AssessmentStatus, OutputContext, OutputPin, ScoringMetric, TargetAppearance};
+use crate::model::MatchModel;
 
 pub trait TargetFunction {
     fn predict(&self, xyz: Xyz) -> Ucs;
@@ -35,6 +38,7 @@ pub struct TargetSpec<'a> {
     pub tau: f64,
     pub support_sigma: f64,
     pub density_floor: Option<f64>,
+    pub appearance: TargetAppearance,
 }
 
 pub struct PreparedTarget<'a> {
@@ -42,6 +46,10 @@ pub struct PreparedTarget<'a> {
     pub function: &'a dyn TargetFunction,
     pub emphasis: Emphasis,
     pub tau: f64,
+    pub appearance: TargetAppearance,
+    /// The requested assessment point count before any qualified probe filtering.
+    pub declared_points: usize,
+    pub target_uncertainty: AssessmentStatus,
     pub supported: Vec<usize>,
     pub sigma2: Vec<f64>,
     /// `probe.weight × emphasis × c_p`; zero for unsupported probes.
@@ -56,17 +64,22 @@ impl<'a> PreparedTarget<'a> {
     pub fn new(spec: TargetSpec<'a>) -> Result<Self> {
         let count = spec.probes.probes.len();
         let mut sigma2 = vec![0.0_f64; count];
+        let mut target_uncertainty = AssessmentStatus::Unassessed;
         if let Some(uncertainty) = spec.uncertainty {
-            let covariance = uncertainty
-                .probe_cov_post
-                .as_ref()
-                .or(uncertainty.probe_cov.as_ref());
+            let covariance = match spec.appearance.metric() {
+                ScoringMetric::RenderedPostClipV1 => uncertainty.probe_cov_post.as_ref(),
+                ScoringMetric::LegacyPreClipV1 => uncertainty
+                    .probe_cov_post
+                    .as_ref()
+                    .or(uncertainty.probe_cov.as_ref()),
+            };
             if let Some(covariance) = covariance {
                 if covariance.values.len() != count.saturating_mul(9) {
                     return Err(MatchError::Dimension(
                         "probe covariance does not cover the probe set".to_string(),
                     ));
                 }
+                target_uncertainty = AssessmentStatus::Assessed;
                 for (index, chunk) in covariance.values.as_chunks::<9>().0.iter().enumerate() {
                     sigma2[index] = chunk[0] + chunk[4] + chunk[8];
                 }
@@ -83,17 +96,24 @@ impl<'a> PreparedTarget<'a> {
         let mut covariance_weight = vec![0.0_f64; count];
         let mut target = Vec::with_capacity(count);
         for (index, probe) in spec.probes.probes.iter().enumerate() {
-            target.push(spec.function.predict(probe.xyz));
+            target.push(spec.appearance.render(spec.function.predict(probe.xyz)));
             let sigma = sigma2[index].max(0.0).sqrt();
             let dense = spec
                 .uncertainty
                 .and_then(|data| data.density.as_ref())
                 .and_then(|density| density.values.get(index).copied())
                 .unwrap_or(f64::INFINITY);
-            let accepted = support_mask.map_or_else(
-                || sigma <= spec.support_sigma && dense >= density_floor,
-                |mask| mask.values[index] > 0.5,
-            );
+            let render_feasible = spec.appearance.metric().is_legacy()
+                || spec.function.look().is_none_or(|look| {
+                    let input = LookInput::new(probe.xyz);
+                    let values = look.layer_values(&input);
+                    check_published_paths(&look.chroma_paths(&input, &values)).is_ok()
+                });
+            let accepted = render_feasible
+                && support_mask.map_or_else(
+                    || sigma <= spec.support_sigma && dense >= density_floor,
+                    |mask| mask.values[index] > 0.5,
+                );
             if accepted {
                 supported.push(index);
                 let c = 1.0 / (1.0 + sigma2[index] / (spec.tau * spec.tau));
@@ -111,6 +131,9 @@ impl<'a> PreparedTarget<'a> {
             function: spec.function,
             emphasis: spec.emphasis,
             tau: spec.tau,
+            appearance: spec.appearance,
+            declared_points: spec.probes.probes.len(),
+            target_uncertainty,
             supported,
             sigma2,
             weight,
@@ -118,6 +141,57 @@ impl<'a> PreparedTarget<'a> {
             target,
             density_floor,
         })
+    }
+
+    pub const fn metric(&self) -> ScoringMetric {
+        self.appearance.metric()
+    }
+
+    /// # Errors
+    /// A count below the filtered probe set, which cannot describe its points.
+    pub fn with_declared_points(mut self, count: usize) -> Result<Self> {
+        if count < self.probes.probes.len() {
+            return Err(MatchError::Dimension(format!(
+                "declared {count} points for {} filtered probes",
+                self.probes.probes.len()
+            )));
+        }
+        self.declared_points = count;
+        Ok(self)
+    }
+
+    pub const fn target_output(&self) -> Option<OutputPin> {
+        self.appearance.pin()
+    }
+
+    pub fn predict(&self, xyz: Xyz) -> Ucs {
+        self.appearance.render(self.function.predict(xyz))
+    }
+
+    pub fn output_context(
+        &self,
+        model: &MatchModel,
+        settings: &looklab_model::realization::Settings,
+    ) -> Result<OutputContext> {
+        let target = self
+            .target_output()
+            .ok_or(MatchError::MissingOutputContext)?;
+        let realization = model.realize(settings)?;
+        Ok(OutputContext {
+            target,
+            camera: model.output_pin(&realization),
+        })
+    }
+
+    pub fn optional_output_context(
+        &self,
+        model: &MatchModel,
+        settings: &looklab_model::realization::Settings,
+    ) -> Result<Option<OutputContext>> {
+        match self.target_output() {
+            Some(_) => self.output_context(model, settings).map(Some),
+            None => Ok(None),
+        }
     }
 
     pub fn support_fraction(&self) -> f64 {

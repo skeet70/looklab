@@ -121,6 +121,8 @@ pub enum RequestDomain {
     ProposalConfirmation,
     ProposalThread,
     FixtureUpload,
+    WithdrawManualConfirmation,
+    ModerateManualConfirmation,
 }
 
 impl RequestDomain {
@@ -140,6 +142,8 @@ impl RequestDomain {
             Self::ProposalConfirmation => "proposal-confirmation",
             Self::ProposalThread => "proposal-thread",
             Self::FixtureUpload => "fixture-upload",
+            Self::WithdrawManualConfirmation => "withdraw-manual-confirmation",
+            Self::ModerateManualConfirmation => "moderate-manual-confirmation",
         }
     }
 }

@@ -8,10 +8,11 @@ use looklab_fit::synth::{
 use looklab_fit::{FitOptions, fit_controlled};
 use looklab_match::synth;
 use looklab_match::{
-    Emphasis, MatchModel, MatchOptions, Plan, PreparedTarget, Settings, TargetSpec, optimize,
+    Emphasis, MatchModel, MatchOptions, OutputPin, Plan, PreparedTarget, Settings,
+    TargetAppearance, TargetSpec, optimize,
 };
 use looklab_model::realization::ControlValue;
-use looklab_schema::SimKey;
+use looklab_schema::{OutputEncoding, SimKey};
 use rand_chacha::ChaCha12Rng;
 use rand_chacha::rand_core::SeedableRng;
 
@@ -64,6 +65,12 @@ fn within_one_step(plan: &Plan, a: &Settings, b: &Settings) -> bool {
     })
 }
 
+fn appearance(model: &MatchModel) -> TargetAppearance {
+    TargetAppearance::Rendered(
+        OutputPin::new(OutputEncoding::Srgb, model.base_look.clip.k).expect("clip"),
+    )
+}
+
 fn median_delta(model: &MatchModel, target: &PreparedTarget<'_>, settings: &Settings) -> f64 {
     let realization = model.realize(settings).expect("realize");
     let mut values: Vec<f64> = target
@@ -71,7 +78,7 @@ fn median_delta(model: &MatchModel, target: &PreparedTarget<'_>, settings: &Sett
         .iter()
         .map(|index| {
             let probe = &target.probes.probes[*index];
-            let prediction = model.input_ucs(&realization, probe.xyz, [0.0, 0.0], 0.0);
+            let prediction = model.scored_ucs(target.metric(), &realization, probe.xyz);
             let expected = target.target[*index];
             let delta = [
                 prediction.j - expected.j,
@@ -158,6 +165,7 @@ fn fitted_realization_recovers_held_out_nondefault_renders() {
         None,
         1,
         1,
+        OutputEncoding::Srgb,
     )
     .expect("fitted model");
     let truth = MatchModel::new(
@@ -167,6 +175,7 @@ fn fitted_realization_recovers_held_out_nondefault_renders() {
         None,
         1,
         1,
+        OutputEncoding::Srgb,
     )
     .expect("truth model");
     let plan = Plan::new(&schema, epoch).expect("plan");
@@ -220,6 +229,7 @@ fn fitted_realization_recovers_held_out_nondefault_renders() {
             tau: 1.0,
             support_sigma: 1.5,
             density_floor: None,
+            appearance: appearance(&truth),
         })
         .expect("target");
         let outcome =

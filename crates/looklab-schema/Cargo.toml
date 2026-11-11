@@ -1,6 +1,6 @@
 [package]
 name = "looklab-schema"
-description = "Validators for the YAML data files (bodies, interfaces, probes)."
+description = "Validators for the YAML data files (bodies, interfaces, probes, manuals)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -25,5 +25,6 @@ fs = ["dep:toml"]
 workspace = true
 
 [dev-dependencies]
+libm.workspace = true
 tempfile.workspace = true
 toml.workspace = true

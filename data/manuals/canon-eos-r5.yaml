@@ -1,0 +1,270 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: canon/eos-r5
+  make: Canon
+  model: EOS R5
+  sources:
+  - id: r5-aug
+    kind: owner_manual
+    url: https://cam.start.canon/en/C003/manual/c003.pdf
+    title: EOS R5 Advanced User Guide
+    edition: CT2-D091-N
+    firmware_scope: 2.2.0 or later
+  capabilities:
+  - key: native_simulations
+    label: Picture Style
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Auto
+      - Standard
+      - Portrait
+      - Landscape
+      - Fine Detail
+      - Neutral
+      - Faithful
+      - Monochrome
+    citations:
+    - source: r5-aug
+      locator: p. 199, Picture Style Characteristics
+    - source: r5-aug
+      locator: p. 200, User Def. 1-3
+  - key: sharpening
+    label: Sharpness
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: 0
+      max: 7
+      step: 1
+    citations:
+    - source: r5-aug
+      locator: 'p. 204, Settings and Effects (Sharpness Strength 0: Weak outline emphasis to 7: Strong outline emphasis)'
+  - key: contrast
+    label: Contrast
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: r5-aug
+      locator: 'p. 204, Settings and Effects (Contrast -4: Low contrast to +4: High contrast)'
+  - key: saturation
+    label: Saturation
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: r5-aug
+      locator: 'p. 204, Settings and Effects (Saturation -4: Low saturation to +4: High saturation)'
+  - key: monochrome_toning
+    label: Toning effect (Monochrome)
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: r5-aug
+      locator: p. 205, Monochrome Adjustment (Toning effect)
+    - source: r5-aug
+      locator: 'p. 205, Monochrome Adjustment (Filter effect: N/Ye/Or/R/G)'
+  - key: clarity
+    label: Clarity
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: r5-aug
+      locator: 'p. 546, RAW Image Processing Options (Clarity: -4 to +4)'
+    - source: r5-aug
+      locator: p. 209, Clarity
+  - key: noise_reduction
+    label: High ISO speed NR
+    category: spatial
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Low
+      - Standard
+      - High
+      - Multi Shot Noise Reduction
+    citations:
+    - source: r5-aug
+      locator: p. 219, High ISO Speed Noise Reduction
+  - key: white_balance_presets
+    label: White balance
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Auto (Ambience priority)
+      - Auto (White priority)
+      - Daylight
+      - Shade
+      - Cloudy, twilight, sunset
+      - Tungsten light
+      - White fluorescent light
+      - When using Flash
+      - Custom
+      - Color temperature
+    citations:
+    - source: r5-aug
+      locator: p. 184, White balance mode table
+  - key: color_temperature
+    label: Color temperature
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: 2500
+      max: 10000
+      step: 100
+    citations:
+    - source: r5-aug
+      locator: p. 192, Color Temperature (approx. 2500K to 10000K in 100K increments)
+  - key: white_balance_shift
+    label: WB Shift/Bkt.
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: r5-aug
+      locator: p. 193-194, White Balance Correction (B/A and M/G grid)
+  - key: exposure_compensation
+    label: Expo.comp./AEB
+    category: rendering
+    availability: available
+    domain:
+      type: rational
+      min: '-3'
+      max: '+3'
+      step: 1/3
+    citations:
+    - source: r5-aug
+      locator: 'p. 369, Other Menu Functions (Exposure comp.: ±3 stops, in 1/3-stop increments)'
+  - key: dynamic_range
+    label: Auto Lighting Optimizer
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Disable
+      - Low
+      - Standard
+    citations:
+    - source: r5-aug
+      locator: p. 161, Auto Lighting Optimizer
+  - key: dynamic_range_priority
+    label: Highlight tone priority
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Disable
+      - Enable
+      - Enhanced
+    citations:
+    - source: r5-aug
+      locator: 'p. 163, Highlight Tone Priority (option screen: Disable OFF, Enable D+, Enhanced D+2)'
+  - key: raw_capture
+    label: Image quality
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: r5-aug
+      locator: p. 137, note on image quality icons (RAW, Compact RAW)
+    - source: r5-aug
+      locator: p. 138, RAW Images
+  - key: jpeg_capture
+    label: Image quality
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: r5-aug
+      locator: p. 135, Image Quality
+  - key: heif_capture
+    label: Image quality
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: r5-aug
+      locator: p. 137, note (HEIF can be specified when HDR shooting in HDR PQ settings is Enable)
+  - key: raw_jpeg_simultaneous
+    label: Image quality
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: r5-aug
+      locator: p. 137, note (two versions recorded when both RAW and JPEG/HEIF are selected)
+  - key: raw_bit_depth
+    label: RAW
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: r5-aug
+      locator: p. 138, RAW Images
+  - key: jpeg_color_spaces
+    label: Color space
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - Adobe RGB
+    citations:
+    - source: r5-aug
+      locator: p. 197, Color Space
+  - key: in_camera_raw_conversion
+    label: RAW processing (RAW/DPRAW)
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: r5-aug
+      locator: p. 540, RAW Processing (RAW/DPRAW)
+  notes:
+  - User Def. 1-3 register a base Picture Style plus adjustments; a User Def. style not yet registered behaves as [Standard] (p. 200, 206).
+  - The Monochrome Picture Style exposes Filter effect (N/Ye/Or/R/G) and a separate Toning effect whose colours the guide does not enumerate, so `monochrome_toning` is unspecified; Picture Style also exposes Color tone (-4 reddish to +4 yellowish) (p. 204-205).
+  - For movie recording, [Fineness] and [Threshold] under Sharpness cannot be set (p. 204); the guide gives Strength 0-7, Fineness 1-5 and Threshold 1-5.
+  - 'Monochrome: colour images cannot be recovered from JPEG images shot with [Monochrome] (p. 199).'
+  - HEIF is selectable only when [HDR PQ settings] HDR shooting is set to [Enable] (p. 137).
+  - Auto White Balance offers Ambience priority and White priority; with White priority the warm cast may fade and flash follows Ambience behaviour (p. 186-187).
+  - WB correction is a B/A and M/G grid with no numeric extent stated; one B/A level equals approx. 5 mireds, and B/A bracketing bias is ±3 levels (p. 194-195).
+  - 'Auto Lighting Optimizer: the option screen shows four positions with the first labelled OFF, while the guide''s text names only Disable, Low and Standard (p. 161).'
+  - Exposure compensation of ±3 stops in 1/3-stop increments is stated in the movie Other Menu Functions (p. 369); the still-photo AEB section states up to ±3 stops in 1/3-stop increments (p. 147) and gives no separate stills compensation range.
+  - RAW bit depth is not stated in the guide.
+  - 'JPEG/HEIF quality: L, M and S1 each in a standard and a fine variant, S2 in fine only (p. 136); the guide names only the fine level as ''(Fine)'' (p. 137).'
+  - Clarity is a separate menu item rather than a Picture Style parameter (p. 209); its -4 to +4 range appears in the RAW processing options list (p. 546).

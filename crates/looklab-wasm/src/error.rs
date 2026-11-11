@@ -20,6 +20,17 @@ pub enum FacadeError {
     Settings(#[from] looklab_upload::SettingsError),
     #[error("the prep module failed: {0}")]
     Module(ModuleError),
+    #[error(
+        "prep module identity does not match this build \
+         (module ABI {found_abi}, prep {found_prep}; \
+          expected ABI {expected_abi}, prep {expected_prep})"
+    )]
+    ModuleVersion {
+        found_abi: u32,
+        found_prep: u32,
+        expected_abi: u32,
+        expected_prep: u32,
+    },
     #[error("the prep module reply is malformed: {0}")]
     Reply(String),
     #[error("{0}")]

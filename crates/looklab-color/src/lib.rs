@@ -22,5 +22,5 @@ pub use cat::Cat;
 pub use lab::{Lab, Lchab};
 pub use linalg::Mat3;
 pub use spaces::RgbSpace;
-pub use types::{Rgb, Xyy, Xyz};
+pub use types::{Rgb, WhiteRelativeXyz, Xyy, Xyz};
 pub use xyy::Illuminant;

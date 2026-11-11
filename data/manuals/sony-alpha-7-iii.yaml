@@ -1,0 +1,286 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: sony/alpha-7-iii
+  make: Sony
+  model: Alpha 7 III (ILCE-7M3)
+  sources:
+  - id: sony-a7iii-hg
+    kind: owner_manual
+    url: https://helpguide.sony.net/ilc/1720/v1/en/print.pdf
+    title: 'Help Guide: Interchangeable Lens Digital Camera ILCE-7M3 a7III'
+    edition: 4-732-947-18(2)
+    firmware_scope: unspecified
+  capabilities:
+  - key: native_simulations
+    label: Creative Style
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Standard
+      - Vivid
+      - Neutral
+      - Clear
+      - Deep
+      - Light
+      - Portrait
+      - Landscape
+      - Sunset
+      - Night Scene
+      - Autumn leaves
+      - Black & White
+      - Sepia
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 200-201, Creative Style, Menu item details
+  - key: creative_filters
+    label: Picture Effect
+    category: mixed
+    availability: available
+    domain:
+      type: enum
+      values:
+      - 'Off'
+      - Toy Camera
+      - Pop Color
+      - Posterization
+      - Retro Photo
+      - Soft High-key
+      - Partial Color
+      - High Contrast Mono.
+      - Rich-tone Mono.
+      default: 'Off'
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 203, Picture Effect, Menu item details
+    - source: sony-a7iii-hg
+      locator: p. 670, List of default setting values, Picture Effect
+  - key: contrast
+    label: Creative Style > Contrast
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 201, Creative Style, To set [Contrast], [Saturation] and [Sharpness]
+  - key: saturation
+    label: Creative Style > Saturation
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 201, Creative Style, To set [Contrast], [Saturation] and [Sharpness]
+  - key: sharpening
+    label: Creative Style > Sharpness
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 201, Creative Style, To set [Contrast], [Saturation] and [Sharpness]
+  - key: white_balance_presets
+    label: White Balance
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Auto
+      - Daylight
+      - Shade
+      - Cloudy
+      - Incandescent
+      - 'Fluor.: Warm White'
+      - 'Fluor.: Cool White'
+      - 'Fluor.: Day White'
+      - 'Fluor.: Daylight'
+      - Flash
+      - Underwater Auto
+      - C.Temp./Filter
+      - Custom 1
+      - Custom 2
+      - Custom 3
+      - Custom Setup
+      default: Auto
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 196, White Balance, Menu item details
+    - source: sony-a7iii-hg
+      locator: p. 669, List of default setting values, White Balance
+  - key: white_balance_shift
+    label: White Balance fine adjustment (right side of control wheel)
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 196, White Balance, Hint (fine adjustment screen)
+  - key: dynamic_range
+    label: DRO/Auto HDR (D-Range Opt.)
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - 'Off'
+      - 'D-Range Optimizer: Auto'
+      - 'D-Range Optimizer: Lv1'
+      - 'D-Range Optimizer: Lv2'
+      - 'D-Range Optimizer: Lv3'
+      - 'D-Range Optimizer: Lv4'
+      - 'D-Range Optimizer: Lv5'
+      default: 'D-Range Optimizer: Auto'
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 186, D-Range Opt. (DRO), Menu item details
+    - source: sony-a7iii-hg
+      locator: p. 670, List of default setting values, DRO/Auto HDR
+  - key: noise_reduction
+    label: High ISO NR
+    category: spatial
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Normal
+      - Low
+      - 'Off'
+      default: Normal
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 215, High ISO NR (still image), Menu item details
+    - source: sony-a7iii-hg
+      locator: p. 667, List of default setting values, High ISO NR
+  - key: raw_capture
+    label: File Format
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 151, File Format (still image), Menu item details
+  - key: jpeg_capture
+    label: File Format
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+      default: true
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 151, File Format (still image), Menu item details
+    - source: sony-a7iii-hg
+      locator: p. 667, List of default setting values, File Format = JPEG
+  - key: raw_jpeg_simultaneous
+    label: File Format (RAW & JPEG)
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 151, File Format (still image), Menu item details
+  - key: heif_capture
+    label: File Format
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 151, File Format (still image), Menu item details
+  - key: raw_bit_depth
+    label: File Format (still image) > About RAW images
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - '14'
+      - '12'
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 151, File Format (still image), About RAW images
+  - key: jpeg_quality
+    label: JPEG Quality
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Extra fine
+      - Fine
+      - Standard
+      default: Fine
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 149, JPEG Quality (still image), Menu item details
+    - source: sony-a7iii-hg
+      locator: p. 667, List of default setting values, JPEG Quality
+  - key: jpeg_color_spaces
+    label: Color Space (still image)
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - AdobeRGB
+      default: sRGB
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 205, Color Space (still image), Menu item details
+    - source: sony-a7iii-hg
+      locator: p. 667, List of default setting values, Color Space
+  - key: in_camera_raw_conversion
+    label: Playback / Viewing menu
+    category: workflow
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 8-9, Viewing (playback topic list)
+    - source: sony-a7iii-hg
+      locator: p. 151, File Format (still image), About RAW images
+  - key: exposure_compensation
+    label: Exposure Comp.
+    category: rendering
+    availability: available
+    domain:
+      type: rational
+      min: '-5.0'
+      max: '+5.0'
+      default: '0.0'
+    citations:
+    - source: sony-a7iii-hg
+      locator: p. 172, Exposure Comp.
+    - source: sony-a7iii-hg
+      locator: p. 662, Specifications, Exposure control, Exposure compensation
+    - source: sony-a7iii-hg
+      locator: p. 176, Exposure step, Menu item details
+  notes:
+  - Style Box holds six registration slots ([Style Box] 1-6), each storing a Creative Style preset with its own Contrast/Saturation/Sharpness values (p. 201).
+  - '[Creative Style] is fixed to [Standard] under [Intelligent Auto], [Scene Selection], when [Picture Effect] is other than [Off], and when [Picture Profile] is other than [Off] (p. 201).'
+  - Contrast, Saturation and Sharpness are adjusted per style, but the manual states no numeric range or default for them (p. 201).
+  - '[Saturation] cannot be adjusted when the style is [Black & White] or [Sepia] (p. 201); the manual documents no separate toning or filter parameter, only those two fixed styles (p. 201).'
+  - '[Auto HDR] sits in the same [DRO/Auto HDR] menu but is a three-exposure composite (Exposure Diff. Auto or 1.0EV-6.0EV) and is not part of the D-Range Optimizer option list; it is unavailable when [File Format] is [RAW] or [RAW & JPEG] (p. 187).'
+  - '[High ISO NR] is unavailable when [File Format] is [RAW] and has no effect on RAW images when [File Format] is [RAW & JPEG] (p. 215).'
+  - '[Picture Effect] (p. 203, recorded here as creative_filters) and [Picture Profile] (p. 245) are separate menu items, not Creative Style presets.'
+  - The White Balance fine adjustment grid exists (right side of the control wheel) but the manual states no numeric range for it; [C.Temp./Filter] is likewise documented without a Kelvin range (p. 196).
+  - The playback menu enumeration lists Photo Capture, Enlarge, Rotate, Copy and the viewing functions and does not list an in-camera RAW conversion; the manual's only stated RAW development path is the Imaging Edge computer application (p. 13, Using a computer > Developing RAW images/Remote shooting (Imaging Edge); p. 396, Imaging Edge).
+  - The a7 III White Balance list includes [Custom Setup], which memorizes the basic white color under the current light and is registered to Custom 1-3 (p. 196, p. 199).
+  - '[White Balance] is fixed to [Auto] under [Intelligent Auto] and [Scene Selection] (p. 196).'
+  - RAW images are 14 bits per pixel, reduced to 12 bits with [Long Exposure NR], [BULB], or [Cont. Shooting] while [RAW File Type] is [Compressed]; [RAW File Type] offers [Compressed] and [Uncompressed] (p. 151-152).
+  - The File Format menu on p. 151 lists RAW, RAW & JPEG and JPEG; HEIF is not listed.
+  - Exposure compensation is limited to -3.0 EV to +3.0 EV on the exposure compensation dial; the -5.0 EV to +5.0 EV range applies with the dial at "0" via MENU, and movies are limited to -2.0 EV to +2.0 EV (p. 171-172).
+  - '[Exposure step] is selectable between 0.3EV and 0.5EV (p. 176); the exposure compensation dial itself always changes in 0.3EV steps (p. 176).'

@@ -6,14 +6,40 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_params_map;
 use serde::Deserialize;
+use wasm_bindgen_futures::JsFuture;
 
 use crate::data::Load;
 use crate::ui;
+
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export function copyStatusLink(text) {
+    if (!navigator.clipboard) return Promise.reject(new Error('clipboard unavailable'));
+    return navigator.clipboard.writeText(text);
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = copyStatusLink)]
+    fn copy_status_link(text: &str) -> js_sys::Promise;
+}
 
 #[derive(Clone, Debug, Deserialize)]
 struct StatusResponse {
     #[serde(rename = "credential")]
     _credential: String,
+    activities: Vec<ActivityView>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ActivitySource {
+    Send,
+    Activity,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ActivityView {
+    source: ActivitySource,
+    created_at: i64,
     contributions: Vec<ContributionView>,
 }
 
@@ -27,15 +53,69 @@ impl core::fmt::Display for ContributionId {
     }
 }
 
+impl PartialEq for ContributionId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for ContributionId {}
+
+impl PartialOrd for ContributionId {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ContributionId {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct ContributionView {
     id: ContributionId,
     status: ContributionStatus,
+    render_class: RenderClass,
+    deferred_until: Option<i64>,
     created_at: i64,
+    body_id: String,
+    intent: IntentView,
+    target_look: Option<String>,
+    sim_key: String,
     images: Vec<ImageFeedView>,
+    #[serde(default)]
+    uses: Vec<ScopedUseView>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IntentView {
+    Native,
+    Recipe,
+    Card,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(from = "String")]
+enum RenderClass {
+    Colour,
+    Monochrome,
+    Unknown,
+}
+
+impl From<String> for RenderClass {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "colour" => Self::Colour,
+            "monochrome" => Self::Monochrome,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(from = "String")]
 enum ContributionStatus {
     Pending,
@@ -70,11 +150,63 @@ impl ContributionStatus {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct ApplicabilityView {
+    state: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ScopedUseView {
+    capability: String,
+    outcome: String,
+    #[serde(default)]
+    selection: Option<String>,
+    applicability: ApplicabilityView,
+}
+
+impl ScopedUseView {
+    fn label(&self) -> String {
+        let scope = match (self.selection.as_deref(), self.outcome.as_str()) {
+            (Some("qualified"), "pass") => "measured",
+            (Some("experimental"), "pass") => "gate-passing experimental",
+            (None, "pass") => "assessed, not currently selected",
+            _ => "incomplete assessment",
+        };
+        let applicability = if self.applicability.state == "current" {
+            String::new()
+        } else {
+            format!(
+                " ({})",
+                self.applicability
+                    .reason
+                    .as_deref()
+                    .unwrap_or(self.applicability.state.as_str())
+            )
+        };
+        format!(
+            "{scope} {}{}{applicability}",
+            self.capability.replace('_', " "),
+            self.outcome_suffix()
+        )
+    }
+
+    fn outcome_suffix(&self) -> String {
+        match self.outcome.as_str() {
+            "pass" => String::new(),
+            other => format!(" ({})", other.replace('_', " ")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct ImageFeedView {
     id: String,
     status: ImageStatus,
     reason: Option<String>,
     rms_de: Option<f64>,
+    #[serde(default)]
+    uses: Vec<ScopedUseView>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -117,6 +249,9 @@ pub fn StatusPage(#[prop(optional)] token_override: Option<String>) -> impl Into
     let session = crate::session::use_session();
     let navigate = leptos_router::hooks::use_navigate();
     let from_link = token_override.is_none();
+    let link_token = token_override
+        .as_deref()
+        .and_then(|token| crate::webauthn::StatusToken::try_from(token.to_owned()).ok());
     let token = Signal::derive(move || {
         token_override
             .clone()
@@ -180,21 +315,7 @@ pub fn StatusPage(#[prop(optional)] token_override: Option<String>) -> impl Into
     view! {
         <h1>"Your contributions"</h1>
         {(!available).then(ui::preview_notice)}
-        <p class="lede" hidden=move || !available>
-            "Keep your status link private. Anyone with the link can read your contributions. "
-            <a href=crate::base::site_url("/help/passkeys")>"How sign-in works"</a> "."
-        </p>
-        {move || available.then(|| {
-            let token = token.get();
-            let feed = crate::base::api_url(&format!("/status/{token}.rss"));
-            let href = feed.clone();
-            view! {
-                <p class="status-links">
-                    <a href=crate::base::site_url(&format!("/status/{token}"))>"Private status link to bookmark"</a>
-                    <a href=href>"Subscribe to updates with RSS"</a>
-                </p>
-            }
-        })}
+        {move || link_token.clone().filter(|_| available).map(|token| view! { <PrivateStatusLinks token/> })}
         {move || {
             if !available {
                 return ().into_any();
@@ -210,10 +331,86 @@ pub fn StatusPage(#[prop(optional)] token_override: Option<String>) -> impl Into
     }
 }
 
+fn absolute_url(path: &str) -> Option<String> {
+    let base = web_sys::window()?.location().href().ok()?;
+    web_sys::Url::new_with_base(path, &base)
+        .ok()
+        .map(|url| url.href())
+}
+
+#[component]
+fn PrivateStatusLinks(token: crate::webauthn::StatusToken) -> impl IntoView {
+    let open = RwSignal::new(false);
+    let message = RwSignal::new(None::<String>);
+    let field = NodeRef::<leptos::html::Input>::new();
+    let link = absolute_url(&crate::base::site_url(&format!(
+        "/status/{}",
+        token.as_str()
+    )));
+    let feed = absolute_url(&crate::base::api_url(&format!(
+        "/status/{}.rss",
+        token.as_str()
+    )));
+    view! {
+        <p class="status-links">
+            <button type="button" on:click=move |_| {
+                message.set(None);
+                open.set(true);
+            }>"Private status link"</button>
+            {match feed {
+                Some(href) => view! {
+                    <a href=href rel="external" type="application/rss+xml">"Subscribe with RSS"</a>
+                }.into_any(),
+                None => ().into_any(),
+            }}
+        </p>
+        <ui::Dialog title="Private status link".to_owned() open=open>
+            <ui::Notice
+                message="Anyone you give this link to can read your contributions. Share it only with people you choose.".to_owned()
+                kind=ui::NoticeKind::Warning
+            />
+            {match link {
+                Some(address) => {
+                    let copied = address.clone();
+                    let copy = move |_| {
+                        let address = copied.clone();
+                        spawn_local(async move {
+                            match JsFuture::from(copy_status_link(&address)).await {
+                                Ok(_) => message.set(Some("Link copied.".to_owned())),
+                                Err(_) => {
+                                    if let Some(input) = field.get_untracked() {
+                                        input.select();
+                                    }
+                                    message.set(Some(
+                                        "Could not access the clipboard. The link is selected for copying."
+                                            .to_owned(),
+                                    ));
+                                }
+                            }
+                        });
+                    };
+                    view! {
+                        <label>"Private status link"
+                            <input node_ref=field type="text" readonly prop:value=address/>
+                        </label>
+                        <div class="field-row">
+                            <button type="button" on:click=copy>"Copy link"</button>
+                        </div>
+                    }.into_any()
+                },
+                None => view! {
+                    <p role="alert">"This browser could not prepare the link."</p>
+                }.into_any(),
+            }}
+            {move || message.get().map(|message| view! { <p role="status">{message}</p> })}
+        </ui::Dialog>
+    }
+}
+
 #[component]
 fn Feed(response: StatusResponse) -> impl IntoView {
     view! {
-        {if response.contributions.is_empty() {
+        {if response.activities.is_empty() {
             view! {
                 <section class="panel">
                     <h2>"Your first contribution starts here"</h2>
@@ -223,74 +420,423 @@ fn Feed(response: StatusResponse) -> impl IntoView {
             }.into_any()
         } else {
             response
-                .contributions
+                .activities
                 .into_iter()
-                .map(|contribution| view! {
-                    <section class="panel">
-                        <Withdrawal contribution_id=contribution.id.clone()/>
-                        <h2>{format!("Contribution {}", contribution.id)}</h2>
-                        <p>
-                            {contribution.status.as_str()}
-                            " · "
-                            {format_date(contribution.created_at)}
-                        </p>
-                        <table class="data-table">
-                            <thead>
-                                <tr>
-                                    <th scope="col">Image</th>
-                                    <th scope="col">Status</th>
-                                    <th scope="col">What happens next</th>
-                                    <th scope="col">Details</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {contribution.images.into_iter().map(|image| view! {
-                                    <tr>
-                                        <th scope="row">{image.id}</th>
-                                        <td>{image.status.as_str()}</td>
-                                        <td>{image.reason.unwrap_or_default()}</td>
-                                        <td>
-                                            <ui::Disclosure summary="Measurements".to_owned()>
-                                                <p>{image.rms_de.map(|value| format!("RMS ΔE: {value:.2}")).unwrap_or_else(|| "Measurements are not available yet.".to_owned())}</p>
-                                            </ui::Disclosure>
-                                        </td>
-                                    </tr>
-                                }).collect_view()}
-                            </tbody>
-                        </table>
-                    </section>
-                })
+                .map(activity_panel)
                 .collect_view()
                 .into_any()
         }}
     }
 }
 
+fn activity_panel(activity: ActivityView) -> impl IntoView {
+    let summary = ActivitySummary::of(&activity);
+    let kind = match activity.source {
+        ActivitySource::Send => "Submission",
+        ActivitySource::Activity => "Earlier activity",
+    };
+    let heading = format_day(activity.created_at);
+    let meta = summary.meta_line();
+    let (label, detail) = summary.status_line();
+    let reasons = summary.reasons.clone();
+    let deferred_until = summary.deferred_until;
+    let withdrawn =
+        summary.contributions > 0 && summary.withdrawn_contributions == summary.contributions;
+    let contribution_ids = activity
+        .contributions
+        .iter()
+        .map(|contribution| contribution.id.clone())
+        .collect::<Vec<_>>();
+    let technical = activity.contributions;
+    view! {
+        <section class="panel contribution-activity">
+            <h2>{heading}</h2>
+            <p class="activity-meta muted">{format!("{kind} · {meta}")}</p>
+            <p class="activity-status"><strong>{label}</strong> " · " {detail}</p>
+            {(!reasons.is_empty()).then(move || view! {
+                <ul class="activity-reasons">
+                    {reasons.into_iter().map(|reason| view! { <li>{reason}</li> }).collect_view()}
+                </ul>
+            })}
+            {deferred_until.map(|until| view! {
+                <p class="muted">{format!(
+                    "Kept until {} for monochrome model development, then deleted unless the measurements enter monochrome analysis first. No published Look is promised.",
+                    format_day(until)
+                )}</p>
+            })}
+            {(!withdrawn).then(move || view! {
+                <div class="field-row"><Withdrawal contribution_ids=contribution_ids/></div>
+            })}
+            <ui::Disclosure summary="Technical details".to_owned()>
+                {technical_table(technical)}
+            </ui::Disclosure>
+        </section>
+    }
+}
+
+#[derive(Default)]
+struct ActivitySummary {
+    contributions: usize,
+    withdrawn_contributions: usize,
+    photos: usize,
+    cameras: Vec<String>,
+    looks: Vec<String>,
+    accepted: usize,
+    down_weighted: usize,
+    quarantined: usize,
+    pending: usize,
+    unknown: usize,
+    withdrawn: usize,
+    deferred: usize,
+    deferred_until: Option<i64>,
+    measured_uses: usize,
+    experimental_uses: usize,
+    reasons: Vec<String>,
+}
+
+impl ActivitySummary {
+    fn of(activity: &ActivityView) -> Self {
+        let mut summary = Self::default();
+        for contribution in &activity.contributions {
+            summary.contributions += 1;
+            summary.photos += contribution.images.len();
+            push_unique(&mut summary.cameras, camera_label(&contribution.body_id));
+            push_unique(&mut summary.looks, look_label(contribution));
+            if contribution.status == ContributionStatus::Withdrawn {
+                summary.withdrawn_contributions += 1;
+                summary.withdrawn += contribution.images.len();
+                continue;
+            }
+            for use_ in &contribution.uses {
+                match (use_.selection.as_deref(), use_.outcome.as_str()) {
+                    (Some("qualified"), "pass") => summary.measured_uses += 1,
+                    (Some("experimental"), "pass") => summary.experimental_uses += 1,
+                    _ => {}
+                }
+            }
+            if contribution.deferred() {
+                summary.deferred += contribution.images.len();
+                summary.deferred_until = summary.deferred_until.max(contribution.deferred_until);
+                continue;
+            }
+            for image in &contribution.images {
+                for use_ in &image.uses {
+                    match (use_.selection.as_deref(), use_.outcome.as_str()) {
+                        (Some("qualified"), "pass") => summary.measured_uses += 1,
+                        (Some("experimental"), "pass") => summary.experimental_uses += 1,
+                        _ => {}
+                    }
+                }
+                match image.status {
+                    ImageStatus::Accepted => summary.accepted += 1,
+                    ImageStatus::DownWeighted => summary.down_weighted += 1,
+                    ImageStatus::Quarantined => summary.quarantined += 1,
+                    ImageStatus::Pending => {
+                        if contribution.status == ContributionStatus::Quarantined {
+                            summary.quarantined += 1;
+                        } else {
+                            summary.pending += 1;
+                        }
+                    }
+                    ImageStatus::Unknown => {
+                        if contribution.status == ContributionStatus::Quarantined {
+                            summary.quarantined += 1;
+                        } else {
+                            summary.unknown += 1;
+                        }
+                    }
+                }
+                if let Some(reason) = &image.reason {
+                    push_unique(&mut summary.reasons, reason.clone());
+                }
+            }
+        }
+        summary
+    }
+
+    fn meta_line(&self) -> String {
+        let mut parts = vec![format!(
+            "{} {}",
+            self.photos,
+            if self.photos == 1 { "photo" } else { "photos" }
+        )];
+        if !self.cameras.is_empty() {
+            parts.push(if self.cameras.len() == 1 {
+                format!("Camera {}", self.cameras[0])
+            } else {
+                format!("Cameras {}", self.cameras.join(", "))
+            });
+        }
+        if !self.looks.is_empty() {
+            parts.push(self.looks.join(", "));
+        }
+        parts.join(" · ")
+    }
+
+    fn status_line(&self) -> (String, String) {
+        if self.contributions > 0 && self.withdrawn_contributions == self.contributions {
+            return (
+                "Withdrawn".to_owned(),
+                "These photos no longer count toward new models.".to_owned(),
+            );
+        }
+        let mut counts = Vec::new();
+        if self.accepted > 0 {
+            counts.push(format!("{} counted", self.accepted));
+        }
+        if self.down_weighted > 0 {
+            counts.push(format!("{} counted less", self.down_weighted));
+        }
+        if self.quarantined > 0 {
+            counts.push(format!("{} set aside", self.quarantined));
+        }
+        if self.pending > 0 {
+            counts.push(format!("{} awaiting a fit", self.pending));
+        }
+        if self.unknown > 0 {
+            counts.push(format!("{} awaiting an update", self.unknown));
+        }
+        if self.deferred > 0 {
+            counts.push(format!("{} awaiting monochrome analysis", self.deferred));
+        }
+        if self.withdrawn > 0 {
+            counts.push(format!("{} withdrawn", self.withdrawn));
+        }
+        let label = if self.measured_uses > 0 {
+            "Used in a measured check"
+        } else if self.experimental_uses > 0 {
+            "Used to check an experimental model"
+        } else if self.accepted > 0 || self.down_weighted > 0 {
+            "Checked"
+        } else if self.pending > 0 || self.deferred > 0 {
+            "Received"
+        } else if self.quarantined > 0 {
+            "Set aside"
+        } else if self.withdrawn > 0 {
+            "Partly withdrawn"
+        } else {
+            "Awaiting an update"
+        };
+        let detail = if self.measured_uses > 0 {
+            format!(
+                "{} scoped uses contributed to a measured model. {}",
+                self.measured_uses,
+                counts.join(" · ")
+            )
+        } else if self.experimental_uses > 0 {
+            format!(
+                "{} scoped uses contributed to a gate-passing experimental model. {}",
+                self.experimental_uses,
+                counts.join(" · ")
+            )
+        } else if counts.is_empty() {
+            "Waiting for status.".to_owned()
+        } else {
+            counts.join(" · ")
+        };
+        (label.to_owned(), detail)
+    }
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn camera_label(body_id: &str) -> String {
+    let (make, model) = body_id.split_once('/').unwrap_or(("", body_id));
+    let make = title_words(make);
+    let model = model
+        .split('-')
+        .map(capitalize)
+        .collect::<Vec<_>>()
+        .join("-");
+    match (make.is_empty(), model.is_empty()) {
+        (true, _) => model,
+        (_, true) => make,
+        _ => format!("{make} {model}"),
+    }
+}
+
+fn look_label(contribution: &ContributionView) -> String {
+    match contribution.intent {
+        IntentView::Native => format!("Built-in {}", title_words(&contribution.sim_key)),
+        IntentView::Recipe => contribution
+            .target_look
+            .as_deref()
+            .map(|look| format!("Recipe for {}", title_words(look)))
+            .unwrap_or_else(|| "Recipe".to_owned()),
+        IntentView::Card => "Card scan".to_owned(),
+    }
+}
+
+fn title_words(value: &str) -> String {
+    value
+        .split(['-', '_'])
+        .map(capitalize)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn capitalize(value: &str) -> String {
+    let mut characters = value.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
+impl ContributionView {
+    fn deferred(&self) -> bool {
+        self.render_class == RenderClass::Monochrome && self.status == ContributionStatus::Pending
+    }
+}
+
+fn technical_table(contributions: Vec<ContributionView>) -> impl IntoView {
+    view! {
+        <table class="data-table">
+            <caption>"Contribution records"</caption>
+            <thead>
+                <tr>
+                    <th scope="col">"Contribution"</th>
+                    <th scope="col">"Image"</th>
+                    <th scope="col">"Received"</th>
+                    <th scope="col">"Contribution status"</th>
+                    <th scope="col">"Render class"</th>
+                    <th scope="col">"Kept until"</th>
+                    <th scope="col">"Image status"</th>
+                    <th scope="col">"RMS ΔE"</th>
+                    <th scope="col">"Reason"</th>
+                </tr>
+            </thead>
+            <tbody>
+                {contributions
+                    .into_iter()
+                    .flat_map(|contribution| {
+                        let id = contribution.id.to_string();
+                        let received = format_date(contribution.created_at);
+                        let deferred = contribution.deferred();
+                        let status = if deferred {
+                            "received, awaiting monochrome analysis".to_owned()
+                        } else {
+                            contribution.status.as_str().to_owned()
+                        };
+                        let render = match contribution.render_class {
+                            RenderClass::Colour => "Colour",
+                            RenderClass::Monochrome => "B&W",
+                            RenderClass::Unknown => "Unknown",
+                        };
+                        let contribution_uses = contribution.uses.clone();
+                        let kept = if deferred {
+                            contribution
+                                .deferred_until
+                                .map(format_date)
+                                .unwrap_or_else(|| "—".to_owned())
+                        } else {
+                            "—".to_owned()
+                        };
+                        if contribution.images.is_empty() {
+                            vec![view! {
+                                <tr>
+                                    <th scope="row">{id.clone()}</th>
+                                    <td>"—"</td>
+                                    <td>{received.clone()}</td>
+                                    <td>{status.clone()}</td>
+                                    <td>{render}</td>
+                                    <td>{kept.clone()}</td>
+                                    <td>"—"</td>
+                                    <td>"—"</td>
+                                    <td></td>
+                                </tr>
+                            }.into_any()]
+                        } else {
+                            contribution
+                                .images
+                                .into_iter()
+                                .map(|image| {
+                                    let image_status = if deferred {
+                                        "received, awaiting monochrome analysis".to_owned()
+                                    } else {
+                                        image.status.as_str().to_owned()
+                                    };
+                                    let rms = image
+                                        .rms_de
+                                        .map(|value| format!("{value:.2}"))
+                                        .unwrap_or_else(|| "—".to_owned());
+                                    let uses = image
+                                        .uses
+                                        .iter()
+                                        .map(ScopedUseView::label)
+                                        .chain(contribution_uses.iter().map(ScopedUseView::label))
+                                        .collect::<Vec<_>>()
+                                        .join("; ");
+                                    let reason = match (image.reason, uses.is_empty()) {
+                                        (Some(reason), true) => reason,
+                                        (Some(reason), false) => format!("{reason}; {uses}"),
+                                        (None, false) => uses,
+                                        (None, true) => String::new(),
+                                    };
+                                    view! {
+                                        <tr>
+                                            <th scope="row">{id.clone()}</th>
+                                            <td>{image.id}</td>
+                                            <td>{received.clone()}</td>
+                                            <td>{status.clone()}</td>
+                                            <td>{render}</td>
+                                            <td>{kept.clone()}</td>
+                                            <td>{image_status}</td>
+                                            <td>{rms}</td>
+                                            <td>{reason}</td>
+                                        </tr>
+                                    }
+                                    .into_any()
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                    })
+                    .collect_view()}
+            </tbody>
+        </table>
+    }
+}
+
 #[component]
-fn Withdrawal(contribution_id: ContributionId) -> impl IntoView {
+fn Withdrawal(contribution_ids: Vec<ContributionId>) -> impl IntoView {
     let busy = RwSignal::new(false);
     let message = RwSignal::new(None::<String>);
     let done = RwSignal::new(false);
     view! {
-        <button disabled=move || busy.get() || done.get() on:click=move |_| {
-            let id = contribution_id.clone();
+        <button type="button" disabled=move || busy.get() || done.get() on:click=move |_| {
+            let mut ids = contribution_ids.clone();
             busy.set(true);
             spawn_local(async move {
+                ids.sort();
+                ids.dedup();
+                let capacity = ids.iter().map(|id| id.0.len()).sum::<usize>()
+                    + ids.len().saturating_sub(1);
+                let mut canonical = String::with_capacity(capacity);
+                for id in &ids {
+                    if !canonical.is_empty() {
+                        canonical.push('\n');
+                    }
+                    canonical.push_str(&id.0);
+                }
                 let result = async {
-                    let signed = crate::webauthn::sign_request(crate::request_digest::RequestDomain::Withdraw, id.0.as_bytes(), None).await?;
+                    let signed = crate::webauthn::sign_request(crate::request_digest::RequestDomain::Withdraw, canonical.as_bytes(), None).await?;
                     #[derive(serde::Serialize)]
-                    struct RequestBody<'a> { #[serde(flatten)] signed: &'a crate::webauthn::SignedFields, contribution_id: &'a ContributionId }
-                    let response = Request::post(&crate::base::api_url("/api/withdraw")).json(&RequestBody { signed: &signed.fields, contribution_id: &id }).map_err(|error| error.to_string())?.send().await.map_err(|error| error.to_string())?;
+                    struct RequestBody<'a> { #[serde(flatten)] signed: &'a crate::webauthn::SignedFields, contribution_ids: &'a [ContributionId] }
+                    let response = Request::post(&crate::base::api_url("/api/withdraw")).json(&RequestBody { signed: &signed.fields, contribution_ids: ids.as_slice() }).map_err(|error| error.to_string())?.send().await.map_err(|error| error.to_string())?;
                     if !response.ok() { return Err("Withdrawal did not finish. Try again with the profile that shared these photos.".to_owned()); }
                     Ok(())
                 }.await;
                 match result {
-                    Ok(()) => { done.set(true); message.set(Some("Withdrawn. These samples will no longer count toward new models.".to_owned())); }
+                    Ok(()) => { done.set(true); message.set(Some("Withdrawn. These photos no longer count toward new models.".to_owned())); }
                     Err(_) => message.set(Some("Withdrawal did not finish. Try again with the profile that shared these photos.".to_owned())),
                 }
                 busy.set(false);
             });
-        }>"Withdraw contribution"</button>
+        }>"Withdraw these photos"</button>
         {move || message.get().map(|message| view! {
             <p role="status">{message}</p>
         })}
@@ -303,4 +849,17 @@ fn format_date(seconds: i64) -> String {
         .to_iso_string()
         .as_string()
         .unwrap_or_default()
+}
+
+fn format_day(seconds: i64) -> String {
+    let millis = (seconds as f64) * 1000.0;
+    let text = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(millis))
+        .to_locale_date_string("en", &wasm_bindgen::JsValue::UNDEFINED)
+        .as_string()
+        .unwrap_or_default();
+    if text.is_empty() {
+        format_date(seconds)
+    } else {
+        text
+    }
 }

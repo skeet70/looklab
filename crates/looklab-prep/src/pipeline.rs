@@ -15,7 +15,7 @@ use rand_chacha::rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::align::{AlignParams, Alignment, align};
+use crate::align::{AlignParams, Alignment, align, align_with_pixel_pitch};
 use crate::chart::ChartRegion;
 use crate::error::PrepError;
 use crate::geom::Point;
@@ -26,7 +26,7 @@ use crate::sample::{PixelSelection, SampleParams, select_pixels};
 use crate::seed::SamplingSeed;
 
 /// Registered preparation version id, [docs/03 §2.2](../../../docs/03-data-model.md).
-pub const PREP_VERSION: u32 = 1;
+pub const PREP_VERSION: u32 = 3;
 
 const DEFAULT_DOWNSAMPLE_MAX_PIXELS: u32 = 1_500_000;
 
@@ -151,6 +151,24 @@ pub struct PreparedImage {
     pub samples: SampleSet,
     pub sanitized: SanitizedMetadata,
     pub removed: Vec<RemovedField>,
+    pub alignment: AlignmentQuality,
+}
+
+/// Alignment quality of one prepared member.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AlignmentQuality {
+    pub correlation: f64,
+    /// Median block shift in original RAW pixels.
+    pub residual_px: f64,
+}
+
+impl From<&Alignment> for AlignmentQuality {
+    fn from(alignment: &Alignment) -> Self {
+        Self {
+            correlation: alignment.central_correlation,
+            residual_px: alignment.residual_px,
+        }
+    }
 }
 
 /// A RAW after orientation, alignment and the fitted radial gain.
@@ -227,8 +245,6 @@ pub fn prepare_group(
 }
 
 /// Prepares one decoded RAW and every JPEG rendered from it.
-///
-/// The returned alignment is the one used to sample every member.
 pub fn prepare_group_with_decoded_raw(
     raw_bytes: &[u8],
     decoded: DecodedRaw,
@@ -236,7 +252,7 @@ pub fn prepare_group_with_decoded_raw(
     prior: &PriorTransform,
     seed: SamplingSeed,
     params: &PrepParams,
-) -> Result<(Vec<PreparedImage>, Alignment), PrepError> {
+) -> Result<Vec<PreparedImage>, PrepError> {
     if jpegs.is_empty() {
         return Err(PrepError::NoJpeg);
     }
@@ -257,9 +273,7 @@ fn prepare_group_chart(
     }
     let metadata: ParsedMetadata = parse(raw_bytes)?;
     let decoded = RawlerDecoder.decode(raw_bytes)?;
-    let (images, _alignment) =
-        prepare_group_images(&metadata, decoded, jpegs, prior, seed, params, chart)?;
-    Ok(images)
+    prepare_group_images(&metadata, decoded, jpegs, prior, seed, params, chart)
 }
 
 fn prepare_group_images(
@@ -270,7 +284,7 @@ fn prepare_group_images(
     seed: SamplingSeed,
     params: &PrepParams,
     chart: Option<&ChartRegion>,
-) -> Result<(Vec<PreparedImage>, Alignment), PrepError> {
+) -> Result<Vec<PreparedImage>, PrepError> {
     if jpegs.is_empty() {
         return Err(PrepError::NoJpeg);
     }
@@ -292,7 +306,6 @@ fn prepare_group_images(
         seed,
         params,
     )?;
-    let alignment = shared.alignment;
     let mut images = Vec::with_capacity(jpegs.len());
     images.push(prepared_image(
         &shared,
@@ -300,18 +313,32 @@ fn prepare_group_images(
         first.rendering,
         &raw_sanitized,
         &raw_removed,
+        &shared.alignment,
+        AlignmentFrame::Raw,
     )?);
-    for bytes in &jpegs[1..] {
+    for (index, bytes) in jpegs[1..].iter().enumerate() {
         let member = decode_group_jpeg(bytes)?;
+        let member_alignment = align_with_pixel_pitch(
+            &shared.downsampled,
+            &member.plane,
+            &params.align,
+            (shared.scale_x, shared.scale_y),
+        )
+        .map_err(|source| PrepError::MemberAlignment {
+            index: index + 2,
+            message: source.to_string(),
+        })?;
         images.push(prepared_image(
             &shared,
             member.plane,
             member.rendering,
             &raw_sanitized,
             &raw_removed,
+            &member_alignment,
+            AlignmentFrame::Downsampled,
         )?);
     }
-    Ok((images, alignment))
+    Ok(images)
 }
 
 struct GroupJpeg {
@@ -337,8 +364,10 @@ fn prepared_image<J: JpegPixels>(
     rendering: Option<(SanitizedMetadata, RemovedFields)>,
     raw_sanitized: &SanitizedMetadata,
     raw_removed: &RemovedFields,
+    alignment: &Alignment,
+    frame: AlignmentFrame,
 ) -> Result<PreparedImage, PrepError> {
-    let samples = sample_member(shared, &jpeg)?;
+    let samples = sample_member(shared, &jpeg, alignment, frame)?;
     let sanitized = match &rendering {
         Some((jpeg_sanitized, _)) => merge_rendering(raw_sanitized, jpeg_sanitized),
         None => raw_sanitized.clone(),
@@ -348,6 +377,7 @@ fn prepared_image<J: JpegPixels>(
         samples,
         sanitized,
         removed,
+        alignment: AlignmentQuality::from(alignment),
     })
 }
 
@@ -413,7 +443,24 @@ fn prepare_decoded_chart(
     )?;
     jpegs
         .iter()
-        .map(|jpeg| sample_member(&shared, *jpeg))
+        .enumerate()
+        .map(|(index, jpeg)| {
+            if index == 0 {
+                sample_member(&shared, *jpeg, &shared.alignment, AlignmentFrame::Raw)
+            } else {
+                let alignment = align_with_pixel_pitch(
+                    &shared.downsampled,
+                    *jpeg,
+                    &params.align,
+                    (shared.scale_x, shared.scale_y),
+                )
+                .map_err(|source| PrepError::MemberAlignment {
+                    index: index + 1,
+                    message: source.to_string(),
+                })?;
+                sample_member(&shared, *jpeg, &alignment, AlignmentFrame::Downsampled)
+            }
+        })
         .collect()
 }
 
@@ -724,23 +771,53 @@ fn prepare_selection<J: JpegPixels + ?Sized>(
     })
 }
 
-fn sample_member<J: JpegPixels>(shared: &SelectionState, jpeg: &J) -> Result<SampleSet, PrepError> {
+/// Coordinate frame of a member's fitted alignment.
+#[derive(Clone, Copy)]
+enum AlignmentFrame {
+    /// The full RAW frame, used by the reference JPEG.
+    Raw,
+    /// The area-downsampled RAW frame used for selection.
+    Downsampled,
+}
+
+fn sample_member<J: JpegPixels>(
+    shared: &SelectionState,
+    jpeg: &J,
+    alignment: &Alignment,
+    frame: AlignmentFrame,
+) -> Result<SampleSet, PrepError> {
     let mut out_rgb = Vec::with_capacity(shared.in_rgb.len());
     let mut flags = Vec::with_capacity(shared.in_rgb.len());
     for &index in shared.selection.indices() {
         let x = (index % shared.downsampled.width as usize) as f64;
         let y = (index / shared.downsampled.width as usize) as f64;
-        let x_raw =
-            ((x + 0.5) * shared.scale_x - 0.5).clamp(0.0, f64::from(shared.raw_width) - 1.0);
-        let y_raw =
-            ((y + 0.5) * shared.scale_y - 0.5).clamp(0.0, f64::from(shared.raw_height) - 1.0);
+        let (center, footprint, frame_width, frame_height) = match frame {
+            AlignmentFrame::Raw => {
+                let x_raw = ((x + 0.5) * shared.scale_x - 0.5)
+                    .clamp(0.0, f64::from(shared.raw_width) - 1.0);
+                let y_raw = ((y + 0.5) * shared.scale_y - 0.5)
+                    .clamp(0.0, f64::from(shared.raw_height) - 1.0);
+                (
+                    (x_raw, y_raw),
+                    (shared.scale_x, shared.scale_y),
+                    shared.raw_width,
+                    shared.raw_height,
+                )
+            }
+            AlignmentFrame::Downsampled => (
+                (x, y),
+                (1.0, 1.0),
+                shared.downsampled.width,
+                shared.downsampled.height,
+            ),
+        };
         let (rgb, near_clip) = jpeg_footprint(
             jpeg,
-            &shared.alignment,
-            (x_raw, y_raw),
-            (shared.scale_x, shared.scale_y),
-            shared.raw_width,
-            shared.raw_height,
+            alignment,
+            center,
+            footprint,
+            frame_width,
+            frame_height,
         )?;
         out_rgb.push(clamp_rgb(rgb));
         flags.push(if near_clip {
@@ -957,14 +1034,14 @@ fn apply_gain(mut image: Image3, alignment: &Alignment) -> Image3 {
     image
 }
 
-/// Area-averages the JPEG over the footprint of one RAW sample.
+/// Area-averages the JPEG over the footprint of one sample.
 fn jpeg_footprint<J: JpegPixels + ?Sized>(
     jpeg: &J,
     alignment: &Alignment,
     center: (f64, f64),
     footprint: (f64, f64),
-    raw_width: u32,
-    raw_height: u32,
+    frame_width: u32,
+    frame_height: u32,
 ) -> Result<([f32; 3], bool), PrepError> {
     let taps = f64::from(JPEG_FOOTPRINT_TAPS);
     let mut sum = [0.0f64; 3];
@@ -977,7 +1054,7 @@ fn jpeg_footprint<J: JpegPixels + ?Sized>(
             let x = center.0 + fx * footprint.0;
             let y = center.1 + fy * footprint.1;
             let (jx, jy) =
-                alignment.raw_to_jpeg(x, y, raw_width, raw_height, jpeg.width(), jpeg.height());
+                alignment.raw_to_jpeg(x, y, frame_width, frame_height, jpeg.width(), jpeg.height());
             let Some(rgb) = jpeg.sample_bilinear(jx, jy) else {
                 return Err(PrepError::SampleOutsideJpeg);
             };

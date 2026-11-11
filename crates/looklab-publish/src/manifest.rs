@@ -44,9 +44,29 @@ pub struct GateSummary {
     pub checks: Vec<GateCheck>,
 }
 
+/// Gate check that marks a version's camera response models as synthetic sample data.
+pub const SYNTHETIC_SAMPLE_GATE: &str = "Sample settings models";
+/// Gate check that marks the browser match fixture.
+pub const SYNTHETIC_FIXTURE_GATE: &str = "synthetic case";
+
+/// What a version manifest declares about its camera response data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CameraModelProvenance {
+    /// The manifest makes no synthetic declaration.
+    Unknown,
+    /// The manifest declares synthetic camera response data for demonstrations or fixtures.
+    Synthetic,
+}
+
 impl GateSummary {
     pub fn all_passed(&self) -> bool {
         self.checks.iter().all(|check| check.passed)
+    }
+
+    fn declares_synthetic_camera_model(&self) -> bool {
+        self.checks.iter().any(|check| {
+            check.name == SYNTHETIC_SAMPLE_GATE || check.name == SYNTHETIC_FIXTURE_GATE
+        })
     }
 }
 
@@ -64,7 +84,8 @@ pub struct ProvenanceSummary {
     pub bodies: Vec<BodyUse>,
     pub root_admissions: Vec<String>,
     pub anchor_version: String,
-    pub community_snapshot_version: u32,
+    /// The community snapshot whose schemas the release was built from.
+    pub community_snapshot_version: u64,
     pub prep_versions: Vec<u32>,
     pub created: String,
     pub software: String,
@@ -73,6 +94,7 @@ pub struct ProvenanceSummary {
 pub const DOCUMENT_ARTIFACT: &str = "look.looklab";
 pub const PREVIEW_LUT_ARTIFACT: &str = "preview.lut33";
 pub const CARD_ARTIFACT: &str = "card.llk";
+pub const RELEASE_ARTIFACT: &str = "release.json";
 
 /// Well-known files inside a version directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +122,29 @@ pub struct ArtifactEntry {
     pub name: ArtifactName,
     pub sha256: ArtifactHash,
     pub bytes: u64,
+}
+
+impl ArtifactEntry {
+    /// # Errors
+    /// Returns [`HashMismatch`] when the digest or size differs.
+    pub fn verify(&self, bytes: &[u8]) -> Result<(), HashMismatch> {
+        if self.bytes != bytes.len() as u64 {
+            return Err(HashMismatch::Size {
+                name: self.name.clone(),
+                expected: self.bytes,
+                actual: bytes.len() as u64,
+            });
+        }
+        let actual = ArtifactHash::of(bytes);
+        if actual != self.sha256 {
+            return Err(HashMismatch::Digest {
+                name: self.name.clone(),
+                expected: self.sha256.clone(),
+                actual,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The published description of one immutable Look version.
@@ -158,6 +203,15 @@ impl VersionManifest {
 
     pub fn artifact(&self, name: &ArtifactName) -> Option<&ArtifactEntry> {
         self.artifacts.iter().find(|entry| &entry.name == name)
+    }
+
+    /// Reports only the synthetic declaration the manifest carries.
+    pub fn camera_model_provenance(&self) -> CameraModelProvenance {
+        if self.gate_summary.declares_synthetic_camera_model() {
+            CameraModelProvenance::Synthetic
+        } else {
+            CameraModelProvenance::Unknown
+        }
     }
 
     /// # Errors
@@ -235,22 +289,7 @@ pub fn verify_artifact(
     let Some(entry) = manifest.artifact(name) else {
         return Err(HashMismatch::NotListed { name: name.clone() });
     };
-    if entry.bytes != bytes.len() as u64 {
-        return Err(HashMismatch::Size {
-            name: name.clone(),
-            expected: entry.bytes,
-            actual: bytes.len() as u64,
-        });
-    }
-    let actual = ArtifactHash::of(bytes);
-    if actual != entry.sha256 {
-        return Err(HashMismatch::Digest {
-            name: name.clone(),
-            expected: entry.sha256.clone(),
-            actual,
-        });
-    }
-    Ok(())
+    entry.verify(bytes)
 }
 
 #[cfg(test)]
@@ -267,6 +306,55 @@ mod tests {
             files,
         )
         .expect("manifest")
+    }
+
+    fn gated_manifest(status: LookStatus, gates: &[&str]) -> VersionManifest {
+        let name = ArtifactName::new("look.looklab").expect("name");
+        VersionManifest::from_files(
+            Slug::new("provia").expect("slug"),
+            LookVersion::new("1.0.0").expect("version"),
+            status,
+            GateSummary {
+                checks: gates
+                    .iter()
+                    .map(|name| GateCheck {
+                        name: String::from(*name),
+                        passed: true,
+                        detail: None,
+                    })
+                    .collect(),
+            },
+            ProvenanceSummary::default(),
+            &[ArtifactBlob::new(name, vec![1, 2, 3])],
+        )
+        .expect("manifest")
+    }
+
+    #[test]
+    fn declared_sample_and_fixture_gates_mark_synthetic_camera_models() {
+        assert_eq!(
+            gated_manifest(LookStatus::Published, &[SYNTHETIC_SAMPLE_GATE])
+                .camera_model_provenance(),
+            CameraModelProvenance::Synthetic
+        );
+        assert_eq!(
+            gated_manifest(LookStatus::Published, &[SYNTHETIC_FIXTURE_GATE])
+                .camera_model_provenance(),
+            CameraModelProvenance::Synthetic
+        );
+    }
+
+    #[test]
+    fn provisional_or_ungated_versions_are_not_called_synthetic() {
+        assert_eq!(
+            gated_manifest(LookStatus::Provisional, &["identity tolerance"])
+                .camera_model_provenance(),
+            CameraModelProvenance::Unknown
+        );
+        assert_eq!(
+            gated_manifest(LookStatus::Published, &[]).camera_model_provenance(),
+            CameraModelProvenance::Unknown
+        );
     }
 
     #[test]

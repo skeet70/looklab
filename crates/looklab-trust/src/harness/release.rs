@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use looklab_color::RgbSpace;
+use looklab_color::{RgbSpace, Xyz};
 use looklab_fit::{
     ContributorId, FitImage, FitOptions, ImageFitStats, PreviousSupport, Verdict, fit_with_history,
     post_clip,
@@ -25,8 +25,8 @@ use crate::gates::{
     exposure_gauge_excluded, gate_release,
 };
 use crate::ids::{
-    ArtifactHash, CredentialId, EffectiveContributorId, ImageRef, SerialLink, SerialReuse,
-    VersionId, resolve_effective_contributors, serial_reuse,
+    ArtifactHash, ContributionId, CredentialId, EffectiveContributorId, ImageRef, SerialLink,
+    SerialReuse, VersionId, resolve_effective_contributors, serial_reuse,
 };
 use crate::params::TrustParams;
 use crate::region::RegionCoverage;
@@ -61,9 +61,18 @@ impl Default for HarnessParams {
     }
 }
 
+/// Whether the published pre-clip appearance of `look` at `xyz` has a defined renderer inverse.
+fn published_feasible(look: &Look, xyz: Xyz) -> bool {
+    let input = LookInput::new(xyz);
+    let values = look.layer_values(&input);
+    looklab_model::domain_penalty::check_published_paths(&look.chroma_paths(&input, &values))
+        .is_ok()
+}
+
 /// One upload in the simulated pool.
 pub struct SimImage {
     pub id: ImageRef,
+    pub contribution: ContributionId,
     pub credential: CredentialId,
     pub kind: ContributionKind,
     pub intent: Intent,
@@ -129,6 +138,7 @@ pub struct Version {
     pub status: VersionStatus,
     pub content: ArtifactHash,
     pub contributors: Vec<CredentialId>,
+    pub contributions: Vec<ContributionId>,
     pub release: u32,
 }
 
@@ -165,7 +175,7 @@ pub struct RevertOutcome {
     pub plan: RevertPlan,
     /// The target's content republished as a new version.
     pub restored: VersionId,
-    /// The refit without the excluded credentials, gated against `restored`.
+    /// The refit without the rejected contributions, gated against `restored`.
     pub refit: ReleaseOutcome,
 }
 
@@ -207,6 +217,7 @@ pub struct Sim {
     slots: BTreeMap<EffectiveContributorId, u32>,
     release_index: u32,
     next_image: u64,
+    next_contribution: u128,
     root_admitted: bool,
 }
 
@@ -248,6 +259,7 @@ impl Sim {
             slots: BTreeMap::new(),
             release_index: 0,
             next_image: 0,
+            next_contribution: 0,
             root_admitted: false,
         })
     }
@@ -345,6 +357,8 @@ impl Sim {
             self.trust.register(credential, &self.params.trust);
         }
         let truth = self.truth.clone();
+        let contribution = ContributionId::from_u128(self.next_contribution);
+        self.next_contribution += 1;
         let generated = population::render(
             batch.seed,
             batch.images,
@@ -366,6 +380,7 @@ impl Sim {
             let grid = population::evidence_grid(&axes)?;
             self.pool.push(SimImage {
                 id: id.clone(),
+                contribution,
                 credential,
                 kind: batch.kind,
                 intent: Intent::Native,
@@ -383,6 +398,16 @@ impl Sim {
 
     pub fn admit_root(&mut self) {
         self.root_admitted = true;
+    }
+
+    pub fn contributions_for(&self, credential: CredentialId) -> Vec<ContributionId> {
+        self.pool
+            .iter()
+            .filter(|image| image.credential == credential)
+            .map(|image| image.contribution)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     pub fn release(&mut self) -> HarnessResult<ReleaseOutcome> {
@@ -411,11 +436,11 @@ impl Sim {
         )
     }
 
-    /// "Revert to version N, exclude credential(s) K, refit" (docs/05 §8).
+    /// "Revert to version N, reject contribution(s) C, refit" (docs/05 §8).
     pub fn revert(
         &mut self,
         target: VersionId,
-        exclude: impl IntoIterator<Item = CredentialId>,
+        reject: impl IntoIterator<Item = ContributionId>,
     ) -> HarnessResult<RevertOutcome> {
         let history: Vec<LookVersionRecord> = self
             .versions
@@ -423,11 +448,9 @@ impl Sim {
             .map(|version| LookVersionRecord {
                 id: version.id,
                 content: version.content,
-                status: version.status,
-                contributors: version.contributors.clone(),
             })
             .collect();
-        let plan = plan_revert(&history, target, exclude)?;
+        let plan = plan_revert(&history, target, reject)?;
         let source = self
             .version(target)
             .cloned()
@@ -445,13 +468,15 @@ impl Sim {
             status: VersionStatus::Published,
             content: plan.publish_as_new,
             contributors: source.contributors,
+            contributions: source.contributions,
             release: self.release_index,
         };
         self.versions.push(restored);
         self.published = Some(id);
 
-        let excluded: BTreeSet<CredentialId> = plan.refit_excluding.iter().copied().collect();
-        let refit = self.release_excluding(&excluded)?;
+        let rejected: BTreeSet<ContributionId> =
+            plan.rejected_contributions.iter().copied().collect();
+        let refit = self.release_excluding(&rejected)?;
         Ok(RevertOutcome {
             plan,
             restored: id,
@@ -489,7 +514,7 @@ impl Sim {
 
     fn release_excluding(
         &mut self,
-        exclude: &BTreeSet<CredentialId>,
+        exclude: &BTreeSet<ContributionId>,
     ) -> HarnessResult<ReleaseOutcome> {
         let weights = self.weights(exclude)?;
         let body_weights = self.body_weights(exclude)?;
@@ -507,27 +532,56 @@ impl Sim {
             let estimate = estimates
                 .get(&index)
                 .ok_or(HarnessError::MissingProbe(index))?;
+            let feasible = published_feasible(&result.look, probe.xyz);
             probes.push(ProbeEstimate {
                 id: probe.id.clone(),
-                pre_clip: estimate.ucs.to_array(),
-                sigma_pre_clip: estimate.sigma_de,
-                post_clip: estimate.post_ucs.to_array(),
-                sigma_post_clip: estimate.post_sigma_de,
-                bias_de: estimate.bias_de,
-                support: ProbeSupport {
-                    sigma: estimate.supported_sigma,
-                    density: estimate.supported_density,
-                    clusters: estimate.supported_clusters,
-                    bias: estimate.supported_bias,
+                pre_clip: if feasible {
+                    estimate.ucs.to_array()
+                } else {
+                    [f64::NAN; 3]
                 },
-                pre_clip_identified: estimate.pre_clip_reliable,
+                sigma_pre_clip: if feasible {
+                    estimate.sigma_de
+                } else {
+                    f64::MAX
+                },
+                post_clip: if feasible {
+                    estimate.post_ucs.to_array()
+                } else {
+                    [f64::NAN; 3]
+                },
+                sigma_post_clip: if feasible {
+                    estimate.post_sigma_de
+                } else {
+                    f64::MAX
+                },
+                bias_de: estimate.bias_de,
+                support: if feasible {
+                    ProbeSupport {
+                        sigma: estimate.supported_sigma,
+                        density: estimate.supported_density,
+                        clusters: estimate.supported_clusters,
+                        bias: estimate.supported_bias,
+                    }
+                } else {
+                    ProbeSupport::default()
+                },
+                pre_clip_identified: feasible && estimate.pre_clip_reliable,
             });
         }
         let contributors: Vec<CredentialId> = self
             .pool
             .iter()
-            .filter(|image| !exclude.contains(&image.credential))
+            .filter(|image| !exclude.contains(&image.contribution))
             .map(|image| image.credential)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let contributions: Vec<ContributionId> = self
+            .pool
+            .iter()
+            .filter(|image| !exclude.contains(&image.contribution))
+            .map(|image| image.contribution)
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -543,6 +597,7 @@ impl Sim {
             status: VersionStatus::Provisional,
             content: population::artifact_hash(&result.look),
             contributors,
+            contributions,
             release: self.release_index,
         };
         self.versions.push(candidate.clone());
@@ -698,15 +753,12 @@ impl Sim {
         self.probes
             .probes
             .iter()
-            .map(|probe| RootObservation {
-                id: probe.id.clone(),
-                jab: post_clip(
-                    &self.truth,
-                    probe.xyz.scale(scale),
-                    anchor.space,
-                    self.truth.clip.k,
-                )
-                .to_array(),
+            .filter_map(|probe| {
+                let xyz = probe.xyz.scale(scale);
+                published_feasible(&self.truth, xyz).then(|| RootObservation {
+                    id: probe.id.clone(),
+                    jab: post_clip(&self.truth, xyz, anchor.space, self.truth.clip.k).to_array(),
+                })
             })
             .collect()
     }
@@ -726,6 +778,10 @@ impl Sim {
             }
             let stored = &version.probes[index];
             let xyz = probe.xyz.scale(scale);
+            if !published_feasible(&version.look, xyz) {
+                excluded.insert(probe.id.clone());
+                continue;
+            }
             estimates.insert(
                 probe.id.clone(),
                 ProbeEstimate {
@@ -790,9 +846,10 @@ impl Sim {
         mapping
     }
 
-    fn weights(&mut self, exclude: &BTreeSet<CredentialId>) -> HarnessResult<LookWeightReport> {
+    fn weights(&mut self, exclude: &BTreeSet<ContributionId>) -> HarnessResult<LookWeightReport> {
         let mapping = self.effective();
-        let images = self.weight_images(&mapping, |image| !exclude.contains(&image.credential))?;
+        let images =
+            self.weight_images(&mapping, |image| !exclude.contains(&image.contribution))?;
         Ok(weight_look(
             &self.params.trust,
             &LookWeightInput {
@@ -805,11 +862,11 @@ impl Sim {
 
     fn body_weights(
         &mut self,
-        exclude: &BTreeSet<CredentialId>,
+        exclude: &BTreeSet<ContributionId>,
     ) -> HarnessResult<BodyWeightReport> {
         let mapping = self.effective();
         let images = self.weight_images(&mapping, |image| {
-            !exclude.contains(&image.credential)
+            !exclude.contains(&image.contribution)
                 && (image.kind == ContributionKind::Chart
                     || matches!(image.intent, Intent::Recipe { .. }))
         })?;
@@ -872,7 +929,7 @@ impl Sim {
     fn refit(
         &mut self,
         weights: &LookWeightReport,
-        exclude: &BTreeSet<CredentialId>,
+        exclude: &BTreeSet<ContributionId>,
     ) -> HarnessResult<(looklab_fit::FitResult, Vec<usize>)> {
         let mapping = self.effective();
         let by_id: BTreeMap<&ImageRef, f64> = weights
@@ -883,7 +940,7 @@ impl Sim {
         let mut fit_indices = Vec::new();
         let mut raw_weights = Vec::new();
         for (index, image) in self.pool.iter().enumerate() {
-            if exclude.contains(&image.credential) {
+            if exclude.contains(&image.contribution) {
                 continue;
             }
             if !matches!(image.intent, Intent::Native) {

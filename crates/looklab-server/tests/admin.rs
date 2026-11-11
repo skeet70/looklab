@@ -4,8 +4,20 @@ use std::path::{Path, PathBuf};
 
 use looklab_model::file::{LookIdentity, LookKind, WbPolicy};
 use looklab_model::{Look, LookDocument};
-use looklab_server::admin::{self, AdminError, ManifestArtifact};
-use looklab_server::{ContributionId, CredentialId, EndorsementId, GrantId, LookVersionId, Tier};
+use looklab_schema::{
+    Applicability, ArtifactRole, ContributionRef, DependencyKind, DependencyRef, DependencyTarget,
+    EligibilitySnapshotId, FamilyTargetId, ImageRef, InvalidationReason, LookId,
+    MANUAL_CATALOG_VERSION, ManualCatalog, ModelSubject, ProposalKind, PublishedTargetId,
+    SafetyCheck, SourceRef, SubjectKey, TargetBasis, TargetEligibility, TargetEligibilityStatus,
+    TargetVersion,
+};
+use looklab_server::admin::{
+    self, AdminError, ManifestArtifact, Restoration, RestorationHold, WorkerProposal,
+};
+use looklab_server::model_store::{self, JobLease, NumericalSources};
+use looklab_server::{
+    ContributionId, CredentialId, EndorsementId, GrantId, JobId, LookVersionId, Tier,
+};
 use looklab_trust::{Actor, Grant, Scope, ScopeRule, TrustError, VersionId};
 use looklab_upload::{BodyId, LookSlug};
 use sha2::{Digest, Sha256};
@@ -62,6 +74,83 @@ fn version_artifacts(
         "clip_k": 1.0,
         "probes": [],
         "gated_since_anchor": union,
+        "converged": true,
+        "gate": {},
+        "provenance": {"anchor_version": format!("{anchor}.0.0")},
+        "created_at": 0,
+    });
+    vec![
+        ManifestArtifact {
+            name: looklab_publish::DOCUMENT_ARTIFACT.to_owned(),
+            sha256: store_blob(blobs, &look_bytes),
+        },
+        ManifestArtifact {
+            name: "release.json".to_owned(),
+            sha256: store_blob(blobs, &serde_json::to_vec(&release).expect("release json")),
+        },
+    ]
+}
+
+fn lut_version_artifacts(
+    blobs: &Path,
+    look: &str,
+    version: u32,
+    anchor: u32,
+) -> Vec<ManifestArtifact> {
+    use looklab_model::file::{
+        DeclaredEncoding, Gamut, LicenseRecord, LogTransfer, LutData, LutDefinition, LutRecord,
+        OutputEncoding,
+    };
+
+    let identity = LookIdentity::new(
+        look,
+        &format!("{version}.0.0"),
+        LookKind::LutDefined,
+        WbPolicy::Adaptive,
+    )
+    .expect("identity");
+    let definition = LutDefinition {
+        name: "Scene Look".to_owned(),
+        license: LicenseRecord {
+            own_work: false,
+            source_license: Some("CC0-1.0".to_owned()),
+            source_url: None,
+            attribution: "a donor".to_owned(),
+        },
+        encoding: DeclaredEncoding::SceneReferred {
+            transfer: LogTransfer::Flog2,
+            gamut: Gamut::Fgamut,
+        },
+        declared_base: None,
+        output: OutputEncoding::Srgb,
+        lut: LutRecord {
+            size: 2,
+            domain_min: [0.0; 3],
+            domain_max: [1.0; 3],
+            values_ref: looklab_model::BinRef::new("bin:lut").expect("ref"),
+        },
+        emulates: None,
+        superseded_by: None,
+        notes: Vec::new(),
+    };
+    let lut = LutData::new(
+        2,
+        [0.0; 3],
+        [1.0; 3],
+        (0..24).map(|value| value as f64 / 23.0).collect(),
+    )
+    .expect("lut");
+    let document =
+        LookDocument::from_lut_definition(identity, Look::colorimetric(), definition, lut)
+            .expect("document");
+    let look_bytes = document.encode().expect("look bytes");
+    let release = serde_json::json!({
+        "version": version,
+        "gauge": 0.0,
+        "anchor": anchor,
+        "clip_k": 1.0,
+        "probes": [],
+        "gated_since_anchor": {"probes": []},
         "converged": true,
         "gate": {},
         "provenance": {"anchor_version": format!("{anchor}.0.0")},
@@ -144,6 +233,30 @@ fn body(value: &str) -> BodyId {
 
 fn look(value: &str) -> LookSlug {
     LookSlug::try_from(value).expect("look")
+}
+
+async fn accept_family_version(db: &SqlitePool, look: &LookSlug, version: u32) {
+    let subject = format!("shared_family:{}", look.as_str());
+    sqlx::query(
+        "INSERT INTO model_subjects (key, kind, family, created_at)
+         VALUES (?, 'shared_family', ?, 0)
+         ON CONFLICT(key) DO NOTHING",
+    )
+    .bind(&subject)
+    .bind(look.as_str())
+    .execute(db)
+    .await
+    .expect("subject");
+    sqlx::query(
+        "INSERT INTO model_subject_revisions (subject_key, revision, role, recorded_at)
+         VALUES (?, ?, 'target', 0)
+         ON CONFLICT(subject_key, revision) DO NOTHING",
+    )
+    .bind(&subject)
+    .bind(i64::from(version))
+    .execute(db)
+    .await
+    .expect("accepted marker");
 }
 
 fn rule(body: Option<&str>, look: Option<&str>) -> ScopeRule {
@@ -414,6 +527,111 @@ async fn root_admission_uses_the_contribution_target_and_scoped_standing() {
 }
 
 #[tokio::test]
+async fn admitting_root_queues_a_refit() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let seeder = credential(db, "seeder", "[]", 1.2).await;
+    let contributor = credential(db, "new", "[]", 0.5).await;
+    admin::endorse(
+        db,
+        actor(&seeder),
+        &contributor,
+        body_scope(BODY_B),
+        "body B",
+        Vec::new(),
+    )
+    .await
+    .expect("endorsement");
+    let contribution = add_contribution(db, &contributor, BODY_B, "chart", None).await;
+    admin::admit_root(
+        db,
+        actor(&seeder),
+        &contribution,
+        body_scope(BODY_B),
+        "new chart",
+    )
+    .await
+    .expect("admit");
+
+    let kind: String = sqlx::query_scalar(
+        "SELECT kind FROM jobs WHERE kind = 'nightly_refit'
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(db)
+    .await
+    .expect("refit job");
+    assert_eq!(kind, "nightly_refit");
+}
+
+#[tokio::test]
+async fn a_running_nightly_refit_does_not_swallow_a_root_request() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let seeder = credential(db, "seeder", "[]", 1.2).await;
+    let contributor = credential(db, "new", "[]", 0.5).await;
+    admin::endorse(
+        db,
+        actor(&seeder),
+        &contributor,
+        body_scope(BODY_B),
+        "body B",
+        Vec::new(),
+    )
+    .await
+    .expect("endorsement");
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, payload, status, attempts, run_after, created_at)
+         VALUES (?, 'nightly_refit', '{}', 'running', 1, 0, 0)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .execute(db)
+    .await
+    .expect("running refit");
+
+    let contribution = add_contribution(db, &contributor, BODY_B, "chart", None).await;
+    admin::admit_root(
+        db,
+        actor(&seeder),
+        &contribution,
+        body_scope(BODY_B),
+        "new chart",
+    )
+    .await
+    .expect("admit");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM jobs WHERE kind = 'nightly_refit' AND status = 'queued'"
+        )
+        .fetch_one(db)
+        .await
+        .expect("queued refits"),
+        1,
+        "a request that arrives while a refit runs must be queued"
+    );
+
+    let second = add_contribution(db, &contributor, BODY_B, "chart", None).await;
+    admin::admit_root(
+        db,
+        actor(&seeder),
+        &second,
+        body_scope(BODY_B),
+        "second chart",
+    )
+    .await
+    .expect("second admit");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM jobs WHERE kind = 'nightly_refit' AND status = 'queued'"
+        )
+        .fetch_one(db)
+        .await
+        .expect("queued refits"),
+        1,
+        "a queued refit coalesces later requests"
+    );
+}
+
+#[tokio::test]
 async fn revocations_are_bounded_by_the_revoker_scope() {
     let fixture = fixture().await;
     let db = &fixture.db;
@@ -514,6 +732,7 @@ async fn wildcard_root_revocation_creates_versions_for_dependent_looks() {
         db,
         &look(LOOK_1),
         VersionId::new(1),
+        admin::VersionStatus::Published,
         std::slice::from_ref(&artifact),
         std::slice::from_ref(&root.id),
     )
@@ -559,6 +778,7 @@ async fn wildcard_root_revocation_creates_versions_for_dependent_looks() {
         db,
         &look(LOOK_1),
         VersionId::new(2),
+        admin::VersionStatus::Published,
         std::slice::from_ref(&artifact),
         std::slice::from_ref(&root.id),
     )
@@ -577,15 +797,188 @@ async fn wildcard_root_revocation_creates_versions_for_dependent_looks() {
 }
 
 #[tokio::test]
+async fn a_manifest_keeps_the_requested_status_and_an_existing_row_wins() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let look = look(LOOK_1);
+    let artifacts = vec![ManifestArtifact {
+        name: "look.looklab".to_owned(),
+        sha256: "ab".repeat(32),
+    }];
+    sqlx::query(
+        "INSERT INTO look_versions (id, look, version, status, changelog, created_at)
+         VALUES (?, ?, 1, 'provisional', NULL, 0)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(LOOK_1)
+    .execute(db)
+    .await
+    .expect("provisional version");
+
+    let preserved = admin::write_version_manifest(
+        db,
+        &look,
+        VersionId::new(1),
+        admin::VersionStatus::Rooted,
+        &artifacts,
+        &[],
+    )
+    .await
+    .expect("manifest for an existing version");
+    assert_eq!(preserved.status, admin::VersionStatus::Provisional);
+
+    let rooted = admin::write_version_manifest(
+        db,
+        &look,
+        VersionId::new(2),
+        admin::VersionStatus::Rooted,
+        &artifacts,
+        &[],
+    )
+    .await
+    .expect("rooted manifest");
+    assert_eq!(rooted.status, admin::VersionStatus::Rooted);
+
+    let first = admin::manifest_record(db, &look, VersionId::new(1))
+        .await
+        .expect("first record");
+    assert_eq!(first.status, admin::VersionStatus::Provisional);
+    let second = admin::manifest_record(db, &look, VersionId::new(2))
+        .await
+        .expect("second record");
+    assert_eq!(second.status, admin::VersionStatus::Rooted);
+}
+
+#[tokio::test]
+async fn reanchor_requires_a_moderator_and_a_released_version_and_is_audited() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    let outsider = credential(db, "new", "[]", 0.5).await;
+    let look = look(LOOK_1);
+    accept_family_version(db, &look, 1).await;
+    admin::write_version_manifest(
+        db,
+        &look,
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &[ManifestArtifact {
+            name: "look.looklab".to_owned(),
+            sha256: "ab".repeat(32),
+        }],
+        &[],
+    )
+    .await
+    .expect("version 1");
+    sqlx::query(
+        "INSERT INTO look_versions (id, look, version, status, changelog, created_at)
+         VALUES (?, ?, 2, 'provisional', NULL, 0)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(LOOK_1)
+    .execute(db)
+    .await
+    .expect("version 2");
+    let error = admin::reanchor(db, actor(&outsider), &look, 1, "new root session")
+        .await
+        .expect_err("outsider");
+    assert!(matches!(error, AdminError::NotAuthorized));
+    let error = admin::reanchor(db, actor(&moderator), &look, 2, "new root session")
+        .await
+        .expect_err("provisional");
+    assert!(matches!(error, AdminError::VersionNotPublished));
+    let error = admin::reanchor(db, actor(&moderator), &look, 9, "new root session")
+        .await
+        .expect_err("unknown");
+    assert!(matches!(error, AdminError::UnknownVersion));
+    let record = admin::reanchor(db, actor(&moderator), &look, 1, "new root session")
+        .await
+        .expect("reanchor");
+    assert_eq!(record.version, 1);
+    assert_eq!(record.reason, "new root session");
+    let (kind, payload): (String, String) =
+        sqlx::query_as("SELECT type, payload FROM audit_log ORDER BY seq DESC LIMIT 1")
+            .fetch_one(db)
+            .await
+            .expect("audit row");
+    assert_eq!(kind, "re_anchor");
+    let payload: serde_json::Value = serde_json::from_str(&payload).expect("payload");
+    assert_eq!(payload["look"], LOOK_1);
+    assert_eq!(payload["version"], 1);
+}
+
+#[tokio::test]
+async fn a_revoked_root_cannot_back_a_new_manifest() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let seeder = credential(db, "seeder", "[]", 1.2).await;
+    let contributor = credential(db, "new", "[]", 0.5).await;
+    admin::endorse(
+        db,
+        actor(&seeder),
+        &contributor,
+        body_scope(BODY_B),
+        "body B",
+        Vec::new(),
+    )
+    .await
+    .expect("endorsement");
+    let contribution = add_contribution(db, &contributor, BODY_B, "chart", None).await;
+    let root = admin::admit_root(
+        db,
+        actor(&seeder),
+        &contribution,
+        body_scope(BODY_B),
+        "chart root",
+    )
+    .await
+    .expect("root admission");
+    admin::revoke_root(db, actor(&seeder), &root.id, "root withdrawn")
+        .await
+        .expect("revocation");
+
+    let error = admin::write_version_manifest(
+        db,
+        &look(LOOK_1),
+        VersionId::new(1),
+        admin::VersionStatus::Rooted,
+        &[ManifestArtifact {
+            name: "look.looklab".to_owned(),
+            sha256: "ab".repeat(32),
+        }],
+        std::slice::from_ref(&root.id),
+    )
+    .await
+    .expect_err("revoked root");
+    assert!(matches!(error, AdminError::RootRevoked(_)));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM look_versions WHERE look = ?")
+            .bind(LOOK_1)
+            .fetch_one(db)
+            .await
+            .expect("versions"),
+        0
+    );
+}
+
+#[tokio::test]
 async fn endorsement_nominations_are_seeder_only() {
     let fixture = fixture().await;
     let db = &fixture.db;
     let nominated = credential(db, "new", "[]", 1.4).await;
 
-    let queue = admin::mod_queue(db, Tier::New).await.expect("queue");
+    let catalog = ManualCatalog {
+        catalog_version: MANUAL_CATALOG_VERSION,
+        cameras: Vec::new(),
+    };
+    let queue = admin::mod_queue(db, Tier::New, &catalog)
+        .await
+        .expect("queue");
     assert!(queue.nominations.is_empty());
 
-    let queue = admin::mod_queue(db, Tier::Seeder).await.expect("queue");
+    let queue = admin::mod_queue(db, Tier::Seeder, &catalog)
+        .await
+        .expect("queue");
     assert_eq!(queue.nominations.len(), 1);
     assert_eq!(queue.nominations[0].credential, nominated);
 }
@@ -649,13 +1042,34 @@ async fn public_lists_page_with_a_hard_cap() {
 }
 
 #[tokio::test]
-async fn revert_republishes_the_target_with_current_gates_and_excludes_credentials() {
+async fn revert_republishes_the_target_and_rejects_only_named_contributions() {
     use looklab_server::admin::VersionStatus;
 
     let fixture = fixture().await;
     let db = &fixture.db;
     let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
-    let attacker = credential(db, "endorsed", "[]", 1.0).await;
+    let contributor = credential(db, "endorsed", "[]", 1.0).await;
+    let bad = add_contribution(db, &contributor, "fujifilm/x-t5", "library", Some(LOOK_1)).await;
+    let good = add_contribution(db, &contributor, "fujifilm/x-t5", "library", Some(LOOK_1)).await;
+    for contribution in [&bad, &good] {
+        sqlx::query("UPDATE contributions SET status = 'accepted' WHERE id = ?")
+            .bind(contribution.as_str())
+            .execute(db)
+            .await
+            .expect("accept contribution");
+    }
+    sqlx::query(
+        "INSERT INTO contribution_images
+         (id, contribution_id, samples_hash, n_samples, meta, status)
+         VALUES (?, ?, x'00', 1, '{}', 'accepted')",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(bad.as_str())
+    .execute(db)
+    .await
+    .expect("rejected image");
+    accept_family_version(db, &look(LOOK_1), 1).await;
+    accept_family_version(db, &look(LOOK_1), 2).await;
 
     let first = version_artifacts(
         &fixture.blobs,
@@ -671,12 +1085,38 @@ async fn revert_republishes_the_target_with_current_gates_and_excludes_credentia
         2,
         serde_json::json!({"probes": ["current"]}),
     );
-    admin::write_version_manifest(db, &look(LOOK_1), VersionId::new(1), &first, &[])
+    admin::write_version_manifest(
+        db,
+        &look(LOOK_1),
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &first,
+        &[],
+    )
+    .await
+    .expect("version 1");
+    admin::write_version_manifest(
+        db,
+        &look(LOOK_1),
+        VersionId::new(2),
+        admin::VersionStatus::Published,
+        &second,
+        &[],
+    )
+    .await
+    .expect("version 2");
+    sqlx::query("INSERT INTO audit_log (type, payload, ts) VALUES ('re_anchor', ?, 0)")
+        .bind(
+            serde_json::json!({
+                "event": "re_anchor",
+                "look": LOOK_1,
+                "version": 9,
+            })
+            .to_string(),
+        )
+        .execute(db)
         .await
-        .expect("version 1");
-    admin::write_version_manifest(db, &look(LOOK_1), VersionId::new(2), &second, &[])
-        .await
-        .expect("version 2");
+        .expect("stale re-anchor");
 
     let reverted = admin::revert(
         db,
@@ -684,7 +1124,7 @@ async fn revert_republishes_the_target_with_current_gates_and_excludes_credentia
         actor(&moderator),
         &look(LOOK_1),
         1,
-        std::slice::from_ref(&attacker),
+        std::slice::from_ref(&bad),
         "contributor introduced a hue shift",
     )
     .await
@@ -692,7 +1132,13 @@ async fn revert_republishes_the_target_with_current_gates_and_excludes_credentia
 
     assert_eq!(reverted.target_version, 1);
     assert_eq!(reverted.new_version, 3);
-    assert_eq!(reverted.excluded, vec![attacker.clone()]);
+    assert_eq!(reverted.rejected, vec![bad.clone()]);
+    assert_eq!(
+        reverted.restoration,
+        Restoration::HistoricalNeedsRebuild {
+            reason: RestorationHold::DependencyHistoryUnavailable
+        }
+    );
 
     let target = admin::manifest_record(db, &look(LOOK_1), VersionId::new(1))
         .await
@@ -700,7 +1146,7 @@ async fn revert_republishes_the_target_with_current_gates_and_excludes_credentia
     let published = admin::manifest_record(db, &look(LOOK_1), VersionId::new(3))
         .await
         .expect("new manifest");
-    assert_eq!(published.status, VersionStatus::Published);
+    assert_eq!(published.status, VersionStatus::Deprecated);
     assert_eq!(
         published
             .artifacts
@@ -750,15 +1196,69 @@ async fn revert_republishes_the_target_with_current_gates_and_excludes_credentia
         .expect("original manifest");
     assert_eq!(original.artifacts, first);
 
-    let exclusions: Vec<(String, i64, i64)> = sqlx::query_as(
-        "SELECT credential_id, target_version, reverted_version
-         FROM look_credential_exclusions WHERE look = ?",
-    )
-    .bind(LOOK_1)
-    .fetch_all(db)
-    .await
-    .expect("exclusions");
-    assert_eq!(exclusions, vec![(attacker.as_str().to_owned(), 1, 3)]);
+    let rejected: Vec<String> =
+        sqlx::query_scalar("SELECT contribution_id FROM contribution_rejections")
+            .fetch_all(db)
+            .await
+            .expect("rejections");
+    assert_eq!(rejected, vec![bad.as_str().to_owned()]);
+    let statuses: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, status FROM contributions WHERE id IN (?, ?) ORDER BY id")
+            .bind(bad.as_str())
+            .bind(good.as_str())
+            .fetch_all(db)
+            .await
+            .expect("statuses");
+    assert!(
+        statuses
+            .iter()
+            .any(|(id, status)| id == bad.as_str() && status == "quarantined")
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|(id, status)| id == good.as_str() && status == "accepted")
+    );
+    for (contribution, expected) in [(&bad, 1), (&good, 0)] {
+        let revoked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM model_revoked_dependencies
+             WHERE kind = 'contribution' AND target = ?",
+        )
+        .bind(contribution.as_str())
+        .fetch_one(db)
+        .await
+        .expect("revoked contribution");
+        assert_eq!(revoked, expected);
+    }
+    let legacy_exclusions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM look_credential_exclusions")
+            .fetch_one(db)
+            .await
+            .expect("legacy exclusions");
+    assert_eq!(legacy_exclusions, 0);
+    sqlx::query("UPDATE contributions SET status = 'accepted' WHERE id = ?")
+        .bind(bad.as_str())
+        .execute(db)
+        .await
+        .expect("automated contribution update");
+    sqlx::query("UPDATE contribution_images SET status = 'accepted' WHERE contribution_id = ?")
+        .bind(bad.as_str())
+        .execute(db)
+        .await
+        .expect("automated image update");
+    let bad_status: String = sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
+        .bind(bad.as_str())
+        .fetch_one(db)
+        .await
+        .expect("rejected status");
+    assert_eq!(bad_status, "quarantined");
+    let image_statuses: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM contribution_images WHERE contribution_id = ?")
+            .bind(bad.as_str())
+            .fetch_all(db)
+            .await
+            .expect("rejected image status");
+    assert!(image_statuses.iter().all(|status| status == "quarantined"));
     let request: (i64, i64) = sqlx::query_as(
         "SELECT generation, reverted_version FROM look_refit_requests WHERE look = ?",
     )
@@ -777,10 +1277,13 @@ async fn revert_republishes_the_target_with_current_gates_and_excludes_credentia
     let audit: serde_json::Value = serde_json::from_str(&audit).expect("audit payload");
     assert_eq!(audit["reason"], "contributor introduced a hue shift");
     assert_eq!(audit["plan"]["target_version"], 1);
-    let attacker_trust = admin::trust_id(&attacker).expect("trust id").to_string();
     assert_eq!(
-        audit["plan"]["refit_excluding"][0].as_str(),
-        Some(attacker_trust.as_str())
+        audit["plan"]["rejected_contributions"][0].as_str(),
+        Some(bad.as_str())
+    );
+    assert_eq!(
+        audit["plan"]["restoration"]["historical_needs_rebuild"]["reason"],
+        "dependency_history_unavailable"
     );
 
     let queued: Vec<(String, i64)> = sqlx::query_as(
@@ -801,19 +1304,21 @@ async fn revert_republishes_the_target_with_current_gates_and_excludes_credentia
 }
 
 #[tokio::test]
-async fn revert_validates_permission_reason_version_and_credentials_before_mutation() {
+async fn revert_validates_permission_reason_version_and_contributions_before_mutation() {
     use looklab_server::admin::ManifestArtifact;
 
     let fixture = fixture().await;
     let db = &fixture.db;
     let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
     let outsider = credential(db, "new", "[]", 0.5).await;
-    let revoked = credential(db, "new", "[]", 0.5).await;
-    sqlx::query("UPDATE credentials SET status = 'revoked' WHERE id = ?")
-        .bind(revoked.as_str())
+    let contributor = credential(db, "new", "[]", 0.5).await;
+    let withdrawn = add_contribution(db, &contributor, "fujifilm/x-t5", "library", None).await;
+    sqlx::query("UPDATE contributions SET status = 'withdrawn' WHERE id = ?")
+        .bind(withdrawn.as_str())
         .execute(db)
         .await
-        .expect("revoke credential");
+        .expect("withdraw contribution");
+    accept_family_version(db, &look(LOOK_1), 1).await;
     let artifact = ManifestArtifact {
         name: "look.looklab".to_owned(),
         sha256: "ab".repeat(32),
@@ -822,6 +1327,7 @@ async fn revert_validates_permission_reason_version_and_credentials_before_mutat
         db,
         &look(LOOK_1),
         VersionId::new(1),
+        admin::VersionStatus::Published,
         std::slice::from_ref(&artifact),
         &[],
     )
@@ -837,13 +1343,29 @@ async fn revert_validates_permission_reason_version_and_credentials_before_mutat
     .await
     .expect("provisional version");
 
-    let error = admin::revert(db, &fixture.blobs, actor(&moderator), &look(LOOK_1), 2, &[], "not published")
-        .await
-        .expect_err("unpublished target");
+    let error = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        2,
+        &[],
+        "not published",
+    )
+    .await
+    .expect_err("unpublished target");
     assert!(matches!(error, AdminError::VersionNotPublished));
-    let error = admin::revert(db, &fixture.blobs, actor(&moderator), &look(LOOK_1), 9, &[], "missing")
-        .await
-        .expect_err("unknown target");
+    let error = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        9,
+        &[],
+        "missing",
+    )
+    .await
+    .expect_err("unknown target");
     assert!(matches!(error, AdminError::UnknownVersion));
     let error = admin::revert(
         db,
@@ -851,45 +1373,72 @@ async fn revert_validates_permission_reason_version_and_credentials_before_mutat
         actor(&moderator),
         &look(LOOK_1),
         1,
-        std::slice::from_ref(&revoked),
-        "inactive credential",
+        std::slice::from_ref(&withdrawn),
+        "withdrawn contribution",
     )
     .await
-    .expect_err("inactive credential");
-    assert!(matches!(error, AdminError::CredentialInactive));
+    .expect_err("withdrawn contribution");
+    assert!(matches!(error, AdminError::ContributionWithdrawn));
+    let unrelated = add_contribution(db, &contributor, "canon/canon-r5", "library", None).await;
     let error = admin::revert(
         db,
         &fixture.blobs,
         actor(&moderator),
         &look(LOOK_1),
         1,
-        std::slice::from_ref(&CredentialId::new()),
-        "unknown credential",
+        std::slice::from_ref(&unrelated),
+        "unrelated contribution",
     )
     .await
-    .expect_err("unknown credential");
-    assert!(matches!(error, AdminError::UnknownCredential));
-    let error = admin::revert(db, &fixture.blobs, actor(&moderator), &look(LOOK_1), 1, &[], "   ")
-        .await
-        .expect_err("empty reason");
+    .expect_err("unrelated contribution");
+    assert!(matches!(error, AdminError::ContributionNotInLookEvidence));
+    let error = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        std::slice::from_ref(&ContributionId::new()),
+        "unknown contribution",
+    )
+    .await
+    .expect_err("unknown contribution");
+    assert!(matches!(error, AdminError::UnknownContribution));
+    let error = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        &[],
+        "   ",
+    )
+    .await
+    .expect_err("empty reason");
     assert!(matches!(error, AdminError::InvalidReason));
-    let error = admin::revert(db, &fixture.blobs, actor(&outsider), &look(LOOK_1), 1, &[], "not a moderator")
-        .await
-        .expect_err("insufficient role");
+    let error = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&outsider),
+        &look(LOOK_1),
+        1,
+        &[],
+        "not a moderator",
+    )
+    .await
+    .expect_err("insufficient role");
     assert!(matches!(error, AdminError::NotAuthorized));
 
-    let versions: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM look_versions WHERE look = ?")
-            .bind(LOOK_1)
-            .fetch_one(db)
-            .await
-            .expect("versions");
+    let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM look_versions WHERE look = ?")
+        .bind(LOOK_1)
+        .fetch_one(db)
+        .await
+        .expect("versions");
     assert_eq!(versions, 2);
-    let exclusions: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM look_credential_exclusions")
-            .fetch_one(db)
-            .await
-            .expect("exclusions");
+    let exclusions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contribution_rejections")
+        .fetch_one(db)
+        .await
+        .expect("rejections");
     assert_eq!(exclusions, 0);
     let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE type = 'revert'")
         .fetch_one(db)
@@ -911,6 +1460,293 @@ async fn revert_validates_permission_reason_version_and_credentials_before_mutat
 }
 
 #[tokio::test]
+async fn a_published_native_version_without_an_accepted_marker_is_not_revertible() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    accept_family_version(db, &look(LOOK_1), 1).await;
+    for version in [1, 2] {
+        let artifacts = version_artifacts(
+            &fixture.blobs,
+            LOOK_1,
+            version,
+            version,
+            serde_json::json!({}),
+        );
+        admin::write_version_manifest(
+            db,
+            &look(LOOK_1),
+            VersionId::new(version),
+            admin::VersionStatus::Published,
+            &artifacts,
+            &[],
+        )
+        .await
+        .expect("version");
+    }
+
+    let error = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        2,
+        &[],
+        "not an accepted release",
+    )
+    .await
+    .expect_err("unselected published version");
+    assert!(matches!(error, AdminError::VersionNotPublished));
+
+    let reverted = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        &[],
+        "accepted historical release",
+    )
+    .await
+    .expect("accepted history remains revertible");
+    assert_eq!(reverted.target_version, 1);
+    assert_eq!(
+        reverted.restoration,
+        Restoration::HistoricalNeedsRebuild {
+            reason: RestorationHold::DependencyHistoryUnavailable
+        }
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM look_versions WHERE look = ? AND version = ?")
+            .bind(LOOK_1)
+            .bind(i64::from(reverted.new_version))
+            .fetch_one(db)
+            .await
+            .expect("restored status");
+    assert_eq!(status, admin::VersionStatus::Deprecated.as_str());
+    let target = PublishedTargetId {
+        look: LookId::new(LOOK_1).expect("look"),
+        version: TargetVersion::new(reverted.new_version).expect("version"),
+    };
+    let mut conn = db.acquire().await.expect("connection");
+    let eligibility = model_store::target_eligibility(&mut conn, &target)
+        .await
+        .expect("eligibility")
+        .expect("held eligibility");
+    assert_eq!(eligibility.status, TargetEligibilityStatus::Invalidated);
+    let revision: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM model_subject_revisions
+         WHERE subject_key = ? AND revision = ? AND role = 'target'",
+    )
+    .bind(format!("shared_family:{LOOK_1}"))
+    .bind(i64::from(reverted.new_version))
+    .fetch_one(&mut *conn)
+    .await
+    .expect("subject revision");
+    assert_eq!(revision, 1, "held revert must stay resolvable history");
+}
+
+#[tokio::test]
+async fn lut_revert_promotes_only_authoritative_eligible_proof() {
+    use looklab_schema::BasePin;
+
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    let contributor = credential(db, "endorsed", "[]", 1.0).await;
+    let evidence = add_contribution(db, &contributor, "fujifilm/x-t5", "library", None).await;
+    let base = PublishedTargetId {
+        look: LookId::new("classic-chrome").expect("base look"),
+        version: TargetVersion::new(1).expect("base version"),
+    };
+    accept_family_version(db, &look("classic-chrome"), 1).await;
+    let base_artifacts = version_artifacts(
+        &fixture.blobs,
+        "classic-chrome",
+        1,
+        1,
+        serde_json::json!({}),
+    );
+    admin::write_version_manifest(
+        db,
+        &look("classic-chrome"),
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &base_artifacts,
+        &[],
+    )
+    .await
+    .expect("base version");
+    let mut conn = db.acquire().await.expect("connection");
+    model_store::record_target_eligibility(
+        &mut conn,
+        &TargetEligibility {
+            id: EligibilitySnapshotId::from_digest([0; 32]),
+            target: base.clone(),
+            basis: TargetBasis::NativeFamily,
+            artifacts: Vec::new(),
+            base_pin: None,
+            support_uncertainty_source: None,
+            status: TargetEligibilityStatus::Eligible,
+            reasons: Vec::new(),
+            dependencies: vec![
+                DependencyRef::required(
+                    DependencyKind::Contribution,
+                    DependencyTarget::contribution(
+                        &ContributionRef::new(evidence.as_str()).expect("contribution"),
+                    ),
+                ),
+                DependencyRef::required(
+                    DependencyKind::Image,
+                    DependencyTarget::image(&ImageRef::new("image-1").expect("image")),
+                ),
+            ],
+        },
+        0,
+    )
+    .await
+    .expect("base eligibility");
+
+    let donor = look("donor-lut");
+    let donor_artifacts = lut_version_artifacts(&fixture.blobs, "donor-lut", 1, 1);
+    admin::write_version_manifest(
+        db,
+        &donor,
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &donor_artifacts,
+        &[],
+    )
+    .await
+    .expect("donor version");
+    model_store::record_target_eligibility(
+        &mut conn,
+        &TargetEligibility {
+            id: EligibilitySnapshotId::from_digest([0; 32]),
+            target: PublishedTargetId {
+                look: LookId::new("donor-lut").expect("look"),
+                version: TargetVersion::new(1).expect("version"),
+            },
+            basis: TargetBasis::LutComposition,
+            artifacts: Vec::new(),
+            base_pin: Some(BasePin::LookVersion(base.clone())),
+            support_uncertainty_source: None,
+            status: TargetEligibilityStatus::Eligible,
+            reasons: Vec::new(),
+            dependencies: vec![DependencyRef::required(
+                DependencyKind::PublishedTarget,
+                DependencyTarget::published_target(&base),
+            )],
+        },
+        0,
+    )
+    .await
+    .expect("donor eligibility");
+    let reverted = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &donor,
+        1,
+        &[],
+        "carry proof",
+    )
+    .await
+    .expect("eligible revert");
+    let new_target = PublishedTargetId {
+        look: LookId::new("donor-lut").expect("look"),
+        version: TargetVersion::new(reverted.new_version).expect("new version"),
+    };
+    let carried = model_store::target_eligibility(&mut conn, &new_target)
+        .await
+        .expect("eligibility")
+        .expect("carried eligibility");
+    assert_eq!(carried.status, TargetEligibilityStatus::Eligible);
+    assert_eq!(carried.base_pin, Some(BasePin::LookVersion(base)));
+
+    for name in ["legacy-lut", "invalid-lut"] {
+        let slug = look(name);
+        let artifacts = lut_version_artifacts(&fixture.blobs, name, 1, 1);
+        admin::write_version_manifest(
+            db,
+            &slug,
+            VersionId::new(1),
+            admin::VersionStatus::Published,
+            &artifacts,
+            &[],
+        )
+        .await
+        .expect("legacy version");
+        sqlx::query(
+            "INSERT INTO model_legacy_scopes
+             (kind, target, family, applicability, reason, recorded_at)
+             VALUES ('look_version', ?, ?, 'unassessed', 'epoch_and_sim_unrecorded', 0)",
+        )
+        .bind(format!("{name}@1"))
+        .bind(name)
+        .execute(&mut *conn)
+        .await
+        .expect("legacy marker");
+        if name == "invalid-lut" {
+            model_store::record_target_eligibility(
+                &mut conn,
+                &TargetEligibility {
+                    id: EligibilitySnapshotId::from_digest([0; 32]),
+                    target: PublishedTargetId {
+                        look: LookId::new(name).expect("look"),
+                        version: TargetVersion::new(1).expect("version"),
+                    },
+                    basis: TargetBasis::LutComposition,
+                    artifacts: Vec::new(),
+                    base_pin: None,
+                    support_uncertainty_source: None,
+                    status: TargetEligibilityStatus::Invalidated,
+                    reasons: Vec::new(),
+                    dependencies: Vec::new(),
+                },
+                0,
+            )
+            .await
+            .expect("invalidated eligibility");
+        }
+        let reverted = admin::revert(
+            db,
+            &fixture.blobs,
+            actor(&moderator),
+            &slug,
+            1,
+            &[],
+            "unassessed history",
+        )
+        .await
+        .expect("legacy revert");
+        let target = PublishedTargetId {
+            look: LookId::new(name).expect("look"),
+            version: TargetVersion::new(reverted.new_version).expect("version"),
+        };
+        let expected = if name == "invalid-lut" {
+            RestorationHold::DependencyInvalidated
+        } else {
+            RestorationHold::DependencyHistoryUnavailable
+        };
+        assert_eq!(
+            reverted.restoration,
+            Restoration::HistoricalNeedsRebuild { reason: expected },
+            "{name}"
+        );
+        let held = model_store::target_eligibility(&mut conn, &target)
+            .await
+            .expect("eligibility")
+            .expect("held eligibility");
+        assert_eq!(
+            held.status,
+            TargetEligibilityStatus::Invalidated,
+            "{name} must not gain eligible authority"
+        );
+    }
+}
+
+#[tokio::test]
 async fn revert_marks_pinned_lut_dependents_for_rebase() {
     use looklab_model::file::{BaseReference, BaseStatus, LookVersion, Slug};
     use looklab_server::admin::LutRebaseReason;
@@ -918,6 +1754,7 @@ async fn revert_marks_pinned_lut_dependents_for_rebase() {
     let fixture = fixture().await;
     let db = &fixture.db;
     let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    accept_family_version(db, &look(LOOK_1), 1).await;
     let artifact = version_artifacts(
         &fixture.blobs,
         LOOK_1,
@@ -929,6 +1766,7 @@ async fn revert_marks_pinned_lut_dependents_for_rebase() {
         db,
         &look(LOOK_1),
         VersionId::new(1),
+        admin::VersionStatus::Published,
         &artifact,
         &[],
     )
@@ -958,6 +1796,7 @@ async fn revert_marks_pinned_lut_dependents_for_rebase() {
         db,
         &dependent,
         VersionId::new(1),
+        admin::VersionStatus::Published,
         &dependent_artifacts,
         &[],
     )
@@ -996,11 +1835,12 @@ async fn revert_marks_pinned_lut_dependents_for_rebase() {
     assert!(pending.iter().any(|work| {
         work.look == dependent && work.version == 1 && work.reason == LutRebaseReason::BasePublished
     }));
-    let queued: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'lut_rebase' AND status = 'queued'")
-            .fetch_one(db)
-            .await
-            .expect("lut rebase job");
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'lut_rebase' AND status = 'queued'",
+    )
+    .fetch_one(db)
+    .await
+    .expect("lut rebase job");
     assert_eq!(queued, 1);
 }
 
@@ -1077,4 +1917,983 @@ async fn hiding_removing_and_relisting_a_look_records_each_state() {
         .await
         .expect_err("unknown Look");
     assert!(matches!(error, AdminError::UnknownLook));
+}
+
+#[tokio::test]
+async fn reanchor_updates_scoped_subject_anchor_with_cas() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    let look = look(LOOK_1);
+    accept_family_version(db, &look, 1).await;
+    let artifacts = version_artifacts(&fixture.blobs, LOOK_1, 1, 1, serde_json::json!({}));
+    admin::write_version_manifest(
+        db,
+        &look,
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &artifacts,
+        &[],
+    )
+    .await
+    .expect("version 1");
+    let family = LookId::new(LOOK_1).expect("family");
+    let subject = SubjectKey::for_family(&family);
+    let mut conn = db.acquire().await.expect("connection");
+    model_store::register_subject(
+        &mut conn,
+        &ModelSubject::SharedFamily {
+            family: family.clone(),
+        },
+        0,
+    )
+    .await
+    .expect("subject");
+    admin::reanchor(db, actor(&moderator), &look, 1, "new root session")
+        .await
+        .expect("reanchor");
+    let state = model_store::subject_state(&mut conn, &subject)
+        .await
+        .expect("state")
+        .expect("scoped state");
+    assert_eq!(state.anchor_revision, Some(1));
+    assert!(
+        !model_store::set_subject_anchor(&mut conn, &subject, Some(0), 1, 1)
+            .await
+            .expect("stale CAS")
+    );
+}
+
+#[tokio::test]
+async fn revert_advances_existing_family_head_for_clean_history() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    let contributor = credential(db, "endorsed", "[]", 1.0).await;
+    let evidence = add_contribution(db, &contributor, "fujifilm/x-t5", "library", None).await;
+    accept_family_version(db, &look(LOOK_1), 1).await;
+    let artifacts = version_artifacts(&fixture.blobs, LOOK_1, 1, 1, serde_json::json!({}));
+    admin::write_version_manifest(
+        db,
+        &look(LOOK_1),
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &artifacts,
+        &[],
+    )
+    .await
+    .expect("version 1");
+    let family = LookId::new(LOOK_1).expect("family");
+    let mut conn = db.acquire().await.expect("connection");
+    model_store::register_subject(
+        &mut conn,
+        &ModelSubject::SharedFamily {
+            family: family.clone(),
+        },
+        0,
+    )
+    .await
+    .expect("subject");
+    sqlx::query(
+        "INSERT INTO model_family_heads
+         (family, head_version, source_limited, numerical, release_gates, report_id,
+          assessed_generation, applicability, invalidated_reason, updated_at)
+         VALUES (?, 1, 1, 'passed', 'passed', NULL, 0, 'current', NULL, 0)",
+    )
+    .bind(family.as_str())
+    .execute(&mut *conn)
+    .await
+    .expect("head");
+    model_store::record_target_eligibility(
+        &mut conn,
+        &TargetEligibility {
+            id: EligibilitySnapshotId::from_digest([0; 32]),
+            target: PublishedTargetId {
+                look: family.clone(),
+                version: TargetVersion::new(1).expect("version"),
+            },
+            basis: TargetBasis::NativeFamily,
+            artifacts: Vec::new(),
+            base_pin: None,
+            support_uncertainty_source: None,
+            status: TargetEligibilityStatus::Eligible,
+            reasons: Vec::new(),
+            dependencies: vec![
+                DependencyRef::required(
+                    DependencyKind::Contribution,
+                    DependencyTarget::contribution(
+                        &ContributionRef::new(evidence.as_str()).expect("contribution"),
+                    ),
+                ),
+                DependencyRef::required(
+                    DependencyKind::Image,
+                    DependencyTarget::image(&ImageRef::new("image-1").expect("image")),
+                ),
+            ],
+        },
+        0,
+    )
+    .await
+    .expect("source eligibility");
+    let reverted = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        &[],
+        "restore the fit",
+    )
+    .await
+    .expect("revert");
+    assert_eq!(reverted.restoration, Restoration::Current);
+    let head = model_store::family_head(&mut conn, &family)
+        .await
+        .expect("head")
+        .expect("advanced head");
+    assert_eq!(head.target.version.get(), reverted.new_version);
+    assert!(head.report.is_none());
+    let new_target = PublishedTargetId {
+        look: family.clone(),
+        version: TargetVersion::new(reverted.new_version).expect("version"),
+    };
+    let eligibility = model_store::target_eligibility(&mut conn, &new_target)
+        .await
+        .expect("eligibility")
+        .expect("bound eligibility");
+    assert_eq!(eligibility.status, TargetEligibilityStatus::Eligible);
+    let bindings = model_store::artifacts(
+        &mut conn,
+        "family_target",
+        &FamilyTargetId {
+            family: family.clone(),
+            version: new_target.version,
+        }
+        .to_key(),
+    )
+    .await
+    .expect("bindings");
+    assert!(
+        bindings
+            .iter()
+            .any(|binding| binding.role == ArtifactRole::Manifest)
+    );
+    let standing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM model_dependency_generations
+         WHERE kind = 'standing' AND target = ?",
+    )
+    .bind(contributor.as_str())
+    .fetch_one(&mut *conn)
+    .await
+    .expect("standing generation");
+    assert_eq!(standing, 0, "rejection does not change standing");
+}
+
+#[tokio::test]
+async fn revert_head_is_invalidated_with_the_restored_target_dependencies() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    let contributor = credential(db, "endorsed", "[]", 1.0).await;
+    let evidence = add_contribution(db, &contributor, "fujifilm/x-t5", "library", None).await;
+    accept_family_version(db, &look(LOOK_1), 1).await;
+    let artifacts = version_artifacts(&fixture.blobs, LOOK_1, 1, 1, serde_json::json!({}));
+    admin::write_version_manifest(
+        db,
+        &look(LOOK_1),
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &artifacts,
+        &[],
+    )
+    .await
+    .expect("version 1");
+    let family = LookId::new(LOOK_1).expect("family");
+    let mut conn = db.acquire().await.expect("connection");
+    model_store::register_subject(
+        &mut conn,
+        &ModelSubject::SharedFamily {
+            family: family.clone(),
+        },
+        0,
+    )
+    .await
+    .expect("subject");
+    sqlx::query(
+        "INSERT INTO model_family_heads
+         (family, head_version, source_limited, numerical, release_gates, report_id,
+          assessed_generation, applicability, invalidated_reason, updated_at)
+         VALUES (?, 1, 1, 'passed', 'passed', NULL, 0, 'current', NULL, 0)",
+    )
+    .bind(family.as_str())
+    .execute(&mut *conn)
+    .await
+    .expect("head");
+    model_store::record_target_eligibility(
+        &mut conn,
+        &TargetEligibility {
+            id: EligibilitySnapshotId::from_digest([0; 32]),
+            target: PublishedTargetId {
+                look: family.clone(),
+                version: TargetVersion::new(1).expect("version"),
+            },
+            basis: TargetBasis::NativeFamily,
+            artifacts: Vec::new(),
+            base_pin: None,
+            support_uncertainty_source: None,
+            status: TargetEligibilityStatus::Eligible,
+            reasons: Vec::new(),
+            dependencies: vec![
+                DependencyRef::required(
+                    DependencyKind::Contribution,
+                    DependencyTarget::contribution(
+                        &ContributionRef::new(evidence.as_str()).expect("contribution"),
+                    ),
+                ),
+                DependencyRef::required(
+                    DependencyKind::Image,
+                    DependencyTarget::image(&ImageRef::new("image-1").expect("image")),
+                ),
+            ],
+        },
+        0,
+    )
+    .await
+    .expect("source eligibility");
+
+    let reverted = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        &[],
+        "restore the prior fit",
+    )
+    .await
+    .expect("revert");
+    assert_eq!(reverted.restoration, Restoration::Current);
+
+    let source = PublishedTargetId {
+        look: family.clone(),
+        version: TargetVersion::new(1).expect("version"),
+    };
+    let affected = model_store::invalidate(
+        &mut conn,
+        &DependencyRef::required(
+            DependencyKind::PublishedTarget,
+            DependencyTarget::published_target(&source),
+        ),
+        InvalidationReason::EvidenceLoss,
+        10,
+    )
+    .await
+    .expect("invalidate restored source");
+    assert!(affected.family_heads >= 1);
+    let head = model_store::family_head(&mut conn, &family)
+        .await
+        .expect("head")
+        .expect("advanced head");
+    assert!(matches!(
+        head.applicability,
+        Applicability::Invalidated { .. }
+    ));
+}
+
+fn evidence_dependencies(contributions: &[&ContributionId]) -> Vec<DependencyRef> {
+    let mut dependencies = contributions
+        .iter()
+        .map(|contribution| {
+            DependencyRef::required(
+                DependencyKind::Contribution,
+                DependencyTarget::contribution(
+                    &ContributionRef::new(contribution.as_str()).expect("contribution"),
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    dependencies.push(DependencyRef::required(
+        DependencyKind::Image,
+        DependencyTarget::image(&ImageRef::new("image-1").expect("image")),
+    ));
+    dependencies
+}
+
+async fn native_target_with_evidence(
+    fixture: &Fixture,
+    family: &LookId,
+    dependencies: Vec<DependencyRef>,
+) {
+    let db = &fixture.db;
+    accept_family_version(db, &look(LOOK_1), 1).await;
+    let artifacts = version_artifacts(&fixture.blobs, LOOK_1, 1, 1, serde_json::json!({}));
+    admin::write_version_manifest(
+        db,
+        &look(LOOK_1),
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &artifacts,
+        &[],
+    )
+    .await
+    .expect("version");
+    let mut conn = db.acquire().await.expect("connection");
+    model_store::register_subject(
+        &mut conn,
+        &ModelSubject::SharedFamily {
+            family: family.clone(),
+        },
+        0,
+    )
+    .await
+    .expect("subject");
+    sqlx::query(
+        "INSERT INTO model_family_heads
+         (family, head_version, source_limited, numerical, release_gates, report_id,
+          assessed_generation, applicability, invalidated_reason, updated_at)
+         VALUES (?, 1, 1, 'passed', 'passed', NULL, 0, 'current', NULL, 0)",
+    )
+    .bind(family.as_str())
+    .execute(&mut *conn)
+    .await
+    .expect("head");
+    model_store::record_target_eligibility(
+        &mut conn,
+        &TargetEligibility {
+            id: EligibilitySnapshotId::from_digest([0; 32]),
+            target: PublishedTargetId {
+                look: family.clone(),
+                version: TargetVersion::new(1).expect("version"),
+            },
+            basis: TargetBasis::NativeFamily,
+            artifacts: Vec::new(),
+            base_pin: None,
+            support_uncertainty_source: None,
+            status: TargetEligibilityStatus::Eligible,
+            reasons: Vec::new(),
+            dependencies,
+        },
+        0,
+    )
+    .await
+    .expect("eligibility");
+}
+
+#[tokio::test]
+async fn rejecting_evidence_in_the_target_closure_holds_the_restored_copy() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    let contributor = credential(db, "endorsed", "[]", 1.0).await;
+    let bad = add_contribution(db, &contributor, "fujifilm/x-t5", "library", None).await;
+    let good = add_contribution(db, &contributor, "fujifilm/x-t5", "library", None).await;
+    for contribution in [&bad, &good] {
+        sqlx::query("UPDATE contributions SET status = 'accepted' WHERE id = ?")
+            .bind(contribution.as_str())
+            .execute(db)
+            .await
+            .expect("accept contribution");
+    }
+    let family = LookId::new(LOOK_1).expect("family");
+    native_target_with_evidence(&fixture, &family, evidence_dependencies(&[&bad])).await;
+
+    let reverted = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        std::slice::from_ref(&bad),
+        "bad evidence",
+    )
+    .await
+    .expect("revert");
+    assert_eq!(
+        reverted.restoration,
+        Restoration::HistoricalNeedsRebuild {
+            reason: RestorationHold::DependencyInvalidated
+        }
+    );
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM look_versions WHERE look = ? AND version = ?")
+            .bind(LOOK_1)
+            .bind(i64::from(reverted.new_version))
+            .fetch_one(db)
+            .await
+            .expect("restored status");
+    assert_eq!(status, admin::VersionStatus::Deprecated.as_str());
+    let mut conn = db.acquire().await.expect("connection");
+    let new_target = PublishedTargetId {
+        look: family.clone(),
+        version: TargetVersion::new(reverted.new_version).expect("version"),
+    };
+    let eligibility = model_store::target_eligibility(&mut conn, &new_target)
+        .await
+        .expect("eligibility")
+        .expect("held eligibility");
+    assert_eq!(eligibility.status, TargetEligibilityStatus::Invalidated);
+    let head = model_store::family_head(&mut conn, &family)
+        .await
+        .expect("head")
+        .expect("head");
+    assert_eq!(head.target.version.get(), 1);
+    let refit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM look_refit_requests WHERE look = ?")
+        .bind(LOOK_1)
+        .fetch_one(db)
+        .await
+        .expect("refit request");
+    assert_eq!(refit, 1);
+    let job: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'revert_refit' AND status = 'queued'",
+    )
+    .fetch_one(db)
+    .await
+    .expect("refit job");
+    assert_eq!(job, 1);
+    let statuses: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, status FROM contributions WHERE id IN (?, ?)")
+            .bind(bad.as_str())
+            .bind(good.as_str())
+            .fetch_all(db)
+            .await
+            .expect("statuses");
+    assert!(
+        statuses
+            .iter()
+            .any(|(id, status)| id == bad.as_str() && status == "quarantined")
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|(id, status)| id == good.as_str() && status == "accepted")
+    );
+}
+
+#[tokio::test]
+async fn rejecting_evidence_outside_the_target_closure_keeps_the_restore_current() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    let contributor = credential(db, "endorsed", "[]", 1.0).await;
+    let bad = add_contribution(db, &contributor, "fujifilm/x-t5", "library", None).await;
+    let good = add_contribution(db, &contributor, "fujifilm/x-t5", "library", None).await;
+    for contribution in [&bad, &good] {
+        sqlx::query("UPDATE contributions SET status = 'accepted' WHERE id = ?")
+            .bind(contribution.as_str())
+            .execute(db)
+            .await
+            .expect("accept contribution");
+    }
+    let family = LookId::new(LOOK_1).expect("family");
+    native_target_with_evidence(&fixture, &family, evidence_dependencies(&[&good])).await;
+
+    let reverted = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        std::slice::from_ref(&bad),
+        "unused bad evidence",
+    )
+    .await
+    .expect("revert");
+    assert_eq!(reverted.restoration, Restoration::Current);
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM look_versions WHERE look = ? AND version = ?")
+            .bind(LOOK_1)
+            .bind(i64::from(reverted.new_version))
+            .fetch_one(db)
+            .await
+            .expect("restored status");
+    assert_eq!(status, admin::VersionStatus::Published.as_str());
+    let mut conn = db.acquire().await.expect("connection");
+    let head = model_store::family_head(&mut conn, &family)
+        .await
+        .expect("head")
+        .expect("head");
+    assert_eq!(head.target.version.get(), reverted.new_version);
+    let new_target = PublishedTargetId {
+        look: family.clone(),
+        version: TargetVersion::new(reverted.new_version).expect("version"),
+    };
+    let eligibility = model_store::target_eligibility(&mut conn, &new_target)
+        .await
+        .expect("eligibility")
+        .expect("carried eligibility");
+    assert_eq!(eligibility.status, TargetEligibilityStatus::Eligible);
+    let bad_status: String = sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
+        .bind(bad.as_str())
+        .fetch_one(db)
+        .await
+        .expect("bad status");
+    assert_eq!(bad_status, "quarantined");
+    let good_status: String = sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
+        .bind(good.as_str())
+        .fetch_one(db)
+        .await
+        .expect("good status");
+    assert_eq!(good_status, "accepted");
+    let refit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM look_refit_requests WHERE look = ?")
+        .bind(LOOK_1)
+        .fetch_one(db)
+        .await
+        .expect("refit request");
+    assert_eq!(refit, 1);
+    let job: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'revert_refit' AND status = 'queued'",
+    )
+    .fetch_one(db)
+    .await
+    .expect("refit job");
+    assert_eq!(job, 1);
+}
+
+#[tokio::test]
+async fn rejecting_a_lut_base_contribution_holds_the_restored_lut_copy() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    let contributor = credential(db, "endorsed", "[]", 1.0).await;
+    let bad = add_contribution(db, &contributor, "fujifilm/x-t5", "library", None).await;
+    sqlx::query("UPDATE contributions SET status = 'accepted' WHERE id = ?")
+        .bind(bad.as_str())
+        .execute(db)
+        .await
+        .expect("accept contribution");
+    let base = PublishedTargetId {
+        look: LookId::new("classic-chrome").expect("base look"),
+        version: TargetVersion::new(1).expect("base version"),
+    };
+    accept_family_version(db, &look("classic-chrome"), 1).await;
+    let base_artifacts = version_artifacts(
+        &fixture.blobs,
+        "classic-chrome",
+        1,
+        1,
+        serde_json::json!({}),
+    );
+    admin::write_version_manifest(
+        db,
+        &look("classic-chrome"),
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &base_artifacts,
+        &[],
+    )
+    .await
+    .expect("base version");
+    let donor = look("donor-lut");
+    let donor_artifacts = lut_version_artifacts(&fixture.blobs, "donor-lut", 1, 1);
+    admin::write_version_manifest(
+        db,
+        &donor,
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &donor_artifacts,
+        &[],
+    )
+    .await
+    .expect("donor version");
+    let mut conn = db.acquire().await.expect("connection");
+    model_store::record_target_eligibility(
+        &mut conn,
+        &TargetEligibility {
+            id: EligibilitySnapshotId::from_digest([0; 32]),
+            target: base.clone(),
+            basis: TargetBasis::NativeFamily,
+            artifacts: Vec::new(),
+            base_pin: None,
+            support_uncertainty_source: None,
+            status: TargetEligibilityStatus::Eligible,
+            reasons: Vec::new(),
+            dependencies: evidence_dependencies(&[&bad]),
+        },
+        0,
+    )
+    .await
+    .expect("base eligibility");
+    model_store::record_target_eligibility(
+        &mut conn,
+        &TargetEligibility {
+            id: EligibilitySnapshotId::from_digest([0; 32]),
+            target: PublishedTargetId {
+                look: LookId::new("donor-lut").expect("look"),
+                version: TargetVersion::new(1).expect("version"),
+            },
+            basis: TargetBasis::LutComposition,
+            artifacts: Vec::new(),
+            base_pin: Some(looklab_schema::BasePin::LookVersion(base)),
+            support_uncertainty_source: None,
+            status: TargetEligibilityStatus::Eligible,
+            reasons: Vec::new(),
+            dependencies: vec![DependencyRef::required(
+                DependencyKind::PublishedTarget,
+                DependencyTarget::published_target(&PublishedTargetId {
+                    look: LookId::new("classic-chrome").expect("base look"),
+                    version: TargetVersion::new(1).expect("base version"),
+                }),
+            )],
+        },
+        0,
+    )
+    .await
+    .expect("donor eligibility");
+
+    let reverted = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &donor,
+        1,
+        std::slice::from_ref(&bad),
+        "bad base evidence",
+    )
+    .await
+    .expect("revert");
+    assert_eq!(
+        reverted.restoration,
+        Restoration::HistoricalNeedsRebuild {
+            reason: RestorationHold::DependencyInvalidated
+        }
+    );
+    let target = PublishedTargetId {
+        look: LookId::new("donor-lut").expect("look"),
+        version: TargetVersion::new(reverted.new_version).expect("version"),
+    };
+    let eligibility = model_store::target_eligibility(&mut conn, &target)
+        .await
+        .expect("eligibility")
+        .expect("held eligibility");
+    assert_eq!(eligibility.status, TargetEligibilityStatus::Invalidated);
+    let refit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM look_refit_requests WHERE look = ?")
+        .bind("donor-lut")
+        .fetch_one(db)
+        .await
+        .expect("refit request");
+    assert_eq!(refit, 1);
+    let job: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'revert_refit' AND status = 'queued'",
+    )
+    .fetch_one(db)
+    .await
+    .expect("refit job");
+    assert_eq!(job, 1);
+}
+
+#[tokio::test]
+async fn invalidated_accepted_versions_are_not_revertible_or_anchorable() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    accept_family_version(db, &look(LOOK_1), 1).await;
+    let artifacts = version_artifacts(&fixture.blobs, LOOK_1, 1, 1, serde_json::json!({}));
+    admin::write_version_manifest(
+        db,
+        &look(LOOK_1),
+        VersionId::new(1),
+        admin::VersionStatus::Published,
+        &artifacts,
+        &[],
+    )
+    .await
+    .expect("version 1");
+    let family = LookId::new(LOOK_1).expect("family");
+    let mut conn = db.acquire().await.expect("connection");
+    model_store::invalidate(
+        &mut conn,
+        &DependencyRef::required(
+            DependencyKind::FamilyVersion,
+            DependencyTarget::family_version(&FamilyTargetId {
+                family: family.clone(),
+                version: TargetVersion::new(1).expect("version"),
+            }),
+        ),
+        InvalidationReason::Withdrawal,
+        10,
+    )
+    .await
+    .expect("revoke family version");
+
+    let error = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        &[],
+        "revoked history",
+    )
+    .await
+    .expect_err("revoked version is not revertible");
+    assert!(matches!(error, AdminError::VersionNotPublished));
+    let error = admin::reanchor(db, actor(&moderator), &look(LOOK_1), 1, "revoked history")
+        .await
+        .expect_err("revoked version is not anchorable");
+    assert!(matches!(error, AdminError::VersionNotPublished));
+    let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM look_versions WHERE look = ?")
+        .bind(LOOK_1)
+        .fetch_one(db)
+        .await
+        .expect("versions");
+    assert_eq!(versions, 1);
+}
+
+#[tokio::test]
+async fn revert_restores_head_metadata_from_the_restored_target() {
+    let fixture = fixture().await;
+    let db = &fixture.db;
+    let moderator = credential(db, "new", "[\"moderator\"]", 0.5).await;
+    let contributor = credential(db, "endorsed", "[]", 1.0).await;
+    let evidence = add_contribution(db, &contributor, "fujifilm/x-t5", "library", None).await;
+    accept_family_version(db, &look(LOOK_1), 1).await;
+    for version in [1, 2] {
+        let artifacts =
+            version_artifacts(&fixture.blobs, LOOK_1, version, 1, serde_json::json!({}));
+        admin::write_version_manifest(
+            db,
+            &look(LOOK_1),
+            VersionId::new(version),
+            admin::VersionStatus::Published,
+            &artifacts,
+            &[],
+        )
+        .await
+        .expect("version");
+    }
+    accept_family_version(db, &look(LOOK_1), 2).await;
+    let family = LookId::new(LOOK_1).expect("family");
+    let subject = SubjectKey::for_family(&family);
+    let mut conn = db.acquire().await.expect("connection");
+    model_store::register_subject(
+        &mut conn,
+        &ModelSubject::SharedFamily {
+            family: family.clone(),
+        },
+        0,
+    )
+    .await
+    .expect("subject");
+    sqlx::query(
+        "INSERT INTO model_family_heads
+         (family, head_version, source_limited, numerical, release_gates, report_id,
+          assessed_generation, applicability, invalidated_reason, updated_at)
+         VALUES (?, 2, 0, 'passed', 'passed', NULL, 7, 'current', NULL, 0)",
+    )
+    .bind(family.as_str())
+    .execute(&mut *conn)
+    .await
+    .expect("head");
+    sqlx::query(
+        "INSERT INTO model_pending_work (subject_key, generation, updated_at) VALUES (?, 9, 0)",
+    )
+    .bind(subject.as_str())
+    .execute(&mut *conn)
+    .await
+    .expect("pending generation");
+    model_store::record_target_eligibility(
+        &mut conn,
+        &TargetEligibility {
+            id: EligibilitySnapshotId::from_digest([0; 32]),
+            target: PublishedTargetId {
+                look: family.clone(),
+                version: TargetVersion::new(1).expect("version"),
+            },
+            basis: TargetBasis::NativeFamily,
+            artifacts: Vec::new(),
+            base_pin: None,
+            support_uncertainty_source: None,
+            status: TargetEligibilityStatus::Eligible,
+            reasons: Vec::new(),
+            dependencies: vec![
+                DependencyRef::required(
+                    DependencyKind::Contribution,
+                    DependencyTarget::contribution(
+                        &ContributionRef::new(evidence.as_str()).expect("contribution"),
+                    ),
+                ),
+                DependencyRef::required(
+                    DependencyKind::Image,
+                    DependencyTarget::image(&ImageRef::new("image-1").expect("image")),
+                ),
+            ],
+        },
+        0,
+    )
+    .await
+    .expect("source eligibility");
+
+    let reverted = admin::revert(
+        db,
+        &fixture.blobs,
+        actor(&moderator),
+        &look(LOOK_1),
+        1,
+        &[],
+        "restore the accepted fit",
+    )
+    .await
+    .expect("revert");
+    assert_eq!(reverted.restoration, Restoration::Current);
+    let head = model_store::family_head(&mut conn, &family)
+        .await
+        .expect("head")
+        .expect("advanced head");
+    assert_eq!(head.target.version.get(), reverted.new_version);
+    assert!(head.source_limited);
+    assert_eq!(head.safety.numerical, SafetyCheck::Passed);
+    assert_eq!(head.safety.release_gates, SafetyCheck::Passed);
+    assert_eq!(head.report, None);
+    let assessed: i64 =
+        sqlx::query_scalar("SELECT assessed_generation FROM model_family_heads WHERE family = ?")
+            .bind(family.as_str())
+            .fetch_one(&mut *conn)
+            .await
+            .expect("assessed generation");
+    assert_eq!(assessed, 9);
+}
+
+fn fence_sources(fitter: &str) -> NumericalSources {
+    NumericalSources {
+        fitter: SourceRef::new(fitter).expect("fitter"),
+        evaluator: SourceRef::new("evaluator@1").expect("evaluator"),
+        model: SourceRef::new("model@1").expect("model"),
+    }
+}
+
+#[tokio::test]
+async fn fenced_worker_proposal_checks_lease_sources_and_accepted_evidence() {
+    let fixture = fixture().await;
+    let sources = fence_sources("fit@1");
+    model_store::sync_active_numerical_sources_fenced(&fixture.db, &sources, 0)
+        .await
+        .expect("sources");
+    let job = JobId::new();
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, payload, status, attempts, run_after, created_at)
+         VALUES (?, 'refit', '{}', 'running', 1, 0, 0)",
+    )
+    .bind(job.as_str())
+    .execute(&fixture.db)
+    .await
+    .expect("job");
+    let body = BodyId::new("fujifilm/x-t5").expect("body");
+    let dependency = DependencyRef::required(
+        DependencyKind::Transform,
+        DependencyTarget::transform(&body, 1),
+    );
+    let family = LookId::new("classic-chrome").expect("family");
+    let target = FamilyTargetId {
+        family,
+        version: TargetVersion::new(1).expect("version"),
+    };
+    let family_dependency = DependencyRef::required(
+        DependencyKind::FamilyVersion,
+        DependencyTarget::family_version(&target),
+    );
+    let dependencies = [dependency.clone(), family_dependency.clone()];
+    let mut conn = fixture.db.acquire().await.expect("connection");
+    let snapshot = model_store::observe_dependency_snapshot(&mut conn, &dependencies, 0)
+        .await
+        .expect("snapshot");
+    drop(conn);
+
+    let proposal = |split_at: &str| WorkerProposal {
+        kind: ProposalKind::EpochSplit,
+        payload: format!(
+            "body: fujifilm/x-t5\nfrom_epoch: 1\nnew_epoch: 2\nsplit_at: {split_at}\n"
+        ),
+        evidence: serde_json::json!({"source": "worker"}),
+    };
+    let lease = JobLease {
+        job: &job,
+        attempts: 1,
+    };
+    assert!(
+        admin::submit_worker_proposal_fenced(
+            &fixture.db,
+            proposal("1.60"),
+            lease,
+            &sources,
+            &dependencies,
+            &snapshot,
+        )
+        .await
+        .expect("valid proposal")
+        .is_some()
+    );
+
+    assert!(matches!(
+        admin::submit_worker_proposal_fenced(
+            &fixture.db,
+            proposal("1.61"),
+            JobLease {
+                job: &job,
+                attempts: 2,
+            },
+            &sources,
+            &dependencies,
+            &snapshot,
+        )
+        .await,
+        Err(AdminError::Conflict)
+    ));
+    assert!(matches!(
+        admin::submit_worker_proposal_fenced(
+            &fixture.db,
+            proposal("1.62"),
+            lease,
+            &fence_sources("fit@2"),
+            &dependencies,
+            &snapshot,
+        )
+        .await,
+        Err(AdminError::Conflict)
+    ));
+
+    let mut conn = fixture.db.acquire().await.expect("connection");
+    let appended = DependencyRef::required(
+        DependencyKind::Image,
+        DependencyTarget::image(&ImageRef::new("image-1").expect("image")),
+    );
+    model_store::observe_dependency_snapshot(&mut conn, &[appended], 2)
+        .await
+        .expect("append");
+    drop(conn);
+    assert!(
+        admin::submit_worker_proposal_fenced(
+            &fixture.db,
+            proposal("1.63"),
+            lease,
+            &sources,
+            &dependencies,
+            &snapshot,
+        )
+        .await
+        .expect("append-only successor")
+        .is_some()
+    );
+
+    let mut conn = fixture.db.acquire().await.expect("connection");
+    model_store::invalidate(
+        &mut conn,
+        &family_dependency,
+        InvalidationReason::EvidenceLoss,
+        3,
+    )
+    .await
+    .expect("invalidate");
+    drop(conn);
+    assert!(matches!(
+        admin::submit_worker_proposal_fenced(
+            &fixture.db,
+            proposal("1.64"),
+            lease,
+            &sources,
+            &dependencies,
+            &snapshot,
+        )
+        .await,
+        Err(AdminError::Conflict)
+    ));
 }

@@ -40,6 +40,25 @@ pub fn validate_slug(value: &str) -> Result<(), IdError> {
     Ok(())
 }
 
+/// Lowercase ASCII letters and digits, with every other run collapsed to one `-`.
+pub fn slug_from_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut previous_dash = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            out.push(character.to_ascii_lowercase());
+            previous_dash = false;
+        } else if !previous_dash && !out.is_empty() {
+            out.push('-');
+            previous_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
 /// Two [`validate_slug`] segments joined by exactly one `/`.
 pub fn validate_body_id(value: &str) -> Result<(), IdError> {
     if value.len() > MAX_BODY_ID_LEN {
@@ -180,3 +199,26 @@ impl EnumValue {
 }
 
 id_type!(MakernoteTag);
+id_type!(SourceId);
+
+/// # Errors
+/// A name that reduces to an empty slug.
+pub fn body_id_from_name(make: &str, model: &str) -> Result<BodyId, IdError> {
+    BodyId::new(&format!(
+        "{}/{}",
+        slug_from_name(make),
+        slug_from_name(model)
+    ))
+}
+
+/// # Errors
+/// A name that reduces to an empty slug.
+pub fn look_id_from_name(name: &str) -> Result<LookId, IdError> {
+    LookId::new(&slug_from_name(name))
+}
+
+/// # Errors
+/// A name that reduces to an empty slug.
+pub fn sim_key_from_name(name: &str) -> Result<SimKey, IdError> {
+    SimKey::new(&slug_from_name(name).replace('-', "_"))
+}

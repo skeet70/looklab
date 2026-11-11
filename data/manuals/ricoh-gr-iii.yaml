@@ -1,0 +1,290 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: ricoh/gr-iii
+  make: Ricoh
+  model: GR III
+  sources:
+  - id: gr-iii-om
+    kind: owner_manual
+    url: https://www.ricoh-imaging.co.jp/english/support/man-pdf/gr-3.pdf
+    title: RICOH GR III Operating Manual
+    firmware_scope: unspecified
+  capabilities:
+  - key: native_simulations
+    label: Image Control
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Standard
+      - Vivid
+      - Monotone
+      - Soft Monotone
+      - Hard Monotone
+      - Hi-Contrast B&W
+      - Positive Film
+      - Bleach Bypass
+      - Retro
+      - HDR Tone
+    citations:
+    - source: gr-iii-om
+      locator: p. 87, Image Control
+    - source: gr-iii-om
+      locator: p. 148, Appendix, Image Control
+  - key: contrast
+    label: Contrast
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: gr-iii-om
+      locator: p. 148, Appendix, Image Control adjustment parameters
+  - key: highlight_tone
+    label: Contrast (Highlight)
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: gr-iii-om
+      locator: p. 148, Appendix, Image Control adjustment parameters
+  - key: shadow_tone
+    label: Contrast (Shadow)
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: gr-iii-om
+      locator: p. 148, Appendix, Image Control adjustment parameters
+  - key: saturation
+    label: Saturation
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: gr-iii-om
+      locator: p. 148, Appendix, Image Control adjustment parameters
+  - key: sharpening
+    label: Sharpness
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: gr-iii-om
+      locator: p. 148, Appendix, Image Control adjustment parameters
+  - key: clarity
+    label: Clarity
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: gr-iii-om
+      locator: p. 148, Appendix, Image Control adjustment parameters
+  - key: grain
+    label: Grain Effect
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: gr-iii-om
+      locator: p. 148, Appendix, Image Control adjustment parameters
+  - key: monochrome_toning
+    label: Toning
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: gr-iii-om
+      locator: p. 148, Appendix, Image Control adjustment parameters
+  - key: white_balance_presets
+    label: White Balance
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Auto White Balance
+      - Multi Auto White Balance
+      - Daylight
+      - Shade
+      - Cloudy
+      - Fl. - Daylight Color
+      - Fl. - Daylight White
+      - Fl. - Cool White
+      - Fl. - Warm White
+      - Tungsten
+      - CTE
+      - Manual White Balance
+      - Color Temperature
+    citations:
+    - source: gr-iii-om
+      locator: p. 69, Setting the White Balance
+    - source: gr-iii-om
+      locator: p. 148, Appendix, White Balance
+  - key: white_balance_shift
+    label: Fine Adjustment
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: gr-iii-om
+      locator: p. 70, step 4 "Use abcd to fine-tune the color"
+    - source: gr-iii-om
+      locator: p. 148, Appendix, Fine Adjustment
+  - key: color_temperature
+    label: Color Temperature
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: 2500
+      max: 10000
+      step: 10
+    citations:
+    - source: gr-iii-om
+      locator: p. 73, Color Temperature
+  - key: dynamic_range
+    label: D-Range Correction
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - 'Highlight Correction: Auto'
+      - 'Highlight Correction: On'
+      - 'Highlight Correction: Off'
+      - 'Shadow Correction: Auto'
+      - 'Shadow Correction: Low'
+      - 'Shadow Correction: Medium'
+      - 'Shadow Correction: High'
+      - 'Shadow Correction: Off'
+    citations:
+    - source: gr-iii-om
+      locator: p. 89, Correcting a Range of Tones (D-Range Correction)
+    - source: gr-iii-om
+      locator: p. 28, A6 menu list, D-Range Correction
+  - key: noise_reduction
+    label: High-ISO Noise Reduction
+    category: spatial
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Auto
+      - Low
+      - Medium
+      - High
+      - Custom
+      - 'Off'
+    citations:
+    - source: gr-iii-om
+      locator: p. 28, A6 menu list, Noise Reduction
+    - source: gr-iii-om
+      locator: p. 68, High-ISO Noise Reduction
+  - key: exposure_compensation
+    label: Exposure Compensation
+    category: rendering
+    availability: available
+    domain:
+      type: rational
+      min: '-5.0'
+      max: '+5.0'
+      step: 1/3
+    citations:
+    - source: gr-iii-om
+      locator: p. 53, Using Exposure Compensation
+    - source: gr-iii-om
+      locator: p. 148, Appendix, EV Compensation
+  - key: raw_capture
+    label: File Format [RAW]
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: gr-iii-om
+      locator: p. 84, Image Capture Settings, File Format
+  - key: jpeg_capture
+    label: File Format [JPEG]
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: gr-iii-om
+      locator: p. 84, Image Capture Settings, File Format
+  - key: raw_jpeg_simultaneous
+    label: File Format [RAW+JPEG]
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: gr-iii-om
+      locator: p. 84, Image Capture Settings, File Format
+  - key: heif_capture
+    label: File Format
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: gr-iii-om
+      locator: p. 84, Image Capture Settings, File Format
+  - key: raw_bit_depth
+    label: RAW
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - '14'
+    citations:
+    - source: gr-iii-om
+      locator: p. 147, Appendix, File Format (Still Image)
+  - key: jpeg_color_spaces
+    label: Color Space
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - AdobeRGB
+    citations:
+    - source: gr-iii-om
+      locator: p. 84, Image Capture Settings, Color Space
+  - key: in_camera_raw_conversion
+    label: RAW Development
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: gr-iii-om
+      locator: p. 100, Developing RAW Images (C2 menu)
+  notes:
+  - Image Control is not applied to RAW images; it can be applied during [RAW Development] of the C2 menu (p. 88, p. 100).
+  - '[Soft Monotone] and [HDR Tone] cannot be selected in movie mode; the movie Image Control list omits both (p. 88, p. 31).'
+  - Image Control provides two registrable settings, Custom1 and Custom2 (p. 87).
+  - Image Control also exposes Hue, High/Low Key Adjustment, Shading, Filter Effect and HDR Tone Level (p. 148); no registry key exists for them and the manual states no numeric ranges for any Image Control parameter.
+  - Toning is listed as an Image Control parameter (p. 148) but the manual does not enumerate its option labels.
+  - White Balance has no dedicated Flash preset; with flash the manual requires Auto White Balance, Multi Auto White Balance or Manual White Balance (p. 71).
+  - White Balance fine adjustment is ±14 steps on the A-B and G-M axes (p. 148).
+  - Color Temperature is settable from 2500 to 10000 K in increments of 10 K (p. 73).
+  - Exposure compensation is ±2.0 EV in movie mode (p. 53, p. 148).
+  - '[D-Range Correction] has two independent sub-controls, [Highlight Correction] and [Shadow Correction]; the enum values carry the sub-control name (p. 89).'
+  - '[Highlight Correction] has no effect below ISO 200; [Shadow Correction] set to [High] may make noise noticeable (p. 89).'
+  - The File Format menu on p. 84 lists JPEG, RAW (DNG) and RAW+JPEG; HEIF is not listed.
+  - No JPEG quality option is documented; JPEG Recorded Pixels offers L, M, S and XS (p. 84).

@@ -113,6 +113,71 @@ fn decodes_tone_and_detail_tags() {
         look.color_chrome_fx_blue.expect("ColorChromeFXBlue").value,
         Some(EffectStrength::Weak)
     );
+    let warm_cool = look.bw_adjustment.expect("BWAdjustment");
+    assert_eq!(warm_cool.tag, FujiTag::BwAdjustment);
+    assert_eq!(warm_cool.raw, 7);
+    assert_eq!(warm_cool.value.expect("warm/cool").steps(), 7);
+    let magenta_green = look.bw_magenta_green.expect("BWMagentaGreen");
+    assert_eq!(magenta_green.tag, FujiTag::BwMagentaGreen);
+    assert_eq!(magenta_green.raw, -3);
+    assert_eq!(magenta_green.value.expect("magenta/green").steps(), -3);
+}
+
+#[test]
+fn decodes_wc_mg_stored_as_unsigned_bytes() {
+    let makernote = support::build_makernote(&[
+        (0x1049, support::FujiValue::Byte(0)),
+        (0x104b, support::FujiValue::Byte(0)),
+    ]);
+    let tiff = support::build_tiff(&[], &[(0x927c, support::Value::Undefined(makernote))], None);
+    let look = parse_tiff(&tiff)
+        .expect("synthetic TIFF")
+        .fuji
+        .expect("Fujifilm makernote")
+        .look;
+    assert_eq!(
+        look.bw_adjustment
+            .expect("BWAdjustment")
+            .value
+            .expect("warm/cool")
+            .steps(),
+        0
+    );
+    assert_eq!(
+        look.bw_magenta_green
+            .expect("BWMagentaGreen")
+            .value
+            .expect("magenta/green")
+            .steps(),
+        0
+    );
+
+    let makernote = support::build_makernote(&[
+        (0x1049, support::FujiValue::Byte(0xff)),
+        (0x104b, support::FujiValue::Byte(0xfe)),
+    ]);
+    let tiff = support::build_tiff(&[], &[(0x927c, support::Value::Undefined(makernote))], None);
+    let look = parse_tiff(&tiff)
+        .expect("synthetic TIFF")
+        .fuji
+        .expect("Fujifilm makernote")
+        .look;
+    assert_eq!(
+        look.bw_adjustment
+            .expect("BWAdjustment")
+            .value
+            .expect("warm/cool")
+            .steps(),
+        -1
+    );
+    assert_eq!(
+        look.bw_magenta_green
+            .expect("BWMagentaGreen")
+            .value
+            .expect("magenta/green")
+            .steps(),
+        -2
+    );
 }
 
 #[test]

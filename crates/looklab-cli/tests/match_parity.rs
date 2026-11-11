@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 use assert_cmd::Command;
-use looklab_match::synth;
+use looklab_match::{ScoringMetric, synth};
 use looklab_model::LookDocument;
 use looklab_model::realization::encode_crm;
+use looklab_schema::OutputEncoding;
 use looklab_wasm::match_api::SourceNames;
 use looklab_wasm::{
     MatchInputs, MatchRequest, SimInputs, SimSources, decode_match_reply, encode_match_request,
@@ -188,7 +189,7 @@ fn run_match_cli(fixture: &Fixture, permalink: &Path) -> String {
         .arg(&fixture.transform)
         .arg("--permalink")
         .arg(permalink)
-        .args(["--seed", "7"])
+        .args(["--seed", "7", "--realization-version", "1"])
         .output()
         .expect("run");
     let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
@@ -213,6 +214,11 @@ fn browser_inputs(fixture: &Fixture) -> MatchInputs {
                 crm: Some("crm.json".to_owned()),
                 covariance: None,
             },
+            realization_version: None,
+            params: None,
+            realization_params: None,
+            wb_mode: None,
+            firmware: None,
         }],
         excluded: Vec::new(),
         body_yaml: std::fs::read_to_string(&fixture.body).expect("body schema"),
@@ -220,7 +226,7 @@ fn browser_inputs(fixture: &Fixture) -> MatchInputs {
         emphasis: "balanced".to_owned(),
         epoch: 1,
         input_transform_version: 1,
-        realization_version: 0,
+        realization_version: 1,
         seed: 7,
         sources: SourceNames {
             target_look: Some("target.looklab".to_owned()),
@@ -228,6 +234,9 @@ fn browser_inputs(fixture: &Fixture) -> MatchInputs {
             transform: Some("transform.yaml".to_owned()),
         },
         calibration: looklab_match::Calibration::default(),
+        selection: None,
+        metric: ScoringMetric::RenderedPostClipV1,
+        output_encoding: Some(OutputEncoding::Srgb),
     }
 }
 

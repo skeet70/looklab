@@ -48,6 +48,10 @@ pub fn site_url(path: &str) -> String {
     join(public_prefix(), path)
 }
 
+pub(crate) fn query_component(value: &str) -> String {
+    js_sys::encode_uri_component(value).into()
+}
+
 /// An absolute URL for an API path.
 pub fn api_url(path: &str) -> String {
     match server() {

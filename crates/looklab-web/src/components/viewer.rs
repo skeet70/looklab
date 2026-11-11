@@ -436,6 +436,8 @@ pub struct LookCardItem {
     pub origin: LookOrigin,
     pub character: String,
     pub status: LookStatus,
+    pub scope: looklab_publish::SelectionScope,
+    pub blockers: Vec<String>,
     pub lut: Option<Arc<Vec<u8>>>,
 }
 
@@ -524,6 +526,8 @@ pub fn LookCard(
                 <strong>{name}</strong>
                 <span>{origin}</span>
                 <super::Badge status=item.status/>
+                <span class="muted">{crate::data::selection_scope_label(item.scope)}</span>
+                {item.blockers.first().map(|blocker| view! { <span class="muted">{blocker.clone()}</span> })}
                 <span>{character}</span>
                 <span class="muted">"Simulated"</span>
             </button>

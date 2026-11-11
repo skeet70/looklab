@@ -1,0 +1,382 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: fujifilm/x-t3
+  make: Fujifilm
+  model: X-T3
+  sources:
+  - id: fuji-x-t3-manual
+    kind: owner_manual
+    url: https://fujifilm-dsc.com/en/manual/x-t3/
+    title: FUJIFILM X-T3 Owner’s Manual
+    edition: online manual; no document code printed on the index page
+    firmware_scope: unspecified
+  - id: fuji-x-t3-firmware
+    kind: firmware_notes
+    url: https://www.fujifilm-x.com/en-us/support/download/firmware/cameras/x-t3/
+    title: X-T3 Firmware update
+    edition: firmware notes page, last updated 03.28.2024
+    firmware_scope: latest listed Ver.5.11
+  capabilities:
+  - key: native_simulations
+    label: FILM SIMULATION
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - PROVIA/STANDARD
+      - Velvia/VIVID
+      - ASTIA/SOFT
+      - CLASSIC CHROME
+      - PRO Neg. Hi
+      - PRO Neg. Std
+      - ETERNA/CINEMA
+      - ACROS
+      - ACROS+Ye FILTER
+      - ACROS+R FILTER
+      - ACROS+G FILTER
+      - MONOCHROME
+      - MONOCHROME+Ye FILTER
+      - MONOCHROME+R FILTER
+      - MONOCHROME+G FILTER
+      - SEPIA
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > FILM SIMULATION
+    notes: The ACROS and MONOCHROME entries document yellow (Ye), red (R) and green (G) filter variants.
+  - key: white_balance_presets
+    label: WHITE BALANCE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - k/l/m (Measure a value for white balance.)
+      - k (Choose a color temperature.)
+      - i (For subjects in direct sunlight.)
+      - j (For subjects in the shade.)
+      - k (Use under “daylight” fluorescent lights.)
+      - l (Use under “warm white” fluorescent lights.)
+      - m (Use under “cool white” fluorescent lights.)
+      - n (Use under incandescent lighting.)
+      - g (Reduces the blue cast typically associated with underwater lighting.)
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > WHITE BALANCE
+    notes: The manual prints these options as icon glyphs with descriptions; no text option names are printed.
+  - key: white_balance_shift
+    label: WHITE BALANCE (fine-tuning)
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: R
+        min: -9
+        max: 9
+        step: 1
+      - label: B
+        min: -9
+        max: 9
+        step: 1
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > WHITE BALANCE > Fine-Tuning White Balance (figure osd_mn_sm_wb_shift_en.png)
+    notes: Two-axis R/B fine-tuning with a numeric readout; the dialog figure shows a 19-position grid per axis, i.e. -9 to +9 in steps of 1.
+  - key: color_temperature
+    label: WHITE BALANCE > COLOR TEMPERATURE
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > WHITE BALANCE > Color Temperature
+    notes: Kelvin, adjusted in 10 K increments; the manual states no numeric minimum or maximum in text (the range appears only in the selection dialog).
+  - key: exposure_compensation
+    label: EXPOSURE COMPENSATION
+    category: rendering
+    availability: available
+    domain:
+      type: rational
+      min: '-5'
+      max: '+5'
+      step: 1/3
+    citations:
+    - source: fuji-x-t3-manual
+      locator: Specifications > Exposure compensation
+    - source: fuji-x-t3-manual
+      locator: Exposure Compensation
+    notes: Still pictures -5 to +5 EV in 1/3 EV increments, movies -2 to +2 EV, per the Specifications page; the exposure page states the amount available varies with the shooting mode. Reached with the exposure dial at C, adjusted with the front command dial.
+  - key: dynamic_range
+    label: DYNAMIC RANGE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - 100%
+      - 200%
+      - 400%
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > DYNAMIC RANGE
+    notes: 200% requires ISO 320-12800; 400% requires ISO 640-12800. AUTO selects 100% or 200%.
+  - key: dynamic_range_priority
+    label: D RANGE PRIORITY
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - STRONG
+      - WEAK
+      - 'OFF'
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > D RANGE PRIORITY
+    notes: WEAK requires ISO 320-12800; STRONG requires ISO 640-12800. Any setting other than OFF overrides HIGHLIGHT TONE, SHADOW TONE and DYNAMIC RANGE.
+  - key: highlight_tone
+    label: HIGHLIGHT TONE
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -2
+      max: 4
+      step: 1
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > HIGHLIGHT TONE
+    notes: Separate item on this model; the manual lists no combined TONE CURVE item.
+  - key: shadow_tone
+    label: SHADOW TONE
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -2
+      max: 4
+      step: 1
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > SHADOW TONE
+    notes: Separate item on this model; the manual lists no combined TONE CURVE item.
+  - key: saturation
+    label: COLOR
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > COLOR
+  - key: monochrome_toning
+    label: B & W ADJ. (Warm/Cool)
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: Warm/Cool
+        min: -9
+        max: 9
+        step: 1
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > B & W ADJ. (Warm/Cool)
+    notes: Single warm/cool adjustment applied to ACROS and MONOCHROME; positive values are redder, negative values bluer.
+  - key: creative_filters
+    label: ADVANCED FILTERS
+    category: mixed
+    availability: available
+    domain:
+      type: enum
+      values:
+      - TOY CAMERA
+      - MINIATURE
+      - POP COLOR
+      - HIGH-KEY
+      - LOW-KEY
+      - DYNAMIC TONE
+      - SOFT FOCUS
+      - PARTIAL COLOR (RED)
+      - PARTIAL COLOR (ORANGE)
+      - PARTIAL COLOR (YELLOW)
+      - PARTIAL COLOR (GREEN)
+      - PARTIAL COLOR (BLUE)
+      - PARTIAL COLOR (PURPLE)
+    citations:
+    - source: fuji-x-t3-manual
+      locator: SHOOTING SETTING > DRIVE SETTING > ADV. FILTER SETTING
+    notes: Available only in the drive mode that selects a filter.
+  - key: sharpening
+    label: SHARPNESS
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > SHARPNESS
+  - key: noise_reduction
+    label: NOISE REDUCTION
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > NOISE REDUCTION
+    notes: Menu item is labelled NOISE REDUCTION on this model.
+  - key: clarity
+    label: CLARITY
+    category: spatial
+    availability: not_documented
+    domain:
+      type: unspecified
+    notes: Not listed in this model’s IMAGE QUALITY SETTING menu.
+  - key: grain
+    label: GRAIN EFFECT (ROUGHNESS)
+    category: spatial
+    availability: available
+    domain:
+      type: enum
+      values:
+      - STRONG
+      - WEAK
+      - 'OFF'
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > GRAIN EFFECT
+    notes: Single GRAIN EFFECT amount on this model; no separate SIZE item is documented.
+  - key: grain_size
+    label: GRAIN EFFECT (SIZE)
+    category: spatial
+    availability: not_documented
+    domain:
+      type: unspecified
+    notes: No GRAIN EFFECT SIZE item is documented on this model.
+  - key: color_chrome_effect
+    label: COLOR CHROME EFFECT
+    category: unknown
+    availability: available
+    domain:
+      type: enum
+      values:
+      - STRONG
+      - WEAK
+      - 'OFF'
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > COLOR CHROME EFFECT
+    notes: Affects the rendering of highly saturated colours such as reds, yellows and greens.
+  - key: color_chrome_fx_blue
+    label: COLOR CHROME FX BLUE
+    category: unknown
+    availability: not_documented
+    domain:
+      type: unspecified
+    notes: Affects the rendering of blues.
+  - key: smooth_skin_effect
+    label: SMOOTH SKIN EFFECT
+    category: spatial
+    availability: not_documented
+    domain:
+      type: unspecified
+    notes: Not listed in this model’s IMAGE QUALITY SETTING menu.
+  - key: raw_capture
+    label: RAW
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > IMAGE QUALITY
+    notes: RAW RECORDING offers UNCOMPRESSED, LOSSLESS COMPRESSED. Specifications list JPEG, RAW.
+  - key: raw_bit_depth
+    label: RAW BIT DEPTH
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: fuji-x-t3-manual
+      locator: Specifications
+    notes: The Specifications page states no RAW bit depth.
+  - key: jpeg_capture
+    label: JPEG
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > IMAGE QUALITY
+  - key: raw_jpeg_simultaneous
+    label: IMAGE QUALITY (RAW + JPEG)
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > IMAGE QUALITY
+    notes: FINE+RAW and NORMAL+RAW record RAW and JPEG (or HEIF) together.
+  - key: heif_capture
+    label: SELECT JPEG/HEIF
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    notes: No SELECT JPEG/HEIF item in this model’s IMAGE QUALITY SETTING menu.
+  - key: jpeg_quality
+    label: IMAGE QUALITY
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - FINE
+      - NORMAL
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > IMAGE QUALITY
+    notes: FINE+RAW, NORMAL+RAW and RAW are also selectable.
+  - key: jpeg_color_spaces
+    label: COLOR SPACE
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - Adobe RGB
+    citations:
+    - source: fuji-x-t3-manual
+      locator: IMAGE QUALITY SETTING > COLOR SPACE
+  - key: in_camera_raw_conversion
+    label: RAW CONVERSION
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: fuji-x-t3-manual
+      locator: Playback menu > RAW CONVERSION
+    notes: Converts recorded RAW files in-camera; some settings are unavailable depending on the capture.

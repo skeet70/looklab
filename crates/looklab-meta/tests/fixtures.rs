@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+#![allow(clippy::disallowed_methods)]
 mod support;
 
 use std::path::{Path, PathBuf};
@@ -6,8 +7,6 @@ use std::path::{Path, PathBuf};
 use looklab_meta::{DynamicRange, FilmMode, RemovedField, WhiteBalanceMode};
 
 #[test]
-// Fixture tests read the local tree and never build for wasm32.
-#[allow(clippy::disallowed_methods)]
 fn fixtures_parse_and_sanitize() {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
     if !directory.is_dir() {

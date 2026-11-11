@@ -335,8 +335,7 @@ pub(crate) fn probe_uncertainty(
         }
         column
     });
-    let apply_prior = |z: &[f64]| -> Vec<f64> {
-        let mut out = crate::fit::identity_apply(layout, block, z);
+    let add_quadratic_priors = |out: &mut [f64], z: &[f64]| {
         for i in 0..n {
             let global = block.params[i];
             out[i] += priors[global] * z[global];
@@ -344,6 +343,15 @@ pub(crate) fn probe_uncertainty(
                 out[i] += penalty[i * n + j] * z[block.params[j]];
             }
         }
+    };
+    let apply_prior = |z: &[f64]| -> Vec<f64> {
+        let mut out = crate::fit::identity_apply(layout, block, z);
+        add_quadratic_priors(&mut out, z);
+        out
+    };
+    let apply_prior_gradient = |z: &[f64]| -> Vec<f64> {
+        let mut out = crate::fit::identity_gradient(layout, block, z);
+        add_quadratic_priors(&mut out, z);
         out
     };
     let penalty_spans = options.prior_floor.then(|| PenaltySpans::new(penalty, n));
@@ -368,7 +376,7 @@ pub(crate) fn probe_uncertainty(
         }
         out
     };
-    let applied_theta = apply_prior(&params.theta);
+    let applied_theta = apply_prior_gradient(&params.theta);
     let applied_k = z_clip.as_ref().map(|column| apply_prior(column));
 
     let (_, beta_slope) = problem.look_and_slope(params);

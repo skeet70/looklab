@@ -10,7 +10,19 @@ use looklab_model::Look;
 use crate::types::ExposureModeId;
 
 /// WB mode class id.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct WbModeClass(pub u32);
 
 /// One designated body fixes `ξ = 0` in its default mode and `ω = 1` in its

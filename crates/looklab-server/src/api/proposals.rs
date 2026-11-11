@@ -13,7 +13,8 @@ use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use looklab_schema::{
-    FixtureDonation, FixtureUpload, LabeledTag, ProposalKind, Sha256Hex, split_fixture_upload,
+    FixtureDonation, FixtureUpload, LabeledTag, ProposalKind, ProposalSigningBody, Sha256Hex,
+    split_fixture_upload,
 };
 use looklab_upload::{Challenge, POW_K, PowSolutions};
 use serde::{Deserialize, Serialize};
@@ -22,7 +23,7 @@ use serde_json::Value;
 use crate::api::auth;
 use crate::blob::BlobHash;
 use crate::error::{ApiError, ApiResult, ErrorCode};
-use crate::ids::ProposalId;
+use crate::ids::{BlobAttemptId, ProposalId};
 use crate::proposals::{
     MessageAuthor, ModProposal, ProposalError, ProposalMessage, SnapshotRecord, Submission,
 };
@@ -34,28 +35,25 @@ use crate::verify::{RequestDomain, SignedRequestPayload, request_digest};
 impl From<ProposalError> for ApiError {
     fn from(error: ProposalError) -> Self {
         let code = match error {
-            ProposalError::Database(_) | ProposalError::Corrupt => ErrorCode::Internal,
+            ProposalError::Database(_) | ProposalError::Corrupt | ProposalError::Storage(_) => {
+                ErrorCode::Internal
+            }
             ProposalError::Admin(admin) => return admin.into(),
             ProposalError::InvalidPayload(_) | ProposalError::InvalidFixture(_) => {
                 ErrorCode::SchemaInvalid
             }
             ProposalError::UnknownProposal => ErrorCode::NotFound,
+            ProposalError::Blocked => ErrorCode::CredentialBlocked,
             ProposalError::Closed => ErrorCode::Conflict,
-            ProposalError::RoundTripTimeout => ErrorCode::RequestTimeout,
+            // The nonce is spent by now; a 408 makes HTTP/1.1 clients resend the request.
+            ProposalError::RoundTripTimeout => ErrorCode::SimulationTimeout,
             ProposalError::RoundTrip(_) | ProposalError::Snapshot(_) => ErrorCode::SchemaInvalid,
         };
         Self::new(code)
     }
 }
 
-#[derive(Serialize)]
-struct SubmitSigningBody<'a> {
-    kind: ProposalKind,
-    payload: &'a str,
-    fixtures: &'a [FixtureDonation],
-}
-
-/// Signs the canonical JSON of `{kind, payload, fixtures}` under `proposal`.
+/// The JSON header of a proposal submission.
 #[derive(Deserialize)]
 pub struct SubmitRequest {
     kind: String,
@@ -76,7 +74,7 @@ pub async fn submit(
         .kind
         .parse::<ProposalKind>()
         .map_err(|_| ApiError::new(ErrorCode::SchemaInvalid))?;
-    let bytes = signing_bytes(&SubmitSigningBody {
+    let bytes = signing_bytes(&ProposalSigningBody {
         kind,
         payload: &payload.payload,
         fixtures: &payload.fixtures,
@@ -99,6 +97,57 @@ pub async fn submit(
             kind,
             payload: payload.payload,
             fixtures: payload.fixtures,
+            lut: None,
+        },
+    )
+    .await?;
+    Ok((axum::http::StatusCode::CREATED, Json(submitted)).into_response())
+}
+
+pub async fn submit_lut(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult<Response> {
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some("application/octet-stream")
+    {
+        return Err(ApiError::new(ErrorCode::UnsupportedMediaType));
+    }
+    let (header_bytes, file_bytes) = looklab_schema::split_lut_proposal(&body)
+        .map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
+    let payload: SubmitRequest = serde_json::from_slice(header_bytes)
+        .map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
+    let kind = payload
+        .kind
+        .parse::<ProposalKind>()
+        .map_err(|_| ApiError::new(ErrorCode::SchemaInvalid))?;
+    let bytes = signing_bytes(&ProposalSigningBody {
+        kind,
+        payload: &payload.payload,
+        fixtures: &payload.fixtures,
+    })?;
+    let credential = auth::authenticate(
+        &state,
+        &payload.signed,
+        RequestDomain::Proposal,
+        &bytes,
+        Action::Proposal,
+    )
+    .await?;
+    let (_, nonce) = payload.signed.decode()?;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Proposal, &bytes));
+    verify_pow(&state, &credential, challenge, &payload.pow).await?;
+    let submitted = crate::proposals::submit(
+        &state,
+        &credential,
+        Submission {
+            kind,
+            payload: payload.payload,
+            fixtures: payload.fixtures,
+            lut: Some(file_bytes.to_vec()),
         },
     )
     .await?;
@@ -193,6 +242,15 @@ pub async fn proposal(
 ) -> ApiResult<Response> {
     let proposal = ProposalId::try_from(id).map_err(|_| ApiError::new(ErrorCode::NotFound))?;
     let view = crate::proposals::view(&state.db, &proposal).await?;
+    Ok(Json(view).into_response())
+}
+
+pub async fn detail(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let proposal = ProposalId::try_from(id).map_err(|_| ApiError::new(ErrorCode::NotFound))?;
+    let view = crate::proposals::detail(&state.db, &proposal).await?;
     Ok(Json(view).into_response())
 }
 
@@ -336,24 +394,50 @@ pub async fn donate_fixture(
     }
     let offset = body.len() - file_bytes.len();
     let payload = body.slice(offset..);
-    let store = state.blobs.clone();
-    tokio::task::spawn_blocking(move || store.put(hash, &payload))
-        .await
-        .map_err(|_| ApiError::new(ErrorCode::Internal))?
-        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
-    sqlx::query(
-        "INSERT INTO fixture_uploads (sha256, credential_id, file, size, created_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (sha256, credential_id)
-         DO UPDATE SET file = excluded.file, size = excluded.size",
+    let attempt = BlobAttemptId::new();
+    let hashes = [*hash.as_bytes()];
+    crate::store::stage_blobs(
+        &state.db,
+        &attempt,
+        &hashes,
+        crate::db::now_unix() + crate::store::STAGED_TTL_SECONDS,
     )
-    .bind(hash.as_bytes().as_slice())
-    .bind(credential.as_str())
-    .bind(&upload.file)
-    .bind(i64::try_from(upload.size).map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?)
-    .bind(crate::db::now_unix())
-    .execute(&state.db)
     .await?;
+    let published = async {
+        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+        if crate::store::intake_blocked_conn(&mut tx, &credential).await? {
+            return Err(ApiError::new(ErrorCode::CredentialBlocked));
+        }
+        if !crate::store::reservation_live(&mut tx, &attempt, 1).await? {
+            return Err(ApiError::new(ErrorCode::Busy));
+        }
+        let store = state.blobs.clone();
+        let payload = payload.clone();
+        let (mut tx, ()) = crate::blob::write_guarded(tx, move || ((), store.put(hash, &payload)))
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+        sqlx::query(
+            "INSERT INTO fixture_uploads (sha256, credential_id, file, size, created_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT (sha256, credential_id)
+             DO UPDATE SET file = excluded.file, size = excluded.size",
+        )
+        .bind(hash.as_bytes().as_slice())
+        .bind(credential.as_str())
+        .bind(&upload.file)
+        .bind(i64::try_from(upload.size).map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?)
+        .bind(crate::db::now_unix())
+        .execute(&mut *tx)
+        .await?;
+        crate::store::clear_staged(&mut tx, &attempt).await?;
+        tx.commit().await?;
+        Ok::<(), ApiError>(())
+    }
+    .await;
+    if let Err(error) = published {
+        let _ = crate::store::abandon_staged(&state.db, &attempt).await;
+        return Err(error);
+    }
     Ok((
         StatusCode::CREATED,
         Json(DonateResponse {

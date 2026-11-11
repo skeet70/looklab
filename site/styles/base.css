@@ -1,6 +1,6 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-html { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.55; background: var(--paper); color: var(--ink); font-size: var(--text-body); }
+html { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.55; background: var(--paper); color: var(--ink); font-size: var(--text-body); scrollbar-gutter: stable; }
 body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; }
 a { color: var(--accent); text-underline-offset: .2em; }
 :focus-visible { outline: var(--focus-ring); outline-offset: 3px; }
@@ -12,7 +12,9 @@ button:disabled { color: var(--muted); cursor: not-allowed; }
 .button-primary { background: var(--accent); color: var(--accent-ink); }
 input[type=search], textarea { width: min(34rem, 100%); }
 label { display: block; font-weight: 600; margin-block: .8rem .3rem; }
-main { width: min(78rem, 100%); margin-inline: auto; padding: clamp(1rem, 3vw, 2.5rem); flex: 1; min-width: 0; }
+label:has(> input[type=checkbox]), label:has(> input[type=radio]) { display: flex; align-items: center; gap: .45rem; }
+input[type=checkbox], input[type=radio] { flex: 0 0 auto; width: auto; padding: 0; border: 0; border-radius: 0; background: transparent; }
+main { width: min(var(--shell-max), 100%); margin-inline: auto; padding: var(--shell-gutter); flex: 1; min-width: 0; }
 main:focus { outline: none; }
 h1, h2, h3 { line-height: 1.2; text-wrap: balance; }
 h1 { font-size: var(--text-title); margin-top: 0; letter-spacing: -.035em; }
@@ -22,20 +24,21 @@ p { max-width: 70ch; }
 .muted, .timing { color: var(--muted); }
 figure { margin: 0; min-width: 0; }
 img, canvas, svg { max-width: 100%; }
-code, dd, td, th { overflow-wrap: anywhere; }
+code, dd, td, th, [role=status], [role=alert] { overflow-wrap: anywhere; }
 pre { overflow: auto; max-width: 100%; }
 .prose { max-width: 70ch; }
 ul, ol { padding-left: 1.3rem; }
 .skip-link { position: absolute; left: -9999px; top: .5rem; background: var(--panel); padding: .5rem 1rem; z-index: 20; }
 .skip-link:focus { left: .5rem; }
-.site-header { display: flex; align-items: center; gap: 2rem; padding: 1rem clamp(1rem, 4vw, 3rem); border-bottom: 1px solid var(--line); background: var(--paper); }
+.visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.site-header { display: flex; align-items: center; gap: 2rem; padding: 1rem var(--shell-inline); border-bottom: 1px solid var(--line); background: var(--paper); }
 .brand { font-weight: 800; font-size: 1.5rem; letter-spacing: -.06em; text-decoration: none; color: var(--ink); }
 .site-header nav { display: flex; align-items: center; gap: 1.6rem; }
 .site-header nav a { color: var(--ink); text-decoration: none; font-size: .95rem; }
 .site-header nav a[aria-current=page] { text-decoration: underline; text-underline-offset: .45em; }
 .header-account { margin-left: auto; }
 .menu-toggle { display: none; }
-.site-footer { border-top: 1px solid var(--line); padding: 1.5rem clamp(1rem, 4vw, 3rem); color: var(--muted); font-size: var(--text-small); }
+.site-footer { border-top: 1px solid var(--line); padding: 1.5rem var(--shell-inline); color: var(--muted); font-size: var(--text-small); }
 .site-footer nav { display: flex; flex-wrap: wrap; gap: 1rem 1.5rem; }
 .site-footer a { color: var(--muted); }
 .preview-banner { display: flex; align-items: center; justify-content: center; gap: 1rem; padding: .35rem 1rem; font-size: var(--text-small); background: var(--notice); }
@@ -55,7 +58,7 @@ ul, ol { padding-left: 1.3rem; }
 .pattern-page canvas { max-width: 100vw; max-height: 100vh; object-fit: contain; }
 .pattern-page .error { position: fixed; inset-block-end: 1rem; inset-inline: 1rem; background: #000000; }
 @media (max-width: 44rem) {
-  .site-header { gap: .75rem; flex-wrap: wrap; padding: .8rem 1rem; }
+  .site-header { gap: .75rem; flex-wrap: wrap; padding: .8rem var(--shell-gutter); }
   .menu-toggle { display: inline-block; }
   .header-account { margin-left: auto; }
   .site-header nav { display: none; flex-basis: 100%; order: 3; gap: .5rem; }

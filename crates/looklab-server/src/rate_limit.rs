@@ -34,6 +34,7 @@ pub enum RateKey {
     PublicRead,
     GlobalUpload,
     GlobalSigned,
+    ClientError,
     Assertion { action: Action, id: RawCredentialId },
 }
 
@@ -59,6 +60,10 @@ impl RateKey {
             Self::PublicRead => Quota {
                 capacity: 120.0,
                 refill_per_second: 8.0,
+            },
+            Self::ClientError => Quota {
+                capacity: 60.0,
+                refill_per_second: 1.0,
             },
             Self::Assertion { action, .. } => match action {
                 Action::Upload => Quota {
@@ -118,6 +123,7 @@ impl core::fmt::Display for RateKey {
             Self::PublicRead => f.write_str("public-read"),
             Self::GlobalUpload => f.write_str("upload"),
             Self::GlobalSigned => f.write_str("signed"),
+            Self::ClientError => f.write_str("client-errors"),
             Self::Assertion { action: a, id } => {
                 let digest = sha2::Sha256::digest(id.as_slice());
                 write!(f, "{}:assertion:{}", action(*a), hex(&digest[..8]))

@@ -20,7 +20,7 @@
 .developer-tool textarea { display: block; width: 100%; box-sizing: border-box; margin-block: .5rem 1rem; resize: vertical; font: inherit; }
 .developer-tool .inspection-result { margin-top: 1rem; }
 .developer-tool .inspection-result h3 { margin-top: 0; }
-.developer-prose { max-width: 50rem; margin-inline: auto; }
+.developer-prose { max-width: 50rem; }
 .developer-prose section { max-width: 70ch; }
 .developer-definition-list { display: grid; grid-template-columns: 12rem 1fr; gap: 1rem 1.5rem; }
 .developer-definition-list dt { font-weight: 650; }

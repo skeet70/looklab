@@ -14,6 +14,42 @@ consent = "CC0 public sample (raw.pixls.us)"
 committed = false
 
 [[fixture]]
+file = "fujifilm-x-t4-0266.raf"
+description = "Fujifilm X-T4, 14-bit uncompressed RAF, ColorChecker chart capture, Provia, firmware 1.00, fetch-only"
+make = "Fujifilm"
+model = "X-T4"
+sha256 = "76f70724b58014fc1c45f6d6f5d0e0781bf08e9537b72de866446bda9a24bb0c"
+size = 57594176
+source_url = "https://raw.pixls.us/getfile.php/3913/nice/Fujifilm%20-%20X-T4%20-%2014bit%2014bit%20uncompressed%20(3:2).RAF"
+license = "CC0-1.0"
+consent = "CC0 public sample (raw.pixls.us)"
+committed = false
+
+[[fixture]]
+file = "fujifilm-x-t4-0267.raf"
+description = "Fujifilm X-T4, 14-bit lossless compressed RAF, ColorChecker chart capture, Provia, firmware 1.00, fetch-only"
+make = "Fujifilm"
+model = "X-T4"
+sha256 = "07ea642656074834ffe5c661870a612ffa2e80fc1218a05166ee966bbe5f6fae"
+size = 27949104
+source_url = "https://raw.pixls.us/getfile.php/3914/nice/Fujifilm%20-%20X-T4%20-%2014bit%2014bit%20lossless%20compressed%20(3:2).RAF"
+license = "CC0-1.0"
+consent = "CC0 public sample (raw.pixls.us)"
+committed = false
+
+[[fixture]]
+file = "fujifilm-x-t4-0268.raf"
+description = "Fujifilm X-T4, 14-bit compressed RAF, ColorChecker chart capture, Provia, firmware 1.00, fetch-only"
+make = "Fujifilm"
+model = "X-T4"
+sha256 = "871836938ffa695f4c41765ddb107c2703ce755f7f3ced7e10f9e04746f1734e"
+size = 26971008
+source_url = "https://raw.pixls.us/getfile.php/3918/nice/Fujifilm%20-%20X-T4%20-%2014bit%2014bit%20compressed%20(3:2).RAF"
+license = "CC0-1.0"
+consent = "CC0 public sample (raw.pixls.us)"
+committed = false
+
+[[fixture]]
 file = "canon-eos-60d.dng"
 description = "Canon EOS 60D, 14-bit DNG crop"
 make = "Canon"

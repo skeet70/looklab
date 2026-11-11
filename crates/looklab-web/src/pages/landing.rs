@@ -1,35 +1,65 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use super::looks::{cards, photo};
+use super::looks::{CatalogAvailability, cards, photo};
 use crate::data::{self, Load};
 use crate::ui;
 use leptos::prelude::*;
 use looklab_publish::{PreparedScene, SiteIndex};
 use std::sync::Arc;
 
+/// What the home page can offer from the published catalog.
+#[derive(Clone, Debug)]
+enum HomeReady {
+    Choices {
+        index: Box<SiteIndex>,
+        scene: Arc<PreparedScene>,
+    },
+    NoPublishedLooks,
+}
+
 #[component]
 pub fn Landing() -> impl IntoView {
-    let state = RwSignal::new(Load::<(SiteIndex, Arc<PreparedScene>)>::Loading);
+    let state = RwSignal::new(Load::<HomeReady>::Loading);
     Effect::new(move |_| {
         wasm_bindgen_futures::spawn_local(async move {
-            state.set(
-                match async { Ok((data::index().await?, photo().await?)) }.await {
-                    Ok(value) => Load::Ready(value),
-                    Err(error) => Load::Failed(error),
-                },
-            );
+            let loaded = async {
+                let index = data::index().await?;
+                if CatalogAvailability::of(&index) == CatalogAvailability::NoPublishedLooks {
+                    return Ok(HomeReady::NoPublishedLooks);
+                }
+                Ok(HomeReady::Choices {
+                    index: Box::new(index),
+                    scene: photo().await?,
+                })
+            }
+            .await;
+            state.set(match loaded {
+                Ok(ready) => Load::Ready(ready),
+                Err(error) => Load::Failed(error),
+            });
         });
     });
     view! {
         <section class="home-heading">
-            <p class="eyebrow">"A world of color. Your camera."</p>
-            <h1>"See any camera's look on your photos, then get it on your camera."</h1>
+            <p class="eyebrow">"A spectrum of styles. Your camera."</p>
+            <h1>{move || match state.get() {
+                Load::Ready(HomeReady::NoPublishedLooks) => "Camera looks, measured from photos shared by the people who shoot them.",
+                _ => "See a camera's look on a sample photo, then get it on your camera.",
+            }}</h1>
         </section>
         {move || match state.get() {
-            Load::Loading => ui::loading().into_any(), Load::Failed(error) => ui::failure(&error).into_any(), Load::Ready((index, scene)) => view! { <HomeChoices index scene/> }.into_any()
+            Load::Loading => ui::loading().into_any(),
+            Load::Failed(error) => ui::failure(&error).into_any(),
+            Load::Ready(HomeReady::NoPublishedLooks) => {
+                crate::prefetch::route_rendered();
+                ui::no_published_looks().into_any()
+            }
+            Load::Ready(HomeReady::Choices { index, scene }) => view! { <HomeChoices index=*index scene/> }.into_any(),
         }}
-        <section class="home-help"><div><h2>"Built together, photo by photo"</h2><p>"Shared photos help us understand each camera's color. About a minute with photos you already have."</p></div><a class="button" href=crate::base::site_url("/contribute")>"Help build looks"</a></section>
-        <section class="home-developers"><p>"Building camera firmware? Give your users a new world of looks."</p><a href=crate::base::site_url("/developers")>"For developers →"</a></section>
+        <Show when=move || state.with(|state| !matches!(state, Load::Ready(HomeReady::NoPublishedLooks)))>
+            <section class="home-help"><div><h2>"Where the looks come from"</h2><p>"Built-in looks are measured from RAW and JPEG pairs that people share. About a minute with photos you already have."</p></div><a class="button" href=crate::base::site_url("/contribute")>"Help build looks"</a></section>
+        </Show>
+        <section class="home-developers"><p>"Building camera firmware? Your firmware can load these looks from a card file."</p><a href=crate::base::site_url("/developers")>"For developers →"</a></section>
     }
 }
 
@@ -135,15 +165,15 @@ fn HomeChoices(index: SiteIndex, scene: Arc<PreparedScene>) -> impl IntoView {
                 }).collect_view()}
             </div>
         </section>
-        <section class="home-picker"><h2>"Make it yours"</h2><div class="home-picker-grid">
+        <section class="home-picker"><h2>"Choose your camera and a look"</h2><div class="home-picker-grid">
             <ui::CameraPicker cameras=index.bodies selected=camera label="What do you shoot?".to_owned()/>
             <div><h3>"Which look?"</h3><ui::LookPicker items=picker_items scene=picker_scene on_select=Callback::new(move |item: ui::LookCardItem| look.set(Some(item.slug))) label="Choose a look".to_owned()/></div>
             <a class="button" href=move || crate::base::site_url(&format!("/match?camera={}&look={}", camera.get().map(|id| id.to_string()).unwrap_or_default(), look.get().map(|slug| slug.to_string()).unwrap_or_default()))>"Continue →"</a>
         </div></section>
         <section>
             <div class="section-heading">
-                <h2>"Find a color that feels like you"</h2>
-                <a href=crate::base::site_url("/looks")>"Explore all looks →"</a>
+                <h2>"Every look, on the same photo"</h2>
+                <a href=crate::base::site_url("/looks")>"All looks →"</a>
             </div>
             <div class="look-gallery">
                 <Show when=move || gallery_ready.get()>

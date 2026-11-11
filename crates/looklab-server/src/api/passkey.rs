@@ -146,6 +146,10 @@ pub async fn register_finish(
         .map(Passkey::from)
         .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
     let raw_id = passkey.cred_id().as_slice();
+    // Assertions carry a nonempty credential id of at most `MAX_CREDENTIAL_ID` bytes.
+    if raw_id.is_empty() || raw_id.len() > looklab_upload::webauthn::MAX_CREDENTIAL_ID {
+        return Err(ApiError::new(ErrorCode::MalformedEnvelope));
+    }
     if store::credential_exists(&state.db, raw_id)
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?

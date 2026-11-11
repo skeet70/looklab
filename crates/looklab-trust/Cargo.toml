@@ -21,6 +21,7 @@ thiserror.workspace = true
 postcard.workspace = true
 looklab-meta.workspace = true
 looklab-model.workspace = true
+looklab-schema.workspace = true
 looklab-upload.workspace = true
 looklab-fit = { workspace = true, features = ["synth"], optional = true }
 looklab-color = { workspace = true, optional = true }

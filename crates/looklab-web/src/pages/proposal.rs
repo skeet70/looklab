@@ -4,7 +4,9 @@
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_params_map;
-use looklab_schema::{Evidence, ProposalRef, ProposalStatus, ProposalView};
+use looklab_schema::{
+    Evidence, ProposalDetailView, ProposalImportState, ProposalRef, ProposalStatus,
+};
 
 use crate::data::{self, Load, MessageAuthor, ProposalMessage};
 use crate::proposal_form;
@@ -16,7 +18,7 @@ struct ProposalRequest(u64);
 #[component]
 pub fn ProposalDetail() -> impl IntoView {
     let params = use_params_map();
-    let state = RwSignal::new(Load::<ProposalView>::Loading);
+    let state = RwSignal::new(Load::<ProposalDetailView>::Loading);
     let id = RwSignal::new(None::<ProposalRef>);
     let request = RwSignal::new(ProposalRequest(0));
 
@@ -89,16 +91,19 @@ pub fn ProposalDetail() -> impl IntoView {
 
 #[component]
 fn ProposalViewDetail(
-    proposal: ProposalView,
+    proposal: ProposalDetailView,
     id: ProposalRef,
-    state: RwSignal<Load<ProposalView>>,
+    state: RwSignal<Load<ProposalDetailView>>,
     current_id: RwSignal<Option<ProposalRef>>,
 ) -> impl IntoView {
     let ctx = crate::session::use_session();
+    let camera_confirmation = proposal.can_confirm_camera_menu();
+    let proposal = proposal.proposal;
     let kind = proposal.kind;
     let status = proposal.status;
     let created = ui::timestamp(proposal.created_at);
     let summary = proposal_form::menu_summary(kind, &proposal.summary);
+    let import = proposal.import.clone();
     let details = summary
         .details
         .iter()
@@ -117,55 +122,6 @@ fn ProposalViewDetail(
             }
         })
         .collect_view();
-
-    let confirm_label = RwSignal::new("provia".to_owned());
-    let confirm_tags = RwSignal::new(String::new());
-    let confirm_message = RwSignal::new(None::<String>);
-    let read_confirmation = Callback::new(move |selected| {
-        spawn_local(async move {
-            let result = async {
-                let files = crate::files::selected_files(selected);
-                let file = files
-                    .first()
-                    .ok_or_else(|| "Choose a camera JPEG.".to_owned())?;
-                proposal_form::file_menu_value(&file.bytes().await?)
-            }
-            .await;
-            match result {
-                Ok(tags) => {
-                    confirm_tags.set(tags);
-                    confirm_message.set(Some(
-                        "Menu information read locally. Your photo will not be sent.".to_owned(),
-                    ));
-                }
-                Err(error) => confirm_message.set(Some(error)),
-            }
-        });
-    });
-
-    let confirm_id = id.clone();
-    let confirm = move |_| {
-        let current = confirm_id.clone();
-        match proposal_form::parse_tag_values(&confirm_tags.get(), &confirm_label.get()) {
-            Err(error) => confirm_message.set(Some(error)),
-            Ok(tags) => {
-                confirm_message.set(None);
-                spawn_local(async move {
-                    match data::confirm_proposal(ctx, &current, &tags).await {
-                        Ok(view) => {
-                            if current_id.try_get_untracked().flatten().as_ref() != Some(&current) {
-                                return;
-                            }
-                            state.set(Load::Ready(view));
-                            confirm_message
-                                .set(Some("Confirmation recorded as evidence.".to_owned()));
-                        }
-                        Err(error) => confirm_message.set(Some(error)),
-                    }
-                });
-            }
-        }
-    };
 
     let thread = RwSignal::new(None::<Vec<ProposalMessage>>);
     let thread_message = RwSignal::new(String::new());
@@ -216,6 +172,45 @@ fn ProposalViewDetail(
         <p class="muted">
             {format!("{} · {} · proposed {created}", proposal_form::kind_label(kind), status_label(status))}
         </p>
+        {move || match (kind, status, import.clone()) {
+            (_, _, Some(state)) => {
+                let (class, heading, detail) = match &state {
+                    ProposalImportState::Queued => (
+                        "muted",
+                        "Import queued",
+                        "Approved. The import job is queued; no Look version exists yet.".to_owned(),
+                    ),
+                    ProposalImportState::Running => (
+                        "muted",
+                        "Import running",
+                        "Approved. The import is fitting the LUT; no Look version exists yet.".to_owned(),
+                    ),
+                    ProposalImportState::Failed { reason } => (
+                        "error",
+                        "Import failed",
+                        format!("Approved, but the import produced no Look version: {reason}. Approval is not publication."),
+                    ),
+                    ProposalImportState::Published { look, version } => (
+                        "valid",
+                        "Published",
+                        format!("Published as /looks/{look} version {version}."),
+                    ),
+                };
+                Some(view! {
+                    <section aria-labelledby="import-heading">
+                        <h2 id="import-heading">{heading}</h2>
+                        <p class=class>{detail}</p>
+                    </section>
+                }.into_any())
+            }
+            (looklab_schema::ProposalKind::LutLook, ProposalStatus::Approved, None) => Some(view! {
+                <section aria-labelledby="import-heading">
+                    <h2 id="import-heading">"Import pending"</h2>
+                    <p class="muted">"Approved. Publication waits for the import job; approval alone does not publish a Look."</p>
+                </section>
+            }.into_any()),
+            _ => None,
+        }}
         <ul>{details}</ul>
         <ui::Disclosure summary="Technical details".to_owned()>
             <ul>
@@ -226,41 +221,16 @@ fn ProposalViewDetail(
         </ui::Disclosure>
         <section aria-labelledby="evidence">
             <h2 id="evidence">"Evidence"</h2>
-            <p>"Confirmations help moderators check a change. They are evidence, not votes."</p>
+            <p>{if camera_confirmation {
+                "Confirmations help moderators check a change. They are evidence, not votes."
+            } else {
+                "Supporting information helps moderators check this proposal."
+            }}</p>
             <ul>{evidence}</ul>
         </section>
-        <section aria-labelledby="confirm">
-            <h2 id="confirm">"Does your camera show this menu too?"</h2>
-            <p>"Share the menu information from your own file to help a moderator check this proposal."</p>
-            <ui::DropZone on_files=read_confirmation accept=".jpg,.jpeg,.raf".to_owned() folders=false/>
-            <label for="confirm-label">"Which menu answer did your file show?"</label>
-            <input
-                type="text"
-                id="confirm-label"
-                prop:value=move || confirm_label.get()
-                on:input=move |event| confirm_label.set(event_target_value(&event))
-            />
-            <ui::Disclosure summary="Advanced: parsed file information".to_owned()>
-                <label for="confirm-tags">"Parsed tag values, one Tag=value per line"</label>
-                <textarea
-                    id="confirm-tags"
-                    rows="4"
-                    cols="40"
-                    prop:value=move || confirm_tags.get()
-                    on:input=move |event| confirm_tags.set(event_target_value(&event))
-                ></textarea>
-            </ui::Disclosure>
-            <button type="button" id="confirm-proposal" on:click=confirm>
-                "My camera shows this menu too"
-            </button>
-            {move || {
-                confirm_message
-                    .get()
-                    .map(|text| view! {
-                        <p class="muted" role="status">{text}</p>
-                    })
-            }}
-        </section>
+        {camera_confirmation.then(|| view! {
+            <CameraMenuConfirmation id state current_id/>
+        })}
         <section aria-labelledby="thread">
             <h2 id="thread">"Discussion"</h2>
             <p class="muted">
@@ -333,6 +303,96 @@ fn ProposalViewDetail(
                     .get()
                     .map(|text| view! {
                         <p class="error" role="alert">{text}</p>
+                    })
+            }}
+        </section>
+    }
+}
+
+#[component]
+fn CameraMenuConfirmation(
+    id: ProposalRef,
+    state: RwSignal<Load<ProposalDetailView>>,
+    current_id: RwSignal<Option<ProposalRef>>,
+) -> impl IntoView {
+    let ctx = crate::session::use_session();
+    let confirm_label = RwSignal::new("provia".to_owned());
+    let confirm_tags = RwSignal::new(String::new());
+    let confirm_message = RwSignal::new(None::<String>);
+    let read_confirmation = Callback::new(move |selected| {
+        spawn_local(async move {
+            let result = async {
+                let files = crate::files::selected_files(selected);
+                let file = files
+                    .first()
+                    .ok_or_else(|| "Choose a camera JPEG.".to_owned())?;
+                proposal_form::file_menu_value(&file.bytes().await?)
+            }
+            .await;
+            match result {
+                Ok(tags) => {
+                    confirm_tags.set(tags);
+                    confirm_message.set(Some(
+                        "Menu information read locally. Your photo will not be sent.".to_owned(),
+                    ));
+                }
+                Err(error) => confirm_message.set(Some(error)),
+            }
+        });
+    });
+    let confirm_id = id;
+    let confirm = move |_| {
+        let current = confirm_id.clone();
+        match proposal_form::parse_tag_values(&confirm_tags.get(), &confirm_label.get()) {
+            Err(error) => confirm_message.set(Some(error)),
+            Ok(tags) => {
+                confirm_message.set(None);
+                spawn_local(async move {
+                    match data::confirm_proposal(ctx, &current, &tags).await {
+                        Ok(view) => {
+                            if current_id.try_get_untracked().flatten().as_ref() != Some(&current) {
+                                return;
+                            }
+                            state.set(Load::Ready(view));
+                            confirm_message
+                                .set(Some("Confirmation recorded as evidence.".to_owned()));
+                        }
+                        Err(error) => confirm_message.set(Some(error)),
+                    }
+                });
+            }
+        }
+    };
+    view! {
+        <section aria-labelledby="confirm">
+            <h2 id="confirm">"Does your camera show this menu too?"</h2>
+            <p>"Share the menu information from your own file to help a moderator check this proposal."</p>
+            <ui::DropZone on_files=read_confirmation accept=".jpg,.jpeg,.raf".to_owned() folders=false/>
+            <label for="confirm-label">"Which menu answer did your file show?"</label>
+            <input
+                type="text"
+                id="confirm-label"
+                prop:value=move || confirm_label.get()
+                on:input=move |event| confirm_label.set(event_target_value(&event))
+            />
+            <ui::Disclosure summary="Advanced: parsed file information".to_owned()>
+                <label for="confirm-tags">"Parsed tag values, one Tag=value per line"</label>
+                <textarea
+                    id="confirm-tags"
+                    rows="4"
+                    cols="40"
+                    prop:value=move || confirm_tags.get()
+                    on:input=move |event| confirm_tags.set(event_target_value(&event))
+                ></textarea>
+            </ui::Disclosure>
+            <button type="button" id="confirm-proposal" on:click=confirm>
+                "My camera shows this menu too"
+            </button>
+            {move || {
+                confirm_message
+                    .get()
+                    .map(|text| view! {
+                        <p class="muted" role="status">{text}</p>
                     })
             }}
         </section>

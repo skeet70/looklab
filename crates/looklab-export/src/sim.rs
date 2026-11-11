@@ -8,6 +8,7 @@ use looklab_model::{Look, ProbeSet};
 use crate::bake::{BakeIlluminant, BakeOutput, baked_look};
 use crate::camera::InputTransform;
 use crate::cct::CctK;
+use crate::downstream::checked_appearance;
 use crate::error::{ExportError, Result};
 
 /// ΔE summary over the supported probes; percentiles are nearest-rank.
@@ -130,22 +131,31 @@ pub fn validate(
         });
     }
     let look_used = baked_look(look, output.insertion.point);
+    let mut feasible = Vec::with_capacity(probes.probes.len());
     let targets: Vec<_> = probes
         .probes
         .iter()
         .map(|probe| {
+            feasible.push(checked_appearance(&look_used, probe.xyz).is_ok());
             let target = output.downstream.target(&look_used, probe.xyz);
             (target, output.downstream.appearance(target.codes))
         })
         .collect();
-    let target_clipped = targets.iter().filter(|(target, _)| target.clipped).count();
+    let target_clipped = targets
+        .iter()
+        .zip(&feasible)
+        .filter(|((target, _), feasible)| **feasible && target.clipped)
+        .count();
 
     let tone_mismatch = (output.insertion.point
         == looklab_schema::InsertionPoint::DisplayEncodedPostTone
         && !look.tone.is_colorimetric())
     .then(|| {
         let mut values = Vec::with_capacity(probes.probes.len());
-        for (probe, (_, partial)) in probes.probes.iter().zip(targets.iter()) {
+        for (index, (probe, (_, partial))) in probes.probes.iter().zip(targets.iter()).enumerate() {
+            if !feasible[index] || checked_appearance(look, probe.xyz).is_err() {
+                continue;
+            }
             let full = output.downstream.target(look, probe.xyz);
             let full = output.downstream.appearance(full.codes);
             values.push(delta_e_ucs(full, *partial));
@@ -157,7 +167,7 @@ pub fn validate(
     let mut primary = None;
     let mut others = Vec::new();
     for cct in output.bake.report_ccts() {
-        let report = evaluate_cct(output, probes, support, &targets, transform, cct)?;
+        let report = evaluate_cct(output, probes, support, &feasible, &targets, transform, cct)?;
         if cct == primary_cct && primary.is_none() {
             primary = Some(report);
         } else {
@@ -181,6 +191,7 @@ fn evaluate_cct(
     output: &BakeOutput,
     probes: &ProbeSet,
     support: Support<'_>,
+    feasible: &[bool],
     targets: &[(crate::downstream::TargetOutput, looklab_color::ucs::Ucs)],
     transform: &dyn InputTransform,
     cct: CctK,
@@ -223,7 +234,7 @@ fn evaluate_cct(
             .iter()
             .all(|value| value.is_finite() && (-1.0e-9..=1.0 + 1.0e-9).contains(value));
         let allowed = support.is_none_or(|mask| mask[index]);
-        if !representable || !allowed {
+        if !representable || !allowed || !feasible[index] {
             unsupported += 1;
             continue;
         }

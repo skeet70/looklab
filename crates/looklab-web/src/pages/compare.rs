@@ -4,7 +4,12 @@ use crate::data::{self, Load};
 use crate::ui;
 use leptos::prelude::*;
 use leptos_router::hooks::{use_navigate, use_query_map};
-use looklab_publish::{LookPage, PreparedScene, SceneKind, SiteIndex};
+use leptos_router::params::ParamsMap;
+use looklab_model::file::{LookVersion, Slug};
+use looklab_publish::{
+    LookPage, LookSummary, LookVisibility, PreparedScene, SceneKind, SceneName, SelectionScope,
+    SiteIndex, VersionSummary,
+};
 use looklab_report::compare::{Comparison, ComparisonInput, FunctionName, LayerId, compare};
 use looklab_report::svg::{
     delta_e_histogram_svg, grl_svg, region_map_svg, tint_comparison_svg, tone_comparison_svg,
@@ -16,11 +21,138 @@ struct CompareReady {
     index: SiteIndex,
     a: LookPage,
     b: LookPage,
-    a_version: looklab_model::file::LookVersion,
-    b_version: looklab_model::file::LookVersion,
+    a_version: LookVersion,
+    b_version: LookVersion,
     a_lut: Arc<Vec<u8>>,
     b_lut: Arc<Vec<u8>>,
     thumbnail: Arc<PreparedScene>,
+    a_label: String,
+    b_label: String,
+    a_scope: SelectionScope,
+    a_blockers: Vec<String>,
+    b_scope: SelectionScope,
+    b_blockers: Vec<String>,
+}
+
+/// What the compare page can show for the current query.
+#[derive(Clone, Debug)]
+enum CompareOutcome {
+    Ready(Box<CompareReady>),
+    Unavailable(Unavailable),
+}
+
+/// The quantitative comparison, or why it cannot run.
+#[derive(Clone, Debug)]
+enum ComparisonOutcome {
+    Compared(Arc<Comparison>),
+    SourcePreview(String),
+}
+
+/// One identifier from the query: absent, parsed, or present but not valid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum QueryValue<T> {
+    Absent,
+    Named(T),
+    Invalid,
+}
+
+// Deriving would add a `T: Default` bound, which `Slug` does not satisfy.
+#[allow(clippy::derivable_impls)]
+impl<T> Default for QueryValue<T> {
+    fn default() -> Self {
+        Self::Absent
+    }
+}
+
+/// The query, with identifiers parsed into the domain types that validate them.
+#[derive(Clone, Debug, Default)]
+struct CompareQuery {
+    a: QueryValue<Slug>,
+    b: QueryValue<Slug>,
+    a_version: QueryValue<LookVersion>,
+    b_version: QueryValue<LookVersion>,
+    scene: QueryValue<SceneName>,
+}
+
+impl CompareQuery {
+    fn parse(query: &ParamsMap) -> Self {
+        Self::from_values(|key| query.get(key))
+    }
+
+    fn from_values(value: impl Fn(&str) -> Option<String>) -> Self {
+        Self {
+            a: identifier(value("a"), Slug::new),
+            b: identifier(value("b"), Slug::new),
+            a_version: identifier(value("av"), LookVersion::new),
+            b_version: identifier(value("bv"), LookVersion::new),
+            scene: identifier(value("scene"), SceneName::new),
+        }
+    }
+}
+
+fn identifier<T, E>(value: Option<String>, parse: fn(String) -> Result<T, E>) -> QueryValue<T> {
+    match value {
+        None => QueryValue::Absent,
+        Some(value) if value.is_empty() => QueryValue::Absent,
+        Some(value) => parse(value).map_or(QueryValue::Invalid, QueryValue::Named),
+    }
+}
+
+/// One side of a comparison, resolved to a published version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LookSelection {
+    slug: Slug,
+    version: LookVersion,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ComparePlan {
+    a: LookSelection,
+    b: LookSelection,
+    scene: SceneName,
+}
+
+/// What the page will compare for a query, before any artifact is fetched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CompareResolution {
+    Ready(ComparePlan),
+    Unavailable(Unavailable),
+}
+
+/// A catalog look with the version a comparison would use.
+#[derive(Clone, Copy)]
+struct CatalogLook<'a> {
+    summary: &'a LookSummary,
+    latest: &'a VersionSummary,
+}
+
+/// Why the published catalog cannot supply a comparison.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Unavailable {
+    NoLooks,
+    UnknownLook(Slug),
+    InvalidLook,
+    UnknownVersion {
+        slug: Slug,
+        name: String,
+        version: LookVersion,
+    },
+    InvalidVersion,
+    NoSecondVersion {
+        slug: Slug,
+        name: String,
+    },
+    UnknownScene {
+        a: LookSelection,
+        b: LookSelection,
+    },
+    NoScenes,
+}
+
+#[derive(Clone, Debug)]
+struct RecoveryAction {
+    label: String,
+    path: String,
 }
 
 #[derive(Clone, Copy)]
@@ -61,23 +193,18 @@ fn updated_url(key: CompareField, value: &str) -> web_sys::Url {
 #[component]
 pub fn ComparePage() -> impl IntoView {
     let query = use_query_map();
-    let state = RwSignal::new(Load::<CompareReady>::Loading);
+    let state = RwSignal::new(Load::<CompareOutcome>::Loading);
     let generation = RwSignal::new(0_u32);
     Effect::new(move |_| {
-        let query = query.read();
-        let a = query.get("a").unwrap_or_default();
-        let b = query.get("b").unwrap_or_default();
-        let scene = query.get("scene").unwrap_or_default();
-        let av = query.get("av");
-        let bv = query.get("bv");
+        let query = CompareQuery::parse(&query.read());
         let mine = generation.get_untracked() + 1;
         generation.set(mine);
         state.set(Load::Loading);
         wasm_bindgen_futures::spawn_local(async move {
-            let loaded = load_pair(a, b, av, bv, scene).await;
+            let loaded = load_pair(query).await;
             if generation.get_untracked() == mine {
                 state.set(match loaded {
-                    Ok(ready) => Load::Ready(ready),
+                    Ok(outcome) => Load::Ready(outcome),
                     Err(error) => Load::Failed(error),
                 });
             }
@@ -85,85 +212,332 @@ pub fn ComparePage() -> impl IntoView {
     });
     view! {
         <article class="compare-page">
-            <header class="compare-heading"><h1>"Compare looks"</h1><p>"One photo. Two ways to see it."</p></header>
+            <header class="compare-heading"><h1>"Compare looks"</h1><p>"One photo, two looks. Split, toggle, or map the difference."</p></header>
             {move || match state.get() {
                 Load::Loading => ui::loading().into_any(),
                 Load::Failed(error) => ui::failure(&error).into_any(),
-                Load::Ready(ready) => view! { <ComparisonView ready/> }.into_any(),
+                Load::Ready(CompareOutcome::Ready(ready)) => view! { <ComparisonView ready=*ready/> }.into_any(),
+                Load::Ready(CompareOutcome::Unavailable(unavailable)) => unavailable_view(unavailable).into_any(),
             }}
         </article>
     }
 }
 
-async fn load_pair(
-    a: String,
-    b: String,
-    av: Option<String>,
-    bv: Option<String>,
-    scene: String,
-) -> Result<CompareReady, String> {
+async fn load_pair(query: CompareQuery) -> Result<CompareOutcome, String> {
     let index = data::index().await?;
-    let public_looks = index
+    let plan = match resolve_comparison(&index, &query) {
+        CompareResolution::Ready(plan) => plan,
+        CompareResolution::Unavailable(unavailable) => {
+            return Ok(CompareOutcome::Unavailable(unavailable));
+        }
+    };
+    let a = data::look(plan.a.slug.as_str()).await?;
+    let b = data::look(plan.b.slug.as_str()).await?;
+    let (a_scope, a_blockers) = displayed_scope(&a, &index, &plan.a.version);
+    let (b_scope, b_blockers) = displayed_scope(&b, &index, &plan.b.version);
+    let a_lut = data::preview(plan.a.slug.as_str(), plan.a.version.as_str()).await?;
+    let b_lut = data::preview(plan.b.slug.as_str(), plan.b.version.as_str()).await?;
+    let thumbnail = Arc::new(data::scene_thumbnail(plan.scene.as_str()).await?);
+    let (a_label, b_label) = comparison_labels(&a, &plan.a, &b, &plan.b);
+    Ok(CompareOutcome::Ready(Box::new(CompareReady {
+        index,
+        a,
+        b,
+        a_version: plan.a.version,
+        b_version: plan.b.version,
+        a_lut,
+        b_lut,
+        thumbnail,
+        a_label,
+        b_label,
+        a_scope,
+        a_blockers,
+        b_scope,
+        b_blockers,
+    })))
+}
+
+fn displayed_scope(
+    page: &LookPage,
+    index: &SiteIndex,
+    version: &LookVersion,
+) -> (SelectionScope, Vec<String>) {
+    page.versions
+        .iter()
+        .find(|entry| entry.version() == version)
+        .map_or_else(
+            || {
+                (
+                    SelectionScope::Unassessed,
+                    vec!["This version has no published page metadata.".to_owned()],
+                )
+            },
+            |entry| crate::selection::version_scope(page, index, entry),
+        )
+}
+
+fn comparison_labels(
+    a: &LookPage,
+    a_selection: &LookSelection,
+    b: &LookPage,
+    b_selection: &LookSelection,
+) -> (String, String) {
+    if a.slug == b.slug {
+        (
+            format!("{} {}", a.name, a_selection.version),
+            format!("{} {}", b.name, b_selection.version),
+        )
+    } else {
+        (a.name.clone(), b.name.clone())
+    }
+}
+
+fn resolve_comparison(index: &SiteIndex, query: &CompareQuery) -> CompareResolution {
+    match plan_comparison(index, query) {
+        Ok(plan) => CompareResolution::Ready(plan),
+        Err(unavailable) => CompareResolution::Unavailable(unavailable),
+    }
+}
+
+fn plan_comparison(index: &SiteIndex, query: &CompareQuery) -> Result<ComparePlan, Unavailable> {
+    let public = public_looks(index);
+    let a_look = match &query.a {
+        QueryValue::Named(slug) => catalog_look(index, slug)?,
+        QueryValue::Invalid => return Err(Unavailable::InvalidLook),
+        QueryValue::Absent => match &query.b {
+            QueryValue::Named(slug) => match public
+                .iter()
+                .copied()
+                .find(|look| look.summary.slug.as_str() != slug.as_str())
+            {
+                Some(look) => look,
+                None => catalog_look(index, slug)?,
+            },
+            QueryValue::Invalid => return Err(Unavailable::InvalidLook),
+            QueryValue::Absent => *public.first().ok_or(Unavailable::NoLooks)?,
+        },
+    };
+    let b_look = match &query.b {
+        QueryValue::Named(slug) => catalog_look(index, slug)?,
+        QueryValue::Invalid => return Err(Unavailable::InvalidLook),
+        QueryValue::Absent => public
+            .iter()
+            .copied()
+            .find(|look| look.summary.slug != a_look.summary.slug)
+            .unwrap_or(a_look),
+    };
+    let same_look = a_look.summary.slug == b_look.summary.slug;
+    let a_version = match &query.a_version {
+        QueryValue::Named(version) => published_version(a_look, version)?,
+        QueryValue::Invalid => return Err(Unavailable::InvalidVersion),
+        QueryValue::Absent => a_look.latest.version.clone(),
+    };
+    let b_version = match &query.b_version {
+        QueryValue::Named(version) => published_version(b_look, version)?,
+        QueryValue::Invalid => return Err(Unavailable::InvalidVersion),
+        QueryValue::Absent if same_look => other_version(b_look, &a_version)?,
+        QueryValue::Absent => b_look.latest.version.clone(),
+    };
+    let a = LookSelection {
+        slug: a_look.summary.slug.clone(),
+        version: a_version,
+    };
+    let b = LookSelection {
+        slug: b_look.summary.slug.clone(),
+        version: b_version,
+    };
+    let scene = plan_scene(index, &query.scene, &a, &b)?;
+    Ok(ComparePlan { a, b, scene })
+}
+
+fn public_looks(index: &SiteIndex) -> Vec<CatalogLook<'_>> {
+    index
         .looks
         .iter()
-        .filter(|look| look.visibility == looklab_publish::LookVisibility::Public);
-    let a_slug = if a.is_empty() {
-        public_looks
-            .clone()
-            .next()
-            .map(|look| look.slug.to_string())
-            .unwrap_or_default()
-    } else {
-        a
-    };
-    let b_slug = if b.is_empty() {
-        public_looks
-            .clone()
-            .nth(1)
-            .or_else(|| public_looks.clone().next())
-            .map(|look| look.slug.to_string())
-            .unwrap_or_default()
-    } else {
-        b
-    };
-    let a = data::look(&a_slug).await?;
-    let b = data::look(&b_slug).await?;
-    let a_version = av
-        .map(looklab_model::file::LookVersion::new)
-        .transpose()
-        .map_err(|error| error.to_string())?
-        .or_else(|| a.latest().map(|version| version.version().clone()))
-        .ok_or("No published version for the first look")?;
-    let b_version = bv
-        .map(looklab_model::file::LookVersion::new)
-        .transpose()
-        .map_err(|error| error.to_string())?
-        .or_else(|| b.latest().map(|version| version.version().clone()))
-        .ok_or("No published version for the second look")?;
-    let a_lut = data::preview(&a_slug, a_version.as_str()).await?;
-    let b_lut = data::preview(&b_slug, b_version.as_str()).await?;
-    let scene_name = if scene.is_empty() {
-        index
+        .filter(|look| look.visibility == LookVisibility::Public)
+        .filter_map(|look| {
+            crate::selection::browsable_version(look).map(|latest| CatalogLook {
+                summary: look,
+                latest,
+            })
+        })
+        .collect()
+}
+
+fn catalog_look<'a>(index: &'a SiteIndex, slug: &Slug) -> Result<CatalogLook<'a>, Unavailable> {
+    index
+        .looks
+        .iter()
+        .find(|look| &look.slug == slug)
+        .and_then(|look| {
+            crate::selection::browsable_version(look).map(|latest| CatalogLook {
+                summary: look,
+                latest,
+            })
+        })
+        .ok_or_else(|| Unavailable::UnknownLook(slug.clone()))
+}
+
+fn published_version(
+    look: CatalogLook<'_>,
+    version: &LookVersion,
+) -> Result<LookVersion, Unavailable> {
+    look.summary
+        .versions
+        .iter()
+        .any(|summary| &summary.version == version)
+        .then(|| version.clone())
+        .ok_or_else(|| Unavailable::UnknownVersion {
+            slug: look.summary.slug.clone(),
+            name: look.summary.name.clone(),
+            version: version.clone(),
+        })
+}
+
+fn other_version(look: CatalogLook<'_>, taken: &LookVersion) -> Result<LookVersion, Unavailable> {
+    look.summary
+        .versions
+        .iter()
+        .map(|summary| summary.version.clone())
+        .filter(|version| version != taken)
+        .max_by(looklab_publish::compare_versions)
+        .ok_or_else(|| Unavailable::NoSecondVersion {
+            slug: look.summary.slug.clone(),
+            name: look.summary.name.clone(),
+        })
+}
+
+fn plan_scene(
+    index: &SiteIndex,
+    requested: &QueryValue<SceneName>,
+    a: &LookSelection,
+    b: &LookSelection,
+) -> Result<SceneName, Unavailable> {
+    match requested {
+        QueryValue::Absent => index
             .scenes
             .iter()
             .find(|scene| scene.kind == SceneKind::Photo)
             .or_else(|| index.scenes.first())
-            .map(|scene| scene.name.to_string())
-            .ok_or("No sample photos published")?
-    } else {
-        scene
+            .map(|scene| scene.name.clone())
+            .ok_or(Unavailable::NoScenes),
+        QueryValue::Named(name) if index.scenes.iter().any(|scene| &scene.name == name) => {
+            Ok(name.clone())
+        }
+        QueryValue::Named(_) | QueryValue::Invalid => Err(Unavailable::UnknownScene {
+            a: a.clone(),
+            b: b.clone(),
+        }),
+    }
+}
+
+fn link(label: impl Into<String>, path: impl Into<String>) -> RecoveryAction {
+    RecoveryAction {
+        label: label.into(),
+        path: path.into(),
+    }
+}
+
+fn compare_href(a: &LookSelection, b: &LookSelection) -> String {
+    format!(
+        "/compare?a={}&av={}&b={}&bv={}",
+        a.slug.as_str(),
+        a.version.as_str(),
+        b.slug.as_str(),
+        b.version.as_str()
+    )
+}
+
+impl Unavailable {
+    fn content(&self) -> Option<(String, String, Vec<RecoveryAction>)> {
+        let content = match self {
+            Self::NoLooks => return None,
+            Self::UnknownLook(slug) => (
+                "That look isn't available".to_owned(),
+                format!(
+                    "No published look is named “{}”. It may have been renamed or withdrawn.",
+                    slug.as_str()
+                ),
+                vec![
+                    link("Compare the published looks", "/compare"),
+                    link("Browse looks", "/looks"),
+                ],
+            ),
+            Self::InvalidLook => (
+                "That look isn't available".to_owned(),
+                "The comparison asked for a look that is not a valid published look name. Choose a published look instead.".to_owned(),
+                vec![
+                    link("Compare the published looks", "/compare"),
+                    link("Browse looks", "/looks"),
+                ],
+            ),
+            Self::UnknownVersion {
+                slug,
+                name,
+                version,
+            } => (
+                "That version isn't available".to_owned(),
+                format!("{name} has no published version {version}."),
+                vec![
+                    link(format!("View {name}"), look_href(slug)),
+                    link("Compare the latest versions", "/compare"),
+                ],
+            ),
+            Self::InvalidVersion => (
+                "That version isn't available".to_owned(),
+                "The comparison asked for a version that is not a valid published version. Choose a published version instead.".to_owned(),
+                vec![
+                    link("Compare the latest versions", "/compare"),
+                    link("Browse looks", "/looks"),
+                ],
+            ),
+            Self::NoSecondVersion { slug, name } => (
+                "There isn't a second look to compare".to_owned(),
+                format!(
+                    "Comparing needs two published looks, or two versions of the same look. {name} has one published version."
+                ),
+                vec![
+                    link(format!("View {name}"), look_href(slug)),
+                    link("Help build more looks", "/contribute"),
+                ],
+            ),
+            Self::UnknownScene { a, b } => (
+                "That sample photo isn't available".to_owned(),
+                "Choose one of the published sample photos to compare these looks on.".to_owned(),
+                vec![link("Use the default sample photo", compare_href(a, b))],
+            ),
+            Self::NoScenes => (
+                "No sample photos are published yet".to_owned(),
+                "A comparison needs a sample photo to render both looks on.".to_owned(),
+                vec![
+                    link("Help build looks", "/contribute"),
+                    link("Browse looks", "/looks"),
+                ],
+            ),
+        };
+        Some(content)
+    }
+}
+
+fn look_href(slug: &Slug) -> String {
+    format!("/looks/{}", slug.as_str())
+}
+
+fn unavailable_view(unavailable: Unavailable) -> impl IntoView {
+    crate::prefetch::route_rendered();
+    let Some((title, message, actions)) = unavailable.content() else {
+        return ui::no_published_looks().into_any();
     };
-    let thumbnail = Arc::new(data::scene_thumbnail(&scene_name).await?);
-    Ok(CompareReady {
-        index,
-        a,
-        b,
-        a_version,
-        b_version,
-        a_lut,
-        b_lut,
-        thumbnail,
-    })
+    view! {
+        <ui::EmptyState title message>
+            <p class="field-row">
+                {actions.into_iter().map(|action| view! {
+                    <a href=crate::base::site_url(&action.path)>{action.label}</a>
+                }).collect_view()}
+            </p>
+        </ui::EmptyState>
+    }
+    .into_any()
 }
 
 #[component]
@@ -214,7 +588,8 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
         .iter()
         .filter(|look| look.visibility == looklab_publish::LookVisibility::Public)
         .filter_map(|look| {
-            let version = look.latest()?;
+            let version = crate::selection::browsable_version(look)?;
+            let (scope, blockers) = crate::selection::browsable_scope(look);
             let cameras = ready
                 .index
                 .bodies
@@ -236,6 +611,8 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
                 },
                 character: String::new(),
                 status: version.status,
+                scope,
+                blockers,
                 lut: None,
             })
         })
@@ -248,15 +625,15 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
     let scene = RwSignal::new(Arc::clone(&ready.thumbnail));
     let scene_error = RwSignal::new(None::<String>);
     let scene_strip_ready = RwSignal::new(false);
-    let comparison = RwSignal::new(Load::<Arc<Comparison>>::Loading);
+    let comparison = RwSignal::new(Load::<ComparisonOutcome>::Loading);
     let measurements = RwSignal::new(None::<Arc<Comparison>>);
     let scene_name = ready.thumbnail.scene.name.clone();
     let a_slug = ready.a.slug.clone();
     let b_slug = ready.b.slug.clone();
     let a_version = ready.a_version.clone();
     let b_version = ready.b_version.clone();
-    let a_name = ready.a.name.clone();
-    let b_name = ready.b.name.clone();
+    let a_name = ready.a_label.clone();
+    let b_name = ready.b_label.clone();
     let summary_a = a_name.clone();
     let summary_b = b_name.clone();
     Effect::new(move |_| {
@@ -289,19 +666,35 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
             let documents = async {
                 let a = data::version(a_slug.as_str(), a_version.as_str()).await?;
                 let b = data::version(b_slug.as_str(), b_version.as_str()).await?;
-                Ok::<_, String>((a.document, b.document))
+                Ok::<_, String>((a, b))
             }
             .await;
-            let (a_document, b_document) = match documents {
+            let (a, b) = match documents {
                 Ok(documents) => documents,
                 Err(error) => {
                     let _ = comparison.try_set(Load::Failed(error));
                     return;
                 }
             };
+            let (a_layered, b_layered) = match (&a.content, &b.content) {
+                (data::VersionContent::Layered(a), data::VersionContent::Layered(b)) => (a, b),
+                (a_content, b_content) => {
+                    let mut notes = Vec::new();
+                    for (name, content) in [(a_name, a_content), (b_name, b_content)] {
+                        if let data::VersionContent::SourcePreview(preview) = content {
+                            notes.push(format!("{name}: {}", data::source_preview_label(preview)));
+                        }
+                    }
+                    notes.push("The visual comparison uses each published preview LUT.".to_owned());
+                    let _ = comparison.try_set(Load::Ready(ComparisonOutcome::SourcePreview(
+                        notes.join(" "),
+                    )));
+                    return;
+                }
+            };
             let probes = looklab_model::probes::v1();
-            let a_look = crate::diagnostics::DocumentLook::new(&a_document, &probes);
-            let b_look = crate::diagnostics::DocumentLook::new(&b_document, &probes);
+            let a_look = crate::diagnostics::DocumentLook::new(&a_layered.document, &probes);
+            let b_look = crate::diagnostics::DocumentLook::new(&b_layered.document, &probes);
             let result = compare(&ComparisonInput {
                 a: &a_look,
                 b: &b_look,
@@ -310,7 +703,9 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
                 b_name: &FunctionName::new(b_name),
             });
             let result = Arc::new(result);
-            let _ = comparison.try_set(Load::Ready(Arc::clone(&result)));
+            let _ = comparison.try_set(Load::Ready(ComparisonOutcome::Compared(Arc::clone(
+                &result,
+            ))));
             ui::paint_browser().await;
             let _ = measurements.try_set(Some(result));
         });
@@ -318,8 +713,8 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
     view! {
         <div class="compare-look-pickers">
             <div class="compare-look-chip">
-                <ui::PreviewCanvas lut=Signal::stored(Some(Arc::clone(&ready.a_lut))) scene=Signal::stored(Arc::clone(&ready.thumbnail)) label=format!("Simulated: {}", ready.a.name) style=Signal::stored("width:4rem;height:3rem;object-fit:cover".to_owned())/>
-                <ui::LookPicker items=items.clone() scene=Arc::clone(&ready.thumbnail) label=format!("A · {}", ready.a.name) on_select=Callback::new(move |item: ui::LookCardItem| change.run((CompareField::LookA, item.slug.to_string())))/>
+                <ui::PreviewCanvas lut=Signal::stored(Some(Arc::clone(&ready.a_lut))) scene=Signal::stored(Arc::clone(&ready.thumbnail)) label=format!("Simulated: {}", ready.a_label) style=Signal::stored("width:4rem;height:3rem;object-fit:cover".to_owned())/>
+                <ui::LookPicker items=items.clone() scene=Arc::clone(&ready.thumbnail) label=format!("A · {}", ready.a_label) on_select=Callback::new(move |item: ui::LookCardItem| change.run((CompareField::LookA, item.slug.to_string())))/>
             </div>
             <button type="button" class="compare-swap" aria-label="Swap looks" on:click=move |_| {
                 let url = web_sys::Url::new(&window().location().href().unwrap_or_default()).expect("current URL");
@@ -327,14 +722,21 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
                 swap_navigate(&crate::base::route_of(&url), leptos_router::NavigateOptions { replace: true, scroll: false, ..Default::default() });
             }>"⇄"</button>
             <div class="compare-look-chip">
-                <ui::PreviewCanvas lut=Signal::stored(Some(Arc::clone(&ready.b_lut))) scene=Signal::stored(Arc::clone(&ready.thumbnail)) label=format!("Simulated: {}", ready.b.name) style=Signal::stored("width:4rem;height:3rem;object-fit:cover".to_owned())/>
-                <ui::LookPicker items scene=Arc::clone(&ready.thumbnail) label=format!("B · {}", ready.b.name) on_select=Callback::new(move |item: ui::LookCardItem| change.run((CompareField::LookB, item.slug.to_string())))/>
+                <ui::PreviewCanvas lut=Signal::stored(Some(Arc::clone(&ready.b_lut))) scene=Signal::stored(Arc::clone(&ready.thumbnail)) label=format!("Simulated: {}", ready.b_label) style=Signal::stored("width:4rem;height:3rem;object-fit:cover".to_owned())/>
+                <ui::LookPicker items scene=Arc::clone(&ready.thumbnail) label=format!("B · {}", ready.b_label) on_select=Callback::new(move |item: ui::LookCardItem| change.run((CompareField::LookB, item.slug.to_string())))/>
             </div>
         </div>
-        <ui::Viewer lut_a=Signal::stored(Arc::clone(&ready.a_lut)) lut_b=Signal::stored(ready.b_lut) scene=Signal::derive(move || scene.get()) label_a=ready.a.name.clone() label_b=ready.b.name.clone() mode on_mode_change=mode_change/>
+        <ui::Viewer lut_a=Signal::stored(Arc::clone(&ready.a_lut)) lut_b=Signal::stored(ready.b_lut) scene=Signal::derive(move || scene.get()) label_a=ready.a_label.clone() label_b=ready.b_label.clone() mode on_mode_change=mode_change/>
         {move || scene_error.get().map(|error| view! { <p class="error" role="alert">{format!("The full-size photo could not load. Showing the smaller preview. {error}")}</p> })}
+        <section class="compare-scope" aria-label="Comparison scope">
+            <p class="muted">{format!("A · {}: {}", ready.a_label, data::selection_scope_label(ready.a_scope))}</p>
+            {ready.a_blockers.into_iter().map(|blocker| view! { <p class="notice">{blocker}</p> }).collect_view()}
+            <p class="muted">{format!("B · {}: {}", ready.b_label, data::selection_scope_label(ready.b_scope))}</p>
+            {ready.b_blockers.into_iter().map(|blocker| view! { <p class="notice">{blocker}</p> }).collect_view()}
+        </section>
         {move || match comparison.get() {
-            Load::Ready(comparison) => view! { <ComparisonSummary comparison a_name=summary_a.clone() b_name=summary_b.clone()/> }.into_any(),
+            Load::Ready(ComparisonOutcome::Compared(comparison)) => view! { <ComparisonSummary comparison a_name=summary_a.clone() b_name=summary_b.clone()/> }.into_any(),
+            Load::Ready(ComparisonOutcome::SourcePreview(note)) => view! { <p class="notice" role="note">{note}</p> }.into_any(),
             Load::Loading => view! { <p class="muted" role="status">"Preparing comparison…"</p> }.into_any(),
             Load::Failed(error) => ui::failure(&error).into_any(),
         }}
@@ -566,5 +968,432 @@ fn SceneChip(
             {move || thumbnail.get().map(|scene| view! { <ui::PreviewCanvas lut=Signal::stored(Some(Arc::clone(&lut))) scene=Signal::stored(scene) label="Simulated sample photo".to_owned() style=Signal::stored("display:block;width:100%;height:auto".to_owned())/> })}
             <span>{scene.title}</span>
         </button>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use looklab_publish::{
+        ArtifactHash, ArtifactName, LookStatus, SITE_FORMAT, SceneArtifact, SceneSummary,
+        SelectedTargetSummary, SitePath, VersionSummary,
+    };
+
+    fn path(value: &str) -> SitePath {
+        SitePath::new(value).expect("site path")
+    }
+
+    fn version(name: &str) -> VersionSummary {
+        VersionSummary {
+            version: LookVersion::new(name).expect("version"),
+            status: LookStatus::Published,
+            matchable: true,
+            card_eligible: false,
+            approximated: false,
+            applicability: looklab_schema::Applicability::Unassessed,
+            eligibility_status: None,
+            card: None,
+            manifest: path(&format!("data/looks/x/{name}/manifest.json")),
+            manifest_sha256: ArtifactHash::of(b"manifest"),
+            manifest_bytes: 1,
+            artifact: ArtifactName::new("look.bin").expect("artifact"),
+            sha256: ArtifactHash::of(b"artifact"),
+            bytes: 1,
+        }
+    }
+
+    fn look(slug: &str, visibility: LookVisibility, versions: &[&str]) -> LookSummary {
+        LookSummary {
+            slug: Slug::new(slug).expect("slug"),
+            name: slug.to_owned(),
+            kind: looklab_model::file::LookKind::NativeFamily,
+            wb_policy: looklab_model::file::WbPolicy::Adaptive,
+            visibility,
+            head: None,
+            selected: None,
+            versions: versions.iter().copied().map(version).collect(),
+        }
+    }
+
+    fn scene(name: &str) -> SceneSummary {
+        SceneSummary {
+            name: SceneName::new(name).expect("scene name"),
+            kind: SceneKind::Photo,
+            title: "Sample".to_owned(),
+            credit: None,
+            thumbnail: SceneArtifact {
+                width: 1,
+                height: 1,
+                path: path("data/scenes/sample.png"),
+                sha256: ArtifactHash::of(b"thumbnail"),
+                bytes: 1,
+            },
+            width: 1,
+            height: 1,
+            path: path("data/scenes/sample.png"),
+            sha256: ArtifactHash::of(b"scene"),
+            bytes: 1,
+        }
+    }
+
+    fn index(looks: Vec<LookSummary>, scenes: Vec<SceneSummary>) -> SiteIndex {
+        SiteIndex {
+            format: SITE_FORMAT.to_owned(),
+            community_snapshot_version: 0,
+            manuals: Vec::new(),
+            interfaces: Vec::new(),
+            input_transforms: Vec::new(),
+            bodies: Vec::new(),
+            looks,
+            scenes,
+            reports: Vec::new(),
+            eligibility: Vec::new(),
+            current: Vec::new(),
+            bundles: Vec::new(),
+            reference_preview: None,
+        }
+    }
+
+    fn published_index(looks: Vec<LookSummary>) -> SiteIndex {
+        index(looks, vec![scene("sample")])
+    }
+
+    fn query(a: Option<&str>, b: Option<&str>) -> CompareQuery {
+        CompareQuery {
+            a: a.map_or(QueryValue::Absent, |value| QueryValue::Named(slug(value))),
+            b: b.map_or(QueryValue::Absent, |value| QueryValue::Named(slug(value))),
+            ..CompareQuery::default()
+        }
+    }
+
+    fn selection(slug_value: &str, version_value: &str) -> LookSelection {
+        LookSelection {
+            slug: Slug::new(slug_value).expect("slug"),
+            version: LookVersion::new(version_value).expect("version"),
+        }
+    }
+
+    fn slug(value: &str) -> Slug {
+        Slug::new(value).expect("slug")
+    }
+
+    fn look_version(value: &str) -> LookVersion {
+        LookVersion::new(value).expect("version")
+    }
+
+    fn parsed(values: &[(&str, &str)]) -> CompareQuery {
+        CompareQuery::from_values(|key| {
+            values
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_owned())
+        })
+    }
+
+    fn ready(index: &SiteIndex, query: &CompareQuery) -> ComparePlan {
+        match resolve_comparison(index, query) {
+            CompareResolution::Ready(plan) => plan,
+            CompareResolution::Unavailable(unavailable) => {
+                panic!("expected a comparison, got {unavailable:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn absent_or_empty_query_values_are_absent() {
+        let absent = parsed(&[]);
+        assert_eq!(absent.a, QueryValue::Absent);
+        assert_eq!(absent.b, QueryValue::Absent);
+        assert_eq!(absent.scene, QueryValue::Absent);
+        let empty = parsed(&[("a", ""), ("b", ""), ("av", ""), ("bv", ""), ("scene", "")]);
+        assert_eq!(empty.a, QueryValue::Absent);
+        assert_eq!(empty.b, QueryValue::Absent);
+        assert_eq!(empty.a_version, QueryValue::Absent);
+        assert_eq!(empty.b_version, QueryValue::Absent);
+        assert_eq!(empty.scene, QueryValue::Absent);
+    }
+
+    #[test]
+    fn query_identifiers_parse_into_domain_types() {
+        let query = parsed(&[("a", "sunlit"), ("av", "1.0.0"), ("scene", "sample")]);
+        assert_eq!(query.a, QueryValue::Named(slug("sunlit")));
+        assert_eq!(query.a_version, QueryValue::Named(look_version("1.0.0")));
+        assert_eq!(
+            query.scene,
+            QueryValue::Named(SceneName::new("sample").expect("scene name"))
+        );
+        assert_eq!(query.b, QueryValue::Absent);
+    }
+
+    #[test]
+    fn unparsable_scene_name_is_not_a_default_scene() {
+        let query = parsed(&[("scene", "Not_A_Name")]);
+        assert_eq!(query.scene, QueryValue::Invalid);
+    }
+
+    #[test]
+    fn empty_catalog_has_nothing_to_compare() {
+        assert_eq!(
+            resolve_comparison(&published_index(Vec::new()), &query(None, None)),
+            CompareResolution::Unavailable(Unavailable::NoLooks)
+        );
+    }
+
+    #[test]
+    fn default_selection_compares_the_first_two_public_looks() {
+        let index = published_index(vec![
+            look("sunlit", LookVisibility::Public, &["1.0.0"]),
+            look("cold", LookVisibility::Public, &["2.0.0", "1.0.0"]),
+        ]);
+        let plan = ready(&index, &query(None, None));
+        assert_eq!(plan.a, selection("sunlit", "1.0.0"));
+        assert_eq!(plan.b, selection("cold", "2.0.0"));
+        assert_eq!(plan.scene, SceneName::new("sample").expect("scene name"));
+    }
+
+    #[test]
+    fn selected_older_target_wins_unpinned_and_an_explicit_version_overrides_it() {
+        let mut cold = look("cold", LookVisibility::Public, &["2.0.0", "1.0.0"]);
+        cold.selected = Some(SelectedTargetSummary {
+            version: look_version("1.0.0"),
+            eligibility: None,
+            applicability: looklab_schema::Applicability::Current,
+        });
+        let index = published_index(vec![
+            look("sunlit", LookVisibility::Public, &["1.0.0"]),
+            cold,
+        ]);
+        let plan = ready(&index, &query(Some("cold"), Some("sunlit")));
+        assert_eq!(plan.a, selection("cold", "1.0.0"));
+        let pinned = ready(
+            &index,
+            &CompareQuery {
+                a: QueryValue::Named(slug("cold")),
+                b: QueryValue::Named(slug("sunlit")),
+                a_version: QueryValue::Named(look_version("2.0.0")),
+                ..CompareQuery::default()
+            },
+        );
+        assert_eq!(pinned.a, selection("cold", "2.0.0"));
+        assert_eq!(pinned.b, selection("sunlit", "1.0.0"));
+    }
+
+    #[test]
+    fn one_public_look_compares_its_two_newest_versions() {
+        let index = published_index(vec![look(
+            "sunlit",
+            LookVisibility::Public,
+            &["1.0.0", "2.0.0"],
+        )]);
+        let plan = ready(&index, &query(None, None));
+        assert_eq!(plan.a, selection("sunlit", "2.0.0"));
+        assert_eq!(plan.b, selection("sunlit", "1.0.0"));
+    }
+
+    #[test]
+    fn one_public_look_with_one_version_is_unavailable() {
+        let index = published_index(vec![look("sunlit", LookVisibility::Public, &["1.0.0"])]);
+        assert_eq!(
+            resolve_comparison(&index, &query(None, None)),
+            CompareResolution::Unavailable(Unavailable::NoSecondVersion {
+                slug: slug("sunlit"),
+                name: "sunlit".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_versions_select_those_versions() {
+        let index = published_index(vec![
+            look("sunlit", LookVisibility::Public, &["1.0.0", "2.0.0"]),
+            look("cold", LookVisibility::Public, &["1.0.0", "1.1.0"]),
+        ]);
+        let plan = ready(
+            &index,
+            &CompareQuery {
+                a: QueryValue::Named(slug("sunlit")),
+                b: QueryValue::Named(slug("cold")),
+                a_version: QueryValue::Named(look_version("1.0.0")),
+                b_version: QueryValue::Named(look_version("1.1.0")),
+                ..CompareQuery::default()
+            },
+        );
+        assert_eq!(plan.a, selection("sunlit", "1.0.0"));
+        assert_eq!(plan.b, selection("cold", "1.1.0"));
+    }
+
+    #[test]
+    fn same_look_version_comparison_is_preserved() {
+        let index = published_index(vec![
+            look("sunlit", LookVisibility::Public, &["1.0.0", "2.0.0"]),
+            look("cold", LookVisibility::Public, &["1.0.0"]),
+        ]);
+        let plan = ready(
+            &index,
+            &CompareQuery {
+                a: QueryValue::Named(slug("sunlit")),
+                b: QueryValue::Named(slug("sunlit")),
+                a_version: QueryValue::Named(look_version("1.0.0")),
+                b_version: QueryValue::Named(look_version("2.0.0")),
+                ..CompareQuery::default()
+            },
+        );
+        assert_eq!(plan.a, selection("sunlit", "1.0.0"));
+        assert_eq!(plan.b, selection("sunlit", "2.0.0"));
+    }
+
+    #[test]
+    fn explicit_test_fixture_look_is_addressable() {
+        let index = published_index(vec![
+            look("sunlit", LookVisibility::Public, &["1.0.0"]),
+            look("synthetic-match", LookVisibility::TestFixture, &["1.0.0"]),
+        ]);
+        let plan = ready(
+            &index,
+            &CompareQuery {
+                b: QueryValue::Named(slug("synthetic-match")),
+                ..CompareQuery::default()
+            },
+        );
+        assert_eq!(plan.a, selection("sunlit", "1.0.0"));
+        assert_eq!(plan.b, selection("synthetic-match", "1.0.0"));
+    }
+
+    #[test]
+    fn unknown_explicit_look_is_unavailable() {
+        let index = published_index(vec![
+            look("sunlit", LookVisibility::Public, &["1.0.0"]),
+            look("cold", LookVisibility::Public, &["1.0.0"]),
+        ]);
+        assert_eq!(
+            resolve_comparison(&index, &query(Some("missing"), None)),
+            CompareResolution::Unavailable(Unavailable::UnknownLook(slug("missing")))
+        );
+    }
+
+    #[test]
+    fn unknown_explicit_version_is_unavailable() {
+        let index = published_index(vec![look(
+            "sunlit",
+            LookVisibility::Public,
+            &["1.0.0", "2.0.0"],
+        )]);
+        assert_eq!(
+            resolve_comparison(
+                &index,
+                &CompareQuery {
+                    a: QueryValue::Named(slug("sunlit")),
+                    b: QueryValue::Named(slug("sunlit")),
+                    a_version: QueryValue::Named(look_version("9.0.0")),
+                    ..CompareQuery::default()
+                },
+            ),
+            CompareResolution::Unavailable(Unavailable::UnknownVersion {
+                slug: slug("sunlit"),
+                name: "sunlit".to_owned(),
+                version: look_version("9.0.0"),
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_explicit_scene_offers_the_default_scene_with_the_same_looks() {
+        let index = published_index(vec![
+            look("sunlit", LookVisibility::Public, &["1.0.0"]),
+            look("cold", LookVisibility::Public, &["1.0.0"]),
+        ]);
+        let unavailable = Unavailable::UnknownScene {
+            a: selection("sunlit", "1.0.0"),
+            b: selection("cold", "1.0.0"),
+        };
+        assert_eq!(
+            resolve_comparison(
+                &index,
+                &CompareQuery {
+                    scene: QueryValue::Named(SceneName::new("missing").expect("scene name")),
+                    ..CompareQuery::default()
+                },
+            ),
+            CompareResolution::Unavailable(unavailable.clone())
+        );
+        assert_eq!(
+            resolve_comparison(
+                &index,
+                &CompareQuery {
+                    scene: QueryValue::Invalid,
+                    ..CompareQuery::default()
+                },
+            ),
+            CompareResolution::Unavailable(unavailable.clone())
+        );
+        let (_, _, actions) = unavailable.content().expect("recovery content");
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.path == "/compare?a=sunlit&av=1.0.0&b=cold&bv=1.0.0")
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_identifiers_reach_their_recovery_state() {
+        let index = published_index(vec![
+            look("sunlit", LookVisibility::Public, &["1.0.0"]),
+            look("cold", LookVisibility::Public, &["1.0.0"]),
+        ]);
+        assert_eq!(
+            resolve_comparison(
+                &index,
+                &CompareQuery {
+                    a: QueryValue::Invalid,
+                    ..CompareQuery::default()
+                },
+            ),
+            CompareResolution::Unavailable(Unavailable::InvalidLook)
+        );
+        assert_eq!(
+            resolve_comparison(
+                &index,
+                &CompareQuery {
+                    b: QueryValue::Invalid,
+                    ..CompareQuery::default()
+                },
+            ),
+            CompareResolution::Unavailable(Unavailable::InvalidLook)
+        );
+        assert_eq!(
+            resolve_comparison(
+                &index,
+                &CompareQuery {
+                    a_version: QueryValue::Invalid,
+                    ..CompareQuery::default()
+                },
+            ),
+            CompareResolution::Unavailable(Unavailable::InvalidVersion)
+        );
+        assert_eq!(
+            resolve_comparison(
+                &index,
+                &CompareQuery {
+                    b_version: QueryValue::Invalid,
+                    ..CompareQuery::default()
+                },
+            ),
+            CompareResolution::Unavailable(Unavailable::InvalidVersion)
+        );
+    }
+
+    #[test]
+    fn catalog_without_sample_photos_is_unavailable() {
+        let index = index(
+            vec![
+                look("sunlit", LookVisibility::Public, &["1.0.0"]),
+                look("cold", LookVisibility::Public, &["1.0.0"]),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            resolve_comparison(&index, &query(None, None)),
+            CompareResolution::Unavailable(Unavailable::NoScenes)
+        );
     }
 }

@@ -11,17 +11,31 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{MessageEvent, Worker, WorkerOptions, WorkerType};
 
 use crate::base::site_url;
+use looklab_wasm::prep::ModuleFunction;
 use looklab_wasm::{
-    RECYCLE_AFTER_FILES, RECYCLE_MEMORY_FRACTION, WORKER_BUDGET_BYTES, WORKER_FN_MATCH,
-    WORKER_FN_VERIFY,
+    RECYCLE_AFTER_FILES, RECYCLE_MEMORY_FRACTION, WORKER_BUDGET_BYTES, WORKER_FN_EXPORT,
+    WORKER_FN_MATCH, WORKER_FN_VERIFY, check_module_version, module_fn_id, version_request,
 };
 
 pub const FILE_TIMEOUT_MS: i32 = 60_000;
+
+const MODULE_MISMATCH: &str = concat!(
+    "This page and its preparation module are different versions. ",
+    "Reload the page, then prepare your files again.",
+);
 
 const TIMEOUT_MARKER: &str = "__looklab_timeout__";
 const TYPE: &str = "type";
 const MESSAGE: &str = "message";
 const TRAP: &str = "trap";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerMessageKind {
+    Result,
+    Error,
+    ClientError,
+    Other,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkerReply {
@@ -73,7 +87,11 @@ impl WorkerLink {
         let pending: Rc<RefCell<Option<Function>>> = Rc::new(RefCell::new(None));
         let message_slot = Rc::clone(&pending);
         let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            if let Some(reply) = reply_from(&event.data()) {
+            let data = event.data();
+            let kind = message_kind(&data);
+            if kind == WorkerMessageKind::ClientError {
+                forward_client_error(&data);
+            } else if let Some(reply) = reply_from(kind, &data) {
                 settle(&message_slot, reply);
             }
         });
@@ -181,6 +199,7 @@ pub struct PrepWorker {
     files: u64,
     memory: u64,
     dead: bool,
+    verified: bool,
 }
 
 impl PrepWorker {
@@ -190,36 +209,74 @@ impl PrepWorker {
         let script = site_url("/workers/prep-worker.js");
         let module = site_url("/generated/wasm/looklab_prep_module.wasm");
         let link = WorkerLink::spawn(&script)?;
-        link.post(&[("type", "init"), ("url", &module)])?;
+        link.post(&[("type", "init"), ("url", &module), ("diagnostics", "1")])?;
         Ok(Self {
             link,
             files: 0,
             memory: 0,
             dead: false,
+            verified: false,
         })
     }
 
     /// # Errors
-    /// Reports a worker that trapped, timed out or answered with an error.
+    /// Reports a trap, timeout, error or a module built from different versions.
     pub async fn call(
         &mut self,
         function: u32,
         bytes: Vec<u8>,
     ) -> Result<WorkerReply, WorkerFailure> {
+        if !self.verified {
+            self.check_version().await?;
+        }
+        self.send(function, bytes).await
+    }
+
+    async fn check_version(&mut self) -> Result<(), WorkerFailure> {
+        let request = version_request();
+        let reply = match self
+            .link
+            .call(
+                module_fn_id(ModuleFunction::Version),
+                &request,
+                FILE_TIMEOUT_MS,
+            )
+            .await
+        {
+            Ok(reply) => reply,
+            Err(failure) => return Err(self.stop(failure)),
+        };
+        if check_module_version(&reply.bytes).is_err() {
+            return Err(self.module_mismatch());
+        }
+        self.verified = true;
+        self.memory = reply.memory;
+        Ok(())
+    }
+
+    fn module_mismatch(&mut self) -> WorkerFailure {
+        self.dead = true;
+        self.link.terminate();
+        WorkerFailure::Module(MODULE_MISMATCH.to_owned())
+    }
+
+    async fn send(&mut self, function: u32, bytes: Vec<u8>) -> Result<WorkerReply, WorkerFailure> {
         match self.link.call(function, &bytes, FILE_TIMEOUT_MS).await {
             Ok(reply) => {
                 self.files += 1;
                 self.memory = reply.memory;
                 Ok(reply)
             }
-            Err(failure) => {
-                if failure.kills_worker() {
-                    self.dead = true;
-                    self.link.terminate();
-                }
-                Err(failure)
-            }
+            Err(failure) => Err(self.stop(failure)),
         }
+    }
+
+    fn stop(&mut self, failure: WorkerFailure) -> WorkerFailure {
+        if failure.kills_worker() {
+            self.dead = true;
+            self.link.terminate();
+        }
+        failure
     }
 
     pub fn should_recycle(&self) -> bool {
@@ -248,7 +305,7 @@ impl MatchWorker {
         let script = site_url("/workers/match-worker.js");
         let module = site_url("/generated/wasm/looklab_match.wasm");
         let link = WorkerLink::spawn(&script)?;
-        link.post(&[("type", "init"), ("url", &module)])?;
+        link.post(&[("type", "init"), ("url", &module), ("diagnostics", "1")])?;
         Ok(Self { link })
     }
 
@@ -271,6 +328,14 @@ impl MatchWorker {
             .map(|reply| reply.bytes)
             .map_err(|error| MatchFailure(error.message()))
     }
+
+    pub async fn run_export(&self, request: &[u8]) -> Result<Vec<u8>, MatchFailure> {
+        self.link
+            .call(WORKER_FN_EXPORT, request, FILE_TIMEOUT_MS)
+            .await
+            .map(|reply| reply.bytes)
+            .map_err(|error| MatchFailure(error.message()))
+    }
 }
 
 #[repr(u32)]
@@ -289,6 +354,7 @@ pub(crate) async fn prepare_scene(
             "url",
             &site_url("/generated/wasm/looklab_scene_module.wasm"),
         ),
+        ("diagnostics", "1"),
     ])?;
     let reply = link
         .call(SceneOperation::Prepare as u32, png, FILE_TIMEOUT_MS)
@@ -346,14 +412,23 @@ fn settle(slot: &Rc<RefCell<Option<Function>>>, reply: JsValue) {
     }
 }
 
-fn reply_from(data: &JsValue) -> Option<JsValue> {
-    match field_string(data, TYPE).as_deref() {
-        Some("result") => read_reply(data),
-        Some("error") => failure_reply(
+fn message_kind(value: &JsValue) -> WorkerMessageKind {
+    match field_string(value, TYPE).as_deref() {
+        Some("result") => WorkerMessageKind::Result,
+        Some("error") => WorkerMessageKind::Error,
+        Some("client-error") => WorkerMessageKind::ClientError,
+        _ => WorkerMessageKind::Other,
+    }
+}
+
+fn reply_from(kind: WorkerMessageKind, data: &JsValue) -> Option<JsValue> {
+    match kind {
+        WorkerMessageKind::Result => read_reply(data),
+        WorkerMessageKind::Error => failure_reply(
             &field_string(data, MESSAGE).unwrap_or_else(|| "worker error".to_owned()),
             field_bool(data, TRAP),
         ),
-        _ => None,
+        WorkerMessageKind::ClientError | WorkerMessageKind::Other => None,
     }
 }
 
@@ -368,6 +443,20 @@ fn field_bool(value: &JsValue, key: &str) -> bool {
         .ok()
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+}
+
+fn forward_client_error(data: &JsValue) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(handler) = Reflect::get(&window, &JsValue::from_str("__looklabWorkerClientError"))
+    else {
+        return;
+    };
+    let Some(handler) = handler.dyn_ref::<Function>() else {
+        return;
+    };
+    let _ = handler.call1(&JsValue::NULL, data);
 }
 
 fn read_reply(value: &JsValue) -> Option<JsValue> {

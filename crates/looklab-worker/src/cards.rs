@@ -2,7 +2,7 @@
 //! Per-firmware verification of card renders against the Look version their
 //! render tag names ([docs/04 §8.4]).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use looklab_color::ucs::delta_e_ucs;
 use looklab_color::{Mat3, Rgb, RgbSpace, Xyz};
@@ -34,12 +34,13 @@ struct VerdictKey {
 pub async fn run(db_pool: &SqlitePool, config: &WorkerConfig) -> Result<()> {
     let rows = sqlx::query(
         "SELECT id, card, body_id FROM contributions
-         WHERE intent = 'card' AND status = 'accepted' ORDER BY id",
+         WHERE intent = 'card' AND status = 'accepted' AND render_class = 'colour' ORDER BY id",
     )
     .fetch_all(db_pool)
     .await?;
 
     let mut transforms: HashMap<BodyId, crate::body::BodyTransforms> = HashMap::new();
+    let mut unavailable: HashSet<BodyId> = HashSet::new();
     let mut looks: HashMap<(String, String), Look> = HashMap::new();
     let mut groups: BTreeMap<VerdictKey, Vec<f64>> = BTreeMap::new();
 
@@ -53,11 +54,20 @@ pub async fn run(db_pool: &SqlitePool, config: &WorkerConfig) -> Result<()> {
             .as_deref()
             .map(serde_json::from_str::<CardDeclaration>)
             .transpose()?;
+        if unavailable.contains(&body) {
+            continue;
+        }
         if !transforms.contains_key(&body) {
-            transforms.insert(
-                body.clone(),
-                TransformDir::new(&config.transforms).load(&body)?,
-            );
+            match TransformDir::new(&config.transforms).load_optional(&body)? {
+                Some(loaded) => {
+                    transforms.insert(body.clone(), loaded);
+                }
+                None => {
+                    tracing::warn!(%body, "skipping card verification: no input transform");
+                    unavailable.insert(body.clone());
+                    continue;
+                }
+            }
         }
         let images = sqlx::query(
             "SELECT samples_hash, meta FROM contribution_images
@@ -139,7 +149,9 @@ pub async fn validate(
     contribution_id: &looklab_server::ContributionId,
 ) -> Result<()> {
     let contribution = db::contribution(db_pool, contribution_id).await?;
-    if contribution.status == db::ContributionStatus::Withdrawn {
+    if contribution.status == db::ContributionStatus::Withdrawn
+        || contribution.render_class == looklab_upload::RenderClass::Monochrome
+    {
         return Ok(());
     }
     let declaration = card_declaration(db_pool, contribution_id).await?;

@@ -11,11 +11,12 @@ use looklab_samples::{
     InputSpace, OutputSpace, PrepParamsHash, PrepVersion, PriorTransformVersion, SampleFlags,
     SampleHeader, SampleSet,
 };
-use looklab_schema::{ControlSchema, SimKey};
+use looklab_schema::{ControlSchema, OutputEncoding, SimKey};
 use rand_chacha::ChaCha12Rng;
 use rand_chacha::rand_core::{RngCore, SeedableRng};
 
 use crate::error::{MatchError, Result};
+use crate::metric::{OutputPin, TargetAppearance};
 use crate::model::MatchModel;
 use crate::settings::Plan;
 use crate::target::TargetFunction;
@@ -42,6 +43,13 @@ impl SyntheticBody {
             settings: self.settings.clone(),
         }
     }
+
+    pub fn appearance(&self) -> TargetAppearance {
+        TargetAppearance::Rendered(
+            OutputPin::new(OutputEncoding::Srgb, self.model.base_look.clip.k)
+                .expect("synthetic clip is valid"),
+        )
+    }
 }
 
 pub struct RealizationTarget {
@@ -52,7 +60,7 @@ pub struct RealizationTarget {
 impl TargetFunction for RealizationTarget {
     fn predict(&self, xyz: Xyz) -> Ucs {
         self.model
-            .predict(&self.settings, xyz)
+            .predict_pre_clip(&self.settings, xyz)
             .expect("synthetic control-response model is valid")
     }
 }
@@ -78,6 +86,102 @@ pub fn body(seed: u64) -> Result<SyntheticBody> {
     body_for_sim(seed, &sim)
 }
 
+pub fn identifiable_body(seed: u64) -> Result<SyntheticBody> {
+    let sim = SimKey::new(SYNTH_SIM).map_err(|error| MatchError::Schema(error.to_string()))?;
+    identifiable_body_for_sim(seed, &sim)
+}
+
+pub fn identifiable_body_for_sim(seed: u64, sim: &SimKey) -> Result<SyntheticBody> {
+    let mut body = body_for_sim(seed, sim)?;
+    complete_response_curves(&mut body)?;
+    Ok(body)
+}
+
+fn complete_response_curves(body: &mut SyntheticBody) -> Result<()> {
+    let plan = plan();
+    for control in &mut body.model.crm.controls {
+        let Some(&index) = plan.by_key.get(&control.key) else {
+            continue;
+        };
+        let selected = body
+            .settings
+            .get(&control.key)
+            .cloned()
+            .unwrap_or_else(|| control.default.clone());
+        let Some(selected_response) = control
+            .values
+            .iter()
+            .find(|response| response.value == selected)
+        else {
+            continue;
+        };
+        if selected_response.delta.layers.is_empty() {
+            continue;
+        }
+        let selected_strength = value_strength(&plan, index, &selected);
+        if selected_strength == 0.0 {
+            continue;
+        }
+        let selected_delta = selected_response.delta.clone();
+        for response in &mut control.values {
+            let strength = value_strength(&plan, index, &response.value);
+            response.delta = scale_delta(&selected_delta, strength / selected_strength);
+        }
+    }
+    for control in &mut body.model.crm.wb.controls {
+        let Some(&index) = plan.by_key.get(&control.key) else {
+            continue;
+        };
+        let selected = body
+            .settings
+            .get(&control.key)
+            .cloned()
+            .unwrap_or_else(|| control.default.clone());
+        let Some(selected_response) = control
+            .values
+            .iter()
+            .find(|response| response.value == selected)
+        else {
+            continue;
+        };
+        if selected_response.log_gain == [0.0, 0.0] {
+            continue;
+        }
+        let selected_strength = value_strength(&plan, index, &selected);
+        if selected_strength == 0.0 {
+            continue;
+        }
+        let selected_gain = selected_response.log_gain;
+        for response in &mut control.values {
+            let strength = value_strength(&plan, index, &response.value);
+            let ratio = strength / selected_strength;
+            response.log_gain = [selected_gain[0] * ratio, selected_gain[1] * ratio];
+        }
+    }
+    Ok(())
+}
+
+fn value_strength(plan: &Plan, control: usize, value: &ControlValue) -> f64 {
+    let domain = &plan.domains[control];
+    let index = domain
+        .index_of(value)
+        .expect("control value belongs to the plan domain");
+    match (value, domain.default_value()) {
+        (ControlValue::Step(value), ControlValue::Step(default)) => (*value - *default) as f64,
+        _ => index as f64 - domain.default as f64,
+    }
+}
+
+fn scale_delta(delta: &Delta, factor: f64) -> Delta {
+    let mut scaled = delta.clone();
+    for layer in &mut scaled.layers {
+        for (_, coefficient) in &mut layer.entries {
+            *coefficient *= factor;
+        }
+    }
+    scaled
+}
+
 pub fn body_for_sim(seed: u64, sim: &SimKey) -> Result<SyntheticBody> {
     let schema = schema();
     let plan = plan();
@@ -86,9 +190,22 @@ pub fn body_for_sim(seed: u64, sim: &SimKey) -> Result<SyntheticBody> {
     let mut crm = ControlResponseModel::zeroed(&schema, 1, sim, 1)
         .map_err(|error| MatchError::Schema(error.to_string()))?;
     let mut settings = plan.default.clone();
+    let family = schema
+        .epochs
+        .iter()
+        .find(|epoch| epoch.id == 1)
+        .and_then(|epoch| epoch.native_sim(sim))
+        .map(|native| &native.look);
+    let applies = |key: &looklab_schema::ControlKey| match family {
+        Some(family) => plan
+            .by_key
+            .get(key)
+            .is_some_and(|index| plan.controls[*index].scope.includes(family)),
+        None => true,
+    };
 
     for control in &mut crm.controls {
-        if !plan.by_key.contains_key(&control.key) || control.values.is_empty() {
+        if !applies(&control.key) || control.values.is_empty() {
             continue;
         }
         let pick = 1 + (rng.next_u32() as usize % control.values.len());
@@ -125,7 +242,7 @@ pub fn body_for_sim(seed: u64, sim: &SimKey) -> Result<SyntheticBody> {
     }
 
     for control in &mut crm.wb.controls {
-        if !plan.by_key.contains_key(&control.key) {
+        if !applies(&control.key) {
             continue;
         }
         if control.values.is_empty() {
@@ -169,7 +286,15 @@ pub fn body_for_sim(seed: u64, sim: &SimKey) -> Result<SyntheticBody> {
 
     crm.validate()
         .map_err(|error| MatchError::Schema(error.to_string()))?;
-    let model = MatchModel::new(base_look, crm, transform(), None, 1, 1)?;
+    let model = MatchModel::new(
+        base_look,
+        crm,
+        transform(),
+        None,
+        1,
+        1,
+        OutputEncoding::Srgb,
+    )?;
     Ok(SyntheticBody { model, settings })
 }
 
@@ -203,7 +328,7 @@ pub fn observed(
         {
             continue;
         }
-        let prediction = model.predict(settings, scene)?;
+        let prediction = model.render(settings, scene)?;
         let jmh = ucs_to_jmh(prediction, UcsSpace::Ucs);
         let xyz = reference_model().jmh_to_xyz(jmh);
         let linear = RgbSpace::Srgb.xyz_to_rgb_linear(xyz);

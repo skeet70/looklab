@@ -16,11 +16,33 @@ mod outlier;
 mod predict;
 mod problem;
 mod solve;
+mod trust_region;
 mod types;
 mod uncertainty;
 
 #[cfg(feature = "synth")]
 pub mod synth;
+
+#[cfg(feature = "synth")]
+pub use fit::{
+    FixedLinearizationBoxSource, FixedLinearizationCandidate, FixedLinearizationDisposition,
+    FixedLinearizationInput, FixedLinearizationOperations, FixedLinearizationOrdinary,
+    FixedLinearizationPartial, FixedLinearizationReference, FixedLinearizationReport,
+    FixedLinearizationStatus, FixedLinearizationTrial, FixedLinearizationWinner,
+    PreconditionerChoice, PreconditionerGroupChoice, diagnose_fixed_linearization,
+};
+
+#[cfg(feature = "synth")]
+pub use fit::fallback_ab::{
+    FallbackArm, FallbackArmReport, FallbackArmStatus, FallbackComparison,
+    FallbackComparisonReport, diagnose_fallback_ab,
+};
+
+#[cfg(feature = "synth")]
+pub use trust_region::{
+    TrustRegionIterationProgress, TrustRegionRefresh, TrustRegionRefreshReason,
+    TrustRegionResidualProgress, TrustRegionTrace,
+};
 
 pub use bootstrap::{
     BOOTSTRAP_RESAMPLES, BootstrapOptions, Cov3, PublishedUncertainty, UncertaintyMethod,
@@ -35,9 +57,13 @@ pub use gauge::{
     ComponentGauge, ExposureGauge, GaugeChange, WbGaugeChange, WbModeClass, merge_gauges,
 };
 pub use hierarchical::{
-    BodyData, BodyGroup, BodyParameters, FIRMWARE_PARAMETERS, FirmwareId, HierDiagnostics,
-    HierImage, HierOptions, HierarchicalFit, LookFamilyId, LookParameters, LookProvenance,
-    firmware_images, firmware_look, firmware_probe_basis, fit_hierarchical,
+    BodyData, BodyGroup, BodyParameters, BodyPin, BodyResume, BodyWarmStart, FIRMWARE_PARAMETERS,
+    FamilyData, FamilyFirmwareId, FamilyMode, FamilyParameters, FamilyResume, FirmwareId,
+    GaugeBinding, GaugeScope, HierDiagnostics, HierFingerprint, HierImage, HierInput,
+    HierLimitation, HierOptions, HierState, HierStateGeneration, HierarchicalFit, LookProvenance,
+    PinnedFamily, RealizationData, RealizationFit, RealizationParameters, RealizationResume,
+    RealizationWarmStart, firmware_images, firmware_look, firmware_probe_basis, fit_hierarchical,
+    fit_realizations,
 };
 pub use looklab_color::{Mat3, RgbSpace, Xyz};
 pub use looklab_model::realization::{
@@ -49,26 +75,21 @@ pub use model_error::{
     estimate_model_error, post_index, region,
 };
 pub use predict::post_clip;
+pub use trust_region::TrustRadius;
 pub use types::{
-    ContributorId, ControlResponseFit, Density, Diagnostics, ExcludeReason, ExcludedImage,
-    ExposureModeId, ExposureOffset, FitError, FitImage, FitOptions, FitResult, FitState,
-    ImageFitStats, ImageIntent, ImageNuisances, ImageScores, OutlierReason, PreviousSupport,
-    ProbeEstimate, ProbeUncertainty, Realization, Result, SampleEvaluations, StageLambdas, Verdict,
+    CertificateOrigin, CertificateTermination, CertificateWork, ContributorId, ControlResponseFit,
+    Density, Diagnostics, ExcludeReason, ExcludedImage, ExposureModeId, ExposureOffset, FitError,
+    FitImage, FitOptions, FitResult, FitStage, FitState, FitStateGeneration, ImageFitStats,
+    ImageIntent, ImageNuisances, ImageScores, ImageWeights, Nats, ObjectiveNats, OutlierReason,
+    PLATEAU_SAMPLES, PlateauHistory, PlateauObjective, PreviousSupport, ProbeEstimate,
+    ProbeUncertainty, Realization, Result, SampleEvaluations, StageImageWeights, StageLambdas,
+    StationarityBounds, StationarityCertificate, StationarityReport, Verdict,
 };
 pub use uncertainty::small_cluster_factor;
 
 /// Fit one body's single Look at the reference control setting.
 pub fn fit(images: &[FitImage], options: &FitOptions) -> Result<FitResult> {
     fit::run(images, options, None)
-}
-
-/// Fit one body's single Look starting from `initial`.
-pub fn fit_with_initial(
-    images: &[FitImage],
-    options: &FitOptions,
-    initial: &Look,
-) -> Result<FitResult> {
-    fit::run_with_initial(images, options, initial)
 }
 
 /// Fit with the previous published support state, for hysteresis.

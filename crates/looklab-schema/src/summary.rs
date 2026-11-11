@@ -8,8 +8,8 @@ use crate::control::Control;
 use crate::ids::ControlKey;
 use crate::interface::{Format, IlluminantHandling, InsertionPoint, InterfaceProfile};
 use crate::proposal::{
-    DATA_LICENSE, EpochSplitProposal, GateOverrideProposal, LookSplitProposal, LutLookProposal,
-    MappingProposal, ValidatedPayload, describe_control,
+    DATA_LICENSE, EpochSplitProposal, GateOverrideProposal, LookSplitProposal, LutEmulationDecl,
+    LutEncoding, LutLookProposal, MappingProposal, ValidatedPayload, describe_control,
 };
 use crate::schema::MakernoteValue;
 
@@ -173,15 +173,36 @@ fn format_name(format: &Format) -> &'static str {
 }
 
 fn lut_summary(look: &LutLookProposal) -> ProposalSummary {
-    ProposalSummary::with_details(
-        format!("adds the LUT-defined look {}", look.name),
-        vec![
-            format!("look id: {}", look.look),
-            format!("license: {}", look.license.describe()),
-            format!("attribution: {}", look.attribution),
-            format!("published under {DATA_LICENSE}"),
-        ],
-    )
+    let mut details = vec![
+        format!("look id: {}", look.look),
+        format!("license: {}", look.license.describe()),
+        format!("attribution: {}", look.attribution),
+        format!("LUT: {} ({} bytes)", look.lut.file, look.lut.size),
+        format!("input: {}", lut_encoding(&look.encoding)),
+    ];
+    if let Some(emulates) = &look.emulates {
+        details.push(format!("emulates: {}", lut_emulation(emulates)));
+    }
+    details.push(format!("published under {DATA_LICENSE}"));
+    ProposalSummary::with_details(format!("adds the LUT-defined look {}", look.name), details)
+}
+
+fn lut_encoding(encoding: &LutEncoding) -> String {
+    match encoding {
+        LutEncoding::Flog2Fgamut => "F-Log2 / F-Gamut".to_owned(),
+        LutEncoding::Display { base } => {
+            format!("display-referred, base {}", base.describe())
+        }
+    }
+}
+
+fn lut_emulation(emulates: &LutEmulationDecl) -> String {
+    match emulates {
+        LutEmulationDecl::CameraRendering { maker, rendering } => {
+            format!("{maker} {rendering}")
+        }
+        LutEmulationDecl::FilmStock { name } => name.clone(),
+    }
 }
 
 fn epoch_summary(split: &EpochSplitProposal) -> ProposalSummary {
@@ -244,12 +265,15 @@ pub(crate) fn menu_words(slug: &str) -> String {
 
 /// Known control keys, in the camera's own menu wording.
 pub(crate) fn menu_label(key: &ControlKey) -> String {
-    const KNOWN: [(&str, &str); 12] = [
+    const KNOWN: [(&str, &str); 15] = [
         ("highlight_tone", "Highlight tone"),
         ("shadow_tone", "Shadow tone"),
         ("color", "Color"),
         ("color_chrome_effect", "Color Chrome effect"),
         ("color_chrome_fx_blue", "Color Chrome FX Blue"),
+        ("mono_filter", "Monochrome filter"),
+        ("bw_adjustment", "BW adjustment"),
+        ("bw_magenta_green", "BW magenta green"),
         ("dynamic_range", "Dynamic range"),
         ("wb_shift_r", "White balance shift R"),
         ("wb_shift_b", "White balance shift B"),

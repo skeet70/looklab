@@ -7,18 +7,20 @@ use leptos::task::spawn_local;
 use looklab_meta::ParsedMetadata;
 use looklab_prep::LocalImageKey;
 use looklab_upload::{
-    CardDeclaration, ContributionKind, FirmwareId, FirmwareVersion, RenderTag, SettingSource,
+    AttestationHash, CardDeclaration, ContributionKind, FirmwareId, FirmwareVersion,
+    MonochromeAuthorization, RenderClass, RenderTag, SettingSource,
 };
 use looklab_wasm::coverage::{CoverageMap, coverage_map, sample_points};
 use looklab_wasm::prep::{ModuleFunction, default_pow};
 use looklab_wasm::{
-    CardCheckError, ControlSetting, GroupSettings, IntentChoice, PairingPlan, PowParamsSpec,
-    PrepSummary, PreparedImageView, build_manifest_request, check_card,
-    decode_build_manifest_reply, decode_encode_reply, decode_pow_reply, decode_prepare_reply,
+    CardCheckError, ControlSetting, GroupSettings, IntentChoice, ManualConfirmationEnvelope,
+    PairingPlan, PowParamsSpec, PrepSummary, PreparedImageView, build_manifest_request,
+    build_send_manifest_request, check_card, decode_build_manifest_reply,
+    decode_build_send_manifest_reply, decode_encode_reply, decode_pow_reply, decode_prepare_reply,
     encode_envelope_request, inspect_metadata, module_fn_id, prefill_settings_parsed,
     prepare_request, serial_ascii_from_metadata, solve_pow_request,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::future::Future;
 use std::pin::Pin;
@@ -28,6 +30,7 @@ use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
 use super::bounties::{Impact, WantedCards};
+use super::manual_confirm::ManualConfirmationPanel;
 use crate::data;
 use crate::files::{
     ContributionDraftStore, DraftFile, LocalFile, download, draft_file_entries, read_draft_file,
@@ -38,6 +41,10 @@ use crate::worker::{PrepWorker, default_worker_count, max_worker_count};
 use crate::{idb, webauthn};
 
 const PRIOR_VERSION: u32 = 1;
+
+/// Shown for a B&W render whose batch did not select monochrome model development.
+const MONOCHROME_UNSELECTED: &str =
+    "B&W render left out: monochrome model development is not selected for this batch";
 
 /// Identifies one upload manifest within a drop.
 #[derive(
@@ -95,6 +102,8 @@ pub(crate) struct GroupFields {
     pub(crate) card: bool,
     pub(crate) card_firmware_id: String,
     pub(crate) card_firmware_version: String,
+    /// The contributor selected this batch's B&W renders for monochrome model development.
+    pub(crate) monochrome_opt_in: bool,
 }
 
 /// One manifest: renders sharing a body, firmware version, look and settings.
@@ -107,13 +116,18 @@ pub(crate) struct ContributionGroup {
     pub(crate) fields: GroupFields,
     pub(crate) serial_opt_in: bool,
     pub(crate) malformed: bool,
+    pub(crate) blocked: Option<String>,
     pub(crate) unavailable: Vec<String>,
     pub(crate) notes: Vec<String>,
     /// Controls the makernotes reproduced; every other control in the settings is declared.
     pub(crate) reproduced: Vec<(String, i64)>,
     /// Look-affecting controls the schema maps from no tag; each needs a declared value.
     pub(crate) unmapped: Vec<String>,
-    /// Never prepared.
+    /// The schema's normalized family for this batch's native sim.
+    pub(crate) family: Option<looklab_schema::LookId>,
+    /// The normalized filter for a monochrome family; Sepia carries toning, not a filter.
+    pub(crate) mono_filter: Option<looklab_schema::MonoFilter>,
+    /// The batch's renders the schema classifies as monochrome.
     pub(crate) monochrome: Vec<looklab_wasm::MonochromeRender>,
 }
 
@@ -122,6 +136,15 @@ pub(crate) struct ContributionGroup {
 pub(crate) struct BatchSet {
     groups: Vec<ContributionGroup>,
     next: u64,
+}
+
+fn active_bodies(set: &BatchSet) -> BTreeSet<String> {
+    set.groups()
+        .iter()
+        .filter(|group| !(group.is_monochrome() && !group.fields.monochrome_opt_in))
+        .map(|group| group.fields.body.clone())
+        .filter(|body| !body.is_empty())
+        .collect()
 }
 
 impl BatchSet {
@@ -222,6 +245,7 @@ impl ContributionGroup {
                 recipe: false,
                 target: String::new(),
                 card: reading.card.is_some(),
+                monochrome_opt_in: false,
                 card_firmware_id: reading
                     .card
                     .as_ref()
@@ -235,11 +259,19 @@ impl ContributionGroup {
             },
             serial_opt_in: false,
             malformed: reading.malformed,
+            blocked: reading.blocked.clone(),
             unavailable: Vec::new(),
             notes: Vec::new(),
             reproduced: reading.controls.clone(),
             unmapped: Vec::new(),
-            monochrome: reading.monochrome.clone(),
+            family: reading.family.clone(),
+            mono_filter: reading.mono_filter,
+            monochrome: reading
+                .monochrome
+                .iter()
+                .filter(|render| render.file == reading.render.as_str())
+                .cloned()
+                .collect(),
         };
         group.absorb(reading);
         group
@@ -247,11 +279,21 @@ impl ContributionGroup {
 
     fn absorb(&mut self, reading: &PairReading) {
         self.malformed |= reading.malformed;
+        if self.blocked.is_none() {
+            self.blocked = reading.blocked.clone();
+        }
+        if self.family.is_none() {
+            self.family = reading.family.clone();
+        }
+        if self.mono_filter.is_none() {
+            self.mono_filter = reading.mono_filter;
+        }
         for render in &reading.monochrome {
-            if !self
-                .monochrome
-                .iter()
-                .any(|known| known.file == render.file)
+            if render.file == reading.render.as_str()
+                && !self
+                    .monochrome
+                    .iter()
+                    .any(|known| known.file == render.file)
             {
                 self.monochrome.push(render.clone());
             }
@@ -273,6 +315,22 @@ impl ContributionGroup {
             }
         }
     }
+
+    /// The batch's own renders the schema classifies as monochrome.
+    fn monochrome_renders(&self) -> usize {
+        self.renders
+            .iter()
+            .filter(|render| {
+                self.monochrome
+                    .iter()
+                    .any(|known| known.file == render.as_str())
+            })
+            .count()
+    }
+
+    fn is_monochrome(&self) -> bool {
+        self.monochrome_renders() > 0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -286,6 +344,7 @@ struct GroupKey {
     camera: Option<CameraKey>,
     firmware: Option<looklab_upload::FirmwareVersionString>,
     sim: Option<String>,
+    render_class: looklab_upload::RenderClass,
     controls: Vec<(String, i64)>,
     card: Option<RenderTag>,
     malformed: bool,
@@ -307,6 +366,10 @@ pub(crate) struct PairReading {
     pub(crate) unmapped: Vec<String>,
     pub(crate) card: Option<RenderTag>,
     pub(crate) malformed: bool,
+    pub(crate) blocked: Option<String>,
+    pub(crate) render_class: looklab_upload::RenderClass,
+    pub(crate) family: Option<looklab_schema::LookId>,
+    pub(crate) mono_filter: Option<looklab_schema::MonoFilter>,
     pub(crate) monochrome: Vec<looklab_wasm::MonochromeRender>,
     pub(crate) note: Option<String>,
 }
@@ -317,6 +380,7 @@ impl PairReading {
             camera: self.camera.clone(),
             firmware: looklab_upload::FirmwareVersionString::new(&self.firmware).ok(),
             sim: self.sim.clone(),
+            render_class: self.render_class,
             controls: self.controls.clone(),
             card: self.card.clone(),
             malformed: self.malformed,
@@ -513,6 +577,13 @@ enum Stage {
     Inspector,
     Send,
     Done,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SentSummary {
+    pub(crate) renders: usize,
+    pub(crate) deferred: usize,
+    pub(crate) cameras: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -748,6 +819,7 @@ pub fn ContributePage() -> impl IntoView {
     let session_context = crate::session::use_session();
     let stage = RwSignal::new(Stage::Drop);
     let current = RwSignal::new(StepIndex(0));
+    let furthest = RwSignal::new(StepIndex(0));
     let file_picker = NodeRef::<leptos::html::Input>::new();
     let selected_help = RwSignal::new(HelpWay::ExistingPhotos);
     let help_open = RwSignal::new(false);
@@ -766,6 +838,42 @@ pub fn ContributePage() -> impl IntoView {
     let parsed_metadata = StoredValue::new_local(Vec::<(String, ParsedMetadata)>::new());
     let batches = RwSignal::new(BatchSet::default());
     let batch_epoch = RwSignal::new(0_u64);
+    let manuals = RwSignal::new(BTreeMap::<String, looklab_publish::ManualPage>::new());
+    let manual_envelopes = RwSignal::new(BTreeMap::<String, ManualConfirmationEnvelope>::new());
+    let manual_error = RwSignal::new(None::<String>);
+    let confirmation_notice = RwSignal::new(None::<String>);
+    let requested_manuals = StoredValue::new_local(BTreeSet::<String>::new());
+    Effect::new(move |_| {
+        let _ = batch_epoch.get();
+        let active = batches.with(active_bodies);
+        manual_envelopes.update(|envelopes| envelopes.retain(|id, _| active.contains(id)));
+        for id in active {
+            if manuals.with(|manuals| manuals.contains_key(&id))
+                || requested_manuals.with_value(|requested| requested.contains(&id))
+            {
+                continue;
+            }
+            let Ok(body) = looklab_schema::BodyId::new(&id) else {
+                continue;
+            };
+            requested_manuals.update_value(|requested| {
+                requested.insert(id.clone());
+            });
+            let make = body.make().to_owned();
+            let model = body.model().to_owned();
+            spawn_local(async move {
+                match data::manual(&make, &model).await {
+                    Ok(Some(page)) => {
+                        manuals.update(|manuals| {
+                            manuals.insert(id, page);
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => manual_error.set(Some(error)),
+                }
+            });
+        }
+    });
     let selected_batch = RwSignal::new(None::<BatchId>);
     let catalog = RwSignal::new(None::<GroupCatalog>);
     let snapshot_version = RwSignal::new(0_u64);
@@ -777,8 +885,23 @@ pub fn ContributePage() -> impl IntoView {
     let coverage = RwSignal::new(None::<CoverageMap>);
     let points = RwSignal::new(Vec::<[f32; 3]>::new());
     let failures = RwSignal::new(Vec::<FailureRow>::new());
+    let send_parts = RwSignal::new(None::<(usize, usize)>);
+    let sent_summary = RwSignal::new(None::<SentSummary>);
     let busy = RwSignal::new(false);
+    let reload_required = RwSignal::new(false);
     let message = RwSignal::new(None::<String>);
+    let invalidate_preparation = Callback::new(move |()| {
+        processed.set(Vec::new());
+        seeds.set(Vec::new());
+        failures.set(Vec::new());
+        coverage.set(None);
+        points.set(Vec::new());
+        furthest.set(StepIndex(1));
+        current.set(StepIndex(1));
+        message.set(Some(
+            "Your B&W selection changed. Process these photos again before sending.".to_owned(),
+        ));
+    });
     let on_help_choose = Callback::new(move |event: leptos::ev::MouseEvent| {
         help_open.set(false);
         current.set(StepIndex(0));
@@ -942,8 +1065,9 @@ pub fn ContributePage() -> impl IntoView {
             files: draft_files.get(),
             batches: batches.with(|set| set.groups().to_vec()),
         };
+        let retain_prepared = processed.with(|groups| !groups.is_empty());
         if let Ok(text) = serde_json::to_string(&draft) {
-            draft_store.with_value(|store| store.schedule(&text));
+            draft_store.with_value(|store| store.schedule(&text, retain_prepared));
         }
     });
     spawn_local(async move {
@@ -1001,6 +1125,7 @@ pub fn ContributePage() -> impl IntoView {
                     failures.set(Vec::new());
                     coverage.set(None);
                     points.set(Vec::new());
+                    furthest.set(StepIndex(1));
                     draft_complete.set(false);
                     status_links.set(Vec::new());
                     match draft_file_entries(&files) {
@@ -1043,6 +1168,7 @@ pub fn ContributePage() -> impl IntoView {
         let count = worker_count.get().max(1);
         busy.set(true);
         processed.set(Vec::new());
+        furthest.set(StepIndex(2));
         current.set(StepIndex(2));
         message.set(Some(
             "Processing locally. Nothing leaves this page yet.".to_owned(),
@@ -1137,6 +1263,9 @@ pub fn ContributePage() -> impl IntoView {
             if completed.with(|done| done.contains(&group.id)) {
                 continue;
             }
+            if group.is_monochrome() && !group.fields.monochrome_opt_in {
+                continue;
+            }
             let images = prepared_images_of(&processed_groups, group.id);
             if images.is_empty() {
                 continue;
@@ -1165,13 +1294,42 @@ pub fn ContributePage() -> impl IntoView {
             } else {
                 None
             };
-            pending.push((group.id, settings, images, serial));
+            pending.push(PendingBatch {
+                id: group.id,
+                settings,
+                images,
+                serial,
+            });
         }
         if pending.is_empty() {
             message.set(Some("Nothing is left to send.".to_owned()));
             return;
         }
-        let total = pending.len();
+        let photos = pending.iter().map(|batch| batch.images.len()).sum();
+        let sent = sent_summary_of(&pending);
+        let sending_bodies = pending
+            .iter()
+            .map(|batch| batch.settings.body.clone())
+            .collect::<BTreeSet<_>>();
+        let mut confirmations = manual_envelopes
+            .get_untracked()
+            .into_iter()
+            .filter(|(id, _)| sending_bodies.contains(id))
+            .map(|(id, envelope)| {
+                let label = manuals
+                    .with(|manuals| {
+                        manuals
+                            .get(&id)
+                            .map(|manual| format!("{} {}", manual.make, manual.model))
+                    })
+                    .unwrap_or(id);
+                (label, envelope)
+            })
+            .collect::<Vec<_>>();
+        let skipped_confirmations = confirmations
+            .len()
+            .saturating_sub(looklab_upload::DEFAULT_MAX_ATTESTATIONS);
+        confirmations.truncate(looklab_upload::DEFAULT_MAX_ATTESTATIONS);
         busy.set(true);
         spawn_local(async move {
             if let Err(error) = validate_batch_sims(&set).await {
@@ -1179,43 +1337,84 @@ pub fn ContributePage() -> impl IntoView {
                 busy.set(false);
                 return;
             }
-            let mut sent = Vec::new();
-            for (position, (id, settings, images, serial)) in pending.into_iter().enumerate() {
-                let number = position + 1;
-                message.set(Some(format!(
-                    "Batch {number} of {total}: confirm on your device. Preparing upload (this keeps spam out)."
-                )));
-                match upload_batch(session_context, settings, images, serial).await {
-                    Ok(reply) => {
-                        if let Some(token) = reply.status_token.as_ref()
-                            && let Ok(token) = webauthn::StatusToken::try_from(token.clone())
-                        {
-                            let context = session_context;
-                            if let crate::session::SessionState::SignedIn(mut profile) =
-                                context.state.get_untracked()
-                            {
-                                profile.status_token = token;
-                                if context.set_signed_in(profile.clone()).await.is_err() {
-                                    context
-                                        .state
-                                        .set(crate::session::SessionState::SignedIn(profile));
-                                }
-                            }
+            send_parts.set(Some((0, photos)));
+            message.set(Some(
+                "Confirm once on your device. Preparing your photos (this keeps spam out)."
+                    .to_owned(),
+            ));
+            let outcome = upload_send(session_context, pending, confirmations, send_parts).await;
+            if outcome.reload_required {
+                reload_required.set(true);
+            }
+            for (id, reply) in outcome.accepted {
+                if let Some(token) = reply.status_token.as_ref()
+                    && let Ok(token) = webauthn::StatusToken::try_from(token.clone())
+                {
+                    let context = session_context;
+                    if let crate::session::SessionState::SignedIn(mut profile) =
+                        context.state.get_untracked()
+                    {
+                        profile.status_token = token;
+                        if context.set_signed_in(profile.clone()).await.is_err() {
+                            context
+                                .state
+                                .set(crate::session::SessionState::SignedIn(profile));
                         }
-                        if let Some(token) = reply.status_token.as_ref() {
-                            let link = crate::base::site_url(&format!("/status/{token}"));
-                            status_links.update(|links| links.push(link));
-                        }
-                        completed.update(|done| done.push(id));
-                        sent.push(reply.contribution_id);
-                    }
-                    Err(error) => {
-                        message.set(Some(format!("Batch {} of {total}: {error}", position + 1)));
-                        busy.set(false);
-                        return;
                     }
                 }
+                if let Some(token) = reply.status_token.as_ref() {
+                    let link = crate::base::site_url(&format!("/status/{token}"));
+                    status_links.update(|links| links.push(link));
+                }
+                completed.update(|done| done.push(id));
             }
+            if let Some((_, error)) = outcome.error {
+                message.set(Some(format!("Your photos could not all be sent: {error}")));
+                busy.set(false);
+                return;
+            }
+            let failed = outcome
+                .confirmations
+                .iter()
+                .filter_map(|(label, result)| {
+                    result
+                        .as_ref()
+                        .err()
+                        .map(|error| format!("{label}: {error}"))
+                })
+                .collect::<Vec<_>>();
+            let recorded = outcome
+                .confirmations
+                .iter()
+                .filter(|(_, result)| result.is_ok())
+                .count();
+            let mut notes = Vec::new();
+            if skipped_confirmations > 0 {
+                notes.push(format!(
+                    "{skipped_confirmations} camera confirmation(s) were not included because one send holds at most {}.",
+                    looklab_upload::DEFAULT_MAX_ATTESTATIONS
+                ));
+            }
+            if failed.is_empty() {
+                if recorded > 0 {
+                    notes.push(format!(
+                        "Camera confirmation recorded for {recorded} {}.",
+                        if recorded == 1 { "camera" } else { "cameras" }
+                    ));
+                }
+            } else {
+                notes.push(format!(
+                    "Your photos were sent. The camera confirmation could not be recorded: {}. You can try again from the camera page.",
+                    failed.join("; ")
+                ));
+            }
+            confirmation_notice.set(if notes.is_empty() {
+                None
+            } else {
+                Some(notes.join(" "))
+            });
+            sent_summary.set(Some(sent));
+            message.set(None);
             draft_complete.set(true);
             let pending = draft_store.with_value(ContributionDraftStore::clear);
             let _ = wasm_bindgen_futures::JsFuture::from(pending).await;
@@ -1223,16 +1422,13 @@ pub fn ContributePage() -> impl IntoView {
             completed.set(Vec::new());
             processed.set(Vec::new());
             seeds.set(Vec::new());
-            all_files.set(Vec::new());
+            let excluded = failures.get_untracked();
+            all_files.update(|files| {
+                files.retain(|file| excluded.iter().any(|row| row.name == file.name()));
+            });
             parsed_metadata.set_value(Vec::new());
             points.set(Vec::new());
             current.set(StepIndex(5));
-            message.set(Some(format!(
-                "Uploaded {} in {} {}.",
-                sent.join(", "),
-                sent.len(),
-                if sent.len() == 1 { "batch" } else { "batches" }
-            )));
             busy.set(false);
         });
     };
@@ -1326,15 +1522,17 @@ pub fn ContributePage() -> impl IntoView {
         });
     };
 
+    let on_donate = Callback::new(donation);
+
     view! {
         <div class="contribute-page">
         <header class="contribute-intro" class:contribution-active=move || stage.get() != Stage::Drop>
-            <p class="eyebrow">"Made together, kept private"</p>
+            <p class="eyebrow">"What helping takes"</p>
             <h1>"Help build looks"</h1>
-            <p class="lede">"Your photos never leave this device. We extract color samples, and you see exactly what's sent before it goes."</p>
-            <p>"Shared color samples help measure the looks photographers love. You need RAW+JPEG pairs from a supported camera, shot with a built-in look."</p>
+            <p class="lede">"Your photos never leave this device. We extract the aesthetic, and you see exactly what's sent before it goes."</p>
+            <p>"Shared samples are how we measure a look. You need RAW+JPEG pairs from a supported camera, shot with a built-in look."</p>
         </header>
-        <p class="notice" hidden=move || !no_platform_store.get()>"This computer can't store passkeys. Your browser will offer to use your phone (scan a QR code) or a security key."</p>
+        <p class="notice" hidden=move || !no_platform_store.get()>{crate::ui::PLATFORM_STORE_UNDETECTED_NOTICE}</p>
         {(!available).then(crate::ui::preview_notice)}
         <section class="ways-to-help" hidden=move || stage.get() != Stage::Drop>
             <h2>"Ways to help"</h2>
@@ -1370,53 +1568,38 @@ pub fn ContributePage() -> impl IntoView {
         }}
         <Stepper
             current
-            steps=[
-                ("Add photos", "Local files only"),
-                ("Check groups", "Settings checked"),
-                ("Process", "Processed on this device"),
-                ("Review", "Color samples reviewed"),
-                ("Send", "Confirmed and sent"),
-                ("Done", "Complete"),
-            ].into_iter().map(|(title, summary)| WizardStep {
-                title: title.to_owned(),
-                summary: Some(summary.to_owned()),
-            }).collect()
+            furthest
+            steps=["Add photos", "Check groups", "Process", "Review", "Send", "Done"]
+                .into_iter()
+                .map(|title| WizardStep { title: title.to_owned(), summary: None })
+                .collect()
             summaries=Signal::derive(move || {
                 let pairs = plan.with(|plan| plan.as_ref().map(|plan| plan.groups.len()).unwrap_or(0));
+                let samples = points.with(Vec::len);
                 vec![
                     Some(format!("{pairs} {}", if pairs == 1 { "pair" } else { "pairs" })),
                     Some(format!("{pairs} {}", if pairs == 1 { "group" } else { "groups" })),
                     coverage.with(|map| map.as_ref().map(|map| format!("{} {} processed", map.images, if map.images == 1 { "photo" } else { "photos" }))),
-                    None,
-                    None,
+                    (samples > 0).then(|| format!("{samples} color samples")),
+                    sent_summary.get().map(|sent| format!("{} {}", sent.renders, if sent.renders == 1 { "photo" } else { "photos" })),
                     None,
                 ]
             })
             locked=Signal::derive(move || busy.get() || draft_complete.get())
+            finished=Signal::derive(move || draft_complete.get())
             can_advance=Signal::derive(move || !busy.get() && matches!(stage.get(), Stage::Inspector))
         />
-        {move || message.get().map(|text| view! { <p class="notice" role="status">{text}</p> })}
+        {move || (stage.get() != Stage::Send).then(|| message.get()).flatten().map(|text| view! { <p class="notice" role="status">{text}</p> })}
         {move || draft_unavailable.get().then(|| view! {
             <p class="notice">"This browser couldn't keep a local draft, so these photos won't be restored after a reload. Processing and sending still work."</p>
         })}
-        {move || {
-            let rows = failures.get();
-            (!rows.is_empty()).then(|| view! {
-                <section class="notice" aria-label="Excluded photos">
-                    <h3>"Photos not included"</h3>
-                    <ul>{rows.into_iter().map(|row| view! {
-                        <li><strong>{row.name.clone()}</strong>": "{row.message.clone()}</li>
-                    }).collect_view()}</ul>
-                </section>
-            })
-        }}
 
         <section class="step" hidden=move || stage.get() != Stage::Drop>
             <h2>"Drop files or a folder"</h2>
             <DropZone
                 on_files
                 file_picker
-                accept=".raf,.dng,.jpg,.jpeg,.arw,.cr2,.nef,.orf,.rw2".to_owned()
+                accept=crate::files::camera_originals_accept_attribute()
                 disabled=Signal::derive(move || busy.get() || !draft_loaded.get())
                 prompt="Drop RAW+JPEG files or a folder here. Photos stay on this device, even when you send color samples.".to_owned()
             />
@@ -1485,8 +1668,17 @@ pub fn ContributePage() -> impl IntoView {
                     ids
                 });
                 view! {
-                    <BatchEditor id=id first=first batches=batches firmware_ids=firmware_ids/>
+                    <BatchEditor id=id first=first batches=batches firmware_ids=firmware_ids on_preparation_change=invalidate_preparation/>
                 }.into_any()
+            }}
+            {move || {
+                let rows = failures.get();
+                (!rows.is_empty()).then(|| view! {
+                    <section class="excluded" aria-label="Excluded files">
+                        <h3>"Files left out"</h3>
+                        {excluded_files(rows, on_donate)}
+                    </section>
+                })
             }}
             <Disclosure summary="Processing options".to_owned()>
             <label for="workers">"Parallel processing tasks"</label>
@@ -1503,9 +1695,15 @@ pub fn ContributePage() -> impl IntoView {
 
         <section class="step" hidden=move || stage.get() != Stage::Processing>
             <h2>"Processing on this device"</h2>
-            <progress aria-label="Processing photos"></progress>
+            {move || {
+                let done = processed.get().len();
+                let total = plan.with(|plan| plan.as_ref().map(|plan| plan.groups.len()).unwrap_or(0)).max(1);
+                view! {
+                    <p role="status">{format!("Processing photo {} of {total}", (done + 1).min(total))}</p>
+                    <progress aria-label="Processing photos" value=done.to_string() max=total.to_string()></progress>
+                }
+            }}
             <p>"Extracting color samples locally. Your photos stay on this device."</p>
-            <p role="status">{move || format!("{} of {} photo groups processed", processed.get().len(), plan.get().map(|plan| plan.groups.len()).unwrap_or(0))}</p>
             {move || coverage.get().map(|map| view! { <CoverageMapView map/> })}
         </section>
         <section class="step" hidden=move || stage.get() != Stage::Inspector>
@@ -1514,6 +1712,15 @@ pub fn ContributePage() -> impl IntoView {
                 <p class="payload-summary">{format!("{} color samples from {} {}, {:.0} KB. No pixels, no location.", points.with(Vec::len), map.images, if map.images == 1 { "photo" } else { "photos" }, processed.with(|groups| groups.iter().flat_map(|group| &group.images).map(|image| image.blob_len).sum::<usize>()) as f64 / 1024.0)}</p>
             })}
             {move || coverage.get().map(|map| view! { <CoverageMapView map/> })}
+            {move || {
+                let rows = failures.get();
+                (!rows.is_empty()).then(|| view! {
+                    <section class="excluded" aria-label="Excluded files">
+                        <h3>"Files left out"</h3>
+                        {excluded_files(rows, on_donate)}
+                    </section>
+                })
+            }}
             <Disclosure summary="See exactly what's sent".to_owned()>
             <h3>"Payload inspector"</h3>
             <p>
@@ -1582,36 +1789,11 @@ pub fn ContributePage() -> impl IntoView {
                 <code>"looklab verify-payload"</code> "."
             </p>
             <button on:click=download_payload>"Download payload (JSON, non-authoritative)"</button>
-            <button on:click=download_seeds>"Export seed file (SENSITIVE)"</button>
-            <p class="warn">
-                "The seed file reveals sampling order. It is never uploaded; keep it local."
-            </p>
             <p>
                 "Source: "
                 <a href="https://github.com/skeet70/looklab">"looklab (AGPL-3.0-or-later)"</a>
                 ". Prefer not to trust a served client? Use the CLI, which you can build from source."
             </p>
-            {move || {
-                let rows = failures.get();
-                (!rows.is_empty()).then(|| view! {
-                    <div class="error" role="alert">
-                        <h3>"Files excluded from the batch"</h3>
-                        <ul>
-                            {rows.into_iter().map(|row| view! {
-                                <li>
-                                    <strong>{row.name.clone()}</strong> ": " {row.message.clone()}
-                                    {(!row.donated).then(|| view! {
-                                        <button on:click={
-                                            let name = row.name.clone();
-                                            move |_| donation(name.clone())
-                                        }>"Donate this file as a test fixture"</button>
-                                    })}
-                                </li>
-                            }).collect_view()}
-                        </ul>
-                    </div>
-                })
-            }}
             <h3>"Timing"</h3>
             <table class="data-table">
                 <thead><tr><th scope="col">"RAW / batch"</th><th scope="col">"Size before → after"</th><th scope="col">Time</th><th scope="col">Worker memory</th></tr></thead>
@@ -1630,26 +1812,144 @@ pub fn ContributePage() -> impl IntoView {
             <button class="button-primary" on:click=move |_| current.set(StepIndex(4))>"Continue to send"</button>
         </section>
         <section class="step" hidden=move || stage.get() != Stage::Send>
-            <h2>"Send your color samples"</h2>
-            <p>"Sign in or create a profile, then confirm this batch once on your device. You can follow its progress in Your contributions."</p>
+            <h2>"Send your samples"</h2>
+            <p>"Sign in or create a profile, then confirm once on your device. One confirmation covers every batch in this send. You can follow its progress in Your contributions."</p>
+            {move || {
+                let active = batches.with(active_bodies);
+                let loaded = manuals.with(|manuals| {
+                    manuals
+                        .iter()
+                        .filter(|(id, _)| active.contains(*id))
+                        .map(|(id, manual)| (id.clone(), manual.clone()))
+                        .collect::<Vec<_>>()
+                });
+                if loaded.is_empty() {
+                    return ().into_any();
+                }
+                view! {
+                    <section class="manual-confirmation" aria-labelledby="camera-confirmation">
+                        <h3 id="camera-confirmation">"Confirm your camera settings (optional)"</h3>
+                        <p class="muted">
+                            "Documented settings are not confirmed by camera owners yet. Check only the options you can see on your camera. Unchecked options are not counted. This uses the same passkey approval as your photos."
+                        </p>
+                        {loaded.into_iter().map(|(id, manual)| {
+                            let firmware_body = id.clone();
+                            let initial_firmware = Signal::derive(move || {
+                                batches.with(|set| {
+                                    set.groups()
+                                        .iter()
+                                        .find(|group| {
+                                            group.fields.body == firmware_body
+                                                && !group.fields.firmware.is_empty()
+                                        })
+                                        .map(|group| group.fields.firmware.clone())
+                                        .unwrap_or_default()
+                                })
+                            });
+                            let key = id;
+                            let on_change = Callback::new(
+                                move |value: Option<ManualConfirmationEnvelope>| {
+                                    manual_envelopes.update(|envelopes| match value {
+                                        Some(value) => {
+                                            envelopes.insert(key.clone(), value);
+                                        }
+                                        None => {
+                                            envelopes.remove(&key);
+                                        }
+                                    });
+                                },
+                            );
+                            view! {
+                                <ManualConfirmationPanel
+                                    manual=manual
+                                    initial_firmware=initial_firmware
+                                    on_change=on_change
+                                />
+                            }
+                        }).collect_view()}
+                    </section>
+                }.into_any()
+            }}
+            {move || manual_error.get().map(|error| view! {
+                <p class="muted">{format!("Documented camera settings could not be loaded: {error}")}</p>
+            })}
             {(!available).then(crate::ui::preview_notice)}
-            <button class="button-primary" on:click=upload disabled=move || busy.get() || !available>"Send contribution"</button>
+            <button class="button-primary" on:click=upload disabled=move || busy.get() || !available || reload_required.get()>"Send contribution"</button>
+            {move || reload_required.get().then(|| view! {
+                <p class="warn" role="alert">
+                    "This page is out of date. Reload it, then prepare and send your photos again."
+                </p>
+            })}
+            <button on:click=download_seeds>"Export seed file (SENSITIVE)"</button>
+            <p class="warn">
+                "The seed file reveals sampling order. It is never uploaded; keep it local."
+            </p>
+            {move || message.get().map(|text| view! { <p class="notice" role="status">{text}</p> })}
+            {move || send_parts.get().map(|(done, total)| view! {
+                <div class="send-progress">
+                    <p>{format!("Sending {} of {total} photos", done.min(total))}</p>
+                    <progress aria-label="Photos sent" value=done.to_string() max=total.to_string()></progress>
+                </div>
+            })}
         </section>
         <section class="step contribution-done" hidden=move || stage.get() != Stage::Done>
-            <h2>"Thanks for helping build looks"</h2>
-            <p>"Your samples are sent. Feedback arrives in Your contributions after processing."</p>
-            <a class="button" href=crate::base::site_url("/me")>"Your contributions"</a>
-            <a href=crate::base::site_url("/contribute/wanted")>
-                "Next way to help: take a few wanted shots"
-            </a>
+            <h2>"Thanks, your samples are in"</h2>
+            {move || sent_summary.get().map(|sent| view! {
+                <p class="done-summary">{format!(
+                    "{} {} from {} {}.",
+                    sent.renders, if sent.renders == 1 { "photo" } else { "photos" },
+                    sent.cameras, if sent.cameras == 1 { "camera" } else { "cameras" },
+                )}</p>
+            })}
+            {move || sent_summary.get().filter(|sent| sent.deferred > 0).map(|sent| view! {
+                <p class="notice" role="status">{format!(
+                    "{} B&W {} received, awaiting monochrome analysis. They never count as colour samples and are kept for up to 180 days for monochrome model development.",
+                    sent.deferred, if sent.deferred == 1 { "render is" } else { "renders are" },
+                )}</p>
+            })}
+            {move || confirmation_notice.get().map(|text| view! {
+                <p class="notice" role="status">{text}</p>
+            })}
+            <p>"Feedback arrives in Your contributions after processing."</p>
+            <a class="button button-primary" href=crate::base::site_url("/me")>"Your contributions"</a>
+            <section class="done-next" aria-labelledby="done-next-heading">
+                <h3 id="done-next-heading">"Next way to help"</h3>
+                <div class="help-grid">
+                    {[HelpWay::WantedShots, HelpWay::Rerender].into_iter().map(|way| {
+                        let guide = way.guide();
+                        let href = match way {
+                            HelpWay::WantedShots => crate::base::site_url("/contribute/wanted"),
+                            _ => crate::base::site_url("/contribute"),
+                        };
+                        view! {
+                            <a class="help-card help-card-link" href=href>
+                                <span class="help-meta">{guide.time} " · " {guide.impact.label()}</span>
+                                <span class="help-title">{guide.title}</span>
+                                <span class="help-description">{guide.description}</span>
+                            </a>
+                        }
+                    }).collect_view()}
+                </div>
+            </section>
+            {move || {
+                let rows = failures.get();
+                (!rows.is_empty()).then(|| view! {
+                    <section class="excluded" aria-label="Excluded files">
+                        <h3>"Files left out"</h3>
+                        {excluded_files(rows, on_donate)}
+                    </section>
+                })
+            }}
             {move || {
                 let links = status_links.get();
                 (!links.is_empty()).then(|| view! {
-                    <ul class="status-links">
-                        {links.into_iter().map(|link| view! {
-                            <li>"Status link: " <a href=link.clone()>{link.clone()}</a></li>
-                        }).collect_view()}
-                    </ul>
+                    <Disclosure summary="Keep a link to these contributions".to_owned()>
+                        <ul class="status-links">
+                            {links.into_iter().map(|link| view! {
+                                <li><a href=link.clone()>{link.clone()}</a></li>
+                            }).collect_view()}
+                        </ul>
+                    </Disclosure>
                 })
             }}
         </section>
@@ -1698,6 +1998,7 @@ impl TextField {
 enum FlagField {
     Recipe,
     Card,
+    MonochromeOptIn,
 }
 
 impl FlagField {
@@ -1705,6 +2006,7 @@ impl FlagField {
         match self {
             Self::Recipe => fields.recipe,
             Self::Card => fields.card,
+            Self::MonochromeOptIn => fields.monochrome_opt_in,
         }
     }
 
@@ -1712,6 +2014,7 @@ impl FlagField {
         match self {
             Self::Recipe => &mut fields.recipe,
             Self::Card => &mut fields.card,
+            Self::MonochromeOptIn => &mut fields.monochrome_opt_in,
         }
     }
 }
@@ -1722,6 +2025,7 @@ fn BatchEditor(
     first: bool,
     batches: RwSignal<BatchSet>,
     firmware_ids: Vec<String>,
+    on_preparation_change: Callback<()>,
 ) -> impl IntoView {
     let suffix = if first {
         String::new()
@@ -1760,6 +2064,7 @@ fn BatchEditor(
     let card_firmware_id = text(TextField::CardId);
     let card_firmware_version = text(TextField::CardVersion);
     let controls = text(TextField::Controls);
+    let source_controls = controls;
     let write_body = write(TextField::Body);
     let write_firmware = write(TextField::Firmware);
     let write_sim = write(TextField::Sim);
@@ -1769,11 +2074,14 @@ fn BatchEditor(
     let write_controls = write(TextField::Controls);
     let recipe = flag(FlagField::Recipe);
     let card = flag(FlagField::Card);
+    let monochrome_opt_in = flag(FlagField::MonochromeOptIn);
     let write_recipe = write_flag(FlagField::Recipe);
     let write_card = write_flag(FlagField::Card);
+    let write_monochrome_opt_in = write_flag(FlagField::MonochromeOptIn);
     let malformed = move || batches.with(|set| set.get(id).is_some_and(|group| group.malformed));
     let menu = menu_settings(&snapshot.fields.controls);
     let raws = snapshot.raws.join(", ");
+    let blocked = snapshot.blocked.clone();
     let unavailable = snapshot.unavailable.clone();
     let unmapped = snapshot.unmapped.clone();
     let notes = snapshot.notes.clone();
@@ -1798,7 +2106,22 @@ fn BatchEditor(
             <p class="muted">{raws}</p>
             <p class="muted">{renders}</p>
             {(!monochrome.is_empty()).then(|| view! {
-                <p class="warn" role="status">{looklab_wasm::MONOCHROME_REFUSAL}</p>
+                <div class="monochrome-opt-in">
+                    <p class="warn" role="status">
+                        "These are B&W renders. They are left out unless you select monochrome model development below."
+                    </p>
+                    <label>
+                        <input type="checkbox" prop:checked=monochrome_opt_in
+                            on:change=move |event| {
+                                write_monochrome_opt_in(event_target_checked(&event));
+                                on_preparation_change.run(());
+                            }/>
+                        " Contribute these B&W renders for monochrome model development"
+                    </label>
+                    <p class="muted">
+                        "looklab keeps them for up to 180 days to develop and validate monochrome response, toning and uncertainty. It deletes them after that unless they enter monochrome analysis. You can withdraw them at any time. No published Look is promised, and they never affect colour fits."
+                    </p>
+                </div>
             })}
             <label for=body_id.clone()>"Camera"</label>
             <input id=body_id type="text" prop:value=body
@@ -1809,6 +2132,12 @@ fn BatchEditor(
             <label for=sim_id.clone()>"Film simulation"</label>
             <input id=sim_id type="text" prop:value=sim
                 on:input=move |event| write_sim(event_target_value(&event))/>
+            {snapshot.family.clone().map(|family| view! {
+                <p class="muted">{format!("Normalized family: {family}")}</p>
+            })}
+            {snapshot.mono_filter.map(|filter| view! {
+                <p class="muted">{format!("Normalized monochrome filter: {filter:?}")}</p>
+            })}
             <label>
                 <input type="checkbox" prop:checked=recipe
                     on:change=move |event| write_recipe(event_target_checked(&event))/>
@@ -1866,7 +2195,7 @@ fn BatchEditor(
             }).collect_view()}
             {(!unmapped.is_empty()).then(|| view! {
                 <p class="warn" role="alert">
-                    "This camera's firmware does not record these settings. Enter the values you used: a batch cannot be sent until each one has a value."
+                    "These settings were not readable from your files. Enter the values you used: a batch cannot be sent until each one has a value."
                 </p>
                 <div class="unmapped-controls">
                     {unmapped.into_iter().filter_map(|raw| looklab_schema::ControlKey::new(&raw).ok()).map(|key| {
@@ -1890,11 +2219,36 @@ fn BatchEditor(
                     }).collect_view()}
                 </div>
             })}
+            <Disclosure summary="Setting sources".to_owned()>
+                <ul class="setting-sources">
+                    {move || {
+                        let text = source_controls();
+                        menu_settings(&text).into_iter().map(|setting| {
+                            let key = setting.key.as_str().to_owned();
+                            let step = setting.step;
+                            let reproduced = batches.with(|set| {
+                                set.get(id).is_some_and(|group| {
+                                    group
+                                        .reproduced
+                                        .iter()
+                                        .any(|(known, known_step)| known == &key && *known_step == step)
+                                })
+                            });
+                            view! {
+                                <li>{format!("{key} = {step}: {}", if reproduced { "reproduced from the photo" } else { "declared" })}</li>
+                            }
+                        }).collect_view()
+                    }}
+                </ul>
+            </Disclosure>
             <Disclosure summary="Technical settings editor".to_owned()>
             <label for=controls_id.clone()>"Settings (key=step, one per line)"</label>
             <textarea id=controls_id rows="3" prop:value=controls
                 on:input=move |event| write_controls(event_target_value(&event))></textarea>
             </Disclosure>
+            {blocked.map(|reason| view! {
+                <p class="warn" role="alert">{reason}</p>
+            })}
             {(!unavailable.is_empty()).then(|| view! {
                 <p class="muted" role="status">
                     "Please check these settings, which could not be read: " {unavailable.join("; ")}
@@ -1919,13 +2273,12 @@ fn matching_camera<'a>(
     fact: &looklab_wasm::pairing::FileFacts,
     index: &'a looklab_publish::SiteIndex,
 ) -> Option<&'a looklab_publish::BodySummary> {
-    let (Some(make), Some(model)) = (&fact.make, &fact.model) else {
-        return None;
-    };
-    index.bodies.iter().find(|camera| {
-        camera.make.trim().eq_ignore_ascii_case(make.trim())
-            && camera.model.trim().eq_ignore_ascii_case(model.trim())
-    })
+    let identity =
+        looklab_prep::CameraIdentity::new(fact.make.as_deref()?, fact.model.as_deref()?)?;
+    index
+        .bodies
+        .iter()
+        .find(|camera| identity.matches(&camera.make, &camera.model))
 }
 
 fn title_case_words(value: &str) -> String {
@@ -2288,6 +2641,10 @@ async fn reading_for_render(
         malformed: facts
             .iter()
             .any(|fact| fact.name == render.as_str() && fact.render_tag_malformed),
+        blocked: None,
+        render_class: RenderClass::Colour,
+        family: None,
+        mono_filter: None,
         monochrome: Vec::new(),
         note: None,
     };
@@ -2311,6 +2668,7 @@ async fn reading_for_render(
         Some(Ok(site)) => site,
         Some(Err(error)) => {
             reading.note = Some(error.clone());
+            reading.blocked = Some(error.clone());
             return reading;
         }
         None => return reading,
@@ -2347,7 +2705,86 @@ async fn reading_for_render(
             reading.controls = prefill.controls;
             reading.unavailable = prefill.unavailable;
             reading.unmapped = prefill.unmapped;
+            reading.family = prefill.family;
+            reading.mono_filter = prefill.mono_filter;
             reading.monochrome = prefill.monochrome;
+            reading.render_class = match prefill.render_class {
+                Some(looklab_schema::RenderClass::Monochrome) => RenderClass::Monochrome,
+                _ => RenderClass::Colour,
+            };
+            if let Some(tag) = &reading.card
+                && let Some(epoch) = epoch
+                && let Ok(family) = looklab_schema::LookId::new(tag.look_slug.as_str())
+                && let Some(declared) = epoch.family_render_class(&family)
+                && let Some(fuji) = parsed
+                    .iter()
+                    .find(|(name, _)| name.as_str() == render.as_str())
+                    .and_then(|(_, metadata)| metadata.fuji.as_ref())
+            {
+                let values = looklab_schema::MakernoteValues::from(&fuji.look);
+                if let Ok(classified) =
+                    looklab_schema::classify_card_render(epoch, &family, declared, &values)
+                {
+                    reading.mono_filter = classified.mono_filter;
+                    reading.render_class = match classified.render_class {
+                        looklab_schema::RenderClass::Monochrome => RenderClass::Monochrome,
+                        looklab_schema::RenderClass::Colour => RenderClass::Colour,
+                    };
+                    let (settings, problems) = looklab_schema::settings_from_makernote_for(
+                        &site.schema,
+                        epoch.id,
+                        &classified.family,
+                        &values,
+                    );
+                    reading.controls = settings
+                        .entries()
+                        .iter()
+                        .map(|setting| (setting.key.to_string(), setting.step))
+                        .collect();
+                    let reach = looklab_schema::applicable_controls(epoch, &classified.family);
+                    reading.family = Some(classified.family);
+                    let reproduced = reading
+                        .controls
+                        .iter()
+                        .map(|(key, _)| key.as_str())
+                        .collect::<Vec<_>>();
+                    let mut unmapped = reach
+                        .mapped
+                        .iter()
+                        .chain(&reach.unmapped)
+                        .filter(|key| !reproduced.contains(&key.as_str()))
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    if reading.render_class == RenderClass::Monochrome {
+                        for key in &reach.spatial {
+                            if !reproduced.contains(&key.as_str())
+                                && !unmapped.iter().any(|known| known.as_str() == key.as_str())
+                            {
+                                unmapped.push(key.to_string());
+                            }
+                        }
+                    }
+                    reading.unmapped = unmapped;
+                    reading.unavailable = problems.iter().map(ToString::to_string).collect();
+                    let sim = reading.sim.clone().unwrap_or_default();
+                    if reading.render_class == RenderClass::Monochrome {
+                        if !reading
+                            .monochrome
+                            .iter()
+                            .any(|known| known.file == render.as_str())
+                        {
+                            reading.monochrome.push(looklab_wasm::MonochromeRender {
+                                file: render.as_str().to_owned(),
+                                sim,
+                            });
+                        }
+                    } else {
+                        reading
+                            .monochrome
+                            .retain(|known| known.file != render.as_str());
+                    }
+                }
+            }
         }
         Err(error) => reading.note = Some(error.to_string()),
     }
@@ -2356,10 +2793,15 @@ async fn reading_for_render(
 
 async fn site_body(make: &str, model: &str) -> Result<SiteBody, String> {
     let index = data::index().await?;
+    let identity = looklab_prep::CameraIdentity::new(make, model);
     let summary = index
         .bodies
         .iter()
-        .find(|body| body.make.eq_ignore_ascii_case(make) && body.model.eq_ignore_ascii_case(model))
+        .find(|body| {
+            identity
+                .as_ref()
+                .is_some_and(|identity| identity.matches(&body.make, &body.model))
+        })
         .ok_or_else(|| format!("the site data has no camera for {make} {model}"))?;
     let page = data::body(summary.id.make(), summary.id.model()).await?;
     let schema = looklab_schema::validate_control_schema(&page.schema).map_err(|errors| {
@@ -2389,11 +2831,29 @@ struct DraftGroup<'a> {
     card: bool,
     tag: Option<&'a RenderTag>,
     malformed: bool,
+    blocked: Option<&'a str>,
     card_firmware_id: &'a str,
     card_firmware_version: &'a str,
+    monochrome: bool,
+    monochrome_opt_in: bool,
 }
 
 fn group_settings(draft: DraftGroup<'_>) -> Result<GroupSettings, String> {
+    if let Some(reason) = draft.blocked {
+        return Err(reason.to_owned());
+    }
+    let render_class = if draft.monochrome {
+        RenderClass::Monochrome
+    } else {
+        RenderClass::Colour
+    };
+    if draft.monochrome && !draft.monochrome_opt_in {
+        return Err(
+            "Select monochrome model development to send this batch's B&W renders.".to_owned(),
+        );
+    }
+    let monochrome_authorization = (render_class == RenderClass::Monochrome)
+        .then_some(MonochromeAuthorization::ModelDevelopment180Days);
     let mut entries = Vec::new();
     for line in draft
         .controls
@@ -2432,7 +2892,7 @@ fn group_settings(draft: DraftGroup<'_>) -> Result<GroupSettings, String> {
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         return Err(format!(
-            "This camera's {} isn't mapped yet. Enter the value you used under Camera settings, or remove those photos from the batch.",
+            "This batch still needs a value for {}. Enter the value you used under Camera settings, or remove those photos from the batch.",
             missing.join(", ")
         ));
     }
@@ -2462,6 +2922,8 @@ fn group_settings(draft: DraftGroup<'_>) -> Result<GroupSettings, String> {
         sim: draft.sim.trim().to_owned(),
         community_snapshot_version: draft.snapshot_version,
         controls: entries,
+        render_class,
+        monochrome_authorization,
     })
 }
 
@@ -2514,8 +2976,11 @@ fn group_settings_for(
         card: group.fields.card || card_tag.is_some(),
         tag: card_tag.as_ref(),
         malformed,
+        blocked: group.blocked.as_deref(),
         card_firmware_id: &group.fields.card_firmware_id,
         card_firmware_version: &group.fields.card_firmware_version,
+        monochrome: group.is_monochrome(),
+        monochrome_opt_in: group.fields.monochrome_opt_in,
     })
 }
 
@@ -2556,15 +3021,15 @@ enum PairOutcome {
 /// The pair's usable JPEGs, and a listing row for every monochrome render.
 fn split_renders(
     pair: &looklab_wasm::PairGroup,
-    refused: &[looklab_wasm::MonochromeRender],
+    excluded: &HashSet<String>,
 ) -> (Vec<RenderFile>, Vec<FailureRow>) {
     let mut usable = Vec::with_capacity(pair.jpegs.len());
     let mut rows = Vec::new();
     for name in &pair.jpegs {
-        if refused.iter().any(|render| &render.file == name) {
+        if excluded.contains(name) {
             rows.push(FailureRow {
                 name: name.clone(),
-                message: looklab_wasm::MONOCHROME_REFUSAL.to_owned(),
+                message: MONOCHROME_UNSELECTED.to_owned(),
                 donated: false,
             });
         } else if let Some(render) = RenderFile::new(name) {
@@ -2709,12 +3174,11 @@ fn lane_indices(count: usize, lanes: usize) -> Vec<Vec<usize>> {
 async fn validate_batch_sims(batches: &BatchSet) -> Result<(), String> {
     let mut schemas = HashMap::new();
     for group in batches.groups() {
-        if !group.renders.iter().any(|render| {
-            !group
-                .monochrome
-                .iter()
-                .any(|mono| mono.file == render.as_str())
-        }) {
+        if group.renders.is_empty() {
+            continue;
+        }
+        let monochrome = group.is_monochrome();
+        if monochrome && !group.fields.monochrome_opt_in {
             continue;
         }
         let body =
@@ -2746,8 +3210,29 @@ async fn validate_batch_sims(batches: &BatchSet) -> Result<(), String> {
             .ok_or_else(|| {
                 "This built-in look isn't listed in the camera's published schema.".to_owned()
             })?;
-        if native.monochrome {
-            return Err(looklab_wasm::MONOCHROME_REFUSAL.to_owned());
+        if monochrome && !group.fields.card && !native.monochrome {
+            return Err(
+                "This batch holds B&W renders but declares a colour film simulation. Enter the B&W film simulation the camera recorded."
+                    .to_owned(),
+            );
+        }
+        if monochrome {
+            let family = group.family.as_ref().ok_or_else(|| {
+                "This B&W batch could not be classified against the camera's published schema."
+                    .to_owned()
+            })?;
+            if !epoch.supports_monochrome_intake(family) {
+                return Err(
+                    "This camera's published schema does not accept B&W measurements yet."
+                        .to_owned(),
+                );
+            }
+        }
+        if !monochrome && !group.fields.card && native.monochrome {
+            return Err(
+                "This batch declares a B&W film simulation but none of its renders are B&W. Enter the colour film simulation the camera recorded."
+                    .to_owned(),
+            );
         }
     }
     Ok(())
@@ -2767,15 +3252,23 @@ async fn run_files_progress(
         pairing.groups.len(),
         usize::try_from(count.max(1)).unwrap_or(1),
     );
-    let refused = batches
+    let monochrome: HashSet<String> = batches
         .groups()
         .iter()
         .flat_map(|group| &group.monochrome)
-        .cloned()
-        .collect::<Vec<_>>();
+        .map(|render| render.file.clone())
+        .collect();
+    let selected: HashSet<String> = batches
+        .groups()
+        .iter()
+        .filter(|group| group.fields.monochrome_opt_in)
+        .flat_map(|group| &group.monochrome)
+        .map(|render| render.file.clone())
+        .collect();
+    let excluded: HashSet<String> = monochrome.difference(&selected).cloned().collect();
     let mut futures: Vec<Lane<'_, PairOutcomes>> = Vec::with_capacity(lanes.len());
     for indices in lanes {
-        let refused = &refused;
+        let excluded = &excluded;
         futures.push(Box::pin(async move {
             let mut worker = PrepWorker::spawn()?;
             let mut outcomes = Vec::with_capacity(indices.len());
@@ -2785,11 +3278,11 @@ async fn run_files_progress(
                     worker = PrepWorker::spawn()?;
                 }
                 let pair = &pairing.groups[index];
-                let (usable, refusals) = split_renders(pair, refused);
-                let outcome = if usable.is_empty() && !refused.is_empty() {
+                let (usable, refusals) = split_renders(pair, excluded);
+                let outcome = if usable.is_empty() && !refusals.is_empty() {
                     PairOutcome::Failed(FailureRow {
                         name: pair.raw.clone(),
-                        message: looklab_wasm::MONOCHROME_REFUSAL.to_owned(),
+                        message: MONOCHROME_UNSELECTED.to_owned(),
                         donated: false,
                     })
                 } else {
@@ -2903,7 +3396,13 @@ async fn check_card_tags(groups: &mut [ProcessedGroup]) -> Vec<FailureRow> {
                 ));
                 continue;
             }
-            match data::card(tag.look_slug.as_str(), tag.look_version.as_str()).await {
+            match data::card(
+                tag.look_slug.as_str(),
+                tag.look_version.as_str(),
+                data::CardUse::VerifyRenderTag,
+            )
+            .await
+            {
                 Ok(bytes) => match check_card(tag, &bytes) {
                     Ok(()) => {}
                     Err(CardCheckError::CidMismatch) => drop.push((
@@ -2934,86 +3433,293 @@ async fn check_card_tags(groups: &mut [ProcessedGroup]) -> Vec<FailureRow> {
     failures
 }
 
-async fn upload_batch(
-    session: crate::session::SessionContext,
+fn group_failures(rows: Vec<FailureRow>) -> Vec<(String, Vec<FailureRow>)> {
+    let mut groups: Vec<(String, Vec<FailureRow>)> = Vec::new();
+    for row in rows {
+        match groups
+            .iter_mut()
+            .find(|(message, _)| *message == row.message)
+        {
+            Some((_, rows)) => rows.push(row),
+            None => groups.push((row.message.clone(), vec![row])),
+        }
+    }
+    groups
+}
+
+fn excluded_files(rows: Vec<FailureRow>, on_donate: Callback<String>) -> impl IntoView {
+    group_failures(rows)
+        .into_iter()
+        .map(|(message, rows)| {
+            let count = rows.len();
+            view! {
+                <details class="disclosure excluded-files">
+                    <summary>{format!("{count} {} left out: {message}", if count == 1 { "file" } else { "files" })}</summary>
+                    <ul>
+                        {rows.into_iter().map(|row| {
+                            let name = row.name.clone();
+                            view! {
+                                <li>
+                                    <span>{row.name.clone()}</span>
+                                    {(!row.donated).then(|| view! {
+                                        <button type="button" class="excluded-donate"
+                                            on:click=move |_| on_donate.run(name.clone())>
+                                            "Donate this file as a test fixture"
+                                        </button>
+                                    })}
+                                </li>
+                            }
+                        }).collect_view()}
+                    </ul>
+                </details>
+            }
+        })
+        .collect_view()
+}
+
+fn sent_summary_of(pending: &[PendingBatch]) -> SentSummary {
+    let mut cameras = pending
+        .iter()
+        .map(|batch| batch.settings.body.as_str())
+        .collect::<Vec<_>>();
+    cameras.sort_unstable();
+    cameras.dedup();
+    SentSummary {
+        renders: pending.iter().map(|batch| batch.images.len()).sum(),
+        deferred: pending
+            .iter()
+            .filter(|batch| batch.settings.render_class == RenderClass::Monochrome)
+            .map(|batch| batch.images.len())
+            .sum(),
+        cameras: cameras.len(),
+    }
+}
+
+struct PendingBatch {
+    id: BatchId,
     settings: GroupSettings,
     images: Vec<PreparedImageView>,
     serial: Option<Vec<u8>>,
-) -> Result<webauthn::UploadReply, String> {
-    if images.is_empty() {
-        return Err("nothing to upload".to_owned());
+}
+
+struct SendOutcome {
+    accepted: Vec<(BatchId, webauthn::UploadReply)>,
+    error: Option<(usize, String)>,
+    confirmations: Vec<(String, Result<(), String>)>,
+    reload_required: bool,
+}
+
+async fn upload_send(
+    session: crate::session::SessionContext,
+    pending: Vec<PendingBatch>,
+    confirmations: Vec<(String, ManualConfirmationEnvelope)>,
+    send_parts: RwSignal<Option<(usize, usize)>>,
+) -> SendOutcome {
+    let total = pending.len();
+    let total_photos = pending
+        .iter()
+        .map(|batch| batch.images.len())
+        .sum::<usize>();
+    let mut photos_sent = 0;
+    let mut accepted = Vec::new();
+    let error = |position: usize, message: String| SendOutcome {
+        accepted: Vec::new(),
+        error: Some((position, message)),
+        confirmations: Vec::new(),
+        reload_required: false,
+    };
+    // Once a batch is uploaded, a later failure must keep it; a retry skips accepted batches.
+    macro_rules! fail {
+        ($position:expr, $message:expr) => {
+            return SendOutcome {
+                accepted,
+                error: Some(($position, $message)),
+                confirmations: Vec::new(),
+                reload_required: false,
+            }
+        };
     }
-    session
-        .require_profile()
-        .await
-        .ok_or_else(|| "Sign in was cancelled. Your prepared samples are still here.".to_owned())?;
-    let credential_id = idb::get(idb::StorageKey::CREDENTIAL)
-        .await?
-        .and_then(|text| webauthn::decode_base64url(&text));
-    let nonce = webauthn::fetch_nonce().await?;
-    let mut worker = PrepWorker::spawn()?;
-    let manifest_request = build_manifest_request(&settings, &images, nonce.nonce)
-        .map_err(|error| error.to_string())?;
-    let manifest_reply = worker
+    if pending.iter().any(|batch| batch.images.is_empty()) {
+        return error(0, "nothing to upload".to_owned());
+    }
+    if session.require_profile().await.is_none() {
+        return error(
+            0,
+            "Sign in was cancelled. Your prepared samples are still here.".to_owned(),
+        );
+    }
+    let credential_id = match idb::get(idb::StorageKey::CREDENTIAL).await {
+        Ok(id) => id.and_then(|text| webauthn::decode_base64url(&text)),
+        Err(message) => return error(0, message),
+    };
+    let nonce = match webauthn::fetch_nonce().await {
+        Ok(nonce) => nonce,
+        Err(message) => return error(0, message),
+    };
+    let mut worker = match PrepWorker::spawn() {
+        Ok(worker) => worker,
+        Err(message) => return error(0, message),
+    };
+
+    let mut manifests = Vec::with_capacity(total);
+    for batch in &pending {
+        let request = match build_manifest_request(&batch.settings, &batch.images, nonce.nonce) {
+            Ok(request) => request,
+            Err(failure) => return error(0, failure.to_string()),
+        };
+        let reply = match worker
+            .call(module_fn_id(ModuleFunction::BuildManifest), request)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(failure) => return error(0, failure.message()),
+        };
+        match decode_build_manifest_reply(&reply.bytes) {
+            Ok(manifest) => manifests.push(manifest),
+            Err(failure) => return error(0, failure.to_string()),
+        }
+    }
+    let hashes = manifests
+        .iter()
+        .map(|manifest| manifest.manifest_hash)
+        .collect::<Vec<_>>();
+    let attestations = confirmations
+        .iter()
+        .map(|(_, envelope)| AttestationHash::from_bytes(envelope.digest()))
+        .collect::<Vec<_>>();
+    let send_request = match build_send_manifest_request(nonce.nonce, hashes, attestations) {
+        Ok(request) => request,
+        Err(failure) => return error(0, failure.to_string()),
+    };
+    let send_reply = match worker
         .call(
-            module_fn_id(ModuleFunction::BuildManifest),
-            manifest_request,
+            module_fn_id(ModuleFunction::BuildSendManifest),
+            send_request,
         )
         .await
-        .map_err(|error| error.message())?;
-    let manifest =
-        decode_build_manifest_reply(&manifest_reply.bytes).map_err(|error| error.to_string())?;
-    let challenge = *manifest.challenge.as_bytes();
-    let assertion =
-        webauthn::sign_batch(&challenge, credential_id.as_deref(), &nonce.rp_id).await?;
+    {
+        Ok(reply) => reply,
+        Err(failure) => return error(0, failure.message()),
+    };
+    let send = match decode_build_send_manifest_reply(&send_reply.bytes) {
+        Ok(send) => send,
+        Err(failure) => return error(0, failure.to_string()),
+    };
+    let assertion = match webauthn::sign_batch(
+        send.challenge.as_bytes(),
+        credential_id.as_deref(),
+        &nonce.rp_id,
+    )
+    .await
+    {
+        Ok(assertion) => assertion,
+        Err(message) => return error(0, message),
+    };
     let defaults = default_pow();
     let pow = nonce.pow.unwrap_or(webauthn::PowParameters {
         memory_kib: defaults.memory_kib,
         iterations: defaults.iterations,
         difficulty_bits_per_image: defaults.difficulty_bits_per_image,
     });
-    let n_images = u32::try_from(images.len()).map_err(|_| "too many images".to_owned())?;
-    let pow_request = solve_pow_request(
-        challenge,
-        n_images,
-        PowParamsSpec {
-            memory_kib: pow.memory_kib,
-            iterations: pow.iterations,
-            difficulty_bits_per_image: pow.difficulty_bits_per_image,
-        },
-        0,
-    )
-    .map_err(|error| error.to_string())?;
-    let pow_reply = worker
-        .call(module_fn_id(ModuleFunction::SolvePow), pow_request)
-        .await
-        .map_err(|error| error.message())?;
-    let pow = decode_pow_reply(&pow_reply.bytes)
-        .map_err(|error| error.to_string())?
-        .solutions;
-    let blobs = images.iter().map(|image| image.blob.clone()).collect();
-    let encode_request = encode_envelope_request(
-        nonce.nonce,
-        manifest.manifest_bytes.clone(),
-        assertion,
-        pow,
-        serial,
-        blobs,
-    )
-    .map_err(|error| error.to_string())?;
-    let encode_reply = worker
-        .call(module_fn_id(ModuleFunction::EncodeEnvelope), encode_request)
-        .await
-        .map_err(|error| error.message())?;
-    let envelope = decode_encode_reply(&encode_reply.bytes)
-        .map_err(|error| error.to_string())?
-        .envelope;
-    worker.terminate();
-    let reply = webauthn::upload_envelope(envelope).await?;
-    if let Some(token) = &reply.status_token {
-        let _ = idb::put(idb::StorageKey::STATUS_TOKEN, token).await;
+
+    for (position, (batch, manifest)) in pending.iter().zip(&manifests).enumerate() {
+        let n_images = match u32::try_from(batch.images.len()) {
+            Ok(count) => count,
+            Err(_) => fail!(position, "too many images".to_owned()),
+        };
+        let pow_request = match solve_pow_request(
+            *manifest.challenge.as_bytes(),
+            n_images,
+            PowParamsSpec {
+                memory_kib: pow.memory_kib,
+                iterations: pow.iterations,
+                difficulty_bits_per_image: pow.difficulty_bits_per_image,
+            },
+            0,
+        ) {
+            Ok(request) => request,
+            Err(failure) => fail!(position, failure.to_string()),
+        };
+        let pow_reply = match worker
+            .call(module_fn_id(ModuleFunction::SolvePow), pow_request)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(failure) => fail!(position, failure.message()),
+        };
+        let pow = match decode_pow_reply(&pow_reply.bytes) {
+            Ok(reply) => reply.solutions,
+            Err(failure) => fail!(position, failure.to_string()),
+        };
+        let blobs = batch
+            .images
+            .iter()
+            .map(|image| image.blob.clone())
+            .collect();
+        let encode_request = match encode_envelope_request(
+            nonce.nonce,
+            send.send_manifest_bytes.clone(),
+            manifest.manifest_bytes.clone(),
+            assertion.clone(),
+            pow,
+            batch.serial.clone(),
+            blobs,
+        ) {
+            Ok(request) => request,
+            Err(failure) => fail!(position, failure.to_string()),
+        };
+        let encode_reply = match worker
+            .call(module_fn_id(ModuleFunction::EncodeEnvelope), encode_request)
+            .await
+        {
+            Ok(reply) => reply,
+            Err(failure) => fail!(position, failure.message()),
+        };
+        let envelope = match decode_encode_reply(&encode_reply.bytes) {
+            Ok(reply) => reply.envelope,
+            Err(failure) => fail!(position, failure.to_string()),
+        };
+        match webauthn::upload_envelope(envelope).await {
+            Ok(reply) => {
+                if let Some(token) = &reply.status_token {
+                    let _ = idb::put(idb::StorageKey::STATUS_TOKEN, token).await;
+                }
+                accepted.push((batch.id, reply));
+                photos_sent += batch.images.len();
+                send_parts.set(Some((photos_sent, total_photos)));
+            }
+            Err(error) => {
+                worker.terminate();
+                let reload_required = error.requires_reload();
+                return SendOutcome {
+                    accepted,
+                    error: Some((position, error.message())),
+                    confirmations: Vec::new(),
+                    reload_required,
+                };
+            }
+        }
     }
-    Ok(reply)
+    worker.terminate();
+    let mut results = Vec::new();
+    if !accepted.is_empty() {
+        for (label, envelope) in &confirmations {
+            let result =
+                match envelope.request_body(&nonce.nonce, &assertion, &send.send_manifest_bytes) {
+                    Ok(body) => crate::data::submit_manual_confirmation(&body)
+                        .await
+                        .map(|_| ()),
+                    Err(error) => Err(error.to_string()),
+                };
+            results.push((label.clone(), result));
+        }
+    }
+    SendOutcome {
+        accepted,
+        error: None,
+        confirmations: results,
+        reload_required: false,
+    }
 }
 
 fn find_file<'a>(files: &'a [LocalFile], name: &str) -> Option<&'a LocalFile> {
@@ -3047,8 +3753,51 @@ mod tests {
             card,
             tag: None,
             malformed,
+            blocked: None,
             card_firmware_id: "acme-sim",
             card_firmware_version: "2.0.1",
+            monochrome: false,
+            monochrome_opt_in: false,
+        }
+    }
+
+    fn summary() -> PrepSummary {
+        PrepSummary {
+            metadata: looklab_upload::ManifestMetadata {
+                make: None,
+                model: None,
+                firmware: None,
+                lens_model: None,
+                focal_length_mm: None,
+                iso: None,
+                shutter_seconds: None,
+                aperture_f_number: None,
+                exposure_compensation_ev: None,
+                as_shot_wb: None,
+                capture_month: None,
+                software: None,
+                render_tag: None,
+                render_tag_malformed: false,
+                look: None,
+            },
+            removed: Vec::new(),
+            rerender_group: None,
+            alignment: looklab_prep_module::AlignmentSummary {
+                correlation: 0.0,
+                residual_px: 0.0,
+            },
+            blob_len: 0,
+        }
+    }
+
+    fn prepared_image() -> PreparedImageView {
+        let summary = summary();
+        PreparedImageView {
+            blob: Vec::new(),
+            metadata: summary.metadata,
+            removed: Vec::new(),
+            rerender_group: None,
+            alignment: summary.alignment,
         }
     }
 
@@ -3089,22 +3838,23 @@ mod tests {
             unmapped: Vec::new(),
             card: None,
             malformed: false,
+            blocked: None,
+            render_class: RenderClass::Colour,
+            family: None,
+            mono_filter: None,
             monochrome: Vec::new(),
             note: None,
         }
     }
 
     #[test]
-    fn monochrome_renders_are_listed_and_left_out_of_the_batch() {
+    fn an_unselected_monochrome_render_is_listed_and_left_out() {
         let pair = looklab_wasm::PairGroup {
             raw: "a.raf".to_owned(),
             jpegs: vec!["a-acros.jpg".to_owned(), "a-provia.jpg".to_owned()],
         };
-        let refused = vec![looklab_wasm::MonochromeRender {
-            file: "a-acros.jpg".to_owned(),
-            sim: "acros".to_owned(),
-        }];
-        let (usable, rows) = split_renders(&pair, &refused);
+        let excluded = HashSet::from(["a-acros.jpg".to_owned(), "b-acros.jpg".to_owned()]);
+        let (usable, rows) = split_renders(&pair, &excluded);
         assert_eq!(
             usable.iter().map(RenderFile::as_str).collect::<Vec<_>>(),
             vec!["a-provia.jpg"]
@@ -3116,13 +3866,75 @@ mod tests {
             raw: "b.raf".to_owned(),
             jpegs: vec!["b-acros.jpg".to_owned()],
         };
-        let refused = vec![looklab_wasm::MonochromeRender {
-            file: "b-acros.jpg".to_owned(),
-            sim: "acros".to_owned(),
-        }];
-        let (usable, rows) = split_renders(&only_monochrome, &refused);
+        let (usable, rows) = split_renders(&only_monochrome, &excluded);
         assert!(usable.is_empty());
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn a_selected_monochrome_render_is_prepared() {
+        let pair = looklab_wasm::PairGroup {
+            raw: "a.raf".to_owned(),
+            jpegs: vec!["a-acros.jpg".to_owned(), "a-provia.jpg".to_owned()],
+        };
+        let (usable, rows) = split_renders(&pair, &HashSet::new());
+        assert_eq!(
+            usable.iter().map(RenderFile::as_str).collect::<Vec<_>>(),
+            vec!["a-acros.jpg", "a-provia.jpg"]
+        );
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn excluded_files_group_by_reason() {
+        let row = |name: &str, message: &str| FailureRow {
+            name: name.to_owned(),
+            message: message.to_owned(),
+            donated: false,
+        };
+        let groups = group_failures(vec![
+            row("a.jpg", MONOCHROME_UNSELECTED),
+            row("b.jpg", "the JPEG file name is invalid"),
+            row("c.jpg", MONOCHROME_UNSELECTED),
+        ]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, MONOCHROME_UNSELECTED);
+        assert_eq!(
+            groups[0]
+                .1
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.jpg", "c.jpg"]
+        );
+        assert_eq!(groups[1].0, "the JPEG file name is invalid");
+    }
+
+    #[test]
+    fn a_monochrome_batch_needs_its_opt_in_to_build_settings() {
+        let settings = group_settings(DraftGroup {
+            sim: "acros",
+            monochrome: true,
+            monochrome_opt_in: true,
+            ..draft(false, false)
+        })
+        .expect("an opted-in B&W batch builds settings");
+        assert_eq!(settings.render_class, RenderClass::Monochrome);
+        assert_eq!(
+            settings.monochrome_authorization,
+            Some(MonochromeAuthorization::ModelDevelopment180Days)
+        );
+
+        let colour = group_settings(draft(false, false)).expect("a colour batch builds settings");
+        assert_eq!(colour.render_class, RenderClass::Colour);
+        assert_eq!(colour.monochrome_authorization, None);
+
+        group_settings(DraftGroup {
+            sim: "acros",
+            monochrome: true,
+            ..draft(false, false)
+        })
+        .expect_err("an unselected B&W batch cannot be signed");
     }
 
     #[test]
@@ -3284,7 +4096,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_raws_monochrome_render_is_listed_but_not_prepared() {
+    fn a_shared_raws_monochrome_render_forms_its_own_batch() {
         let mut acros = render_reading(
             "DSCF0101.RAF",
             "RENDER-ACROS.JPG",
@@ -3320,11 +4132,6 @@ mod tests {
             acros,
         ];
         let set = BatchSet::from_readings(&readings);
-        let refused = set
-            .groups()
-            .iter()
-            .flat_map(|group| group.monochrome.iter().cloned())
-            .collect::<Vec<_>>();
         let pair = looklab_wasm::PairGroup {
             raw: "DSCF0101.RAF".to_owned(),
             jpegs: vec![
@@ -3333,7 +4140,7 @@ mod tests {
                 "RENDER-ACROS.JPG".to_owned(),
             ],
         };
-        let (usable, rows) = split_renders(&pair, &refused);
+        let (usable, rows) = split_renders(&pair, &HashSet::from(["RENDER-ACROS.JPG".to_owned()]));
 
         assert_eq!(
             usable.iter().map(RenderFile::as_str).collect::<Vec<_>>(),
@@ -3342,12 +4149,67 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "RENDER-ACROS.JPG");
         assert_eq!(set.groups().len(), 3);
-        assert!(set.groups().iter().any(|group| {
-            group
-                .monochrome
+        let acros_batch = set
+            .groups()
+            .iter()
+            .find(|group| group.fields.sim == "acros")
+            .expect("the B&W render has its own batch");
+        assert!(acros_batch.is_monochrome());
+        assert_eq!(acros_batch.monochrome.len(), 1);
+        assert!(
+            set.groups()
                 .iter()
-                .any(|render| render.file == "RENDER-ACROS.JPG")
-        }));
+                .filter(|group| group.fields.sim != "acros")
+                .all(|group| !group.is_monochrome())
+        );
+    }
+
+    #[test]
+    fn a_selected_bw_batch_counts_its_deferred_renders() {
+        let mut acros = render_reading(
+            "DSCF0101.RAF",
+            "RENDER-ACROS.JPG",
+            "fujifilm",
+            "x-t4",
+            "acros",
+            0,
+            "1.10",
+        );
+        acros.monochrome = vec![looklab_wasm::MonochromeRender {
+            file: "RENDER-ACROS.JPG".to_owned(),
+            sim: "acros".to_owned(),
+        }];
+        let colour = render_reading(
+            "DSCF0101.RAF",
+            "DSCF0101.JPG",
+            "fujifilm",
+            "x-t4",
+            "provia",
+            0,
+            "1.10",
+        );
+        let mut set = BatchSet::from_readings(&[colour, acros]);
+        let acros_id = set
+            .groups()
+            .iter()
+            .find(|group| group.fields.sim == "acros")
+            .expect("B&W batch")
+            .id;
+        set.update(acros_id, |group| group.fields.monochrome_opt_in = true);
+        let pending = set
+            .groups()
+            .iter()
+            .map(|group| PendingBatch {
+                id: group.id,
+                settings: group_settings_for(group, &[], 0).expect("batch settings"),
+                images: vec![prepared_image()],
+                serial: None,
+            })
+            .collect::<Vec<_>>();
+        let sent = sent_summary_of(&pending);
+        assert_eq!(sent.renders, 2);
+        assert_eq!(sent.deferred, 1);
+        assert_eq!(sent.cameras, 1);
     }
 
     #[test]

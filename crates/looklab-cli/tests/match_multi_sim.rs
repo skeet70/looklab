@@ -161,7 +161,7 @@ fn run_match(fixture: &Fixture) -> Output {
         .arg(&fixture.target)
         .arg("--bundle")
         .arg(&fixture.dir)
-        .args(["--seed", "7"])
+        .args(["--seed", "7", "--realization-version", "1"])
         .output()
         .expect("run")
 }
@@ -173,6 +173,38 @@ fn assert_rejected(output: Output) {
         !output.status.success(),
         "command succeeded\nstdout: {stdout}\nstderr: {stderr}"
     );
+}
+
+#[test]
+fn matching_a_legacy_bundle_requires_a_positive_realization_version() {
+    let fixture = published_bundle();
+    let run = |version: Option<&str>| {
+        let mut command = looklab();
+        command
+            .arg("match")
+            .arg("--look")
+            .arg(&fixture.target)
+            .arg("--bundle")
+            .arg(&fixture.dir)
+            .args(["--seed", "7"]);
+        if let Some(version) = version {
+            command.args(["--realization-version", version]);
+        }
+        command.output().expect("run")
+    };
+    let missing = run(None);
+    let failed = !missing.status.success();
+    let stderr = String::from_utf8(missing.stderr).expect("utf-8 stderr");
+    assert!(failed, "match accepted a missing realization version");
+    assert!(
+        stderr.contains("--realization-version is required"),
+        "{stderr}"
+    );
+    let zero = run(Some("0"));
+    let failed = !zero.status.success();
+    let stderr = String::from_utf8(zero.stderr).expect("utf-8 stderr");
+    assert!(failed, "match accepted a zero realization version");
+    assert!(stderr.contains("must be positive"), "{stderr}");
 }
 
 #[test]
@@ -189,7 +221,7 @@ fn a_published_bundle_ranks_every_sim_and_picks_the_matching_one() {
         .arg(&fixture.dir)
         .arg("--permalink")
         .arg("match.permalink")
-        .args(["--seed", "7"])
+        .args(["--seed", "7", "--realization-version", "1"])
         .output()
         .expect("run");
     let elapsed = started.elapsed();
@@ -325,7 +357,7 @@ fn verify_replays_the_pinned_bundle_beside_its_permalink() {
         .arg(&fixture.dir)
         .arg("--permalink")
         .arg(&permalink)
-        .args(["--seed", "7"])
+        .args(["--seed", "7", "--realization-version", "1"])
         .output()
         .expect("run");
     let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
@@ -358,7 +390,7 @@ fn verify_rejects_a_pinned_source_that_no_longer_matches_the_bundle() {
         .arg(&fixture.dir)
         .arg("--permalink")
         .arg(&permalink_path)
-        .args(["--seed", "7"])
+        .args(["--seed", "7", "--realization-version", "1"])
         .output()
         .expect("run");
     assert!(output.status.success(), "match failed");

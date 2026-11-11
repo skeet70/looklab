@@ -19,13 +19,20 @@ pub(crate) enum AuditKind {
     RootRevoked,
     ModerationDecision,
     ProposalOpened,
+    ProposalExpired,
+    ProposalLegacyRejected,
     ReAnchor,
     Revert,
+    CredentialIntakeBlocked,
     Split,
     ReleaseManifest,
     LookHidden,
     LookRemoved,
     LookRelisted,
+    ManualConfirmation,
+    ManualConfirmationPromotion,
+    ManualConfirmationWithdrawal,
+    ManualModeratorConfirmation,
 }
 
 impl AuditKind {
@@ -40,13 +47,20 @@ impl AuditKind {
             Self::RootRevoked => "root_revoked",
             Self::ModerationDecision => "moderation_decision",
             Self::ProposalOpened => "proposal_opened",
+            Self::ProposalExpired => "proposal_expired",
+            Self::ProposalLegacyRejected => "proposal_legacy_rejected",
             Self::ReAnchor => "re_anchor",
             Self::Revert => "revert",
+            Self::CredentialIntakeBlocked => "credential_intake_blocked",
             Self::Split => "split",
             Self::ReleaseManifest => "release_manifest",
             Self::LookHidden => "look_hidden",
             Self::LookRemoved => "look_removed",
             Self::LookRelisted => "look_relisted",
+            Self::ManualConfirmation => "manual_confirmation",
+            Self::ManualConfirmationPromotion => "manual_confirmation_promotion",
+            Self::ManualConfirmationWithdrawal => "manual_confirmation_withdrawal",
+            Self::ManualModeratorConfirmation => "manual_moderator_confirmation",
         }
     }
 }

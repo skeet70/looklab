@@ -61,22 +61,26 @@ pub(crate) async fn authenticate_with_pow(
     let stored = store::find_credential(&state.db, raw_id.as_slice())
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?;
-    let (passkey, existing, display_handle) = match stored {
-        Some(credential) => (credential.passkey, Some(credential.id), None),
+    let (original, existing, revision) = match stored {
+        Some(credential) => (
+            credential.passkey,
+            Some(credential.id),
+            Some(credential.revision),
+        ),
         None if domain == RequestDomain::Session => {
             if store::credential_exists(&state.db, raw_id.as_slice()).await? {
                 return Err(ApiError::new(ErrorCode::CredentialUnknown));
             }
-            let (passkey, handle) = state
+            let (passkey, _) = state
                 .pending_credential(raw_id.as_slice())
                 .ok_or_else(|| ApiError::new(ErrorCode::CredentialUnknown))?;
-            (passkey, None, handle)
+            (passkey, None, None)
         }
         None => return Err(ApiError::new(ErrorCode::CredentialUnknown)),
     };
     let challenge = Challenge::new(&nonce, &request_digest(domain, payload));
     let passkey = verify_assertion(
-        &passkey,
+        &original,
         &assertion,
         challenge,
         &state.config.origin,
@@ -90,12 +94,20 @@ pub(crate) async fn authenticate_with_pow(
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
     if let Some(credential) = existing {
-        store::update_credential_passkey(&state.db, &credential, &passkey)
-            .await
-            .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+        let revision = revision.ok_or_else(|| ApiError::new(ErrorCode::Internal))?;
+        match store::update_credential_passkey(&state.db, &credential, &passkey, &revision).await {
+            Ok(store::CredentialUpdate::Applied) => {}
+            Ok(store::CredentialUpdate::Stale) => {
+                return Err(ApiError::new(ErrorCode::SignatureInvalid));
+            }
+            Err(_) => return Err(ApiError::new(ErrorCode::Internal)),
+        }
         Ok(credential)
     } else {
         let solutions = pow.ok_or_else(|| ApiError::new(ErrorCode::PowInvalid))?;
+        let promotion = state
+            .begin_promotion(&original, &passkey)
+            .map_err(super::upload::promotion_error)?;
         let params = state
             .trust
             .pow_params(crate::trust::NEW_CREDENTIAL_STANDING);
@@ -116,14 +128,20 @@ pub(crate) async fn authenticate_with_pow(
         store::insert_credential(
             &mut tx,
             &credential,
-            raw_id.as_slice(),
-            &passkey,
-            display_handle.as_deref(),
+            promotion.passkey().cred_id().as_slice(),
+            promotion.passkey(),
+            promotion.display_handle(),
         )
         .await
         .map_err(super::upload::database_error)?;
-        tx.commit().await.map_err(super::upload::database_error)?;
-        state.remove_pending_credential(raw_id.as_slice());
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = done_tx.send(promotion.commit(tx).await);
+        });
+        done_rx
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::Internal))?
+            .map_err(super::upload::database_error)?;
         Ok(credential)
     }
 }

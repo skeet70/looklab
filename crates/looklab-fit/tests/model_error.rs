@@ -4,7 +4,6 @@
 #![cfg(feature = "synth")]
 #![allow(clippy::disallowed_types)]
 
-use looklab_body::BodyId;
 use looklab_color::ucs::{Ucs, UcsSpace, ucs_to_jmh};
 use looklab_color::{Rgb, RgbSpace, Xyz};
 use looklab_fit::hierarchical::BodyGroup;
@@ -24,7 +23,7 @@ use looklab_model::probes::v1 as probes_v1;
 use looklab_model::solve::{reference_model, ucs_of_xyz};
 use looklab_model::{LookInput, soft_clip};
 use looklab_samples::{RerenderGroupId, SampleSet};
-use looklab_schema::{ControlKey, EnumValue, SimKey, validate_control_schema};
+use looklab_schema::{BodyId, ControlKey, EnumValue, SimKey, validate_control_schema};
 
 const SAMPLES: usize = 1600;
 
@@ -81,7 +80,7 @@ fn add_body(
         images.push(image);
     }
     groups.push(BodyGroup {
-        body: BodyId::new(format!("body-{label}")).expect("body id"),
+        body: BodyId::new(&format!("test/body-{label}")).expect("body id"),
         images: (start..images.len()).collect(),
     });
 }
@@ -143,11 +142,7 @@ fn neutral_probes() -> ProbeUncertainty {
         .collect();
     ProbeUncertainty {
         probes,
-        ids: v1
-            .probes
-            .iter()
-            .map(|probe| probe.id.clone())
-            .collect(),
+        ids: v1.probes.iter().map(|probe| probe.id.clone()).collect(),
         supported_fraction: 0.0,
     }
 }
@@ -627,10 +622,7 @@ fn opposing_chroma_errors_inside_a_region_are_retained() {
         .filter(|cell| field.repeats[*cell] > 0)
         .map(|cell| moment_trace(field.post[cell]))
         .fold(0.0_f64, f64::max);
-    assert!(
-        rms > 0.05,
-        "local chroma error collapsed: {rms}"
-    );
+    assert!(rms > 0.05, "local chroma error collapsed: {rms}");
     assert!(
         variance > 0.01,
         "local chroma variance collapsed: {variance}"
@@ -738,11 +730,11 @@ fn single_sample_cell_uses_global_fallback() {
     images.extend(body1);
     let groups = vec![
         BodyGroup {
-            body: BodyId::new("sparse").expect("body id"),
+            body: BodyId::new("test/sparse").expect("body id"),
             images: (0..start).collect(),
         },
         BodyGroup {
-            body: BodyId::new("rest").expect("body id"),
+            body: BodyId::new("test/rest").expect("body id"),
             images: (start..images.len()).collect(),
         },
     ];
@@ -834,8 +826,7 @@ fn estimated_field_marks_thin_cell_without_evidence_and_keeps_encodings_separate
         .find(|(_, probe)| {
             let target = cell(&LookInput::new(probe.xyz));
             images.iter().any(|image| {
-                (0..image.samples.n())
-                    .any(|index| cell(&sample_input(image, index)) == target)
+                (0..image.samples.n()).any(|index| cell(&sample_input(image, index)) == target)
             })
         })
         .map(|(index, _)| index)
@@ -860,8 +851,7 @@ fn estimated_field_marks_thin_cell_without_evidence_and_keeps_encodings_separate
         .iter()
         .enumerate()
         .find(|(index, probe)| {
-            *index != target_probe
-                && field.evidence_at(&LookInput::new(probe.xyz), RgbSpace::Srgb)
+            *index != target_probe && field.evidence_at(&LookInput::new(probe.xyz), RgbSpace::Srgb)
         })
         .map(|(index, _)| index)
         .expect("another sRGB cell has evidence");
@@ -1000,7 +990,7 @@ fn image_copies_do_not_add_confidence() {
         let start = independent_images.len();
         independent_images.push(image.clone());
         independent_groups.push(BodyGroup {
-            body: BodyId::new(format!("image-{index}")).expect("body id"),
+            body: BodyId::new(&format!("test/image-{index}")).expect("body id"),
             images: (start..independent_images.len()).collect(),
         });
         let group =
@@ -1010,7 +1000,7 @@ fn image_copies_do_not_add_confidence() {
             copy_images.push(copy_with_group(image, group));
         }
         copy_groups.push(BodyGroup {
-            body: BodyId::new(format!("copy-{index}")).expect("body id"),
+            body: BodyId::new(&format!("test/copy-{index}")).expect("body id"),
             images: (start..copy_images.len()).collect(),
         });
     }
@@ -1062,11 +1052,11 @@ fn distinct_same_raw_renders_are_preserved() {
     let groups = || {
         vec![
             BodyGroup {
-                body: BodyId::new("same-raw").expect("body id"),
+                body: BodyId::new("test/same-raw").expect("body id"),
                 images: vec![0, 1],
             },
             BodyGroup {
-                body: BodyId::new("other").expect("body id"),
+                body: BodyId::new("test/other").expect("body id"),
                 images: vec![2],
             },
         ]

@@ -75,6 +75,14 @@ fn mul(m: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
     ]
 }
 
+fn infinite_scale(slope: f64, component: f64) -> f64 {
+    if component == 0.0 {
+        0.0
+    } else {
+        slope * component
+    }
+}
+
 fn post_adaptation_scalar(response: f64, f_l: f64) -> f64 {
     let u = f_l * response.abs() / 100.0;
     let f = libm::pow(u, 0.42);
@@ -108,8 +116,16 @@ impl Jet {
     }
 
     fn sqrt(self) -> Self {
-        if self.v <= 0.0 {
-            return Self::constant(self.v.max(0.0).sqrt());
+        if self.v < 0.0 {
+            return Self::constant(f64::NAN);
+        }
+        if self.v == 0.0 {
+            return Self {
+                v: 0.0,
+                d: self
+                    .d
+                    .map(|component| infinite_scale(f64::INFINITY, component)),
+            };
         }
         self.map(|x| (x.sqrt(), 0.5 / x.sqrt()))
     }
@@ -117,14 +133,24 @@ impl Jet {
     fn pow_signed(self, p: f64) -> Self {
         let magnitude = self.v.abs();
         let value = self.v.signum() * libm::pow(magnitude, p);
-        let slope = if magnitude > 0.0 {
-            p * libm::pow(magnitude, p - 1.0)
-        } else {
-            0.0
+        let derivative = |component: f64| {
+            if magnitude > 0.0 {
+                p * libm::pow(magnitude, p - 1.0) * component
+            } else if p == 1.0 {
+                component
+            } else if p < 1.0 {
+                infinite_scale(f64::INFINITY, component)
+            } else {
+                0.0
+            }
         };
         Self {
             v: value,
-            d: [slope * self.d[0], slope * self.d[1], slope * self.d[2]],
+            d: [
+                derivative(self.d[0]),
+                derivative(self.d[1]),
+                derivative(self.d[2]),
+            ],
         }
     }
 
@@ -206,16 +232,23 @@ fn post_adaptation(response: Jet, f_l: f64) -> Jet {
     let denom = 27.13 + f;
     let value = 400.0 * response.v.signum() * f / denom + 0.1;
     let slope = if response.v == 0.0 {
-        0.0
+        f64::INFINITY
     } else {
         400.0 * 27.13 / (denom * denom) * 0.42 * (f / u) * (f_l / 100.0)
+    };
+    let scale = |component: f64| {
+        if component == 0.0 {
+            0.0
+        } else {
+            slope * component
+        }
     };
     Jet {
         v: value,
         d: [
-            slope * response.d[0],
-            slope * response.d[1],
-            slope * response.d[2],
+            scale(response.d[0]),
+            scale(response.d[1]),
+            scale(response.d[2]),
         ],
     }
 }
@@ -225,7 +258,7 @@ fn atan2_degrees(b: Jet, a: Jet) -> Jet {
     let scale = 180.0 / PI;
     let value = libm::atan2(b.v, a.v) * scale;
     let (da, db) = if denominator == 0.0 {
-        (0.0, 0.0)
+        (f64::NAN, f64::NAN)
     } else {
         (-b.v / denominator * scale, a.v / denominator * scale)
     };

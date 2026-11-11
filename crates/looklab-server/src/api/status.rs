@@ -14,24 +14,24 @@ use crate::error::{ApiError, ApiResult, ErrorCode};
 use crate::ids::{CredentialId, StatusToken};
 use crate::rate_limit::Action;
 use crate::state::AppState;
-use crate::store::{self, ContributionFeed};
+use crate::store::{self, ActivityFeed, ContributionStatus};
 use crate::trust::Tier;
 use crate::verify::{RequestDomain, SignedRequestPayload};
 
 #[derive(Serialize)]
 pub struct StatusResponse {
     credential: CredentialId,
-    contributions: Vec<ContributionFeed>,
+    activities: Vec<ActivityFeed>,
 }
 
-async fn feed(state: &AppState, token: &str) -> ApiResult<(CredentialId, Vec<ContributionFeed>)> {
+async fn feed(state: &AppState, token: &str) -> ApiResult<(CredentialId, Vec<ActivityFeed>)> {
     let token =
         StatusToken::from_base64url(token).ok_or_else(|| ApiError::new(ErrorCode::TokenUnknown))?;
     let credential = store::credential_id_for_token(&state.db, &token.hash())
         .await?
         .ok_or_else(|| ApiError::new(ErrorCode::TokenUnknown))?;
-    let contributions = store::status_feed(&state.db, &credential).await?;
-    Ok((credential, contributions))
+    let activities = store::status_feed(&state.db, &credential).await?;
+    Ok((credential, activities))
 }
 
 pub async fn status(
@@ -41,16 +41,16 @@ pub async fn status(
     if let Some(token) = token.strip_suffix(".rss") {
         return rss(&state, token).await;
     }
-    let (credential, contributions) = feed(&state, &token).await?;
+    let (credential, activities) = feed(&state, &token).await?;
     Ok(Json(StatusResponse {
         credential,
-        contributions,
+        activities,
     })
     .into_response())
 }
 
 async fn rss(state: &AppState, token: &str) -> ApiResult<Response> {
-    let (credential, contributions) = feed(state, token).await?;
+    let (credential, activities) = feed(state, token).await?;
     let mut xml =
         String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<rss version=\"2.0\"><channel>");
     xml.push_str("<title>looklab contribution status</title>");
@@ -59,33 +59,127 @@ async fn rss(state: &AppState, token: &str) -> ApiResult<Response> {
         "<link>looklab-status:{}</link>",
         escape_xml(credential.as_str())
     );
-    xml.push_str("<description>Per-image status of your contributions.</description>");
-    for contribution in contributions {
+    xml.push_str("<description>Status of your contributions.</description>");
+    for activity in activities {
         xml.push_str("<item>");
         let _ = write!(
             xml,
             "<title>{}</title>",
-            escape_xml(&format!("Contribution {}", contribution.id))
+            escape_xml(&format!(
+                "Contribution from {}",
+                format_day(activity.created_at)
+            ))
         );
-        let mut description = String::new();
-        for image in &contribution.images {
-            let _ = writeln!(
-                description,
-                "{}: {}{}",
-                image.id,
-                image.status,
-                image
-                    .reason
-                    .as_deref()
-                    .map(|reason| format!(" ({reason})"))
-                    .unwrap_or_default()
-            );
+        let photos: usize = activity
+            .contributions
+            .iter()
+            .map(|contribution| contribution.images.len())
+            .sum();
+        let mut description = format!("{photos} photos\n");
+        let mut photo_index = 0;
+        for contribution in &activity.contributions {
+            if contribution.status == ContributionStatus::Withdrawn {
+                description.push_str("withdrawn\n");
+                photo_index += contribution.images.len();
+                continue;
+            }
+            if contribution.render_class == looklab_upload::RenderClass::Monochrome
+                && contribution.status == ContributionStatus::Pending
+            {
+                description.push_str("received, awaiting monochrome analysis\n");
+                photo_index += contribution.images.len();
+                continue;
+            }
+            if !contribution.uses.is_empty() {
+                let measured = contribution.uses.iter().any(|entry| {
+                    entry.selection == Some(looklab_schema::SelectionScope::Qualified)
+                        && entry.outcome == looklab_schema::AssessmentOutcome::Pass
+                });
+                let experimental = contribution.uses.iter().any(|entry| {
+                    entry.selection == Some(looklab_schema::SelectionScope::Experimental)
+                        && entry.outcome == looklab_schema::AssessmentOutcome::Pass
+                });
+                let _ = writeln!(
+                    description,
+                    "Contribution used to check a {}",
+                    if measured {
+                        "measured model"
+                    } else if experimental {
+                        "gate-passing experimental model"
+                    } else if contribution
+                        .uses
+                        .iter()
+                        .any(|entry| entry.outcome == looklab_schema::AssessmentOutcome::Pass)
+                    {
+                        "assessed model, not currently selected"
+                    } else {
+                        "incomplete assessment"
+                    }
+                );
+            }
+            for image in &contribution.images {
+                photo_index += 1;
+                if !image.uses.is_empty() {
+                    let measured = image.uses.iter().any(|entry| {
+                        entry.selection == Some(looklab_schema::SelectionScope::Qualified)
+                            && entry.outcome == looklab_schema::AssessmentOutcome::Pass
+                    });
+                    let experimental = image.uses.iter().any(|entry| {
+                        entry.selection == Some(looklab_schema::SelectionScope::Experimental)
+                            && entry.outcome == looklab_schema::AssessmentOutcome::Pass
+                    });
+                    let capabilities = image
+                        .uses
+                        .iter()
+                        .map(|entry| match entry.capability {
+                            looklab_schema::QualificationCapability::NativePrediction => {
+                                "camera response"
+                            }
+                            looklab_schema::QualificationCapability::ControlsMatching => {
+                                "settings and controls"
+                            }
+                            looklab_schema::QualificationCapability::CrossBodyAdmission => {
+                                "cross-camera agreement"
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let _ = writeln!(
+                        description,
+                        "Photo {photo_index}: used to check a {} ({})",
+                        if measured {
+                            "measured model"
+                        } else if experimental {
+                            "gate-passing experimental model"
+                        } else if image
+                            .uses
+                            .iter()
+                            .any(|entry| entry.outcome == looklab_schema::AssessmentOutcome::Pass)
+                        {
+                            "assessed model, not currently selected"
+                        } else {
+                            "incomplete assessment"
+                        },
+                        capabilities.join(", ")
+                    );
+                    continue;
+                }
+                let _ = writeln!(
+                    description,
+                    "Photo {photo_index}: {}{}",
+                    image.status,
+                    image
+                        .reason
+                        .as_deref()
+                        .map(|reason| format!(" ({reason})"))
+                        .unwrap_or_default()
+                );
+            }
         }
         let _ = write!(
             xml,
             "<description>{}</description><guid isPermaLink=\"false\">{}</guid>",
             escape_xml(&description),
-            escape_xml(contribution.id.as_str())
+            activity.identity
         );
         xml.push_str("</item>");
     }
@@ -96,6 +190,20 @@ async fn rss(state: &AppState, token: &str) -> ApiResult<Response> {
         xml,
     )
         .into_response())
+}
+
+fn format_day(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 fn escape_xml(value: &str) -> String {

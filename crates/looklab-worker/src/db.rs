@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Row access for uploads, credentials, blobs, versions and moderation items.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use looklab_server::admin::{self, ManifestArtifact};
 use looklab_server::{ContributionId, CredentialId};
 use looklab_trust::{CredentialId as TrustCredentialId, Reputation, Scope, Tier};
-use looklab_upload::{BodyId, ContributionKind, ControlSettings, LookSlug};
-use sqlx::{Row, SqlitePool};
+use looklab_upload::{
+    BodyId, CommunitySnapshotVersion, ContributionKind, ControlSettings, LookSlug, RenderClass,
+};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::error::{Result, WorkerError};
 
@@ -165,6 +167,9 @@ pub struct ContributionRow {
     pub firmware: String,
     pub sim_key: String,
     pub settings: ControlSettings,
+    pub render_class: RenderClass,
+    pub deferred_until: Option<i64>,
+    pub community_snapshot_version: CommunitySnapshotVersion,
     pub serial_hmac: Option<[u8; 32]>,
     pub status: ContributionStatus,
     pub created_at: i64,
@@ -211,14 +216,22 @@ pub fn blob_path(root: &Path, hash: &[u8; 32]) -> PathBuf {
 }
 
 pub async fn credential(pool: &SqlitePool, id: &CredentialId) -> Result<CredentialInfo> {
+    let mut conn = pool.acquire().await?;
+    credential_conn(&mut conn, id).await
+}
+
+pub async fn credential_conn(
+    conn: &mut SqliteConnection,
+    id: &CredentialId,
+) -> Result<CredentialInfo> {
     let row: (String, f64) = sqlx::query_as(
         "SELECT tier, reputation FROM credentials WHERE id = ? AND status = 'active'",
     )
     .bind(id.as_str())
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     let tier = parse_tier(&row.0)?;
-    let scope = credential_scope(pool, id).await?;
+    let scope = credential_scope_conn(conn, id).await?;
     Ok(CredentialInfo {
         id: id.clone(),
         trust: admin::trust_id(id)?,
@@ -229,7 +242,10 @@ pub async fn credential(pool: &SqlitePool, id: &CredentialId) -> Result<Credenti
 }
 
 /// An unrestricted grant or endorsement is `None`; no active scope is an empty scope.
-async fn credential_scope(pool: &SqlitePool, id: &CredentialId) -> Result<Option<Scope>> {
+async fn credential_scope_conn(
+    conn: &mut SqliteConnection,
+    id: &CredentialId,
+) -> Result<Option<Scope>> {
     let rows: Vec<(Option<String>,)> = sqlx::query_as(
         "SELECT scope FROM grants
          WHERE subject_credential = ? AND role_or_tier = 'seeder' AND revoked_at IS NULL
@@ -239,7 +255,7 @@ async fn credential_scope(pool: &SqlitePool, id: &CredentialId) -> Result<Option
     )
     .bind(id.as_str())
     .bind(id.as_str())
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     let mut rules = Vec::new();
     for (scope,) in rows {
@@ -252,22 +268,48 @@ async fn credential_scope(pool: &SqlitePool, id: &CredentialId) -> Result<Option
     Ok(Some(Scope::new(rules)))
 }
 
-/// Credentials a moderator excluded from later fits of one Look.
-pub async fn look_credential_exclusions(
-    pool: &SqlitePool,
-    look: &str,
-) -> Result<BTreeSet<CredentialId>> {
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT credential_id FROM look_credential_exclusions WHERE look = ?")
-            .bind(look)
-            .fetch_all(pool)
-            .await?;
+/// Active root admissions, oldest first, in the caller's snapshot.
+pub async fn active_root_admissions(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<admin::ActiveRootAdmission>> {
+    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT id, contribution_id, scope, admitted_at FROM root_admissions
+         WHERE revoked_at IS NULL ORDER BY admitted_at, id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
     rows.into_iter()
-        .map(|(id,)| {
-            CredentialId::try_from(id)
-                .map_err(|_| WorkerError::Data("excluded credential id is not a UUID".to_owned()))
+        .map(|(id, contribution, scope, admitted_at)| {
+            Ok(admin::ActiveRootAdmission {
+                id: looklab_server::RootAdmissionId::try_from(id)
+                    .map_err(|_| WorkerError::Data("root admission id is not a UUID".to_owned()))?,
+                contribution: ContributionId::try_from(contribution).map_err(|_| {
+                    WorkerError::Data("root admission contribution is not a UUID".to_owned())
+                })?,
+                scope: admin::parse_scope(Some(scope.as_str()))
+                    .map_err(WorkerError::Admin)?
+                    .ok_or_else(|| WorkerError::Data("root admission has no scope".to_owned()))?,
+                admitted_at,
+            })
         })
         .collect()
+}
+
+/// The published community snapshot version and recorded hash, if one exists.
+pub async fn published_snapshot_identity(
+    conn: &mut SqliteConnection,
+) -> Result<Option<(u64, String)>> {
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT version, content_hash FROM community_snapshot_activation WHERE id = 1",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    row.map(|(version, hash)| {
+        let version = u64::try_from(version)
+            .map_err(|_| WorkerError::Data("published snapshot version is not a u64".to_owned()))?;
+        Ok((version, hash))
+    })
+    .transpose()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,6 +396,14 @@ fn parse_kind(value: &str) -> Result<ContributionKind> {
     })
 }
 
+fn parse_render_class(value: &str) -> Result<RenderClass> {
+    match value {
+        "colour" => Ok(RenderClass::Colour),
+        "monochrome" => Ok(RenderClass::Monochrome),
+        other => Err(WorkerError::Data(format!("unknown render class `{other}`"))),
+    }
+}
+
 fn parse_intent(value: &str) -> Result<ContributionIntent> {
     Ok(match value {
         "native" => ContributionIntent::Native,
@@ -398,6 +448,12 @@ fn contribution_row(row: &sqlx::sqlite::SqliteRow) -> Result<ContributionRow> {
         firmware: row.get("firmware_version"),
         sim_key: row.get("sim_key"),
         settings: serde_json::from_str::<ControlSettings>(&row.get::<String, _>("settings"))?,
+        render_class: parse_render_class(&row.get::<String, _>("render_class"))?,
+        deferred_until: row.get("deferred_until"),
+        community_snapshot_version: CommunitySnapshotVersion::new(
+            u64::try_from(row.get::<i64, _>("community_snapshot_version"))
+                .map_err(|_| WorkerError::Data("snapshot version is not a u64".to_owned()))?,
+        ),
         serial_hmac,
         status: ContributionStatus::parse(row.get::<String, _>("status").as_str())?,
         created_at: row.get("created_at"),
@@ -443,7 +499,8 @@ fn image_row(row: &sqlx::sqlite::SqliteRow) -> Result<ImageRow> {
 }
 
 const CONTRIBUTION_COLUMNS: &str = "c.id, c.credential_id, c.kind, c.intent, c.target_look_id,
-    c.body_id, c.firmware_version, c.sim_key, c.settings, c.serial_hmac, c.status, c.created_at";
+    c.body_id, c.firmware_version, c.sim_key, c.settings, c.render_class, c.deferred_until,
+    c.community_snapshot_version, c.serial_hmac, c.status, c.created_at";
 
 pub async fn contribution(pool: &SqlitePool, id: &ContributionId) -> Result<ContributionRow> {
     let sql = format!("SELECT {CONTRIBUTION_COLUMNS} FROM contributions c WHERE c.id = ?");
@@ -467,14 +524,22 @@ pub async fn body_pool(
     pool: &SqlitePool,
     body: &BodyId,
 ) -> Result<Vec<(ContributionRow, Vec<ImageRow>)>> {
+    let mut conn = pool.acquire().await?;
+    body_pool_conn(&mut conn, body).await
+}
+
+pub async fn body_pool_conn(
+    conn: &mut SqliteConnection,
+    body: &BodyId,
+) -> Result<Vec<(ContributionRow, Vec<ImageRow>)>> {
     let sql = format!(
         "SELECT {CONTRIBUTION_COLUMNS} FROM contributions c
-         WHERE c.body_id = ? AND c.intent != 'card'
+         WHERE c.body_id = ? AND c.intent != 'card' AND c.render_class = 'colour'
            AND c.status NOT IN ('withdrawn', 'quarantined') ORDER BY c.id"
     );
     let contributions = sqlx::query(&sql)
         .bind(body.as_str())
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
     let mut out = Vec::with_capacity(contributions.len());
     for row in &contributions {
@@ -485,7 +550,7 @@ pub async fn body_pool(
              WHERE contribution_id = ? AND status != 'quarantined' ORDER BY id",
         )
         .bind(contribution.id.as_str())
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         let images = images.iter().map(image_row).collect::<Result<Vec<_>>>()?;
         out.push((contribution, images));
@@ -496,7 +561,9 @@ pub async fn body_pool(
 pub async fn all_contributions(pool: &SqlitePool) -> Result<Vec<ContributionRow>> {
     let sql = format!(
         "SELECT {CONTRIBUTION_COLUMNS} FROM contributions c
-         WHERE c.status != 'withdrawn' AND c.intent != 'card' ORDER BY c.id"
+         WHERE c.status NOT IN ('withdrawn', 'quarantined')
+           AND c.intent != 'card' AND c.render_class = 'colour'
+         ORDER BY c.id"
     );
     let rows = sqlx::query(&sql).fetch_all(pool).await?;
     rows.iter().map(contribution_row).collect()
@@ -514,11 +581,18 @@ pub async fn images_for_contributions(
 }
 
 pub async fn serial_links(pool: &SqlitePool) -> Result<Vec<(CredentialId, [u8; 32])>> {
+    let mut conn = pool.acquire().await?;
+    serial_links_conn(&mut conn).await
+}
+
+pub async fn serial_links_conn(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<(CredentialId, [u8; 32])>> {
     let rows = sqlx::query(
         "SELECT DISTINCT credential_id, serial_hmac FROM contributions
          WHERE serial_hmac IS NOT NULL",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     rows.iter()
         .map(|row| {
@@ -555,7 +629,8 @@ pub async fn write_image_stats(
         "UPDATE contribution_images
          SET rms_de = ?, z = ?, reason = ?, weight_components = ?, status = ?, status_reason = ?
          WHERE id = ?
-           AND contribution_id IN (SELECT id FROM contributions WHERE status != 'withdrawn')",
+           AND contribution_id IN (SELECT id FROM contributions
+                                   WHERE status != 'withdrawn' AND render_class = 'colour')",
     )
     .bind(stats.rms_de)
     .bind(stats.z)
@@ -575,12 +650,14 @@ pub async fn set_contribution_status(
     id: &ContributionId,
     outcome: ContributionOutcome,
 ) -> Result<bool> {
-    let result =
-        sqlx::query("UPDATE contributions SET status = ? WHERE id = ? AND status != 'withdrawn'")
-            .bind(outcome.as_str())
-            .bind(id.as_str())
-            .execute(pool)
-            .await?;
+    let result = sqlx::query(
+        "UPDATE contributions SET status = ?
+             WHERE id = ? AND status != 'withdrawn' AND render_class = 'colour'",
+    )
+    .bind(outcome.as_str())
+    .bind(id.as_str())
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected() == 1)
 }
 
@@ -747,47 +824,177 @@ pub async fn mark_withdrawal_deleted(
     Ok(())
 }
 
-/// Releases one image's reference once per withdrawal. `None` means the reference
-/// was already released by an earlier attempt, so the caller must not delete again.
-pub async fn release_blob_once(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredExpiryId(String);
+
+impl DeferredExpiryId {
+    pub fn parse(text: &str) -> Option<Self> {
+        uuid::Uuid::parse_str(text)
+            .ok()
+            .map(|_| Self(text.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeferredExpiryRow {
+    pub id: DeferredExpiryId,
+    pub contribution: ContributionId,
+    pub due_at: i64,
+}
+
+pub async fn deferred_expiries_due(
     pool: &SqlitePool,
-    withdrawal: &WithdrawalId,
+    contribution: Option<&ContributionId>,
+    now: i64,
+) -> Result<Vec<DeferredExpiryRow>> {
+    let rows = sqlx::query(
+        "SELECT d.id, d.contribution_id, d.due_at FROM deferred_expiries d
+         WHERE d.status = 'pending' AND d.due_at <= ? AND (? IS NULL OR d.contribution_id = ?)
+           AND NOT EXISTS (
+               SELECT 1 FROM withdrawals w
+               WHERE w.contribution_id = d.contribution_id
+                 AND w.status = 'pending' AND w.delete_after <= ?
+           )
+         ORDER BY d.due_at",
+    )
+    .bind(now)
+    .bind(contribution.map(|id| id.as_str()))
+    .bind(contribution.map(|id| id.as_str()))
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            let id: String = row.get("id");
+            let id = DeferredExpiryId::parse(&id)
+                .ok_or_else(|| WorkerError::Data("expiry id is not a UUID".to_owned()))?;
+            let contribution: String = row.get("contribution_id");
+            let contribution = ContributionId::try_from(contribution)
+                .map_err(|_| WorkerError::Data("contribution id is not a UUID".to_owned()))?;
+            Ok(DeferredExpiryRow {
+                id,
+                contribution,
+                due_at: row.get("due_at"),
+            })
+        })
+        .collect()
+}
+
+pub async fn expire_deferred_contribution(
+    pool: &SqlitePool,
+    contribution: &ContributionId,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE contributions SET status = 'withdrawn'
+         WHERE id = ? AND render_class = 'monochrome' AND status != 'withdrawn'",
+    )
+    .bind(contribution.as_str())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_deferred_expiry_deleted(
+    pool: &SqlitePool,
+    contribution: &ContributionId,
+) -> Result<()> {
+    sqlx::query("UPDATE deferred_expiries SET status = 'deleted' WHERE contribution_id = ?")
+        .bind(contribution.as_str())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn release_image_blob_once(
+    pool: &SqlitePool,
+    blobs: &Path,
     image: &ImageId,
     hash: &[u8; 32],
     now: i64,
-) -> Result<Option<i64>> {
-    let mut tx = pool.begin().await?;
-    let inserted = sqlx::query(
-        "INSERT INTO withdrawal_releases (withdrawal_id, image_id, released_at)
-         VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let claimed = sqlx::query(
+        "UPDATE contribution_images SET blob_released_at = ?
+         WHERE id = ? AND blob_released_at IS NULL",
     )
-    .bind(withdrawal.as_str())
-    .bind(image.as_str())
     .bind(now)
+    .bind(image.as_str())
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    if inserted == 0 {
-        tx.rollback().await?;
-        return Ok(None);
-    }
-    sqlx::query("UPDATE blobs SET ref_count = ref_count - 1 WHERE hash = ?")
-        .bind(hash.as_slice())
-        .execute(&mut *tx)
-        .await?;
-    let remaining: Option<i64> = sqlx::query_scalar("SELECT ref_count FROM blobs WHERE hash = ?")
-        .bind(hash.as_slice())
-        .fetch_optional(&mut *tx)
-        .await?;
-    let remaining = remaining.unwrap_or(0);
-    if remaining <= 0 {
-        sqlx::query("DELETE FROM blobs WHERE hash = ?")
+    if claimed == 1 {
+        sqlx::query("UPDATE blobs SET ref_count = ref_count - 1 WHERE hash = ?")
             .bind(hash.as_slice())
             .execute(&mut *tx)
             .await?;
+        let remaining: Option<i64> =
+            sqlx::query_scalar("SELECT ref_count FROM blobs WHERE hash = ?")
+                .bind(hash.as_slice())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if remaining.unwrap_or(0) <= 0 {
+            sqlx::query("DELETE FROM blobs WHERE hash = ?")
+                .bind(hash.as_slice())
+                .execute(&mut *tx)
+                .await?;
+            if !blob_referenced(&mut tx, hash).await? {
+                remove_blob_file(blobs, hash)?;
+            }
+        }
     }
     tx.commit().await?;
-    Ok(Some(remaining))
+    Ok(())
+}
+
+pub async fn blob_referenced(conn: &mut SqliteConnection, hash: &[u8; 32]) -> Result<bool> {
+    let referenced: i64 =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM blob_references WHERE hash = ?)")
+            .bind(hex(hash))
+            .fetch_one(conn)
+            .await?;
+    Ok(referenced != 0)
+}
+
+pub async fn expired_staging_hashes(
+    conn: &mut SqliteConnection,
+    now: i64,
+) -> Result<Vec<[u8; 32]>> {
+    let rows: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT DISTINCT hash FROM blob_staging WHERE expires_at <= ?")
+            .bind(now)
+            .fetch_all(conn)
+            .await?;
+    rows.into_iter()
+        .map(|row| {
+            row.try_into()
+                .map_err(|_| WorkerError::Data("blob hash is not 32 bytes".to_owned()))
+        })
+        .collect()
+}
+
+pub async fn delete_expired_staging(
+    conn: &mut SqliteConnection,
+    hash: &[u8; 32],
+    now: i64,
+) -> Result<()> {
+    sqlx::query("DELETE FROM blob_staging WHERE hash = ? AND expires_at <= ?")
+        .bind(hash.as_slice())
+        .bind(now)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+pub fn remove_blob_file(root: &Path, hash: &[u8; 32]) -> Result<()> {
+    match std::fs::remove_file(blob_path(root, hash)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Versions a moderator explicitly re-anchored (docs/05 §8).

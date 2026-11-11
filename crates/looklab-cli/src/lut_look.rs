@@ -149,6 +149,7 @@ fn import(args: &ImportArgs) -> Result<()> {
         name: args.name.clone(),
         license,
         encoding,
+        declared_base: None,
         output: match args.output {
             OutputArg::Srgb => OutputEncoding::Srgb,
         },
@@ -441,6 +442,7 @@ mod tests {
                 attribution: "test".to_string(),
             },
             encoding: DeclaredEncoding::DisplayReferred { base, status },
+            declared_base: None,
             output: OutputEncoding::Srgb,
             lut: LutRecord {
                 size: 2,

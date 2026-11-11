@@ -41,6 +41,42 @@ impl Xyz {
     }
 }
 
+/// Tristimulus departure from a reference white, a plain [`Xyz`] difference.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WhiteRelativeXyz(Xyz);
+
+impl WhiteRelativeXyz {
+    pub const fn from_array(v: [f64; 3]) -> Self {
+        Self(Xyz::from_array(v))
+    }
+
+    /// `absolute - white`.
+    pub fn between(absolute: Xyz, white: Xyz) -> Self {
+        Self(Xyz::new(
+            absolute.x - white.x,
+            absolute.y - white.y,
+            absolute.z - white.z,
+        ))
+    }
+
+    pub const fn x(self) -> f64 {
+        self.0.x
+    }
+
+    pub const fn y(self) -> f64 {
+        self.0.y
+    }
+
+    pub const fn z(self) -> f64 {
+        self.0.z
+    }
+
+    pub const fn to_array(self) -> [f64; 3] {
+        self.0.to_array()
+    }
+}
+
 impl Rgb {
     pub const fn new(r: f64, g: f64, b: f64) -> Self {
         Self { r, g, b }

@@ -7,11 +7,13 @@ use sqlx::SqlitePool;
 use crate::clock::now_unix;
 use crate::config::WorkerConfig;
 use crate::db;
-use crate::error::Result;
+use crate::error::{Result, WorkerError};
 use crate::jobs::{self, ClaimedJob, JobId, JobKind, JobPayload};
 use crate::publish::{self, PublishConfig, PublishSummary};
 use crate::refit::{self, RefitOutcome};
-use crate::{bounties, cards, consistency, duplicates, gc, lut_rebase};
+use crate::{bounties, cards, consistency, duplicates, gc, lut_import, lut_rebase};
+
+const BLOB_GC_INTERVAL_SECONDS: i64 = 3_600;
 
 pub struct Worker {
     pool: SqlitePool,
@@ -22,6 +24,8 @@ impl Worker {
     pub async fn open(config: WorkerConfig) -> Result<Self> {
         std::fs::create_dir_all(&config.blobs)?;
         let pool = looklab_server::open_database(&config.db).await?;
+        crate::source_identity::activate(&pool).await?;
+        crate::model_assessment::enqueue_engine_verification(&pool, &config, now_unix()).await?;
         Ok(Self { pool, config })
     }
 
@@ -49,6 +53,7 @@ impl Worker {
     /// A failed job is marked before the error returns.
     pub async fn run_once(&self) -> Result<Option<JobId>> {
         let now = now_unix();
+        let _ = crate::model_fit::enqueue_pending(&self.pool, &self.config, now).await?;
         let _ = jobs::enqueue_pending_publication(&self.pool, now).await?;
         let Some(job) = jobs::claim(&self.pool, self.config.lease_seconds, now).await? else {
             return Ok(None);
@@ -126,9 +131,30 @@ impl Worker {
     }
 
     pub async fn run_until_idle(&self) -> Result<usize> {
+        self.run_until_idle_bounded(usize::MAX, Duration::MAX).await
+    }
+
+    /// Fails once `max_jobs` have run or `deadline` passes; the clock is read between jobs.
+    pub async fn run_until_idle_bounded(
+        &self,
+        max_jobs: usize,
+        deadline: Duration,
+    ) -> Result<usize> {
+        let started = std::time::Instant::now();
         let mut completed = 0;
         while self.run_once().await?.is_some() {
             completed += 1;
+            if completed >= max_jobs {
+                return Err(WorkerError::Job(format!(
+                    "drained {completed} jobs without reaching idle; a job is re-enqueuing itself"
+                )));
+            }
+            if started.elapsed() > deadline {
+                return Err(WorkerError::Job(format!(
+                    "drained {completed} jobs in {:?} without reaching idle",
+                    started.elapsed()
+                )));
+            }
         }
         Ok(completed)
     }
@@ -146,6 +172,16 @@ impl Worker {
                 jobs::enqueue(
                     &self.pool,
                     &JobPayload::NightlyRefit { bodies: Vec::new() },
+                    now,
+                )
+                .await?;
+            }
+            if jobs::blob_gc_due(&self.pool, now, BLOB_GC_INTERVAL_SECONDS).await? {
+                jobs::enqueue_if_idle(
+                    &self.pool,
+                    &JobPayload::BlobGc {
+                        contribution_id: None,
+                    },
                     now,
                 )
                 .await?;
@@ -197,18 +233,87 @@ impl Worker {
         Ok(())
     }
 
+    async fn score_contribution(
+        &self,
+        contribution_id: &looklab_server::ContributionId,
+        ownership: &jobs::JobOwnership,
+    ) -> Result<()> {
+        use looklab_schema::{
+            Applicability, ModelSubject, ProjectionUse, QualificationCapability, ScopeKey,
+        };
+        use looklab_server::model_store;
+
+        let contribution = db::contribution(&self.pool, contribution_id).await?;
+        if contribution.intent == db::ContributionIntent::Card {
+            return cards::validate(&self.pool, &self.config, contribution_id).await;
+        }
+        if contribution.status == db::ContributionStatus::Withdrawn
+            || contribution.render_class == looklab_upload::RenderClass::Monochrome
+        {
+            return Ok(());
+        }
+        if crate::body::TransformDir::new(&self.config.transforms)
+            .load_optional(&contribution.body)?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let resources = crate::body::published_data_dir(&self.pool, &self.config)
+            .await?
+            .load(&contribution.body)?;
+        let Some((realization, _)) = crate::pool::realization_scope(&resources, &contribution)?
+        else {
+            return Ok(());
+        };
+        let subject = ModelSubject::BodyRealization { realization }.key();
+        let mut conn = self.pool.acquire().await?;
+        let mut projections =
+            model_store::current_projections(&mut conn, &subject, ProjectionUse::QualifiedMatch)
+                .await?;
+        drop(conn);
+        projections.retain(|projection| {
+            projection.capability == QualificationCapability::NativePrediction
+                && projection.applicability == Applicability::Current
+        });
+        if projections.is_empty() {
+            consistency::run(
+                &self.pool,
+                &self.config,
+                contribution_id,
+                &ScopeKey::all(),
+                &ownership.id,
+                ownership.attempts,
+            )
+            .await?;
+        } else {
+            for projection in projections {
+                consistency::run(
+                    &self.pool,
+                    &self.config,
+                    contribution_id,
+                    &projection.scope_key,
+                    &ownership.id,
+                    ownership.attempts,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn execute(&self, job: &ClaimedJob) -> Result<()> {
         match job.payload()? {
+            JobPayload::ModelAssessment { request } => {
+                crate::model_assessment::run(&self.pool, &self.config, &request, &job.ownership())
+                    .await
+            }
             JobPayload::ConsistencyScore { contribution_id } => {
-                let contribution = db::contribution(&self.pool, &contribution_id).await?;
-                if contribution.intent == db::ContributionIntent::Card {
-                    cards::validate(&self.pool, &self.config, &contribution_id).await
-                } else {
-                    consistency::run(&self.pool, &self.config, &contribution_id).await
-                }
+                self.score_contribution(&contribution_id, &job.ownership())
+                    .await
             }
             JobPayload::HonestDuplicateMerge => duplicates::run(&self.pool).await,
             JobPayload::NightlyRefit { bodies } => {
+                gc::run(&self.pool, &self.config, None).await?;
                 self.refit_bodies(&bodies, &job.ownership()).await
             }
             JobPayload::RevertRefit => {
@@ -219,10 +324,13 @@ impl Worker {
             JobPayload::BlobGc { contribution_id } => {
                 gc::run(&self.pool, &self.config, contribution_id.as_ref()).await
             }
-            JobPayload::Bounties => bounties::run(&self.pool, &self.config).await,
+            JobPayload::Bounties => bounties::run(&self.pool, &self.config, &job.ownership()).await,
             JobPayload::CardVerification => cards::run(&self.pool, &self.config).await,
             JobPayload::LutRebase => {
                 lut_rebase::run(&self.pool, &self.config, &job.ownership()).await
+            }
+            JobPayload::LutImport { proposal_id } => {
+                lut_import::run(&self.pool, &self.config, &job.ownership(), &proposal_id).await
             }
             JobPayload::PublishSite => {
                 self.publish_owned(&job.ownership()).await?;

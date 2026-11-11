@@ -1,0 +1,319 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: sony/alpha-7-iv
+  make: Sony
+  model: Alpha 7 IV (ILCE-7M4)
+  sources:
+  - id: sony-a7iv-help
+    kind: owner_manual
+    url: https://helpguide.sony.net/ilc/2110/v1/en/print.pdf
+    title: 'Help Guide: Interchangeable Lens Digital Camera ILCE-7M4 α7IV'
+    edition: 5-071-846-12(3)
+    firmware_scope: unspecified
+  capabilities:
+  - key: native_simulations
+    label: Creative Look
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - ST
+      - PT
+      - NT
+      - VV
+      - VV2
+      - FL
+      - IN
+      - SH
+      - BW
+      - SE
+      default: ST
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 218, Creative Look (still image/movie), Menu item details; p. 219
+    - source: sony-a7iv-help
+      locator: p. 560, List of default setting values, Creative Look
+  - key: contrast
+    label: Contrast
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -9
+      max: 9
+      step: 1
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 219, Creative Look, To adjust in greater detail, Contrast
+  - key: highlight_tone
+    label: Highlights
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -9
+      max: 9
+      step: 1
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 219, Creative Look, To adjust in greater detail, Highlights
+  - key: shadow_tone
+    label: Shadows
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -9
+      max: 9
+      step: 1
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 219, Creative Look, To adjust in greater detail, Shadows
+  - key: saturation
+    label: Saturation
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -9
+      max: 9
+      step: 1
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 219, Creative Look, To adjust in greater detail, Saturation
+    - source: sony-a7iv-help
+      locator: p. 220, Note, Saturation not adjustable for BW(Black & White) or SE(Sepia)
+  - key: sharpening
+    label: Sharpness
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: 0
+      max: 9
+      step: 1
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 219, Creative Look, To adjust in greater detail, Sharpness
+    - source: sony-a7iv-help
+      locator: p. 219, Creative Look, Sharpness Range (1 to 5)
+  - key: clarity
+    label: Clarity
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: 0
+      max: 9
+      step: 1
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 219, Creative Look, To adjust in greater detail, Clarity
+  - key: white_balance_presets
+    label: White Balance
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Auto
+      - 'Auto: Ambience'
+      - 'Auto: White'
+      - Daylight
+      - Shade
+      - Cloudy
+      - Incandescent
+      - 'Fluor.: Warm White'
+      - 'Fluor.: Cool White'
+      - 'Fluor.: Day White'
+      - 'Fluor.: Daylight'
+      - Flash
+      - Underwater Auto
+      - C.Temp./Filter
+      - Custom 1
+      - Custom 2
+      - Custom 3
+      default: Auto
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 212, White Balance (still image/movie), Menu item details
+    - source: sony-a7iv-help
+      locator: p. 560, List of default setting values, White Balance
+  - key: white_balance_shift
+    label: White Balance
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 212, White Balance (still image/movie), Hint (fine adjustment screen)
+    - source: sony-a7iv-help
+      locator: p. 214, custom white balance, fine adjustment screen after capture
+  - key: exposure_compensation
+    label: Exposure Comp.
+    category: rendering
+    availability: available
+    domain:
+      type: rational
+      min: '-5.0'
+      max: '+5.0'
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 195, Exposure Comp. (still image/movie)
+    - source: sony-a7iv-help
+      locator: p. 196, Exposure Comp. (still image/movie), movie range -2.0 EV to +2.0 EV
+    - source: sony-a7iv-help
+      locator: p. 198, Exposure step (still image/movie)
+    - source: sony-a7iv-help
+      locator: p. 560, List of default setting values, Exposure Comp. / Exposure step
+  - key: dynamic_range
+    label: D-Range Optimizer
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - 'Off'
+      - 'D-Range Optimizer: Auto'
+      - 'D-Range Optimizer: Lv1'
+      - 'D-Range Optimizer: Lv2'
+      - 'D-Range Optimizer: Lv3'
+      - 'D-Range Optimizer: Lv4'
+      - 'D-Range Optimizer: Lv5'
+      default: 'D-Range Optimizer: Auto'
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 200, D-Range Optimizer (still image/movie), Menu item details
+    - source: sony-a7iv-help
+      locator: p. 560, List of default setting values, D-Range Optimizer
+  - key: noise_reduction
+    label: High ISO NR
+    category: spatial
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Normal
+      - Low
+      - 'Off'
+      default: Normal
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 318, High ISO NR, Menu item details
+    - source: sony-a7iv-help
+      locator: p. 556, List of default setting values, High ISO NR
+  - key: jpeg_quality
+    label: JPEG Quality
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Extra fine
+      - Fine
+      - Standard
+      - Light
+    citations:
+    - source: sony-a7iv-help
+      locator: 'p. 251, Image Quality Settings: JPEG Quality/HEIF Quality, Menu item details'
+  - key: raw_capture
+    label: File Format
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: sony-a7iv-help
+      locator: 'p. 247, Image Quality Settings: File Format (still image), Menu item details'
+  - key: jpeg_capture
+    label: File Format
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: sony-a7iv-help
+      locator: 'p. 247, Image Quality Settings: File Format (still image), Menu item details (JPEG/HEIF)'
+    - source: sony-a7iv-help
+      locator: p. 246, JPEG/HEIF Switch, Menu item details (JPEG)
+  - key: heif_capture
+    label: JPEG/HEIF Switch
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 246, JPEG/HEIF Switch, Menu item details (HEIF(4:2:0), HEIF(4:2:2))
+    - source: sony-a7iv-help
+      locator: 'p. 247, Image Quality Settings: File Format (still image) (RAW & HEIF, JPEG/HEIF)'
+  - key: raw_jpeg_simultaneous
+    label: File Format
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: sony-a7iv-help
+      locator: 'p. 247, Image Quality Settings: File Format (still image), RAW & JPEG/RAW & HEIF'
+  - key: raw_bit_depth
+    label: File Format
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - '14'
+      - '12'
+    citations:
+    - source: sony-a7iv-help
+      locator: 'p. 247, Image Quality Settings: File Format (still image), About RAW images'
+  - key: jpeg_color_spaces
+    label: Color Space
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - AdobeRGB
+      default: sRGB
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 257, Color Space, Menu item details
+    - source: sony-a7iv-help
+      locator: p. 556, List of default setting values, Color Space
+  - key: in_camera_raw_conversion
+    label: Edit
+    category: workflow
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: sony-a7iv-help
+      locator: p. 116, MENU list, Playback tab, Edit group
+    - source: sony-a7iv-help
+      locator: 'p. 247, Image Quality Settings: File Format (still image), About RAW images'
+  notes:
+  - 'Creative Look prints long names for each Look: ST(Standard), PT(Portrait), NT(Neutral), VV(Vivid), VV2(Vivid 2), FL(Film), IN(Instant), SH(Soft Highkey), BW(Black & White), SE(Sepia) (pp. 218-219).'
+  - Custom Look registers six numbered slots that recall the same Looks with different settings; slot count is six (p. 219).
+  - Creative Look is fixed to [-] when [Intelligent Auto] is selected or [Picture Profile] is set to other than [Off] (p. 220).
+  - Creative Look also exposes Fade (0 to 9) and Sharpness Range (1 to 5), which have no registry key; Sharpness Range cannot be adjusted in movie mode (pp. 219-220).
+  - 'No Creative Style menu exists on this body: the Color/Tone menu group enumerates D-Range Optimizer, Creative Look, Picture Profile and Soft Skin Effect only (p. 113).'
+  - White Balance also offers C.Temp./Filter (color temperature with color filter effect) and three Custom registers; the manual states no Kelvin range (pp. 212-214).
+  - White Balance fine adjustment is reached from the right side of the control wheel and uses a color-tone grid; the manual states no numeric limit for the shift amount (p. 212).
+  - D-Range Optimizer is fixed to [Off] when [Picture Profile] is set to other than [Off] (p. 200).
+  - The manual documents no Auto HDR item; D-Range Optimizer is the only dynamic-range control documented (p. 200).
+  - When [HLG Still Image] is [On], both [Creative Look] and [D-Range Optimizer] are not available (p. 255).
+  - 'HEIF recording has no Color Space selection: with [HLG Still Image] Off the file is sRGB, with it On the file is recorded in BT.2100 (BT.2020 color gamut) (pp. 246, 257).'
+  - JPEG/HEIF Switch options are JPEG, HEIF(4:2:0), HEIF(4:2:2) (p. 246); the File Format menu switches between JPEG and HEIF accordingly (p. 247).
+  - RAW is 14 bits per pixel, limited to 12 bits for [Cont. Shooting] when [RAW File Type] is [Compressed] (p. 247).
+  - Lossless Comp (L/M/S) under [RAW File Type] requires camera firmware Ver.1.10 or later (p. 249); creating still images from Shot Marks requires Ver.4.00 or later (p. 418). The document does not otherwise state the firmware it describes.
+  - High ISO NR is fixed to [Normal] in [Intelligent Auto], is not available when [File Format] is [RAW], and does not affect RAW data when [File Format] is [RAW & JPEG]/[RAW & HEIF] (p. 318).
+  - Exposure step is selectable between 0.5EV and 0.3EV, default 0.3EV (pp. 198, 560); the movie exposure compensation range is -2.0 EV to +2.0 EV (p. 196).
+  - Exposure compensation cannot be set in [Intelligent Auto], and under [Manual Exposure] only when [ISO] is [ISO AUTO] (p. 196).
+  - The Playback Edit group on p. 116 lists Photo Capture, Create Still Image and JPEG/HEIF Switch and does not list RAW conversion; the manual states RAW images are opened and converted with Imaging Edge Desktop (p. 247).

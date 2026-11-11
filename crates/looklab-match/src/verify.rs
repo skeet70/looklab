@@ -3,12 +3,14 @@
 use looklab_color::ucs::{Ucs, delta_e_ucs};
 use looklab_color::{Rgb, RgbSpace, Xyz};
 use looklab_model::LookInput;
+use looklab_model::domain_penalty::check_published_paths;
 use looklab_model::realization::{ControlResponseModel, Settings};
 use looklab_model::solve::ucs_of_xyz;
 use looklab_samples::{OutputSpace, SampleSet};
-use looklab_schema::ControlKey;
+use looklab_schema::{ControlKey, OutputEncoding};
 
 use crate::error::{MatchError, Result};
+use crate::metric::{AssessmentStatus, ScoringMetric};
 use crate::model::MatchModel;
 use crate::optimizer::{MatchOptions, Suggestion, optimize, quantile};
 use crate::settings::Plan;
@@ -48,18 +50,38 @@ pub struct DeltaStats {
     pub median: f64,
     pub p95: f64,
     pub max: f64,
+    pub metric: ScoringMetric,
+    pub status: AssessmentStatus,
 }
 
 impl DeltaStats {
-    fn new(mut values: Vec<f64>) -> Self {
+    fn new(mut values: Vec<f64>, metric: ScoringMetric) -> Self {
         values.sort_by(f64::total_cmp);
         Self {
             count: values.len(),
             median: quantile(&values, 0.5),
             p95: quantile(&values, 0.95),
             max: values.last().copied().unwrap_or(0.0),
+            metric,
+            status: AssessmentStatus::Unassessed,
         }
     }
+}
+
+pub fn validate_observed_encoding(
+    observed: &[ObservedRender],
+    camera: OutputEncoding,
+) -> Result<()> {
+    for render in observed {
+        let found = observed_encoding(render.samples.header().output_space);
+        if found != camera {
+            return Err(MatchError::ObservedOutputEncoding {
+                expected: camera.as_str().to_string(),
+                found: found.as_str().to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub trait ObservedFitter {
@@ -68,18 +90,32 @@ pub trait ObservedFitter {
         model: &MatchModel,
         plan: &Plan,
         settings: &Settings,
+        metric: ScoringMetric,
         observed: &[ObservedRender],
         options: &FitObservedOptions,
     ) -> Result<ControlResponseModel>;
 }
 
 pub trait TruthRenderer {
-    fn render(&self, model: &MatchModel, settings: &Settings, xyz: Xyz) -> Result<Ucs>;
+    fn render(
+        &self,
+        model: &MatchModel,
+        metric: ScoringMetric,
+        settings: &Settings,
+        xyz: Xyz,
+    ) -> Result<Ucs>;
 }
 
 impl TruthRenderer for MatchModel {
-    fn render(&self, _model: &MatchModel, settings: &Settings, xyz: Xyz) -> Result<Ucs> {
-        self.predict(settings, xyz)
+    fn render(
+        &self,
+        _model: &MatchModel,
+        metric: ScoringMetric,
+        settings: &Settings,
+        xyz: Xyz,
+    ) -> Result<Ucs> {
+        let realization = self.realize(settings)?;
+        Ok(self.scored_ucs(metric, &realization, xyz))
     }
 }
 
@@ -94,9 +130,13 @@ impl ScaleFitter {
         model: &MatchModel,
         plan: &Plan,
         settings: &Settings,
+        metric: ScoringMetric,
         observed: &[ObservedRender],
         options: &FitObservedOptions,
     ) -> Result<(ControlResponseModel, Vec<(ControlKey, f64)>)> {
+        if metric.is_rendered() {
+            validate_observed_encoding(observed, model.output_encoding)?;
+        }
         let mut crm = model.crm.clone();
         let mut scales: Vec<(ControlKey, f64)> = Vec::new();
         for _ in 0..options.iterations {
@@ -121,28 +161,55 @@ impl ScaleFitter {
                 let space = output_space(render.samples.header().output_space);
                 let n = render.samples.n();
                 let stride = (n / options.max_samples.max(1)).max(1);
-                for sample in (0..n).step_by(stride) {
+                'sample: for sample in (0..n).step_by(stride) {
                     let rgb = render.samples.in_rgb()[sample].map(f64::from);
                     let scene = candidate.scene_from_camera(rgb);
                     let input_xyz = candidate.input_xyz(&realization, scene);
-                    let prediction = realization.look.eval(input_xyz);
+                    let input = LookInput::new(input_xyz);
+                    let values = realization.look.layer_values(&input);
+                    if check_published_paths(&realization.look.chroma_paths(&input, &values))
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let pre = realization.look.eval_from_layer_values(&input, &values);
+                    let pin = candidate.output_pin(&realization);
+                    let prediction = match metric {
+                        ScoringMetric::LegacyPreClipV1 => pre,
+                        ScoringMetric::RenderedPostClipV1 => pin.render(pre),
+                    };
+                    let render_jacobian = match metric {
+                        ScoringMetric::LegacyPreClipV1 => None,
+                        ScoringMetric::RenderedPostClipV1 => match pin.render_jacobian(pre) {
+                            Some(jacobian) => Some(jacobian),
+                            None => continue,
+                        },
+                    };
                     let observed_ucs = observed_ucs(&render.samples, sample, space)?;
                     let residual = [
                         prediction.j - observed_ucs.j,
                         prediction.a - observed_ucs.a,
                         prediction.b - observed_ucs.b,
                     ];
-                    let jacobian = realization.look.coef_jacobian(&LookInput::new(input_xyz));
+                    let jacobian = realization.look.coef_jacobian(&input);
                     let derivatives = derivatives_at(&candidate, &realization, scene);
                     let mut effects = Vec::with_capacity(size);
                     for &control in &active {
                         let key = plan.key(control);
                         let value = plan.value(control, settings);
                         let (delta, wb, _) = candidate.value_row(key, &value)?;
-                        let mut effect = delta.project(&jacobian);
+                        let Some(mut effect) = delta.project_checked(&jacobian) else {
+                            continue 'sample;
+                        };
                         for (channel, value) in effect.iter_mut().enumerate() {
                             *value +=
                                 wb[0] * derivatives.0[channel] + wb[1] * derivatives.1[channel];
+                        }
+                        if let Some(render_jacobian) = &render_jacobian {
+                            effect = render_jacobian.mul_vec(effect);
+                        }
+                        if effect.iter().any(|value| !value.is_finite()) {
+                            continue 'sample;
                         }
                         effects.push(effect);
                     }
@@ -186,11 +253,12 @@ impl ObservedFitter for ScaleFitter {
         model: &MatchModel,
         plan: &Plan,
         settings: &Settings,
+        metric: ScoringMetric,
         observed: &[ObservedRender],
         options: &FitObservedOptions,
     ) -> Result<ControlResponseModel> {
         Ok(self
-            .fit_with_scales(model, plan, settings, observed, options)?
+            .fit_with_scales(model, plan, settings, metric, observed, options)?
             .0)
     }
 }
@@ -230,9 +298,9 @@ fn derivatives_at(
     xyz: Xyz,
 ) -> ([f64; 3], [f64; 3]) {
     let step = 1e-3;
-    let base = model.input_ucs(realization, xyz, [0.0, 0.0], 0.0);
-    let red = model.input_ucs(realization, xyz, [step, 0.0], 0.0);
-    let blue = model.input_ucs(realization, xyz, [0.0, step], 0.0);
+    let base = model.pre_clip_ucs(realization, xyz, [0.0, 0.0], 0.0);
+    let red = model.pre_clip_ucs(realization, xyz, [step, 0.0], 0.0);
+    let blue = model.pre_clip_ucs(realization, xyz, [0.0, step], 0.0);
     (
         [
             (red.j - base.j) / step,
@@ -245,6 +313,13 @@ fn derivatives_at(
             (blue.b - base.b) / step,
         ],
     )
+}
+
+fn observed_encoding(space: OutputSpace) -> OutputEncoding {
+    match space {
+        OutputSpace::Srgb => OutputEncoding::Srgb,
+        OutputSpace::AdobeRgb => OutputEncoding::AdobeRgb,
+    }
 }
 
 fn output_space(space: OutputSpace) -> RgbSpace {
@@ -303,23 +378,27 @@ pub fn measure_target_error(
     _settings: &Settings,
     observed: &[ObservedRender],
 ) -> Result<DeltaStats> {
+    if target.metric().is_rendered() {
+        validate_observed_encoding(observed, model.output_encoding)?;
+    }
     let mut values = Vec::new();
     for render in observed {
         let space = output_space(render.samples.header().output_space);
         for sample in 0..render.samples.n() {
             let rgb = render.samples.in_rgb()[sample].map(f64::from);
             let scene = model.scene_from_camera(rgb);
-            let expected = target.function.predict(scene);
+            let expected = target.predict(scene);
             let observed_ucs = observed_ucs(&render.samples, sample, space)?;
             values.push(delta_e_ucs(expected, observed_ucs));
         }
     }
-    Ok(DeltaStats::new(values))
+    Ok(DeltaStats::new(values, target.metric()))
 }
 
 pub fn select_verification_samples(
     model: &MatchModel,
     settings: &Settings,
+    metric: ScoringMetric,
     candidates: &[SampleSet],
     count: usize,
 ) -> Result<Vec<usize>> {
@@ -333,10 +412,19 @@ pub fn select_verification_samples(
         for sample in (0..n).step_by(stride) {
             let rgb = samples.in_rgb()[sample].map(f64::from);
             let scene = model.scene_from_camera(rgb);
-            total += crate::covariance::trace_with(model, &realization, settings, scene)?;
-            seen += 1;
+            if let Some(trace) =
+                crate::covariance::trace_with(model, &realization, settings, metric, scene)?
+            {
+                total += trace;
+                seen += 1;
+            }
         }
-        ranked.push((total / seen.max(1) as f64, index));
+        if seen > 0 {
+            ranked.push((total / seen as f64, index));
+        }
+    }
+    if ranked.is_empty() {
+        return Err(MatchError::NoSupportedProbes);
     }
     ranked.sort_by(|left, right| right.0.total_cmp(&left.0));
     let take = count.clamp(2, 4).min(ranked.len());
@@ -373,6 +461,9 @@ pub fn verify_once(
     if request.observed.is_empty() {
         return Err(MatchError::EmptyObserved);
     }
+    if request.target.metric().is_rendered() {
+        validate_observed_encoding(request.observed, request.model.output_encoding)?;
+    }
     let first_outcome = optimize(
         std::slice::from_ref(request.model),
         request.target,
@@ -388,6 +479,7 @@ pub fn verify_once(
         request.model,
         request.plan,
         &first.settings,
+        request.target.metric(),
         request.observed,
         &request.fit_options,
     )?;
@@ -448,10 +540,10 @@ fn measure_truth(
         for sample in 0..render.samples.n() {
             let rgb = render.samples.in_rgb()[sample].map(f64::from);
             let scene = model.scene_from_camera(rgb);
-            let expected = target.function.predict(scene);
-            let rendered = truth.render(model, second, scene)?;
+            let expected = target.predict(scene);
+            let rendered = truth.render(model, target.metric(), second, scene)?;
             values.push(delta_e_ucs(expected, rendered));
         }
     }
-    Ok(DeltaStats::new(values))
+    Ok(DeltaStats::new(values, target.metric()))
 }

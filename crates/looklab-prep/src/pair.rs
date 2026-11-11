@@ -16,9 +16,25 @@ pub enum RawFormat {
     Raf,
     Rw2,
     Srw,
+    /// Hasselblad `.3fr`.
+    ThreeFr,
 }
 
 impl RawFormat {
+    pub const ALL: &[Self] = &[
+        Self::Arw,
+        Self::Cr2,
+        Self::Cr3,
+        Self::Dng,
+        Self::Nef,
+        Self::Orf,
+        Self::Pef,
+        Self::Raf,
+        Self::Rw2,
+        Self::Srw,
+        Self::ThreeFr,
+    ];
+
     pub fn from_extension(extension: &str) -> Option<Self> {
         Some(match extension.to_ascii_lowercase().as_str() {
             "arw" => Self::Arw,
@@ -31,6 +47,7 @@ impl RawFormat {
             "raf" => Self::Raf,
             "rw2" => Self::Rw2,
             "srw" => Self::Srw,
+            "3fr" => Self::ThreeFr,
             _ => return None,
         })
     }
@@ -47,6 +64,7 @@ impl RawFormat {
             Self::Raf => "raf",
             Self::Rw2 => "rw2",
             Self::Srw => "srw",
+            Self::ThreeFr => "3fr",
         }
     }
 }
@@ -114,26 +132,102 @@ impl LocalImageKey {
     }
 }
 
-/// Make and model normalised for comparison.
+/// A camera's normalised make and model.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BodyKey(String);
+pub struct CameraIdentity {
+    make: String,
+    model: String,
+}
 
-impl BodyKey {
-    /// Normalised `<make> <model>`; `None` when either tag is missing.
-    pub fn from_metadata(metadata: &ParsedMetadata) -> Option<Self> {
-        let make = metadata.exif.make.as_deref()?;
-        let model = metadata.exif.model.as_deref()?;
+impl CameraIdentity {
+    /// Lowercased make and model, with a make repeated at the start of the
+    /// model removed; `None` when either is blank.
+    pub fn new(make: &str, model: &str) -> Option<Self> {
         let make = normalise(make);
-        let model = normalise(model);
-        if make.is_empty() || model.is_empty() {
+        if make.is_empty() {
             return None;
         }
-        Some(Self(format!("{make} {model}")))
+        let mut model = normalise(model);
+        if let Some(prefix) = model
+            .strip_prefix(make.as_str())
+            .and_then(|rest| rest.strip_prefix(' '))
+            .map(|rest| model.len() - rest.len())
+        {
+            model.replace_range(..prefix, "");
+        }
+        if model.is_empty() {
+            return None;
+        }
+        Some(Self { make, model })
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn from_metadata(metadata: &ParsedMetadata) -> Option<Self> {
+        Self::new(
+            metadata.exif.make.as_deref()?,
+            metadata.exif.model.as_deref()?,
+        )
     }
+
+    pub fn make(&self) -> &str {
+        &self.make
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Compares raw EXIF make and model against this identity without allocating.
+    pub fn matches(&self, make: &str, model: &str) -> bool {
+        words_eq(self.make.split(' '), make.split_whitespace())
+            && words_eq(
+                self.model.split(' '),
+                model
+                    .split_whitespace()
+                    .skip(repeated_make_words(make, model)),
+            )
+    }
+}
+
+fn words_eq<'a, 'b>(
+    mut expected: impl Iterator<Item = &'a str>,
+    mut candidate: impl Iterator<Item = &'b str>,
+) -> bool {
+    loop {
+        match (expected.next(), candidate.next()) {
+            (None, None) => return true,
+            (Some(expected), Some(candidate)) => {
+                if !word_eq(expected, candidate) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// How many leading `model` words repeat `make`.
+fn repeated_make_words(make: &str, model: &str) -> usize {
+    let mut make_words = make.split_whitespace();
+    let mut model_words = model.split_whitespace();
+    let mut repeated = 0;
+    loop {
+        match (make_words.next(), model_words.next()) {
+            (Some(make_word), Some(model_word)) => {
+                if !word_eq(make_word, model_word) {
+                    return 0;
+                }
+                repeated += 1;
+            }
+            (Some(_), None) | (None, None) => return 0,
+            (None, Some(_)) => return repeated,
+        }
+    }
+}
+
+fn word_eq(left: &str, right: &str) -> bool {
+    left.chars()
+        .flat_map(char::to_lowercase)
+        .eq(right.chars().flat_map(char::to_lowercase))
 }
 
 fn normalise(text: &str) -> String {
@@ -157,7 +251,7 @@ pub struct PairingFile {
     kind: FileKind,
     capture_time: Option<CaptureTime>,
     image_number: Option<ImageNumber>,
-    body: Option<BodyKey>,
+    body: Option<CameraIdentity>,
     look: Option<LookSettings>,
     firmware: Option<RenderingFirmware>,
 }
@@ -169,7 +263,7 @@ impl PairingFile {
             kind: key.kind(),
             capture_time: pairing.capture_time,
             image_number: pairing.image_number,
-            body: BodyKey::from_metadata(metadata),
+            body: CameraIdentity::from_metadata(metadata),
             look: metadata.fuji.as_ref().map(|fuji| fuji.look.clone()),
             firmware: metadata
                 .firmware
@@ -197,7 +291,7 @@ impl PairingFile {
         self.image_number
     }
 
-    pub fn body(&self) -> Option<&BodyKey> {
+    pub fn body(&self) -> Option<&CameraIdentity> {
         self.body.as_ref()
     }
 
@@ -292,7 +386,7 @@ impl PairingOutcome {
     }
 }
 
-fn bodies_compatible(a: Option<&BodyKey>, b: Option<&BodyKey>) -> bool {
+fn bodies_compatible(a: Option<&CameraIdentity>, b: Option<&CameraIdentity>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => a == b,
         _ => true,

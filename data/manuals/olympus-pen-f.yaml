@@ -1,0 +1,324 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: olympus/pen-f
+  make: Olympus
+  model: PEN-F
+  sources:
+  - id: olympus-pen-f-manual
+    kind: owner_manual
+    url: https://download.omsystem.com/pages/inst/penf/manual_penf_ENU.pdf
+    title: PEN-F Instruction Manual
+    edition: ENU
+    firmware_scope: '3.0'
+  capabilities:
+  - key: clarity
+    label: Clarity
+    category: spatial
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: color_chrome
+    label: Color Chrome
+    category: unknown
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: color_profile_control
+    label: Color Profile Control
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 39
+  - key: color_temperature
+    label: CWB
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: 2000
+      max: 14000
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 46
+  - key: contrast
+    label: Contrast
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 65
+  - key: creative_filters
+    label: Art Filter
+    category: mixed
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Pop Art I/II
+      - Soft Focus
+      - Pale&Light Color I/II
+      - Light Tone
+      - Grainy Film I/II
+      - Pin Hole I/II/III
+      - Diorama I/II
+      - Cross Process I/II
+      - Gentle Sepia
+      - Dramatic Tone I/II
+      - Key Line I/II
+      - Watercolor I/II
+      - Vintage I/II/III
+      - Partial Color I/II/III
+      - Bleach Bypass I/II
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 42
+    - source: olympus-pen-f-manual
+      locator: p. 182
+  - key: dynamic_range
+    label: Gradation
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Auto
+      - Normal
+      - High Key
+      - Low Key
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 66
+  - key: exposure_compensation
+    label: Exposure compensation
+    category: rendering
+    availability: available
+    domain:
+      type: rational
+      min: '-5.0'
+      max: '+5.0'
+      steps:
+      - 1/3
+      - 1/2
+      - '1'
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 166
+  - key: grain
+    label: Film Grain Effect
+    category: spatial
+    availability: available
+    domain:
+      type: enum
+      values:
+      - 'Off'
+      - Low
+      - Medium
+      - High
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 66
+  - key: grain_size
+    label: Grain Size
+    category: spatial
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: heif_capture
+    label: HEIF
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: highlight_tone
+    label: Highlight & Shadow Control
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 44
+  - key: in_camera_raw_conversion
+    label: RAW Data Edit
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 100
+  - key: jpeg_capture
+    label: JPEG
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 59
+  - key: jpeg_color_spaces
+    label: Color Space
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - AdobeRGB
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 68
+  - key: jpeg_quality
+    label: Compression ratio
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - SF
+      - F
+      - N
+      - B
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 59
+  - key: monochrome_profile_control
+    label: Monochrome Profile Control
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 40
+  - key: monochrome_toning
+    label: Monochrome Color
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - N:Normal
+      - S:Sepia
+      - B:Blue
+      - P:Purple
+      - G:Green
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 67
+  - key: native_simulations
+    label: Picture mode
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - i-Enhance
+      - Vivid
+      - Natural
+      - Muted
+      - Portrait
+      - Monochrome
+      - Custom
+      - e-Portrait
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 38
+  - key: noise_reduction
+    label: Noise Filter
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 109
+  - key: raw_capture
+    label: RAW
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 59
+  - key: raw_jpeg_simultaneous
+    label: RAW+JPEG
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 59
+  - key: saturation
+    label: Saturation
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 65
+  - key: shadow_tone
+    label: Highlight & Shadow Control
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 44
+  - key: sharpening
+    label: Sharpness
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 64
+  - key: white_balance_presets
+    label: White Balance
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - '5'
+      - N
+      - O
+      - '1'
+      - '>'
+      - U
+      - n
+      - P
+      - Q
+      - W
+      - X
+      - CWB
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 46
+  - key: white_balance_shift
+    label: white balance compensation
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: A (Red-Blue)
+      - label: G (Green-Magenta)
+    citations:
+    - source: olympus-pen-f-manual
+      locator: p. 54
+  notes:
+  - Color Creator, Color Profile Control, Monochrome Profile Control, and Art Filter are creative-dial image enhancement modes, not Picture mode options (p. 38). Color Profile Control adjusts twelve colors by up to ±5, with hue on the front dial and saturation on the rear dial, stored in Color Profile 1-3 (p. 39); Monochrome Profile Control sets a color filter and filter level plus a Shading Editor (p. 40). The exposure compensation dial covers ±3.0 EV; ±5 EV requires assigning exposure compensation to the front or rear dial (p. 45). Firmware version 3.0 adds Bleach Bypass and Shading Editor for Color Profile Control and Color Creator (p. 179).

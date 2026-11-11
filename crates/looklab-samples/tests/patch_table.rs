@@ -233,11 +233,10 @@ fn an_oversized_patch_zstd_window_is_rejected_before_decoding() {
 
 #[test]
 fn the_committed_patch_fuzz_seed_decodes() {
-    let bytes = std::fs::read(concat!(
+    let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../fuzz/corpus/patch/seed_patch_table"
-    ))
-    .expect("the fuzz seed is committed");
-    let table = decode_patch_table(&bytes).expect("the committed seed is a version 1 blob");
+    ));
+    let table = decode_patch_table(bytes).expect("the committed seed is a version 1 blob");
     assert_eq!(table.rows().len(), 3);
 }

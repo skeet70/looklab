@@ -53,9 +53,50 @@ impl<'de> Deserialize<'de> for CredentialId {
     }
 }
 
-/// A group of credentials linked by a shared serial HMAC.
-///
-/// The representative is the smallest [`CredentialId`] in the group.
+/// Internal contribution id. Rendered as 32 lowercase hex digits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContributionId(u128);
+
+impl ContributionId {
+    pub const fn from_u128(value: u128) -> Self {
+        Self(value)
+    }
+
+    pub const fn to_u128(self) -> u128 {
+        self.0
+    }
+}
+
+impl fmt::Display for ContributionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
+}
+
+impl FromStr for ContributionId {
+    type Err = TrustError;
+
+    fn from_str(text: &str) -> Result<Self> {
+        u128::from_str_radix(text, 16)
+            .map(Self)
+            .map_err(|_| TrustError::InvalidId(text.to_owned()))
+    }
+}
+
+impl Serialize for ContributionId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContributionId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(D::Error::custom)
+    }
+}
+
+/// A group of credentials linked by a shared serial HMAC; the representative is the smallest id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EffectiveContributorId(CredentialId);
 

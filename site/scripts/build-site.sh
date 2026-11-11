@@ -108,13 +108,60 @@ for css in "$root/site/styles.css" "$root"/site/styles/*.css; do
   [ -f "$css" ] || continue
   cp -- "$css" "$stage/$(basename -- "$css")"
 done
+cp -- "$root/site/favicon.ico" "$stage/favicon.ico"
 
 for name in data workers generated; do
   [ -d "$root/site/$name" ] || continue
   cp -R -- "$root/site/$name" "$stage/$name"
 done
+cp -- "$root/site/errors.js" "$stage/errors.js"
 
-sed "s|__PREFIX__|$public_url|g" "$root/site/index.html" > "$stage/index.html"
+for file in pkg/looklab-site.wasm pkg/looklab-site.js errors.js \
+  workers/prep-worker.js workers/match-worker.js workers/scene-worker.js \
+  generated/wasm/looklab_prep_module.wasm generated/wasm/looklab_scene_module.wasm \
+  generated/wasm/looklab_match.wasm; do
+  if [ ! -f "$stage/$file" ]; then
+    printf '%s: missing client asset %s\n' "$0" "$file" >&2
+    exit 1
+  fi
+done
+
+# The release id covers the client assets and the page template that installs diagnostics.
+release=$(
+  {
+    sha256sum -- "$root/site/index.html" | cut -d' ' -f1
+    for file in errors.js workers/prep-worker.js workers/match-worker.js \
+      workers/scene-worker.js generated/wasm/looklab_prep_module.wasm \
+      generated/wasm/looklab_scene_module.wasm generated/wasm/looklab_match.wasm; do
+      sha256sum -- "$stage/$file" | cut -d' ' -f1
+    done
+    find "$stage/pkg" -type f \( -name '*.js' -o -name '*.wasm' \) | LC_ALL=C sort |
+      while IFS= read -r file; do
+        sha256sum -- "$file" | cut -d' ' -f1
+      done
+  } | sha256sum | cut -d' ' -f1
+)
+if [ "${#release}" -ne 64 ]; then
+  printf '%s: could not compute a 64-character build id\n' "$0" >&2
+  exit 1
+fi
+
+api_base=${LOOKLAB_API_BASE:-}
+preview=
+case "${LOOKLAB_PREVIEW:-}" in
+  *[![:space:]]*) preview=1 ;;
+esac
+
+escape_replacement() {
+  printf '%s' "$1" | sed 's/[\\|&]/\\&/g'
+}
+
+sed \
+  -e "s|__PREFIX__|$(escape_replacement "$public_url")|g" \
+  -e "s|__RELEASE__|$release|g" \
+  -e "s|__API_BASE__|$(escape_replacement "$api_base")|g" \
+  -e "s|__PREVIEW__|$preview|g" \
+  "$root/site/index.html" > "$stage/index.html"
 
 if [ -e "$dist" ]; then
   mv -- "$dist" "$retired"

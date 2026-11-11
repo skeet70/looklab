@@ -114,7 +114,7 @@ Keep the seed file, the HAR and the verify state under a private directory, for 
 5. Choose **Export seed file** and save it as `seeds-chrome-qr.json`.
 6. Choose **Continue to send**, then **Send contribution**. In the dialog, leave the display name empty and choose **Create a profile**.
 7. In the Chrome passkey prompt choose **Use a phone or tablet**. Scan the QR code with the phone and approve with the phone's screen lock.
-8. Expect **Thanks for helping build looks**, then **Your contributions** listing the batch and its one image.
+8. Expect **Thanks, your color samples are in**, then **Your contributions** listing the batch and its one image.
 9. Capture the HAR and run `verify-payload` as described below, with `--state state-chrome-qr.json`. Expect `PASS`.
 10. Sign out, then **Continue with passkey** and approve on the phone. Expect the account menu and `/me` without a new upload.
 

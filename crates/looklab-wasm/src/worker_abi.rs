@@ -7,9 +7,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::match_api::{MatchRequest, VerifyRequestMessage, run_match, run_verify};
+use crate::software_export::{SoftwareExportRequest, run_export};
 
 use crate::{
-    WORKER_FN_MATCH as FN_MATCH, WORKER_FN_VERIFY as FN_VERIFY, WORKER_FN_VERSION as FN_VERSION,
+    WORKER_FN_EXPORT as FN_EXPORT, WORKER_FN_MATCH as FN_MATCH, WORKER_FN_VERIFY as FN_VERIFY,
+    WORKER_FN_VERSION as FN_VERSION,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +35,10 @@ pub fn dispatch(fn_id: u32, input: &[u8]) -> Vec<u8> {
         FN_VERIFY => reply(
             decode::<VerifyRequestMessage>(input)
                 .and_then(|request| run_verify(&request).map_err(|error| error.to_string())),
+        ),
+        FN_EXPORT => reply(
+            decode::<SoftwareExportRequest>(input)
+                .and_then(|request| run_export(&request).map_err(|error| error.to_string())),
         ),
         other => reply::<WorkerVersion>(Err(format!("unknown worker function {other}"))),
     }

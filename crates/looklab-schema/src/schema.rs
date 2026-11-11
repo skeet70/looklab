@@ -11,8 +11,8 @@ use serde::Deserialize;
 use serde::de::{self, Visitor};
 
 use crate::control::{
-    Affects, Constraints, Control, ControlDefault, ControlType, Range, ScalarValue, Tolerated,
-    numeric_steps,
+    Affects, Constraints, Control, ControlDefault, ControlScope, ControlType, Range, ScalarValue,
+    Tolerated, numeric_steps,
 };
 use crate::error::{ErrorKind, ValidationError};
 use crate::ids::{
@@ -56,9 +56,31 @@ pub struct Epoch {
     pub id: u32,
     pub firmware: FirmwareRange,
     pub native_sims: Vec<NativeSim>,
+    pub monochrome: Option<MonochromeCapability>,
     pub exposure_modes: Vec<ExposureMode>,
     pub controls: Vec<Control>,
     pub solve_plan: Vec<SolvePlanStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MonochromeCapability {
+    /// Monochrome families deferred intake may accept.
+    pub families: Vec<LookId>,
+    /// Families whose filter variants the body offers.
+    pub filter: Vec<LookId>,
+    /// Families whose WC/MG toning axes the body offers.
+    #[serde(default)]
+    pub toning: Vec<LookId>,
+    /// Whether the body retains an independent GrainEffectSize setting.
+    #[serde(default)]
+    pub grain_size: bool,
+}
+
+impl MonochromeCapability {
+    pub fn supports(&self, family: &LookId) -> bool {
+        self.families.contains(family)
+    }
 }
 
 impl Epoch {
@@ -66,6 +88,26 @@ impl Epoch {
         self.native_sims
             .iter()
             .find(|sim| sim.key.as_str() == key.as_str())
+    }
+
+    pub fn monochrome_capability(&self) -> Option<&MonochromeCapability> {
+        self.monochrome.as_ref()
+    }
+
+    pub fn supports_monochrome_intake(&self, family: &LookId) -> bool {
+        let Some(capability) = self.monochrome.as_ref() else {
+            return false;
+        };
+        if !capability.supports(family) {
+            return false;
+        }
+        !capability.grain_size
+            || self.controls.iter().any(|control| {
+                control.key.as_str() == MonochromeControl::GrainSize.key()
+                    && control.spatial
+                    && control.makernote.is_some()
+                    && control.scope == ControlScope::All
+            })
     }
 }
 
@@ -107,8 +149,8 @@ pub struct SolvePlanStep {
     pub controls: Vec<ControlKey>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(try_from = "String")]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct FirmwareVersion {
     raw: String,
     parts: Vec<u64>,
@@ -156,6 +198,12 @@ impl TryFrom<String> for FirmwareVersion {
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         value.parse()
+    }
+}
+
+impl From<FirmwareVersion> for String {
+    fn from(value: FirmwareVersion) -> Self {
+        value.raw
     }
 }
 
@@ -244,6 +292,8 @@ struct RawEpoch {
     id: u32,
     firmware: FirmwareRange,
     native_sims: Vec<NativeSim>,
+    #[serde(default)]
+    monochrome: Option<MonochromeCapability>,
     exposure_modes: Vec<ExposureMode>,
     controls: Vec<RawControl>,
     solve_plan: Vec<SolvePlanStep>,
@@ -268,6 +318,7 @@ struct RawControl {
     tolerated: Option<Tolerated>,
     constraints: Option<Constraints>,
     makernote: Option<RawControlMakernote>,
+    applies_to: Option<ControlScope>,
 }
 
 #[derive(Deserialize)]
@@ -373,6 +424,267 @@ pub fn apply_sim_mapping(
     Ok(updated)
 }
 
+/// One field change on a control the epoch already declares.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlEdit {
+    Range(Range),
+    Step(Rational),
+    Default(ScalarValue),
+    Values(Vec<EnumValue>),
+    LookAffecting(bool),
+    Affects(Vec<Affects>),
+    Spatial(bool),
+    Tolerated(Tolerated),
+}
+
+impl ControlEdit {
+    fn apply(&self, control: &mut serde_norway::Mapping) {
+        let (key, value) = match self {
+            Self::Range(range) => (
+                "range",
+                serde_norway::Value::Sequence(vec![
+                    yaml_rational(range.min),
+                    yaml_rational(range.max),
+                ]),
+            ),
+            Self::Step(step) => ("step", yaml_rational(*step)),
+            Self::Default(default) => ("default", yaml_scalar(default)),
+            Self::Values(values) => (
+                "values",
+                serde_norway::Value::Sequence(
+                    values
+                        .iter()
+                        .map(|value| serde_norway::Value::String(value.as_str().to_owned()))
+                        .collect(),
+                ),
+            ),
+            Self::LookAffecting(enabled) => ("look_affecting", serde_norway::Value::Bool(*enabled)),
+            Self::Affects(affects) => (
+                "affects",
+                serde_norway::Value::Sequence(
+                    affects
+                        .iter()
+                        .map(|affect| serde_norway::Value::String(affect.as_str().to_owned()))
+                        .collect(),
+                ),
+            ),
+            Self::Spatial(enabled) => ("spatial", serde_norway::Value::Bool(*enabled)),
+            Self::Tolerated(tolerated) => ("tolerated", yaml_tolerated(tolerated)),
+        };
+        control.insert(serde_norway::Value::String(key.to_owned()), value);
+    }
+}
+
+/// A control definition to insert into an epoch that does not declare it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlDefinition {
+    pub key: ControlKey,
+    pub kind: ControlType,
+    pub range: Option<Range>,
+    pub step: Option<Rational>,
+    pub default: Option<ScalarValue>,
+    pub values: Option<Vec<EnumValue>>,
+    pub look_affecting: bool,
+    pub affects: Vec<Affects>,
+    pub spatial: bool,
+    pub tolerated: Option<Tolerated>,
+}
+
+impl ControlDefinition {
+    fn to_yaml(&self) -> serde_norway::Value {
+        let mut map = serde_norway::Mapping::new();
+        map.insert(
+            serde_norway::Value::String("key".to_owned()),
+            serde_norway::Value::String(self.key.as_str().to_owned()),
+        );
+        map.insert(
+            serde_norway::Value::String("type".to_owned()),
+            serde_norway::Value::String(self.kind.as_str().to_owned()),
+        );
+        if let Some(range) = &self.range {
+            map.insert(
+                serde_norway::Value::String("range".to_owned()),
+                serde_norway::Value::Sequence(vec![
+                    yaml_rational(range.min),
+                    yaml_rational(range.max),
+                ]),
+            );
+        }
+        if let Some(step) = self.step {
+            map.insert(
+                serde_norway::Value::String("step".to_owned()),
+                yaml_rational(step),
+            );
+        }
+        if let Some(default) = &self.default {
+            map.insert(
+                serde_norway::Value::String("default".to_owned()),
+                yaml_scalar(default),
+            );
+        }
+        if let Some(values) = &self.values {
+            map.insert(
+                serde_norway::Value::String("values".to_owned()),
+                serde_norway::Value::Sequence(
+                    values
+                        .iter()
+                        .map(|value| serde_norway::Value::String(value.as_str().to_owned()))
+                        .collect(),
+                ),
+            );
+        }
+        if self.look_affecting {
+            map.insert(
+                serde_norway::Value::String("look_affecting".to_owned()),
+                serde_norway::Value::Bool(true),
+            );
+        }
+        if !self.affects.is_empty() {
+            map.insert(
+                serde_norway::Value::String("affects".to_owned()),
+                serde_norway::Value::Sequence(
+                    self.affects
+                        .iter()
+                        .map(|affect| serde_norway::Value::String(affect.as_str().to_owned()))
+                        .collect(),
+                ),
+            );
+        }
+        if self.spatial {
+            map.insert(
+                serde_norway::Value::String("spatial".to_owned()),
+                serde_norway::Value::Bool(true),
+            );
+        }
+        if let Some(tolerated) = &self.tolerated {
+            map.insert(
+                serde_norway::Value::String("tolerated".to_owned()),
+                yaml_tolerated(tolerated),
+            );
+        }
+        serde_norway::Value::Mapping(map)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlChange {
+    Set {
+        key: ControlKey,
+        edits: Vec<ControlEdit>,
+    },
+    Add(ControlDefinition),
+}
+
+fn yaml_rational(value: Rational) -> serde_norway::Value {
+    serde_norway::Value::String(value.to_string())
+}
+
+fn yaml_scalar(value: &ScalarValue) -> serde_norway::Value {
+    match value {
+        ScalarValue::Bool(value) => serde_norway::Value::Bool(*value),
+        ScalarValue::Number(value) => yaml_rational(*value),
+        ScalarValue::Text(value) => serde_norway::Value::String(value.clone()),
+    }
+}
+
+fn yaml_tolerated(value: &Tolerated) -> serde_norway::Value {
+    match value {
+        Tolerated::Any => serde_norway::Value::String("any".to_owned()),
+        Tolerated::Values(values) => {
+            serde_norway::Value::Sequence(values.iter().map(yaml_scalar).collect())
+        }
+    }
+}
+
+/// # Errors
+/// The document does not validate, an epoch is absent, a control is absent for
+/// a set, or a key is already declared for an add.
+pub fn apply_control_changes(
+    yaml: &str,
+    changes: &[(u32, ControlChange)],
+) -> Result<String, Vec<ValidationError>> {
+    let mut document: serde_norway::Value =
+        serde_norway::from_str(yaml).map_err(ValidationError::syntax)?;
+    for (epoch, change) in changes {
+        apply_change(&mut document, *epoch, change)?;
+    }
+    let updated = serde_norway::to_string(&document).map_err(ValidationError::syntax)?;
+    validate_control_schema(&updated)?;
+    Ok(updated)
+}
+
+/// # Errors
+/// The document does not validate, the epoch is absent, the control is absent
+/// for a set, or the key is already declared for an add.
+pub fn apply_control_change(
+    yaml: &str,
+    epoch: u32,
+    change: &ControlChange,
+) -> Result<String, Vec<ValidationError>> {
+    apply_control_changes(yaml, &[(epoch, change.clone())])
+}
+
+fn apply_change(
+    document: &mut serde_norway::Value,
+    epoch: u32,
+    change: &ControlChange,
+) -> Result<(), Vec<ValidationError>> {
+    let invalid = |path: &str, expected: &'static str| {
+        vec![ValidationError::new(
+            path,
+            ErrorKind::InvalidValue { expected },
+        )]
+    };
+    let epochs = document
+        .get_mut("epochs")
+        .and_then(serde_norway::Value::as_sequence_mut)
+        .ok_or_else(|| invalid("epochs", "the document's list of epochs"))?;
+    let index = epochs
+        .iter()
+        .position(|candidate| {
+            candidate.get("id").and_then(serde_norway::Value::as_u64) == Some(u64::from(epoch))
+        })
+        .ok_or_else(|| invalid("epoch", "an epoch the body's control schema declares"))?;
+    let controls = epochs[index]
+        .get_mut("controls")
+        .and_then(serde_norway::Value::as_sequence_mut)
+        .ok_or_else(|| invalid("controls", "the epoch's list of controls"))?;
+    match change {
+        ControlChange::Set { key, edits } => {
+            let control = controls
+                .iter_mut()
+                .find(|control| {
+                    control.get("key").and_then(serde_norway::Value::as_str) == Some(key.as_str())
+                })
+                .and_then(serde_norway::Value::as_mapping_mut)
+                .ok_or_else(|| {
+                    invalid(
+                        &format!("epochs[{index}].controls"),
+                        "a control the epoch declares",
+                    )
+                })?;
+            for edit in edits {
+                edit.apply(control);
+            }
+        }
+        ControlChange::Add(definition) => {
+            if controls.iter().any(|control| {
+                control.get("key").and_then(serde_norway::Value::as_str)
+                    == Some(definition.key.as_str())
+            }) {
+                return Err(vec![ValidationError::new(
+                    format!("epochs[{index}].controls"),
+                    ErrorKind::DuplicateKey {
+                        key: definition.key.to_string(),
+                    },
+                )]);
+            }
+            controls.push(definition.to_yaml());
+        }
+    }
+    Ok(())
+}
+
 fn validate_schema(raw: &RawSchema, errors: &mut Vec<ValidationError>) {
     for (index, epoch) in raw.epochs.iter().enumerate() {
         validate_epoch(epoch, &format!("epochs[{index}]"), errors);
@@ -392,6 +704,24 @@ fn validate_epoch(epoch: &RawEpoch, path: &str, errors: &mut Vec<ValidationError
             ));
         }
     }
+    let mut family_classes: BTreeMap<&LookId, bool> = BTreeMap::new();
+    for (index, sim) in epoch.native_sims.iter().enumerate() {
+        match family_classes.get(&sim.look) {
+            Some(monochrome) if *monochrome != sim.monochrome => {
+                errors.push(ValidationError::new(
+                    format!("{path}.native_sims[{index}].monochrome"),
+                    ErrorKind::FamilyRenderClassConflict {
+                        family: sim.look.to_string(),
+                    },
+                ));
+            }
+            Some(_) => {}
+            None => {
+                family_classes.insert(&sim.look, sim.monochrome);
+            }
+        }
+    }
+    validate_monochrome(epoch, path, errors);
 
     let mut mode_keys = HashSet::new();
     for (index, mode) in epoch.exposure_modes.iter().enumerate() {
@@ -406,6 +736,7 @@ fn validate_epoch(epoch: &RawEpoch, path: &str, errors: &mut Vec<ValidationError
     }
 
     let mut control_keys = HashSet::new();
+    let families: HashSet<&LookId> = epoch.native_sims.iter().map(|sim| &sim.look).collect();
     for (index, control) in epoch.controls.iter().enumerate() {
         let control_path = format!("{path}.controls[{index}]");
         if !control_keys.insert(control.key.as_str()) {
@@ -416,7 +747,7 @@ fn validate_epoch(epoch: &RawEpoch, path: &str, errors: &mut Vec<ValidationError
                 },
             ));
         }
-        validate_control(control, &control_path, errors);
+        validate_control(control, &families, &control_path, errors);
     }
 
     let mut planned = HashSet::new();
@@ -443,8 +774,227 @@ fn validate_epoch(epoch: &RawEpoch, path: &str, errors: &mut Vec<ValidationError
     }
 }
 
-fn validate_control(control: &RawControl, path: &str, errors: &mut Vec<ValidationError>) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonochromeControl {
+    Filter,
+    WarmCool,
+    MagentaGreen,
+    GrainSize,
+}
+
+impl MonochromeControl {
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Filter => "mono_filter",
+            Self::WarmCool => "bw_adjustment",
+            Self::MagentaGreen => "bw_magenta_green",
+            Self::GrainSize => "grain_size",
+        }
+    }
+
+    const fn capability_field(self) -> &'static str {
+        match self {
+            Self::Filter => "filter",
+            Self::WarmCool | Self::MagentaGreen => "toning",
+            Self::GrainSize => "grain_size",
+        }
+    }
+}
+
+fn validate_monochrome(epoch: &RawEpoch, path: &str, errors: &mut Vec<ValidationError>) {
+    let mono_families: HashSet<&LookId> = epoch
+        .native_sims
+        .iter()
+        .filter(|sim| sim.monochrome)
+        .map(|sim| &sim.look)
+        .collect();
+    let Some(capability) = &epoch.monochrome else {
+        return;
+    };
+    let capability_path = format!("{path}.monochrome");
+    validate_family_list(
+        &capability.families,
+        &mono_families,
+        &format!("{capability_path}.families"),
+        errors,
+    );
+    let families: HashSet<&LookId> = capability.families.iter().collect();
+    validate_family_list(
+        &capability.filter,
+        &families,
+        &format!("{capability_path}.filter"),
+        errors,
+    );
+    validate_family_list(
+        &capability.toning,
+        &families,
+        &format!("{capability_path}.toning"),
+        errors,
+    );
+    validate_monochrome_control(
+        epoch,
+        MonochromeControl::Filter,
+        &capability.filter,
+        &capability_path,
+        errors,
+    );
+    validate_monochrome_control(
+        epoch,
+        MonochromeControl::WarmCool,
+        &capability.toning,
+        &capability_path,
+        errors,
+    );
+    validate_monochrome_control(
+        epoch,
+        MonochromeControl::MagentaGreen,
+        &capability.toning,
+        &capability_path,
+        errors,
+    );
+    validate_grain_size(epoch, capability, &capability_path, errors);
+}
+
+fn validate_grain_size(
+    epoch: &RawEpoch,
+    capability: &MonochromeCapability,
+    capability_path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    let path = format!("{capability_path}.grain_size");
+    let control = epoch
+        .controls
+        .iter()
+        .find(|control| control.key.as_str() == MonochromeControl::GrainSize.key());
+    match (control, capability.grain_size) {
+        (None, false) => {}
+        (None, true) => errors.push(ValidationError::new(
+            path,
+            ErrorKind::MonochromeGrainSizeMissing,
+        )),
+        (Some(_), false) => errors.push(ValidationError::new(
+            path,
+            ErrorKind::MonochromeGrainSizeNotDeclared,
+        )),
+        (Some(control), true) => {
+            let scoped = matches!(&control.applies_to, None | Some(ControlScope::All));
+            if !control.spatial || control.makernote.is_none() || !scoped {
+                errors.push(ValidationError::new(
+                    path,
+                    ErrorKind::MonochromeGrainSizeMismatch,
+                ));
+            }
+        }
+    }
+}
+
+fn validate_family_list(
+    families: &[LookId],
+    allowed: &HashSet<&LookId>,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    let mut seen = HashSet::new();
+    for (index, family) in families.iter().enumerate() {
+        if !seen.insert(family) {
+            errors.push(ValidationError::new(
+                format!("{path}[{index}]"),
+                ErrorKind::DuplicateKey {
+                    key: family.to_string(),
+                },
+            ));
+        }
+        if !allowed.contains(family) {
+            errors.push(ValidationError::new(
+                format!("{path}[{index}]"),
+                ErrorKind::MonochromeFamilyNotDeclared {
+                    family: family.to_string(),
+                },
+            ));
+        }
+    }
+}
+
+fn validate_monochrome_control(
+    epoch: &RawEpoch,
+    role: MonochromeControl,
+    families: &[LookId],
+    capability_path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    let control = epoch
+        .controls
+        .iter()
+        .find(|control| control.key.as_str() == role.key());
+    let path = format!("{capability_path}.{}", role.capability_field());
+    let expected: HashSet<&LookId> = families.iter().collect();
+    match (control, families.is_empty()) {
+        (None, true) => {}
+        (None, false) => errors.push(ValidationError::new(
+            path,
+            ErrorKind::MonochromeControlMissing {
+                control: role.key(),
+            },
+        )),
+        (Some(_), true) => errors.push(ValidationError::new(
+            path,
+            ErrorKind::MonochromeControlNotDeclared {
+                control: role.key(),
+            },
+        )),
+        (Some(control), false) => {
+            let actual: HashSet<&LookId> = match &control.applies_to {
+                Some(ControlScope::Families(scope)) => scope.iter().collect(),
+                _ => HashSet::new(),
+            };
+            if actual != expected {
+                errors.push(ValidationError::new(
+                    path,
+                    ErrorKind::MonochromeControlMismatch {
+                        control: role.key(),
+                    },
+                ));
+            }
+        }
+    }
+}
+
+fn validate_control(
+    control: &RawControl,
+    families: &HashSet<&LookId>,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) {
     let field = |name: &str| format!("{path}.{name}");
+    if let Some(ControlScope::Families(scope)) = &control.applies_to {
+        if scope.is_empty() {
+            errors.push(ValidationError::new(
+                field("applies_to"),
+                ErrorKind::InvalidValue {
+                    expected: "at least one look family",
+                },
+            ));
+        }
+        let mut seen = HashSet::new();
+        for (index, family) in scope.iter().enumerate() {
+            if !seen.insert(family) {
+                errors.push(ValidationError::new(
+                    format!("{path}.applies_to[{index}]"),
+                    ErrorKind::DuplicateKey {
+                        key: family.to_string(),
+                    },
+                ));
+            }
+            if !families.contains(family) {
+                errors.push(ValidationError::new(
+                    format!("{path}.applies_to[{index}]"),
+                    ErrorKind::UnknownFamily {
+                        family: family.to_string(),
+                    },
+                ));
+            }
+        }
+    }
     match control.kind {
         ControlType::Int => {
             if control.values.is_some() {
@@ -940,6 +1490,7 @@ fn build_epoch(raw: RawEpoch) -> Epoch {
         id: raw.id,
         firmware: raw.firmware,
         native_sims: raw.native_sims,
+        monochrome: raw.monochrome,
         exposure_modes: raw.exposure_modes,
         controls: raw.controls.into_iter().map(build_control).collect(),
         solve_plan: raw.solve_plan,
@@ -982,6 +1533,7 @@ fn build_control(raw: RawControl) -> Control {
         tolerated: raw.tolerated,
         constraints: raw.constraints,
         makernote: raw.makernote.and_then(build_makernote),
+        scope: raw.applies_to.unwrap_or_default(),
     }
 }
 

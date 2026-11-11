@@ -11,10 +11,33 @@ const VOLUME_COEFS: usize = looklab_model::basis::VOLUME_COEFS;
 /// Three nuisances per image: exposure, `log w_R`, `log w_B`.
 pub const NUISANCE_PER_IMAGE: usize = 3;
 
+/// Fitted tone coordinates of [`Tone::colorimetric`], the fixed tone-prior mean.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToneCenter {
+    pub c0: f64,
+    pub eta: [f64; TONE_COEFS],
+}
+
+impl ToneCenter {
+    fn colorimetric() -> Self {
+        let tone = Tone::colorimetric(&looklab_model::basis::TONE_KNOTS)
+            .expect("colorimetric tone over the fixed knots");
+        let Tone::Spline { c0, beta } = tone else {
+            unreachable!("Tone::colorimetric returns a spline");
+        };
+        Self {
+            c0,
+            eta: beta.map(softplus_inverse),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layout {
     pub tone_c0: usize,
     pub tone_beta: Range<usize>,
+    /// Tone-prior mean in fitted coordinates.
+    pub tone_center: ToneCenter,
     pub tint_a: Range<usize>,
     pub tint_b: Range<usize>,
     pub g: Range<usize>,
@@ -60,6 +83,7 @@ impl Layout {
         Self {
             tone_c0,
             tone_beta,
+            tone_center: ToneCenter::colorimetric(),
             tint_a,
             tint_b,
             g,
@@ -87,6 +111,17 @@ impl Layout {
 
     pub fn mode_of(&self, index: usize) -> usize {
         self.modes.start + index
+    }
+
+    /// Prior mean of `global` in fitted coordinates; zero outside the tone layer.
+    pub(crate) fn identity_mean(&self, global: usize) -> f64 {
+        if global == self.tone_c0 {
+            self.tone_center.c0
+        } else if self.tone_beta.contains(&global) {
+            self.tone_center.eta[global - self.tone_beta.start]
+        } else {
+            0.0
+        }
     }
 
     pub fn look(&self, theta: &[f64]) -> Look {
@@ -184,12 +219,9 @@ pub struct Params {
 impl Params {
     pub fn initial(layout: Layout, contributor_count: usize) -> Self {
         let mut theta = vec![0.0_f64; layout.total];
-        if let Ok(Tone::Spline { c0, beta }) = Tone::colorimetric(&looklab_model::basis::TONE_KNOTS)
-        {
-            theta[layout.tone_c0] = c0;
-            for (k, value) in beta.iter().enumerate() {
-                theta[layout.tone_beta.start + k] = softplus_inverse(*value);
-            }
+        theta[layout.tone_c0] = layout.tone_center.c0;
+        for (k, value) in layout.tone_center.eta.iter().enumerate() {
+            theta[layout.tone_beta.start + k] = *value;
         }
         if let Some(slot) = theta.get_mut(layout.clip) {
             *slot = zeta_from_clip(0.03);

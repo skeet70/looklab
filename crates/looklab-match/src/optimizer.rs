@@ -6,13 +6,17 @@ use rand_chacha::ChaCha12Rng;
 use rand_chacha::rand_core::{RngCore, SeedableRng};
 use std::collections::BTreeSet;
 
+use crate::domain::AssessedDomain;
 use crate::error::{MatchError, Result};
 use crate::linear::{LinearCache, ProbeSubset};
+use crate::metric::{OutputContext, ScoringMetric};
 use crate::model::MatchModel;
 use crate::settings::Plan;
 use crate::target::PreparedTarget;
 
-pub const OPTIMIZER_VERSION: &str = "looklab-match/1";
+pub const OPTIMIZER_VERSION: &str = "looklab-match/2";
+
+pub const PRE_CLIP_OPTIMIZER_VERSION: &str = "looklab-match/1";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MatchOptions {
@@ -57,7 +61,9 @@ pub struct Suggestion {
     pub median_delta_e: f64,
     pub p95_delta_e: f64,
     pub max_delta_e: f64,
-    pub sigma_band: f64,
+    pub sigma_band: Option<f64>,
+    pub metric: ScoringMetric,
+    pub output: Option<OutputContext>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -107,6 +113,14 @@ pub fn optimize(
                 model.sim()
             )));
         }
+    }
+
+    if let Some(domain) = plan.assessed() {
+        let domains: std::collections::BTreeMap<_, _> = models
+            .iter()
+            .map(|model| (model.sim().clone(), domain.clone()))
+            .collect();
+        return optimize_scoped(models, target, plan, options, &domains);
     }
 
     let subset = target.subset(options.probe_subset);
@@ -181,6 +195,7 @@ pub fn optimize(
                 options,
                 &mut stats.exact_evaluations,
             )?
+            .unwrap_or_else(|| start.clone())
         } else {
             start.clone()
         };
@@ -206,7 +221,9 @@ pub fn optimize(
                 options,
                 &mut stats.exact_evaluations,
             )?;
-            seeds.push((index, result));
+            if let Some(result) = result {
+                seeds.push((index, result));
+            }
         }
         let exact_cache = LinearCache::new(
             &models[index],
@@ -285,8 +302,12 @@ pub fn optimize(
             };
             let exact = exact_score(cache, target, plan, &subset, &entry.settings, options.beta)?;
             stats.exact_evaluations += 1;
+            if !exact.rankable {
+                continue;
+            }
             let linear = cache.predicted_output(plan, &entry.settings);
-            let median = median_prediction_difference(&linear, &exact.predictions);
+            let median =
+                median_prediction_difference(&linear, &cache.indices, &subset, &exact.predictions);
             let exact_median = quantile(&exact.deltas, 0.5);
             if exact_median <= 0.3 {
                 continue;
@@ -343,6 +364,10 @@ pub fn optimize(
         };
         let exact = exact_score(cache, target, plan, &full, &settings, options.beta)?;
         stats.exact_evaluations += 1;
+        if !exact.rankable {
+            continue;
+        }
+        let output = target.optional_output_context(&models[sim], &settings)?;
         let suggestion = Suggestion {
             sim: models[sim].sim().clone(),
             settings,
@@ -351,8 +376,13 @@ pub fn optimize(
             p95_delta_e: quantile(&exact.deltas, 0.95),
             max_delta_e: exact.deltas.last().copied().unwrap_or(0.0),
             sigma_band: exact.band(),
+            metric: target.metric(),
+            output,
         };
         scored.push((suggestion.objective, suggestion));
+    }
+    if scored.is_empty() {
+        return Err(MatchError::NoRankableCandidate);
     }
     scored.sort_by(|left, right| left.0.total_cmp(&right.0));
     scored.truncate(options.top_results.max(1));
@@ -369,6 +399,79 @@ fn affects(plan: &Plan, control: usize, affect: Affects) -> bool {
     plan.controls[control].affects.contains(&affect)
 }
 
+/// Scores only each sim's joint assessed settings points on the assessed probes.
+pub fn optimize_scoped(
+    models: &[MatchModel],
+    target: &PreparedTarget<'_>,
+    plan: &Plan,
+    options: &MatchOptions,
+    domains: &std::collections::BTreeMap<SimKey, AssessedDomain>,
+) -> Result<MatchOutcome> {
+    if domains.is_empty() {
+        return Err(MatchError::NoSims);
+    }
+    let mut evaluations = 0_usize;
+    for model in models {
+        if let Some(domain) = domains.get(model.sim()) {
+            evaluations = evaluations.saturating_add(domain.check_budget(1)?);
+        }
+    }
+    if evaluations > crate::domain::MAX_ASSESSED_EVALUATIONS {
+        return Err(MatchError::AssessedDomainTooLarge {
+            combinations: evaluations,
+            sims: models.len(),
+            budget: crate::domain::MAX_ASSESSED_EVALUATIONS,
+        });
+    }
+    let subset = target.full_subset();
+    let mut stats = RunStats {
+        sims_considered: models.len(),
+        supported_probes: target.supported.len(),
+        probe_subset: subset.indices.len(),
+        exact_evaluations: evaluations,
+        ..RunStats::default()
+    };
+    let mut scored: Vec<(f64, Suggestion)> = Vec::with_capacity(evaluations);
+    for model in models {
+        let Some(domain) = domains.get(model.sim()) else {
+            continue;
+        };
+        stats.sims_kept += 1;
+        let cache = LinearCache::new(model, plan, target, &plan.default, &subset, options.beta)?;
+        for settings in domain.combinations() {
+            let exact = exact_score(&cache, target, plan, &subset, settings, options.beta)?;
+            if !exact.rankable {
+                continue;
+            }
+            let output = target.optional_output_context(model, settings)?;
+            let suggestion = Suggestion {
+                sim: model.sim().clone(),
+                settings: settings.clone(),
+                objective: exact.objective,
+                median_delta_e: quantile(&exact.deltas, 0.5),
+                p95_delta_e: quantile(&exact.deltas, 0.95),
+                max_delta_e: exact.deltas.last().copied().unwrap_or(0.0),
+                sigma_band: exact.band(),
+                metric: target.metric(),
+                output,
+            };
+            scored.push((suggestion.objective, suggestion));
+        }
+    }
+    if scored.is_empty() {
+        return Err(MatchError::NoRankableCandidate);
+    }
+    scored.sort_by(|left, right| left.0.total_cmp(&right.0));
+    scored.truncate(options.top_results.max(1));
+    Ok(MatchOutcome {
+        results: scored
+            .into_iter()
+            .map(|(_, suggestion)| suggestion)
+            .collect(),
+        stats,
+    })
+}
+
 fn exact_probe_score(
     model: &MatchModel,
     target: &PreparedTarget<'_>,
@@ -380,7 +483,7 @@ fn exact_probe_score(
     for (index, weight) in subset.indices.iter().zip(&subset.weights) {
         let probe = &target.probes.probes[*index];
         let prediction = model
-            .input_ucs(&realization, probe.xyz, [0.0, 0.0], 0.0)
+            .scored_ucs(target.metric(), &realization, probe.xyz)
             .to_array();
         let expected = target.target[*index].to_array();
         let delta = [
@@ -641,14 +744,20 @@ fn exact_objective(
     settings: &Settings,
     beta: f64,
     scratch: &mut crate::linear::RealizationScratch,
-) -> Result<f64> {
+) -> Result<Option<f64>> {
     if cache.model.groups.is_empty() {
         let (gains, exposure) = cache.realize_into(plan, settings, scratch)?;
         let mut total = 0.0_f64;
         for (slot, index) in subset.indices.iter().enumerate() {
             let probe = &target.probes.probes[*index];
             let input = cache.input_xyz(probe.xyz, gains, exposure);
-            let prediction = scratch.look.eval(input);
+            let pre = scratch.look.eval(input);
+            let prediction = match cache.metric {
+                ScoringMetric::LegacyPreClipV1 => pre,
+                ScoringMetric::RenderedPostClipV1 => {
+                    cache.model.output_pin_for_look(&scratch.look).render(pre)
+                }
+            };
             let expected = target.target[*index];
             let delta = [
                 prediction.j - expected.j,
@@ -658,7 +767,7 @@ fn exact_objective(
             total += subset.weights[slot]
                 * (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]);
         }
-        return Ok(total);
+        return Ok(Some(total));
     }
     let realization = cache.realization(plan, settings)?;
     let mut total = 0.0_f64;
@@ -666,7 +775,7 @@ fn exact_objective(
         let probe = &target.probes.probes[*index];
         let prediction = cache
             .model
-            .input_ucs(&realization, probe.xyz, [0.0, 0.0], 0.0);
+            .scored_ucs(cache.metric, &realization, probe.xyz);
         let expected = target.target[*index];
         let delta = [
             prediction.j - expected.j,
@@ -674,10 +783,19 @@ fn exact_objective(
             prediction.b - expected.b,
         ];
         let squared = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
-        let trace = crate::covariance::trace_with(&cache.model, &realization, settings, probe.xyz)?;
+        let trace = crate::covariance::trace_with(
+            &cache.model,
+            &realization,
+            settings,
+            cache.metric,
+            probe.xyz,
+        )?;
+        let Some(trace) = trace else {
+            return Ok(None);
+        };
         total += subset.weights[slot] * squared + beta * subset.covariance_weights[slot] * trace;
     }
-    Ok(total)
+    Ok(Some(total))
 }
 
 fn exact_descend(
@@ -688,10 +806,10 @@ fn exact_descend(
     start: &Settings,
     options: &MatchOptions,
     evaluations: &mut usize,
-) -> Result<Settings> {
-    let mut scratch = cache.scratch();
+) -> Result<Option<Settings>> {
+    let mut scratch = cache.scratch()?;
     let mut current = start.clone();
-    let mut current_score = {
+    let Some(mut current_score) = ({
         *evaluations += 1;
         exact_objective(
             cache,
@@ -702,6 +820,8 @@ fn exact_descend(
             options.beta,
             &mut scratch,
         )?
+    }) else {
+        return Ok(None);
     };
     for stage in &plan.stages {
         for _ in 0..options.coordinate_passes.min(1) {
@@ -716,7 +836,7 @@ fn exact_descend(
                     }
                     let candidate = plan.candidate(&current, control, value);
                     *evaluations += 1;
-                    let score = exact_objective(
+                    let Some(score) = exact_objective(
                         cache,
                         plan,
                         target,
@@ -724,7 +844,10 @@ fn exact_descend(
                         &candidate,
                         options.beta,
                         &mut scratch,
-                    )?;
+                    )?
+                    else {
+                        continue;
+                    };
                     if score + 1e-12 < best_score {
                         best_score = score;
                         best_value = value;
@@ -741,7 +864,7 @@ fn exact_descend(
             }
         }
     }
-    Ok(current)
+    Ok(Some(current))
 }
 
 fn mutate(
@@ -805,22 +928,24 @@ fn shortlist(pool: &[Entry], count: usize) -> Vec<&Entry> {
 
 struct ExactScore {
     objective: f64,
+    rankable: bool,
     deltas: Vec<f64>,
     predictions: Vec<[f64; 3]>,
-    traces: Vec<f64>,
+    traces: Vec<Option<f64>>,
 }
 
 impl ExactScore {
-    fn band(&self) -> f64 {
-        if self.traces.is_empty() {
-            0.0
-        } else {
+    fn band(&self) -> Option<f64> {
+        if self.traces.is_empty() || self.traces.iter().any(Option::is_none) {
+            return None;
+        }
+        Some(
             self.traces
                 .iter()
-                .map(|trace| trace.max(0.0).sqrt())
+                .map(|trace| trace.unwrap_or(0.0).max(0.0).sqrt())
                 .sum::<f64>()
-                / self.traces.len() as f64
-        }
+                / self.traces.len() as f64,
+        )
     }
 }
 
@@ -832,7 +957,7 @@ fn exact_score(
     settings: &Settings,
     beta: f64,
 ) -> Result<ExactScore> {
-    let mut scratch = cache.scratch();
+    let mut scratch = cache.scratch()?;
     let mut objective = 0.0_f64;
     let mut deltas = Vec::with_capacity(subset.indices.len());
     let mut predictions = Vec::with_capacity(subset.indices.len());
@@ -851,16 +976,17 @@ fn exact_score(
     for (slot, index) in subset.indices.iter().enumerate() {
         let probe = &target.probes.probes[*index];
         let prediction = if use_scratch {
-            scratch
+            let pre = scratch
                 .look
-                .eval(cache.input_xyz(probe.xyz, gains, exposure))
+                .eval(cache.input_xyz(probe.xyz, gains, exposure));
+            match cache.metric {
+                ScoringMetric::LegacyPreClipV1 => pre,
+                ScoringMetric::RenderedPostClipV1 => {
+                    cache.model.output_pin_for_look(&scratch.look).render(pre)
+                }
+            }
         } else {
-            cache.model.input_ucs(
-                realization.as_ref().expect("realization"),
-                probe.xyz,
-                [0.0, 0.0],
-                0.0,
-            )
+            cache.scored_ucs(realization.as_ref().expect("realization"), probe.xyz)
         };
         let expected = target.target[*index];
         let delta = [
@@ -870,39 +996,55 @@ fn exact_score(
         ];
         let delta_e = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
         let trace = if use_scratch {
-            0.0
+            Some(0.0)
         } else {
             crate::covariance::trace_with(
                 &cache.model,
                 realization.as_ref().expect("realization"),
                 settings,
+                cache.metric,
                 probe.xyz,
             )?
         };
-        objective += subset.weights[slot] * delta_e * delta_e
-            + beta * subset.covariance_weights[slot] * trace;
+        objective += subset.weights[slot] * delta_e * delta_e;
+        if let Some(trace) = trace {
+            objective += beta * subset.covariance_weights[slot] * trace;
+        }
         deltas.push(delta_e);
         predictions.push(prediction.to_array());
         traces.push(trace);
     }
     deltas.sort_by(f64::total_cmp);
+    let rankable = traces.iter().all(Option::is_some);
     Ok(ExactScore {
         objective,
+        rankable,
         deltas,
         predictions,
         traces,
     })
 }
 
-fn median_prediction_difference(linear: &[[f64; 3]], exact: &[[f64; 3]]) -> f64 {
-    let mut differences: Vec<f64> = linear
-        .iter()
-        .zip(exact.iter())
-        .map(|(a, b)| {
-            let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-        })
-        .collect();
+fn median_prediction_difference(
+    linear: &[[f64; 3]],
+    retained: &[usize],
+    subset: &ProbeSubset,
+    exact: &[[f64; 3]],
+) -> f64 {
+    let mut differences: Vec<f64> = Vec::with_capacity(linear.len());
+    let mut position = 0;
+    for (slot, &index) in retained.iter().enumerate() {
+        while position < subset.indices.len() && subset.indices[position] != index {
+            position += 1;
+        }
+        if position >= subset.indices.len() || subset.indices[position] != index {
+            continue;
+        }
+        let a = linear[slot];
+        let b = exact[position];
+        let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        differences.push((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt());
+    }
     differences.sort_by(f64::total_cmp);
     quantile(&differences, 0.5)
 }

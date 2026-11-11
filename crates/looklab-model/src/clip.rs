@@ -2,7 +2,7 @@
 
 use looklab_color::cam16::Chroma;
 use looklab_color::ucs::{Ucs, UcsSpace, ucs_to_jmh};
-use looklab_color::{RgbSpace, Xyz};
+use looklab_color::{Mat3, RgbSpace, Xyz};
 use serde::{Deserialize, Serialize};
 
 use crate::solve;
@@ -43,6 +43,102 @@ pub fn soft_clip(x: f64, k: f64) -> f64 {
     }
 }
 
+/// `c'(x)` of [`soft_clip`]; `1` on the identity segment.
+pub fn soft_clip_derivative(x: f64, k: f64) -> f64 {
+    if x > 1.0 - k || x < k {
+        let u = if x > 1.0 - k {
+            (x - (1.0 - k)) / k
+        } else {
+            (k - x) / k
+        };
+        let exponential = libm::exp(-2.0 * u);
+        let fraction = exponential / (1.0 + exponential);
+        4.0 * fraction * (1.0 - fraction)
+    } else {
+        1.0
+    }
+}
+
+/// `soft_clip(x, k) - 1`, evaluated as the shoulder departure.
+pub fn soft_clip_departure(x: f64, k: f64) -> f64 {
+    if x > 1.0 - k {
+        let u = (x - (1.0 - k)) / k;
+        let exponential = libm::exp(-2.0 * u);
+        -2.0 * k * exponential / (1.0 + exponential)
+    } else if x < k {
+        let u = (k - x) / k;
+        let exponential = libm::exp(-2.0 * u);
+        2.0 * k * exponential / (1.0 + exponential) - 1.0
+    } else {
+        x - 1.0
+    }
+}
+
+/// Value and first/second derivatives of [`soft_clip`] in `x` and `k`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SoftClipDerivatives {
+    pub value: f64,
+    pub first: f64,
+    pub second: f64,
+    pub first_k: f64,
+    pub second_k: f64,
+    pub mixed: f64,
+}
+
+/// [`SoftClipDerivatives`] using the exponential shoulder tail, not `tanh`.
+pub fn soft_clip_derivatives(x: f64, k: f64) -> SoftClipDerivatives {
+    if x > 1.0 - k {
+        let u = (x - (1.0 - k)) / k;
+        let exponential = libm::exp(-2.0 * u);
+        let fraction = exponential / (1.0 + exponential);
+        let tanh = 1.0 - 2.0 * fraction;
+        let sech2 = 4.0 * fraction * (1.0 - fraction);
+        let offset = x - 1.0;
+        SoftClipDerivatives {
+            value: soft_clip(x, k),
+            first: sech2,
+            second: -2.0 * tanh * sech2 / k,
+            first_k: -2.0 * fraction + 4.0 * fraction * (1.0 - fraction) * (1.0 - x) / k,
+            second_k: -2.0 * tanh * sech2 * offset * offset / (k * k * k),
+            mixed: 2.0 * tanh * sech2 * offset / (k * k),
+        }
+    } else if x < k {
+        let u = (k - x) / k;
+        let exponential = libm::exp(-2.0 * u);
+        let fraction = exponential / (1.0 + exponential);
+        let tanh = 1.0 - 2.0 * fraction;
+        let sech2 = 4.0 * fraction * (1.0 - fraction);
+        SoftClipDerivatives {
+            value: soft_clip(x, k),
+            first: sech2,
+            second: 2.0 * tanh * sech2 / k,
+            first_k: 2.0 * fraction - 4.0 * fraction * (1.0 - fraction) * x / k,
+            second_k: 2.0 * tanh * sech2 * x * x / (k * k * k),
+            mixed: -2.0 * tanh * sech2 * x / (k * k),
+        }
+    } else {
+        SoftClipDerivatives {
+            value: x,
+            first: 1.0,
+            second: 0.0,
+            first_k: 0.0,
+            second_k: 0.0,
+            mixed: 0.0,
+        }
+    }
+}
+
+/// `∂c(x, k)/∂k` of [`soft_clip`]; zero on the identity segment.
+pub fn soft_clip_k_derivative(x: f64, k: f64) -> f64 {
+    soft_clip_derivatives(x, k).first_k
+}
+
+/// [`output_encode_clip`] without the neutral fallback; `None` where the
+/// forward encode is undefined.
+pub fn try_output_encode_clip(ucs: Ucs, output_space: RgbSpace, k: f64) -> Option<Ucs> {
+    encode_once(ucs, output_space, k)
+}
+
 /// `J'a'b'` through linear output RGB, the per-channel soft clip, and back.
 pub fn output_encode_clip(ucs: Ucs, output_space: RgbSpace, k: f64) -> Ucs {
     if let Some(encoded) = encode_once(ucs, output_space, k) {
@@ -57,6 +153,146 @@ pub fn output_encode_clip(ucs: Ucs, output_space: RgbSpace, k: f64) -> Ucs {
     encode_once(neutral, output_space, k)
         .or_else(|| encode_once(Ucs::new(0.0, 0.0, 0.0), output_space, k))
         .unwrap_or(Ucs::new(0.0, 0.0, 0.0))
+}
+
+/// `xyz` of the pre-clip prediction and `dXYZ/d(J'a'b')`; chromatic columns vanish
+/// at a neutral prediction.
+pub fn preclip_xyz_jacobian(pre: Ucs) -> (Xyz, [[f64; 3]; 3]) {
+    let model = solve::reference_model();
+    let jmh = ucs_to_jmh(pre, UcsSpace::Ucs);
+    let (xyz, d_xyz) = model.inverse_xyz_and_jacobian(jmh);
+    let c1 = 0.007;
+    let denominator = 1.0 + 100.0 * c1 - c1 * pre.j;
+    let d_j = (1.0 + 100.0 * c1) / (denominator * denominator);
+    let c2 = UcsSpace::Ucs.coefficients().c2;
+    let m_prime = (pre.a * pre.a + pre.b * pre.b).sqrt();
+    let (d_m_a, d_m_b, d_h_a, d_h_b) = if m_prime > 0.0 {
+        let d_m = libm::exp(c2 * m_prime);
+        let degrees = 180.0 / core::f64::consts::PI;
+        (
+            d_m * pre.a / m_prime,
+            d_m * pre.b / m_prime,
+            -pre.b / (m_prime * m_prime) * degrees,
+            pre.a / (m_prime * m_prime) * degrees,
+        )
+    } else {
+        (0.0, 0.0, 0.0, 0.0)
+    };
+    let chain = [[d_j, 0.0, 0.0], [0.0, d_m_a, d_m_b], [0.0, d_h_a, d_h_b]];
+    let mut jacobian = [[0.0_f64; 3]; 3];
+    for (row, values) in jacobian.iter_mut().enumerate() {
+        for (axis, value) in values.iter_mut().enumerate() {
+            for (k, row_values) in chain.iter().enumerate() {
+                *value += d_xyz[row][k] * row_values[axis];
+            }
+        }
+    }
+    (xyz, jacobian)
+}
+
+/// `∂²XYZ/∂(J'a'b')²` of the pre-clip inverse, as `[c][d]` over the two pre-clip
+/// channels; zero where the forward map is singular.
+pub fn preclip_xyz_second(pre: Ucs) -> [[[f64; 3]; 3]; 3] {
+    let (xyz, _) = preclip_xyz_jacobian(pre);
+    let model = crate::deriv::reference_cam16();
+    let (_, forward) = model.ucs_xyz_jacobian(xyz);
+    let second = model.ucs_xyz_second(xyz);
+    inverse_second(forward, &second)
+}
+
+/// `D²(f⁻¹)[e_c, e_d] = −Df⁻¹ · D²f[Df⁻¹e_c, Df⁻¹e_d]`.
+fn inverse_second(forward: [[f64; 3]; 3], second: &[[f64; 3]; 6]) -> [[[f64; 3]; 3]; 3] {
+    let mut out = [[[0.0_f64; 3]; 3]; 3];
+    let Some(inverse) = Mat3(forward).inverse() else {
+        return out;
+    };
+    if !inverse.0.iter().flatten().all(|value| value.is_finite()) {
+        return out;
+    }
+    let packed = [(0usize, 0usize), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2)];
+    for (c, rows) in out.iter_mut().enumerate() {
+        for (d, entry) in rows.iter_mut().enumerate() {
+            let left = [inverse.0[0][c], inverse.0[1][c], inverse.0[2][c]];
+            let right = [inverse.0[0][d], inverse.0[1][d], inverse.0[2][d]];
+            let mut direction = [0.0_f64; 3];
+            for (slot, (a, b)) in packed.into_iter().enumerate() {
+                let weight = if a == b {
+                    left[a] * right[b]
+                } else {
+                    left[a] * right[b] + left[b] * right[a]
+                };
+                for (channel, value) in direction.iter_mut().enumerate() {
+                    *value += weight * second[slot][channel];
+                }
+            }
+            *entry = inverse.mul_vec(direction).map(|value| -value);
+        }
+    }
+    out
+}
+
+/// `∂²XYZ/∂(J', n_a, n_b)²` of the internal pre-clip inverse, as `[c][d]` over
+/// those three channels.
+pub fn preclip_internal_xyz_second(chroma: [f64; 2], j_prime: f64) -> [[[f64; 3]; 3]; 3] {
+    let xyz = crate::look::internal_chroma_to_xyz(chroma, j_prime);
+    let model = crate::deriv::reference_cam16();
+    let scale = crate::look::neutral_scale();
+    let mut forward = [[0.0_f64; 3]; 3];
+    forward[0] = model.j_prime_xyz_gradient(xyz);
+    for axis in 0..3 {
+        let mut direction = [0.0_f64; 3];
+        direction[axis] = 1.0;
+        let (_, first, _) = model.neutral_second(xyz, direction, scale);
+        forward[1][axis] = first[0];
+        forward[2][axis] = first[1];
+    }
+    let ucs = model.ucs_xyz_second(xyz);
+    let neutral = model.neutral_xyz_second(xyz, scale);
+    let mut second = [[0.0_f64; 3]; 6];
+    for (slot, value) in second.iter_mut().enumerate() {
+        *value = [ucs[slot][0], neutral[slot][0], neutral[slot][1]];
+    }
+    inverse_second(forward, &second)
+}
+
+/// `xyz` of the internal chroma and `dXYZ/d(n_a, n_b, J')`.
+pub fn preclip_internal_xyz_jacobian(chroma: [f64; 2], j_prime: f64) -> (Xyz, [[f64; 3]; 3]) {
+    let xyz = crate::look::internal_chroma_to_xyz(chroma, j_prime);
+    let (opponent, d_opponent) = solve::reference_model().cone_opponent_jacobian(xyz);
+    let scale = crate::look::neutral_scale();
+    let denominator = opponent.denominator;
+    let mut forward = [[0.0_f64; 3]; 3];
+    forward[0] = crate::look::j_prime_xyz_gradient(xyz);
+    for axis in 0..3 {
+        forward[1][axis] = scale
+            * (d_opponent[0][axis] * denominator - opponent.a * d_opponent[2][axis])
+            / (denominator * denominator);
+        forward[2][axis] = scale
+            * (d_opponent[1][axis] * denominator - opponent.b * d_opponent[2][axis])
+            / (denominator * denominator);
+    }
+    let inverse = Mat3(forward).inverse();
+    if let Some(inverse) = inverse
+        && inverse.0.iter().flatten().all(|value| value.is_finite())
+    {
+        return (xyz, inverse.0);
+    }
+    // At a zero cone response the forward slope is infinite and the inverse is not
+    // recoverable by inversion; the inverse map itself is finite there.
+    let mut jacobian = [[0.0_f64; 3]; 3];
+    let step = 1e-7;
+    for axis in 0..3 {
+        let mut plus = [chroma[0], chroma[1], j_prime];
+        let mut minus = plus;
+        plus[axis] += step;
+        minus[axis] -= step;
+        let a = crate::look::internal_chroma_to_xyz([plus[0], plus[1]], plus[2]);
+        let b = crate::look::internal_chroma_to_xyz([minus[0], minus[1]], minus[2]);
+        jacobian[0][axis] = (a.x - b.x) / (2.0 * step);
+        jacobian[1][axis] = (a.y - b.y) / (2.0 * step);
+        jacobian[2][axis] = (a.z - b.z) / (2.0 * step);
+    }
+    (xyz, jacobian)
 }
 
 /// [`output_encode_clip`] for a point CAM16's inverse model is defined on.
@@ -114,6 +350,44 @@ mod tests {
     }
 
     #[test]
+    fn preclip_second_matches_differences_of_the_jacobian() {
+        for pre in [
+            Ucs::new(55.0, 12.0, -7.0),
+            Ucs::new(20.0, -4.0, 9.0),
+            Ucs::new(85.0, 25.0, 18.0),
+        ] {
+            let second = preclip_xyz_second(pre);
+            let h = 1e-6;
+            let mut worst = 0.0_f64;
+            for c in 0..3 {
+                let mut plus = pre.to_array();
+                let mut minus = pre.to_array();
+                plus[c] += h;
+                minus[c] -= h;
+                let (_, jacobian_plus) = preclip_xyz_jacobian(Ucs::from_array(plus));
+                let (_, jacobian_minus) = preclip_xyz_jacobian(Ucs::from_array(minus));
+                for d in 0..3 {
+                    for row in 0..3 {
+                        let numerical =
+                            (jacobian_plus[row][d] - jacobian_minus[row][d]) / (2.0 * h);
+                        let analytic = second[c][d][row];
+                        let scale = numerical.abs().max(1e-3);
+                        let gap = (analytic - numerical).abs() / scale;
+                        if gap > worst {
+                            worst = gap;
+                            println!(
+                                "pre {pre:?} c {c} d {d} row {row}: analytic {analytic:.9e} numerical {numerical:.9e}"
+                            );
+                        }
+                    }
+                }
+            }
+            println!("preclip_xyz_second worst relative gap {worst:.3e} for {pre:?}");
+            assert!(worst < 1e-5, "worst relative gap {worst:.3e}");
+        }
+    }
+
+    #[test]
     fn soft_clip_limits_and_monotonicity() {
         let k = 0.03;
         assert!(soft_clip(1e6, k) <= 1.0);
@@ -134,6 +408,72 @@ mod tests {
         let k = 0.03;
         for x in [0.03, 0.5, 0.97] {
             assert_eq!(soft_clip(x, k), x);
+        }
+    }
+
+    #[test]
+    fn shoulder_departure_survives_value_rounding() {
+        let k = 0.03;
+        let x = 1.711_046_689_324_750_5;
+        assert_eq!(soft_clip(x, k), 1.0);
+        assert!(soft_clip_departure(x, k) < 0.0);
+        assert!(soft_clip_departure(x, k).abs() < 1e-20);
+        assert!(soft_clip_derivative(x, k) > 0.0);
+        assert!(soft_clip_derivative(x, k) < 1e-20);
+    }
+
+    #[test]
+    fn saturated_shoulders_preserve_mixed_curvature() {
+        // mpmath 1.4.1, 100-digit differentiation of soft_clip's value expression.
+        let first = 1.401_395_733_290_771_7e-21;
+        let second = 9.342_638_221_938_478e-20;
+        let first_k = 3.391_595_775_298_653e-20;
+        let second_k = 5.248_355_683_832_013e-17;
+        let mixed = 2.214_350_659_089_409_4e-18;
+        for (x, expected) in [
+            (
+                1.711_046_689_324_750_5,
+                [first, -second, -first_k, -second_k, mixed],
+            ),
+            (
+                -0.711_046_689_324_750_5,
+                [first, second, first_k, second_k, mixed],
+            ),
+        ] {
+            let derivatives = soft_clip_derivatives(x, 0.03);
+            let actual = [
+                derivatives.first,
+                derivatives.second,
+                derivatives.first_k,
+                derivatives.second_k,
+                derivatives.mixed,
+            ];
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() <= 3e-14 * expected.abs(),
+                    "x {x}: derivative {actual:.17e} vs {expected:.17e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shoulder_derivatives_match_finite_differences() {
+        let k = 0.03;
+        let step = 1e-6;
+        for x in [0.01, 1.05, 1.1, 1.2] {
+            let numerical = (soft_clip(x + step, k) - soft_clip(x - step, k)) / (2.0 * step);
+            let analytic = soft_clip_derivative(x, k);
+            assert!(
+                (analytic - numerical).abs() < 1e-6,
+                "x {x}: derivative {analytic} vs {numerical}"
+            );
+            let numerical_k = (soft_clip(x, k + step) - soft_clip(x, k - step)) / (2.0 * step);
+            let analytic_k = soft_clip_k_derivative(x, k);
+            assert!(
+                (analytic_k - numerical_k).abs() < 1e-6,
+                "x {x}: k derivative {analytic_k} vs {numerical_k}"
+            );
         }
     }
 }

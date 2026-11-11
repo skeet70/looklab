@@ -20,6 +20,12 @@ pub struct PublishArgs {
     /// Body and control-schema snapshots.
     #[arg(long, default_value = "data")]
     pub data: PathBuf,
+    /// Documentation-derived camera catalog directory.
+    #[arg(long, default_value = "data/manuals")]
+    pub manuals: PathBuf,
+    /// Approved community snapshots; the newest `v<version>` is published.
+    #[arg(long, default_value = "data/community")]
+    pub snapshot_dir: PathBuf,
     /// Body input transforms, one `<make>-<model>.yaml` per body.
     #[arg(long, default_value = "data/transforms")]
     pub transforms: PathBuf,
@@ -34,6 +40,8 @@ pub fn run(args: &PublishArgs) -> Result<()> {
         db: args.db.clone(),
         blobs: args.blobs.clone(),
         data: args.data.clone(),
+        manuals: args.manuals.clone(),
+        snapshot_dir: args.snapshot_dir.clone(),
         transforms: args.transforms.clone(),
         out: args.out.clone(),
     }))?;

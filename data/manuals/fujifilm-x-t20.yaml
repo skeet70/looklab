@@ -1,0 +1,239 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: fujifilm/x-t20
+  make: Fujifilm
+  model: X-T20
+  sources:
+  - id: xt20-manual
+    kind: owner_manual
+    url: https://fujifilm-dsc.com/en/manual/x-t20/
+    title: FUJIFILM X-T20 Owner's Manual
+    edition: BL00004889-206 EN
+    firmware_scope: unspecified
+  - id: xt20-firmware
+    kind: firmware_notes
+    url: https://fujifilm-x.com/en-us/support/download/firmware/cameras/x-t20/
+    title: X-T20 Firmware update
+    edition: web edition, accessed 2026-11-08
+    firmware_scope: '2.11'
+  capabilities:
+  - key: native_simulations
+    label: FILM SIMULATION
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - PROVIA/STANDARD
+      - Velvia/VIVID
+      - ASTIA/SOFT
+      - CLASSIC CHROME
+      - PRO Neg. Hi
+      - PRO Neg. Std
+      - ACROS
+      - ACROS+Ye
+      - ACROS+R
+      - ACROS+G
+      - MONOCHROME
+      - MONOCHROME+Ye
+      - MONOCHROME+R
+      - MONOCHROME+G
+      - SEPIA
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > FILM SIMULATION (menu_shooting/image_quality_setting)
+    notes: ACROS and MONOCHROME are documented with yellow (Ye), red (R) and green (G) filter variants in a footnote.
+  - key: jpeg_quality
+    label: IMAGE QUALITY
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - FINE
+      - NORMAL
+      - RAW
+      - FINE+RAW
+      - NORMAL+RAW
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > IMAGE QUALITY (menu_shooting/image_quality_setting)
+  - key: raw_capture
+    label: RAW RECORDING
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - UNCOMPRESSED
+      - LOSSLESS COMPRESSED
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > RAW RECORDING (menu_shooting/image_quality_setting)
+  - key: heif_capture
+    label: HEIF
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > IMAGE QUALITY (menu_shooting/image_quality_setting)
+    notes: No HEIF option appears in the documented image-quality formats.
+  - key: in_camera_raw_conversion
+    label: RAW CONVERSION
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: xt20-manual
+      locator: PLAY BACK MENU > RAW CONVERSION (playback/menu_playback)
+  - key: jpeg_color_spaces
+    label: COLOR SPACE
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - Adobe RGB
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > COLOR SPACE (menu_shooting/image_quality_setting)
+  - key: white_balance_presets
+    label: WHITE BALANCE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - CUSTOM 1
+      - CUSTOM 2
+      - CUSTOM 3
+      - COLOR TEMPERATURE
+      - DAYLIGHT
+      - SHADE
+      - FLUORESCENT LIGHT-1
+      - FLUORESCENT LIGHT-2
+      - FLUORESCENT LIGHT-3
+      - INCANDESCENT
+      - UNDERWATER
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > WHITE BALANCE (menu_shooting/image_quality_setting)
+  - key: white_balance_shift
+    label: WB SHIFT
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: R
+      - label: B
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > WHITE BALANCE > Fine-Tuning White Balance (menu_shooting/image_quality_setting)
+    notes: Two-axis fine-tuning dialog; the rendered dialog figure shows the grid and current R/B values without numeric limits.
+  - key: dynamic_range
+    label: DYNAMIC RANGE
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - 100%
+      - 200%
+      - 400%
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > DYNAMIC RANGE (menu_shooting/image_quality_setting)
+    notes: 200% requires ISO 400 or above; 400% requires ISO 800 or above. AUTO selects 100% or 200%.
+  - key: highlight_tone
+    label: HIGHLIGHT TONE
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -2
+      max: 4
+      step: 1
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > HIGHLIGHT TONE and SHADOW TONE (menu_shooting/image_quality_setting)
+  - key: shadow_tone
+    label: SHADOW TONE
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -2
+      max: 4
+      step: 1
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > HIGHLIGHT TONE and SHADOW TONE (menu_shooting/image_quality_setting)
+  - key: saturation
+    label: COLOR
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > COLOR (menu_shooting/image_quality_setting)
+  - key: sharpening
+    label: SHARPNESS
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > SHARPNESS (menu_shooting/image_quality_setting)
+  - key: noise_reduction
+    label: NOISE REDUCTION
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: -4
+      max: 4
+      step: 1
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > NOISE REDUCTION (menu_shooting/image_quality_setting)
+  - key: grain
+    label: GRAIN EFFECT
+    category: spatial
+    availability: available
+    domain:
+      type: enum
+      values:
+      - STRONG
+      - WEAK
+      - 'OFF'
+    citations:
+    - source: xt20-manual
+      locator: IMAGE QUALITY SETTING > GRAIN EFFECT (menu_shooting/image_quality_setting)
+  - key: film_simulation_bracket
+    label: FILM SIMULATION BKT
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: xt20-manual
+      locator: Bracketing > FILM SIMULATION BKT (taking_photo/bracketing)
+  notes:
+  - Firmware notes through Ver. 2.11 list no additional film simulations or rendering controls.

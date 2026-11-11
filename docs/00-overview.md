@@ -12,15 +12,17 @@ Existing tools each cover part of this. darktable-lut-generator fits a LUT from 
 
 ## Goals
 
-- **G1: Camera-independent looks.** A Look is a function from white-balanced *scene* colorimetry to display *appearance*, estimated from RAW+JPEG pairs and separated from each body's sensor/profile by explicit per-body input transforms.
+- **G1: Camera-independent looks.** One canonical native-family Look maps white-balanced *scene* colorimetry to display *appearance*. Camera-specific calibration and realization models map sensor data and controls to that target; independently fitted camera diagnostics are not competing canonical Looks.
 - **G2: Explainable comparison.** Differences are decomposed into tone, neutral-axis tint, per-hue chroma gain, per-hue hue rotation, per-hue lightness shift and a residual. Every number comes with uncertainty.
 - **G3: Actionable matching.**
   - Stock firmware: the best achievable control settings, predicted error by region, and a list of what can't be reached.
-  - Loadable firmware: an exact artifact baked for that firmware's declared interface.
+  - Loadable firmware: a body-agnostic target card that the firmware translates into its own pipeline ([04 §8](04-matching-and-export.md#8-firmware-card-format)).
 - **G4: Crowdsourced and robust.** Many contributors and many bodies improve targets over time. The system resists honest mistakes and deliberate poisoning.
 - **G5: Private by construction.** No pixels leave the user's browser. Only shuffled, coordinate-free color samples and whitelisted metadata do, under a pseudonymous credential (no accounts, email or stored IPs). Uploads are still pseudonymous personal data, because someone holding the original photo could match them; see [06](06-privacy-and-payload.md).
 - **G6: Low barrier to contributing.** Dropping in a folder of existing RAW+JPEG pairs is a valid contribution. More rigor (re-renders, phone pattern, color chart) is optional and raises weight.
 - **G7: Rust end to end.** Backend, frontend (WASM) and the color/fit core. Python is allowed only for dev-time golden-vector generation.
+
+Broad contribution intake and safe experimental results are not restricted to the milestone reference camera. A measured capability is qualified only for its named body/epoch/sim, target version, settings and observed domain; preparation availability, mapping confirmation, numerical validity, publication eligibility and rooted trust remain separate ([03 §1](03-data-model.md#1-entities), [05 §8](05-trust-and-integrity.md#8-release-gates-and-rollback)). The reference-body baseline and cross-body-qualified release have distinct requirements ([09](09-roadmap.md)).
 
 ## Non-goals (for now)
 
@@ -37,10 +39,10 @@ Existing tools each cover part of this. darktable-lut-generator fits a LUT from 
 | **Firmware version / Epoch** | Firmware versions are grouped into **epochs**. Within an epoch, the control schema and sim behavior are assumed identical. Epochs split at breaking changes. |
 | **Control schema** | Versioned definition of a body/epoch's look-related controls: names, ranges, steps, dependencies, makernote mappings. |
 | **Native sim** | A look built into a body's firmware (e.g. Classic Chrome on X-T5, epoch 2). |
-| **Look** | A target: function from adapted scene colorimetry to CAM16-UCS appearance. Versioned. Kinds: `native_family` (defined by native sims across bodies), `lut_defined` (defined by an uploaded LUT plus its declared encodings and base rendering; it may emulate a camera rendering or a film stock, and a camera-rendering emulation is superseded once the native Look is published). |
+| **Look** | A versioned canonical target from adapted scene colorimetry to CAM16-UCS appearance. Kinds: `native_family` (one shared target estimated from an explicit native-evidence cohort), `lut_defined` (defined by an uploaded LUT plus its declared encodings and base rendering; it may emulate a camera rendering or a film stock, and a camera-rendering emulation is superseded once the native Look is published). |
 | **Declared encoding** | What a submitted LUT consumes and emits: a scene-referred log (transfer + gamut), or a display-referred image with a pinned base rendering; plus the output encoding. |
 | **Base rendering** | For a display-referred LUT, the published Look version (`look@version`) or body realization that maps scene colorimetry to the image the LUT expects. Pinned and frozen into the layered approximation. |
-| **Realization** | A Look as produced by a specific body + native sim + settings. |
+| **Realization** | A Look as produced by a specific body + epoch + native sim + settings. Its camera-model revision pins a target version, calibration and control-response artifacts; it does not redefine the target. |
 | **Input transform** | Per-body map from linear camera RGB (white-balanced) to scene XYZ. Initialized from published matrices, refined by the crowd and anchored by charts or spectral data. |
 | **Recipe** | Settings on a body that *attempt* a look not native to it (or a different one). Measured, never used to define the target. |
 | **Probe set** | Fixed, versioned set of synthetic scene colors on which looks are evaluated and compared. |
@@ -55,6 +57,8 @@ Existing tools each cover part of this. darktable-lut-generator fits a LUT from 
 | **Interface profile** | Declaration of what a software pipeline (raw developer, editor) can load and where in its pipeline it applies it. |
 | **Card file** | The body-agnostic file (`card.llk`) that hacked camera firmware loads and translates into its own pipeline ([04 §8](04-matching-and-export.md)). |
 | **Bounty** | A public request for specific data, generated where the system's uncertainty most affects users. |
+| **Qualification** | A versioned assessment of an immutable target/realization and evidence snapshot for a named capability and measured domain. It does not grant trust or verify unobserved settings. |
+| **Cohort** | Explicit native evidence admitted to a shared-target fit under trust, calibration and domain eligibility. Membership changes preserve target identity and gauge/anchor history. |
 
 ## Core principles
 
@@ -65,3 +69,7 @@ Existing tools each cover part of this. darktable-lut-generator fits a LUT from 
 5. **Recipes never define targets.** Recipe data may refine body input transforms and control-response models, and drives bounties. It never feeds any Look's coefficients.
 6. **Nothing spatial leaves the client.** Alignment and masking happen locally. Uploaded samples are coordinate-free and shuffled.
 7. **Test the central premise early.** G1 assumes one sim behaves the same across sensors once input transforms are accounted for. A two-body spike (P1.9) tests this right after the single-body milestone.
+8. **Broad availability, scoped claims.** Any supported camera may contribute and seed a new family's provisional target under existing policy. A publishable experimental realization is usable without claiming every camera or setting is verified.
+9. **Qualification advances mechanically.** The common worker assesses independent evidence, promotes eligible revisions, invalidates affected claims and requests missing shots. New bodies require data/resources, not camera-specific fitting code or routine moderator promotion.
+
+The [qualification implementation plan](model-qualification-plan.md) records the integration rationale and acceptance cases; the linked canonical sections own the contracts.

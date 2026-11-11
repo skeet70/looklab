@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use looklab_match::{
-    ConfidenceLevel, DeltaStats, MatchOutcome, SettingsCard, Suggestion, UnreachableRegion,
+    AssessmentStatus, ConfidenceLevel, DeltaStats, MatchOutcome, OutputContext, ReachabilityStatus,
+    ScoringMetric, SettingsCard, SettingsSupport, Suggestion,
 };
 use looklab_model::file::{LookVersion, Slug};
 use looklab_model::realization::Settings;
@@ -18,11 +19,26 @@ pub struct CardEntryDto {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UnreachableDto {
+pub struct MissedDto {
     pub region: String,
     pub layer: String,
     pub remaining_delta_e: f64,
     pub probes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReachabilityDto {
+    pub witness: Settings,
+    pub tolerance: f64,
+    pub declared: usize,
+    pub evaluated: usize,
+    pub assessed: usize,
+    pub within_tolerance: usize,
+    pub within_assessed: usize,
+    pub settings: SettingsSupport,
+    pub domain_assessed: bool,
+    pub uncertainty: AssessmentStatus,
+    pub status: ReachabilityStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -34,7 +50,11 @@ pub struct CardDto {
     pub p95_delta_e: f64,
     pub sigma_band: Option<f64>,
     pub residual_summary: String,
-    pub unreachable: Vec<UnreachableDto>,
+    pub missed: Vec<MissedDto>,
+    pub reachability: ReachabilityDto,
+    pub joint_uncertainty: AssessmentStatus,
+    pub metric: ScoringMetric,
+    pub output: Option<OutputContext>,
     pub confidence: ConfidenceDto,
     pub confidence_reason: String,
 }
@@ -77,19 +97,31 @@ impl CardDto {
             p95_delta_e: card.p95_delta_e,
             sigma_band: card.sigma_band,
             residual_summary: card.residual_summary.clone(),
-            unreachable: card
-                .unreachable
-                .iter()
-                .map(UnreachableDto::from_region)
-                .collect(),
+            missed: card.missed.iter().map(MissedDto::from_region).collect(),
+            reachability: ReachabilityDto {
+                witness: card.reachability.witness.clone(),
+                tolerance: card.reachability.tolerance,
+                declared: card.reachability.declared,
+                evaluated: card.reachability.evaluated,
+                assessed: card.reachability.assessed,
+                within_tolerance: card.reachability.within_tolerance,
+                within_assessed: card.reachability.within_assessed,
+                settings: card.reachability.settings,
+                domain_assessed: card.reachability.domain_assessed,
+                uncertainty: card.reachability.uncertainty,
+                status: card.reachability.status,
+            },
+            joint_uncertainty: card.joint_uncertainty,
+            metric: card.metric,
+            output: card.output,
             confidence: level_value(card.confidence.level),
             confidence_reason: card.confidence.reason.clone(),
         }
     }
 }
 
-impl UnreachableDto {
-    fn from_region(region: &UnreachableRegion) -> Self {
+impl MissedDto {
+    fn from_region(region: &looklab_match::MissedRegion) -> Self {
         Self {
             region: region.region.clone(),
             layer: region.layer.clone(),
@@ -115,7 +147,9 @@ pub struct SuggestionDto {
     pub median_delta_e: f64,
     pub p95_delta_e: f64,
     pub max_delta_e: f64,
-    pub sigma_band: f64,
+    pub sigma_band: Option<f64>,
+    pub metric: ScoringMetric,
+    pub output: Option<OutputContext>,
 }
 
 impl SuggestionDto {
@@ -128,6 +162,8 @@ impl SuggestionDto {
             p95_delta_e: suggestion.p95_delta_e,
             max_delta_e: suggestion.max_delta_e,
             sigma_band: suggestion.sigma_band,
+            metric: suggestion.metric,
+            output: suggestion.output,
         }
     }
 }
@@ -163,6 +199,8 @@ pub struct DeltaStatsDto {
     pub median: f64,
     pub p95: f64,
     pub max: f64,
+    pub metric: ScoringMetric,
+    pub status: AssessmentStatus,
 }
 
 impl DeltaStatsDto {
@@ -172,6 +210,8 @@ impl DeltaStatsDto {
             median: stats.median,
             p95: stats.p95,
             max: stats.max,
+            metric: stats.metric,
+            status: stats.status,
         }
     }
 }
@@ -187,6 +227,7 @@ pub struct MatchReply {
     pub epoch_map_version: u32,
     pub crm_version: u32,
     pub permalink: String,
+    pub selection: Option<looklab_match::SelectionContext>,
     pub card: CardDto,
     pub results: Vec<SuggestionDto>,
     pub stats: StatsDto,

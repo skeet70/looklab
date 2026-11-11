@@ -1,0 +1,291 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: olympus/e-m1
+  make: Olympus
+  model: OM-D E-M1
+  sources:
+  - id: olympus-e-m1-manual
+    kind: owner_manual
+    url: https://download.omsystem.com/pages/inst/em1/manual_em1_v4_ENU.pdf
+    title: OM-D E-M1 Instruction Manual
+    edition: ENU v4.0
+    firmware_scope: '4.0'
+  capabilities:
+  - key: clarity
+    label: Clarity
+    category: spatial
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: color_chrome
+    label: Color Chrome
+    category: unknown
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: color_temperature
+    label: Custom WB (CWB)
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: 2000
+      max: 14000
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 58
+  - key: contrast
+    label: Contrast
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 80
+  - key: creative_filters
+    label: Art Filter
+    category: mixed
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Pop Art
+      - Soft Focus
+      - Pale&Light Color
+      - Light Tone
+      - Grainy Film
+      - Pin Hole
+      - Diorama
+      - Cross Process
+      - Gentle Sepia
+      - Dramatic Tone
+      - Key Line
+      - Watercolor
+      - Vintage
+      - Partial Color
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 70
+  - key: dynamic_range
+    label: Gradation
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Auto
+      - Normal
+      - High Key
+      - Low Key
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 80
+  - key: exposure_compensation
+    label: Exposure compensation
+    category: rendering
+    availability: available
+    domain:
+      type: rational
+      min: '-5.0'
+      max: '+5.0'
+      steps:
+      - 1/3
+      - 1/2
+      - '1'
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 152
+  - key: grain
+    label: Grain
+    category: spatial
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: heif_capture
+    label: HEIF
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+  - key: highlight_tone
+    label: Highlight&Shadow Control
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 51
+  - key: in_camera_raw_conversion
+    label: RAW Data Edit
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 88
+  - key: jpeg_capture
+    label: JPEG
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 72
+  - key: jpeg_color_spaces
+    label: Color Space
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - AdobeRGB
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 98
+    - source: olympus-e-m1-manual
+      locator: p. 99
+  - key: jpeg_quality
+    label: Compression ratio
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - SF
+      - F
+      - N
+      - B
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 72
+  - key: monochrome_toning
+    label: Pict. Tone (Monotone)
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - N:Neutral
+      - S:Sepia
+      - B:Blue
+      - P:Purple
+      - G:Green
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 81
+  - key: native_simulations
+    label: Picture Mode
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - i-Enhance
+      - Vivid
+      - Natural
+      - Muted
+      - Portrait
+      - Monotone
+      - Custom
+      - e-Portrait
+      - Color Creator
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 70
+  - key: noise_reduction
+    label: Noise Filter
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 97
+  - key: raw_capture
+    label: RAW
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 72
+  - key: raw_jpeg_simultaneous
+    label: RAW+JPEG
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 72
+  - key: saturation
+    label: Saturation
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 80
+  - key: shadow_tone
+    label: Highlight&Shadow Control
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 51
+  - key: sharpening
+    label: Sharpness
+    category: spatial
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 80
+  - key: white_balance_presets
+    label: WB
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - 5 (5300K)
+      - N (7500K)
+      - O (6000K)
+      - 1 (3000K)
+      - '> (4000K)'
+      - U (Underwater)
+      - n (5500K)
+      - P/Q/W/X (One-touch)
+      - CWB
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 58
+  - key: white_balance_shift
+    label: WB Compensation
+    category: rendering
+    availability: available
+    domain:
+      type: axes
+      axes:
+      - label: A – B (Amber – Blue)
+      - label: G – M (Green – Magenta)
+    citations:
+    - source: olympus-e-m1-manual
+      locator: p. 83
+    - source: olympus-e-m1-manual
+      locator: p. 98
+  notes:
+  - Color Space is locked to sRGB when Picture Mode is ART (p. 89). Long-exposure Noise Reduction (Auto/On/Off) is a separate custom-menu item (p. 96). Noise Filter option levels are not enumerated in the manual text.

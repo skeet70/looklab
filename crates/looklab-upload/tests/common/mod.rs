@@ -8,8 +8,8 @@ use looklab_samples::{
 use looklab_upload::{
     BatchManifest, BlobKind, BodyId, CommunitySnapshotVersion, ContributionKind, ControlEntry,
     ControlKey, ControlSettings, EnvelopeParts, FirmwareVersionString, Intent, Limits,
-    ManifestImage, ManifestMetadata, Nonce, PowSolutions, RawSerial, SimKey, StepIndex,
-    WebAuthnAssertion, encode_envelope,
+    ManifestImage, ManifestMetadata, Nonce, PowSolutions, RawSerial, RenderClass, SendManifest,
+    SimKey, StepIndex, WebAuthnAssertion, encode_envelope, manifest_hash,
 };
 use sha2::{Digest, Sha256};
 
@@ -91,6 +91,8 @@ pub fn manifest(images: Vec<ManifestImage>) -> BatchManifest {
     BatchManifest {
         kind: ContributionKind::Library,
         intent: Intent::Native,
+        render_class: RenderClass::Colour,
+        monochrome_authorization: None,
         body: BodyId::new("fujifilm/x-t5").expect("fixture body id"),
         firmware_version: FirmwareVersionString::new("2.10").expect("fixture firmware"),
         sim_key: SimKey::new("classic_chrome").expect("fixture sim key"),
@@ -145,24 +147,28 @@ impl Fixture {
         }
     }
 
-    pub fn parts(&self) -> EnvelopeParts<'_> {
-        EnvelopeParts {
+    fn send_manifest(&self) -> SendManifest {
+        SendManifest::canonical(vec![manifest_hash(&self.manifest)]).expect("send manifest")
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        let send_manifest = self.send_manifest();
+        encode_envelope(&EnvelopeParts {
             nonce: self.nonce,
+            send_manifest: &send_manifest,
             manifest: &self.manifest,
             assertion: &self.assertion,
             pow: &self.pow,
             serial: self.serial.as_ref(),
             blobs: &self.blobs,
-        }
-    }
-
-    pub fn bytes(&self) -> Vec<u8> {
-        encode_envelope(&self.parts())
+        })
     }
 
     pub fn offsets(&self) -> Offsets {
+        let send_len = looklab_upload::canonical_send_manifest_bytes(&self.send_manifest()).len();
         let manifest_len = looklab_upload::canonical_manifest_bytes(&self.manifest).len();
-        let mut cursor = 44 + manifest_len;
+        let manifest_len_offset = 44 + send_len;
+        let mut cursor = manifest_len_offset + 4 + manifest_len;
         let credential_len = cursor;
         cursor += 1;
         let credential = cursor;
@@ -186,8 +192,10 @@ impl Fixture {
         Offsets {
             version: 6,
             nonce: 8,
-            manifest_len: 40,
-            manifest: 44,
+            send_manifest_len: 40,
+            send_manifest: 44,
+            manifest_len: manifest_len_offset,
+            manifest: manifest_len_offset + 4,
             credential_len,
             credential,
             authenticator_len,
@@ -215,6 +223,8 @@ impl Default for Fixture {
 pub struct Offsets {
     pub version: usize,
     pub nonce: usize,
+    pub send_manifest_len: usize,
+    pub send_manifest: usize,
     pub manifest_len: usize,
     pub manifest: usize,
     pub credential_len: usize,
@@ -232,6 +242,9 @@ pub fn images_count_offset(manifest: &BatchManifest) -> usize {
     let parts = [
         postcard::to_allocvec(&manifest.kind).expect("kind serializes"),
         postcard::to_allocvec(&manifest.intent).expect("intent serializes"),
+        postcard::to_allocvec(&manifest.render_class).expect("render class serializes"),
+        postcard::to_allocvec(&manifest.monochrome_authorization)
+            .expect("authorization serializes"),
         postcard::to_allocvec(&manifest.body).expect("body serializes"),
         postcard::to_allocvec(&manifest.firmware_version).expect("firmware serializes"),
         postcard::to_allocvec(&manifest.sim_key).expect("sim key serializes"),
@@ -248,5 +261,7 @@ pub fn compact_limits() -> Limits {
         max_manifest_bytes: 1 << 16,
         max_images: 8,
         max_blob_bytes: 1 << 16,
+        max_batches: 8,
+        max_attestations: 8,
     }
 }

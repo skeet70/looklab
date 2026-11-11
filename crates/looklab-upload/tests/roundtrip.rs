@@ -4,8 +4,8 @@ mod common;
 use common::{Fixture, compact_limits, image, manifest};
 use looklab_upload::{
     BatchManifest, BlobKind, EnvelopeParts, Limits, ManifestImage, Nonce, PowSolutions, RawSerial,
-    WebAuthnAssertion, canonical_manifest_bytes, encode_envelope, parse_envelope_strict,
-    peek_nonce,
+    SendManifest, WebAuthnAssertion, canonical_manifest_bytes, encode_envelope,
+    parse_envelope_strict, peek_nonce,
 };
 use proptest::prelude::*;
 
@@ -32,11 +32,12 @@ fn envelope_roundtrips() {
     );
     assert_eq!(
         parsed.challenge(),
-        looklab_upload::Challenge::new(&fixture.nonce, &parsed.manifest_hash())
+        looklab_upload::Challenge::for_send(&fixture.nonce, &parsed.send_manifest_hash)
     );
 
     let reencoded = encode_envelope(&EnvelopeParts {
         nonce: parsed.nonce,
+        send_manifest: &parsed.send_manifest,
         manifest: &parsed.manifest,
         assertion: &parsed.assertion,
         pow: &parsed.pow,
@@ -56,6 +57,7 @@ fn envelope_roundtrips_with_serial() {
 
     let reencoded = encode_envelope(&EnvelopeParts {
         nonce: parsed.nonce,
+        send_manifest: &parsed.send_manifest,
         manifest: &parsed.manifest,
         assertion: &parsed.assertion,
         pow: &parsed.pow,
@@ -97,6 +99,8 @@ fn limits_are_overridable() {
         max_manifest_bytes: usize::MAX,
         max_images: 100,
         max_blob_bytes: 1 << 20,
+        max_batches: 8,
+        max_attestations: 8,
     };
     assert!(parse_envelope_strict(&bytes, &limits).is_ok());
 }
@@ -202,6 +206,7 @@ fn arb_nonce() -> impl Strategy<Value = Nonce> {
 #[derive(Debug)]
 struct Generated {
     nonce: Nonce,
+    send_manifest: SendManifest,
     manifest: BatchManifest,
     assertion: WebAuthnAssertion,
     pow: PowSolutions,
@@ -220,6 +225,7 @@ impl Generated {
         let serial = self.serial();
         encode_envelope(&EnvelopeParts {
             nonce: self.nonce,
+            send_manifest: &self.send_manifest,
             manifest: &self.manifest,
             assertion: &self.assertion,
             pow: &self.pow,
@@ -237,16 +243,20 @@ fn arb_envelope() -> impl Strategy<Value = Generated> {
         arb_pow(),
         arb_serial(),
     )
-        .prop_map(
-            |((manifest, blobs), nonce, assertion, pow, serial)| Generated {
+        .prop_map(|((manifest, blobs), nonce, assertion, pow, serial)| {
+            let send_manifest =
+                SendManifest::canonical(vec![looklab_upload::manifest_hash(&manifest)])
+                    .expect("send manifest");
+            Generated {
                 nonce,
+                send_manifest,
                 manifest,
                 assertion,
                 pow,
                 serial,
                 blobs,
-            },
-        )
+            }
+        })
 }
 
 proptest! {
@@ -271,6 +281,7 @@ proptest! {
         prop_assert_eq!(parsed.serial.is_some(), generated.serial.is_some());
         let reencoded = encode_envelope(&EnvelopeParts {
             nonce: parsed.nonce,
+            send_manifest: &parsed.send_manifest,
             manifest: &parsed.manifest,
             assertion: &parsed.assertion,
             pow: &parsed.pow,

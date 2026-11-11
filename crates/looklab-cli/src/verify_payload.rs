@@ -5,6 +5,7 @@
 //! The flow is [docs/06 §5](../../../docs/06-privacy-and-payload.md) steps 1-4.
 //! Nothing the site served beyond the HAR itself is consulted, and no keys.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -18,18 +19,23 @@ use looklab_prep_module::{
     PrepareRequest, PrepareResponse, PriorTransformSpec, Response, VersionResponse,
 };
 use looklab_schema::{
-    Epoch, MakernoteValues, MappingError, SettingSource, SimKey, monochrome_sim,
-    settings_from_makernote_partial, sim_from_makernote,
+    ConfirmationScope as SchemaConfirmationScope, Finding as SchemaFinding, LookId,
+    MAX_CONFIRMATION_BYTES, MakernoteValues, ManualCatalog, MappingError, MonoFilter,
+    RenderClass as SchemaRenderClass, SettingSource, Sha256Hex, SimKey, applicable_controls,
+    classify_card_render, classify_render, merge_manual_catalogs, settings_from_makernote_for,
+    sim_from_makernote, validate_manual_catalog,
 };
 use looklab_server::body_schema::{Bodies, BodyRecord, resolve_epoch, validate_settings};
 use looklab_server::{RequestDomain, StatusToken, request_digest};
 use looklab_upload::{
     BatchManifest, BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion,
-    ContributionKind, ControlEntry, ControlKey, ControlSettings, Envelope, EnvelopeParts,
-    ExpectedAssertion, FirmwareId, FirmwareVersion, FirmwareVersionString, Intent, Limits,
-    LookSlug, ManifestImage, ManifestMetadata, Nonce, PowParams, RawSerial as UploadSerial,
-    SignatureAlgorithm, StepIndex, StructuralVerdict, TopOriginReview, WebAuthnAssertion,
-    check_structure, encode_envelope, parse_envelope_strict, verify as verify_pow,
+    ContributionKind, ControlEntry, ControlKey, ControlSettings, DEFAULT_MAX_ATTESTATIONS,
+    DEFAULT_MAX_BATCHES, Envelope, EnvelopeParts, ExpectedAssertion, FirmwareId, FirmwareVersion,
+    FirmwareVersionString, Intent, Limits, LookSlug, ManifestHash, ManifestImage, ManifestMetadata,
+    ManualWithdrawalRequest, MonochromeAuthorization, Nonce, PowParams, RawSerial as UploadSerial,
+    RenderClass, SendManifest, SignatureAlgorithm, StepIndex, StructuralVerdict, TopOriginReview,
+    WebAuthnAssertion, canonical_send_manifest_bytes, check_structure, encode_envelope,
+    parse_envelope_strict, send_manifest_hash, verify as verify_pow,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -37,6 +43,8 @@ use wasmtime::{Engine, Instance, Module, Store};
 
 const STATE_FORMAT: &str = "looklab-verify-state/1";
 const UPLOAD_PATH: &str = "/api/upload";
+const MANUAL_CONFIRMATION_PATH: &str = "/api/manual-confirmations";
+const MANUAL_WITHDRAWAL_PATH: &str = "/api/manual-confirmations/withdraw";
 const NONCE_PATH: &str = "/api/nonce";
 const SESSION_PATH: &str = "/api/session";
 const REGISTER_START_PATH: &str = "/api/passkey/register/start";
@@ -49,7 +57,7 @@ const FILM_MODE_TAG: &str = "FilmMode";
 const RESIDUAL_CHANNELS: &[&str] = &[
     "Residual channels (documented, not closed):",
     "- a client can choose which valid proof-of-work solutions it sends, leaking a few bits per batch at exponentially more work;",
-    "- the signature itself: a site that forges keys can choose signature bytes freely (tens to hundreds of bytes per batch, depending on algorithm);",
+    "- the signature itself: one signature per send, because every batch must carry the same assertion; a site that forges keys can choose its bytes freely (tens to hundreds of bytes per send, depending on algorithm);",
     "- the credential ID chosen at passkey registration: a forged-key site picks it once (≤ 255 bytes, a one-time leak; it's then fixed by the identical-ID check);",
     "- timing.",
 ];
@@ -82,11 +90,26 @@ pub enum DeclaredIntent {
     Card,
 }
 
+/// The explicit contribution authorization the upload's monochrome batches carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DeclaredAuthorization {
+    #[value(name = "model-development-180-days")]
+    ModelDevelopment180Days,
+}
+
+impl From<DeclaredAuthorization> for MonochromeAuthorization {
+    fn from(value: DeclaredAuthorization) -> Self {
+        match value {
+            DeclaredAuthorization::ModelDevelopment180Days => Self::ModelDevelopment180Days,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct VerifyPayloadArgs {
     /// The local seed file exported by the client. SENSITIVE: it reveals sampling order.
     #[arg(long, value_name = "FILE")]
-    pub seeds: PathBuf,
+    pub seeds: Option<PathBuf>,
     /// HAR files exported from the browser request log; repeat for several sessions.
     #[arg(long = "har", value_name = "FILE", required = true)]
     pub har: Vec<PathBuf>,
@@ -118,6 +141,13 @@ pub struct VerifyPayloadArgs {
     /// A control value you entered by hand, as `key=step`. Repeat for each.
     #[arg(long = "declare-setting", value_name = "KEY=STEP")]
     pub declare_setting: Vec<String>,
+    /// The contributor's explicit monochrome model-development authorization; required for monochrome batches.
+    #[arg(
+        long = "monochrome-authorization",
+        value_enum,
+        value_name = "AUTHORIZATION"
+    )]
+    pub monochrome_authorization: Option<DeclaredAuthorization>,
     /// Where the credential id is recorded between runs. Defaults to
     /// `$XDG_STATE_HOME/looklab/verify.json`, else `~/.local/state/looklab/verify.json`.
     #[arg(long, value_name = "FILE")]
@@ -132,7 +162,7 @@ pub struct VerifyPayloadArgs {
     #[arg(long = "pow-difficulty", value_name = "BITS")]
     pub pow_difficulty: Option<f64>,
     /// The RAW and JPEG files that went into the upload, each RAW before its JPEGs.
-    #[arg(value_name = "FILES", required = true)]
+    #[arg(value_name = "FILES")]
     pub files: Vec<PathBuf>,
 }
 
@@ -236,12 +266,48 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         .map(|path| Ok((path.clone(), Har::load(path)?)))
         .collect::<Result<_>>()?;
 
-    let seeds_text = std::fs::read_to_string(&args.seeds)
-        .with_context(|| format!("reading {}", args.seeds.display()))?;
-    let seeds = SeedFile::from_json(&seeds_text)
-        .with_context(|| format!("parsing {}", args.seeds.display()))?;
+    let has_uploads = hars.iter().any(|(_, har)| {
+        har.log
+            .entries
+            .iter()
+            .any(|entry| classify(&entry.request, &origin) == RequestClass::Upload)
+    });
+    let has_withdrawals = hars.iter().any(|(_, har)| {
+        har.log
+            .entries
+            .iter()
+            .any(|entry| classify(&entry.request, &origin) == RequestClass::ManualWithdrawal)
+    });
+    let manuals = if has_withdrawals {
+        Some(load_manual_catalog(&args.data)?)
+    } else {
+        None
+    };
+
+    let seeds = match args.seeds.as_deref() {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            Some(
+                SeedFile::from_json(&text)
+                    .with_context(|| format!("parsing {}", path.display()))?,
+            )
+        }
+        None if has_uploads => bail!("--seeds is required when the HAR contains an upload"),
+        None => None,
+    };
     let module = ModuleHost::open(&args.module)?;
-    let groups = load_groups(&args.files)?;
+    let groups = if has_uploads {
+        if args.files.is_empty() {
+            bail!("RAW and JPEG files are required when the HAR contains an upload");
+        }
+        load_groups(&args.files)?
+    } else {
+        if !args.files.is_empty() {
+            bail!("RAW and JPEG files were supplied but the HAR contains no upload to cover");
+        }
+        Vec::new()
+    };
     let state_path = state_path(args.state.as_deref())?;
     let mut state = VerifyState::load(&state_path)?;
 
@@ -256,11 +322,14 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         version.prep_version,
         hex(&version.build_id)
     ));
-    findings.note(format!(
-        "seeds: {} (prior-transform version {})",
-        args.seeds.display(),
-        seeds.prior_transform_version().get()
-    ));
+    findings.note(match (&args.seeds, &seeds) {
+        (Some(path), Some(seeds)) => format!(
+            "seeds: {} (prior-transform version {})",
+            path.display(),
+            seeds.prior_transform_version().get()
+        ),
+        _ => "seeds: none".to_owned(),
+    });
     findings.note(format!("state: {}", state_path.display()));
     findings.note(format!(
         "files: {} in {} group(s)",
@@ -275,7 +344,10 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         .collect();
 
     let snapshot = manifest_snapshot_version(&hars, &origin, &mut findings);
-    let reproduced = reproduce(&groups, &seeds, &module, &bodies, snapshot, &mut findings);
+    let reproduced = match &seeds {
+        Some(seeds) if has_uploads => reproduce(&groups, seeds, &module, &mut findings),
+        _ => Vec::new(),
+    };
     let card_firmware = args
         .firmware
         .as_deref()
@@ -295,10 +367,15 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
         intent,
         card_firmware,
         declarations: &declarations,
+        declaration_use: RefCell::new(BTreeSet::new()),
+        monochrome_authorization: args.monochrome_authorization.map(Into::into),
+        manuals: manuals.as_ref(),
     };
 
     let mut credentials: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut covered = vec![false; reproduced.len()];
+    let mut covered = vec![0usize; reproduced.len()];
+    let mut parsed: Vec<ParsedUpload> = Vec::new();
+    let mut parsed_confirmations: Vec<ParsedConfirmation> = Vec::new();
     for (path, har) in &hars {
         findings.note("");
         findings.note(format!(
@@ -307,6 +384,8 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
             har.log.entries.len()
         ));
         let mut uploads = Vec::new();
+        let mut confirmations = Vec::new();
+        let mut withdrawals = 0usize;
         for entry in &har.log.entries {
             let class = classify(&entry.request, &origin);
             let marker = match class {
@@ -325,41 +404,102 @@ fn verify(args: &VerifyPayloadArgs) -> Result<Findings> {
                     entry.request.url
                 )),
                 RequestClass::Upload => uploads.push(entry),
+                RequestClass::ManualConfirmation => confirmations.push(entry),
+                RequestClass::ManualWithdrawal => withdrawals += 1,
                 _ => {}
             }
             if UrlParts::parse(&entry.request.url).is_some_and(|parts| parts.origin() == origin.0) {
-                audit_request(&entry.request, class, &service, &mut findings);
+                audit_request(
+                    &entry.request,
+                    class,
+                    &service,
+                    &mut findings,
+                    &mut credentials,
+                );
                 if class == RequestClass::SessionStatus {
                     audit_session_status(&entry.request, har, &origin, &mut findings);
                 }
             }
         }
-        if uploads.is_empty() {
+        if uploads.is_empty() && confirmations.is_empty() && withdrawals == 0 {
             findings.fail(format!(
-                "{} has no POST {UPLOAD_PATH} request",
+                "{} has no POST {UPLOAD_PATH}, {MANUAL_CONFIRMATION_PATH} or {MANUAL_WITHDRAWAL_PATH} request",
                 path.display()
             ));
         }
         for (index, entry) in uploads.iter().enumerate() {
-            let label = format!("upload {} of {}", index + 1, file_name(path));
             findings.note("");
-            findings.note(label.clone());
-            if let Some(upload) = verify_upload(&entry.request, &service, &mut findings) {
-                for image in upload.images {
-                    covered[image] = true;
-                }
-                credentials.push((label, upload.credential));
+            findings.note(format!("upload {} of {}", index + 1, file_name(path)));
+            if let Some(upload) = parse_upload(&entry.request, &mut findings) {
+                parsed.push(upload);
+            }
+        }
+        for entry in confirmations {
+            if let Some(confirmation) = parse_confirmation(&entry.request, &mut findings) {
+                parsed_confirmations.push(confirmation);
             }
         }
     }
 
-    if findings.failures.is_empty() {
-        for (index, named) in covered.iter().enumerate() {
-            if !named {
-                findings.fail(format!(
+    let mut sends: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
+    for (index, upload) in parsed.iter().enumerate() {
+        sends
+            .entry(*upload.envelope.nonce.as_bytes())
+            .or_default()
+            .push(index);
+    }
+    for (nonce, indices) in &sends {
+        let label = format!("send {}", hex(&nonce[..4]));
+        findings.note("");
+        findings.note(format!("{label}: {} batch(es)", indices.len()));
+        verify_send(
+            &parsed,
+            indices,
+            &service,
+            &label,
+            &mut findings,
+            &mut covered,
+            &mut credentials,
+        );
+    }
+    verify_confirmations(
+        &parsed,
+        &sends,
+        &parsed_confirmations,
+        &service,
+        &mut findings,
+        &mut credentials,
+    );
+
+    if service.monochrome_authorization.is_some()
+        && !parsed
+            .iter()
+            .any(|upload| upload.envelope.manifest.render_class == RenderClass::Monochrome)
+    {
+        findings.fail(
+            "--monochrome-authorization was declared, but no upload names a monochrome batch",
+        );
+    }
+    for key in service.declarations.keys() {
+        if !service.declaration_use.borrow().contains(key) {
+            findings.fail(format!(
+                "--declare-setting {key} is not applicable to any uploaded batch"
+            ));
+        }
+    }
+
+    if findings.failures.is_empty() && !parsed.is_empty() {
+        for (index, count) in covered.iter().enumerate() {
+            match count {
+                1 => {}
+                0 => findings.fail(format!(
                     "no upload names the reproduced image {index} (blob {}); the HAR does not cover every prepared image",
                     hex(&reproduced[index].blob_sha256)
-                ));
+                )),
+                _ => findings.fail(format!(
+                    "the reproduced image {index} (blob {}) appears in {count} uploads; each prepared image belongs to one batch",
+                    hex(&reproduced[index].blob_sha256)
+                )),
             }
         }
     }
@@ -394,6 +534,56 @@ fn intent_before_files(args: &VerifyPayloadArgs) -> Result<Option<Intent>> {
             )?))
         }
     }
+}
+
+fn load_manual_catalog(data: &Path) -> Result<ManualCatalog> {
+    let root = data.join("manuals");
+    if !root.is_dir() {
+        bail!(
+            "{} is not a directory; a manual confirmation withdrawal needs the local documented manual catalog",
+            root.display()
+        );
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&root).with_context(|| format!("reading {}", root.display()))? {
+        let entry = entry.with_context(|| format!("reading {}", root.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("yaml") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        files.push((entry.file_name().to_string_lossy().into_owned(), source));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    if files.is_empty() {
+        bail!(
+            "{} contains no manual catalog YAML; a manual confirmation withdrawal needs the local documented manual catalog",
+            root.display()
+        );
+    }
+    let catalogs = files
+        .iter()
+        .map(|(name, source)| {
+            validate_manual_catalog(source).map_err(|errors| {
+                anyhow!(
+                    "{}/{name}: {}",
+                    root.display(),
+                    validation_error_text(&errors)
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    merge_manual_catalogs(catalogs)
+        .map_err(|errors| anyhow!("{}: {}", root.display(), validation_error_text(&errors)))
+}
+
+fn validation_error_text(errors: &[looklab_schema::ValidationError]) -> String {
+    errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn parse_declared_settings(args: &[String]) -> Result<BTreeMap<ControlKey, StepIndex>> {
@@ -558,16 +748,23 @@ struct BatchFields {
     body: BodyId,
     firmware: FirmwareVersionString,
     sim: SimKey,
+    render_class: RenderClass,
+    family: LookId,
+    mono_filter: Option<MonoFilter>,
     settings: ControlSettings,
     settings_sources: Vec<BatchSetting>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_batch(
     images: &[&ReproducedImage],
     bodies: &Bodies,
     version: CommunitySnapshotVersion,
     declarations: &BTreeMap<ControlKey, StepIndex>,
     card: bool,
+    card_family: Option<&LookId>,
+    card_render_class: Option<RenderClass>,
+    used: &RefCell<BTreeSet<ControlKey>>,
     findings: &mut Findings,
 ) -> Option<BatchFields> {
     let records = match bodies.at(version) {
@@ -581,7 +778,16 @@ fn derive_batch(
         }
     };
     let first = images.first()?;
-    let fields = match derive_one(&first.metadata, records, version, declarations, card) {
+    let fields = match derive_one(
+        &first.metadata,
+        records,
+        version,
+        declarations,
+        card,
+        card_family,
+        card_render_class,
+        used,
+    ) {
         Ok(fields) => fields,
         Err(reason) => {
             findings.fail(format!(
@@ -591,7 +797,16 @@ fn derive_batch(
         }
     };
     for image in &images[1..] {
-        match derive_one(&image.metadata, records, version, declarations, card) {
+        match derive_one(
+            &image.metadata,
+            records,
+            version,
+            declarations,
+            card,
+            card_family,
+            card_render_class,
+            used,
+        ) {
             Ok(other) if other == fields => {}
             Ok(_) => {
                 findings.fail(
@@ -610,12 +825,16 @@ fn derive_batch(
     Some(fields)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_one(
     metadata: &ManifestMetadata,
     records: &BTreeMap<String, BodyRecord>,
     version: CommunitySnapshotVersion,
     declarations: &BTreeMap<ControlKey, StepIndex>,
     card: bool,
+    card_family: Option<&LookId>,
+    card_render_class: Option<RenderClass>,
+    used: &RefCell<BTreeSet<ControlKey>>,
 ) -> Result<BatchFields, String> {
     let make = metadata
         .make
@@ -639,8 +858,44 @@ fn derive_one(
     let epoch = resolve_epoch(&record.schema, firmware_text)
         .ok_or_else(|| format!("no epoch covers firmware {firmware_text}"))?;
     let values = MakernoteValues::from(metadata);
-    let sim = sim_from_makernote(epoch, &values).map_err(|error| error.to_string())?;
-    let (derived, problems) = settings_from_makernote_partial(&record.schema, epoch.id, &values);
+    let native = classify_render(epoch, &values);
+    let native_sim = match &native {
+        Ok(classification) => classification.native_sim.clone(),
+        Err(_) => sim_from_makernote(epoch, &values)
+            .map_err(|error| format!("the files do not determine the film simulation: {error}"))?,
+    };
+    let (render_class, family, mono_filter) = match (card, card_family, card_render_class) {
+        (true, Some(family), Some(declared)) => {
+            let declared = match declared {
+                RenderClass::Colour => SchemaRenderClass::Colour,
+                RenderClass::Monochrome => SchemaRenderClass::Monochrome,
+            };
+            let classified = classify_card_render(epoch, family, declared, &values)
+                .map_err(|error| format!("the card render does not classify: {error}"))?;
+            (
+                schema_render_class(classified.render_class),
+                classified.family,
+                classified.mono_filter,
+            )
+        }
+        _ => {
+            let classification = native
+                .map_err(|error| format!("the files do not determine the render class: {error}"))?;
+            (
+                schema_render_class(classification.render_class),
+                classification.family,
+                classification.mono_filter,
+            )
+        }
+    };
+    if render_class == RenderClass::Monochrome && !epoch.supports_monochrome_intake(&family) {
+        return Err(format!(
+            "the schema does not accept monochrome intake for family {family}"
+        ));
+    }
+    let reach = applicable_controls(epoch, &family);
+    let (derived, problems) =
+        settings_from_makernote_for(&record.schema, epoch.id, &family, &values);
     let mut sources: Vec<BatchSetting> = derived
         .entries()
         .iter()
@@ -652,16 +907,16 @@ fn derive_one(
         })
         .collect();
     for (key, step) in declarations {
+        let applicable = reach.mapped.contains(key)
+            || reach.unmapped.contains(key)
+            || reach.spatial.contains(key);
+        if !applicable {
+            continue;
+        }
         if sources.iter().any(|setting| &setting.key == key) {
-            return Err(format!(
-                "{key} is reproduced from its makernote; it cannot also be declared"
-            ));
+            continue;
         }
-        if !epoch.controls.iter().any(|control| &control.key == key) {
-            return Err(format!(
-                "snapshot {version} has no control {key} for {body}"
-            ));
-        }
+        used.borrow_mut().insert(key.clone());
         sources.push(BatchSetting {
             key: key.clone(),
             step: *step,
@@ -670,13 +925,16 @@ fn derive_one(
         });
     }
     sources.sort_by(|left, right| left.key.cmp(&right.key));
-    if !card {
-        for missing in epoch
-            .controls
-            .iter()
-            .filter(|control| control.look_affecting)
-        {
-            if sources.iter().any(|setting| setting.key == missing.key) {
+    let deferred = render_class == RenderClass::Monochrome;
+    let mut required: Vec<&ControlKey> = reach.mapped.iter().chain(&reach.unmapped).collect();
+    if deferred {
+        required.extend(reach.spatial.iter());
+    }
+    required.sort();
+    required.dedup();
+    if !card || deferred {
+        for missing in required {
+            if sources.iter().any(|setting| &setting.key == missing) {
                 continue;
             }
             let detail = problems.iter().find_map(|problem| match problem {
@@ -684,14 +942,16 @@ fn derive_one(
                 | MappingError::UnmappedValue { control, .. }
                 | MappingError::ScaleNotNumeric { control, .. }
                 | MappingError::NotOnStep { control, .. }
-                    if control.as_str() == missing.key.as_str() =>
+                    if control.as_str() == missing.as_str() =>
                 {
                     Some(problem.to_string())
                 }
                 _ => None,
             });
-            let reason = if missing.makernote.is_some() {
+            let reason = if reach.mapped.contains(missing) {
                 "the makernote did not determine it"
+            } else if reach.spatial.contains(missing) {
+                "a deferred batch keeps its spatial settings"
             } else {
                 "this snapshot maps no makernote tag for it"
             };
@@ -699,8 +959,7 @@ fn derive_one(
                 .map(|detail| format!(" ({detail})"))
                 .unwrap_or_default();
             return Err(format!(
-                "control {key} has no value: {reason}{detail}; declare it with --declare-setting {key}=<step>",
-                key = missing.key
+                "control {missing} has no value: {reason}{detail}; declare it with --declare-setting {missing}=<step>",
             ));
         }
     }
@@ -709,17 +968,40 @@ fn derive_one(
         .map(|setting| ControlEntry::new(setting.key.clone(), setting.step, setting.source))
         .collect();
     let settings = ControlSettings::new(entries).map_err(|error| error.to_string())?;
-    validate_settings(record, firmware_text, &sim, &settings, card)
-        .map_err(|problem| format!("the derived settings are not valid for {body}: {problem}"))?;
+    let validation_family = if card && card_family.is_none() {
+        None
+    } else {
+        Some(family.clone())
+    };
+    validate_settings(
+        record,
+        firmware_text,
+        &native_sim,
+        validation_family.as_ref(),
+        &settings,
+        card,
+        deferred,
+    )
+    .map_err(|problem| format!("the derived settings are not valid for {body}: {problem}"))?;
 
     Ok(BatchFields {
         version,
         body,
         firmware,
-        sim,
+        sim: native_sim,
+        render_class,
+        family,
+        mono_filter,
         settings,
         settings_sources: sources,
     })
+}
+
+fn schema_render_class(render_class: SchemaRenderClass) -> RenderClass {
+    match render_class {
+        SchemaRenderClass::Colour => RenderClass::Colour,
+        SchemaRenderClass::Monochrome => RenderClass::Monochrome,
+    }
 }
 
 fn match_body(
@@ -779,6 +1061,14 @@ fn print_batch_fields(
                 "  sim: {} (reproduced from the {FILM_MODE_TAG} makernote)",
                 fields.sim
             ));
+            findings.note(format!(
+                "  render class: {:?} (reproduced from the schema and makernotes)",
+                fields.render_class
+            ));
+            findings.note(format!("  family: {} (schema family)", fields.family));
+            if let Some(filter) = fields.mono_filter {
+                findings.note(format!("  mono filter: {filter:?} (reproduced)"));
+            }
             let reproduced = fields
                 .settings_sources
                 .iter()
@@ -843,10 +1133,16 @@ fn expected_manifest(
     fields: &BatchFields,
     declared: &DeclaredFields,
     images: &[&ReproducedImage],
+    authorization: Option<MonochromeAuthorization>,
 ) -> BatchManifest {
     BatchManifest {
         kind: declared.kind,
         intent: declared.intent.clone(),
+        render_class: fields.render_class,
+        monochrome_authorization: match fields.render_class {
+            RenderClass::Colour => None,
+            RenderClass::Monochrome => authorization,
+        },
         body: fields.body.clone(),
         firmware_version: fields.firmware.clone(),
         sim_key: fields.sim.clone(),
@@ -880,6 +1176,10 @@ struct Service<'a> {
     intent: Option<Intent>,
     card_firmware: Option<(FirmwareId, FirmwareVersion)>,
     declarations: &'a BTreeMap<ControlKey, StepIndex>,
+    /// Declarations applicable to at least one uploaded batch.
+    declaration_use: RefCell<BTreeSet<ControlKey>>,
+    monochrome_authorization: Option<MonochromeAuthorization>,
+    manuals: Option<&'a ManualCatalog>,
 }
 
 #[derive(Debug)]
@@ -890,16 +1190,12 @@ struct ReproducedImage {
     blob_sha256: [u8; 32],
 }
 
-struct VerifiedUpload {
-    credential: Vec<u8>,
-    images: Vec<usize>,
+struct ParsedUpload {
+    envelope: Envelope,
+    body: Vec<u8>,
 }
 
-fn verify_upload(
-    request: &HarRequest,
-    service: &Service<'_>,
-    findings: &mut Findings,
-) -> Option<VerifiedUpload> {
+fn parse_upload(request: &HarRequest, findings: &mut Findings) -> Option<ParsedUpload> {
     if let Some(mime_type) = request
         .post_data
         .as_ref()
@@ -927,21 +1223,533 @@ fn verify_upload(
         }
     };
     findings.note(format!(
-        "  envelope: canonical LLUPLD version 1, {} bytes, no trailing bytes",
+        "  envelope: canonical LLUPLD version {}, {} bytes, no trailing bytes",
+        looklab_upload::VERSION,
         body.len()
     ));
     findings.note(format!(
         "  nonce: {} bytes",
         envelope.nonce.as_bytes().len()
     ));
+    findings.note(format!(
+        "  send manifest: {} batch(es), {} attestation(s)",
+        envelope.send_manifest.batches.len(),
+        envelope.send_manifest.attestations.len()
+    ));
+    Some(ParsedUpload { envelope, body })
+}
 
-    let selected = select_images(&envelope, service.reproduced, findings);
+fn verify_send(
+    parsed: &[ParsedUpload],
+    indices: &[usize],
+    service: &Service<'_>,
+    label: &str,
+    findings: &mut Findings,
+    covered: &mut [usize],
+    credentials: &mut Vec<(String, Vec<u8>)>,
+) {
+    let first = &parsed[indices[0]].envelope;
+    for &index in &indices[1..] {
+        let other = &parsed[index].envelope;
+        if other.send_manifest_bytes != first.send_manifest_bytes {
+            findings.fail(format!(
+                "{label}: the send's batches carry different send manifests"
+            ));
+        }
+        if other.assertion != first.assertion {
+            findings.fail(format!(
+                "{label}: the send's batches carry different assertions; the browser approved more than once"
+            ));
+        }
+    }
+
+    let mut present: Vec<ManifestHash> = indices
+        .iter()
+        .map(|&index| parsed[index].envelope.manifest_hash())
+        .collect();
+    present.sort_unstable();
+    if present != first.send_manifest.batches {
+        let listed: BTreeSet<ManifestHash> = first.send_manifest.batches.iter().copied().collect();
+        let found: BTreeSet<ManifestHash> = present.iter().copied().collect();
+        for hash in listed.difference(&found) {
+            findings.fail(format!(
+                "{label}: batch {} is missing from the HAR",
+                hex(hash.as_bytes())
+            ));
+        }
+        for hash in found.difference(&listed) {
+            findings.fail(format!(
+                "{label}: batch {} is not in the send manifest",
+                hex(hash.as_bytes())
+            ));
+        }
+        if present.len() != found.len() {
+            findings.fail(format!(
+                "{label}: a batch appears more than once in the HAR"
+            ));
+        } else if present.len() != listed.len() && found == listed {
+            findings.fail(format!(
+                "{label}: the HAR carries {} batches but the send manifest lists {}",
+                present.len(),
+                listed.len()
+            ));
+        }
+    }
+
+    findings.note(format!("  one assertion over {} batch(es)", indices.len()));
+    check_assertion(
+        &first.assertion,
+        service,
+        first.challenge(),
+        "H(nonce ‖ send manifest hash)",
+        findings,
+    );
+    for &index in indices {
+        verify_upload(&parsed[index], service, findings, covered);
+    }
+    credentials.push((label.to_owned(), first.assertion.credential_id.clone()));
+}
+
+struct ParsedConfirmation {
+    nonce: Nonce,
+    send_manifest: SendManifest,
+    send_manifest_bytes: Vec<u8>,
+    assertion: WebAuthnAssertion,
+    digest: Sha256Hex,
+}
+
+fn decode_confirmation_field(value: &str, max: usize) -> Option<Vec<u8>> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .ok()?;
+    (!bytes.is_empty() && bytes.len() <= max).then_some(bytes)
+}
+
+fn escaped(value: &str) -> String {
+    format!("{value:?}")
+}
+
+fn print_manual_confirmation(
+    confirmation: &looklab_schema::ManualConfirmation,
+    findings: &mut Findings,
+) {
+    findings.note("  manual confirmation, owner-declared (requires human review):");
+    findings.note(format!("    version: {}", confirmation.version));
+    findings.note(format!(
+        "    camera: {}",
+        escaped(confirmation.camera.as_str())
+    ));
+    findings.note(format!(
+        "    camera definition digest: {}",
+        hex(confirmation.camera_digest.as_bytes())
+    ));
+    findings.note(format!(
+        "    reported firmware: {}",
+        escaped(confirmation.firmware.as_str())
+    ));
+    match &confirmation.scope {
+        SchemaConfirmationScope::Complete => findings.note("    scope: complete".to_owned()),
+        SchemaConfirmationScope::Controls { keys } => {
+            findings.note(format!(
+                "    scope: controls, {} key(s) in payload order:",
+                keys.len()
+            ));
+            for (index, key) in keys.iter().enumerate() {
+                findings.note(format!(
+                    "      scope key [{index}]: {}",
+                    escaped(key.as_str())
+                ));
+            }
+        }
+    }
+    findings.note(format!(
+        "    observations: {} in payload order:",
+        confirmation.observations.len()
+    ));
+    for (index, observation) in confirmation.observations.iter().enumerate() {
+        findings.note(format!("      observation [{index}]:"));
+        findings.note(format!(
+            "        key: {}",
+            escaped(observation.key.as_str())
+        ));
+        findings.note(format!(
+            "        definition digest: {}",
+            hex(observation.definition_digest.as_bytes())
+        ));
+        match &observation.finding {
+            SchemaFinding::Matches => {
+                findings.note("        finding: matches the documented options".to_owned());
+            }
+            SchemaFinding::Corrected {
+                availability,
+                domain,
+            } => {
+                findings.note(format!(
+                    "        finding: corrected, availability {availability}"
+                ));
+                findings.note(format!("        correction domain: {domain:?}"));
+            }
+        }
+    }
+    findings.review(format!(
+        "manual confirmation {} is owner-declared: its firmware, scope, observations and correction domains are bound by the send's signed attestation but not reproduced from photographs; review the printed declarations",
+        hex(confirmation.digest().as_bytes())
+    ));
+}
+
+fn parse_confirmation(request: &HarRequest, findings: &mut Findings) -> Option<ParsedConfirmation> {
+    if let Some(mime_type) = request
+        .post_data
+        .as_ref()
+        .and_then(|post| post.mime_type.as_deref())
+        && !mime_type.starts_with("application/json")
+    {
+        findings.fail(format!(
+            "the manual confirmation's content type is {mime_type:?}, expected application/json"
+        ));
+    }
+    let raw = match request.body() {
+        Ok(body) => body,
+        Err(error) => {
+            findings.fail(format!(
+                "the manual confirmation body could not be extracted: {error}"
+            ));
+            return None;
+        }
+    };
+    let body: looklab_upload::ManualConfirmationRequest = match serde_json::from_slice(&raw) {
+        Ok(body) => body,
+        Err(error) => {
+            findings.fail(format!(
+                "the manual confirmation is not the canonical request object: {error}"
+            ));
+            return None;
+        }
+    };
+    if body.canonical_bytes() != raw {
+        findings.fail(
+            "the manual confirmation request is not the canonical encoding: whitespace, escapes or field order differ from the builder's bytes",
+        );
+        return None;
+    }
+    if body.confirmation.canonical_bytes().len() > MAX_CONFIRMATION_BYTES {
+        findings.fail("the manual confirmation payload is larger than the allowed maximum");
+        return None;
+    }
+    if let Err(errors) = body.confirmation.validate_structure() {
+        for error in &errors {
+            findings.fail(format!(
+                "the manual confirmation is structurally invalid: {error}"
+            ));
+        }
+        return None;
+    }
+    print_manual_confirmation(&body.confirmation, findings);
+    let Some(nonce_bytes) = decode_confirmation_field(&body.nonce, 32) else {
+        findings.fail("the manual confirmation's nonce is not 32 base64url bytes");
+        return None;
+    };
+    let Some(nonce) = Nonce::from_slice(&nonce_bytes) else {
+        findings.fail("the manual confirmation's nonce is not 32 bytes");
+        return None;
+    };
+    let Some(credential_id) = decode_confirmation_field(&body.credential_id, 255) else {
+        findings.fail("the manual confirmation's credential id is not base64url within 255 bytes");
+        return None;
+    };
+    let Some(authenticator_data) = decode_confirmation_field(&body.authenticator_data, 512) else {
+        findings
+            .fail("the manual confirmation's authenticator data is not base64url within 512 bytes");
+        return None;
+    };
+    let Some(client_data_json) = decode_confirmation_field(&body.client_data_json, 1024) else {
+        findings.fail("the manual confirmation's client data is not base64url within 1024 bytes");
+        return None;
+    };
+    let Some(signature) = decode_confirmation_field(&body.signature, 512) else {
+        findings.fail("the manual confirmation's signature is not base64url within 512 bytes");
+        return None;
+    };
+    let Some(manifest_bytes) = decode_confirmation_field(&body.send_manifest, 1024 * 1024) else {
+        findings.fail("the manual confirmation's send manifest is not base64url within 1 MiB");
+        return None;
+    };
+    let (send_manifest, rest) = match postcard::take_from_bytes::<SendManifest>(&manifest_bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            findings.fail(format!(
+                "the manual confirmation's send manifest is not postcard: {error}"
+            ));
+            return None;
+        }
+    };
+    if !rest.is_empty() || canonical_send_manifest_bytes(&send_manifest) != manifest_bytes {
+        findings.fail("the manual confirmation's send manifest is not canonical");
+        return None;
+    }
+    if let Err(error) = send_manifest.validate(DEFAULT_MAX_BATCHES, DEFAULT_MAX_ATTESTATIONS) {
+        findings.fail(format!(
+            "the manual confirmation's send manifest is invalid: {error}"
+        ));
+        return None;
+    }
+    let digest = body.confirmation.digest();
+    findings.note(format!(
+        "  manual confirmation: {} batch(es), {} attestation(s), payload {}",
+        send_manifest.batches.len(),
+        send_manifest.attestations.len(),
+        hex(digest.as_bytes())
+    ));
+    Some(ParsedConfirmation {
+        nonce,
+        send_manifest,
+        send_manifest_bytes: manifest_bytes,
+        assertion: WebAuthnAssertion {
+            credential_id,
+            authenticator_data,
+            client_data_json,
+            signature,
+        },
+        digest,
+    })
+}
+
+fn audit_withdrawal(
+    request: &HarRequest,
+    service: &Service<'_>,
+    findings: &mut Findings,
+    credentials: &mut Vec<(String, Vec<u8>)>,
+) {
+    let raw = match request.body() {
+        Ok(body) => body,
+        Err(error) => {
+            findings.fail(format!(
+                "the manual confirmation withdrawal body could not be extracted: {error}"
+            ));
+            return;
+        }
+    };
+    let body: ManualWithdrawalRequest = match serde_json::from_slice(&raw) {
+        Ok(body) => body,
+        Err(error) => {
+            findings.fail(format!(
+                "the manual confirmation withdrawal is not the canonical request object: {error}"
+            ));
+            return;
+        }
+    };
+    if body.canonical_bytes() != raw {
+        findings.fail(
+            "the manual confirmation withdrawal is not the canonical encoding: whitespace, escapes or field order differ from the builder's bytes",
+        );
+        return;
+    }
+    let Some(manuals) = service.manuals else {
+        findings.fail(
+            "the manual confirmation withdrawal has no local documented manual catalog to resolve its camera",
+        );
+        return;
+    };
+    let Some(camera) = manuals.camera(&body.camera) else {
+        findings.fail(format!(
+            "the manual confirmation withdrawal names camera {}, which is not in the local documented manual catalog",
+            escaped(body.camera.as_str())
+        ));
+        return;
+    };
+    findings.note(format!(
+        "  withdrawal target: {} ({} {})",
+        escaped(camera.id.as_str()),
+        escaped(&camera.make),
+        escaped(&camera.model)
+    ));
+    let Some(nonce) =
+        decode_confirmation_field(&body.nonce, 32).and_then(|bytes| Nonce::from_slice(&bytes))
+    else {
+        findings.fail("the manual confirmation withdrawal's nonce is not 32 base64url bytes");
+        return;
+    };
+    let Some(credential_id) = decode_confirmation_field(&body.credential_id, 255) else {
+        findings.fail(
+            "the manual confirmation withdrawal's credential id is not base64url within 255 bytes",
+        );
+        return;
+    };
+    let Some(authenticator_data) = decode_confirmation_field(&body.authenticator_data, 512) else {
+        findings.fail(
+            "the manual confirmation withdrawal's authenticator data is not base64url within 512 bytes",
+        );
+        return;
+    };
+    let Some(client_data_json) = decode_confirmation_field(&body.client_data_json, 1024) else {
+        findings.fail(
+            "the manual confirmation withdrawal's client data is not base64url within 1024 bytes",
+        );
+        return;
+    };
+    let Some(signature) = decode_confirmation_field(&body.signature, 512) else {
+        findings.fail(
+            "the manual confirmation withdrawal's signature is not base64url within 512 bytes",
+        );
+        return;
+    };
+    let assertion = WebAuthnAssertion {
+        credential_id,
+        authenticator_data,
+        client_data_json,
+        signature,
+    };
+    let digest = request_digest(
+        RequestDomain::WithdrawManualConfirmation,
+        body.camera.as_str().as_bytes(),
+    );
+    check_assertion(
+        &assertion,
+        service,
+        Challenge::new(&nonce, &digest),
+        "H(nonce ‖ H(\"withdraw-manual-confirmation\" ‖ camera))",
+        findings,
+    );
+    credentials.push((
+        "manual confirmation withdrawal".to_owned(),
+        assertion.credential_id.clone(),
+    ));
+}
+
+fn verify_confirmations(
+    parsed: &[ParsedUpload],
+    sends: &BTreeMap<[u8; 32], Vec<usize>>,
+    confirmations: &[ParsedConfirmation],
+    service: &Service<'_>,
+    findings: &mut Findings,
+    credentials: &mut Vec<(String, Vec<u8>)>,
+) {
+    let mut by_send: BTreeMap<[u8; 32], Vec<&ParsedConfirmation>> = BTreeMap::new();
+    for confirmation in confirmations {
+        by_send
+            .entry(*confirmation.nonce.as_bytes())
+            .or_default()
+            .push(confirmation);
+    }
+    let mut nonces: BTreeSet<[u8; 32]> = sends.keys().copied().collect();
+    nonces.extend(by_send.keys().copied());
+    for nonce in nonces {
+        let nonce = Nonce::from_bytes(nonce);
+        let list = by_send
+            .get(nonce.as_bytes())
+            .map(|list| list.as_slice())
+            .unwrap_or(&[]);
+        let label = format!("send {}", hex(&nonce.as_bytes()[..4]));
+        if !list.is_empty() {
+            findings.note("");
+            findings.note(format!(
+                "{label}: {} manual confirmation request(s)",
+                list.len()
+            ));
+        }
+        let manifest: &SendManifest = match sends.get(nonce.as_bytes()) {
+            Some(indices) => {
+                let upload = &parsed[indices[0]].envelope;
+                for confirmation in list {
+                    if confirmation.send_manifest_bytes != upload.send_manifest_bytes {
+                        findings.fail(format!(
+                            "{label}: a manual confirmation carries a different send manifest than the uploads"
+                        ));
+                    }
+                    if confirmation.assertion != upload.assertion {
+                        findings.fail(format!(
+                            "{label}: a manual confirmation carries a different assertion than the uploads"
+                        ));
+                    }
+                }
+                &upload.send_manifest
+            }
+            None => {
+                let Some(first) = list.first() else {
+                    continue;
+                };
+                if !first.send_manifest.batches.is_empty() {
+                    findings.fail(format!(
+                        "{label}: the send manifest declares {} batch(es) but the HAR has no upload for them",
+                        first.send_manifest.batches.len()
+                    ));
+                }
+                for confirmation in list {
+                    if confirmation.send_manifest_bytes != first.send_manifest_bytes {
+                        findings.fail(format!(
+                            "{label}: the send's manual confirmations carry different send manifests"
+                        ));
+                    }
+                    if confirmation.assertion != first.assertion {
+                        findings.fail(format!(
+                            "{label}: the send's manual confirmations carry different assertions; the browser approved more than once"
+                        ));
+                    }
+                }
+                check_assertion(
+                    &first.assertion,
+                    service,
+                    Challenge::for_send(&nonce, &send_manifest_hash(&first.send_manifest)),
+                    "H(nonce ‖ send manifest hash)",
+                    findings,
+                );
+                credentials.push((label.clone(), first.assertion.credential_id.clone()));
+                &first.send_manifest
+            }
+        };
+        let declared: BTreeSet<[u8; 32]> = manifest
+            .attestations
+            .iter()
+            .map(|hash| *hash.as_bytes())
+            .collect();
+        let submitted: BTreeSet<[u8; 32]> = list
+            .iter()
+            .map(|confirmation| *confirmation.digest.as_bytes())
+            .collect();
+        for digest in declared.difference(&submitted) {
+            findings.fail(format!(
+                "{label}: the send manifest lists attestation {} but the HAR has no manual confirmation for it",
+                hex(digest)
+            ));
+        }
+        for digest in submitted.difference(&declared) {
+            findings.fail(format!(
+                "{label}: manual confirmation {} is not in the send manifest",
+                hex(digest)
+            ));
+        }
+        if submitted.len() != list.len() {
+            findings.fail(format!(
+                "{label}: a manual confirmation appears more than once in the HAR"
+            ));
+        }
+    }
+}
+
+fn verify_upload(
+    upload: &ParsedUpload,
+    service: &Service<'_>,
+    findings: &mut Findings,
+    covered: &mut [usize],
+) {
+    let envelope = &upload.envelope;
+    let selected = select_images(envelope, service.reproduced, findings);
     let images = selected.as_ref().map(|indices| {
         indices
             .iter()
             .map(|&index| &service.reproduced[index])
             .collect::<Vec<_>>()
     });
+    if let Some(indices) = &selected {
+        for &index in indices {
+            covered[index] += 1;
+            if covered[index] > 1 {
+                findings.fail(format!(
+                    "the reproduced image {index} appears in more than one upload; each prepared image belongs to one batch"
+                ));
+            }
+        }
+    }
     if let Some(images) = &images {
         findings.note(format!(
             "  images: {} of {} reproduced, in the manifest's order",
@@ -950,18 +1758,40 @@ fn verify_upload(
         ));
         match upload_declared(service, images, findings) {
             Some(declared) => {
+                let card_family = match &declared.intent {
+                    Intent::Card(CardDeclaration::Tagged(tag)) => {
+                        LookId::new(tag.look_slug.as_str()).ok()
+                    }
+                    _ => None,
+                };
                 let derived = derive_batch(
                     images,
                     service.bodies,
                     service.snapshot,
                     service.declarations,
                     matches!(declared.intent, Intent::Card(_)),
+                    card_family.as_ref(),
+                    matches!(declared.intent, Intent::Card(_))
+                        .then_some(envelope.manifest.render_class),
+                    &service.declaration_use,
                     findings,
                 );
                 print_batch_fields(derived.as_ref(), &declared, service.bodies, findings);
                 if let Some(fields) = &derived {
-                    let expected = expected_manifest(fields, &declared, images);
-                    check_images(&envelope, &expected, images, service, findings);
+                    if fields.render_class == RenderClass::Monochrome
+                        && service.monochrome_authorization.is_none()
+                    {
+                        findings.fail(
+                            "the upload includes a monochrome batch, but --monochrome-authorization model-development-180-days was not declared",
+                        );
+                    }
+                    let expected = expected_manifest(
+                        fields,
+                        &declared,
+                        images,
+                        service.monochrome_authorization,
+                    );
+                    check_images(envelope, &expected, images, service, findings);
                 } else {
                     findings.fail(
                         "the manifest cannot be reproduced: the batch fields are not determined",
@@ -976,14 +1806,8 @@ fn verify_upload(
         findings.fail("the manifest cannot be reproduced: the upload's images are not reproduced");
     }
 
-    check_webauthn(&envelope, service, findings);
-    check_pow(&envelope, service, findings);
-    check_serial(&envelope, service, &body, findings);
-
-    Some(VerifiedUpload {
-        credential: envelope.assertion.credential_id,
-        images: selected.unwrap_or_default(),
-    })
+    check_pow(envelope, service, findings);
+    check_serial(envelope, service, &upload.body, findings);
 }
 
 /// The reproduced images one upload names, in its manifest's order.
@@ -1067,6 +1891,8 @@ fn check_images(
     let request = BuildManifestRequest {
         kind: expected.kind,
         intent: expected.intent.clone(),
+        render_class: expected.render_class,
+        monochrome_authorization: expected.monochrome_authorization,
         body: expected.body.clone(),
         firmware: expected.firmware_version.clone(),
         sim: expected.sim_key.clone(),
@@ -1137,6 +1963,18 @@ fn manifest_differences(site: &BatchManifest, expected: &BatchManifest) -> Vec<S
         differences.push(format!(
             "intent is {:?}, declared {:?}",
             site.intent, expected.intent
+        ));
+    }
+    if site.render_class != expected.render_class {
+        differences.push(format!(
+            "render class is {:?}, reproduced {:?}",
+            site.render_class, expected.render_class
+        ));
+    }
+    if site.monochrome_authorization != expected.monochrome_authorization {
+        differences.push(format!(
+            "monochrome authorization is {:?}, expected {:?}",
+            site.monochrome_authorization, expected.monochrome_authorization
         ));
     }
     if site.body != expected.body {
@@ -1235,16 +2073,6 @@ fn manifest_differences(site: &BatchManifest, expected: &BatchManifest) -> Vec<S
         }
     }
     differences
-}
-
-fn check_webauthn(envelope: &Envelope, service: &Service<'_>, findings: &mut Findings) {
-    check_assertion(
-        &envelope.assertion,
-        service,
-        envelope.challenge(),
-        "H(nonce ‖ manifest hash)",
-        findings,
-    );
 }
 
 /// Structural WebAuthn checks against `challenge`; returns whether some supported
@@ -1351,7 +2179,12 @@ fn webauthn_line(service: &Service<'_>, algorithm: SignatureAlgorithm) -> String
 
 fn check_pow(envelope: &Envelope, service: &Service<'_>, findings: &mut Findings) {
     let n_images = u32::try_from(envelope.manifest.images.len()).unwrap_or(u32::MAX);
-    match verify_pow(&envelope.challenge(), n_images, &service.pow, &envelope.pow) {
+    match verify_pow(
+        &envelope.pow_challenge(),
+        n_images,
+        &service.pow,
+        &envelope.pow,
+    ) {
         Ok(()) => {
             let bits = service.pow.difficulty_bits(n_images).unwrap_or(0);
             findings.note(format!(
@@ -1373,6 +2206,7 @@ fn check_serial(envelope: &Envelope, service: &Service<'_>, body: &[u8], finding
     for (name, serial) in &candidates {
         let parts = EnvelopeParts {
             nonce: envelope.nonce,
+            send_manifest: &envelope.send_manifest,
             manifest: &envelope.manifest,
             assertion: &envelope.assertion,
             pow: &envelope.pow,
@@ -1397,8 +2231,6 @@ fn reproduce(
     groups: &[Group],
     seeds: &SeedFile,
     module: &ModuleHost,
-    bodies: &Bodies,
-    snapshot: CommunitySnapshotVersion,
     findings: &mut Findings,
 ) -> Vec<ReproducedImage> {
     let version = seeds.prior_transform_version().get();
@@ -1414,29 +2246,9 @@ fn reproduce(
             findings.fail(format!("the seed file has no entry for {}", group.raw.name));
             continue;
         };
-        let monochrome = monochrome_renders(group, bodies, snapshot);
-        let refused: Vec<&str> = group
-            .jpegs
-            .iter()
-            .zip(&monochrome)
-            .filter(|(_, refused)| **refused)
-            .map(|(file, _)| file.name.as_str())
-            .collect();
-        if !refused.is_empty() {
-            findings.note(format!(
-                "  excluded known monochrome render(s): {}",
-                refused.join(", ")
-            ));
-        }
-        let jpegs: Vec<Vec<u8>> = group
-            .jpegs
-            .iter()
-            .zip(&monochrome)
-            .filter(|(_, refused)| !**refused)
-            .map(|(file, _)| file.bytes.clone())
-            .collect();
+        let jpegs: Vec<Vec<u8>> = group.jpegs.iter().map(|file| file.bytes.clone()).collect();
         if jpegs.is_empty() {
-            findings.note("  no colour render to prepare");
+            findings.note("  no render to prepare");
             continue;
         }
         let request = PrepareRequest {
@@ -1462,55 +2274,6 @@ fn reproduce(
         }
     }
     images
-}
-
-/// One flag per JPEG, in file order: whether the published schema calls its
-/// render a monochrome sim.
-fn monochrome_renders(
-    group: &Group,
-    bodies: &Bodies,
-    snapshot: CommunitySnapshotVersion,
-) -> Vec<bool> {
-    let none = vec![false; group.jpegs.len()];
-    let Ok(records) = bodies.at(snapshot) else {
-        return none;
-    };
-    let Some(epoch) = group_epoch(group, records) else {
-        return none;
-    };
-    group
-        .jpegs
-        .iter()
-        .map(|jpeg| {
-            jpeg.manifest_metadata().is_some_and(|metadata| {
-                monochrome_sim(epoch, &MakernoteValues::from(&metadata)).is_some()
-            })
-        })
-        .collect()
-}
-
-/// The epoch the contribution form classifies the group under: the first
-/// JPEG's body and firmware, else another file's.
-fn group_epoch<'a>(group: &Group, records: &'a BTreeMap<String, BodyRecord>) -> Option<&'a Epoch> {
-    let jpegs: Vec<ManifestMetadata> = group
-        .jpegs
-        .iter()
-        .filter_map(InputFile::manifest_metadata)
-        .collect();
-    let primary = jpegs
-        .first()
-        .cloned()
-        .or_else(|| group.files().find_map(InputFile::manifest_metadata))?;
-    let firmware = jpegs
-        .iter()
-        .find_map(|metadata| metadata.firmware.clone())
-        .or_else(|| {
-            group
-                .files()
-                .find_map(|file| file.manifest_metadata()?.firmware)
-        })?;
-    let body = match_body(records, primary.make.as_deref()?, primary.model.as_deref()?).ok()?;
-    resolve_epoch(&records.get(body.as_str())?.schema, &firmware)
 }
 
 fn undecodable(name: &str, failure: &ModuleFailure) -> String {
@@ -1792,12 +2555,6 @@ impl InputFile {
     fn serial(&self) -> Option<&RawSerial> {
         self.parsed.as_ref().and_then(ParsedMetadata::body_serial)
     }
-
-    fn manifest_metadata(&self) -> Option<ManifestMetadata> {
-        self.parsed
-            .as_ref()
-            .map(|parsed| ManifestMetadata::from(&looklab_meta::sanitize(parsed).0))
-    }
 }
 
 fn load_groups(files: &[PathBuf]) -> Result<Vec<Group>> {
@@ -1980,6 +2737,7 @@ fn audit_request(
     class: RequestClass,
     service: &Service<'_>,
     findings: &mut Findings,
+    credentials: &mut Vec<(String, Vec<u8>)>,
 ) {
     for header in &request.headers {
         if class == RequestClass::SessionStatus && header.name.eq_ignore_ascii_case("authorization")
@@ -2016,7 +2774,8 @@ fn audit_request(
         RequestClass::RegisterFinish => {
             audit_registration(request, &["handle", "credential"], findings);
         }
-        RequestClass::Upload | RequestClass::Unexpected => {}
+        RequestClass::ManualWithdrawal => audit_withdrawal(request, service, findings, credentials),
+        RequestClass::Upload | RequestClass::ManualConfirmation | RequestClass::Unexpected => {}
     }
 }
 
@@ -2388,6 +3147,8 @@ fn audit_registration_credential(credential: &serde_json::Value, findings: &mut 
 enum RequestClass {
     Nonce,
     Upload,
+    ManualConfirmation,
+    ManualWithdrawal,
     Status,
     Session,
     SessionStatus,
@@ -2409,6 +3170,8 @@ fn classify(request: &HarRequest, origin: &Origin) -> RequestClass {
     match (request.method.as_str(), parts.path()) {
         ("POST", NONCE_PATH) => RequestClass::Nonce,
         ("POST", UPLOAD_PATH) => RequestClass::Upload,
+        ("POST", MANUAL_CONFIRMATION_PATH) => RequestClass::ManualConfirmation,
+        ("POST", MANUAL_WITHDRAWAL_PATH) => RequestClass::ManualWithdrawal,
         ("POST", SESSION_PATH) => RequestClass::Session,
         ("GET", SESSION_PATH) => RequestClass::SessionStatus,
         ("POST", REGISTER_START_PATH) => RequestClass::RegisterStart,

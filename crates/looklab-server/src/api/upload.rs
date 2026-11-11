@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::Json;
@@ -8,25 +9,33 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use http_body_util::BodyExt as _;
-use looklab_upload::{Challenge, Envelope, parse_envelope_strict, peek_nonce};
+use looklab_upload::{Challenge, Envelope, WebAuthnAssertion, parse_envelope_strict, peek_nonce};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::task;
+use webauthn_rs::prelude::Passkey;
 
-use crate::api::consume_nonce;
 use crate::blob::{BlobHash, BlobStore};
 use crate::body_schema::{
-    SettingsProblem, SnapshotVersionError, validate_render_sims, validate_settings,
+    RenderClassProblem, RenderDeclaration, SettingsProblem, SnapshotVersionError, classify_renders,
+    mono_filter_setting, validate_settings,
 };
+use crate::db::now_unix;
 use crate::error::{ApiError, ApiResult, ErrorCode};
-use crate::ids::{ContributionId, CredentialId, RawCredentialId, StatusToken};
-use crate::preparse::parse_header;
+use crate::ids::{BlobAttemptId, ContributionId, CredentialId, RawCredentialId, StatusToken};
+use crate::preparse::{EnvelopeHeader, parse_header};
 use crate::rate_limit::{Action, RateKey};
-use crate::state::AppState;
-use crate::store::{self, ContributionKind, IntentKind, NewContribution, NewImage};
-use crate::trust::NEW_CREDENTIAL_STANDING;
+use crate::state::{AppState, BatchAdmissionError, PendingPromotion, PromotionError};
+use crate::store::{
+    self, ContributionKind, EstablishSend, IntentKind, NewContribution, NewImage, NewSend,
+    StoredSend,
+};
+use crate::trust::{CredentialStanding, NEW_CREDENTIAL_STANDING};
 use crate::verify::verify_assertion;
 
 const NONCE_END: usize = 40;
+
+const DEFERRED_RETENTION_DAYS: i64 = 180;
 
 #[derive(Serialize)]
 pub struct UploadResponse {
@@ -57,8 +66,7 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         if bytes.len() < NONCE_END {
             return Err(ApiError::new(ErrorCode::MalformedEnvelope));
         }
-        let nonce = peek_nonce(&bytes).map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
-        consume_nonce(&state, &nonce).await?;
+        peek_nonce(&bytes).map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
         read_rest(&mut body, &mut bytes, max_bytes).await?;
         Ok::<Bytes, ApiError>(Bytes::from(bytes))
     };
@@ -66,8 +74,12 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         .await
         .map_err(|_| ApiError::new(ErrorCode::RequestTimeout))??;
 
-    let header = parse_header(&body, &state.config.limits)
-        .map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
+    let header = parse_header(&body, &state.config.limits).map_err(|error| match error {
+        crate::preparse::HeaderError::UnsupportedVersion(_) => {
+            ApiError::with_action(ErrorCode::EnvelopeVersionUnsupported, "reload_and_prepare")
+        }
+        _ => ApiError::new(ErrorCode::MalformedEnvelope),
+    })?;
     if !state.rate_limiter.check(&RateKey::GlobalUpload) {
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
@@ -76,34 +88,138 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
     let stored = store::find_credential(&state.db, raw_id.as_slice())
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+    if let Some(credential) = &stored
+        && store::intake_blocked(&state.db, &credential.id)
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::Internal))?
+    {
+        return Err(ApiError::new(ErrorCode::CredentialBlocked));
+    }
     let pending = if stored.is_none() {
         state.pending_credential(raw_id.as_slice())
     } else {
         None
     };
-
-    let (passkey, standing, existing_credential, display_handle) = match (stored, pending) {
-        (Some(credential), _) => (
-            credential.passkey,
-            credential.standing,
-            Some(credential.id),
-            None,
-        ),
-        (None, Some((passkey, display_handle))) => {
-            (passkey, NEW_CREDENTIAL_STANDING, None, display_handle)
-        }
+    let resolved = match (stored, pending) {
+        (Some(credential), _) => ResolvedCredential {
+            passkey: credential.passkey,
+            revision: Some(credential.revision),
+            standing: credential.standing,
+            existing: Some(credential.id),
+        },
+        (None, Some((passkey, _))) => ResolvedCredential {
+            passkey,
+            revision: None,
+            standing: NEW_CREDENTIAL_STANDING,
+            existing: None,
+        },
         (None, None) => return Err(ApiError::new(ErrorCode::CredentialUnknown)),
     };
 
-    let challenge = Challenge::new(&header.nonce, &header.manifest_hash);
-    let verified_passkey = verify_assertion(
-        &passkey,
-        &header.assertion,
-        challenge,
-        &state.config.origin,
-        &state.config.rp_id,
-    )
-    .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
+    let assertion_hash = assertion_digest(&header.assertion);
+    let send = store::find_send(&state.db, &header.nonce)
+        .await
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+    let mut send_expires_at = send.as_ref().map(|send| send.expires_at);
+    let passkey = resolved.passkey;
+    let mut promotion: Option<PendingPromotion> = None;
+    match send {
+        Some(send) => {
+            check_send_binding(
+                &send,
+                header.send_manifest_hash.as_bytes(),
+                &header.assertion.credential_id,
+                &assertion_hash,
+            )?;
+            check_send_open(&send)?;
+            check_batch_pending(&state, &header).await?;
+            if resolved.existing.is_none() {
+                promotion = Some(
+                    state
+                        .begin_promotion(&passkey, &passkey)
+                        .map_err(promotion_error)?,
+                );
+            }
+        }
+        None => {
+            let challenge = Challenge::for_send(&header.nonce, &header.send_manifest_hash);
+            let verified = verify_assertion(
+                &passkey,
+                &header.assertion,
+                challenge,
+                &state.config.origin,
+                &state.config.rp_id,
+            )
+            .map_err(|_| ApiError::new(ErrorCode::SignatureInvalid))?;
+            if let Some(id) = &resolved.existing {
+                let revision = resolved
+                    .revision
+                    .as_ref()
+                    .ok_or_else(|| ApiError::new(ErrorCode::Internal))?;
+                match store::update_credential_passkey(&state.db, id, &verified, revision).await {
+                    Ok(store::CredentialUpdate::Applied) => {}
+                    Ok(store::CredentialUpdate::Stale) => {
+                        return Err(ApiError::new(ErrorCode::SignatureInvalid));
+                    }
+                    Err(_) => return Err(ApiError::new(ErrorCode::Internal)),
+                }
+            } else {
+                promotion = Some(
+                    state
+                        .begin_promotion(&passkey, &verified)
+                        .map_err(promotion_error)?,
+                );
+            }
+            let batch_hashes = header
+                .send_manifest
+                .batches
+                .iter()
+                .map(|hash| *hash.as_bytes())
+                .collect::<Vec<_>>();
+            let attestation_hashes = header
+                .send_manifest
+                .attestations
+                .iter()
+                .map(|hash| *hash.as_bytes())
+                .collect::<Vec<_>>();
+            let new_send = NewSend {
+                manifest_hash: header.send_manifest_hash.as_bytes(),
+                nonce: &header.nonce,
+                credential_id: &header.assertion.credential_id,
+                assertion_hash: &assertion_hash,
+                batch_hashes: &batch_hashes,
+                attestation_hashes: &attestation_hashes,
+            };
+            match store::establish_send(&state.db, &new_send)
+                .await
+                .map_err(|_| ApiError::new(ErrorCode::Internal))?
+            {
+                EstablishSend::Established => {
+                    send_expires_at = Some(
+                        store::find_send(&state.db, &header.nonce)
+                            .await
+                            .map_err(|_| ApiError::new(ErrorCode::Internal))?
+                            .ok_or_else(|| ApiError::new(ErrorCode::Internal))?
+                            .expires_at,
+                    );
+                }
+                EstablishSend::Existing(send) => {
+                    send_expires_at = Some(send.expires_at);
+                    check_send_binding(
+                        &send,
+                        header.send_manifest_hash.as_bytes(),
+                        &header.assertion.credential_id,
+                        &assertion_hash,
+                    )?;
+                    check_send_open(&send)?;
+                    check_batch_pending(&state, &header).await?;
+                }
+                EstablishSend::Unknown => return Err(ApiError::new(ErrorCode::NonceUnknown)),
+                EstablishSend::Expired => return Err(ApiError::new(ErrorCode::NonceExpired)),
+                EstablishSend::Replayed => return Err(ApiError::new(ErrorCode::NonceReplayed)),
+            }
+        }
+    };
     if !state.rate_limiter.check(&RateKey::Assertion {
         action: Action::Upload,
         id: raw_id.clone(),
@@ -111,36 +227,58 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
 
-    let params = state.trust.pow_params(standing);
+    let send_expires_at = send_expires_at.ok_or_else(|| ApiError::new(ErrorCode::Internal))?;
+    let attempt = state
+        .batch_admission
+        .try_begin(
+            header.nonce.as_bytes(),
+            header.manifest_hash.as_bytes(),
+            send_expires_at,
+        )
+        .map_err(|error| match error {
+            BatchAdmissionError::InFlight => ApiError::new(ErrorCode::Busy),
+            BatchAdmissionError::Exhausted => ApiError::new(ErrorCode::RateLimited),
+            BatchAdmissionError::Capacity => ApiError::new(ErrorCode::Busy),
+        })?;
+
+    let params = state.trust.pow_params(resolved.standing);
     let n_images = header.n_images();
     let pow_json = serde_json::to_string(header.pow.as_array())
         .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+    let pow_challenge = header.pow_challenge();
     let pow = header.pow;
-    let pow_challenge = challenge;
     task::spawn_blocking(move || looklab_upload::verify(&pow_challenge, n_images, &params, &pow))
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?
         .map_err(|_| ApiError::new(ErrorCode::PowInvalid))?;
 
     let limits = state.config.limits;
-    let store = state.blobs.clone();
     let body_for_parse = body.clone();
     let (mut envelope, counts) =
         task::spawn_blocking(move || -> Result<(Envelope, Vec<i64>), ApiError> {
-            let envelope = parse_envelope_strict(&body_for_parse, &limits)
-                .map_err(|_| ApiError::new(ErrorCode::MalformedEnvelope))?;
-            let counts = store_blobs(&store, &envelope)?;
+            let envelope =
+                parse_envelope_strict(&body_for_parse, &limits).map_err(|error| match error {
+                    looklab_upload::EnvelopeError::UnsupportedVersion(_) => ApiError::with_action(
+                        ErrorCode::EnvelopeVersionUnsupported,
+                        "reload_and_prepare",
+                    ),
+                    _ => ApiError::new(ErrorCode::MalformedEnvelope),
+                })?;
+            let counts = blob_counts(&envelope)?;
             Ok((envelope, counts))
         })
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))??;
 
-    if envelope.nonce != header.nonce || envelope.challenge() != challenge {
+    if envelope.nonce != header.nonce
+        || envelope.send_manifest_hash != header.send_manifest_hash
+        || envelope.manifest_hash() != header.manifest_hash
+    {
         return Err(ApiError::new(ErrorCode::MalformedEnvelope));
     }
 
-    let records = state
-        .bodies
+    let bodies = state.bodies.read().await;
+    let records = bodies
         .at(envelope.manifest.community_snapshot_version)
         .map_err(|error| match error {
             SnapshotVersionError::Unknown { .. } => ApiError::new(ErrorCode::SnapshotUnknown),
@@ -149,20 +287,62 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
     let body_record = records
         .get(envelope.manifest.body.as_str())
         .ok_or_else(|| ApiError::new(ErrorCode::BodyUnknown))?;
+    let card = matches!(envelope.manifest.intent, looklab_upload::Intent::Card(_));
+    let card_family = match &envelope.manifest.intent {
+        looklab_upload::Intent::Card(looklab_upload::CardDeclaration::Tagged(tag)) => {
+            looklab_schema::LookId::new(tag.look_slug.as_str()).ok()
+        }
+        _ => None,
+    };
+    let classified = classify_renders(
+        body_record,
+        RenderDeclaration {
+            firmware: envelope.manifest.firmware_version.as_str(),
+            sim_key: &envelope.manifest.sim_key,
+            signed_class: envelope.manifest.render_class,
+            card,
+            card_family: card_family.as_ref(),
+            setting_filter: mono_filter_setting(
+                body_record,
+                envelope.manifest.firmware_version.as_str(),
+                &envelope.manifest.settings,
+            ),
+        },
+        envelope.manifest.images.iter().map(|image| &image.meta),
+    )
+    .map_err(render_class_error)?;
     validate_settings(
         body_record,
         envelope.manifest.firmware_version.as_str(),
         &envelope.manifest.sim_key,
+        card_family.as_ref(),
         &envelope.manifest.settings,
-        matches!(envelope.manifest.intent, looklab_upload::Intent::Card(_)),
+        card,
+        envelope.manifest.render_class == looklab_upload::RenderClass::Monochrome,
     )
     .map_err(settings_error)?;
-    validate_render_sims(
-        body_record,
-        envelope.manifest.firmware_version.as_str(),
-        envelope.manifest.images.iter().map(|image| &image.meta),
-    )
-    .map_err(settings_error)?;
+
+    let model_scope =
+        if envelope.manifest.render_class == looklab_upload::RenderClass::Colour && !card {
+            let epoch = body_record
+                .schema
+                .epoch_for(envelope.manifest.firmware_version.as_str())
+                .ok_or_else(|| ApiError::new(ErrorCode::Internal))?;
+            let classified = classified
+                .first()
+                .ok_or_else(|| ApiError::new(ErrorCode::MalformedEnvelope))?;
+            Some(ModelEvidenceScope {
+                realization: looklab_schema::BodyRealizationId {
+                    body: body_record.schema.body.clone(),
+                    epoch: looklab_schema::ControlEpochId::new(epoch.id),
+                    native_sim: classified.native_sim.clone(),
+                },
+                native_family: matches!(envelope.manifest.intent, looklab_upload::Intent::Native)
+                    .then(|| classified.family.clone()),
+            })
+        } else {
+            None
+        };
 
     let serial_hmac = match envelope.serial.take() {
         Some(serial) => {
@@ -175,10 +355,12 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         }
         None => None,
     };
+    drop(bodies);
 
     let Envelope {
         manifest,
         assertion,
+        blobs,
         ..
     } = envelope;
 
@@ -195,7 +377,8 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         .images
         .iter()
         .zip(counts)
-        .map(|(image, n_samples)| -> ApiResult<NewImage> {
+        .zip(classified)
+        .map(|((image, n_samples), classified)| -> ApiResult<NewImage> {
             Ok(NewImage {
                 samples_hash: image.blob_sha256,
                 n_samples,
@@ -203,6 +386,10 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
                     .map_err(|_| ApiError::new(ErrorCode::Internal))?,
                 rerender_group: image.rerender_group.map(|group| hex(group.as_bytes())),
                 setting_source: setting_source.clone(),
+                render_class: classified.render_class,
+                native_sim: Some(classified.native_sim),
+                family: Some(classified.family),
+                mono_filter: classified.mono_filter,
             })
         })
         .collect::<ApiResult<Vec<_>>>()?;
@@ -221,25 +408,48 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         }
     };
 
-    let first_contribution = existing_credential.is_none();
+    let deferred_until = match manifest.render_class {
+        looklab_upload::RenderClass::Colour => None,
+        looklab_upload::RenderClass::Monochrome => {
+            Some(now_unix() + DEFERRED_RETENTION_DAYS * 86_400)
+        }
+    };
+    let first_contribution = resolved.existing.is_none();
     let token = if first_contribution {
         Some(StatusToken::generate().map_err(|_| ApiError::new(ErrorCode::Internal))?)
     } else {
         None
     };
     let contribution_id = ContributionId::new();
+    let staged = StagedUpload::new(
+        images.iter().map(|image| image.samples_hash).collect(),
+        blobs,
+        state.blobs.clone(),
+    );
+    store::stage_blobs(
+        &state.db,
+        &staged.attempt,
+        &staged.hashes,
+        staged.expires_at,
+    )
+    .await?;
+    let promotion = if resolved.existing.is_some() {
+        None
+    } else {
+        Some(
+            promotion
+                .take()
+                .ok_or_else(|| ApiError::new(ErrorCode::Internal))?,
+        )
+    };
     let completion = complete(
         &state,
-        existing_credential.clone(),
-        raw_id.as_slice(),
-        &verified_passkey,
-        display_handle.as_deref(),
+        promotion,
         NewContribution {
             id: contribution_id.clone(),
-            credential_id: existing_credential
-                .clone()
-                .unwrap_or_else(CredentialId::new),
+            credential_id: resolved.existing.clone().unwrap_or_else(CredentialId::new),
             manifest_hash: *header.manifest_hash.as_bytes(),
+            send_nonce: header.nonce,
             signature: assertion.signature,
             pow: pow_json,
             kind: ContributionKind::from_upload(manifest.kind),
@@ -252,12 +462,29 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
             sim_key: manifest.sim_key.as_str().to_owned(),
             settings_json: serde_json::to_string(&manifest.settings)
                 .map_err(|_| ApiError::new(ErrorCode::Internal))?,
+            normalized_settings: manifest.settings.clone(),
+            community_snapshot_version: manifest.community_snapshot_version,
+            render_class: manifest.render_class,
+            monochrome_authorization: manifest.monochrome_authorization,
+            deferred_until,
             images,
         },
         token.as_ref(),
+        &staged,
+        model_scope,
     )
     .await;
-    completion?;
+    if let Err(error) = completion {
+        let _ = store::discard_staged(
+            &state.db,
+            state.blobs.as_ref(),
+            &staged.attempt,
+            &staged.hashes,
+        )
+        .await;
+        return Err(error);
+    }
+    attempt.succeed();
 
     state.remove_pending_credential(raw_id.as_slice());
     Ok((
@@ -270,50 +497,176 @@ pub async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Api
         .into_response())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn complete(
-    state: &AppState,
-    existing_credential: Option<CredentialId>,
-    raw_id: &[u8],
-    passkey: &webauthn_rs::prelude::Passkey,
-    display_handle: Option<&str>,
-    mut contribution: NewContribution,
-    token: Option<&StatusToken>,
+struct ResolvedCredential {
+    passkey: Passkey,
+    revision: Option<store::CredentialRevision>,
+    standing: CredentialStanding,
+    existing: Option<CredentialId>,
+}
+
+pub(super) fn check_send_binding(
+    send: &StoredSend,
+    manifest_hash: &[u8; 32],
+    credential_id: &[u8],
+    assertion_hash: &[u8; 32],
 ) -> ApiResult<()> {
-    let mut tx = state.db.begin().await?;
-    let credential_id = match existing_credential {
-        Some(id) => {
-            store::update_credential_passkey_tx(&mut tx, &id, passkey).await?;
-            id
-        }
-        None => {
-            let id = CredentialId::new();
-            store::insert_credential(&mut tx, &id, raw_id, passkey, display_handle)
-                .await
-                .map_err(database_error)?;
-            id
-        }
-    };
-    contribution.credential_id = credential_id.clone();
-    store::insert_contribution(&mut tx, &contribution).await?;
-    if let Some(token) = token {
-        store::insert_status_token(&mut tx, &credential_id, &token.hash()).await?;
+    if send.manifest_hash != *manifest_hash {
+        return Err(ApiError::new(ErrorCode::SendManifestInvalid));
     }
-    store::enqueue_consistency_score(&mut tx, &contribution.id).await?;
-    tx.commit().await.map_err(database_error)?;
+    if send.credential_id != credential_id || send.assertion_hash != *assertion_hash {
+        return Err(ApiError::new(ErrorCode::SendCredentialMismatch));
+    }
     Ok(())
 }
 
-fn store_blobs(store: &Arc<dyn BlobStore>, envelope: &Envelope) -> Result<Vec<i64>, ApiError> {
+pub(super) fn check_send_open(send: &StoredSend) -> ApiResult<()> {
+    if send.completed_at.is_some() || send.withdrawn_at.is_some() {
+        return Err(ApiError::new(ErrorCode::SendReplayed));
+    }
+    if now_unix() > send.expires_at {
+        return Err(ApiError::new(ErrorCode::SendExpired));
+    }
+    Ok(())
+}
+
+async fn check_batch_pending(state: &AppState, header: &EnvelopeHeader) -> ApiResult<()> {
+    match store::find_send_batch(&state.db, &header.nonce, header.manifest_hash.as_bytes())
+        .await
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?
+    {
+        None => Err(ApiError::new(ErrorCode::SendManifestInvalid)),
+        Some(Some(_)) => Err(ApiError::new(ErrorCode::BatchReplayed)),
+        Some(None) => Ok(()),
+    }
+}
+
+pub(super) fn assertion_digest(assertion: &WebAuthnAssertion) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for field in [
+        &assertion.credential_id,
+        &assertion.authenticator_data,
+        &assertion.client_data_json,
+        &assertion.signature,
+    ] {
+        hasher.update(u32::try_from(field.len()).unwrap_or(u32::MAX).to_le_bytes());
+        hasher.update(field);
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
+
+struct ModelEvidenceScope {
+    realization: looklab_schema::BodyRealizationId,
+    native_family: Option<looklab_schema::LookId>,
+}
+
+async fn complete(
+    state: &AppState,
+    promotion: Option<PendingPromotion>,
+    contribution: NewContribution,
+    token: Option<&StatusToken>,
+    staged: &StagedUpload,
+    model_scope: Option<ModelEvidenceScope>,
+) -> ApiResult<()> {
+    let tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let mut tx = staged.acquire(tx).await?;
+    if store::intake_blocked_conn(&mut tx, &contribution.credential_id)
+        .await
+        .map_err(database_error)?
+    {
+        return Err(ApiError::new(ErrorCode::CredentialBlocked));
+    }
+    if let Some(promotion) = promotion.as_ref() {
+        store::insert_credential(
+            &mut tx,
+            &contribution.credential_id,
+            promotion.passkey().cred_id().as_slice(),
+            promotion.passkey(),
+            promotion.display_handle(),
+        )
+        .await
+        .map_err(database_error)?;
+    }
+    store::insert_contribution(&mut tx, &contribution).await?;
+    if let Some(scope) = model_scope {
+        let subject = looklab_schema::ModelSubject::BodyRealization {
+            realization: scope.realization,
+        }
+        .key();
+        crate::model_store::note_evidence_arrival(&mut tx, &subject, now_unix())
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+        if let Some(family) = scope.native_family {
+            crate::model_store::note_evidence_arrival(
+                &mut tx,
+                &looklab_schema::SubjectKey::for_family(&family),
+                now_unix(),
+            )
+            .await
+            .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+        }
+    }
+    if let Some(hmac) = contribution.serial_hmac {
+        let linked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT credential_id) FROM contributions WHERE serial_hmac = ?",
+        )
+        .bind(hmac.to_vec())
+        .fetch_one(&mut *tx)
+        .await?;
+        if linked > 1 {
+            store::request_publication(&mut tx).await?;
+        }
+    }
+    if !store::mark_send_batch_received(
+        &mut tx,
+        &contribution.send_nonce,
+        &contribution.manifest_hash,
+        &contribution.id,
+    )
+    .await?
+    {
+        return Err(ApiError::new(ErrorCode::BatchReplayed));
+    }
+    store::increment_send_received(&mut tx, &contribution.send_nonce).await?;
+    if let Some(token) = token {
+        store::insert_status_token(&mut tx, &contribution.credential_id, &token.hash()).await?;
+    }
+    if contribution.render_class == looklab_upload::RenderClass::Colour {
+        store::enqueue_consistency_score(&mut tx, &contribution.id).await?;
+    }
+    store::clear_staged(&mut tx, &staged.attempt).await?;
+    match promotion {
+        Some(promotion) => {
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = done_tx.send(promotion.commit(tx).await);
+            });
+            done_rx
+                .await
+                .map_err(|_| ApiError::new(ErrorCode::Internal))?
+                .map_err(database_error)?;
+        }
+        None => tx.commit().await.map_err(database_error)?,
+    }
+    Ok(())
+}
+
+pub(super) fn promotion_error(error: PromotionError) -> ApiError {
+    match error {
+        PromotionError::Stale => ApiError::new(ErrorCode::SignatureInvalid),
+        PromotionError::Busy => ApiError::new(ErrorCode::Busy),
+    }
+}
+
+fn blob_counts(envelope: &Envelope) -> Result<Vec<i64>, ApiError> {
     let mut counts = Vec::with_capacity(envelope.blobs.len());
     for (blob, image) in envelope.blobs.iter().zip(envelope.manifest.images.iter()) {
         let hash = BlobHash::of(blob);
         if hash.as_bytes() != &image.blob_sha256 {
             return Err(ApiError::new(ErrorCode::MalformedEnvelope));
         }
-        store
-            .put(hash, blob)
-            .map_err(|_| ApiError::new(ErrorCode::Internal))?;
         let n = match image.blob_kind {
             looklab_upload::BlobKind::Samples => looklab_samples::decode(blob)
                 .map_err(|_| ApiError::new(ErrorCode::Internal))?
@@ -328,10 +681,74 @@ fn store_blobs(store: &Arc<dyn BlobStore>, envelope: &Envelope) -> Result<Vec<i6
     Ok(counts)
 }
 
-fn settings_error(problem: SettingsProblem) -> ApiError {
+/// One upload's blob reservation and bytes.
+struct StagedUpload {
+    attempt: BlobAttemptId,
+    hashes: Vec<[u8; 32]>,
+    blobs: Arc<Vec<Vec<u8>>>,
+    store: Arc<dyn BlobStore>,
+    expires_at: i64,
+}
+
+impl StagedUpload {
+    fn new(hashes: Vec<[u8; 32]>, blobs: Vec<Vec<u8>>, store: Arc<dyn BlobStore>) -> Self {
+        Self {
+            attempt: BlobAttemptId::new(),
+            hashes,
+            blobs: Arc::new(blobs),
+            store,
+            expires_at: now_unix() + store::STAGED_TTL_SECONDS,
+        }
+    }
+
+    /// Verifies the reservation and writes under a transaction the blocking task owns.
+    async fn acquire(
+        &self,
+        mut tx: sqlx::Transaction<'static, sqlx::Sqlite>,
+    ) -> ApiResult<sqlx::Transaction<'static, sqlx::Sqlite>> {
+        if !store::reservation_live(&mut tx, &self.attempt, self.distinct_hashes()).await? {
+            return Err(ApiError::new(ErrorCode::Busy));
+        }
+        let store = self.store.clone();
+        let hashes = self.hashes.clone();
+        let blobs = self.blobs.clone();
+        let (tx, ()) = crate::blob::write_guarded(tx, move || {
+            for (hash, blob) in hashes.iter().zip(blobs.iter()) {
+                if let Err(error) = store.put(BlobHash::from_bytes(*hash), blob) {
+                    return ((), Err(error));
+                }
+            }
+            ((), Ok(()))
+        })
+        .await
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
+        Ok(tx)
+    }
+
+    fn distinct_hashes(&self) -> usize {
+        self.hashes.iter().collect::<BTreeSet<_>>().len()
+    }
+}
+
+fn settings_error(_problem: SettingsProblem) -> ApiError {
+    ApiError::new(ErrorCode::SchemaInvalid)
+}
+
+fn render_class_error(problem: RenderClassProblem) -> ApiError {
     match problem {
-        SettingsProblem::MonochromeSim(_) => ApiError::new(ErrorCode::MonochromeUnsupported),
-        _ => ApiError::new(ErrorCode::SchemaInvalid),
+        RenderClassProblem::ClassMismatch { .. }
+        | RenderClassProblem::SimMismatch { .. }
+        | RenderClassProblem::AmbiguousSim
+        | RenderClassProblem::CardFamilyUnknown
+        | RenderClassProblem::MonochromeUnsupported { .. } => {
+            ApiError::new(ErrorCode::RenderClassMismatch)
+        }
+        RenderClassProblem::Mapping(looklab_schema::MappingError::RenderClassConflict {
+            ..
+        }) => ApiError::new(ErrorCode::RenderClassMismatch),
+        RenderClassProblem::NoEpoch
+        | RenderClassProblem::UnknownSim(_)
+        | RenderClassProblem::Mapping(_) => ApiError::new(ErrorCode::SchemaInvalid),
     }
 }
 
@@ -401,4 +818,128 @@ fn hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use looklab_upload::{CommunitySnapshotVersion, ControlSettings, Limits, Nonce, RenderClass};
+
+    use super::*;
+    use crate::config::{Config, PowConfig, SiteConfig};
+
+    async fn state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let secret = dir.path().join("server-secret");
+        std::fs::write(&secret, [9u8; 32]).expect("server secret");
+        let snapshot = dir.path().join("community");
+        std::fs::create_dir_all(&snapshot).expect("snapshot dir");
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+        let config = Config {
+            bind: "127.0.0.1:0".parse().expect("bind"),
+            db_path: dir.path().join("looklab.sqlite3"),
+            blob_dir: dir.path().join("blobs"),
+            rp_id: "looklab.example".to_owned(),
+            origin: "https://looklab.example".to_owned(),
+            server_secret_path: secret,
+            bodies_dir: data.join("bodies"),
+            manuals_dir: data.join("manuals"),
+            snapshot_dir: snapshot,
+            nonce_ttl: Duration::from_secs(300),
+            registration_ttl: Duration::from_secs(300),
+            body_timeout: Duration::from_secs(30),
+            blob_retention_days: 30,
+            cors_origins: Vec::new(),
+            site: SiteConfig::default(),
+            pow: PowConfig::default(),
+            limits: Limits {
+                max_body_bytes: 1 << 20,
+                max_manifest_bytes: 1 << 16,
+                max_images: 8,
+                max_blob_bytes: 1 << 16,
+                max_batches: 8,
+                max_attestations: 8,
+            },
+        };
+        let state = AppState::new(config).await.expect("state");
+        (dir, state)
+    }
+
+    fn contribution(credential: &CredentialId) -> NewContribution {
+        NewContribution {
+            id: ContributionId::new(),
+            credential_id: credential.clone(),
+            manifest_hash: [0; 32],
+            send_nonce: Nonce::from_bytes([1; 32]),
+            signature: vec![0],
+            pow: "[]".to_owned(),
+            kind: crate::store::ContributionKind::Library,
+            serial_hmac: None,
+            intent: IntentKind::Native,
+            target_look: None,
+            card: None,
+            body_id: "fujifilm/x-t5".to_owned(),
+            firmware_version: "1.0".to_owned(),
+            sim_key: "sim".to_owned(),
+            settings_json: "{}".to_owned(),
+            normalized_settings: ControlSettings::new(Vec::new()).expect("settings"),
+            community_snapshot_version: CommunitySnapshotVersion::new(0),
+            render_class: RenderClass::Colour,
+            monochrome_authorization: None,
+            deferred_until: None,
+            images: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_rechecks_the_intake_block_after_staging() {
+        let (_dir, state) = state().await;
+        let credential = CredentialId::new();
+        sqlx::query(
+            "INSERT INTO credentials (id, credential_id, webauthn_credential, created_at)
+             VALUES (?, ?, '{}', 0)",
+        )
+        .bind(credential.as_str())
+        .bind(credential.as_str().as_bytes())
+        .execute(&state.db)
+        .await
+        .expect("credential");
+
+        let hash = [7u8; 32];
+        let attempt = BlobAttemptId::new();
+        crate::store::stage_blobs(&state.db, &attempt, &[hash], now_unix() + 60)
+            .await
+            .expect("stage");
+        sqlx::query(
+            "INSERT INTO credential_intake_blocks
+             (credential_id, moderator_credential, reason, blocked_at)
+             VALUES (?, 'cli', 'test', 0)",
+        )
+        .bind(credential.as_str())
+        .execute(&state.db)
+        .await
+        .expect("block");
+        let staged = StagedUpload {
+            attempt,
+            hashes: vec![hash],
+            blobs: Arc::new(vec![vec![1, 2, 3]]),
+            store: state.blobs.clone(),
+            expires_at: now_unix() + store::STAGED_TTL_SECONDS,
+        };
+        let contribution = contribution(&credential);
+        let id = contribution.id.clone();
+        let error = complete(&state, None, contribution, None, &staged, None)
+            .await
+            .expect_err("blocked completion");
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contributions WHERE id = ?")
+            .bind(id.as_str())
+            .fetch_one(&state.db)
+            .await
+            .expect("contribution count");
+        assert_eq!(count, 0);
+    }
 }

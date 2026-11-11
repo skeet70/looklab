@@ -33,6 +33,7 @@ export LOOKLAB_RP_ID=localhost
 export LOOKLAB_ORIGIN="$origin"
 export LOOKLAB_SERVER_SECRET_PATH="$state/server-secret"
 export LOOKLAB_BODIES_DIR="$data_dir/bodies"
+export LOOKLAB_MANUALS_DIR="$data_dir/manuals"
 export LOOKLAB_SNAPSHOT_DIR="$state/community"
 export LOOKLAB_SITE_DIST="$dist"
 export LOOKLAB_SITE_DATA="$data"
@@ -43,6 +44,8 @@ export LOOKLAB_SITE_DATA="$data"
   --db "$LOOKLAB_DB_PATH" \
   --blobs "$LOOKLAB_BLOB_DIR" \
   --data "$data_dir" \
+  --manuals "$data_dir/manuals" \
+  --snapshot-dir "$LOOKLAB_SNAPSHOT_DIR" \
   --site "$state/site" \
   --transforms "$data_dir/transforms" \
   --lease-seconds 300 &

@@ -47,10 +47,26 @@ impl<'de> Deserialize<'de> for ManifestImage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderClass {
+    Colour,
+    Monochrome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonochromeAuthorization {
+    #[serde(rename = "model_development_180_days")]
+    ModelDevelopment180Days,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BatchManifest {
     pub kind: ContributionKind,
     pub intent: Intent,
+    pub render_class: RenderClass,
+    pub monochrome_authorization: Option<MonochromeAuthorization>,
     pub body: BodyId,
     pub firmware_version: FirmwareVersionString,
     pub sim_key: SimKey,
@@ -59,18 +75,20 @@ pub struct BatchManifest {
     pub images: Vec<ManifestImage>,
 }
 
-/// The look-affecting controls of the named snapshot.
+/// The controls of the named snapshot, by source category.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingReach {
-    /// Controls the schema maps from a makernote tag.
+    /// Look-affecting controls the schema maps from a makernote tag.
     pub mapped: Vec<ControlKey>,
-    /// Controls the schema maps from no tag.
+    /// Look-affecting controls the schema maps from no tag.
     pub unmapped: Vec<ControlKey>,
+    /// Spatial controls, which a deferred batch must still source.
+    pub spatial: Vec<ControlKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SettingsSourceError {
-    #[error("look-affecting control `{key}` has no value; declare it")]
+    #[error("control `{key}` has no value; declare it")]
     MissingLookAffectingControl { key: ControlKey },
     #[error("control `{key}` is reproduced but its snapshot maps no tag for it")]
     ReproducedWithoutMapping { key: ControlKey },
@@ -93,11 +111,21 @@ pub enum IntentError {
     MissingCardTag,
 }
 
-/// Rejects settings the named snapshot cannot support. A card render
-/// (`card`) is exempt from covering every look-affecting control.
+/// A batch whose signed render classification and authorization disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RenderClassError {
+    #[error("a monochrome batch needs an explicit monochrome authorization")]
+    MissingAuthorization,
+    #[error("a colour batch carries a monochrome authorization")]
+    UnexpectedAuthorization,
+}
+
+/// Rejects settings the named snapshot cannot support. A colour card render
+/// (`card`) is exempt from covering every applicable control.
 pub fn validate_setting_sources(
     settings: &ControlSettings,
     card: bool,
+    render_class: RenderClass,
     reach: &SettingReach,
 ) -> Result<(), SettingsSourceError> {
     for entry in settings.entries() {
@@ -107,10 +135,15 @@ pub fn validate_setting_sources(
             });
         }
     }
-    if card {
+    if card && render_class == RenderClass::Colour {
         return Ok(());
     }
-    for key in reach.mapped.iter().chain(&reach.unmapped) {
+    let spatial = if render_class == RenderClass::Monochrome {
+        reach.spatial.as_slice()
+    } else {
+        &[]
+    };
+    for key in reach.mapped.iter().chain(&reach.unmapped).chain(spatial) {
         if settings.get(key).is_none() {
             return Err(SettingsSourceError::MissingLookAffectingControl { key: key.clone() });
         }
@@ -119,7 +152,16 @@ pub fn validate_setting_sources(
 }
 
 impl BatchManifest {
-    /// Rejects settings the named snapshot cannot support.
+    pub fn validate_render_class(&self) -> Result<(), RenderClassError> {
+        match (self.render_class, self.monochrome_authorization) {
+            (RenderClass::Monochrome, None) => Err(RenderClassError::MissingAuthorization),
+            (RenderClass::Colour, Some(_)) => Err(RenderClassError::UnexpectedAuthorization),
+            (RenderClass::Colour, None) | (RenderClass::Monochrome, Some(_)) => Ok(()),
+        }
+    }
+
+    /// Rejects settings the named snapshot cannot support. A colour card
+    /// render (`card`) is exempt from covering every applicable control.
     pub fn validate_setting_sources(
         &self,
         reach: &SettingReach,
@@ -127,6 +169,7 @@ impl BatchManifest {
         validate_setting_sources(
             &self.settings,
             matches!(self.intent, Intent::Card(_)),
+            self.render_class,
             reach,
         )
     }

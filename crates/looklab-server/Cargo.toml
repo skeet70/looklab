@@ -19,6 +19,7 @@ getrandom.workspace = true
 http-body-util.workspace = true
 looklab-color.workspace = true
 looklab-export.workspace = true
+looklab-meta.workspace = true
 looklab-model.workspace = true
 looklab-publish.workspace = true
 looklab-samples.workspace = true
@@ -40,6 +41,7 @@ webauthn-rs = { workspace = true, features = ["danger-credential-internals"] }
 webauthn-rs-core.workspace = true
 
 [dev-dependencies]
+p256.workspace = true
 tempfile.workspace = true
 tower.workspace = true
 webauthn-authenticator-rs.workspace = true

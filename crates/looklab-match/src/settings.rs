@@ -84,6 +84,7 @@ pub struct Plan {
     pub stages: Vec<Vec<usize>>,
     pub plan_controls: Vec<usize>,
     pub default: Settings,
+    assessed: Option<crate::domain::AssessedDomain>,
 }
 
 impl Plan {
@@ -133,7 +134,17 @@ impl Plan {
             stages,
             plan_controls,
             default,
+            assessed: None,
         })
+    }
+
+    pub fn with_assessed(mut self, assessed: crate::domain::AssessedDomain) -> Self {
+        self.assessed = Some(assessed);
+        self
+    }
+
+    pub fn assessed(&self) -> Option<&crate::domain::AssessedDomain> {
+        self.assessed.as_ref()
     }
 
     pub fn key(&self, index: usize) -> &ControlKey {

@@ -58,6 +58,7 @@ fn display_unpinned() -> LookDocument {
                 missing: BaseField::FilmSimulation,
             },
         },
+        declared_base: None,
         output: OutputEncoding::Srgb,
         lut: lut.record(),
         emulates: None,

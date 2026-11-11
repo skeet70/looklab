@@ -5,18 +5,26 @@
 #![cfg(feature = "synth")]
 #![allow(clippy::disallowed_types)]
 
+use looklab_body::Delta6;
 use looklab_color::RgbSpace;
 use looklab_color::ucs::delta_e_ucs;
 use looklab_fit::bootstrap::{BootstrapOptions, published_uncertainty};
 use looklab_fit::hierarchical::{
-    BodyData, FirmwareId, HierOptions, LookFamilyId, firmware_images, fit_hierarchical,
+    BodyData, BodyPin, BodyResume, BodyWarmStart, FamilyData, FamilyMode, FirmwareId, HierInput,
+    HierOptions, RealizationData, firmware_images, fit_hierarchical, fit_realizations,
 };
 use looklab_fit::synth::{ControlSynthConfig, MultiBodyConfig, SynthConfig, multi_body};
-use looklab_fit::{ComponentGauge, ImageIntent, WbModeClass};
-use looklab_fit::{FitOptions, ImageNuisances, SplitOptions, detect_split, project_images};
+use looklab_fit::{ComponentGauge, ExposureOffset, ImageIntent, WbModeClass};
+use looklab_fit::{
+    FitError, FitOptions, ImageNuisances, SplitOptions, detect_split, project_images,
+};
 #[cfg(feature = "full-scale")]
 use looklab_fit::{PROJECTION_DIM, SampleProjection};
 use looklab_model::probes::v1 as probes_v1;
+use looklab_model::{Look, Tone};
+use looklab_schema::{
+    BodyId, BodyRealizationId, ControlEpochId, FamilyTargetId, LookId, SimKey, TargetVersion,
+};
 
 fn fit_options() -> FitOptions {
     FitOptions {
@@ -59,10 +67,37 @@ fn config() -> MultiBodyConfig {
     }
 }
 
-fn body<'a>(data: &'a [BodyData], name: &str) -> &'a BodyData {
-    data.iter()
+fn body<'a>(data: &'a HierInput, name: &str) -> &'a BodyData {
+    data.bodies
+        .iter()
         .find(|body| body.id.as_str() == name)
         .expect("synthetic body exists")
+}
+
+fn family(index: u32) -> LookId {
+    LookId::new(&format!("family-{index}")).expect("synthetic family id")
+}
+
+fn target(index: u32) -> FamilyTargetId {
+    FamilyTargetId {
+        family: family(index),
+        version: TargetVersion::new(1).expect("one is a positive target version"),
+    }
+}
+
+fn firmware(body: &BodyId, version: &str) -> FirmwareId {
+    FirmwareId::new(body.clone(), ControlEpochId::new(1), version).expect("firmware identity")
+}
+
+fn free_input(bodies: Vec<BodyData>) -> HierInput {
+    HierInput {
+        families: vec![FamilyData {
+            target: target(0),
+            mode: FamilyMode::Fit { initial: None },
+            previous_support: None,
+        }],
+        bodies,
+    }
 }
 
 fn truth_exposure(body: &looklab_fit::synth::SynthBody, mode: looklab_fit::ExposureModeId) -> f64 {
@@ -95,8 +130,13 @@ fn multi_body_fit_timing() {
     let elapsed = start.elapsed();
     eprintln!(
         "hierarchical fit: {} bodies, {} images, {} evaluations, {:.1} s",
-        input.len(),
-        input.iter().map(|body| body.images.len()).sum::<usize>(),
+        input.bodies.len(),
+        input
+            .bodies
+            .iter()
+            .flat_map(|body| &body.realizations)
+            .map(|realization| realization.images.len())
+            .sum::<usize>(),
         fit.diagnostics.evaluations,
         elapsed.as_secs_f64()
     );
@@ -153,15 +193,15 @@ fn synthetic_bodies_recover_delta_exposure_wb_and_look() {
     }
 
     for (family, truth) in &data.truths {
-        let fitted = fit.look(*family).expect("fitted family");
+        let fitted = fit.family_of(family).expect("fitted family");
         let errors: Vec<f64> = probes_v1()
             .probes
             .iter()
             .map(|probe| delta_e_ucs(fitted.look.eval(probe.xyz), truth.eval(probe.xyz)))
             .collect();
         let value = median(errors);
-        eprintln!("look {} median dE: {value:.3}", family.0);
-        assert!(value <= 0.5, "look {} median {value}", family.0);
+        eprintln!("look {} median dE: {value:.3}", family.as_str());
+        assert!(value <= 0.5, "look {} median {value}", family.as_str());
     }
 }
 
@@ -195,12 +235,9 @@ fn one_body_update_refits_exactly_its_dependent_looks() {
     let last = body(&input, "body-2").id.clone();
     let middle = body(&input, "body-1").id.clone();
 
-    assert_eq!(fit.refit_cascade(&[first]), vec![LookFamilyId(0)]);
-    assert_eq!(fit.refit_cascade(&[last]), vec![LookFamilyId(1)]);
-    assert_eq!(
-        fit.refit_cascade(&[middle]),
-        vec![LookFamilyId(0), LookFamilyId(1)]
-    );
+    assert_eq!(fit.refit_cascade(&[first]), vec![target(0)]);
+    assert_eq!(fit.refit_cascade(&[last]), vec![target(1)]);
+    assert_eq!(fit.refit_cascade(&[middle]), vec![target(0), target(1)]);
 }
 
 #[cfg(feature = "full-scale")]
@@ -315,15 +352,10 @@ fn published_uncertainty_covers_held_out_bodies() {
     let mut after = 0usize;
     let mut regions = 0usize;
     for outer in 0..data.bodies.len() {
-        let all = data.body_data();
-        let training: Vec<looklab_fit::hierarchical::BodyData> = all
-            .into_iter()
-            .enumerate()
-            .filter(|(index, _)| *index != outer)
-            .map(|(_, body)| body)
-            .collect();
+        let mut training = data.body_data();
+        training.bodies.remove(outer);
         let fit = fit_hierarchical(&training, &coverage_options()).expect("hierarchical fit");
-        let parameters = fit.look(LookFamilyId(0)).expect("family 0 is fitted");
+        let parameters = fit.family(&target(0)).expect("family 0 is fitted");
         let published = published_uncertainty(
             &parameters.look,
             &parameters.pool,
@@ -393,6 +425,137 @@ fn published_uncertainty_covers_held_out_bodies() {
     assert!(after_fraction >= 0.85, "coverage {after_fraction}");
 }
 
+#[cfg(feature = "full-scale")]
+#[test]
+fn write_known_reference_workload() {
+    let Some(out) = std::env::var_os("LOOKLAB_ENGINE_REFERENCE_OUT") else {
+        return;
+    };
+    let fitter = std::env::var("LOOKLAB_ENGINE_FITTER").expect("LOOKLAB_ENGINE_FITTER");
+    let evaluator = std::env::var("LOOKLAB_ENGINE_EVALUATOR").expect("LOOKLAB_ENGINE_EVALUATOR");
+    let model = std::env::var("LOOKLAB_ENGINE_MODEL").expect("LOOKLAB_ENGINE_MODEL");
+    let data = multi_body(&coverage_config());
+    let truth = data
+        .truths
+        .iter()
+        .find(|(family, _)| *family == target(0).family)
+        .map(|(_, look)| look)
+        .expect("family truth");
+    let bodies: Vec<String> = data
+        .bodies
+        .iter()
+        .map(|body| body.id.as_str().to_owned())
+        .collect();
+    let mut trials = Vec::new();
+    for outer in 0..data.bodies.len() {
+        let held_body = data.bodies[outer].id.clone();
+        let training: Vec<String> = data
+            .bodies
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != outer)
+            .map(|(_, body)| body.id.as_str().to_owned())
+            .collect();
+        let mut training_input = data.body_data();
+        training_input.bodies.remove(outer);
+        let fit = fit_hierarchical(&training_input, &coverage_options()).expect("hierarchical fit");
+        let parameters = fit.family(&target(0)).expect("family 0 is fitted");
+        let published = published_uncertainty(
+            &parameters.look,
+            &parameters.pool,
+            &parameters.groups,
+            &parameters.probes,
+            &parameters.density,
+            &coverage_options().fit,
+            &BootstrapOptions {
+                resamples: 32,
+                seed: 0x0b00_7e57 ^ outer as u64,
+                leave_one_body_out: true,
+            },
+            parameters.clip_k,
+            None,
+            None,
+        )
+        .expect("published uncertainty");
+        let bins =
+            looklab_fit::model_error::MODEL_HUE_BINS * looklab_fit::model_error::MODEL_S_BINS;
+        let probes = probes_v1();
+        let mut after_sums = vec![0.0_f64; bins];
+        let mut probe_counts = vec![0.0_f64; bins];
+        for (index, probe) in probes.probes.iter().enumerate() {
+            let input = looklab_model::LookInput::new(probe.xyz);
+            let bin = looklab_fit::model_error::region(input.s, input.h_in);
+            after_sums[bin] += published.probes.probes[index].covariance[0][0]
+                + published.probes.probes[index].covariance[1][1]
+                + published.probes.probes[index].covariance[2][2];
+            probe_counts[bin] += 1.0;
+        }
+        let (held, held_counts) =
+            held_out_regions(&data, outer, &parameters.look, &coverage_options().fit);
+        for bin in 0..bins {
+            if held_counts[bin] <= 0.0 || probe_counts[bin] <= 0.0 {
+                continue;
+            }
+            let band = 2.5002 * (after_sums[bin] / probe_counts[bin]).max(0.0).sqrt();
+            trials.push(serde_json::json!({
+                "body": held_body.as_str(),
+                "cell": format!("cell-{bin}"),
+                "true_error_de": held[bin],
+                "band_90_de": band,
+                "recovered": held[bin] <= band,
+                "training_bodies": &training,
+                "held_out_body": true,
+                "out_of_gamut": false,
+                "marked_unsupported": false,
+            }));
+        }
+        for (index, probe) in probes.probes.iter().enumerate() {
+            if probe.id.as_str().split('-').nth(2) != Some("80") {
+                continue;
+            }
+            let estimate = &published.probes.probes[index];
+            if estimate.supported {
+                continue;
+            }
+            let predicted = looklab_fit::post_clip(
+                &parameters.look,
+                probe.xyz,
+                parameters.output_space,
+                parameters.clip_k,
+            );
+            let target_ucs = looklab_fit::post_clip(
+                truth,
+                probe.xyz,
+                parameters.output_space,
+                parameters.clip_k,
+            );
+            trials.push(serde_json::json!({
+                "body": held_body.as_str(),
+                "cell": format!("cell-{}", looklab_fit::model_error::cell(&looklab_model::LookInput::new(probe.xyz))),
+                "true_error_de": delta_e_ucs(predicted, target_ucs),
+                "band_90_de": 2.5002 * estimate.post_sigma_de,
+                "recovered": true,
+                "training_bodies": &training,
+                "held_out_body": true,
+                "out_of_gamut": true,
+                "marked_unsupported": true,
+            }));
+        }
+    }
+    let reference = serde_json::json!({
+        "format": "looklab-engine-reference/1",
+        "engine": format!("{fitter}|{evaluator}|{model}"),
+        "rule_revision": "engine-coverage/1",
+        "bodies": bodies,
+        "trials": trials,
+    });
+    std::fs::write(
+        out,
+        serde_json::to_vec_pretty(&reference).expect("workload json"),
+    )
+    .expect("write workload");
+}
+
 fn projected_body_images(
     data: &looklab_fit::synth::MultiBodyDataset,
 ) -> (
@@ -420,11 +583,42 @@ fn projected_body_images(
                 contributor: looklab_fit::ContributorId(body_index as u32),
                 weight: 1.0,
             });
-            firmware.push(tag.firmware);
+            firmware.push(tag.firmware.clone());
             images.push(image);
         }
     }
     (images, nuisances, firmware)
+}
+
+#[test]
+fn firmware_projection_reports_a_retained_row_outside_the_inverse_domain() {
+    let data = multi_body(&MultiBodyConfig {
+        seed: 0x51e2_0004,
+        bodies: 1,
+        images_per_body: 1,
+        samples_per_image: 32,
+        look_families: 1,
+        firmware: 1,
+        exposure_modes: 1,
+        wb_modes: 1,
+        ..MultiBodyConfig::default()
+    });
+    let mut base = data.truth(&family(0)).cloned().expect("truth look");
+    base.color.g.plane.fill(1.0e6);
+    base.color.g.volume.fill(1.0e6);
+    base.color.g.core.fill(1.0e6);
+    let (images, nuisances, firmware) = projected_body_images(&data);
+    let error = firmware_images(
+        &base,
+        &images,
+        &nuisances,
+        &firmware,
+        RgbSpace::Srgb,
+        &vec![0.03; images.len()],
+        &fit_options(),
+    )
+    .expect_err("a retained row outside the inverse domain must fail the projection");
+    assert!(matches!(error, FitError::Hierarchy(_)));
 }
 
 #[test]
@@ -439,7 +633,7 @@ fn a_silent_firmware_change_is_detected_through_the_projection_path() {
         firmware_shift: [2.0, 0.08],
         ..MultiBodyConfig::default()
     });
-    let base = data.truth(LookFamilyId(0)).expect("truth look");
+    let base = data.truth(&family(0)).expect("truth look");
     let (images, nuisances, firmware) = projected_body_images(&data);
     let projections = firmware_images(
         base,
@@ -447,7 +641,7 @@ fn a_silent_firmware_change_is_detected_through_the_projection_path() {
         &nuisances,
         &firmware,
         RgbSpace::Srgb,
-        0.03,
+        &vec![0.03; images.len()],
         &fit_options(),
     )
     .expect("projections");
@@ -538,8 +732,9 @@ fn firmware_offsets_have_the_observed_sign() {
         wb_modes: 1,
         ..MultiBodyConfig::default()
     });
+    let input = data.body_data();
     let fit = fit_hierarchical(
-        &data.body_data(),
+        &input,
         &HierOptions {
             fit: FitOptions {
                 max_samples_per_image: 250,
@@ -554,11 +749,11 @@ fn firmware_offsets_have_the_observed_sign() {
         },
     )
     .expect("hierarchical fit");
-    let parameters = fit.look(LookFamilyId(0)).expect("family 0");
+    let parameters = fit.family(&target(0)).expect("family 0");
     let offset = parameters
         .firmware
         .iter()
-        .find(|(id, _)| *id == FirmwareId(1))
+        .find(|(id, _)| id.version.as_str() == "1.1")
         .map(|(_, offset)| *offset)
         .expect("firmware 1 offset");
     assert!(offset[0] > 0.05, "tone offset {offset:?}");
@@ -578,10 +773,10 @@ fn persisted_gauge_body_is_kept() {
         ..MultiBodyConfig::default()
     });
     let mut input = data.body_data();
-    let extra = input[1].images[0].clone();
-    input[1].images.push(extra);
+    let extra = input.bodies[1].realizations[0].images[0].clone();
+    input.bodies[1].realizations[0].images.push(extra);
     let gauge = ComponentGauge {
-        designated: input[0].id.clone(),
+        designated: looklab_body::BodyId::new(input.bodies[0].id.as_str()).expect("gauge body"),
         exposure_mode: looklab_fit::ExposureModeId(0),
         wb_mode: WbModeClass(0),
         anchored_delta: true,
@@ -616,11 +811,21 @@ fn recipe_only_relationships_do_not_enter_the_cascade() {
         ..MultiBodyConfig::default()
     });
     let mut input = data.body_data();
-    let last = input.len() - 1;
-    let mut recipe = input[last].images[0].clone();
+    let last = input.bodies.len() - 1;
+    let mut recipe = input.bodies[last].realizations[0].images[0].clone();
     recipe.image.intent = ImageIntent::Recipe;
-    recipe.look = LookFamilyId(0);
-    input[last].images.push(recipe);
+    let last_body = input.bodies[last].id.clone();
+    input.bodies[last].realizations.push(RealizationData {
+        id: BodyRealizationId {
+            body: last_body.clone(),
+            epoch: ControlEpochId::new(2),
+            native_sim: SimKey::new("recipe").expect("recipe sim"),
+        },
+        target: target(0),
+        model: None,
+        images: vec![recipe],
+        warm: None,
+    });
     let options = HierOptions {
         fit: FitOptions {
             max_samples_per_image: 150,
@@ -634,15 +839,15 @@ fn recipe_only_relationships_do_not_enter_the_cascade() {
         ..HierOptions::default()
     };
     let fit = fit_hierarchical(&input, &options).expect("hierarchical fit");
-    let cascade = fit.refit_cascade(&[input[last].id.clone()]);
-    assert!(cascade.contains(&LookFamilyId(1)));
-    assert!(!cascade.contains(&LookFamilyId(0)));
-    let family = fit.look(LookFamilyId(0)).expect("family 0");
+    let cascade = fit.refit_cascade(std::slice::from_ref(&last_body));
+    assert!(cascade.contains(&target(1)));
+    assert!(!cascade.contains(&target(0)));
+    let family = fit.family(&target(0)).expect("family 0");
     assert!(
         !family
             .provenance
             .iter()
-            .any(|provenance| provenance.body == input[last].id),
+            .any(|provenance| provenance.body == last_body),
         "recipe-only body in Look 0 provenance"
     );
 }
@@ -674,17 +879,24 @@ fn recipe_images_do_not_move_the_published_look() {
     };
     let plain = fit_hierarchical(&data.body_data(), &options).expect("plain fit");
     let mut with_recipe = data.body_data();
-    let mut recipe = with_recipe[1].images[0].clone();
+    let mut recipe = with_recipe.bodies[1].realizations[0].images[0].clone();
     recipe.image.intent = ImageIntent::Recipe;
-    with_recipe[1].images.push(recipe);
+    let recipe_body = with_recipe.bodies[1].id.clone();
+    with_recipe.bodies[1].realizations.push(RealizationData {
+        id: BodyRealizationId {
+            body: recipe_body,
+            epoch: ControlEpochId::new(2),
+            native_sim: SimKey::new("recipe").expect("recipe sim"),
+        },
+        target: target(0),
+        model: None,
+        images: vec![recipe],
+        warm: None,
+    });
     let treated = fit_hierarchical(&with_recipe, &options).expect("recipe fit");
-    let left = plain
-        .look(LookFamilyId(0))
-        .expect("plain")
-        .look
-        .coef_vector();
+    let left = plain.family(&target(0)).expect("plain").look.coef_vector();
     let right = treated
-        .look(LookFamilyId(0))
+        .family(&target(0))
         .expect("recipe")
         .look
         .coef_vector();
@@ -706,7 +918,7 @@ fn single_body_bootstrap_draws_images() {
     });
     let result = looklab_fit::fit(&data.images, &fit_options()).expect("fit");
     let group = looklab_fit::BodyGroup {
-        body: looklab_body::BodyId::new("one").expect("id"),
+        body: BodyId::new("one").expect("id"),
         images: (0..data.images.len()).collect(),
     };
     let published = published_uncertainty(
@@ -742,7 +954,8 @@ fn control_body(
     dataset: &looklab_fit::synth::ControlledDataset,
     model: Option<looklab_fit::ControlResponseModel>,
 ) -> BodyData {
-    let id = looklab_body::BodyId::new("controlled").expect("body id");
+    let id = BodyId::new("controlled").expect("body id");
+    let body_id = looklab_body::BodyId::new("controlled").expect("body id");
     let a0 = dataset.images[0].transform;
     let prior = looklab_body::BodyPrior {
         source: looklab_body::A0Source::Dng,
@@ -754,23 +967,33 @@ fn control_body(
         .iter()
         .map(|image| looklab_fit::HierImage {
             image: image.clone(),
-            look: LookFamilyId(0),
-            firmware: FirmwareId(0),
+            firmware: firmware(&id, "1.0"),
             wb_mode: WbModeClass(0),
         })
         .collect();
+    let realization = RealizationData {
+        id: BodyRealizationId {
+            body: id.clone(),
+            epoch: ControlEpochId::new(1),
+            native_sim: SimKey::new("native").expect("native sim"),
+        },
+        target: target(0),
+        model,
+        images,
+        warm: None,
+    };
     BodyData {
-        id: id.clone(),
+        id,
         transform: looklab_body::InputTransform::prior(
-            id,
+            body_id,
             looklab_body::TransformVersion::new(1),
             prior,
         ),
         default_mode: looklab_fit::ExposureModeId(0),
         default_wb_mode: WbModeClass(0),
-        images,
         charts: Vec::new(),
-        model,
+        warm: None,
+        realizations: vec![realization],
     }
 }
 
@@ -826,18 +1049,21 @@ fn hierarchical_body_block_fits_control_responses() {
         ..HierOptions::default()
     };
     let with_model = fit_hierarchical(
-        &[control_body(&dataset, Some(dataset.truth_model.clone()))],
+        &free_input(vec![control_body(
+            &dataset,
+            Some(dataset.truth_model.clone()),
+        )]),
         &options,
     )
     .expect("controlled hierarchical fit");
-    let without_model = fit_hierarchical(&[control_body(&dataset, None)], &options)
+    let without_model = fit_hierarchical(&free_input(vec![control_body(&dataset, None)]), &options)
         .expect("uncontrolled hierarchical fit");
     assert!(
-        with_model.bodies[0].model.is_some(),
+        with_model.realizations[0].model.is_some(),
         "body block produced no control response"
     );
     let error = |fit: &looklab_fit::hierarchical::HierarchicalFit| {
-        let fitted = &fit.look(LookFamilyId(0)).expect("family 0").look;
+        let fitted = &fit.family(&target(0)).expect("family 0").look;
         median(
             probes_v1()
                 .probes
@@ -851,7 +1077,10 @@ fn hierarchical_body_block_fits_control_responses() {
     let fitted = error(&with_model);
     let bare = error(&without_model);
     eprintln!("controlled look median dE: with model {fitted:.3}, without {bare:.3}");
-    let model = with_model.bodies[0].model.as_ref().expect("fitted model");
+    let model = with_model.realizations[0]
+        .model
+        .as_ref()
+        .expect("fitted model");
     assert!(
         model.controls.iter().any(|control| control
             .values
@@ -860,14 +1089,14 @@ fn hierarchical_body_block_fits_control_responses() {
         "fitted control response is empty"
     );
     let difference = with_model
-        .look(LookFamilyId(0))
+        .family(&target(0))
         .expect("family 0")
         .look
         .coef_vector()
         .iter()
         .zip(
             without_model
-                .look(LookFamilyId(0))
+                .family(&target(0))
                 .expect("family 0")
                 .look
                 .coef_vector()
@@ -880,4 +1109,251 @@ fn hierarchical_body_block_fits_control_responses() {
         "control model did not change the Look fit"
     );
     assert!(fitted <= 0.75, "controlled look median {fitted}");
+}
+
+fn pinned_input(data: &looklab_fit::synth::MultiBodyDataset) -> HierInput {
+    let mut input = data.body_data();
+    input.families = data
+        .truths
+        .iter()
+        .map(|(family, look)| {
+            FamilyData::pinned(
+                FamilyTargetId {
+                    family: family.clone(),
+                    version: TargetVersion::new(1).expect("one is a positive target version"),
+                },
+                look.clone(),
+            )
+        })
+        .collect();
+    input
+}
+
+fn with_realization(input: &HierInput, index: usize) -> HierInput {
+    let mut out = input.clone();
+    for body in &mut out.bodies {
+        body.realizations = vec![body.realizations[index].clone()];
+    }
+    out
+}
+
+fn shifted(look: &Look) -> Look {
+    let mut out = look.clone();
+    if let Tone::Spline { c0, beta } = &out.tone {
+        out.tone = Tone::spline(*c0 + 0.25, *beta).expect("shifted tone spline");
+    }
+    out
+}
+
+fn exposure_of(
+    fit: &looklab_fit::hierarchical::RealizationFit,
+    body: &BodyId,
+    mode: looklab_fit::ExposureModeId,
+) -> f64 {
+    fit.body(body)
+        .expect("fitted body")
+        .exposure
+        .iter()
+        .find(|offset| offset.mode == mode)
+        .map_or(0.0, |offset| offset.offset)
+}
+
+#[test]
+fn pinned_realizations_keep_the_exact_target() {
+    let data = multi_body(&MultiBodyConfig {
+        seed: 0x51e2_0022,
+        bodies: 1,
+        images_per_body: 4,
+        samples_per_image: 200,
+        look_families: 2,
+        exposure_modes: 1,
+        wb_modes: 1,
+        ..MultiBodyConfig::default()
+    });
+    let input = pinned_input(&data);
+    let options = HierOptions {
+        fit: fit_options(),
+        outer_iterations: 1,
+        body_iterations: 2,
+        ..HierOptions::default()
+    };
+    let fit = fit_realizations(&input, &options).expect("pinned realization fit");
+    for (family, look) in &data.truths {
+        let pinned = fit
+            .families
+            .iter()
+            .find(|pinned| &pinned.target.family == family)
+            .expect("pinned family");
+        assert_eq!(
+            pinned.look.coef_vector(),
+            look.coef_vector(),
+            "pinned target moved"
+        );
+    }
+    assert!(
+        fit.state.families.is_empty(),
+        "pinned fit stored family coordinates"
+    );
+}
+
+#[test]
+fn shared_body_calibration_balances_every_realization() {
+    let data = multi_body(&MultiBodyConfig {
+        seed: 0x51e2_0021,
+        bodies: 2,
+        images_per_body: 6,
+        samples_per_image: 300,
+        look_families: 2,
+        exposure_modes: 1,
+        wb_modes: 1,
+        ..MultiBodyConfig::default()
+    });
+    let mut input = pinned_input(&data);
+    let (family_one, look_one) = &data.truths[1];
+    let corrupted = shifted(look_one);
+    for family in &mut input.families {
+        if &family.target.family == family_one {
+            family.mode = FamilyMode::Pinned(corrupted.clone());
+        }
+    }
+    let options = HierOptions {
+        fit: fit_options(),
+        outer_iterations: 3,
+        body_iterations: 6,
+        ..HierOptions::default()
+    };
+    let joint = fit_realizations(&input, &options).expect("joint pinned fit");
+    let first =
+        fit_realizations(&with_realization(&input, 0), &options).expect("first realization fit");
+    let second =
+        fit_realizations(&with_realization(&input, 1), &options).expect("second realization fit");
+    let body = input.bodies[1].id.clone();
+    let mode = input.bodies[1].default_mode;
+    let joint = exposure_of(&joint, &body, mode);
+    let first = exposure_of(&first, &body, mode);
+    let second = exposure_of(&second, &body, mode);
+    assert!(
+        (first - second).abs() > 1e-4,
+        "realizations do not discriminate: {first} vs {second}"
+    );
+    let low = first.min(second);
+    let high = first.max(second);
+    assert!(
+        joint >= low - 1e-3 && joint <= high + 1e-3,
+        "shared exposure {joint} outside [{low}, {high}]"
+    );
+}
+
+#[test]
+fn a_nonstationary_body_certificate_blocks_numerical_publication() {
+    let data = multi_body(&MultiBodyConfig {
+        seed: 0x51e2_0023,
+        bodies: 1,
+        images_per_body: 4,
+        samples_per_image: 200,
+        look_families: 2,
+        exposure_modes: 1,
+        wb_modes: 1,
+        ..MultiBodyConfig::default()
+    });
+    let mut input = pinned_input(&data);
+    let corrupted = shifted(&data.truths[0].1);
+    for family in &mut input.families {
+        family.mode = FamilyMode::Pinned(corrupted.clone());
+    }
+    let options = HierOptions {
+        fit: FitOptions {
+            max_samples_per_image: 200,
+            hessian_samples: 1200,
+            max_sweeps: 2,
+            sweep_budget: 200_000.0,
+            ..fit_options()
+        },
+        outer_iterations: 1,
+        body_iterations: 1,
+        ..HierOptions::default()
+    };
+    let fit = fit_realizations(&input, &options).expect("pinned realization fit");
+    let report = fit
+        .diagnostics
+        .body_certificate
+        .expect("body certificate computed");
+    assert!(
+        !report.certificate.is_certified_stationary(),
+        "a single body step certified stationarity"
+    );
+    assert!(
+        !fit.numerically_publishable(),
+        "a nonstationary body block was numerically publishable"
+    );
+}
+
+#[test]
+fn fixed_body_pin_keeps_shared_calibration() {
+    let data = multi_body(&MultiBodyConfig {
+        seed: 0x51e2_0024,
+        bodies: 1,
+        images_per_body: 4,
+        samples_per_image: 200,
+        look_families: 2,
+        exposure_modes: 1,
+        wb_modes: 1,
+        ..MultiBodyConfig::default()
+    });
+    let input = pinned_input(&data);
+    let body = &input.bodies[0];
+    let mut params = [0.0_f64; 6];
+    params[0] = 0.002;
+    let delta = Delta6::new(params).expect("valid delta");
+    let state = BodyWarmStart {
+        delta,
+        exposure: vec![ExposureOffset {
+            mode: body.default_mode,
+            offset: 0.25,
+        }],
+        wb: vec![(body.default_wb_mode, [0.1, -0.1])],
+    };
+    let resumes = vec![BodyResume {
+        id: body.id.clone(),
+        state: state.clone(),
+    }];
+    for pin in [
+        BodyPin::Native(resumes.clone()),
+        BodyPin::Published(resumes.clone()),
+    ] {
+        let options = HierOptions {
+            fit: fit_options(),
+            outer_iterations: 2,
+            body_iterations: 4,
+            body_pin: pin,
+            ..HierOptions::default()
+        };
+        let fit = fit_realizations(&input, &options).expect("fixed body fit");
+        let fitted = fit.body(&body.id).expect("fitted body");
+        assert_eq!(fitted.transform.delta().params(), delta.params());
+        let exposure = fitted
+            .exposure
+            .iter()
+            .find(|offset| offset.mode == body.default_mode)
+            .map_or(0.0, |offset| offset.offset);
+        assert!((exposure - 0.25).abs() < 1e-12, "fixed exposure moved");
+        let wb = fitted
+            .wb
+            .iter()
+            .find(|(mode, _)| *mode == body.default_wb_mode)
+            .map_or([0.0; 2], |(_, value)| *value);
+        assert!(
+            (wb[0] - 0.1).abs() < 1e-12 && (wb[1] + 0.1).abs() < 1e-12,
+            "fixed WB moved"
+        );
+        assert!(
+            fit.realizations
+                .iter()
+                .flat_map(|realization| realization.images.iter())
+                .any(|nuisance| nuisance.exposure.abs() > 1e-6
+                    || nuisance.wb_log_r.abs() > 1e-6
+                    || nuisance.wb_log_b.abs() > 1e-6),
+            "conditional realization locals were not fitted"
+        );
+    }
 }

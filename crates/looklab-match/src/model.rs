@@ -6,10 +6,13 @@ use looklab_model::realization::{
     ControlResponseModel, ControlValue, Realization, Settings, realize,
 };
 use looklab_model::{Look, LookInput};
-use looklab_schema::{ControlKey, SimKey};
+use looklab_schema::{
+    ControlKey, FirmwareId, MatchParams, MatchRealizationParams, OutputEncoding, SimKey, WbModeKey,
+};
 
 use crate::covariance::{ControlCovariance, CovarianceGroup, SparseDelta};
 use crate::error::{MatchError, Result};
+use crate::metric::{OutputPin, ScoringMetric};
 
 #[derive(Clone, Debug)]
 pub struct MatchModel {
@@ -21,6 +24,11 @@ pub struct MatchModel {
     pub groups: Vec<CovarianceGroup>,
     pub input_transform_version: u32,
     pub realization_params_version: u32,
+    pub output_encoding: OutputEncoding,
+    pub params: Option<MatchParams>,
+    pub realization: Option<MatchRealizationParams>,
+    pub wb_mode: Option<WbModeKey>,
+    pub firmware: Option<FirmwareId>,
 }
 
 impl MatchModel {
@@ -31,6 +39,7 @@ impl MatchModel {
         covariance: Option<ControlCovariance>,
         input_transform_version: u32,
         realization_params_version: u32,
+        output_encoding: OutputEncoding,
     ) -> Result<Self> {
         crm.validate()
             .map_err(|error| MatchError::Schema(error.to_string()))?;
@@ -48,7 +57,32 @@ impl MatchModel {
             groups,
             input_transform_version,
             realization_params_version,
+            output_encoding,
+            params: None,
+            realization: None,
+            wb_mode: None,
+            firmware: None,
         })
+    }
+
+    pub fn with_params(mut self, params: MatchParams) -> Result<Self> {
+        let transform = Mat3(params.transform.camera_to_xyz);
+        self.inverse = transform.inverse().ok_or(MatchError::SingularTransform)?;
+        self.transform = transform;
+        self.params = Some(params);
+        Ok(self)
+    }
+
+    pub fn with_realization(mut self, realization: MatchRealizationParams) -> Self {
+        self.realization_params_version = realization.version;
+        self.realization = Some(realization);
+        self
+    }
+
+    pub fn with_modes(mut self, wb_mode: Option<WbModeKey>, firmware: Option<FirmwareId>) -> Self {
+        self.wb_mode = wb_mode;
+        self.firmware = firmware;
+        self
     }
 
     pub fn sim(&self) -> &SimKey {
@@ -59,9 +93,70 @@ impl MatchModel {
         self.crm.version
     }
 
+    fn exposure_offset(
+        crm: &ControlResponseModel,
+        params: &MatchParams,
+        settings: &Settings,
+    ) -> f64 {
+        let mut total = 0.0;
+        for entry in &params.exposure {
+            for mode in &crm.exposure.modes {
+                if let ControlValue::Enum(value) = &mode.value
+                    && value.as_str() == entry.mode.as_str()
+                    && settings.get(&mode.control) == Some(&mode.value)
+                {
+                    total += entry.offset;
+                }
+            }
+        }
+        total
+    }
+
+    pub fn realized_look(&self) -> Result<Look> {
+        let mut look = self.base_look.clone();
+        if let Some(realization) = &self.realization {
+            let offset = realization
+                .firmware_offset(self.firmware.as_ref())
+                .map_err(|error| MatchError::Schema(error.to_owned()))?;
+            if let Some(offset) = offset {
+                look = looklab_fit::firmware_look(&look, offset);
+            }
+            look.clip.k = realization.clip_k;
+        }
+        Ok(look)
+    }
+
+    /// Body exposure/WB offsets as `(log R vs G, log B vs G)` and EV.
+    pub fn body_offsets(&self, settings: &Settings) -> Result<([f64; 2], f64)> {
+        let Some(params) = &self.params else {
+            return Ok(([0.0, 0.0], 0.0));
+        };
+        let wb = params
+            .wb_offset(self.wb_mode.as_ref())
+            .map_err(|error| MatchError::Schema(error.to_owned()))?;
+        Ok((wb, Self::exposure_offset(&self.crm, params, settings)))
+    }
+
     pub fn realize(&self, settings: &Settings) -> Result<Realization> {
-        realize(&self.base_look, &self.crm, settings)
-            .map_err(|error| MatchError::Schema(error.to_string()))
+        let look = self.realized_look()?;
+        let mut realization = realize(&look, &self.crm, settings)
+            .map_err(|error| MatchError::Schema(error.to_string()))?;
+        let (wb, exposure) = self.body_offsets(settings)?;
+        realization.exposure_ev += exposure;
+        realization.wb_gain[0] *= libm::exp(wb[0]);
+        realization.wb_gain[2] *= libm::exp(wb[1]);
+        Ok(realization)
+    }
+
+    pub fn output_pin(&self, realization: &Realization) -> OutputPin {
+        self.output_pin_for_look(&realization.look)
+    }
+
+    pub fn output_pin_for_look(&self, look: &Look) -> OutputPin {
+        OutputPin {
+            encoding: self.output_encoding,
+            clip_k: look.clip.k,
+        }
     }
 
     pub fn input_xyz(&self, realization: &Realization, xyz: Xyz) -> Xyz {
@@ -79,7 +174,7 @@ impl MatchModel {
         ]))
     }
 
-    pub fn input_ucs(
+    pub fn pre_clip_ucs(
         &self,
         realization: &Realization,
         xyz: Xyz,
@@ -101,9 +196,48 @@ impl MatchModel {
         realization.look.eval(input)
     }
 
-    pub fn predict(&self, settings: &Settings, xyz: Xyz) -> Result<Ucs> {
+    pub fn scored_ucs(&self, metric: ScoringMetric, realization: &Realization, xyz: Xyz) -> Ucs {
+        self.scored_ucs_shifted(metric, realization, xyz, [0.0, 0.0], 0.0)
+    }
+
+    pub fn scored_ucs_shifted(
+        &self,
+        metric: ScoringMetric,
+        realization: &Realization,
+        xyz: Xyz,
+        extra_wb: [f64; 2],
+        extra_exposure: f64,
+    ) -> Ucs {
+        let pre = self.pre_clip_ucs(realization, xyz, extra_wb, extra_exposure);
+        match metric {
+            ScoringMetric::LegacyPreClipV1 => pre,
+            ScoringMetric::RenderedPostClipV1 => self.output_pin(realization).render(pre),
+        }
+    }
+
+    pub(crate) fn try_scored_ucs_shifted(
+        &self,
+        metric: ScoringMetric,
+        realization: &Realization,
+        xyz: Xyz,
+        extra_wb: [f64; 2],
+        extra_exposure: f64,
+    ) -> Option<Ucs> {
+        let pre = self.pre_clip_ucs(realization, xyz, extra_wb, extra_exposure);
+        match metric {
+            ScoringMetric::LegacyPreClipV1 => Some(pre),
+            ScoringMetric::RenderedPostClipV1 => self.output_pin(realization).try_render(pre),
+        }
+    }
+
+    pub fn predict_pre_clip(&self, settings: &Settings, xyz: Xyz) -> Result<Ucs> {
         let realization = self.realize(settings)?;
-        Ok(self.input_ucs(&realization, xyz, [0.0, 0.0], 0.0))
+        Ok(self.pre_clip_ucs(&realization, xyz, [0.0, 0.0], 0.0))
+    }
+
+    pub fn render(&self, settings: &Settings, xyz: Xyz) -> Result<Ucs> {
+        let realization = self.realize(settings)?;
+        Ok(self.scored_ucs(ScoringMetric::RenderedPostClipV1, &realization, xyz))
     }
 
     pub fn scene_from_camera(&self, rgb: [f64; 3]) -> Xyz {
@@ -156,6 +290,15 @@ impl MatchModel {
         Ok((SparseDelta::from_entries(entries), wb, exposure))
     }
 
+    pub(crate) fn params_exposure_offset(&self, key: &ControlKey, value: &ControlValue) -> f64 {
+        let Some(params) = &self.params else {
+            return 0.0;
+        };
+        let mut single = Settings::new();
+        single.set(key.clone(), value.clone());
+        Self::exposure_offset(&self.crm, params, &single)
+    }
+
     pub fn coefficient_jacobian(
         &self,
         realization: &Realization,
@@ -200,6 +343,11 @@ impl MatchModel {
             groups: self.groups.clone(),
             input_transform_version: self.input_transform_version,
             realization_params_version: self.realization_params_version,
+            output_encoding: self.output_encoding,
+            params: self.params.clone(),
+            realization: self.realization.clone(),
+            wb_mode: self.wb_mode.clone(),
+            firmware: self.firmware.clone(),
         }
     }
 
@@ -211,7 +359,17 @@ impl MatchModel {
             self.covariance.clone(),
             self.input_transform_version,
             self.realization_params_version,
+            self.output_encoding,
         )
+        .and_then(|model| match &self.params {
+            Some(params) => model.with_params(params.clone()),
+            None => Ok(model),
+        })
+        .map(|model| match &self.realization {
+            Some(realization) => model.with_realization(realization.clone()),
+            None => model,
+        })
+        .map(|model| model.with_modes(self.wb_mode.clone(), self.firmware.clone()))
     }
 
     pub fn realization_module_version() -> &'static str {

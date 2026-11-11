@@ -6,7 +6,7 @@ use leptos::prelude::*;
 pub fn PrivacyPage() -> impl IntoView {
     view! {
         <article class="prose">
-            <h1>"Your photos stay with you"</h1>
+            <h1>"Your photos stay on your device"</h1>
             <p class="lede">"Browsing, comparing and matching looks is anonymous. Your photos are processed on your device, not uploaded."</p>
             <h2>"When you contribute"</h2>
             <p>"looklab extracts shuffled color samples and a short list of camera settings. No pixels, location, names or capture dates are sent. You can inspect what's being shared before you send it."</p>
@@ -17,6 +17,9 @@ pub fn PrivacyPage() -> impl IntoView {
                 <a href=crate::base::site_url("/me")>"Your contributions"</a>
                 " includes withdrawal. Withdrawing stops your samples counting toward new models; already published versions remain available."
             </p>
+            <h2>"Automatic error reports"</h2>
+            <p>"If the app fails, server-backed versions send the error category, page category, app build and application code locations to looklab. Reports contain no error messages, console arguments, photos, filenames, private links or profile identifiers. They are sent without sign-in credentials or cookies. Serverless previews send none."</p>
+            <p>"Reports stay private. Recent reports are available to the operator for 14 days, with at most 10,000 stored. Older reports are deleted when the next report arrives; backups have their own retention."</p>
             <crate::ui::Disclosure summary="Technical details and independent verification".to_owned()>
             <h2 id="limits">"What a served client can and cannot prove"</h2>
             <p>

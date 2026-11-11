@@ -3,7 +3,8 @@
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use looklab_schema::ProposalRef;
+use leptos_router::components::A;
+use looklab_schema::{ManualCheckReviewStatus, ManualOwnerLinkage, ProposalRef};
 
 use crate::data::{self, Decision, DecisionReceipt, Load, ModeratorProposal, ReviewQueue};
 use crate::ui;
@@ -53,6 +54,7 @@ enum ReviewTarget {
     FailedGate(usize),
     FitHold(usize),
     SerialReuse(usize),
+    ManualCheck(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,7 @@ enum QueueFilter {
     FailedGates,
     FitHolds,
     SharedCameras,
+    CameraChecks,
 }
 
 impl QueueFilter {
@@ -70,6 +73,7 @@ impl QueueFilter {
             "failed-gates" => Self::FailedGates,
             "fit-holds" => Self::FitHolds,
             "shared-cameras" => Self::SharedCameras,
+            "camera-checks" => Self::CameraChecks,
             _ => value.parse().map(Self::Proposal).unwrap_or(Self::All),
         }
     }
@@ -99,10 +103,23 @@ pub fn ModQueuePage() -> impl IntoView {
     let listing_notice = RwSignal::new(None::<String>);
     let revert_slug = RwSignal::new(String::new());
     let revert_version = RwSignal::new(String::new());
-    let revert_excluded = RwSignal::new(String::new());
+    let revert_rejected = RwSignal::new(String::new());
     let revert_reason = RwSignal::new(String::new());
     let revert_notice = RwSignal::new(None::<String>);
-    let filter = RwSignal::new(QueueFilter::All);
+    let block_credential = RwSignal::new(String::new());
+    let block_reason = RwSignal::new(String::new());
+    let block_notice = RwSignal::new(None::<String>);
+    let reanchor_slug = RwSignal::new(String::new());
+    let reanchor_version = RwSignal::new(String::new());
+    let reanchor_reason = RwSignal::new(String::new());
+    let reanchor_notice = RwSignal::new(None::<String>);
+    let filter = RwSignal::new(QueueFilter::parse(
+        leptos_router::hooks::use_query_map()
+            .get_untracked()
+            .get("filter")
+            .unwrap_or_default()
+            .as_str(),
+    ));
     let expiry_timer = StoredValue::new(None::<leptos::leptos_dom::helpers::TimeoutHandle>);
     on_cleanup(move || {
         if let Some(timer) = expiry_timer.get_value() {
@@ -313,7 +330,7 @@ pub fn ModQueuePage() -> impl IntoView {
             revert_notice.set(Some("A reason is required.".to_owned()));
             return;
         }
-        let excluded: Vec<String> = revert_excluded
+        let rejected: Vec<String> = revert_rejected
             .get_untracked()
             .split(|character: char| character == ',' || character.is_whitespace())
             .filter(|id| !id.is_empty())
@@ -322,13 +339,79 @@ pub fn ModQueuePage() -> impl IntoView {
         busy.set(true);
         revert_notice.set(None);
         spawn_local(async move {
-            let outcome = data::revert_look(&look, version, &excluded, &reason).await;
+            let outcome = data::revert_look(&look, version, &rejected, &reason).await;
             busy.set(false);
             revert_notice.set(Some(match outcome {
+                Ok(receipt) => {
+                    let restoration = match receipt.restoration {
+                        data::Restoration::Current => "the current target",
+                        data::Restoration::HistoricalNeedsRebuild { .. } => {
+                            "a historical copy that needs rebuilding"
+                        }
+                    };
+                    format!(
+                        "Reverted {look} to version {} and published version {} as {restoration}.",
+                        receipt.target_version, receipt.new_version
+                    )
+                }
+                Err(error) => error,
+            }));
+        });
+    };
+
+    let block_intake = move |_| {
+        let credential = block_credential.get_untracked().trim().to_owned();
+        if credential.is_empty() {
+            block_notice.set(Some("Enter the profile's internal ID.".to_owned()));
+            return;
+        }
+        let reason = block_reason.get_untracked().trim().to_owned();
+        if reason.is_empty() {
+            block_notice.set(Some("A reason is required.".to_owned()));
+            return;
+        }
+        busy.set(true);
+        block_notice.set(None);
+        spawn_local(async move {
+            let outcome = data::block_intake(&credential, &reason).await;
+            busy.set(false);
+            block_notice.set(Some(match outcome {
                 Ok(receipt) => format!(
-                    "Reverted {look} to version {} and published version {}.",
-                    receipt.target_version, receipt.new_version
+                    "Blocked {} from new contributions. Withdrawal and status access remain available.",
+                    receipt.credential
                 ),
+                Err(error) => error,
+            }));
+        });
+    };
+
+    let reanchor_look = move |_| {
+        let look = reanchor_slug.get_untracked().trim().to_owned();
+        if look.is_empty() {
+            reanchor_notice.set(Some("Enter the Look slug.".to_owned()));
+            return;
+        }
+        let version = match reanchor_version.get_untracked().trim().parse::<u32>() {
+            Ok(version) if version > 0 => version,
+            _ => {
+                reanchor_notice.set(Some(
+                    "Enter the released version number to anchor.".to_owned(),
+                ));
+                return;
+            }
+        };
+        let reason = reanchor_reason.get_untracked().trim().to_owned();
+        if reason.is_empty() {
+            reanchor_notice.set(Some("A reason is required.".to_owned()));
+            return;
+        }
+        busy.set(true);
+        reanchor_notice.set(None);
+        spawn_local(async move {
+            let outcome = data::reanchor_look(&look, version, &reason).await;
+            busy.set(false);
+            reanchor_notice.set(Some(match outcome {
+                Ok(receipt) => format!("Anchored {} at version {}.", receipt.look, receipt.version),
                 Err(error) => error,
             }));
         });
@@ -373,62 +456,115 @@ pub fn ModQueuePage() -> impl IntoView {
         <h1>"Review queue"</h1>
         <p class="lede">"Check the evidence. Explain the decision. Help keep camera data useful."</p>
         {(!available).then(ui::preview_notice)}
-        <section aria-labelledby="session" hidden=move || !available || !can_moderate()>
+        <section class="review-session" aria-labelledby="session" hidden=move || !available || !can_moderate()>
             <h2 id="session">"Confirm it's you"</h2>
-            <p>"Use your passkey once to open a short-lived review session."</p>
-            {move || {
-                if session.get() {
-                    view! { <p class="muted" id="mod-session">"Session open."</p> }.into_any()
-                } else {
-                    view! {
-                        <button
-                            type="button"
-                            id="mod-open-session"
-                            disabled=move || busy.get() || !available
-                            on:click=open_session
-                        >
-                            "Confirm it's you"
-                        </button>
+            <p class="muted">"Use your passkey once to open a short-lived review session."</p>
+            <div class="field-row">
+                {move || {
+                    if session.get() {
+                        view! { <p class="muted" id="mod-session">"Session open."</p> }.into_any()
+                    } else {
+                        view! {
+                            <button
+                                type="button"
+                                id="mod-open-session"
+                                disabled=move || busy.get() || !available
+                                on:click=open_session
+                            >
+                                "Confirm it's you"
+                            </button>
+                        }
+                            .into_any()
                     }
-                        .into_any()
-                }
-            }}
+                }}
+            </div>
             {move || {
                 notice
                     .get()
                     .map(|text| view! { <p class="error" role="alert">{text}</p> })
             }}
         </section>
-        <section aria-labelledby="look-listing" hidden=move || !available || !can_moderate() || !session.get()>
-            <h2 id="look-listing">"Look listing"</h2>
-            <p class="muted">"Hide or remove a LUT Look that a native Look supersedes, or relist one."</p>
-            <label for="mod-look-slug">"Look slug"</label>
-            <input id="mod-look-slug" type="text" on:input=move |event| look_slug.set(event_target_value(&event))/>
-            <label for="mod-look-reason">"Reason"</label>
-            <input id="mod-look-reason" type="text" on:input=move |event| reason.set(event_target_value(&event))/>
-            <div class="field-row">
-                <button type="button" id="mod-look-hide" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Hide)>"Hide"</button>
-                <button type="button" id="mod-look-remove" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Remove)>"Remove"</button>
-                <button type="button" id="mod-look-relist" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Relist)>"Relist"</button>
-            </div>
-            {move || listing_notice.get().map(|text| view! { <p class="muted" role="status">{text}</p> })}
-        </section>
-        <section aria-labelledby="look-revert" hidden=move || !available || !can_moderate() || !session.get()>
-            <h2 id="look-revert">"Revert a Look"</h2>
-            <p class="muted">"Publish a released version's content as a new version, then refit without the excluded profiles."</p>
-            <label for="mod-revert-slug">"Look slug"</label>
-            <input id="mod-revert-slug" type="text" on:input=move |event| revert_slug.set(event_target_value(&event))/>
-            <label for="mod-revert-version">"Version to restore"</label>
-            <input id="mod-revert-version" type="number" min="1" on:input=move |event| revert_version.set(event_target_value(&event))/>
-            <label for="mod-revert-excluded">"Exclude profiles (comma separated internal IDs)"</label>
-            <input id="mod-revert-excluded" type="text" on:input=move |event| revert_excluded.set(event_target_value(&event))/>
-            <label for="mod-revert-reason">"Reason"</label>
-            <input id="mod-revert-reason" type="text" on:input=move |event| revert_reason.set(event_target_value(&event))/>
-            <div class="field-row">
-                <button type="button" id="mod-revert-submit" disabled=move || busy.get() on:click=revert_look>"Revert and exclude"</button>
-            </div>
-            {move || revert_notice.get().map(|text| view! { <p class="muted" role="status">{text}</p> })}
-        </section>
+        <div class="review-look-actions" hidden=move || !available || !can_moderate() || !session.get()>
+            <ui::Disclosure summary="Look actions".to_owned()>
+                <div class="review-maintenance">
+                    <section aria-labelledby="look-listing">
+                        <h2 id="look-listing">"Look listing"</h2>
+                        <p class="muted">"Hide or remove a LUT Look that a native Look supersedes, or relist one."</p>
+                        <div class="review-form-grid">
+                            <label for="mod-look-slug">"Look slug"
+                                <input id="mod-look-slug" type="text" on:input=move |event| look_slug.set(event_target_value(&event))/>
+                            </label>
+                            <label for="mod-look-reason">"Reason"
+                                <input id="mod-look-reason" type="text" on:input=move |event| reason.set(event_target_value(&event))/>
+                            </label>
+                        </div>
+                        <div class="field-row">
+                            <button type="button" id="mod-look-hide" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Hide)>"Hide"</button>
+                            <button type="button" id="mod-look-remove" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Remove)>"Remove"</button>
+                            <button type="button" id="mod-look-relist" disabled=move || busy.get() on:click=move |_| moderate_listing(data::LookListingAction::Relist)>"Relist"</button>
+                        </div>
+                        {move || listing_notice.get().map(|text| view! { <p class="muted" role="status">{text}</p> })}
+                    </section>
+                    <section aria-labelledby="look-revert">
+                        <h2 id="look-revert">"Revert a Look"</h2>
+                        <p class="muted">"Publish a released version's content as a new version and reject the named contributions. Other contributions from the same profile keep their weight."</p>
+                        <div class="review-form-grid">
+                            <label for="mod-revert-slug">"Look slug"
+                                <input id="mod-revert-slug" type="text" on:input=move |event| revert_slug.set(event_target_value(&event))/>
+                            </label>
+                            <label for="mod-revert-version">"Version to restore"
+                                <input id="mod-revert-version" type="number" min="1" on:input=move |event| revert_version.set(event_target_value(&event))/>
+                            </label>
+                            <label for="mod-revert-rejected">"Reject contributions (comma separated internal IDs)"
+                                <input id="mod-revert-rejected" type="text" on:input=move |event| revert_rejected.set(event_target_value(&event))/>
+                            </label>
+                            <label for="mod-revert-reason">"Reason"
+                                <input id="mod-revert-reason" type="text" on:input=move |event| revert_reason.set(event_target_value(&event))/>
+                            </label>
+                        </div>
+                        <div class="field-row">
+                            <button type="button" id="mod-revert-submit" disabled=move || busy.get() on:click=revert_look>"Revert and reject"</button>
+                        </div>
+                        {move || revert_notice.get().map(|text| view! { <p class="muted" role="status">{text}</p> })}
+                    </section>
+                    <section aria-labelledby="profile-block">
+                        <h2 id="profile-block">"Block future contributions"</h2>
+                        <p class="muted">"Denies new photo uploads, manual confirmations, proposals and fixture donations from one profile. Existing data, withdrawal, status access and sign-in stay available."</p>
+                        <div class="review-form-grid">
+                            <label for="mod-block-credential">"Profile internal ID"
+                                <input id="mod-block-credential" type="text" on:input=move |event| block_credential.set(event_target_value(&event))/>
+                            </label>
+                            <label for="mod-block-reason">"Reason"
+                                <input id="mod-block-reason" type="text" on:input=move |event| block_reason.set(event_target_value(&event))/>
+                            </label>
+                        </div>
+                        <div class="field-row">
+                            <button type="button" id="mod-block-submit" disabled=move || busy.get() on:click=block_intake>"Block future contributions"</button>
+                        </div>
+                        {move || block_notice.get().map(|text| view! { <p class="muted" role="status">{text}</p> })}
+                    </section>
+                    <section aria-labelledby="look-reanchor">
+                        <h2 id="look-reanchor">"Re-anchor a Look"</h2>
+                        <p class="muted">"Start the cumulative release gate at a released version. The action is logged with its reason."</p>
+                        <div class="review-form-grid">
+                            <label for="mod-reanchor-slug">"Look slug"
+                                <input id="mod-reanchor-slug" type="text" on:input=move |event| reanchor_slug.set(event_target_value(&event))/>
+                            </label>
+                            <label for="mod-reanchor-version">"Released version"
+                                <input id="mod-reanchor-version" type="number" min="1" on:input=move |event| reanchor_version.set(event_target_value(&event))/>
+                            </label>
+                            <label for="mod-reanchor-reason">"Reason"
+                                <input id="mod-reanchor-reason" type="text" on:input=move |event| reanchor_reason.set(event_target_value(&event))/>
+                            </label>
+                        </div>
+                        <div class="field-row">
+                            <button type="button" id="mod-reanchor-submit" disabled=move || busy.get() on:click=reanchor_look>"Re-anchor"</button>
+                        </div>
+                        {move || reanchor_notice.get().map(|text| view! { <p class="muted" role="status">{text}</p> })}
+                    </section>
+                </div>
+            </ui::Disclosure>
+        </div>
         <ui::Tabs tabs=tabs() selected=tab_ui>
         <div tabindex="0" aria-label="Proposal queue, use j and k to navigate" hidden=move || tab.get() != ReviewTab::Queue on:keydown=move |event| {
             if event.target().and_then(|target| wasm_bindgen::JsCast::dyn_into::<web_sys::Element>(target).ok()).is_some_and(|element| matches!(element.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT")) { return; }
@@ -443,24 +579,27 @@ pub fn ModQueuePage() -> impl IntoView {
                 activate(items[next].clone());
             }
         }>
-        <div class="review-filters">
+        <div class="field-row review-filters">
             <label for="review-filter">"Item type"</label>
             <select id="review-filter" on:change=move |event| filter.set(QueueFilter::parse(&event_target_value(&event)))>
-                <option value="">"All types"</option>
+                <option value="" selected=move || filter.get() == QueueFilter::All>"All types"</option>
                 {looklab_schema::ProposalKind::ALL.into_iter().map(|kind| view! {
-                    <option value=kind.as_str()>{move || format!("{} ({})", crate::proposal_form::kind_label(kind), match queue.get() {
+                    <option value=kind.as_str() selected=move || filter.get() == QueueFilter::Proposal(kind)>{move || format!("{} ({})", crate::proposal_form::kind_label(kind), match queue.get() {
                         Load::Ready(items) => items.proposals.iter().filter(|item| item.kind == kind).count(),
                         _ => 0,
                     })}</option>
                 }).collect_view()}
-                <option value="failed-gates">{move || format!("Release checks ({})", match queue.get() {
+                <option value="failed-gates" selected=move || filter.get() == QueueFilter::FailedGates>{move || format!("Release checks ({})", match queue.get() {
                     Load::Ready(items) => items.failed_gates.len(), _ => 0,
                 })}</option>
-                <option value="fit-holds">{move || format!("Fit not converging ({})", match queue.get() {
+                <option value="fit-holds" selected=move || filter.get() == QueueFilter::FitHolds>{move || format!("Fit not converging ({})", match queue.get() {
                     Load::Ready(items) => items.fit_holds.len(), _ => 0,
                 })}</option>
-                <option value="shared-cameras">{move || format!("Shared camera flags ({})", match queue.get() {
+                <option value="shared-cameras" selected=move || filter.get() == QueueFilter::SharedCameras>{move || format!("Shared camera flags ({})", match queue.get() {
                     Load::Ready(items) => items.serial_reuse.len(), _ => 0,
+                })}</option>
+                <option value="camera-checks" selected=move || filter.get() == QueueFilter::CameraChecks>{move || format!("Camera checks ({})", match queue.get() {
+                    Load::Ready(items) => items.manual_checks.len(), _ => 0,
                 })}</option>
             </select>
             <p class="muted">"Use j and k to move through items."</p>
@@ -473,7 +612,7 @@ pub fn ModQueuePage() -> impl IntoView {
             match queue.get() {
                 Load::Loading => ui::loading().into_any(),
                 Load::Failed(error) => ui::failure(&error).into_any(),
-                Load::Ready(queue) if queue.proposals.is_empty() && queue.failed_gates.is_empty() && queue.fit_holds.is_empty() && queue.serial_reuse.is_empty() => {
+                Load::Ready(queue) if queue.proposals.is_empty() && queue.failed_gates.is_empty() && queue.fit_holds.is_empty() && queue.serial_reuse.is_empty() && queue.manual_checks.is_empty() => {
                     view! { <p class="muted">"Nothing is waiting for moderation."</p> }.into_any()
                 }
                 Load::Ready(queue) => {
@@ -548,6 +687,31 @@ pub fn ModQueuePage() -> impl IntoView {
                                     </button>
                                     <p>{format!("{} contributions need a check.", flag.contributions.len())}</p>
                                 </li>
+                            }).collect_view()}
+                        </ul>
+                        <ul class="activity-list" hidden=move || !matches!(filter.get(), QueueFilter::All | QueueFilter::CameraChecks)>
+                            {queue.manual_checks.into_iter().enumerate().map(|(index, check)| {
+                                let title = format!(
+                                    "{} {}: {}",
+                                    check.camera.make(),
+                                    check.camera.model(),
+                                    check.label
+                                );
+                                let detail = format!(
+                                    "Firmware {} · {} · {}",
+                                    check.firmware.as_str(),
+                                    super::body::finding_text(&check.finding),
+                                    manual_check_status_text(&check.status)
+                                );
+                                view! {
+                                    <li>
+                                        <button type="button" on:click=move |_| activate(ReviewTarget::ManualCheck(index))>
+                                            {title}
+                                        </button>
+                                        <p>{detail}</p>
+                                        <small>{ui::timestamp(check.submitted_at)}</small>
+                                    </li>
+                                }
                             }).collect_view()}
                         </ul>
                         </div>
@@ -707,6 +871,47 @@ pub fn ModQueuePage() -> impl IntoView {
                         <p>"Sharing a camera is not evidence of misuse. No trust change happens automatically."</p>
                     </section>
                 }.into_any()).unwrap_or_else(|| ().into_any()),
+                Some(ReviewTarget::ManualCheck(index)) => queue.manual_checks.get(index).map(|check| {
+                    let camera_path = format!(
+                        "/cameras/{}?control={}#manual-moderation",
+                        check.camera.as_str(),
+                        check.control.as_str()
+                    );
+                    let definition = check.definition_digest.to_string();
+                    let linkage = match &check.owner_linkage {
+                        ManualOwnerLinkage::Linked => {
+                            "Linked to this camera by a photo contribution."
+                        }
+                        ManualOwnerLinkage::Unlinked => {
+                            "No photo contribution links this profile to the camera."
+                        }
+                    };
+                    view! {
+                        <section>
+                            <button type="button" class="review-back" on:click=move |_| selected_alert.set(None)>"Back to queue"</button>
+                            <h2>{format!("{} {}: {}", check.camera.make(), check.camera.model(), check.label)}</h2>
+                            <p class="muted"><code>{check.control.as_str()}</code></p>
+                            <dl class="manual-check-detail">
+                                <dt>"Firmware"</dt>
+                                <dd>{check.firmware.as_str().to_owned()}</dd>
+                                <dt>"Submitted finding"</dt>
+                                <dd>{super::body::finding_text(&check.finding)}</dd>
+                                <dt>"Review status"</dt>
+                                <dd>{manual_check_status_text(&check.status)}</dd>
+                                <dt>"Submission"</dt>
+                                <dd>"Latest active check for this control and firmware."</dd>
+                                <dt>"Owner linkage"</dt>
+                                <dd>{linkage}</dd>
+                                <dt>"Submitted definition digest"</dt>
+                                <dd><code>{definition}</code></dd>
+                                <dt>"Submitted"</dt>
+                                <dd>{ui::timestamp(check.submitted_at)}</dd>
+                            </dl>
+                            <p class="muted">"A moderator decision cites evidence for this control. It does not change the schema or enable RAW decoding or fitting."</p>
+                            <p><A href=crate::base::site_url(&camera_path)>"Open this control's camera review"</A></p>
+                        </section>
+                    }
+                }.into_any()).unwrap_or_else(|| ().into_any()),
                 _ => ().into_any(),
             }
         })}
@@ -745,9 +950,25 @@ pub fn ModQueuePage() -> impl IntoView {
             <label for="mod-template">"Common reasons"</label>
             <select id="mod-template" on:change=move |event| reason.set(event_target_value(&event))>
                 <option value="">"Choose a reason or write your own"</option>
-                <option>"The sample files confirm this camera menu."</option>
-                <option>"Please share a sample file showing this menu."</option>
-                <option>"The proposed change does not match the supplied evidence."</option>
+                {move || {
+                    let presets = match pending_decision.get() {
+                        Decision::Approve => [
+                            "The supplied evidence supports this change.",
+                            "The schema matches the documented camera controls.",
+                        ],
+                        Decision::Reject => [
+                            "The proposed change does not match the supplied evidence.",
+                            "The proposed change is outside the supported scope.",
+                        ],
+                        Decision::RequestInfo => [
+                            "Please provide evidence supporting the proposed change.",
+                            "Please clarify the controls and firmware this change applies to.",
+                        ],
+                    };
+                    presets.into_iter().map(|preset| view! {
+                        <option>{preset}</option>
+                    }).collect_view()
+                }}
             </select>
             <label for="mod-reason">"Reason (required)"</label>
             <textarea id="mod-reason" rows="3" prop:value=move || reason.get()
@@ -810,7 +1031,19 @@ fn review_targets(queue: &ReviewQueue, filter: QueueFilter) -> Vec<ReviewTarget>
     if matches!(filter, QueueFilter::All | QueueFilter::SharedCameras) {
         targets.extend((0..queue.serial_reuse.len()).map(ReviewTarget::SerialReuse));
     }
+    if matches!(filter, QueueFilter::All | QueueFilter::CameraChecks) {
+        targets.extend((0..queue.manual_checks.len()).map(ReviewTarget::ManualCheck));
+    }
     targets
+}
+
+fn manual_check_status_text(status: &ManualCheckReviewStatus) -> &'static str {
+    match status {
+        ManualCheckReviewStatus::Counted => "counted toward agreement",
+        ManualCheckReviewStatus::Pending => "pending review",
+        ManualCheckReviewStatus::StaleDefinition => "older control definition",
+        ManualCheckReviewStatus::Reviewed => "reviewed by moderator evidence",
+    }
 }
 
 fn violation_summary(violation: &looklab_trust::Violation) -> &'static str {

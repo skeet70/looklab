@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use looklab_server::client_errors::BuildId;
 use looklab_server::operator::AdminSubject;
 use looklab_server::{Config, operator};
 
@@ -13,9 +14,12 @@ usage:
   looklab-server init [--config <path>]
   looklab-server bootstrap-admin [--config <path>]
       (--credential <uuid> | --display-handle <name>) [--reason <text>]
+  looklab-server client-errors [--config <path>] [--limit <n>] [--json]
+      [--release <build-id>]
 
   init             create state directories, the server secret and the migrated database
   bootstrap-admin  grant admin to one registered credential through the audited CLI actor
+  client-errors    print private diagnostic reports newest first (read-only; limit <= 1000)
   serve            run the HTTP server (default)
 
 environment overrides:
@@ -35,6 +39,12 @@ enum Command {
         credential: Option<String>,
         display_handle: Option<String>,
         reason: String,
+    },
+    ClientErrors {
+        config: Option<PathBuf>,
+        limit: usize,
+        json: bool,
+        release: Option<BuildId>,
     },
 }
 
@@ -78,6 +88,17 @@ async fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Command::ClientErrors {
+            config,
+            limit,
+            json,
+            release,
+        } => {
+            let config = Config::load(config.as_deref())?;
+            let reports = operator::client_error_reports(&config, limit, release.as_ref()).await?;
+            operator::write_client_error_reports(std::io::stdout().lock(), &reports, json)?;
+            Ok(())
+        }
     }
 }
 
@@ -95,6 +116,15 @@ fn parse() -> anyhow::Result<Command> {
                 credential: None,
                 display_handle: None,
                 reason: "first admin bootstrap".to_owned(),
+            }
+        }
+        Some("client-errors") => {
+            args.next();
+            Command::ClientErrors {
+                config: None,
+                limit: 50,
+                json: false,
+                release: None,
             }
         }
         Some("serve") => {
@@ -161,7 +191,62 @@ fn parse() -> anyhow::Result<Command> {
                 }
                 other => anyhow::bail!("unexpected argument {other:?}; try --help"),
             },
+            Command::ClientErrors {
+                config,
+                limit,
+                json,
+                release,
+            } => match arg.as_str() {
+                "--help" | "-h" => {
+                    print!("{USAGE}");
+                    std::process::exit(0);
+                }
+                "--config" => {
+                    let Some(path) = args.next() else {
+                        anyhow::bail!("--config needs a path");
+                    };
+                    *config = Some(PathBuf::from(path));
+                }
+                "--limit" => {
+                    let Some(value) = args.next() else {
+                        anyhow::bail!("--limit needs a number");
+                    };
+                    *limit = parse_limit(&value)?;
+                }
+                "--json" => *json = true,
+                "--release" => {
+                    let Some(value) = args.next() else {
+                        anyhow::bail!("--release needs a build id");
+                    };
+                    *release = Some(BuildId::parse(&value).map_err(|_| {
+                        anyhow::anyhow!("--release needs 64 lowercase hexadecimal characters")
+                    })?);
+                }
+                other if other.starts_with("--config=") => {
+                    *config = Some(PathBuf::from(&other["--config=".len()..]));
+                }
+                other if other.starts_with("--limit=") => {
+                    *limit = parse_limit(&other["--limit=".len()..])?;
+                }
+                other if other.starts_with("--release=") => {
+                    let value = &other["--release=".len()..];
+                    *release = Some(BuildId::parse(value).map_err(|_| {
+                        anyhow::anyhow!("--release needs 64 lowercase hexadecimal characters")
+                    })?);
+                }
+                other => anyhow::bail!("unexpected argument {other:?}; try --help"),
+            },
         }
     }
     Ok(command)
+}
+
+fn parse_limit(value: &str) -> anyhow::Result<usize> {
+    let limit: usize = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--limit needs a number"))?;
+    if !(1..=1_000).contains(&limit) {
+        anyhow::bail!("--limit must be between 1 and 1000");
+    }
+    Ok(limit)
 }

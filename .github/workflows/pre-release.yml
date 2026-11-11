@@ -15,6 +15,7 @@ jobs:
   trust_integration:
     name: compact fitter-to-trust integration
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -31,7 +32,7 @@ jobs:
             target/release/build
             target/release/.fingerprint
       - name: Compact fitter-to-trust contracts
-        run: nix develop -c cargo nextest run --locked -p looklab-trust --features integration --release --test compact --no-fail-fast --ignore-default-filter
+        run: nix develop -c cargo nextest run --locked -p looklab-trust --features integration --release --profile pre-release --test compact --no-fail-fast --ignore-default-filter
       - uses: ./.github/actions/cache
         if: ${{ !cancelled() }}
         with:
@@ -47,6 +48,7 @@ jobs:
   worker_integration:
     name: worker fitter-to-trust integration
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
@@ -63,7 +65,7 @@ jobs:
             target/release/build
             target/release/.fingerprint
       - name: Worker fitter-to-trust contracts
-        run: nix develop -c cargo nextest run --locked -p looklab-worker --features integration --release --test worker --test lut_rebase --test match_bundle --no-fail-fast --ignore-default-filter
+        run: nix develop -c cargo nextest run --locked -p looklab-worker --features integration --release --profile pre-release --test worker --test lut_rebase --test match_bundle --no-fail-fast --ignore-default-filter
       - uses: ./.github/actions/cache
         if: ${{ !cancelled() }}
         with:

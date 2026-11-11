@@ -28,14 +28,14 @@ pub use image::Image3;
 pub use jpeg::{DecodedJpeg, decode_jpeg};
 pub use mask::{Mask, MaskCounts, MaskOptions, build_mask};
 pub use pair::{
-    BodyKey, FileKind, JpegMember, JpegRole, LocalImageKey, PairingFile, PairingOutcome, RawFormat,
-    RawPair, UnpairedFile, UnpairedReason, pair,
+    CameraIdentity, FileKind, JpegMember, JpegRole, LocalImageKey, PairingFile, PairingOutcome,
+    RawFormat, RawPair, UnpairedFile, UnpairedReason, pair,
 };
 pub use pattern::{PatternDetection, PatternError, PatternParams, PatternSeed};
 pub use pipeline::{
-    AlignedRaw, PREP_VERSION, PrepParams, PreparedImage, PriorTransform, prepare_aligned_raw,
-    prepare_decoded, prepare_decoded_with_chart, prepare_group, prepare_group_with_decoded_raw,
-    prepare_pair, prepare_pair_decoded, prepare_pair_with_chart,
+    AlignedRaw, AlignmentQuality, PREP_VERSION, PrepParams, PreparedImage, PriorTransform,
+    prepare_aligned_raw, prepare_decoded, prepare_decoded_with_chart, prepare_group,
+    prepare_group_with_decoded_raw, prepare_pair, prepare_pair_decoded, prepare_pair_with_chart,
 };
 pub use preselect::{CoveragePool, PreselectOptions, preselect};
 pub use sample::{MAX_DENSITY_SAMPLES, PixelSelection, SampleParams, select_pixels};

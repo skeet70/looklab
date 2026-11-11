@@ -60,6 +60,14 @@ epochs:
         look: sepia
         monochrome: true
         makernote: { tag: Saturation, value: 0x0310 }
+    # https://fujifilm-dsc.com/en/manual/x-e3/menu_shooting/image_quality_setting/
+    # X-E3 offers ACROS/MONOCHROME with Ye/R/G filters but no MONOCHROMATIC COLOR
+    # (B&W ADJ.) control.
+    monochrome:
+      families: [acros, monochrome, sepia]
+      filter: [acros, monochrome]
+      toning: []
+      grain_size: false
     exposure_modes:
       - key: dr100
       - key: dr200
@@ -78,4 +86,18 @@ epochs:
           fallback:
             tag: DynamicRangeSetting
             values: { dr100: 0x100, dr200: 0x200, dr400: 0x201 }
+      - key: mono_filter
+        type: enum
+        values: [none, yellow, red, green]
+        default: none
+        look_affecting: true
+        affects: [tint]
+        applies_to: [acros, monochrome]
+        makernote:
+          tag: Saturation
+          values:
+            none: [0x0500, 0x0300]
+            yellow: [0x0502, 0x0302]
+            red: [0x0501, 0x0301]
+            green: [0x0503, 0x0303]
     solve_plan: []

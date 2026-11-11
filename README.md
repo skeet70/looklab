@@ -6,13 +6,15 @@ A tool, and eventually a web app, for **measuring camera "looks" (film simulatio
 - **Compare** any two looks in a perceptual appearance space (CAM16-UCS), broken down into tone, neutral tint, chroma, hue and lightness components, with uncertainty.
 - **Match** a look on another body. You get either the best in-camera settings for stock firmware, or an exact LUT/curve bundle for firmware that can load one.
 
+The design keeps one canonical Look per native family, with versioned camera-specific realizations rather than separate camera-specific targets. Contribution intake stays broad; publishable experimental camera mappings are usable without claiming unmeasured settings or cross-body generalization. Qualification advances through scoped evidence and the worker, not a hand-maintained camera allowlist. See the [architecture](docs/01-architecture.md#shared-targets-and-camera-realizations), [qualification lifecycle](docs/05-trust-and-integrity.md#8-release-gates-and-rollback) and [release boundaries](docs/09-roadmap.md). These are design requirements, not a claim that the current fitter has passed its numerical gates.
+
 ## Build storage
 
 Run builds through `nix develop` from a checkout. The development shell uses two shared build roots in the main checkout: `target/` for native Cargo commands and `target-ui/` for the UI lane. Linked worktrees reuse those same directories; Cargo may select either shared root for its lane.
 
 Cargo serializes competing builds with its existing locks. Wait rather than creating per-agent or per-task build directories. The shell refuses inherited roots outside those two locations, and refuses non-empty local `target/` or `target-ui/` storage in a linked checkout, including symlinks to non-shared storage. Unset stale `CARGO_TARGET_DIR` and `LOOKLAB_UI_TARGET_DIR` overrides before re-entering. An exceptional isolated build requires `LOOKLAB_ISOLATED_BUILD_OWNER` naming its cleanup owner; the owner retires that storage when the task ends. These guards do not delete anything.
 
-The integration owner runs the workspace-wide gates once after combining changes. Subagents run targeted crate or test checks for their slice and hand off their results. Keep one build owner per shared root; redundant Cargo commands queue behind the same locks. Use the checked-in profiles rather than per-agent profile overrides.
+The integration owner runs the workspace-wide gates once after combining changes. Delegated tasks run targeted crate or test checks for their slice and hand off their results. Keep one build owner per shared root; redundant Cargo commands queue behind the same locks. Use the checked-in profiles rather than per-agent profile overrides.
 
 Native dev and test builds keep line-table debug information for source-line backtraces rather than full type and variable information. For a debugging session that needs locals or types, use Cargo's `CARGO_PROFILE_DEV_DEBUG=full` or `CARGO_PROFILE_TEST_DEBUG=full` override. Return to the checked-in defaults afterward; do not make full debug output a per-agent build default.
 
@@ -20,11 +22,11 @@ After merging or abandoning an agent task, stop its builds and services, remove 
 
 UI build directories can contain `stub-state/`, including a local database and server secret. Preserve that state before retiring a UI build directory, and never delete a build directory while another task is using it.
 
-## Build pipelines
-
 Do not copy build roots into another checkout. Use a source-only linked worktree and the shared roots, or the Nix release package whose fileset excludes build caches. In older topic checkouts, enter the current main checkout's shell explicitly with `nix develop /absolute/main/checkout#default -c COMMAND` to use its current admission policy.
 
-CI has independent `lint`, `native`, `wasm release` and targeted trust-policy lanes. The required `ci` check succeeds only when every required lane succeeds. Compact real fitter-to-trust integration runs in the **Pre-release integration** workflow on `v*` tags or manual dispatch, not on ordinary pushes and pull requests. Native tests explicitly enable `looklab-fit/synth`. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
+## Build pipelines
+
+CI has independent `lint`, `native`, `wasm release`, targeted trust-policy and browser error-reporting lanes. The required `ci` check succeeds only when every required lane succeeds. Compact real fitter-to-trust integration runs in the **Pre-release integration** workflow on `v*` tags or manual dispatch, not on ordinary pushes and pull requests. Native tests explicitly enable `looklab-fit/synth`. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
 
 Native CI sets `CARGO_PROFILE_TEST_OPT_LEVEL=3` for the workspace test command and its compiler-cache restore/save steps. Debug assertions and overflow checks remain enabled. The override does not affect Pages, WASM product builds or the local default test profile. Local numerical tests can use the same override through `nix develop -c env CARGO_PROFILE_TEST_OPT_LEVEL=3 cargo test -p looklab-fit --features synth`.
 
@@ -42,9 +44,13 @@ The noisy tone-recovery study fits two 20-image × 10,000-sample datasets and al
 
 Before publishing a release, push its `v*` candidate tag or manually dispatch **Pre-release integration** for the release commit, and require both compact and worker integration jobs to pass. Neither job enables full-scale studies. Ordinary CI eligibility requires approximately two minutes or less of total integration-job wall time.
 
+Both pre-release jobs run under the `pre-release` nextest profile in `.config/nextest.toml`, which reports a test as slow every 60s and terminates it after 30 periods, and both carry a job-level `timeout-minutes` (30 for compact, 120 for worker). A timed-out case is a failure; the limits only stop a case that makes no progress from consuming the job. The 30-minute per-test limit is sized against the slowest case measured on the current tree, `match_bundle::publish_writes_a_bundle_with_the_sims_published_at_each_release` at 13m 41s for two non-converged fits over 16,800 samples each. The worker test helper's queue drain also fails after 64 jobs or 15 minutes of drain time instead of spinning on a job that re-enqueues itself.
+
 Worker tests retain ten fit-free or budget-short-circuit cases across `worker.rs` and `lut_rebase.rs` in ordinary CI, plus separate supersession coverage. Forty fitter-dependent cases across `worker.rs`, `lut_rebase.rs` and `match_bundle.rs` require `looklab-worker/integration` and run before releases with their original fixtures and assertions. The ignored 1,000-image benchmark and fixture-convergence diagnostic additionally require `looklab-worker/full-scale`.
 
 The [worker pre-release job at `ffd2b6f`](https://github.com/skeet70/looklab/actions/runs/42349668698/job/128334912333) selected 27 cases and was canceled after 6h 00m 17s. Four cases passed, two failed and 21 had no completed result; no final test summary was produced. The expanded 50-case selection at `c90496d` compiled and listed, and one newly selected LUT case passed locally, but the complete expanded suite has not passed. Release verification remains blocked.
+
+Re-running the four cases that were still running at cancellation, one per process in release with `LOOKLAB_TIMING`, `LOOKLAB_FIT_DIAG` and `LOOKLAB_MODEL_ERROR_DIAG` set and a 20-minute cap, completes each in 31s to 184s on the current tree; none re-drains the job queue. Two still stop at `converged == false` from the native fit (143 and 131 sweeps), and two converge the main fit and then fail in the model-error cross-validation with `Fit(NoModelErrorEvidence)` after a held-out fold or its nuisance conditioning does not converge. Either way no version is published, and the assertions then read an absent manifest, an unknown version or a zero version count.
 
 | Compact integration measurement | Total job | Test execution | Evidence |
 |---|---:|---:|---|
@@ -183,7 +189,7 @@ nix develop -c sh site/scripts/site-data.sh --check
 nix develop -c sh site/scripts/site-data.sh --release
 ```
 
-The data wrapper accepts a destination directory in place of `site`, including a directory under `/tmp`. Generation stages on the destination filesystem and atomically exchanges the current data tree before sealing its receipt. Outside the launcher, `LOOKLAB_API_BASE` names the API origin at build time (unset: the page's own origin), and `LOOKLAB_PREVIEW=1` builds a server-less preview with uploads, status, proposals and moderation disabled. The launcher unsets both to use its local stub. The `Pages` workflow deploys only from `main`; manual runs on other branches build without deployment.
+The data wrapper accepts a destination directory in place of `site`, including a directory under `/tmp`. Generation stages on the destination filesystem and atomically exchanges the current data tree before sealing its receipt. Outside the launcher, `LOOKLAB_API_BASE` names the API origin at build time (unset: the page's own origin), and `LOOKLAB_PREVIEW=1` builds a server-less preview with uploads, status, proposals and moderation disabled. The launcher unsets both to use its local stub. The `Pages` preview workflow is manually dispatched; a dispatch on `main` deploys, and other branches build without deployment. Pushes do not run its synthetic fitting pipeline.
 
 New stub profiles have no roles. For local moderation checks, POST `/api/__stub/moderator/{credential}` with the base64url credential ID. POST `/api/__stub/access/{credential}` with the JSON string `"moderator"`, `"admin"` or `"seeder"` to exercise the other review roles. Reload to refresh the role menu from the server. These two grant endpoints are the stub's only API additions; every other `/api/*` route reaches the `looklab-server` handler with its normal validation. An upload creates the profile on first use and returns a status token only for that first contribution; later uploads return just a contribution id. Contributions start pending and the status feed lists them from SQLite. `site/checks/e2e.mjs --flow account` covers profile creation and work-based activation, local sign-out, sign-in again, independent browser sessions, global revocation and role refresh.
 
@@ -199,24 +205,32 @@ After the first person registers a passkey, grant the first admin with the packa
 
 Full volumes, environment variables, domain steps, sizing, smoke commands and restart checks are in [docs/ops/deployment.md](docs/ops/deployment.md). Litestream replication is in [docs/ops/litestream.md](docs/ops/litestream.md).
 
+## Web-app error visibility
+
+Server-backed builds automatically report browser console errors, uncaught exceptions, unhandled promise rejections and worker failures to a private, bounded diagnostic store. Reports identify the client build, route category and application code locations, without sending error messages, console arguments, photo data or private URLs. Serverless previews send nothing.
+
+Read recent failures with `looklab-server client-errors --config /etc/looklab/looklab.toml --limit 50`, adding `--json` or `--release <build-id>` for agent use. Host database access is required; there is no public read API. See [operator commands and limits](docs/ops/deployment.md#browser-error-diagnostics) and the [privacy contract](docs/06-privacy-and-payload.md#11-automatic-error-diagnostics).
+
 ## Design docs
 
-Read in order. Each doc is self-contained enough to hand to an implementer.
+Read in order. These canonical documents own the design contracts; each is self-contained enough to hand to an implementer.
 
 | # | Doc | What it covers |
 |---|-----|----------------|
 | 00 | [Overview](docs/00-overview.md) | Goals, non-goals, glossary, core principles |
-| 01 | [Architecture](docs/01-architecture.md) | Crates, client/server split, tech choices, licensing |
-| 02 | [Color pipeline](docs/02-color-pipeline.md) | Input transforms, the Look model, fitting, uncertainty, probes, diagnostics |
-| 03 | [Data model](docs/03-data-model.md) | Entities, firmware epochs, file formats, DB schema |
+| 01 | [Architecture](docs/01-architecture.md) | Crates, shared targets and camera realizations, client/server split, tech choices, licensing |
+| 02 | [Color pipeline](docs/02-color-pipeline.md) | Input transforms, the Look model, fitting, evidence/qualification protocols, uncertainty, probes, diagnostics |
+| 03 | [Data model](docs/03-data-model.md) | Entities, scoped revisions/reports/dependencies, firmware epochs, file formats, DB schema |
 | 04 | [Matching & export](docs/04-matching-and-export.md) | Control schemas, control-response models, optimizer, firmware card format, software interface profiles, LUT baking |
-| 05 | [Trust & integrity](docs/05-trust-and-integrity.md) | Tiers, reputation, weighting, caps, release gates, rollback (hobby scale) |
+| 05 | [Trust & integrity](docs/05-trust-and-integrity.md) | Tiers, reputation, weighting, caps, experimental isolation, automatic qualification/invalidation, release gates, rollback |
 | 06 | [Privacy & payload](docs/06-privacy-and-payload.md) | What leaves the browser, metadata sanitization, payload inspector |
 | 07 | [Contribution](docs/07-contribution.md) | The contribution ladder, capture protocols, detection |
 | 08 | [UI](docs/08-ui.md) | Audiences, principles and vocabulary, pages, flows, visual system |
 | 09 | [Roadmap](docs/09-roadmap.md) | Phases, tasks, acceptance criteria |
 | 10 | [Open questions](docs/10-open-questions.md) | Decisions not yet made |
 | — | [References](docs/references.md) | Prior art and papers |
+
+The reviewed [qualification implementation plan](docs/model-qualification-plan.md) retains integration rationale and acceptance cases. It does not replace the canonical contracts above.
 
 Working conventions for implementers (human or agent): [AGENTS.md](AGENTS.md).
 

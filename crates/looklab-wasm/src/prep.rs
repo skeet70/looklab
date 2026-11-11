@@ -4,15 +4,16 @@
 use looklab_meta::RawSerial;
 use looklab_prep::PrepParams;
 use looklab_prep_module::{
-    AssertionFields, BuildManifestRequest, BuildManifestResponse, EncodeEnvelopeRequest,
-    EncodeEnvelopeResponse, Function, ManifestImageInput, ModuleError, ParseEnvelopeRequest,
-    ParseEnvelopeResponse, PowParamsSpec, PrepareRequest, PrepareResponse, PreparedImageView,
-    PriorTransformSpec, Response, SolvePowRequest, SolvePowResponse,
+    AssertionFields, BuildManifestRequest, BuildManifestResponse, BuildSendManifestRequest,
+    BuildSendManifestResponse, EncodeEnvelopeRequest, EncodeEnvelopeResponse, Function,
+    ManifestImageInput, ModuleError, ParseEnvelopeRequest, ParseEnvelopeResponse, PowParamsSpec,
+    PrepareRequest, PrepareResponse, PreparedImageView, PriorTransformSpec, Response,
+    SolvePowRequest, SolvePowResponse,
 };
 use looklab_upload::{
     BlobKind, BodyId, CardDeclaration, Challenge, CommunitySnapshotVersion, ContributionKind,
-    ControlEntry, ControlKey, ControlSettings, Intent, Limits, LookSlug, ManifestHash, Nonce,
-    SettingSource, SimKey, StepIndex,
+    ControlEntry, ControlKey, ControlSettings, Intent, Limits, LookSlug, ManifestHash,
+    MonochromeAuthorization, Nonce, RenderClass, SettingSource, SimKey, StepIndex,
 };
 
 use crate::error::FacadeError;
@@ -30,6 +31,8 @@ pub struct ControlSetting {
 pub struct GroupSettings {
     pub kind: ContributionKind,
     pub intent: IntentChoice,
+    pub render_class: RenderClass,
+    pub monochrome_authorization: Option<MonochromeAuthorization>,
     pub body: String,
     pub firmware: String,
     pub sim: String,
@@ -97,6 +100,7 @@ pub enum ModuleFunction {
     Version,
     Prepare,
     BuildManifest,
+    BuildSendManifest,
     EncodeEnvelope,
     SolvePow,
     ParseEnvelope,
@@ -108,6 +112,7 @@ impl ModuleFunction {
             Self::Version => Function::Version,
             Self::Prepare => Function::Prepare,
             Self::BuildManifest => Function::BuildManifest,
+            Self::BuildSendManifest => Function::BuildSendManifest,
             Self::EncodeEnvelope => Function::EncodeEnvelope,
             Self::SolvePow => Function::SolvePow,
             Self::ParseEnvelope => Function::ParseEnvelope,
@@ -117,6 +122,28 @@ impl ModuleFunction {
 
 pub fn version_request() -> Vec<u8> {
     postcard::to_allocvec(&looklab_prep_module::VersionRequest).expect("unit request is encodable")
+}
+
+/// Rejects a malformed reply or a module built from different wire versions.
+pub fn check_module_version(bytes: &[u8]) -> Result<(), FacadeError> {
+    let version = match decode_reply(bytes)? {
+        Response::Version(version) => version,
+        other => {
+            return Err(FacadeError::Reply(format!(
+                "version reply came back as {}",
+                response_name(&other)
+            )));
+        }
+    };
+    if version.matches_current() {
+        return Ok(());
+    }
+    Err(FacadeError::ModuleVersion {
+        found_abi: version.module_abi_version,
+        found_prep: version.prep_version,
+        expected_abi: looklab_prep_module::MODULE_ABI_VERSION,
+        expected_prep: looklab_prep_module::PREP_VERSION,
+    })
 }
 
 pub fn prepare_request(
@@ -161,6 +188,8 @@ pub fn build_manifest_request(
     let request = BuildManifestRequest {
         kind: settings.kind,
         intent: settings.intent.clone().into_intent()?,
+        render_class: settings.render_class,
+        monochrome_authorization: settings.monochrome_authorization,
         body: BodyId::new(&settings.body).map_err(|error| FacadeError::Id(error.to_string()))?,
         firmware: looklab_upload::FirmwareVersionString::new(&settings.firmware)
             .map_err(|error| FacadeError::Id(error.to_string()))?,
@@ -184,8 +213,27 @@ pub fn build_manifest_request(
     Ok(postcard::to_allocvec(&request).expect("manifest request is encodable"))
 }
 
+/// Builds the one manifest a send's passkey approval covers.
+///
+/// # Errors
+/// Rejects a nonce that is not 32 bytes or a hash list the manifest cannot hold.
+pub fn build_send_manifest_request(
+    nonce: [u8; 32],
+    manifest_hashes: Vec<ManifestHash>,
+    attestation_hashes: Vec<looklab_upload::AttestationHash>,
+) -> Result<Vec<u8>, FacadeError> {
+    let request = BuildSendManifestRequest {
+        nonce: Nonce::from_slice(&nonce)
+            .ok_or_else(|| FacadeError::Input("nonce is not 32 bytes".to_owned()))?,
+        manifest_hashes,
+        attestation_hashes,
+    };
+    Ok(postcard::to_allocvec(&request).expect("send manifest request is encodable"))
+}
+
 pub fn encode_envelope_request(
     nonce: [u8; 32],
+    send_manifest_bytes: Vec<u8>,
     manifest_bytes: Vec<u8>,
     assertion: AssertionFields,
     pow: [u64; looklab_upload::POW_K],
@@ -195,6 +243,7 @@ pub fn encode_envelope_request(
     let request = EncodeEnvelopeRequest {
         nonce: Nonce::from_slice(&nonce)
             .ok_or_else(|| FacadeError::Input("nonce is not 32 bytes".to_owned()))?,
+        send_manifest_bytes,
         manifest_bytes,
         assertion,
         pow,
@@ -257,6 +306,18 @@ pub fn decode_build_manifest_reply(bytes: &[u8]) -> Result<BuildManifestResponse
     }
 }
 
+pub fn decode_build_send_manifest_reply(
+    bytes: &[u8],
+) -> Result<BuildSendManifestResponse, FacadeError> {
+    match decode_reply(bytes)? {
+        Response::BuildSendManifest(response) => Ok(response),
+        other => Err(FacadeError::Reply(format!(
+            "send manifest reply came back as {}",
+            response_name(&other)
+        ))),
+    }
+}
+
 pub fn decode_encode_reply(bytes: &[u8]) -> Result<EncodeEnvelopeResponse, FacadeError> {
     match decode_reply(bytes)? {
         Response::EncodeEnvelope(response) => Ok(response),
@@ -292,6 +353,7 @@ fn response_name(response: &Response) -> &'static str {
         Response::Version(_) => "version",
         Response::Prepare(_) => "prepare",
         Response::BuildManifest(_) => "manifest",
+        Response::BuildSendManifest(_) => "send manifest",
         Response::EncodeEnvelope(_) => "envelope",
         Response::SolvePow(_) => "pow",
         Response::ParseEnvelope(_) => "parse",
@@ -318,4 +380,49 @@ pub fn serial_ascii_for_file(bytes: &[u8]) -> Option<Vec<u8>> {
 /// For the envelope only.
 pub fn serial_ascii_from_metadata(metadata: &looklab_meta::ParsedMetadata) -> Option<Vec<u8>> {
     metadata.body_serial().map(serial_ascii)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn version_reply(version: looklab_prep_module::VersionResponse) -> Vec<u8> {
+        postcard::to_allocvec(&Ok::<Response, ModuleError>(Response::Version(version)))
+            .expect("version reply encodes")
+    }
+
+    #[test]
+    fn accepts_the_module_this_build_encodes() {
+        assert!(check_module_version(&version_reply(looklab_prep_module::version())).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_different_module_abi() {
+        let mut version = looklab_prep_module::version();
+        version.module_abi_version += 1;
+        assert!(matches!(
+            check_module_version(&version_reply(version)),
+            Err(FacadeError::ModuleVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_different_prep_version() {
+        let mut version = looklab_prep_module::version();
+        version.prep_version += 1;
+        assert!(matches!(
+            check_module_version(&version_reply(version)),
+            Err(FacadeError::ModuleVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_different_build_id() {
+        let mut version = looklab_prep_module::version();
+        version.build_id[0] ^= 1;
+        assert!(matches!(
+            check_module_version(&version_reply(version)),
+            Err(FacadeError::ModuleVersion { .. })
+        ));
+    }
 }

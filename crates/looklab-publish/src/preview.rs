@@ -3,7 +3,10 @@
 
 use looklab_color::ucs::Ucs;
 use looklab_color::{Rgb, RgbSpace, Xyz};
-use looklab_export::{OutputSpace, in_gamut, perceptual_clip, ucs_to_xyz};
+use looklab_export::{
+    Lut3d, LutLookError, OutputSpace, in_gamut, perceptual_clip, preview_composed_encoded,
+    ucs_to_xyz,
+};
 use looklab_model::{Look, LookDocument};
 
 use crate::PublishError;
@@ -54,6 +57,48 @@ pub fn preview_unshaper(coordinate: f64) -> f64 {
 /// Encoded-sRGB preview of a published Look with an identity input transform.
 pub fn bake_preview_lut(document: &LookDocument) -> Vec<u8> {
     bake_lut(&document.look, |xyz| xyz)
+}
+
+/// Encoded-sRGB preview of a LUT composed on an explicit baseline, on the [`bake_lut`] grid.
+pub fn bake_lut_preview(
+    lut: &Lut3d,
+    encoding: &looklab_model::file::DeclaredEncoding,
+    output: looklab_model::file::OutputEncoding,
+    record: &looklab_model::file::LutRecord,
+    baseline: &looklab_model::file::BaseReference,
+    base_look: Option<&LookDocument>,
+) -> Result<Vec<u8>, LutLookError> {
+    let mut out = Vec::with_capacity(LUT_BYTES);
+    let scale = 1.0 / (LUT_SIZE - 1) as f64;
+    for r in 0..LUT_SIZE {
+        for g in 0..LUT_SIZE {
+            for b in 0..LUT_SIZE {
+                let xyz = RgbSpace::Rec2020.rgb_linear_to_xyz(Rgb::new(
+                    preview_unshaper(r as f64 * scale),
+                    preview_unshaper(g as f64 * scale),
+                    preview_unshaper(b as f64 * scale),
+                ));
+                let encoded = match preview_composed_encoded(
+                    lut, encoding, output, record, baseline, base_look, xyz,
+                ) {
+                    Ok(encoded) => encoded,
+                    Err(_) => preview_composed_encoded(
+                        lut,
+                        encoding,
+                        output,
+                        record,
+                        &looklab_model::file::BaseReference::neutral_baseline(),
+                        None,
+                        xyz,
+                    )?,
+                };
+                for channel in [encoded.r, encoded.g, encoded.b] {
+                    out.extend_from_slice(&(channel.clamp(0.0, 1.0) as f32).to_le_bytes());
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Encoded-sRGB output, little-endian `f32`, red slowest.

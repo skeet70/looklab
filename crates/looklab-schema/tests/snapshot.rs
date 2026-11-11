@@ -191,10 +191,12 @@ fn a_manifest_entry_without_a_digest_is_rejected() {
     );
     let failures = looklab_schema::validate_snapshot_dir(dir.path()).expect("walk");
     assert!(
-        failures.iter().any(|failure| failure.errors.iter().any(|error| {
-            error.path == "fixture[0]"
-                && matches!(error.kind, looklab_schema::ErrorKind::FixtureManifest(_))
-        })),
+        failures
+            .iter()
+            .any(|failure| failure.errors.iter().any(|error| {
+                error.path == "fixture[0]"
+                    && matches!(error.kind, looklab_schema::ErrorKind::FixtureManifest(_))
+            })),
         "{failures:?}"
     );
 }

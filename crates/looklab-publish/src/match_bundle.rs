@@ -23,7 +23,6 @@ const BASE_SUFFIX: &str = "base.looklab";
 const CRM_SUFFIX: &str = "crm.json";
 const COVARIANCE_SUFFIX: &str = "covariance.json";
 
-/// One native sim's inputs for the optimizer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchSim {
     pub sim: SimKey,
@@ -41,6 +40,16 @@ pub enum SimExclusion {
     NoPublishedLook,
     /// The sim's Look has no published control-response model.
     NoResponse,
+    /// No realization revision is selected for the sim.
+    NoRealization,
+    /// The selected realization is not numerically valid or gate-passing.
+    UnacceptedRealization,
+    /// The realization's pinned target is not eligible.
+    TargetIneligible,
+    /// Only unassessed legacy artifacts exist for the sim.
+    UnassessedRealization,
+    /// The sim's realization table lacks the requested firmware.
+    MissingFirmware,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

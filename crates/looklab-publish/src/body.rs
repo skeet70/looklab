@@ -5,12 +5,14 @@ use looklab_model::file::{LookVersion, Slug};
 use looklab_schema::{
     Affects, Body, BodyKind as SchemaBodyKind, BodyStatus as SchemaBodyStatus, ControlKey,
     ControlSchema, ControlType, EnumValue, ExposureModeKey, MakernoteTag,
-    MappingStatus as SchemaMappingStatus, ScalarValue, SimKey, StageName, Tolerated,
+    MappingStatus as SchemaMappingStatus, ScalarValue, SelectionScope, SimKey, StageName,
+    Tolerated,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::PublishError;
 use crate::manifest::LookStatus;
+use crate::qualification::{BundleSelection, RealizationCard};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +119,16 @@ pub struct NativeLookCard {
     pub version: Option<LookVersion>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<LookStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realization: Option<RealizationCard>,
+    #[serde(default = "unassessed_scope")]
+    pub scope: SelectionScope,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<String>,
+}
+
+fn unassessed_scope() -> SelectionScope {
+    SelectionScope::Unassessed
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +213,54 @@ pub struct EpochPage {
     pub solve_plan: Vec<SolvePlanStepPage>,
 }
 
+/// Whether normal RAW+JPEG contributions can enter a colour fit for a body.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationReadiness {
+    /// No readiness decision was published for this body.
+    #[default]
+    Unknown,
+    /// The required input transform is present.
+    Ready,
+    /// A catalog entry exists, but a required fit resource is absent.
+    Unavailable,
+}
+
+/// The missing resource that keeps a body from being fitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationBlocker {
+    InputTransformMissing,
+}
+
+/// A body's fit readiness.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparationPage {
+    pub readiness: PreparationReadiness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<PreparationBlocker>,
+}
+
+impl PreparationPage {
+    pub fn ready() -> Self {
+        Self {
+            readiness: PreparationReadiness::Ready,
+            blocker: None,
+        }
+    }
+
+    pub fn unavailable(blocker: PreparationBlocker) -> Self {
+        Self {
+            readiness: PreparationReadiness::Unavailable,
+            blocker: Some(blocker),
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.readiness == PreparationReadiness::Ready
+    }
+}
+
 /// Everything the body page renders, as a JSON document.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BodyPage {
@@ -214,18 +274,24 @@ pub struct BodyPage {
     pub status: BodyStatus,
     pub mapping_status: MappingStatus,
     pub capabilities: CapabilitiesPage,
+    #[serde(default)]
+    pub preparation: PreparationPage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_transform: Option<InputTransformPage>,
     pub epochs: Vec<EpochPage>,
     pub realization_notes: Vec<RealizationNote>,
     pub native_looks: Vec<NativeLookCard>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundles: Vec<BundleSelection>,
 }
 
 /// Body-level facts that are not in the schema snapshot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BodyExtras {
+    pub preparation: PreparationPage,
     pub input_transform: Option<InputTransformPage>,
     pub realization_notes: Vec<RealizationNote>,
+    pub bundles: Vec<BundleSelection>,
 }
 
 impl BodyPage {
@@ -260,6 +326,9 @@ impl BodyPage {
                     look,
                     version: None,
                     status: None,
+                    realization: None,
+                    scope: SelectionScope::Unassessed,
+                    blockers: Vec::new(),
                 });
             }
             epochs.push(EpochPage {
@@ -312,9 +381,11 @@ impl BodyPage {
                 heif: body.capabilities.heif,
             },
             input_transform: extras.input_transform.clone(),
+            preparation: extras.preparation.clone(),
             epochs,
             realization_notes: extras.realization_notes.clone(),
             native_looks,
+            bundles: extras.bundles.clone(),
         })
     }
 }

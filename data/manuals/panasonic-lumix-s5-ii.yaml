@@ -1,0 +1,350 @@
+# Documentation-derived record. Not a body snapshot, decoder mapping or fit input.
+# Every value is not confirmed by camera owners.
+catalog_version: 1
+cameras:
+- id: panasonic/lumix-s5-ii
+  make: Panasonic
+  model: DC-S5M2
+  sources:
+  - id: s5m2-om
+    kind: owner_manual
+    url: https://eww.pavc.panasonic.co.jp/dscoi/DC-S5M2/pdf/DC-S5M2_DVQP2839_full_eng.pdf
+    title: Operating Instructions / Owner's Manual <Complete Guide> Digital Camera DC-S5M2
+    edition: DVQP2839ZK
+    firmware_scope: unspecified
+  - id: s5m2-fw
+    kind: firmware_notes
+    url: https://eww.pavc.panasonic.co.jp/dscoi/DC-S5M2/pdf/DC-S5M2_DVQP2839_full_eng.pdf
+    title: DC-S5M2 Operating Instructions addendum, section F "Firmware Update" (Ver. 1.1 to Ver. 3.7)
+    edition: DVQP2839ZK
+    firmware_scope: 3.7 (addenda Ver. 1.1-3.7; LEICA Monochrome added in Ver. 3.1)
+  capabilities:
+  - key: native_simulations
+    label: Photo Style
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Standard
+      - Vivid
+      - Natural
+      - L.ClassicNeo
+      - Flat
+      - Landscape
+      - Portrait
+      - Monochrome
+      - L.Monochrome
+      - L.Monochrome D
+      - L.Monochrome S
+      - LEICA Monochrome
+      - Cinelike D2
+      - Cinelike V2
+      - Like709
+      - V-Log
+      - REAL TIME LUT
+      - Like2100(HLG)
+      - Like2100(HLG) Full Range
+    citations:
+    - source: s5m2-om
+      locator: pp. 301-304, [Photo Style]
+    - source: s5m2-om
+      locator: p. 534, [Photo Style Settings] (Show/Hide Photo Style enumeration)
+    - source: s5m2-fw
+      locator: p. F-71, Firmware Ver. 3.1 - [LEICA Monochrome] Has Been Added to [Photo Style]
+    - source: s5m2-fw
+      locator: p. F-85, List of Photo Style Information
+  - key: contrast
+    label: Contrast
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -5
+      max: 5
+      step: 1
+    citations:
+    - source: s5m2-om
+      locator: p. 306, Settings Items (Image Quality Adjustment)
+    - source: s5m2-om
+      locator: p. 306, Adjusting Image Quality (adjustment scale -5 to +5)
+  - key: highlight_tone
+    label: Highlight
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -5
+      max: 5
+      step: 1
+    citations:
+    - source: s5m2-om
+      locator: p. 306, Settings Items (Image Quality Adjustment)
+    - source: s5m2-om
+      locator: p. 306, Adjusting Image Quality (adjustment scale -5 to +5)
+  - key: shadow_tone
+    label: Shadow
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -5
+      max: 5
+      step: 1
+    citations:
+    - source: s5m2-om
+      locator: p. 306, Settings Items (Image Quality Adjustment)
+    - source: s5m2-om
+      locator: p. 306, Adjusting Image Quality (adjustment scale -5 to +5)
+  - key: saturation
+    label: Saturation
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: -5
+      max: 5
+      step: 1
+    citations:
+    - source: s5m2-om
+      locator: p. 306, Settings Items (Image Quality Adjustment)
+    - source: s5m2-om
+      locator: p. 309, availability table (Saturation not adjustable for Monochrome/L.Monochrome/L.Monochrome D/L.Monochrome S, V-Log, REAL TIME LUT)
+  - key: white_balance_presets
+    label: White Balance
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AWB
+      - AWBc
+      - AWBw
+      - Clear sky
+      - Cloudy sky
+      - Shade under a clear sky
+      - Incandescent light
+      - Flash
+      - Set mode 1
+      - Set mode 2
+      - Set mode 3
+      - Set mode 4
+      - Color temperature 1
+      - Color temperature 2
+      - Color temperature 3
+      - Color temperature 4
+    citations:
+    - source: s5m2-om
+      locator: p. 295, Setting Items (White Balance)
+  - key: white_balance_shift
+    label: Adjusting the White Balance
+    category: rendering
+    availability: available
+    domain:
+      type: unspecified
+    citations:
+    - source: s5m2-om
+      locator: p. 299, Adjusting the White Balance ([A]/[G]/[B]/[M] adjustment screen)
+  - key: color_temperature
+    label: Color Temperature Setting
+    category: rendering
+    availability: available
+    domain:
+      type: integer
+      min: 2500
+      max: 10000
+    citations:
+    - source: s5m2-om
+      locator: p. 298, Color Temperature Setting
+  - key: exposure_compensation
+    label: Exposure Compensation
+    category: rendering
+    availability: available
+    domain:
+      type: rational
+      min: '-5'
+      max: '+5'
+      step: 1/3
+    citations:
+    - source: s5m2-om
+      locator: p. 280, Exposure Compensation
+  - key: dynamic_range
+    label: i.Dynamic Range
+    category: rendering
+    availability: available
+    domain:
+      type: enum
+      values:
+      - AUTO
+      - HIGH
+      - STANDARD
+      - LOW
+      - 'OFF'
+    citations:
+    - source: s5m2-om
+      locator: p. 283, [i.Dynamic Range]
+  - key: creative_filters
+    label: Filter Effect
+    category: mixed
+    availability: available
+    domain:
+      type: enum
+      values:
+      - Expressive
+      - Retro
+      - Old Days
+      - High Key
+      - Low Key
+      - Sepia
+      - Cross Process
+      - Bleach Bypass
+    citations:
+    - source: s5m2-om
+      locator: p. 314, [Filter Settings] ([Filter Effect] menu path)
+    - source: s5m2-om
+      locator: p. 316, Adjusting the Filter Effect (filter list)
+  - key: sharpening
+    label: Sharpness
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: -5
+      max: 5
+      step: 1
+    citations:
+    - source: s5m2-om
+      locator: p. 307, Settings Items (Image Quality Adjustment)
+    - source: s5m2-om
+      locator: p. 306, Adjusting Image Quality (adjustment scale -5 to +5)
+  - key: noise_reduction
+    label: Noise Reduction
+    category: spatial
+    availability: available
+    domain:
+      type: integer
+      min: -5
+      max: 5
+      step: 1
+    citations:
+    - source: s5m2-om
+      locator: p. 307, Settings Items (Image Quality Adjustment)
+    - source: s5m2-om
+      locator: p. 306, Adjusting Image Quality (adjustment scale -5 to +5)
+  - key: grain
+    label: Grain Effect
+    category: spatial
+    availability: available
+    domain:
+      type: enum
+      values:
+      - 'Off'
+      - Low
+      - Standard
+      - High
+    citations:
+    - source: s5m2-om
+      locator: p. 307, Settings Items (Image Quality Adjustment)
+  - key: raw_capture
+    label: Picture Quality
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: s5m2-om
+      locator: 'p. 120, [Picture Quality] ([RAW] option, File format: RAW)'
+  - key: jpeg_capture
+    label: Picture Quality
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: s5m2-om
+      locator: 'p. 120, [Picture Quality] ([FINE] and [STD.] options, File format: JPEG)'
+  - key: raw_jpeg_simultaneous
+    label: Picture Quality
+    category: capture
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: s5m2-om
+      locator: 'p. 120, [Picture Quality] ([RAW+FINE]/[RAW+STD.] options, File format: RAW+JPEG)'
+  - key: jpeg_quality
+    label: Picture Quality
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - FINE
+      - STD.
+    citations:
+    - source: s5m2-om
+      locator: p. 120, [Picture Quality]
+  - key: raw_bit_depth
+    label: Note on RAW
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - '14'
+      - '12'
+    citations:
+    - source: s5m2-om
+      locator: p. 120, Note on RAW
+  - key: heif_capture
+    label: Picture Quality
+    category: capture
+    availability: not_documented
+    domain:
+      type: unspecified
+    citations:
+    - source: s5m2-om
+      locator: p. 120, [Picture Quality] (lists [FINE], [STD.], [RAW+FINE], [RAW+STD.], [RAW]; HEIF not listed)
+  - key: jpeg_color_spaces
+    label: Color Space
+    category: capture
+    availability: available
+    domain:
+      type: enum
+      values:
+      - sRGB
+      - AdobeRGB
+    citations:
+    - source: s5m2-om
+      locator: p. 538, [Color Space]
+  - key: in_camera_raw_conversion
+    label: RAW Processing
+    category: workflow
+    availability: available
+    domain:
+      type: boolean
+    citations:
+    - source: s5m2-om
+      locator: p. 482, [RAW Processing]
+    - source: s5m2-om
+      locator: p. 485, Setting Items ([RAW Processing])
+  notes:
+  - My Photo Style has 10 slots ([MY PHOTO STYLE 1] to [MY PHOTO STYLE 10]); effects up to [MY PHOTO STYLE 4] are displayed with default settings and the registered name may be up to 22 characters (p. 304, p. 313).
+  - '[LEICA Monochrome] is documented only in the firmware Ver. 3.1 addendum (p. F-71, listed at p. F-85); the base Photo Style list at pp. 301-304 does not include it.'
+  - Photo Style is not available while [Filter Settings] is in use (p. 305); in [iA] mode only [Standard] or [Monochrome] can be set and image quality cannot be adjusted (p. 305).
+  - '[Like2100(HLG)] and [Like2100(HLG) Full Range] can only be selected in the video mode with a 10-bit [Rec Quality] (p. 304).'
+  - 'Per the p. 309 table: Contrast, Highlight, Shadow and Sharpness are adjustable for all Photo Styles except the V-Log and REAL TIME LUT groups; Color Tone and Filter Effect only for the Monochrome/L.Monochrome/L.Monochrome D/L.Monochrome S group; Hue not for the monochrome group; Grain Effect and Color Noise only for L.ClassicNeo and the monochrome group; Noise Reduction adjustable for all listed groups.'
+  - '[Grain Effect] and [Color Noise] are not available during video recording (p. 310).'
+  - Photo Style [Color Tone] (blue/yellow tint), [Hue] (violet/magenta to yellow/green) and [Filter Effect] (Yellow/Orange/Red/Green/Off, monochrome group only) are documented at pp. 306-307 but have no registry key.
+  - '[Filter Settings] is a separate control from the Photo Style [Filter Effect]; while it is used the white balance is fixed to [AWB], the flash is fixed to Forced Flash Off and the ISO upper limit is [6400] (pp. 305, 316, 318).'
+  - White balance fine adjustment uses [A]/[G]/[B]/[M] axes with diagonal and touch operation; the manual does not state the numeric adjustment limits (p. 299).
+  - The white balance [Flash] setting operates as [AWB] during video recording (p. 295).
+  - Exposure compensation is 1/3 EV steps over ±5 EV; the range changes to ±3 EV when recording videos (p. 280).
+  - Color temperature is settable from 2500 K to 10000 K (p. 298); the manual states no increment, so `step` is omitted.
+  - The p. 306 adjustment scale shown for Photo Style image quality items runs from -5 to +5 with 0 at centre; the manual gives no separate numeric range for individual items.
+  - '[i.Dynamic Range] is not available with [Like709]/[V-Log]/[REAL TIME LUT]/[Like2100(HLG)]/[Like2100(HLG) Full Range] Photo Styles or with [Filter Settings] (p. 283).'
+  - RAW images are 14 bits, limited to 12 bits during burst recording; RAW images are always recorded in [L] size at [3:2] (p. 120).
+  - '[Color Space] is fixed to [sRGB] during video recording, with [Like709]/[V-Log]/[REAL TIME LUT] Photo Styles, and with [Filter Settings] (p. 538).'
+  - '[RAW Processing] processes RAW images on the camera and saves them as JPEG; [REAL TIME LUT] cannot be selected as a Photo Style in RAW Processing (pp. 482, 485).'
+  - Picture Quality is not available in High Resolution mode (p. 120).
+  - The [Picture Quality] menu on p. 120 lists [FINE], [STD.], [RAW+FINE], [RAW+STD.] and [RAW]; HEIF is not listed, and the manual does not state that HEIF is unsupported.

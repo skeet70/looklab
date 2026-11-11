@@ -4,6 +4,7 @@ use looklab_model::realization::{Realization, Settings};
 
 use crate::covariance::SparseDelta;
 use crate::error::Result;
+use crate::metric::{RenderJacobian, ScoringMetric};
 use crate::model::MatchModel;
 use crate::settings::Plan;
 use crate::target::PreparedTarget;
@@ -42,6 +43,7 @@ pub struct LinearCache {
     pub covariance_weights: Vec<f64>,
     pub target: Vec<[f64; 3]>,
     pub output: Vec<[f64; 3]>,
+    pub metric: ScoringMetric,
     /// `[probe][control][value]`, relative to `settings`.
     pub contributions: Vec<Vec<Vec<[f64; 3]>>>,
     /// `[probe][control][value]`, absolute predicted trace contribution.
@@ -66,21 +68,42 @@ impl LinearCache {
         subset: &ProbeSubset,
         beta: f64,
     ) -> Result<Self> {
+        let metric = target.metric();
         let realization = model.realize(settings)?;
         let mut output = Vec::with_capacity(subset.indices.len());
         let mut target_out = Vec::with_capacity(subset.indices.len());
         let mut jacobians = Vec::with_capacity(subset.indices.len());
+        let mut render_jacobians = Vec::with_capacity(subset.indices.len());
         let mut derivatives = Vec::with_capacity(subset.indices.len());
-        for index in &subset.indices {
+        let mut indices = Vec::with_capacity(subset.indices.len());
+        let mut weights = Vec::with_capacity(subset.indices.len());
+        let mut covariance_weights = Vec::with_capacity(subset.indices.len());
+        for (slot, index) in subset.indices.iter().enumerate() {
             let probe = &target.probes.probes[*index];
             let xyz = probe.xyz;
+            let pre = model.pre_clip_ucs(&realization, xyz, [0.0, 0.0], 0.0);
+            let render_jacobian = match metric {
+                ScoringMetric::LegacyPreClipV1 => None,
+                ScoringMetric::RenderedPostClipV1 => {
+                    match model.output_pin(&realization).render_jacobian_status(pre) {
+                        RenderJacobian::Finite(jacobian) => Some(jacobian),
+                        RenderJacobian::DomainViolation | RenderJacobian::Singular => continue,
+                    }
+                }
+            };
+            indices.push(*index);
+            weights.push(subset.weights[slot]);
+            covariance_weights.push(subset.covariance_weights[slot]);
             output.push(
-                model
-                    .input_ucs(&realization, xyz, [0.0, 0.0], 0.0)
-                    .to_array(),
+                match metric {
+                    ScoringMetric::LegacyPreClipV1 => pre,
+                    ScoringMetric::RenderedPostClipV1 => model.output_pin(&realization).render(pre),
+                }
+                .to_array(),
             );
             target_out.push(target.target[*index].to_array());
             jacobians.push(model.coefficient_jacobian(&realization, xyz));
+            render_jacobians.push(render_jacobian);
             derivatives.push(derivatives_at(model, &realization, xyz));
         }
 
@@ -97,8 +120,9 @@ impl LinearCache {
             }
         }
 
-        let mut contributions = vec![vec![Vec::new(); plan.domains.len()]; subset.indices.len()];
-        let mut covariance = vec![vec![Vec::new(); plan.domains.len()]; subset.indices.len()];
+        let mut contributions = vec![vec![Vec::new(); plan.domains.len()]; indices.len()];
+        let mut covariance = vec![vec![Vec::new(); plan.domains.len()]; indices.len()];
+        let mut valid = vec![true; indices.len()];
         for control in 0..plan.domains.len() {
             let key = &plan.domains[control].key;
             let current_index = plan.value_index(control, settings);
@@ -106,38 +130,79 @@ impl LinearCache {
                 let row = &rows[control][value_index];
                 let current_row = &rows[control][current_index];
                 let single_value = Settings::new().with(key.clone(), value.clone());
-                for probe in 0..subset.indices.len() {
+                let params_exposure = model.params_exposure_offset(key, value)
+                    - model
+                        .params_exposure_offset(key, &plan.domains[control].values[current_index]);
+                for probe in 0..indices.len() {
                     let jacobian = &jacobians[probe];
-                    let mut linear = project_difference(&row.delta, &current_row.delta, jacobian);
+                    let Some(mut linear) =
+                        project_difference(&row.delta, &current_row.delta, jacobian)
+                    else {
+                        valid[probe] = false;
+                        continue;
+                    };
                     let d = &derivatives[probe];
                     let dwb_r = row.wb[0] - current_row.wb[0];
                     let dwb_b = row.wb[1] - current_row.wb[1];
-                    let de = row.exposure - current_row.exposure;
+                    let de = row.exposure - current_row.exposure + params_exposure;
                     for (channel, value) in linear.iter_mut().enumerate() {
                         *value +=
                             dwb_r * d.d_r[channel] + dwb_b * d.d_b[channel] + de * d.d_e[channel];
                     }
-                    contributions[probe][control].push(linear);
-                    covariance[probe][control].push(covariance_at(
+                    if let Some(render_jacobian) = &render_jacobians[probe] {
+                        linear = render_jacobian.mul_vec(linear);
+                    }
+                    let Some(trace) = covariance_at(
                         model,
                         &single_value,
                         key,
                         jacobian,
                         d,
-                    ));
+                        render_jacobians[probe].as_ref(),
+                    ) else {
+                        valid[probe] = false;
+                        continue;
+                    };
+                    contributions[probe][control].push(linear);
+                    covariance[probe][control].push(trace);
                 }
             }
         }
+
+        let mut slot = 0;
+        for (probe, keep) in valid.iter().enumerate() {
+            if !keep {
+                continue;
+            }
+            if probe != slot {
+                indices.swap(slot, probe);
+                weights.swap(slot, probe);
+                covariance_weights.swap(slot, probe);
+                target_out.swap(slot, probe);
+                output.swap(slot, probe);
+                contributions.swap(slot, probe);
+                covariance.swap(slot, probe);
+            }
+            slot += 1;
+        }
+        indices.truncate(slot);
+        weights.truncate(slot);
+        covariance_weights.truncate(slot);
+        target_out.truncate(slot);
+        output.truncate(slot);
+        contributions.truncate(slot);
+        covariance.truncate(slot);
 
         Ok(Self {
             model: model.clone(),
             sim: model.sim().clone(),
             settings: settings.clone(),
-            indices: subset.indices.clone(),
-            weights: subset.weights.clone(),
-            covariance_weights: subset.covariance_weights.clone(),
+            indices,
+            weights,
+            covariance_weights,
             target: target_out,
             output,
+            metric,
             contributions,
             covariance,
             beta,
@@ -146,13 +211,14 @@ impl LinearCache {
         })
     }
 
-    pub(crate) fn scratch(&self) -> RealizationScratch {
-        let base_coef = self.model.base_look.coef_vector();
-        RealizationScratch {
-            look: self.model.base_look.clone(),
+    pub(crate) fn scratch(&self) -> Result<RealizationScratch> {
+        let look = self.model.realized_look()?;
+        let base_coef = look.coef_vector();
+        Ok(RealizationScratch {
+            look,
             coef: base_coef.clone(),
             base_coef,
-        }
+        })
     }
 
     pub(crate) fn realize_into(
@@ -182,6 +248,10 @@ impl LinearCache {
             wb[1] += row.wb[1];
             exposure += row.exposure;
         }
+        let (body_wb, body_exposure) = self.model.body_offsets(settings)?;
+        wb[0] += body_wb[0];
+        wb[1] += body_wb[1];
+        exposure += body_exposure;
         if !scratch.look.tone.is_colorimetric() {
             for value in &mut scratch.coef[layout.tone.start + 1..layout.tone.end] {
                 *value = value.max(0.0);
@@ -210,8 +280,9 @@ impl LinearCache {
         if !self.model.crm.interactions.is_empty() {
             return self.model.realize(settings);
         }
-        let mut coef = self.model.base_look.coef_vector();
-        let layout = self.model.base_look.layout();
+        let mut look = self.model.realized_look()?;
+        let mut coef = look.coef_vector();
+        let layout = look.layout();
         let mut wb = self.model.crm.wb.omega;
         let mut exposure = 0.0_f64;
         for control in 0..plan.domains.len() {
@@ -226,12 +297,15 @@ impl LinearCache {
             wb[1] += row.wb[1];
             exposure += row.exposure;
         }
-        if !self.model.base_look.tone.is_colorimetric() {
+        let (body_wb, body_exposure) = self.model.body_offsets(settings)?;
+        wb[0] += body_wb[0];
+        wb[1] += body_wb[1];
+        exposure += body_exposure;
+        if !look.tone.is_colorimetric() {
             for value in &mut coef[layout.tone.start + 1..layout.tone.end] {
                 *value = value.max(0.0);
             }
         }
-        let mut look = self.model.base_look.clone();
         look.apply_coef(&coef)?;
         Ok(Realization {
             look,
@@ -247,7 +321,15 @@ impl LinearCache {
         xyz: looklab_color::Xyz,
     ) -> Result<looklab_color::ucs::Ucs> {
         let realization = self.realization(plan, settings)?;
-        Ok(self.model.input_ucs(&realization, xyz, [0.0, 0.0], 0.0))
+        Ok(self.model.scored_ucs(self.metric, &realization, xyz))
+    }
+
+    pub(crate) fn scored_ucs(
+        &self,
+        realization: &Realization,
+        xyz: looklab_color::Xyz,
+    ) -> looklab_color::ucs::Ucs {
+        self.model.scored_ucs(self.metric, realization, xyz)
     }
 
     pub fn score(&self, plan: &Plan, settings: &Settings) -> f64 {
@@ -299,13 +381,13 @@ fn project_difference(
     value: &SparseDelta,
     current: &SparseDelta,
     jacobian: &[looklab_model::CoefTerm],
-) -> [f64; 3] {
-    let mut out = value.project(jacobian);
-    let base = current.project(jacobian);
+) -> Option<[f64; 3]> {
+    let mut out = value.project_checked(jacobian)?;
+    let base = current.project_checked(jacobian)?;
     for channel in 0..3 {
         out[channel] -= base[channel];
     }
-    out
+    Some(out)
 }
 
 fn derivatives_at(
@@ -314,10 +396,10 @@ fn derivatives_at(
     xyz: looklab_color::Xyz,
 ) -> Derivatives {
     let step = 1e-4;
-    let base = model.input_ucs(realization, xyz, [0.0, 0.0], 0.0);
-    let red = model.input_ucs(realization, xyz, [step, 0.0], 0.0);
-    let blue = model.input_ucs(realization, xyz, [0.0, step], 0.0);
-    let exposure = model.input_ucs(realization, xyz, [0.0, 0.0], step);
+    let base = model.pre_clip_ucs(realization, xyz, [0.0, 0.0], 0.0);
+    let red = model.pre_clip_ucs(realization, xyz, [step, 0.0], 0.0);
+    let blue = model.pre_clip_ucs(realization, xyz, [0.0, step], 0.0);
+    let exposure = model.pre_clip_ucs(realization, xyz, [0.0, 0.0], step);
     Derivatives {
         d_r: [
             (red.j - base.j) / step,
@@ -343,7 +425,8 @@ fn covariance_at(
     key: &looklab_schema::ControlKey,
     jacobian: &[looklab_model::CoefTerm],
     derivatives: &Derivatives,
-) -> f64 {
+    render_jacobian: Option<&looklab_color::Mat3>,
+) -> Option<f64> {
     let mut trace = 0.0_f64;
     for group in &model.groups {
         if &group.key != key {
@@ -354,10 +437,13 @@ fn covariance_at(
             continue;
         }
         for term in &group.terms {
-            let mut vector = term.delta.project(jacobian);
+            let mut vector = term.delta.project_checked(jacobian)?;
             for (channel, value) in vector.iter_mut().enumerate() {
                 *value +=
                     term.wb[0] * derivatives.d_r[channel] + term.wb[1] * derivatives.d_b[channel];
+            }
+            if let Some(render_jacobian) = render_jacobian {
+                vector = render_jacobian.mul_vec(vector);
             }
             trace += weight
                 * weight
@@ -365,5 +451,5 @@ fn covariance_at(
                 * (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]);
         }
     }
-    trace
+    Some(trace)
 }

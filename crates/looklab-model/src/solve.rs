@@ -2,7 +2,7 @@
 //! The exact `Y_ref` solve of docs/02 §3.3 step 2.
 
 use looklab_color::cam16::{Cam16Model, ViewingConditions};
-use looklab_color::{Xyz, ucs};
+use looklab_color::{WhiteRelativeXyz, Xyz, ucs};
 use std::sync::LazyLock;
 use thiserror::Error;
 
@@ -80,6 +80,20 @@ pub fn solve_y_ref(target: f64, guess: f64) -> f64 {
 /// CAM16-UCS of `xyz` under the reference viewing conditions.
 pub fn ucs_of_xyz(xyz: Xyz) -> ucs::Ucs {
     let cam = reference_model().xyz_to_cam16(xyz);
+    ucs::jmh_to_ucs(
+        looklab_color::cam16::Jmh {
+            j: cam.j,
+            m: cam.m,
+            h: cam.h,
+        },
+        ucs::UcsSpace::Ucs,
+    )
+}
+
+/// CAM16-UCS of `white + departure` under the reference viewing conditions;
+/// `departure` is relative to the reference white.
+pub fn ucs_of_xyz_departure(departure: WhiteRelativeXyz) -> ucs::Ucs {
+    let cam = reference_model().xyz_departure_to_cam16(departure);
     ucs::jmh_to_ucs(
         looklab_color::cam16::Jmh {
             j: cam.j,

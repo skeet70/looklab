@@ -43,6 +43,7 @@ GRACE_SECONDS = 10.0
 READY_SECONDS = 15.0
 FICLONE = 0x40049409
 TERMINATION_SIGNALS = frozenset({signal.SIGTERM, signal.SIGINT, signal.SIGHUP})
+DATA_DIRECTORIES = ("bodies", "manuals")
 
 
 class BuildError(RuntimeError):
@@ -332,7 +333,7 @@ class Supervisor:
         self.children = Children()
         self.active_binary: Path | None = None
         self.active_binary_digest: str | None = None
-        self.active_bodies_digest = "missing"
+        self.active_data_digests = {name: "missing" for name in DATA_DIRECTORIES}
         self.environment = sanitized_base()
 
     def prepare(self) -> None:
@@ -345,11 +346,11 @@ class Supervisor:
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
-    def stage_bodies(self) -> tuple[Path, str] | None:
-        source = self.layout.view / "data" / "bodies"
+    def stage_data(self, name: str) -> tuple[Path, str] | None:
+        source = self.layout.view / "data" / name
         if not source.is_dir():
             return None
-        staging = self.layout.runtime / "data" / ".bodies.next"
+        staging = self.layout.runtime / "data" / f".{name}.next"
         shutil.rmtree(staging, ignore_errors=True)
         shutil.copytree(source, staging)
         return staging, tree_digest(staging)
@@ -366,31 +367,31 @@ class Supervisor:
         shutil.rmtree(destination, ignore_errors=True)
         shutil.copytree(source, destination)
 
-    def replace_bodies(self, staging: Path) -> None:
+    def replace_data(self, name: str, staging: Path) -> None:
         data = self.layout.runtime / "data"
-        destination = data / "bodies"
-        retired = data / ".bodies.old"
+        destination = data / name
+        retired = data / f".{name}.old"
         shutil.rmtree(retired, ignore_errors=True)
         if destination.exists():
             os.rename(destination, retired)
         os.rename(staging, destination)
 
-    def restore_bodies(self, had_bodies: bool) -> None:
+    def restore_data(self, name: str, had_data: bool) -> None:
         data = self.layout.runtime / "data"
-        destination = data / "bodies"
-        retired = data / ".bodies.old"
-        failed = data / ".bodies.failed"
+        destination = data / name
+        retired = data / f".{name}.old"
+        failed = data / f".{name}.failed"
         shutil.rmtree(failed, ignore_errors=True)
         if destination.exists():
             os.rename(destination, failed)
         if retired.exists():
             os.rename(retired, destination)
-        elif not had_bodies:
+        elif not had_data:
             shutil.rmtree(destination, ignore_errors=True)
         shutil.rmtree(failed, ignore_errors=True)
 
-    def drop_bodies_backup(self) -> None:
-        shutil.rmtree(self.layout.runtime / "data" / ".bodies.old", ignore_errors=True)
+    def drop_data_backup(self, name: str) -> None:
+        shutil.rmtree(self.layout.runtime / "data" / f".{name}.old", ignore_errors=True)
 
     def install_binary(self, digest: str) -> Path:
         if not self.layout.stub_binary.is_file():
@@ -462,13 +463,11 @@ class Supervisor:
         return value if isinstance(value, dict) else None
 
     def write_runtime_record(self, generation: str) -> None:
+        record = {"generation": generation}
+        record.update(self.active_data_digests)
         write_atomic(
             self.layout.runtime_record,
-            json.dumps(
-                {"generation": generation, "bodies": self.active_bodies_digest},
-                sort_keys=True,
-            )
-            + "\n",
+            json.dumps(record, sort_keys=True) + "\n",
         )
 
     def start_persisted_runtime(self) -> bool:
@@ -476,14 +475,17 @@ class Supervisor:
         if record is None:
             return False
         generation = record.get("generation")
-        bodies = record.get("bodies")
-        if not isinstance(generation, str) or not isinstance(bodies, str):
+        if not isinstance(generation, str):
+            return False
+        digests = {name: record.get(name) for name in DATA_DIRECTORIES}
+        if not all(isinstance(digest, str) for digest in digests.values()):
             return False
         binary = self.layout.stub_bin / generation
         if not binary.is_file():
             return False
-        if tree_digest(self.layout.runtime / "data" / "bodies") != bodies:
-            return False
+        for name, digest in digests.items():
+            if tree_digest(self.layout.runtime / "data" / name) != digest:
+                return False
         try:
             self.launch_stub(binary)
             self.wait_ready()
@@ -492,7 +494,7 @@ class Supervisor:
             self.children.stop("stub")
             return False
         self.activate(binary)
-        self.active_bodies_digest = bodies
+        self.active_data_digests = digests
         return True
 
     def start_helpers(self) -> None:
@@ -511,10 +513,15 @@ class Supervisor:
             env=self.environment,
         )
 
-    def rollback_stub(self, old_binary: Path | None, had_bodies: bool, swapped: bool) -> None:
+    def rollback_stub(
+        self,
+        old_binary: Path | None,
+        swaps: dict[str, tuple[Path, str]],
+        had_data: dict[str, bool],
+    ) -> None:
         self.children.stop("stub")
-        if swapped:
-            self.restore_bodies(had_bodies)
+        for name in swaps:
+            self.restore_data(name, had_data[name])
         if old_binary is None:
             return
         try:
@@ -527,10 +534,14 @@ class Supervisor:
 
     def run_generation(
         self, generation, environment: dict[str, str]
-    ) -> tuple[Path, tuple[Path, str] | None]:
+    ) -> tuple[Path, dict[str, tuple[Path, str]]]:
         layout = self.layout
         view = layout.view
-        staged_bodies = self.stage_bodies()
+        staged = {
+            name: staged_dir
+            for name in DATA_DIRECTORIES
+            if (staged_dir := self.stage_data(name)) is not None
+        }
         if not self.reuse_data:
             run_step(
                 f"site data ({generation.digest[:12]})",
@@ -584,28 +595,32 @@ class Supervisor:
             cwd=layout.origin,
             env=environment,
         )
-        return binary, staged_bodies
+        return binary, staged
 
     def publish_generation(
         self,
         generation,
         signature: str,
         binary: Path,
-        staged_bodies: tuple[Path, str] | None,
+        staged: dict[str, tuple[Path, str]],
     ) -> None:
         layout = self.layout
         binary_digest = file_digest(binary)
-        swap_bodies = (
-            staged_bodies is not None
-            and staged_bodies[1] != self.active_bodies_digest
-        )
+        swaps = {
+            name: staged_dir
+            for name, staged_dir in staged.items()
+            if staged_dir[1] != self.active_data_digests[name]
+        }
         restart = (
             not self.children.running("stub")
             or binary_digest != self.active_binary_digest
-            or swap_bodies
+            or bool(swaps)
         )
         old_binary = self.active_binary
-        had_bodies = self.active_bodies_digest not in (None, "missing")
+        had_data = {
+            name: self.active_data_digests[name] not in (None, "missing")
+            for name in DATA_DIRECTORIES
+        }
         with blocked_termination():
             write_atomic(
                 layout.next_dist / BUILD_STAMP, f"{generation.digest}\n"
@@ -613,23 +628,23 @@ class Supervisor:
             if restart:
                 self.children.stop("stub")
                 try:
-                    if swap_bodies:
-                        self.replace_bodies(staged_bodies[0])
+                    for name, (staging, _) in swaps.items():
+                        self.replace_data(name, staging)
                     self.launch_stub(binary)
                     self.wait_ready()
                 except BaseException:
-                    self.rollback_stub(old_binary, had_bodies, swap_bodies)
+                    self.rollback_stub(old_binary, swaps, had_data)
                     raise
             try:
                 exchange_dist(layout.next_dist, layout.dist)
             except BaseException:
                 if restart:
-                    self.rollback_stub(old_binary, had_bodies, swap_bodies)
+                    self.rollback_stub(old_binary, swaps, had_data)
                 raise
             if restart:
                 self.activate(binary, binary_digest)
-                if swap_bodies:
-                    self.active_bodies_digest = staged_bodies[1]
+                for name, (_, digest) in swaps.items():
+                    self.active_data_digests[name] = digest
                 try:
                     self.write_runtime_record(generation.digest)
                 except OSError as error:
@@ -647,17 +662,19 @@ class Supervisor:
                     flush=True,
                 )
             shutil.rmtree(layout.next_dist, ignore_errors=True)
-            if staged_bodies is not None and not swap_bodies:
-                shutil.rmtree(staged_bodies[0], ignore_errors=True)
-            if swap_bodies:
-                self.drop_bodies_backup()
+            for name, (staging, _) in staged.items():
+                if name not in swaps:
+                    shutil.rmtree(staging, ignore_errors=True)
+            for name in swaps:
+                self.drop_data_backup(name)
             self.prune_binaries(binary)
 
     def shutdown(self) -> None:
         self.children.stop_all()
         data = self.layout.runtime / "data"
-        for name in (".bodies.next", ".bodies.old", ".bodies.failed"):
-            shutil.rmtree(data / name, ignore_errors=True)
+        for name in DATA_DIRECTORIES:
+            for suffix in ("next", "old", "failed"):
+                shutil.rmtree(data / f".{name}.{suffix}", ignore_errors=True)
 
 
 def read_record(layout: Layout) -> dict | None:
@@ -748,10 +765,8 @@ def attempt(layout: Layout, supervisor: Supervisor, observer: Observer, observed
             return "failed", generation, signature, error
         environment = build_environment(layout, generation)
         try:
-            binary, staged_bodies = supervisor.run_generation(generation, environment)
-            supervisor.publish_generation(
-                generation, signature, binary, staged_bodies
-            )
+            binary, staged = supervisor.run_generation(generation, environment)
+            supervisor.publish_generation(generation, signature, binary, staged)
         except Stopped:
             raise
         except (BuildError, OSError) as error:

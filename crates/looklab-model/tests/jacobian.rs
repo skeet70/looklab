@@ -57,6 +57,28 @@ impl SplitMix64 {
 }
 
 #[test]
+fn neutral_layer_jacobian_keeps_finite_tone_and_gain_and_singular_tint() {
+    let mut look = Look::colorimetric();
+    let mut beta = [0.0_f64; looklab_model::basis::TONE_COEFS];
+    beta[3] = 0.1;
+    look.tone = Tone::spline(0.35, beta).expect("non-negative betas");
+    look.color.g.plane[3] = 0.2;
+    let input = LookInput::new(looklab_model::solve::reference_white().scale(0.18));
+    let values = look.layer_values(&input);
+    let jacobian = look.d_output_d_layer_values(&input, &values);
+    assert!((jacobian[0][0] - 1.0).abs() < 1e-9, "neutral tone slope");
+    assert_eq!(jacobian[0][3], 0.0, "pure gain lightness slope");
+    assert_eq!(jacobian[1][3], 0.0, "pure gain chroma a");
+    assert_eq!(jacobian[2][3], 0.0, "pure gain chroma b");
+    for column in [1, 2, 7, 8] {
+        assert!(
+            jacobian[1][column].is_nan() && jacobian[2][column].is_nan(),
+            "active internal-chroma column {column} is singular"
+        );
+    }
+}
+
+#[test]
 fn jacobian_matches_finite_differences() {
     let look = sample_look();
     let mut rng = SplitMix64(0x5eed_9876_5432_1000);
@@ -202,13 +224,38 @@ fn coefficient_jacobian_matches_perturbations() {
 }
 
 #[test]
-fn tint_derivative_is_zero_outside_the_domain() {
+fn tint_derivative_follows_the_c2_continuation() {
     let look = full_look();
-    for t in [-1.0, 150.0] {
-        assert_eq!(look.d_tint_d_t(t), (0.0, 0.0));
+    let evaluate = |t: f64| {
+        let (indices, weights, _) = looklab_model::basis::tint_weights(t);
+        let mut a = 0.0;
+        let mut b = 0.0;
+        for (position, index) in indices.iter().enumerate() {
+            a += weights[position] * look.tint.a[*index];
+            b += weights[position] * look.tint.b[*index];
+        }
+        (a, b)
+    };
+    for t in [50.0, 120.0] {
+        let (a, b) = look.d_tint_d_t(t);
+        let h = 1e-6;
+        let plus = evaluate(t + h);
+        let minus = evaluate(t - h);
+        let numerical_a = (plus.0 - minus.0) / (2.0 * h);
+        let numerical_b = (plus.1 - minus.1) / (2.0 * h);
+        assert!(
+            (a - numerical_a).abs() < 1e-5,
+            "t {t} a {a} vs {numerical_a}"
+        );
+        assert!(
+            (b - numerical_b).abs() < 1e-5,
+            "t {t} b {b} vs {numerical_b}"
+        );
     }
-    let (a, b) = look.d_tint_d_t(50.0);
-    assert!(a != 0.0 || b != 0.0);
+    for t in [-1.0, 150.0] {
+        let (a, b) = look.d_tint_d_t(t);
+        assert!(a.is_finite() && b.is_finite());
+    }
 }
 
 #[test]
@@ -220,6 +267,4 @@ fn neutral_jacobian_has_unit_tone_response() {
     assert!((jacobian[0][0] - 1.0).abs() < 1e-9);
     assert_eq!(jacobian[0][5], 1.0);
     assert_eq!(jacobian[0][6], 1.0);
-    assert_eq!(jacobian[1][1], 1.0);
-    assert_eq!(jacobian[2][2], 1.0);
 }

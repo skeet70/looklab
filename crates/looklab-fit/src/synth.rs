@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Synthetic single-body fixtures: a known Look rendered through the forward model with nuisances and Student-t noise.
 
+use std::collections::BTreeMap;
+
 use looklab_color::ucs::{UcsSpace, ucs_to_jmh};
 use looklab_color::{Mat3, Rgb, RgbSpace, Xyz};
 use looklab_model::basis::{
@@ -17,10 +19,14 @@ use rand_chacha::rand_core::{RngCore, SeedableRng};
 
 use crate::gauge::WbModeClass;
 use crate::hierarchical::{
-    BodyData, FIRMWARE_PARAMETERS, FirmwareId, HierImage, LookFamilyId, firmware_look,
+    BodyData, FIRMWARE_PARAMETERS, FamilyData, FamilyMode, FirmwareId, HierImage, HierInput,
+    RealizationData, firmware_look,
 };
 use crate::types::{ContributorId, ExposureModeId, FitImage};
 use looklab_body::{A0Source, BodyId, BodyPrior, Delta6, InputTransform, TransformVersion};
+use looklab_schema::{
+    BodyRealizationId, ControlEpochId, FamilyTargetId, LookId, SimKey, TargetVersion,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SynthConfig {
@@ -401,7 +407,7 @@ pub fn dataset_with(
 }
 
 use looklab_model::realization::{ControlResponseModel, ControlValue, Delta, LayerKind, Settings};
-use looklab_schema::{ControlSchema, SimKey};
+use looklab_schema::ControlSchema;
 
 #[derive(Clone, Debug)]
 pub struct ControlSynthConfig {
@@ -718,6 +724,8 @@ pub struct SynthBody {
     pub truth_exposure: Vec<(ExposureModeId, f64)>,
     pub truth_wb: Vec<(WbModeClass, [f64; 2])>,
     pub images: Vec<HierImage>,
+    /// Family of each image, parallel to `images`.
+    pub families: Vec<LookId>,
     pub points: Vec<Vec<Xyz>>,
     /// Per image: `[x, log w_R, log w_B]`.
     pub image_nuisances: Vec<[f64; 3]>,
@@ -725,24 +733,64 @@ pub struct SynthBody {
 
 pub struct MultiBodyDataset {
     pub bodies: Vec<SynthBody>,
-    pub truths: Vec<(LookFamilyId, Look)>,
+    pub truths: Vec<(LookId, Look)>,
     pub firmware_truth: Vec<(FirmwareId, [f64; FIRMWARE_PARAMETERS])>,
     pub clip_k: f64,
 }
 
 impl MultiBodyDataset {
     /// The synthetic bodies in the fit's input shape.
-    pub fn body_data(&self) -> Vec<BodyData> {
-        self.bodies
+    pub fn body_data(&self) -> HierInput {
+        let families = self
+            .truths
+            .iter()
+            .map(|(family, _)| FamilyData {
+                target: FamilyTargetId {
+                    family: family.clone(),
+                    version: TargetVersion::new(1).expect("one is a positive target version"),
+                },
+                mode: FamilyMode::Fit { initial: None },
+                previous_support: None,
+            })
+            .collect();
+        let bodies = self
+            .bodies
             .iter()
             .map(|body| {
+                let id = looklab_schema::BodyId::new(body.id.as_str())
+                    .expect("synthetic body id is valid");
                 let prior = BodyPrior {
                     source: A0Source::Dng,
                     a0_a: body.a0,
                     a0_d65: body.a0,
                 };
+                let mut grouped: BTreeMap<LookId, Vec<HierImage>> = BTreeMap::new();
+                for (index, image) in body.images.iter().enumerate() {
+                    grouped
+                        .entry(body.families[index].clone())
+                        .or_default()
+                        .push(image.clone());
+                }
+                let realizations = grouped
+                    .into_iter()
+                    .map(|(family, images)| RealizationData {
+                        id: BodyRealizationId {
+                            body: id.clone(),
+                            epoch: ControlEpochId::new(1),
+                            native_sim: SimKey::new("native").expect("synthetic sim key"),
+                        },
+                        target: FamilyTargetId {
+                            family,
+                            version: TargetVersion::new(1)
+                                .expect("one is a positive target version"),
+                        },
+                        model: None,
+                        images,
+                        warm: None,
+                    })
+                    .collect();
                 BodyData {
-                    id: body.id.clone(),
+                    id,
                     transform: InputTransform::prior(
                         body.id.clone(),
                         TransformVersion::new(1),
@@ -750,18 +798,19 @@ impl MultiBodyDataset {
                     ),
                     default_mode: ExposureModeId(0),
                     default_wb_mode: WbModeClass(0),
-                    images: body.images.clone(),
                     charts: Vec::new(),
-                    model: None,
+                    warm: None,
+                    realizations,
                 }
             })
-            .collect()
+            .collect();
+        HierInput { families, bodies }
     }
 
-    pub fn truth(&self, look: LookFamilyId) -> Option<&Look> {
+    pub fn truth(&self, look: &LookId) -> Option<&Look> {
         self.truths
             .iter()
-            .find(|(id, _)| *id == look)
+            .find(|(id, _)| id == look)
             .map(|(_, look)| look)
     }
 }
@@ -770,26 +819,15 @@ pub fn multi_body(config: &MultiBodyConfig) -> MultiBodyDataset {
     let mut rng = ChaCha12Rng::seed_from_u64(config.seed);
     let body_count = config.bodies.max(1);
     let families = config.look_families.max(1);
-    let truths: Vec<(LookFamilyId, Look)> = (0..families)
+    let truths: Vec<(LookId, Look)> = (0..families)
         .map(|family| {
             (
-                LookFamilyId(family as u32),
+                LookId::new(&format!("family-{family}")).expect("synthetic family id"),
                 truth_look(config.seed + 0x51 + family as u64),
             )
         })
         .collect();
-    let firmware_truth: Vec<(FirmwareId, [f64; FIRMWARE_PARAMETERS])> = (0..config.firmware.max(1))
-        .map(|version| {
-            (
-                FirmwareId(version as u32),
-                if version == 1 {
-                    config.firmware_shift
-                } else {
-                    [0.0; FIRMWARE_PARAMETERS]
-                },
-            )
-        })
-        .collect();
+    let mut firmware_truth: Vec<(FirmwareId, [f64; FIRMWARE_PARAMETERS])> = Vec::new();
 
     let mut delta_params: Vec<[f64; 6]> = (0..body_count)
         .map(|_| core::array::from_fn(|_| config.delta_sd * gaussian(&mut rng)))
@@ -809,6 +847,27 @@ pub fn multi_body(config: &MultiBodyConfig) -> MultiBodyDataset {
     let mut bodies = Vec::with_capacity(body_count);
     for body_index in 0..body_count {
         let id = BodyId::new(format!("body-{body_index}")).expect("generated id is non-empty");
+        let schema_id =
+            looklab_schema::BodyId::new(id.as_str()).expect("generated schema id is valid");
+        let firmware_ids: Vec<FirmwareId> = (0..config.firmware.max(1))
+            .map(|version| {
+                let firmware = FirmwareId::new(
+                    schema_id.clone(),
+                    ControlEpochId::new(1),
+                    &format!("1.{version}"),
+                )
+                .expect("generated firmware identity is valid");
+                firmware_truth.push((
+                    firmware.clone(),
+                    if version == 1 {
+                        config.firmware_shift
+                    } else {
+                        [0.0; FIRMWARE_PARAMETERS]
+                    },
+                ));
+                firmware
+            })
+            .collect();
         let a0 = camera_matrix(&mut rng);
         let truth_delta = Delta6::new(delta_params[body_index]).expect("delta within range");
         let truth_exposure: Vec<(ExposureModeId, f64)> = (0..config.exposure_modes.max(1))
@@ -837,21 +896,24 @@ pub fn multi_body(config: &MultiBodyConfig) -> MultiBodyDataset {
         let transform = a0.mul(&truth_delta.transform());
         let inverse = transform.inverse().unwrap_or(Mat3::IDENTITY);
         let mut images = Vec::with_capacity(config.images_per_body);
+        let mut families_out = Vec::with_capacity(config.images_per_body);
         let mut points = Vec::with_capacity(config.images_per_body);
         let mut image_nuisances = Vec::with_capacity(config.images_per_body);
         for image_index in 0..config.images_per_body {
             let mode = ExposureModeId((image_index % config.exposure_modes.max(1)) as u32);
             let wb_mode = WbModeClass((image_index % config.wb_modes.max(1)) as u32);
-            let family = LookFamilyId(if body_index == 0 {
+            let family_index = if body_index == 0 {
                 0
             } else if body_index + 1 == body_count {
-                (families - 1) as u32
+                families - 1
             } else if image_index < config.images_per_body.div_ceil(2) {
                 0
             } else {
-                (families - 1) as u32
-            });
-            let firmware = FirmwareId((image_index % config.firmware.max(1)) as u32);
+                families - 1
+            };
+            let family = truths[family_index].0.clone();
+            let firmware_index = image_index % config.firmware.max(1);
+            let firmware = firmware_ids[firmware_index].clone();
             let xi = truth_exposure
                 .iter()
                 .find(|(candidate, _)| *candidate == mode)
@@ -936,10 +998,10 @@ pub fn multi_body(config: &MultiBodyConfig) -> MultiBodyDataset {
             image.contributor = ContributorId(body_index as u32);
             images.push(HierImage {
                 image,
-                look: family,
                 firmware,
                 wb_mode,
             });
+            families_out.push(family);
             image_nuisances.push([exposure, wb[0], wb[1]]);
             points.push(xyz_points);
         }
@@ -950,6 +1012,7 @@ pub fn multi_body(config: &MultiBodyConfig) -> MultiBodyDataset {
             truth_exposure,
             truth_wb,
             images,
+            families: families_out,
             points,
             image_nuisances,
         });

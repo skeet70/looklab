@@ -19,6 +19,8 @@ pub enum ModuleError {
     Metadata { index: usize, message: String },
     #[error("manifest is not a canonical BatchManifest: {message}")]
     Manifest { message: String },
+    #[error("send manifest is not canonical: {message}")]
+    SendManifest { message: String },
     #[error("proof-of-work failed: {message}")]
     Pow { message: String },
     #[error("envelope encoding failed: {message}")]

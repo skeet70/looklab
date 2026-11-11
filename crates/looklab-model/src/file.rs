@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 
 use looklab_color::cam16::ViewingConditions;
-use looklab_schema::{BodyId, SimKey};
+use looklab_schema::{BodyId, LutBase, LutDynamicRange, LutRenderer, SimKey};
 use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 
@@ -295,6 +295,61 @@ impl BaseReference {
             };
         }
         BaseStatus::BaseIdentifiedUnmeasured
+    }
+}
+
+impl TryFrom<&LutBase> for BaseReference {
+    type Error = ModelError;
+
+    fn try_from(base: &LutBase) -> Result<Self> {
+        Ok(match base {
+            LutBase::Look { look, version } => Self::Look {
+                slug: Slug::new(look.as_str())?,
+                version: LookVersion::new(version.as_str())?,
+            },
+            LutBase::BodyRealization {
+                body,
+                renderer,
+                film_simulation,
+                dynamic_range,
+                notes,
+            } => Self::BodyRealization {
+                body: body.clone(),
+                renderer: (*renderer).into(),
+                film_simulation: film_simulation.clone(),
+                dynamic_range: dynamic_range.map(Into::into),
+                notes: notes.clone(),
+            },
+            LutBase::FamilyRendering {
+                maker,
+                rendering,
+                dynamic_range,
+                notes,
+            } => Self::FamilyRendering {
+                maker: maker.as_str().to_owned(),
+                rendering: rendering.as_str().to_owned(),
+                dynamic_range: dynamic_range.map(Into::into),
+                notes: notes.clone(),
+            },
+        })
+    }
+}
+
+impl From<LutRenderer> for Renderer {
+    fn from(renderer: LutRenderer) -> Self {
+        match renderer {
+            LutRenderer::XRawStudio => Self::XRawStudio,
+        }
+    }
+}
+
+impl From<LutDynamicRange> for DynamicRange {
+    fn from(dynamic_range: LutDynamicRange) -> Self {
+        match dynamic_range {
+            LutDynamicRange::Dr100 => Self::Dr100,
+            LutDynamicRange::Dr200 => Self::Dr200,
+            LutDynamicRange::Dr400 => Self::Dr400,
+        }
     }
 }
 
@@ -604,7 +659,11 @@ impl LutData {
 pub struct LutDefinition {
     pub name: String,
     pub license: LicenseRecord,
+    /// The rendering the fitted coefficients were composed against.
     pub encoding: DeclaredEncoding,
+    /// The base the LUT was declared for, when the fit used an identified approximation instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_base: Option<BaseReference>,
     pub output: OutputEncoding,
     pub lut: LutRecord,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -636,6 +695,16 @@ impl LutDefinition {
         if let DeclaredEncoding::DisplayReferred { status, base } = &self.encoding {
             base.validate()?;
             status.validate()?;
+            if let Some(declared) = &self.declared_base {
+                declared.validate()?;
+                if declared == base {
+                    return Err(ModelError::Invalid("redundant declared base".to_string()));
+                }
+            }
+        } else if self.declared_base.is_some() {
+            return Err(ModelError::Invalid(
+                "declared base on a scene-referred LUT".to_string(),
+            ));
         }
         Ok(())
     }
@@ -908,7 +977,7 @@ pub struct Provenance {
     pub base: Option<BaseReference>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub needs_rebase: bool,
-    pub community_snapshot_version: u32,
+    pub community_snapshot_version: u64,
     pub prep_versions: Vec<u32>,
     pub created: String,
     pub software: String,
@@ -1188,6 +1257,89 @@ pub struct UncertaintyData {
 }
 
 impl UncertaintyData {
+    /// # Errors
+    /// Out-of-range indices, empty indices with stored arrays, or inconsistent dimensions.
+    pub fn restrict_to(&self, indices: &[usize]) -> Result<Self> {
+        let mut counts = Vec::new();
+        if let Some(covariance) = &self.probe_cov {
+            if covariance.values.len() != covariance.probes.saturating_mul(9) {
+                return Err(ModelError::Invalid("probe_cov dimensions".to_string()));
+            }
+            counts.push(("probe_cov", covariance.probes));
+        }
+        if let Some(covariance) = &self.probe_cov_post {
+            if covariance.values.len() != covariance.probes.saturating_mul(9) {
+                return Err(ModelError::Invalid("probe_cov_post dimensions".to_string()));
+            }
+            counts.push(("probe_cov_post", covariance.probes));
+        }
+        for (name, scalars) in [
+            ("probe_bias", &self.probe_bias),
+            ("probe_sigma", &self.probe_sigma),
+            ("probe_sigma_post", &self.probe_sigma_post),
+            ("probe_pre_reliable", &self.probe_pre_reliable),
+            ("support", &self.support),
+        ] {
+            if let Some(scalars) = scalars {
+                counts.push((name, scalars.values.len()));
+            }
+        }
+        if let Some(density) = &self.density {
+            counts.push(("kde", density.values.len()));
+        }
+        let Some((_, probes)) = counts.first() else {
+            return Ok(Self::default());
+        };
+        let probes = *probes;
+        if let Some((name, _)) = counts.iter().copied().find(|(_, count)| *count != probes) {
+            return Err(ModelError::Invalid(format!("{name} dimensions")));
+        }
+        if indices.is_empty() {
+            return Err(ModelError::Invalid("empty probe subset".to_string()));
+        }
+        if indices.iter().any(|index| *index >= probes) {
+            return Err(ModelError::Invalid("probe subset index".to_string()));
+        }
+        let covariance = |values: &Option<ProbeCovariance>| -> Result<Option<ProbeCovariance>> {
+            values
+                .as_ref()
+                .map(|covariance| {
+                    let mut selected = Vec::with_capacity(indices.len().saturating_mul(9));
+                    for index in indices {
+                        let start = *index * 9;
+                        selected.extend_from_slice(&covariance.values[start..start + 9]);
+                    }
+                    ProbeCovariance::new(indices.len(), selected)
+                })
+                .transpose()
+        };
+        let scalars = |values: &Option<ProbeScalars>| -> Result<Option<ProbeScalars>> {
+            values
+                .as_ref()
+                .map(|scalars| {
+                    ProbeScalars::new(indices.iter().map(|index| scalars.values[*index]).collect())
+                })
+                .transpose()
+        };
+        let density = self
+            .density
+            .as_ref()
+            .map(|density| {
+                Density::new(indices.iter().map(|index| density.values[*index]).collect())
+            })
+            .transpose()?;
+        Ok(Self {
+            probe_cov: covariance(&self.probe_cov)?,
+            probe_cov_post: covariance(&self.probe_cov_post)?,
+            probe_bias: scalars(&self.probe_bias)?,
+            probe_sigma: scalars(&self.probe_sigma)?,
+            probe_sigma_post: scalars(&self.probe_sigma_post)?,
+            probe_pre_reliable: scalars(&self.probe_pre_reliable)?,
+            support: scalars(&self.support)?,
+            density,
+        })
+    }
+
     fn validate(&self, probes: usize) -> Result<()> {
         for (name, covariance) in [
             ("probe_cov", &self.probe_cov),

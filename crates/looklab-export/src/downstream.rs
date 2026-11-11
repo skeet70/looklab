@@ -4,9 +4,10 @@
 use looklab_color::cam16::Chroma;
 use looklab_color::ucs::{Ucs, UcsSpace, ucs_to_jmh};
 use looklab_color::{RgbSpace, Xyz};
-use looklab_model::Look;
 use looklab_model::clip::output_encode_clip;
+use looklab_model::domain_penalty::{DomainViolation, PublishedInverse, check_published_inverse};
 use looklab_model::solve;
+use looklab_model::{Look, LookInput};
 use looklab_schema::{
     Downstream, GamutClip, InterfaceProfile, OutputTransform, Primaries, TransferFunction,
 };
@@ -19,6 +20,44 @@ use crate::error::{ExportError, Result};
 pub fn ucs_to_xyz(ucs: Ucs) -> Xyz {
     let jmh = ucs_to_jmh(ucs, UcsSpace::Ucs);
     solve::reference_model().cam16_to_xyz(jmh.j, Chroma::M(jmh.m), jmh.h)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RenderableAppearance {
+    Interior(PublishedInverse),
+    NeutralBlack,
+}
+
+impl RenderableAppearance {
+    pub fn appearance(&self) -> Ucs {
+        match self {
+            Self::Interior(inverse) => inverse.appearance,
+            Self::NeutralBlack => Ucs::new(0.0, 0.0, 0.0),
+        }
+    }
+}
+
+impl TryFrom<Ucs> for RenderableAppearance {
+    type Error = DomainViolation;
+
+    fn try_from(appearance: Ucs) -> core::result::Result<Self, Self::Error> {
+        if appearance.j == 0.0 && appearance.a == 0.0 && appearance.b == 0.0 {
+            Ok(Self::NeutralBlack)
+        } else {
+            check_published_inverse(appearance).map(Self::Interior)
+        }
+    }
+}
+
+/// Published pre-clip appearance, including the neutral-black rendering boundary.
+pub fn checked_appearance(
+    look: &Look,
+    xyz: Xyz,
+) -> core::result::Result<RenderableAppearance, DomainViolation> {
+    let input = LookInput::new(xyz);
+    let values = look.layer_values(&input);
+    let paths = look.chroma_paths(&input, &values);
+    RenderableAppearance::try_from(paths.published())
 }
 
 /// The primaries the firmware's output transform writes into.

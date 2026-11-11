@@ -8,6 +8,8 @@ use looklab_publish::{GateCheck, LookStatus};
 pub mod components;
 pub use components::*;
 
+pub(crate) const PLATFORM_STORE_UNDETECTED_NOTICE: &str = "No built-in passkey store was detected. Use a password manager, your phone, or a security key.";
+
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
 export function looklabPaint() {
     return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
@@ -57,6 +59,21 @@ pub fn preview_notice() -> impl IntoView + use<> {
             <strong>"Sharing is turned off in this demo."</strong>
             <p>"You can still explore looks and process your photos on this device."</p>
         </div>
+    }
+}
+
+/// The notice shown wherever the whole public catalog has no published look.
+pub fn no_published_looks() -> impl IntoView + use<> {
+    view! {
+        <EmptyState
+            title="No looks are published yet".to_owned()
+            message="looklab measures a camera's color from RAW and JPEG pairs shared by the people who shoot it. Looks are published once a camera has enough checked photos.".to_owned()
+        >
+            <p class="field-row">
+                <a class="button" href=crate::base::site_url("/contribute")>"Share photos you already have"</a>
+                <a href=crate::base::site_url("/about/how-it-works")>"How looks are made →"</a>
+            </p>
+        </EmptyState>
     }
 }
 

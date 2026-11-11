@@ -2,9 +2,11 @@
 
 use looklab_match::synth;
 use looklab_match::{
-    ControlDomain, Emphasis, MatchOptions, Plan, PreparedTarget, Settings, TargetSpec, optimize,
+    ControlDomain, Emphasis, MatchOptions, OutputPin, Plan, PreparedTarget, Settings,
+    TargetAppearance, TargetSpec, optimize,
 };
 use looklab_model::realization::ControlValue;
+use looklab_schema::OutputEncoding;
 
 fn within_one_step(plan: &Plan, a: &Settings, b: &Settings) -> bool {
     plan.plan_controls.iter().all(|&control| {
@@ -52,6 +54,7 @@ fn recovers_held_out_targets_within_one_step_or_05_delta_e() {
             tau: 1.0,
             support_sigma: 1.5,
             density_floor: None,
+            appearance: body.appearance(),
         })
         .expect("target");
         let outcome = optimize(std::slice::from_ref(&body.model), &target, &plan, &options)
@@ -94,6 +97,7 @@ fn emphasis_changes_group_weights() {
         tau: 1.0,
         support_sigma: 1.5,
         density_floor: None,
+        appearance: body.appearance(),
     })
     .expect("balanced");
     let skin = PreparedTarget::new(TargetSpec {
@@ -104,6 +108,7 @@ fn emphasis_changes_group_weights() {
         tau: 1.0,
         support_sigma: 1.5,
         density_floor: None,
+        appearance: body.appearance(),
     })
     .expect("skin");
     let skin_probe = probes
@@ -134,6 +139,7 @@ fn probe_subset_is_deterministic_and_bounded() {
         tau: 1.0,
         support_sigma: 1.5,
         density_floor: None,
+        appearance: body.appearance(),
     })
     .expect("target");
     let first = target.subset(200);
@@ -162,4 +168,30 @@ fn control_domain_steps_match_the_schema() {
     assert_eq!(plan.domains[ec].values.len(), 19);
     let domain: &ControlDomain = &plan.domains[ec];
     assert_eq!(domain.default, 9);
+}
+
+#[test]
+fn an_infeasible_published_render_has_no_supported_probes() {
+    let mut look = looklab_model::Look::colorimetric_spline().expect("look");
+    look.color.lambda.plane.fill(400.0);
+    look.color.lambda.volume.fill(400.0);
+    let probes = looklab_model::probes::v1();
+    let error = PreparedTarget::new(TargetSpec {
+        probes: &probes,
+        function: &look,
+        uncertainty: None,
+        emphasis: Emphasis::Balanced,
+        tau: 1.0,
+        support_sigma: f64::MAX,
+        density_floor: None,
+        appearance: TargetAppearance::Rendered(
+            OutputPin::new(OutputEncoding::Srgb, look.clip.k).expect("clip"),
+        ),
+    })
+    .err()
+    .expect("no feasible probe");
+    assert!(matches!(
+        error,
+        looklab_match::MatchError::NoSupportedProbes
+    ));
 }

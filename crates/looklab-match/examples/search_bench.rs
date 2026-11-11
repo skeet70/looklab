@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tau: 1.0,
         support_sigma: 1.5,
         density_floor: None,
+        appearance: truth.appearance(),
     })?;
     let mut models = Vec::new();
     for seed in 0..3 {
