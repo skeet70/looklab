@@ -45,6 +45,7 @@ const STATE_FORMAT: &str = "looklab-verify-state/1";
 const UPLOAD_PATH: &str = "/api/upload";
 const MANUAL_CONFIRMATION_PATH: &str = "/api/manual-confirmations";
 const MANUAL_WITHDRAWAL_PATH: &str = "/api/manual-confirmations/withdraw";
+const MANUAL_SUMMARY_PREFIX: &str = "/api/manual-confirmations/";
 const NONCE_PATH: &str = "/api/nonce";
 const SESSION_PATH: &str = "/api/session";
 const REGISTER_START_PATH: &str = "/api/passkey/register/start";
@@ -755,39 +756,34 @@ struct BatchFields {
     settings_sources: Vec<BatchSetting>,
 }
 
-#[allow(clippy::too_many_arguments)]
+struct DerivationInputs<'a> {
+    version: CommunitySnapshotVersion,
+    declarations: &'a BTreeMap<ControlKey, StepIndex>,
+    card: bool,
+    card_family: Option<&'a LookId>,
+    card_render_class: Option<RenderClass>,
+}
+
 fn derive_batch(
     images: &[&ReproducedImage],
     bodies: &Bodies,
-    version: CommunitySnapshotVersion,
-    declarations: &BTreeMap<ControlKey, StepIndex>,
-    card: bool,
-    card_family: Option<&LookId>,
-    card_render_class: Option<RenderClass>,
+    inputs: &DerivationInputs<'_>,
     used: &RefCell<BTreeSet<ControlKey>>,
     findings: &mut Findings,
 ) -> Option<BatchFields> {
-    let records = match bodies.at(version) {
+    let records = match bodies.at(inputs.version) {
         Ok(records) => records,
         Err(error) => {
             findings.fail(format!(
-                "the manifest names community snapshot {version}: {error}; --data has up to {}",
+                "the manifest names community snapshot {}: {error}; --data has up to {}",
+                inputs.version,
                 bodies.current_version()
             ));
             return None;
         }
     };
     let first = images.first()?;
-    let fields = match derive_one(
-        &first.metadata,
-        records,
-        version,
-        declarations,
-        card,
-        card_family,
-        card_render_class,
-        used,
-    ) {
+    let fields = match derive_one(&first.metadata, records, inputs, used) {
         Ok(fields) => fields,
         Err(reason) => {
             findings.fail(format!(
@@ -797,16 +793,7 @@ fn derive_batch(
         }
     };
     for image in &images[1..] {
-        match derive_one(
-            &image.metadata,
-            records,
-            version,
-            declarations,
-            card,
-            card_family,
-            card_render_class,
-            used,
-        ) {
+        match derive_one(&image.metadata, records, inputs, used) {
             Ok(other) if other == fields => {}
             Ok(_) => {
                 findings.fail(
@@ -825,17 +812,13 @@ fn derive_batch(
     Some(fields)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn derive_one(
     metadata: &ManifestMetadata,
     records: &BTreeMap<String, BodyRecord>,
-    version: CommunitySnapshotVersion,
-    declarations: &BTreeMap<ControlKey, StepIndex>,
-    card: bool,
-    card_family: Option<&LookId>,
-    card_render_class: Option<RenderClass>,
+    inputs: &DerivationInputs<'_>,
     used: &RefCell<BTreeSet<ControlKey>>,
 ) -> Result<BatchFields, String> {
+    let version = inputs.version;
     let make = metadata
         .make
         .as_deref()
@@ -864,30 +847,32 @@ fn derive_one(
         Err(_) => sim_from_makernote(epoch, &values)
             .map_err(|error| format!("the files do not determine the film simulation: {error}"))?,
     };
-    let (render_class, family, mono_filter) = match (card, card_family, card_render_class) {
-        (true, Some(family), Some(declared)) => {
-            let declared = match declared {
-                RenderClass::Colour => SchemaRenderClass::Colour,
-                RenderClass::Monochrome => SchemaRenderClass::Monochrome,
-            };
-            let classified = classify_card_render(epoch, family, declared, &values)
-                .map_err(|error| format!("the card render does not classify: {error}"))?;
-            (
-                schema_render_class(classified.render_class),
-                classified.family,
-                classified.mono_filter,
-            )
-        }
-        _ => {
-            let classification = native
-                .map_err(|error| format!("the files do not determine the render class: {error}"))?;
-            (
-                schema_render_class(classification.render_class),
-                classification.family,
-                classification.mono_filter,
-            )
-        }
-    };
+    let (render_class, family, mono_filter) =
+        match (inputs.card, inputs.card_family, inputs.card_render_class) {
+            (true, Some(family), Some(declared)) => {
+                let declared = match declared {
+                    RenderClass::Colour => SchemaRenderClass::Colour,
+                    RenderClass::Monochrome => SchemaRenderClass::Monochrome,
+                };
+                let classified = classify_card_render(epoch, family, declared, &values)
+                    .map_err(|error| format!("the card render does not classify: {error}"))?;
+                (
+                    schema_render_class(classified.render_class),
+                    classified.family,
+                    classified.mono_filter,
+                )
+            }
+            _ => {
+                let classification = native.map_err(|error| {
+                    format!("the files do not determine the render class: {error}")
+                })?;
+                (
+                    schema_render_class(classification.render_class),
+                    classification.family,
+                    classification.mono_filter,
+                )
+            }
+        };
     if render_class == RenderClass::Monochrome && !epoch.supports_monochrome_intake(&family) {
         return Err(format!(
             "the schema does not accept monochrome intake for family {family}"
@@ -906,7 +891,7 @@ fn derive_one(
             tag: setting.source.name(),
         })
         .collect();
-    for (key, step) in declarations {
+    for (key, step) in inputs.declarations {
         let applicable = reach.mapped.contains(key)
             || reach.unmapped.contains(key)
             || reach.spatial.contains(key);
@@ -932,7 +917,7 @@ fn derive_one(
     }
     required.sort();
     required.dedup();
-    if !card || deferred {
+    if !inputs.card || deferred {
         for missing in required {
             if sources.iter().any(|setting| &setting.key == missing) {
                 continue;
@@ -968,7 +953,7 @@ fn derive_one(
         .map(|setting| ControlEntry::new(setting.key.clone(), setting.step, setting.source))
         .collect();
     let settings = ControlSettings::new(entries).map_err(|error| error.to_string())?;
-    let validation_family = if card && card_family.is_none() {
+    let validation_family = if inputs.card && inputs.card_family.is_none() {
         None
     } else {
         Some(family.clone())
@@ -979,7 +964,7 @@ fn derive_one(
         &native_sim,
         validation_family.as_ref(),
         &settings,
-        card,
+        inputs.card,
         deferred,
     )
     .map_err(|problem| format!("the derived settings are not valid for {body}: {problem}"))?;
@@ -1764,15 +1749,18 @@ fn verify_upload(
                     }
                     _ => None,
                 };
+                let inputs = DerivationInputs {
+                    version: service.snapshot,
+                    declarations: service.declarations,
+                    card: matches!(declared.intent, Intent::Card(_)),
+                    card_family: card_family.as_ref(),
+                    card_render_class: matches!(declared.intent, Intent::Card(_))
+                        .then_some(envelope.manifest.render_class),
+                };
                 let derived = derive_batch(
                     images,
                     service.bodies,
-                    service.snapshot,
-                    service.declarations,
-                    matches!(declared.intent, Intent::Card(_)),
-                    card_family.as_ref(),
-                    matches!(declared.intent, Intent::Card(_))
-                        .then_some(envelope.manifest.render_class),
+                    &inputs,
                     &service.declaration_use,
                     findings,
                 );
@@ -2579,10 +2567,14 @@ fn load_groups(files: &[PathBuf]) -> Result<Vec<Group>> {
     if groups.is_empty() {
         bail!("no RAW file was given");
     }
-    for group in &groups {
+    for group in &mut groups {
         if group.jpegs.is_empty() {
             bail!("{} has no JPEG in its group", group.raw.name);
         }
+        // The site pairs a RAW's JPEGs by file name; prep samples the first as the reference.
+        group
+            .jpegs
+            .sort_by(|left, right| left.name.trim().cmp(right.name.trim()));
     }
     Ok(groups)
 }
@@ -2775,8 +2767,51 @@ fn audit_request(
             audit_registration(request, &["handle", "credential"], findings);
         }
         RequestClass::ManualWithdrawal => audit_withdrawal(request, service, findings, credentials),
+        RequestClass::ManualSummary => audit_manual_summary(request, service, findings),
         RequestClass::Upload | RequestClass::ManualConfirmation | RequestClass::Unexpected => {}
     }
+}
+
+fn audit_manual_summary(request: &HarRequest, service: &Service<'_>, findings: &mut Findings) {
+    if request.post_data.is_some() {
+        findings.fail(format!(
+            "request {} {} carries a body, but the camera summary is a GET",
+            request.method, request.url
+        ));
+        return;
+    }
+    let Some(parts) = UrlParts::parse(&request.url) else {
+        return;
+    };
+    let Some(camera) = manual_summary_camera(parts.path()) else {
+        return;
+    };
+    let Ok(camera_id) = BodyId::new(camera) else {
+        findings.fail(format!(
+            "the camera summary names an invalid camera {:?}",
+            escaped(camera)
+        ));
+        return;
+    };
+    let Some(manuals) = service.manuals else {
+        findings.fail(
+            "the camera summary has no local documented manual catalog to resolve its camera",
+        );
+        return;
+    };
+    let Some(catalog_camera) = manuals.camera(&camera_id) else {
+        findings.fail(format!(
+            "the camera summary names {}, which is not in the local documented manual catalog",
+            escaped(camera)
+        ));
+        return;
+    };
+    findings.note(format!(
+        "  camera summary target: {} ({} {})",
+        escaped(catalog_camera.id.as_str()),
+        escaped(&catalog_camera.make),
+        escaped(&catalog_camera.model)
+    ));
 }
 
 fn audit_session_status(request: &HarRequest, har: &Har, origin: &Origin, findings: &mut Findings) {
@@ -3149,6 +3184,7 @@ enum RequestClass {
     Upload,
     ManualConfirmation,
     ManualWithdrawal,
+    ManualSummary,
     Status,
     Session,
     SessionStatus,
@@ -3176,9 +3212,16 @@ fn classify(request: &HarRequest, origin: &Origin) -> RequestClass {
         ("GET", SESSION_PATH) => RequestClass::SessionStatus,
         ("POST", REGISTER_START_PATH) => RequestClass::RegisterStart,
         ("POST", REGISTER_FINISH_PATH) => RequestClass::RegisterFinish,
+        ("GET", path) if manual_summary_camera(path).is_some() => RequestClass::ManualSummary,
         ("GET", path) if status_token(path).is_some() => RequestClass::Status,
         _ => RequestClass::Unexpected,
     }
+}
+
+fn manual_summary_camera(path: &str) -> Option<&str> {
+    let camera = path.strip_prefix(MANUAL_SUMMARY_PREFIX)?;
+    let (make, model) = camera.split_once('/')?;
+    (!make.is_empty() && !model.is_empty() && !model.contains('/')).then_some(camera)
 }
 
 fn status_token(path: &str) -> Option<&str> {

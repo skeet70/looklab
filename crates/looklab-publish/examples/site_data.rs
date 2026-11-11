@@ -240,6 +240,7 @@ fn source_body() -> Result<BodyPage, Box<dyn Error>> {
                 text: "Brightness stays the same across firmware versions; Color Chrome Blue changes the shadows.".to_owned(),
             },
         ],
+        bundles: Vec::new(),
     };
     Ok(BodyPage::from_schema(&body, &schema, &extras)?)
 }
@@ -261,6 +262,7 @@ fn fixture_body() -> Result<BodyPage, Box<dyn Error>> {
             epoch: None,
             text: "Sample data for the committed X-S10 RAW fixture. Camera entity and menu mappings are copied from the X-T5.".to_owned(),
         }],
+        bundles: Vec::new(),
     };
     Ok(BodyPage::from_schema(&body, &schema, &extras)?)
 }

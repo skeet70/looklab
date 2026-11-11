@@ -505,7 +505,7 @@ impl core::str::FromStr for CapabilityKey {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CapabilityDomain {
     Boolean {
@@ -716,6 +716,7 @@ impl CapabilityDomain {
                         ));
                     }
                 }
+                let steps_are_positive = steps.iter().all(|step| *step > 0);
                 if let Some(step) = step {
                     if *step <= 0 {
                         errors.push(ValidationError::new(
@@ -745,9 +746,10 @@ impl CapabilityDomain {
                                 format!("{path}.default"),
                                 ErrorKind::DefaultOutOfRange,
                             ));
-                        } else if default
-                            .checked_sub(*min)
-                            .is_none_or(|delta| !steps.iter().any(|step| delta % *step == 0))
+                        } else if steps_are_positive
+                            && default
+                                .checked_sub(*min)
+                                .is_none_or(|delta| !steps.iter().any(|step| delta % *step == 0))
                         {
                             errors.push(ValidationError::new(
                                 format!("{path}.default"),

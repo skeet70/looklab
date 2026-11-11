@@ -678,7 +678,7 @@ fn firmware_scope_gates_quorum() {
         .enumerate()
         .map(|(index, group)| evidence(camera, target, group, "2.50", index as i64))
         .collect::<Vec<_>>();
-    let control = evaluate_control(camera, target, &in_scope, None);
+    let control = evaluate_control(camera, target, &in_scope, &[]);
     assert_eq!(control.state, ConfirmationState::Confirmed);
     assert_eq!(control.agreeing_groups, AGREEMENT_GROUPS as u32);
 
@@ -687,7 +687,7 @@ fn firmware_scope_gates_quorum() {
         .enumerate()
         .map(|(index, group)| evidence(camera, target, group, "3.00", index as i64))
         .collect::<Vec<_>>();
-    let control = evaluate_control(camera, target, &out_of_scope, None);
+    let control = evaluate_control(camera, target, &out_of_scope, &[]);
     assert_eq!(control.state, ConfirmationState::Unconfirmed);
     assert_eq!(control.agreeing_groups, 0);
 }
@@ -706,7 +706,7 @@ fn identical_corrections_confirm_the_reported_options() {
         corrected.clone(),
     );
 
-    let control = evaluate_control(camera, target, &entries, None);
+    let control = evaluate_control(camera, target, &entries, &[]);
     assert_eq!(control.state, ConfirmationState::Confirmed);
     assert_eq!(control.agreeing_groups, 3);
     assert!(control.contradictions.is_empty());
@@ -741,7 +741,7 @@ fn corrections_matching_the_manual_use_the_documented_basis() {
         documented.clone(),
     );
 
-    let control = evaluate_control(camera, target, &entries, None);
+    let control = evaluate_control(camera, target, &entries, &[]);
     assert_eq!(control.state, ConfirmationState::Confirmed);
     let result = firmware_result(&control, "1.00");
     assert_eq!(result.basis, Some(ConfirmationBasis::Documented));
@@ -766,7 +766,7 @@ fn corrections_confirm_a_formerly_not_documented_control() {
         corrected.clone(),
     );
 
-    let control = evaluate_control(camera, target, &entries, None);
+    let control = evaluate_control(camera, target, &entries, &[]);
     assert_eq!(control.state, ConfirmationState::Confirmed);
     let result = firmware_result(&control, "1.00");
     assert_eq!(result.basis, Some(ConfirmationBasis::Corrected));
@@ -800,7 +800,7 @@ fn corrections_confirm_a_changed_range() {
         corrected.clone(),
     );
 
-    let control = evaluate_control(camera, target, &entries, None);
+    let control = evaluate_control(camera, target, &entries, &[]);
     assert_eq!(control.state, ConfirmationState::Confirmed);
     let result = firmware_result(&control, "1.00");
     assert_eq!(result.basis, Some(ConfirmationBasis::Corrected));
@@ -838,7 +838,7 @@ fn two_corrections_are_not_a_quorum() {
         ),
     ];
 
-    let control = evaluate_control(camera, target, &entries, None);
+    let control = evaluate_control(camera, target, &entries, &[]);
     assert_eq!(control.state, ConfirmationState::Unconfirmed);
     assert_eq!(control.agreeing_groups, 2);
     let result = firmware_result(&control, "1.00");
@@ -861,7 +861,7 @@ fn a_differing_active_claim_blocks_corrected_confirmation() {
     );
     entries.push(evidence(camera, target, &group("d"), "1.00", 4));
 
-    let control = evaluate_control(camera, target, &entries, None);
+    let control = evaluate_control(camera, target, &entries, &[]);
     assert_eq!(control.state, ConfirmationState::Contradicted);
     assert_eq!(control.agreeing_groups, 3);
     assert_eq!(control.contradictions.len(), 1);
@@ -886,7 +886,7 @@ fn corrected_quorum_respects_firmware_scope() {
         Availability::Available,
         corrected.clone(),
     );
-    let control = evaluate_control(camera, target, &in_scope, None);
+    let control = evaluate_control(camera, target, &in_scope, &[]);
     assert_eq!(control.state, ConfirmationState::Confirmed);
     let result = firmware_result(&control, "2.50");
     assert_eq!(
@@ -899,7 +899,7 @@ fn corrected_quorum_respects_firmware_scope() {
     );
 
     let out_of_scope = corrections(camera, target, "3.00", Availability::Available, corrected);
-    let control = evaluate_control(camera, target, &out_of_scope, None);
+    let control = evaluate_control(camera, target, &out_of_scope, &[]);
     assert_eq!(control.state, ConfirmationState::Unconfirmed);
     assert_eq!(control.agreeing_groups, 0);
     assert!(control.firmware.is_empty());
@@ -918,7 +918,7 @@ fn a_partial_correction_does_not_invent_options() {
         CapabilityDomain::Unspecified,
     );
 
-    let control = evaluate_control(camera, target, &entries, None);
+    let control = evaluate_control(camera, target, &entries, &[]);
     assert_eq!(control.state, ConfirmationState::Confirmed);
     let result = firmware_result(&control, "1.00");
     assert_eq!(result.basis, Some(ConfirmationBasis::Corrected));
@@ -950,7 +950,7 @@ fn different_firmware_options_are_not_contradictions() {
         enum_domain(&["REALA ACE"]),
     ));
 
-    let control = evaluate_control(camera, target, &entries, None);
+    let control = evaluate_control(camera, target, &entries, &[]);
     assert_eq!(control.state, ConfirmationState::Confirmed);
     assert_eq!(control.firmware.len(), 2);
     assert!(control.contradictions.is_empty());
@@ -1019,7 +1019,7 @@ fn unspecified_scope_does_not_merge_firmware_votes() {
         ),
     ];
 
-    let control = evaluate_control(camera, target, &entries, None);
+    let control = evaluate_control(camera, target, &entries, &[]);
     assert_eq!(control.state, ConfirmationState::Unconfirmed);
     assert_eq!(control.agreeing_groups, 1);
     assert_eq!(control.firmware.len(), 3);
@@ -1153,7 +1153,9 @@ fn exact_moderator_scope_satisfies_the_scoped_camera_rule() {
         .collect::<Vec<_>>();
     let moderators = BTreeMap::from([(
         CapabilityKey::ExposureCompensation,
-        moderator(ModeratorFirmwareScope::exact("1.00").expect("a firmware scope")),
+        vec![moderator(
+            ModeratorFirmwareScope::exact("1.00").expect("a firmware scope"),
+        )],
     )]);
     let summary = evaluate_camera(camera, &entries, &moderators);
     assert_eq!(
@@ -1164,7 +1166,9 @@ fn exact_moderator_scope_satisfies_the_scoped_camera_rule() {
 
     let disjoint = BTreeMap::from([(
         CapabilityKey::ExposureCompensation,
-        moderator(ModeratorFirmwareScope::exact("2.00").expect("a firmware scope")),
+        vec![moderator(
+            ModeratorFirmwareScope::exact("2.00").expect("a firmware scope"),
+        )],
     )]);
     let summary = evaluate_camera(camera, &entries, &disjoint);
     assert!(summary.common_confirmed_firmware().is_empty());
@@ -1183,7 +1187,7 @@ fn unspecified_moderator_scope_is_reviewed_but_not_confirmed_across_versions() {
         .collect::<Vec<_>>();
     let moderators = BTreeMap::from([(
         CapabilityKey::ExposureCompensation,
-        moderator(ModeratorFirmwareScope::unspecified()),
+        vec![moderator(ModeratorFirmwareScope::unspecified())],
     )]);
     let summary = evaluate_camera(camera, &entries, &moderators);
     assert!(summary.common_confirmed_firmware().is_empty());
@@ -1251,7 +1255,7 @@ fn stale_control_definitions_do_not_contribute() {
     let mut changed = camera.clone();
     changed.capabilities[1].label = "Exposure".to_owned();
     let changed_target = capability(&changed, CapabilityKey::ExposureCompensation);
-    let control = evaluate_control(&changed, changed_target, &entries, None);
+    let control = evaluate_control(&changed, changed_target, &entries, &[]);
     assert_eq!(control.state, ConfirmationState::Unconfirmed);
     assert_eq!(control.agreeing_groups, 0);
 }
@@ -1267,7 +1271,7 @@ fn contradictions_block_and_known_groups_dedup() {
         .enumerate()
         .map(|(index, group)| evidence(camera, target, group, "1.00", index as i64))
         .collect::<Vec<_>>();
-    let control = evaluate_control(camera, target, &agreeing, None);
+    let control = evaluate_control(camera, target, &agreeing, &[]);
     assert_eq!(control.state, ConfirmationState::Confirmed);
     assert!(control.contradictions.is_empty());
 
@@ -1281,7 +1285,7 @@ fn contradictions_block_and_known_groups_dedup() {
         Availability::Unavailable,
         CapabilityDomain::Unspecified,
     ));
-    let control = evaluate_control(camera, target, &contradicted, None);
+    let control = evaluate_control(camera, target, &contradicted, &[]);
     assert_eq!(control.state, ConfirmationState::Contradicted);
     assert_eq!(control.agreeing_groups, 3);
     assert_eq!(control.contradictions.len(), 1);
@@ -1301,7 +1305,7 @@ fn contradictions_block_and_known_groups_dedup() {
         ),
     ];
     changed.sort_by_key(|entry| entry.submitted_at);
-    let control = evaluate_control(camera, target, &changed, None);
+    let control = evaluate_control(camera, target, &changed, &[]);
     assert_eq!(control.state, ConfirmationState::Contradicted);
     assert_eq!(control.agreeing_groups, 2);
 
@@ -1310,7 +1314,7 @@ fn contradictions_block_and_known_groups_dedup() {
         evidence(camera, target, &group("a"), "1.00", 2),
         evidence(camera, target, &group("b"), "1.00", 3),
     ];
-    let control = evaluate_control(camera, target, &repeated, None);
+    let control = evaluate_control(camera, target, &repeated, &[]);
     assert_eq!(control.state, ConfirmationState::Unconfirmed);
     assert_eq!(control.agreeing_groups, 2);
 }
@@ -1354,11 +1358,16 @@ fn evidence_for_another_control_does_not_confirm_this_one() {
         camera,
         capability(camera, CapabilityKey::ExposureCompensation),
         &[],
-        Some(&moderator),
+        std::slice::from_ref(&moderator),
     );
     assert_eq!(control.state, ConfirmationState::ModeratorConfirmed);
     assert!(control.moderator.is_some());
-    assert!(control.firmware.is_empty());
+    assert_eq!(control.firmware.len(), 1);
+    assert_eq!(control.firmware[0].firmware.as_str(), "1.00");
+    assert_eq!(
+        control.firmware[0].state,
+        ConfirmationState::ModeratorConfirmed
+    );
 }
 
 #[test]
@@ -1410,4 +1419,188 @@ fn nested_unknown_confirmation_fields_are_rejected() {
         value["observations"][0]["finding"]["domain"] =
             json!({"type": "unspecified", "extra": true});
     });
+}
+
+#[test]
+fn moderator_decisions_apply_only_within_their_firmware_scope() {
+    let catalog = catalog(NATIVE);
+    let camera = &catalog.cameras[0];
+    let native = capability(camera, CapabilityKey::NativeSimulations);
+    let entries = groups(["a", "b", "c"])
+        .iter()
+        .enumerate()
+        .map(|(index, group)| evidence(camera, native, group, "1.00", index as i64))
+        .collect::<Vec<_>>();
+    let scoped = |firmware: &str, confirmed: bool| ModeratorRecord {
+        confirmed,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Video,
+            url: None,
+            description: "menu walkthrough".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::exact(firmware).expect("a firmware scope"),
+        },
+    };
+    let moderators = BTreeMap::from([(
+        CapabilityKey::NativeSimulations,
+        vec![scoped("2.00", false)],
+    )]);
+    let summary = evaluate_camera(camera, &entries, &moderators);
+    let control = summary
+        .control(CapabilityKey::NativeSimulations)
+        .expect("a summary entry");
+    assert_eq!(control.state, ConfirmationState::Confirmed);
+    assert_eq!(
+        firmware_result(control, "1.00").state,
+        ConfirmationState::Confirmed
+    );
+    assert_eq!(
+        firmware_result(control, "2.00").state,
+        ConfirmationState::ModeratorRejected
+    );
+    assert_eq!(
+        summary.common_confirmed_firmware(),
+        vec![ReportedFirmware::new("1.00").expect("a firmware version")]
+    );
+}
+
+#[test]
+fn zero_selectable_step_is_rejected_before_remainder_arithmetic() {
+    let zero_step = "  - key: color_temperature
+    label: COLOR TEMPERATURE
+    category: capture
+    availability: available
+    domain:
+      type: integer
+      min: 0
+      max: 1
+      steps: [0]
+      default: 0
+    citations:
+    - source: manual
+      locator: p. 3
+";
+    let errors = validate(&format!("{NATIVE}{zero_step}")).expect_err("zero step");
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error.kind, ErrorKind::StepNotPositive)),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn lower_bound_firmware_scope_accepts_matching_owner_evidence() {
+    let catalog =
+        validate_manual_catalog(&camera_yaml("2.2.0 or later", NATIVE)).expect("a valid catalog");
+    let camera = &catalog.cameras[0];
+    let native = capability(camera, CapabilityKey::NativeSimulations);
+    for (firmware, expected) in [("2.2.0", true), ("2.3.1", true), ("2.1.9", false)] {
+        assert_eq!(
+            firmware_scope_accepts(
+                camera,
+                native,
+                &ReportedFirmware::new(firmware).expect("firmware")
+            ),
+            expected,
+            "{firmware}"
+        );
+    }
+    let entries = groups(["a", "b", "c"])
+        .iter()
+        .enumerate()
+        .map(|(index, group)| evidence(camera, native, group, "2.2.0", index as i64))
+        .collect::<Vec<_>>();
+    let summary = evaluate_camera(camera, &entries, &BTreeMap::new());
+    assert_eq!(
+        summary
+            .control(CapabilityKey::NativeSimulations)
+            .expect("native simulations")
+            .state,
+        ConfirmationState::Confirmed
+    );
+}
+
+#[test]
+fn newest_overlapping_moderator_scope_wins_per_firmware() {
+    let catalog = catalog(&format!("{NATIVE}{}", exposure_compensation("-1/3")));
+    let camera = &catalog.cameras[0];
+    let native = capability(camera, CapabilityKey::NativeSimulations);
+    let entries = groups(["a", "b", "c"])
+        .iter()
+        .enumerate()
+        .map(|(index, group)| evidence(camera, native, group, "2.00", index as i64))
+        .collect::<Vec<_>>();
+    let reject = ModeratorRecord {
+        confirmed: false,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Video,
+            url: None,
+            description: "newer exact rejection".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::exact("2.00").expect("a firmware scope"),
+        },
+    };
+    let older_confirm = ModeratorRecord {
+        confirmed: true,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Video,
+            url: None,
+            description: "older range confirmation".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::range("1.00", "3.00")
+                .expect("a firmware range"),
+        },
+    };
+    let control = evaluate_control(camera, native, &entries, &[reject, older_confirm]);
+    assert_eq!(
+        firmware_result(&control, "2.00").state,
+        ConfirmationState::ModeratorRejected
+    );
+    assert_eq!(control.state, ConfirmationState::ModeratorRejected);
+}
+
+#[test]
+fn every_moderator_confirmed_firmware_participates_in_camera_confirmation() {
+    let catalog = catalog(&format!("{NATIVE}{}", exposure_compensation("-1/3")));
+    let camera = &catalog.cameras[0];
+    let exposure = capability(camera, CapabilityKey::ExposureCompensation);
+    let entries = groups(["a", "b", "c"])
+        .iter()
+        .enumerate()
+        .map(|(index, group)| evidence(camera, exposure, group, "1.00", index as i64))
+        .collect::<Vec<_>>();
+    let moderator = |firmware: &str| ModeratorRecord {
+        confirmed: true,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Video,
+            url: None,
+            description: "menu walkthrough".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::exact(firmware).expect("a firmware scope"),
+        },
+    };
+    let moderators = BTreeMap::from([(
+        CapabilityKey::NativeSimulations,
+        vec![moderator("2.00"), moderator("1.00")],
+    )]);
+    let summary = evaluate_camera(camera, &entries, &moderators);
+    assert_eq!(
+        summary.common_confirmed_firmware(),
+        vec![ReportedFirmware::new("1.00").expect("a firmware version")]
+    );
+}
+
+#[test]
+fn textual_firmware_scope_matches_only_the_reported_text() {
+    let catalog =
+        validate_manual_catalog(&camera_yaml("release-A", NATIVE)).expect("a valid catalog");
+    let camera = &catalog.cameras[0];
+    let native = capability(camera, CapabilityKey::NativeSimulations);
+    assert!(firmware_scope_accepts(
+        camera,
+        native,
+        &ReportedFirmware::new("release-A").expect("firmware")
+    ));
+    assert!(!firmware_scope_accepts(
+        camera,
+        native,
+        &ReportedFirmware::new("2.00").expect("firmware")
+    ));
 }

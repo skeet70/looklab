@@ -3,6 +3,10 @@
 
 use core::fmt;
 
+use looklab_schema::{
+    BodyId, CapabilityKey, ConfirmationBasis, ManualUrl, ModeratorEvidenceKind,
+    ModeratorFirmwareScope,
+};
 use serde::{Deserialize, Serialize};
 
 macro_rules! string_ref {
@@ -152,6 +156,32 @@ pub enum AuditEvent {
         version: VersionRef,
         manifest_sha256: crate::ArtifactHash,
     },
+    ManualConfirmation {
+        camera: BodyId,
+        firmware: String,
+        controls: usize,
+    },
+    ManualConfirmationPromotion {
+        camera: BodyId,
+        control: CapabilityKey,
+        firmware: String,
+        groups: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basis: Option<ConfirmationBasis>,
+    },
+    ManualConfirmationWithdrawal {
+        camera: BodyId,
+        withdrawn: u64,
+    },
+    ManualModeratorConfirmation {
+        camera: BodyId,
+        control: CapabilityKey,
+        confirmed: bool,
+        firmware_scope: ModeratorFirmwareScope,
+        evidence: ModeratorEvidenceKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence_url: Option<ManualUrl>,
+    },
 }
 
 impl AuditEvent {
@@ -170,6 +200,10 @@ impl AuditEvent {
             Self::Split { .. } => "split",
             Self::LookListing { .. } => "look_listing",
             Self::Release { .. } => "release",
+            Self::ManualConfirmation { .. } => "manual_confirmation",
+            Self::ManualConfirmationPromotion { .. } => "manual_confirmation_promotion",
+            Self::ManualConfirmationWithdrawal { .. } => "manual_confirmation_withdrawal",
+            Self::ManualModeratorConfirmation { .. } => "manual_moderator_confirmation",
         }
     }
 }

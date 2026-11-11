@@ -10,21 +10,22 @@ use leptos::task::spawn_local;
 use looklab_publish::{ManualCapabilityPage, ManualPage};
 use looklab_schema::{
     Availability, Axis, BodyId, CapabilityDomain, CapabilityKey, ConfirmationBasis,
-    ConfirmationScope, ControlObservation, Finding, ManualConfirmationSummary,
-    ModeratorEvidenceKind, ModeratorFirmwareScope, Rational, ReportedFirmware, Sha256Hex,
+    ConfirmationScope, ControlObservation, Finding, ManualConfirmationSummary, ManualUrl,
+    ModeratorEvidence, ModeratorEvidenceKind, ModeratorFirmwareScope, Rational, ReportedFirmware,
+    Sha256Hex,
 };
 use looklab_upload::AttestationHash;
 use looklab_wasm::prep::ModuleFunction;
 use looklab_wasm::{
-    ManualConfirmationEnvelope, ModerationEvidenceDraft, build_manual_confirmation,
-    build_manual_moderation, build_send_manifest_request, decode_build_send_manifest_reply,
-    module_fn_id,
+    ManualConfirmationEnvelope, build_manual_confirmation, build_manual_moderation,
+    build_send_manifest_request, decode_build_send_manifest_reply, module_fn_id,
 };
 
 use super::body::{
     availability_text, category_text, confirmation_state_text, confirmation_text,
-    control_actual_text, domain_text, finding_text, firmware_actual_text, firmware_basis_text,
-    firmware_definition_digest, firmware_detail, intake_text, moderator_evidence_text,
+    control_actual_text, documentation_note, domain_text, finding_text, firmware_actual_text,
+    firmware_basis_text, firmware_definition_digest, firmware_detail, intake_text,
+    moderator_evidence_text,
 };
 use crate::session::SessionContext;
 use crate::worker::PrepWorker;
@@ -844,6 +845,8 @@ pub fn ManualConfirmationPanel(
     on_change: Callback<Option<ManualConfirmationEnvelope>>,
     #[prop(default = true)] show_context: bool,
     #[prop(optional)] summary: Option<RwSignal<ManualConfirmationSummary>>,
+    #[prop(default = Signal::derive(|| true))] counts_ready: Signal<bool>,
+    #[prop(default = Callback::new(|_: ()| ()))] on_withdraw: Callback<()>,
 ) -> impl IntoView {
     let camera = manual.id.clone();
     let camera_digest = manual.camera_digest;
@@ -917,7 +920,11 @@ pub fn ManualConfirmationPanel(
                 let firmware_actuals = confirmation.firmware.iter().map(|result| {
                     let firmware = result.firmware.as_str().to_owned();
                     let actual = firmware_actual_text(result);
-                    let detail = firmware_detail(result);
+                    let detail = if counts_ready.get() {
+                        firmware_detail(result)
+                    } else {
+                        None
+                    };
                     let digest = firmware_definition_digest(result);
                     view! {
                         <div>
@@ -934,7 +941,11 @@ pub fn ManualConfirmationPanel(
                 }).collect_view();
                 let firmware_bases = confirmation.firmware.iter().map(|result| {
                     let firmware = result.firmware.as_str().to_owned();
-                    let basis = firmware_basis_text(result);
+                    let basis = if counts_ready.get() {
+                        Some(firmware_basis_text(result))
+                    } else {
+                        None
+                    };
                     let contradictions = result.contradictions.iter().map(|contradiction| {
                         view! {
                             <li>{format!("Conflicting report: {}", finding_text(&contradiction.finding))}</li>
@@ -942,7 +953,8 @@ pub fn ManualConfirmationPanel(
                     }).collect_view();
                     view! {
                         <li>
-                            <strong>{format!("Firmware {firmware}")}</strong>{format!(": {basis}")}
+                            <strong>{format!("Firmware {firmware}")}</strong>
+                            {basis.map(|basis| format!(": {basis}"))}
                             {(!result.contradictions.is_empty()).then(|| view! {
                                 <ul>{contradictions}</ul>
                             })}
@@ -950,15 +962,14 @@ pub fn ManualConfirmationPanel(
                     }
                 }).collect_view();
                 let control_actual = control_actual_text(&confirmation);
-                let control_basis = confirmation_text(&confirmation);
-                let moderator = moderator_evidence_text(&confirmation);
-                let manual_note = if confirmation.firmware.iter().any(|result| {
-                    matches!(result.basis.as_ref(), Some(ConfirmationBasis::Corrected))
-                }) {
-                    "Documentation-derived; some firmware values are corrected by owners"
+                let control_basis = if counts_ready.get() {
+                    Some(confirmation_text(&confirmation))
                 } else {
-                    "Documentation-derived"
+                    None
                 };
+                let moderator = moderator_evidence_text(&confirmation);
+                let manual_note =
+                    documentation_note(capability.documented.availability, &confirmation);
                 let documented_for_change = capability.documented.clone();
                 let confirmation_for_change = confirmation.clone();
                 let documented_for_editor = capability.documented.clone();
@@ -982,10 +993,10 @@ pub fn ManualConfirmationPanel(
                     </td>
                     <td>
                         {manual_value}
-                        <div class="muted">{manual_note}</div>
+                        {manual_note.map(|text| view! { <div class="muted">{text}</div> })}
                     </td>
                     <td>
-                        <div class="muted">{control_basis}</div>
+                        {control_basis.map(|text| view! { <div class="muted">{text}</div> })}
                         {(!confirmation.firmware.is_empty()).then(|| view! {
                             <ul>{firmware_bases}</ul>
                         })}
@@ -1120,7 +1131,7 @@ pub fn ManualConfirmationPanel(
                     view! { <p class="muted">"This confirmation will be submitted when you confirm."</p> }.into_any()
                 }
             }}
-            <ManualWithdrawControl camera=camera.clone() summary=summary/>
+            <ManualWithdrawControl camera=camera.clone() summary=summary on_withdraw=on_withdraw/>
         </div>
     }
 }
@@ -1130,6 +1141,7 @@ pub fn ManualConfirmationPanel(
 pub fn ManualWithdrawControl(
     camera: BodyId,
     summary: RwSignal<ManualConfirmationSummary>,
+    #[prop(default = Callback::new(|_: ()| ()))] on_withdraw: Callback<()>,
 ) -> impl IntoView {
     let session = crate::session::use_session();
     let available = crate::base::server_available();
@@ -1158,17 +1170,20 @@ pub fn ManualWithdrawControl(
             }
             .await;
             match result {
-                Ok(()) => match data::manual_summary(&make, &model).await {
-                    Ok(refreshed) => {
-                        summary.set(refreshed);
-                        message.set(Some(
-                            "Your owner checks for this camera were withdrawn.".to_owned(),
-                        ));
+                Ok(()) => {
+                    on_withdraw.try_run(());
+                    match data::manual_summary(&make, &model).await {
+                        Ok(refreshed) => {
+                            summary.set(refreshed);
+                            message.set(Some(
+                                "Your owner checks for this camera were withdrawn.".to_owned(),
+                            ));
+                        }
+                        Err(error) => message.set(Some(format!(
+                            "Your owner checks were withdrawn, but the summary could not be refreshed: {error}"
+                        ))),
                     }
-                    Err(error) => message.set(Some(format!(
-                        "Your owner checks were withdrawn, but the summary could not be refreshed: {error}"
-                    ))),
-                },
+                }
                 Err(error) => message.set(Some(error)),
             }
             busy.set(false);
@@ -1201,6 +1216,15 @@ pub fn ManualModerationPanel(
         .get_untracked()
         .get("control")
         .and_then(|value| CapabilityKey::from_str(&value).ok());
+    let section = NodeRef::<leptos::html::Section>::new();
+    if requested.is_some() {
+        // The router resolves the fragment before this panel mounts.
+        Effect::new(move |_| {
+            if let Some(section) = section.get() {
+                section.scroll_into_view();
+            }
+        });
+    }
     let selected = RwSignal::new(
         requested
             .filter(|key| {
@@ -1244,11 +1268,14 @@ pub fn ManualModerationPanel(
                             aria-current=active.to_string()
                             disabled=busy
                             on:click=move |_| {
+                                if selected.get_untracked() == Some(key) {
+                                    return;
+                                }
                                 result.set(None);
                                 selected.set(Some(key));
                             }
                         >
-                            <span class="manual-control-name">{label}</span>
+                            <span>{label}</span>
                             <span class="manual-control-state">{meta}</span>
                         </button>
                     </li>
@@ -1278,10 +1305,10 @@ pub fn ManualModerationPanel(
         None => view! { <p class="muted">"Choose a control to review."</p> }.into_any(),
     };
     view! {
-        <section class="manual-moderation" aria-labelledby="manual-moderation">
+        <section class="manual-moderation" aria-labelledby="manual-moderation" node_ref=section>
             <h3 id="manual-moderation">"Moderate documented controls"</h3>
             <p class="muted">
-                "Choose one control. Evidence is recorded against the firmware scope you enter; leave the scope as unspecified when the evidence does not establish one. Received checks are shown separately from counted owner groups."
+                "Choose one control. Evidence is recorded against the firmware scope you enter. Leave the scope as unspecified when the evidence does not establish one; it is then shown as human-reviewed without claiming a firmware range."
             </p>
             <ul class="manual-moderation-controls">{controls}</ul>
             {editor}
@@ -1317,6 +1344,18 @@ impl FromStr for ModerationDecision {
             "confirm" => Ok(Self::Confirm),
             "reject" => Ok(Self::Reject),
             _ => Err(()),
+        }
+    }
+}
+
+fn moderator_scope_label(scope: &ModeratorFirmwareScope) -> String {
+    match scope {
+        ModeratorFirmwareScope::Unspecified {} => "no recorded firmware scope".to_owned(),
+        ModeratorFirmwareScope::Exact { firmware } => {
+            format!("firmware {}", firmware.as_str())
+        }
+        ModeratorFirmwareScope::Range { from, to } => {
+            format!("firmware {} to {}", from.as_str(), to.as_str())
         }
     }
 }
@@ -1403,18 +1442,20 @@ fn ModerationEditor(
             <dl class="manual-moderation-claim">
                 <dt>"Current status"</dt>
                 <dd>{confirmation_state_text(confirmation.state)}</dd>
-                <dt>"Counted owner groups"</dt>
+                <dt>"Agreeing owner groups"</dt>
                 <dd>{confirmation.agreeing_groups.to_string()}</dd>
                 <dt>"Received checks"</dt>
                 <dd>{intake_text(&confirmation.intake)}</dd>
             </dl>
             {(!confirmation.firmware.is_empty()).then(|| view! {
-                <h5>"Linked owner checks by firmware"</h5>
+                <h5>"Evidence by firmware"</h5>
                 <ul class="manual-moderation-evidence">{firmware}</ul>
             })}
-            {moderator.map(|text| view! { <p class="muted">{text}</p> })}
+            {moderator.map(|text| view! {
+                <p class="muted">{format!("Newest moderator record: {text}")}</p>
+            })}
             <p class="muted">
-                "Individual submissions, including unlinked ones, are listed with their values in the moderation queue."
+                "A decision applies to the firmware scope you record. Decisions recorded for other firmware scopes stay in force."
             </p>
         }
     };
@@ -1455,6 +1496,17 @@ fn ModerationEditor(
         let description = description.get_untracked().trim().to_owned();
         let camera = camera.clone();
         let submitted_label = submitted_label.clone();
+        let missing = if description.is_empty() {
+            Some("describe the evidence before recording a decision")
+        } else if kind == ModeratorEvidenceKind::Video && url.is_none() {
+            Some("video evidence needs a link to the video")
+        } else {
+            None
+        };
+        if let Some(missing) = missing {
+            result.set(Some(format!("{submitted_label}: {missing}.")));
+            return;
+        }
         pending.set(Some(key));
         result.set(Some(format!(
             "{submitted_label}: {decision_label} pending; confirm once on your device."
@@ -1469,19 +1521,24 @@ fn ModerationEditor(
                     ScopeKindDraft::Unspecified => Ok(ModeratorFirmwareScope::unspecified()),
                 }
                 .map_err(|error| error.to_string())?;
+                let url = url
+                    .as_deref()
+                    .map(ManualUrl::new)
+                    .transpose()
+                    .map_err(|error| error.to_string())?;
+                let scope_label = moderator_scope_label(&scope);
                 let envelope = build_manual_moderation(
                     camera.clone(),
                     key,
                     definition_digest,
                     confirmed,
-                    ModerationEvidenceDraft {
+                    ModeratorEvidence {
                         kind,
-                        url: url.as_deref(),
-                        description: &description,
+                        url,
+                        description,
                         firmware_scope: scope,
                     },
-                )
-                .map_err(|error| error.to_string())?;
+                );
                 let credential = webauthn::profile_credential(session).await?;
                 let signed = webauthn::sign_request(
                     crate::request_digest::RequestDomain::ModerateManualConfirmation,
@@ -1498,14 +1555,16 @@ fn ModerationEditor(
                         &signed.fields.signature,
                     )
                     .map_err(|error| error.to_string())?;
-                data::moderate_manual_confirmation(&camera, key, &body).await
+                data::moderate_manual_confirmation(&camera, key, &body)
+                    .await
+                    .map(|refreshed| (refreshed, scope_label))
             }
             .await;
             match outcome {
-                Ok(refreshed) => {
+                Ok((refreshed, scope_label)) => {
                     summary.set(refreshed);
                     result.set(Some(format!(
-                        "Moderator {decision_label} recorded for {submitted_label}."
+                        "Moderator {decision_label} recorded for {submitted_label} ({scope_label})."
                     )));
                 }
                 Err(error) => result.set(Some(format!(
@@ -1516,7 +1575,7 @@ fn ModerationEditor(
         });
     };
     view! {
-        <div class="manual-moderation-editor" aria-labelledby=format!("moderation-heading-{slug}")>
+        <div class="manual-moderation-editor" role="group" aria-labelledby=format!("moderation-heading-{slug}")>
             <h4 id=format!("moderation-heading-{slug}")>{format!("Review {label}")}</h4>
             <p class="muted"><code>{key.as_str()}</code></p>
             <dl class="manual-moderation-claim">
@@ -1537,8 +1596,8 @@ fn ModerationEditor(
                             );
                         }
                     >
-                        <option value="confirm" selected=move || decision.get() == ModerationDecision::Confirm>"Confirm"</option>
-                        <option value="reject" selected=move || decision.get() == ModerationDecision::Reject>"Reject"</option>
+                        <option value="confirm" prop:selected=move || decision.get() == ModerationDecision::Confirm>"Confirm"</option>
+                        <option value="reject" prop:selected=move || decision.get() == ModerationDecision::Reject>"Reject"</option>
                     </select>
                 </label>
                 <label for=scope_id.clone()>"Firmware scope"
@@ -1557,7 +1616,7 @@ fn ModerationEditor(
                             (ScopeKindDraft::Range, "Firmware range"),
                         ].into_iter().map(|(candidate, label)| view! {
                             <option value=candidate.to_string()
-                                selected=move || scope_kind.get() == candidate>{label}</option>
+                                prop:selected=move || scope_kind.get() == candidate>{label}</option>
                         }).collect_view()}
                     </select>
                 </label>
@@ -1598,8 +1657,8 @@ fn ModerationEditor(
                             );
                         }
                     >
-                        <option value="physical" selected=move || kind.get() == ModeratorEvidenceKind::Physical>"Physical inspection"</option>
-                        <option value="video" selected=move || kind.get() == ModeratorEvidenceKind::Video>"Video"</option>
+                        <option value="physical" prop:selected=move || kind.get() == ModeratorEvidenceKind::Physical>"Physical inspection"</option>
+                        <option value="video" prop:selected=move || kind.get() == ModeratorEvidenceKind::Video>"Video"</option>
                     </select>
                 </label>
                 <label for=url_id.clone()>"Evidence URL"
@@ -1628,11 +1687,12 @@ fn ModerationEditor(
     }
 }
 
-/// Confirms documented controls on a camera with no contribution support.
 #[component]
 pub fn StandaloneConfirmation(
     manual: ManualPage,
     summary: RwSignal<ManualConfirmationSummary>,
+    #[prop(default = false)] measured_contributions: bool,
+    #[prop(default = Signal::derive(|| true))] counts_ready: Signal<bool>,
 ) -> impl IntoView {
     let session = crate::session::use_session();
     let available = crate::base::server_available();
@@ -1666,18 +1726,26 @@ pub fn StandaloneConfirmation(
         });
     };
 
+    let lede = if measured_contributions {
+        "You can confirm which documented options you see on this camera without sending photos. If a confirmation sent with your photos did not record, try it again here."
+    } else {
+        "This camera has documented guidance but no contribution support yet. You can still confirm which documented options you see and correct anything the documentation gets wrong. No photos or RAW files are needed."
+    };
     view! {
         <section class="manual-confirmation" aria-labelledby="owner-confirmation">
             <h2 id="owner-confirmation">"Confirm these settings on your camera"</h2>
-            <p>
-                "This camera has documented guidance but no contribution support yet. You can still confirm which documented options you see and correct anything the documentation gets wrong. No photos or RAW files are needed."
-            </p>
+            <p>{lede}</p>
             <ManualConfirmationPanel
                 manual=form_manual
                 initial_firmware=Signal::derive(String::new)
                 on_change=on_change
                 show_context=false
                 summary=summary
+                counts_ready=counts_ready
+                on_withdraw=Callback::new(move |()| {
+                    message.set(None);
+                    receipt.set(None);
+                })
             />
             {(!available).then(crate::ui::preview_notice)}
             <button
@@ -1703,7 +1771,7 @@ fn receipt_text(receipt: &looklab_schema::ManualSubmissionReceipt) -> String {
     let checks = receipt.recorded_checks;
     match &receipt.owner_linkage {
         looklab_schema::ManualOwnerLinkage::Linked => format!(
-            "{checks} check(s) recorded. Your profile is linked to this camera by a photo contribution, so your profile counts as one owner group toward agreement."
+            "{checks} check(s) recorded. Your profile is linked to this camera by a photo contribution, so these checks are eligible to count toward owner agreement."
         ),
         looklab_schema::ManualOwnerLinkage::Unlinked => format!(
             "{checks} check(s) recorded. Your profile has no photo contribution linked to this camera, so these checks are received but do not count toward owner agreement. They stay visible on the camera page, and moderators can review them."

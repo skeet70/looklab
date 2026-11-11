@@ -10,6 +10,7 @@ use looklab_schema::{
 use serde::{Deserialize, Serialize};
 
 use crate::body::PreparationPage;
+use crate::hash::{ArtifactHash, SitePath};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManualCapabilityPage {
@@ -55,7 +56,7 @@ impl ManualPage {
                 confirmation: confirmation
                     .control(capability.key)
                     .cloned()
-                    .unwrap_or_else(|| evaluate_control(camera, capability, &[], None)),
+                    .unwrap_or_else(|| evaluate_control(camera, capability, &[], &[])),
             })
             .collect();
         let human_confirmed = confirmation.human_confirmed();
@@ -93,7 +94,7 @@ impl ManualPage {
         )
     }
 
-    pub fn summary(&self) -> ManualSummary {
+    pub fn summary(&self, artifact: ManualArtifact) -> ManualSummary {
         ManualSummary {
             id: self.id.clone(),
             make: self.make.clone(),
@@ -116,8 +117,16 @@ impl ManualPage {
                 .map(|control| control.intake.unlinked)
                 .sum(),
             preparation: self.preparation.clone(),
+            artifact,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualArtifact {
+    pub path: SitePath,
+    pub sha256: ArtifactHash,
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,9 +140,12 @@ pub struct ManualSummary {
     pub documented_controls: usize,
     pub confirmed_controls: u32,
     pub contradicted_controls: u32,
+    /// Total checks recorded against current control definitions.
     #[serde(default)]
     pub recorded_checks: u32,
+    /// Subset of `recorded_checks` from profiles with no serial-linked photo.
     #[serde(default)]
     pub unlinked_checks: u32,
     pub preparation: PreparationPage,
+    pub artifact: ManualArtifact,
 }

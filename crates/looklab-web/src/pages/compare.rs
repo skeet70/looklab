@@ -1040,10 +1040,10 @@ mod tests {
         SiteIndex {
             format: SITE_FORMAT.to_owned(),
             community_snapshot_version: 0,
-            manuals: Vec::new(),
             interfaces: Vec::new(),
             input_transforms: Vec::new(),
             bodies: Vec::new(),
+            manuals: Vec::new(),
             looks,
             scenes,
             reports: Vec::new(),

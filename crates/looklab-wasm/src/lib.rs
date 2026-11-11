@@ -31,9 +31,9 @@ pub use looklab_prep_module::{
     AlignmentSummary, AssertionFields, PowParamsSpec, PreparedImageView,
 };
 pub use manual::{
-    ManualConfirmationEnvelope, ManualModerationEnvelope, ModerationEvidenceDraft,
-    build_manual_confirmation, build_manual_moderation, manual_confirmation_bytes,
-    manual_confirmation_digest, manual_withdraw_request,
+    ManualConfirmationEnvelope, ManualModerationEnvelope, build_manual_confirmation,
+    build_manual_moderation, manual_confirmation_bytes, manual_confirmation_digest,
+    manual_withdraw_request,
 };
 pub use match_api::{
     MatchInputs, MatchRequest, SimInputs, SimSources, VerifyRequestMessage, decode_match_reply,

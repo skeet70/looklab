@@ -1054,6 +1054,19 @@ impl HarBuilder {
         self
     }
 
+    fn manual_summary(mut self, camera: &str) -> Self {
+        self.entries.push(entry(
+            "GET",
+            &format!("https://looklab.test/api/manual-confirmations/{camera}"),
+            None,
+        ));
+        self
+    }
+
+    fn get_body(mut self, url: &str, body: &[u8]) -> Self {
+        self.entries.push(entry("GET", url, Some(body)));
+        self
+    }
     fn header(mut self, name: &str, value: &str) -> Self {
         let Some(last) = self.entries.last_mut() else {
             panic!("a header needs a request");
@@ -1117,6 +1130,20 @@ fn run_extra(
     intent_args: &[&str],
     extra: &[&str],
 ) -> (bool, String) {
+    let files = std::iter::once(fixture.raw.as_path())
+        .chain(fixture.jpegs.iter().map(PathBuf::as_path))
+        .collect::<Vec<_>>();
+    run_files(fixture, hars, state, intent_args, extra, &files)
+}
+
+fn run_files(
+    fixture: &Fixture,
+    hars: &[&Path],
+    state: &Path,
+    intent_args: &[&str],
+    extra: &[&str],
+    files: &[&Path],
+) -> (bool, String) {
     let mut command = Command::cargo_bin("looklab").expect("built binary");
     command
         .args(["verify-payload", "--seeds"])
@@ -1142,8 +1169,7 @@ fn run_extra(
             "--pow-difficulty",
             "0",
         ])
-        .arg(&fixture.raw)
-        .args(&fixture.jpegs);
+        .args(files);
     let output = command.output().expect("command runs");
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
@@ -1288,6 +1314,28 @@ fn reproduces_an_upload_and_passes() {
     let recorded: Value =
         serde_json::from_str(&std::fs::read_to_string(&state).expect("state file")).expect("json");
     assert_eq!(recorded["credentials"][0]["credential_id"], hex(CREDENTIAL));
+}
+
+#[test]
+fn the_file_order_within_a_group_does_not_change_the_reproduction() {
+    let fixture = fixture();
+    let site = Site::new();
+    let har = har_path("file-order", &default_har(&site).json());
+    let state = state_path("file-order");
+    let files = std::iter::once(fixture.raw.as_path())
+        .chain(fixture.jpegs.iter().rev().map(PathBuf::as_path))
+        .collect::<Vec<_>>();
+    let (success, output) = run_files(
+        fixture,
+        &[har.as_path()],
+        &state,
+        &["--intent", "native"],
+        &[],
+        &files,
+    );
+
+    assert!(success, "{output}");
+    assert!(output.contains("PASS"), "{output}");
 }
 
 #[test]
@@ -2817,6 +2865,7 @@ fn withdrawal_har_is_recognized_and_bound_to_the_camera() {
         &HarBuilder::new()
             .post("https://looklab.test/api/nonce")
             .withdrawal(&body)
+            .manual_summary(camera)
             .json(),
     );
     let (success, output) = run_minimal(fixture, har.as_path(), &state_path("withdrawal"));
@@ -2824,6 +2873,10 @@ fn withdrawal_har_is_recognized_and_bound_to_the_camera() {
     assert!(
         output.contains(camera),
         "the withdrawal target is not printed: {output}"
+    );
+    assert!(
+        output.contains("camera summary target"),
+        "the browser's summary refresh is not audited: {output}"
     );
 
     let unknown = "leak/00112233445566778899aabbccddeeff";
@@ -2895,5 +2948,70 @@ fn withdrawal_har_is_recognized_and_bound_to_the_camera() {
     assert!(
         !success,
         "a withdrawal without a local manual catalog must not verify: {output}"
+    );
+}
+
+#[test]
+fn the_camera_summary_request_is_checked() {
+    let fixture = fixture();
+    let site = Site::from_fixture(fixture);
+    let nonce = Nonce::from_bytes([0x58; 32]);
+    let camera = site.manifest.body.as_str();
+    let body = withdrawal_body(&site, &nonce, camera);
+    let url = format!("https://looklab.test/api/manual-confirmations/{camera}");
+
+    let query = format!("{url}?after=1");
+    let har = har_path(
+        "withdrawal-summary-query",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .withdrawal(&body)
+            .get(&query)
+            .json(),
+    );
+    let (success, output) = run_minimal(
+        fixture,
+        har.as_path(),
+        &state_path("withdrawal-summary-query"),
+    );
+    assert!(
+        !success,
+        "a camera summary with a query string must not verify: {output}"
+    );
+
+    let har = har_path(
+        "withdrawal-summary-body",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .withdrawal(&body)
+            .get_body(&url, b"{}")
+            .json(),
+    );
+    let (success, output) = run_minimal(
+        fixture,
+        har.as_path(),
+        &state_path("withdrawal-summary-body"),
+    );
+    assert!(
+        !success,
+        "a camera summary with a body must not verify: {output}"
+    );
+
+    let har = har_path(
+        "withdrawal-summary-unknown-camera",
+        &HarBuilder::new()
+            .post("https://looklab.test/api/nonce")
+            .withdrawal(&body)
+            .manual_summary("leak/00112233445566778899aabbccddeeff")
+            .json(),
+    );
+    let (success, output) = run_minimal(
+        fixture,
+        har.as_path(),
+        &state_path("withdrawal-summary-unknown-camera"),
+    );
+    assert!(
+        !success,
+        "a camera summary for an undocumented camera must not verify: {output}"
     );
 }

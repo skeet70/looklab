@@ -109,9 +109,15 @@ pub async fn withdraw(
     }
 
     let delete_after = now_unix() + i64::from(state.config.blob_retention_days) * 86_400;
-    let delete_after = store::withdraw(&state.db, &contribution_ids, &credential.id, delete_after)
-        .await?
-        .ok_or_else(|| ApiError::new(ErrorCode::ContributionUnknown))?;
+    let delete_after = store::withdraw(
+        &state.db,
+        &contribution_ids,
+        &credential.id,
+        delete_after,
+        &state.manuals,
+    )
+    .await?
+    .ok_or_else(|| ApiError::new(ErrorCode::ContributionUnknown))?;
 
     Ok(Json(WithdrawResponse {
         status: WithdrawalState::Withdrawn,

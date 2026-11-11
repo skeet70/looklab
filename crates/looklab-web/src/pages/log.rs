@@ -2,6 +2,9 @@
 
 use leptos::prelude::*;
 use looklab_publish::{AuditEvent, Decision, LookListing, Role, SplitKind};
+use looklab_schema::{
+    BodyId, CapabilityKey, ConfirmationBasis, ModeratorEvidenceKind, ModeratorFirmwareScope,
+};
 
 use crate::data::{self, Load};
 use crate::ui;
@@ -124,6 +127,77 @@ pub(super) fn event_sentence(event: &AuditEvent) -> String {
             }
         ),
         AuditEvent::Release { look, version, .. } => format!("{look} {version} published."),
+        AuditEvent::ManualConfirmation {
+            camera,
+            firmware,
+            controls,
+        } => format!(
+            "An owner confirmed {controls} documented {} on {camera} for firmware {firmware}.",
+            if *controls == 1 {
+                "control"
+            } else {
+                "controls"
+            },
+        ),
+        AuditEvent::ManualConfirmationPromotion {
+            camera,
+            control,
+            firmware,
+            groups,
+            basis,
+        } => format!(
+            "{groups} independent owner groups confirmed {} on {camera} for firmware {firmware}{}.",
+            control.as_str(),
+            basis_text(*basis),
+        ),
+        AuditEvent::ManualConfirmationWithdrawal { camera, withdrawn } => format!(
+            "An owner withdrew {withdrawn} {} for {camera}.",
+            if *withdrawn == 1 {
+                "confirmation"
+            } else {
+                "confirmations"
+            },
+        ),
+        AuditEvent::ManualModeratorConfirmation {
+            camera,
+            control,
+            confirmed,
+            firmware_scope,
+            evidence,
+            ..
+        } => format!(
+            "A moderator {} {} on {camera} for firmware {} from {} evidence.",
+            if *confirmed { "confirmed" } else { "rejected" },
+            control.as_str(),
+            firmware_scope_text(firmware_scope),
+            evidence_text(*evidence),
+        ),
+    }
+}
+
+fn basis_text(basis: Option<ConfirmationBasis>) -> &'static str {
+    match basis {
+        Some(ConfirmationBasis::Documented) => " (documented value)",
+        Some(ConfirmationBasis::Corrected) => " (corrected value)",
+        Some(ConfirmationBasis::Moderator) => " (moderator-checked)",
+        None => "",
+    }
+}
+
+fn evidence_text(kind: ModeratorEvidenceKind) -> &'static str {
+    match kind {
+        ModeratorEvidenceKind::Video => "video",
+        ModeratorEvidenceKind::Physical => "physical inspection",
+    }
+}
+
+fn firmware_scope_text(scope: &ModeratorFirmwareScope) -> String {
+    match scope {
+        ModeratorFirmwareScope::Unspecified {} => "any firmware".to_owned(),
+        ModeratorFirmwareScope::Exact { firmware } => firmware.as_str().to_owned(),
+        ModeratorFirmwareScope::Range { from, to } => {
+            format!("{} to {}", from.as_str(), to.as_str())
+        }
     }
 }
 
@@ -463,6 +537,10 @@ enum LiveEventKind {
     CredentialIntakeBlocked,
     Split,
     ReleaseManifest,
+    ManualConfirmation,
+    ManualConfirmationPromotion,
+    ManualConfirmationWithdrawal,
+    ManualModeratorConfirmation,
     #[serde(other)]
     Unknown,
 }
@@ -474,9 +552,18 @@ struct LivePayload {
     subject: Option<looklab_publish::CredentialRef>,
     proposal: Option<looklab_publish::ProposalRef>,
     look: Option<looklab_publish::LookRef>,
+    camera: Option<BodyId>,
+    control: Option<CapabilityKey>,
+    firmware: Option<String>,
+    controls: Option<u64>,
+    withdrawn: Option<u64>,
+    groups: Option<u32>,
+    basis: Option<ConfirmationBasis>,
+    firmware_scope: Option<ModeratorFirmwareScope>,
+    evidence_kind: Option<ModeratorEvidenceKind>,
     #[serde(default)]
     reason: String,
-    decision: Option<LiveDecision>,
+    decision: Option<LiveDecisionField>,
     #[serde(alias = "moderator_handle")]
     actor_handle: Option<crate::webauthn::DisplayHandle>,
     #[serde(alias = "human_summary")]
@@ -540,6 +627,46 @@ impl LiveDecision {
             Self::Approve => "approved",
             Self::Reject => "rejected",
             Self::RequestInfo => "requested information on",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ManualDecision {
+    Confirm,
+    Reject,
+}
+
+impl ManualDecision {
+    fn wording(self) -> &'static str {
+        match self {
+            Self::Confirm => "confirmed",
+            Self::Reject => "rejected",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum LiveDecisionField {
+    Proposal(LiveDecision),
+    Manual(ManualDecision),
+}
+
+impl LiveDecisionField {
+    fn proposal(self) -> Option<LiveDecision> {
+        match self {
+            Self::Proposal(decision) => Some(decision),
+            Self::Manual(_) => None,
+        }
+    }
+
+    fn manual(self) -> Option<ManualDecision> {
+        match self {
+            Self::Manual(decision) => Some(decision),
+            Self::Proposal(LiveDecision::Reject) => Some(ManualDecision::Reject),
+            Self::Proposal(_) => None,
         }
     }
 }
@@ -659,6 +786,61 @@ async fn load_activity() -> Result<Vec<ActivityItem>, String> {
                         Some(proposal.clone()),
                         ActivityFilter::Decisions,
                     ),
+                    AuditEvent::ManualConfirmation {
+                        camera,
+                        firmware,
+                        controls,
+                    } => (
+                        format!(
+                            "An owner confirmed {controls} documented {} on {camera} for firmware {firmware}.",
+                            if *controls == 1 { "control" } else { "controls" },
+                        ),
+                        String::new(),
+                        None,
+                        ActivityFilter::All,
+                    ),
+                    AuditEvent::ManualConfirmationPromotion {
+                        camera,
+                        control,
+                        firmware,
+                        ..
+                    } => (
+                        format!(
+                            "Independent owner groups confirmed {} on {camera} for firmware {firmware}.",
+                            control.as_str(),
+                        ),
+                        String::new(),
+                        None,
+                        ActivityFilter::All,
+                    ),
+                    AuditEvent::ManualConfirmationWithdrawal { camera, withdrawn } => (
+                        format!(
+                            "An owner withdrew {withdrawn} {} for {camera}.",
+                            if *withdrawn == 1 {
+                                "confirmation"
+                            } else {
+                                "confirmations"
+                            },
+                        ),
+                        String::new(),
+                        None,
+                        ActivityFilter::All,
+                    ),
+                    AuditEvent::ManualModeratorConfirmation {
+                        camera,
+                        control,
+                        confirmed,
+                        ..
+                    } => (
+                        format!(
+                            "A moderator {} {} on {camera}.",
+                            if *confirmed { "confirmed" } else { "rejected" },
+                            control.as_str(),
+                        ),
+                        String::new(),
+                        None,
+                        ActivityFilter::All,
+                    ),
                 };
                 ActivityItem {
                     sentence,
@@ -686,24 +868,41 @@ async fn load_activity() -> Result<Vec<ActivityItem>, String> {
         let page: LivePage = response.json().await.map_err(|error| error.to_string())?;
         items.extend(page.entries.into_iter().map(|entry| {
             let payload = entry.payload;
-            let detail = format!(
-                "Actor: {} · Subject: {} · Proposal: {}",
-                payload
-                    .actor
-                    .as_ref()
-                    .map(|id| id.as_str())
-                    .unwrap_or("not recorded"),
-                payload
-                    .subject
-                    .as_ref()
-                    .map(|id| id.as_str())
-                    .unwrap_or("not recorded"),
-                payload
-                    .proposal
-                    .as_ref()
-                    .map(|id| id.as_str())
-                    .unwrap_or("not recorded")
-            );
+            let detail = match payload.event {
+                LiveEventKind::ManualConfirmation
+                | LiveEventKind::ManualConfirmationPromotion
+                | LiveEventKind::ManualConfirmationWithdrawal
+                | LiveEventKind::ManualModeratorConfirmation => format!(
+                    "Camera: {} · Control: {}",
+                    payload
+                        .camera
+                        .as_ref()
+                        .map(BodyId::as_str)
+                        .unwrap_or("not recorded"),
+                    payload
+                        .control
+                        .map(|control| control.as_str())
+                        .unwrap_or("not recorded")
+                ),
+                _ => format!(
+                    "Actor: {} · Subject: {} · Proposal: {}",
+                    payload
+                        .actor
+                        .as_ref()
+                        .map(|id| id.as_str())
+                        .unwrap_or("not recorded"),
+                    payload
+                        .subject
+                        .as_ref()
+                        .map(|id| id.as_str())
+                        .unwrap_or("not recorded"),
+                    payload
+                        .proposal
+                        .as_ref()
+                        .map(|id| id.as_str())
+                        .unwrap_or("not recorded")
+                ),
+            };
             let actor = payload
                 .actor_handle
                 .as_ref()
@@ -736,6 +935,7 @@ async fn load_activity() -> Result<Vec<ActivityItem>, String> {
                         "{actor} {} a proposal{}",
                         payload
                             .decision
+                            .and_then(LiveDecisionField::proposal)
                             .map(LiveDecision::wording)
                             .unwrap_or("reviewed"),
                         payload
@@ -782,6 +982,92 @@ async fn load_activity() -> Result<Vec<ActivityItem>, String> {
                 ),
                 LiveEventKind::ReleaseManifest => {
                     (format!("{look} published."), ActivityFilter::Releases)
+                }
+                LiveEventKind::ManualConfirmation => {
+                    let camera = payload
+                        .camera
+                        .as_ref()
+                        .map(BodyId::as_str)
+                        .unwrap_or("a documented camera");
+                    let firmware = payload.firmware.as_deref().unwrap_or("an unspecified firmware");
+                    let controls = payload.controls.unwrap_or(0);
+                    (
+                        format!(
+                            "An owner confirmed {controls} documented {} on {camera} for firmware {firmware}.",
+                            if controls == 1 { "control" } else { "controls" },
+                        ),
+                        ActivityFilter::All,
+                    )
+                }
+                LiveEventKind::ManualConfirmationPromotion => {
+                    let camera = payload
+                        .camera
+                        .as_ref()
+                        .map(BodyId::as_str)
+                        .unwrap_or("a documented camera");
+                    let firmware = payload.firmware.as_deref().unwrap_or("an unspecified firmware");
+                    let control = payload
+                        .control
+                        .map(|control| control.as_str())
+                        .unwrap_or("a documented control");
+                    let groups = payload.groups.unwrap_or(0);
+                    (
+                        format!(
+                            "{groups} independent owner groups confirmed {control} on {camera} for firmware {firmware}{}.",
+                            basis_text(payload.basis),
+                        ),
+                        ActivityFilter::All,
+                    )
+                }
+                LiveEventKind::ManualConfirmationWithdrawal => {
+                    let camera = payload
+                        .camera
+                        .as_ref()
+                        .map(BodyId::as_str)
+                        .unwrap_or("a documented camera");
+                    let withdrawn = payload.withdrawn.unwrap_or(0);
+                    (
+                        format!(
+                            "An owner withdrew {withdrawn} {} for {camera}.",
+                            if withdrawn == 1 {
+                                "confirmation"
+                            } else {
+                                "confirmations"
+                            },
+                        ),
+                        ActivityFilter::All,
+                    )
+                }
+                LiveEventKind::ManualModeratorConfirmation => {
+                    let camera = payload
+                        .camera
+                        .as_ref()
+                        .map(BodyId::as_str)
+                        .unwrap_or("a documented camera");
+                    let control = payload
+                        .control
+                        .map(|control| control.as_str())
+                        .unwrap_or("a documented control");
+                    let decision = payload
+                        .decision
+                        .and_then(LiveDecisionField::manual)
+                        .map(ManualDecision::wording)
+                        .unwrap_or("reviewed");
+                    let scope = payload
+                        .firmware_scope
+                        .as_ref()
+                        .map(firmware_scope_text)
+                        .unwrap_or_else(|| "unspecified firmware".to_owned());
+                    let evidence = payload
+                        .evidence_kind
+                        .map(evidence_text)
+                        .unwrap_or("recorded");
+                    (
+                        format!(
+                            "A moderator {decision} {control} on {camera} for firmware {scope} from {evidence} evidence."
+                        ),
+                        ActivityFilter::All,
+                    )
                 }
                 LiveEventKind::Unknown => (
                     "Community activity recorded.".to_owned(),

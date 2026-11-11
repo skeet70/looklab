@@ -42,7 +42,8 @@ fn signed_payload(request: &ManualConfirmationRequest) -> SignedRequestPayload {
 }
 
 fn camera_id_from_path(make: &str, model: &str) -> ApiResult<looklab_schema::BodyId> {
-    looklab_schema::body_id_from_name(make, model).map_err(|_| ApiError::new(ErrorCode::NotFound))
+    looklab_schema::BodyId::try_from(format!("{make}/{model}"))
+        .map_err(|_| ApiError::new(ErrorCode::NotFound))
 }
 
 pub async fn page(
@@ -141,6 +142,7 @@ pub async fn confirm(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResu
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
 
+    let _guard = state.lock_assertion().await;
     let credential = store::find_credential(&state.db, &assertion.credential_id)
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?
@@ -226,6 +228,7 @@ pub async fn confirm(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResu
             }
         }
     }
+    drop(_guard);
 
     match store::find_send_attestation(&state.db, &nonce, digest.as_bytes())
         .await
@@ -239,6 +242,7 @@ pub async fn confirm(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResu
     match manual_confirm::record(
         &state.db,
         &credential.id,
+        camera,
         &request.confirmation,
         digest,
         &assertion_hash,
@@ -259,9 +263,6 @@ pub async fn confirm(State(state): State<Arc<AppState>>, body: Bytes) -> ApiResu
         }
     }
     let summary = manual_confirm::summary(&state.db, camera)
-        .await
-        .map_err(|_| ApiError::new(ErrorCode::Internal))?;
-    manual_confirm::promotion_audit(&state.db, camera, &summary)
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?;
     let receipt = ManualSubmissionReceipt {
@@ -293,15 +294,16 @@ pub async fn withdraw_confirmation(
     if request.canonical_bytes().as_slice() != body.as_ref() {
         return Err(ApiError::new(ErrorCode::MalformedEnvelope));
     }
-    if state.manuals.camera(&request.camera).is_none() {
+    let Some(camera) = state.manuals.camera(&request.camera) else {
         return Err(ApiError::new(ErrorCode::NotFound));
-    }
+    };
     let (assertion, nonce) = withdrawal_signed(&request).decode()?;
     let raw_id = RawCredentialId::new(assertion.credential_id.clone());
     crate::api::consume_nonce(&state, &nonce).await?;
     if !state.rate_limiter.check(&RateKey::GlobalSigned) {
         return Err(ApiError::new(ErrorCode::RateLimited));
     }
+    let guard = state.lock_assertion().await;
     let credential = store::find_credential(&state.db, raw_id.as_slice())
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?
@@ -338,7 +340,8 @@ pub async fn withdraw_confirmation(
         }
         Err(_) => return Err(ApiError::new(ErrorCode::Internal)),
     }
-    manual_confirm::withdraw(&state.db, &credential.id, &request.camera)
+    drop(guard);
+    manual_confirm::withdraw(&state.db, &credential.id, camera)
         .await
         .map_err(|_| ApiError::new(ErrorCode::Internal))?;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -453,6 +456,11 @@ pub async fn moderate(
         RequestDomain::ModerateManualConfirmation,
         &moderation.canonical_bytes(),
     );
+    let guard = state.lock_assertion().await;
+    let credential = store::find_credential(&state.db, raw_id.as_slice())
+        .await
+        .map_err(|_| ApiError::new(ErrorCode::Internal))?
+        .ok_or_else(|| ApiError::new(ErrorCode::CredentialUnknown))?;
     let passkey = verify_assertion(
         &credential.passkey,
         &assertion,
@@ -481,6 +489,7 @@ pub async fn moderate(
         }
         Err(_) => return Err(ApiError::new(ErrorCode::Internal)),
     }
+    drop(guard);
     let record = ModeratorRecord {
         confirmed: request.confirmed,
         evidence,

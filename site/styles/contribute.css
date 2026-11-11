@@ -4,7 +4,7 @@
 .contribute-intro.contribution-active > p { display: none; }
 .contribute-intro.contribution-active h1 { font-size: clamp(1.8rem, 3vw, 2.5rem); }
 .help-grid, .wanted-grid, .pairing-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr)); gap: 1rem; }
-.help-card, .wanted-card, .pairing-card { padding: 1.25rem; border: 1px solid var(--line); border-radius: .6rem; background: var(--panel); min-width: 0; }
+.help-card, .wanted-card, .pairing-card, .monochrome-consent, .batch-detail { padding: 1.25rem; border: 1px solid var(--line); border-radius: .6rem; background: var(--panel); min-width: 0; }
 .help-card h3, .wanted-card h2 { margin: .35rem 0 .6rem; }
 .help-meta { color: var(--muted); font-size: .85rem; margin: 0; }
 .help-card-button { display: flex; flex-direction: column; gap: .65rem; width: 100%; text-align: left; }

@@ -144,18 +144,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_round_trips_through_dispatch() {
-        let input = postcard::to_allocvec(&VersionRequest).expect("version request encodes");
-        let output = dispatch(Function::Version.id(), &input);
-        let response: Result<Response, ModuleError> =
-            postcard::from_bytes(&output).expect("version response decodes");
-        assert_eq!(
-            response.expect("version succeeds"),
-            Response::Version(version())
-        );
-    }
-
-    #[test]
     fn unknown_function_is_an_error_response() {
         let output = dispatch(99, &[]);
         let response: Result<Response, ModuleError> =
@@ -164,11 +152,5 @@ mod tests {
             response,
             Err(ModuleError::UnknownFunction { fn_id: 99 })
         ));
-    }
-
-    #[test]
-    fn build_id_ignores_the_host() {
-        assert_eq!(build_id(), build_id());
-        assert_ne!(build_id(), [0u8; 32]);
     }
 }

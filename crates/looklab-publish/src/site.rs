@@ -20,7 +20,7 @@ use crate::manifest::{
     ArtifactBlob, ArtifactEntry, GateSummary, LookStatus, ProvenanceSummary, VersionManifest,
     verify_artifact,
 };
-use crate::manual::{ManualPage, ManualSummary};
+use crate::manual::{ManualArtifact, ManualPage, ManualSummary};
 use crate::qualification::{
     BundleEntry, CurrentEntry, EligibilityEntry, FamilyHeadPage, PublishedBundleRevisionPage,
     ReportSummaryEntry, SelectedTargetSummary, SiteReport, SubjectCurrentPage,
@@ -432,8 +432,11 @@ pub fn write_site<S: SiteSink + ?Sized>(
 ) -> Result<ArtifactHash, PublishError> {
     validate(site)?;
 
+    let mut manuals = Vec::with_capacity(site.manuals.len());
     for manual in &site.manuals {
-        sink.put(&manual_path(&manual.id)?, &json(manual)?)?;
+        let encoded = EncodedManual::new(manual)?;
+        sink.put(&encoded.summary.artifact.path, &encoded.bytes)?;
+        manuals.push(encoded.summary);
     }
 
     let mut interfaces = Vec::new();
@@ -593,6 +596,7 @@ pub fn write_site<S: SiteSink + ?Sized>(
             bundles,
             interfaces,
             input_transforms,
+            manuals,
         },
     )?)?;
     sink.put(&index_path(), &index)?;
@@ -640,6 +644,24 @@ impl EncodedScene {
     }
 }
 
+struct EncodedManual {
+    summary: ManualSummary,
+    bytes: Vec<u8>,
+}
+
+impl EncodedManual {
+    fn new(manual: &ManualPage) -> Result<Self, PublishError> {
+        let bytes = json(manual)?;
+        let path = manual_path(&manual.id)?;
+        let summary = manual.summary(ManualArtifact {
+            path,
+            sha256: ArtifactHash::of(&bytes),
+            bytes: bytes.len() as u64,
+        });
+        Ok(Self { summary, bytes })
+    }
+}
+
 fn reference_preview_path(name: &ArtifactName) -> Result<SitePath, PublishError> {
     SitePath::new(format!("data/reference/{}", name.as_str()))
 }
@@ -653,6 +675,7 @@ struct SiteEntries {
     bundles: Vec<BundleEntry>,
     interfaces: Vec<InterfaceProfileEntry>,
     input_transforms: Vec<InputTransformEntry>,
+    manuals: Vec<ManualSummary>,
 }
 
 fn site_index(site: &SiteData, entries: SiteEntries) -> Result<SiteIndex, PublishError> {
@@ -664,6 +687,7 @@ fn site_index(site: &SiteData, entries: SiteEntries) -> Result<SiteIndex, Publis
         bundles,
         interfaces,
         input_transforms,
+        manuals,
     } = entries;
     let bodies = site
         .bodies
@@ -755,7 +779,6 @@ fn site_index(site: &SiteData, entries: SiteEntries) -> Result<SiteIndex, Publis
             })
         })
         .collect::<Result<Vec<_>, PublishError>>()?;
-    let manuals = site.manuals.iter().map(ManualPage::summary).collect();
     Ok(SiteIndex {
         format: SITE_FORMAT.to_owned(),
         community_snapshot_version: site.community_snapshot_version,

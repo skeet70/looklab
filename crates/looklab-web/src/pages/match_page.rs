@@ -50,7 +50,7 @@ impl Application {
     }
 }
 
-/// What the published catalog can offer the camera match wizard.
+/// What the published catalog can offer the match wizard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MatchAvailability {
     /// At least one public look has a matchable version.
@@ -173,7 +173,6 @@ struct MatchCompletion {
     blockers: Vec<String>,
     camera_model_provenance: looklab_publish::CameraModelProvenance,
 }
-
 #[component]
 pub fn MatchPage() -> impl IntoView {
     let query = use_query_map();

@@ -599,7 +599,7 @@ pub fn ModQueuePage() -> impl IntoView {
                     Load::Ready(items) => items.serial_reuse.len(), _ => 0,
                 })}</option>
                 <option value="camera-checks" selected=move || filter.get() == QueueFilter::CameraChecks>{move || format!("Camera checks ({})", match queue.get() {
-                    Load::Ready(items) => items.manual_checks.len(), _ => 0,
+                    Load::Ready(items) => pending_manual_check_count(&items), _ => 0,
                 })}</option>
             </select>
             <p class="muted">"Use j and k to move through items."</p>
@@ -612,7 +612,7 @@ pub fn ModQueuePage() -> impl IntoView {
             match queue.get() {
                 Load::Loading => ui::loading().into_any(),
                 Load::Failed(error) => ui::failure(&error).into_any(),
-                Load::Ready(queue) if queue.proposals.is_empty() && queue.failed_gates.is_empty() && queue.fit_holds.is_empty() && queue.serial_reuse.is_empty() && queue.manual_checks.is_empty() => {
+                Load::Ready(queue) if queue.proposals.is_empty() && queue.failed_gates.is_empty() && queue.fit_holds.is_empty() && queue.serial_reuse.is_empty() && pending_manual_check_count(&queue) == 0 => {
                     view! { <p class="muted">"Nothing is waiting for moderation."</p> }.into_any()
                 }
                 Load::Ready(queue) => {
@@ -697,11 +697,16 @@ pub fn ModQueuePage() -> impl IntoView {
                                     check.camera.model(),
                                     check.label
                                 );
+                                let linkage = match &check.owner_linkage {
+                                    ManualOwnerLinkage::Linked => "linked",
+                                    ManualOwnerLinkage::Unlinked => "not linked",
+                                };
                                 let detail = format!(
-                                    "Firmware {} · {} · {}",
+                                    "Firmware {} · {} · {} · {}",
                                     check.firmware.as_str(),
                                     super::body::finding_text(&check.finding),
-                                    manual_check_status_text(&check.status)
+                                    manual_check_status_text(&check.status),
+                                    linkage
                                 );
                                 view! {
                                     <li>
@@ -899,7 +904,7 @@ pub fn ModQueuePage() -> impl IntoView {
                                 <dt>"Review status"</dt>
                                 <dd>{manual_check_status_text(&check.status)}</dd>
                                 <dt>"Submission"</dt>
-                                <dd>"Latest active check for this control and firmware."</dd>
+                                <dd>"One profile's newest active check for this control and firmware."</dd>
                                 <dt>"Owner linkage"</dt>
                                 <dd>{linkage}</dd>
                                 <dt>"Submitted definition digest"</dt>
@@ -965,9 +970,7 @@ pub fn ModQueuePage() -> impl IntoView {
                             "Please clarify the controls and firmware this change applies to.",
                         ],
                     };
-                    presets.into_iter().map(|preset| view! {
-                        <option>{preset}</option>
-                    }).collect_view()
+                    presets.into_iter().map(|text| view! { <option>{text}</option> }).collect_view()
                 }}
             </select>
             <label for="mod-reason">"Reason (required)"</label>
@@ -1032,9 +1035,24 @@ fn review_targets(queue: &ReviewQueue, filter: QueueFilter) -> Vec<ReviewTarget>
         targets.extend((0..queue.serial_reuse.len()).map(ReviewTarget::SerialReuse));
     }
     if matches!(filter, QueueFilter::All | QueueFilter::CameraChecks) {
-        targets.extend((0..queue.manual_checks.len()).map(ReviewTarget::ManualCheck));
+        targets.extend(
+            queue
+                .manual_checks
+                .iter()
+                .enumerate()
+                .filter(|(_, check)| check.status == ManualCheckReviewStatus::Pending)
+                .map(|(index, _)| ReviewTarget::ManualCheck(index)),
+        );
     }
     targets
+}
+
+fn pending_manual_check_count(queue: &ReviewQueue) -> usize {
+    queue
+        .manual_checks
+        .iter()
+        .filter(|check| check.status == ManualCheckReviewStatus::Pending)
+        .count()
 }
 
 fn manual_check_status_text(status: &ManualCheckReviewStatus) -> &'static str {

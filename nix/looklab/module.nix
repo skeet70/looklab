@@ -382,8 +382,8 @@ in
           touch ${cfg.dataDir}/.seeded
         fi
         if [ -d ${hostPackages.looklab-manuals} ]; then
-          mkdir -p ${cfg.manualsDir}
-          cp -R --remove-destination ${hostPackages.looklab-manuals}/. ${cfg.manualsDir}/
+          mkdir -p "${cfg.manualsDir}"
+          cp -R --remove-destination "${hostPackages.looklab-manuals}/." "${cfg.manualsDir}/"
         fi
         ${
           optionalString (cfg.scenesDir != null) ''
@@ -399,6 +399,7 @@ in
     systemd.services.looklab-server = {
       description = "looklab API and site server";
       wantedBy = [ "multi-user.target" ];
+      restartTriggers = [ hostPackages.looklab-data ];
       after = [
         "network.target"
         "looklab-seed-data.service"
@@ -422,6 +423,7 @@ in
     systemd.services.looklab-worker = {
       description = "looklab job runner and site publisher";
       wantedBy = [ "multi-user.target" ];
+      restartTriggers = [ hostPackages.looklab-data ];
       after = [
         "network.target"
         "looklab-server.service"

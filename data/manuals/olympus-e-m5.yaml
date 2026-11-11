@@ -110,9 +110,12 @@ cameras:
   - key: highlight_tone
     label: Highlight&Shadow Control
     category: rendering
-    availability: not_documented
+    availability: available
     domain:
       type: unspecified
+    citations:
+    - source: olympus-e-m5-manual
+      locator: p. 47 (Changing the brightness of highlights and shadows); pp. 93 and 112 (Highlight&Shadow Control)
   - key: in_camera_raw_conversion
     label: RAW Data Edit
     category: workflow
@@ -230,9 +233,12 @@ cameras:
   - key: shadow_tone
     label: Highlight&Shadow Control
     category: rendering
-    availability: not_documented
+    availability: available
     domain:
       type: unspecified
+    citations:
+    - source: olympus-e-m5-manual
+      locator: p. 47 (Changing the brightness of highlights and shadows); pp. 93 and 112 (Highlight&Shadow Control)
   - key: sharpening
     label: Sharpness
     category: spatial

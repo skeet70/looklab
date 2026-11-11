@@ -158,30 +158,6 @@ impl ModeratorFirmwareScope {
             Self::Range { .. } | Self::Unspecified {} => None,
         }
     }
-
-    /// An unspecified scope covers no firmware.
-    pub fn covers(&self, firmware: &ReportedFirmware) -> bool {
-        match self {
-            Self::Unspecified {} => false,
-            Self::Exact { firmware: scope } => {
-                !scope.is_unspecified() && scope_accepts(scope, firmware.as_str())
-            }
-            Self::Range { from, to } => {
-                if from.is_unspecified() || to.is_unspecified() {
-                    return false;
-                }
-                let (Some(reported), Some(start), Some(end)) = (
-                    parse_version(firmware.as_str()),
-                    parse_version(from.as_str()),
-                    parse_version(to.as_str()),
-                ) else {
-                    return false;
-                };
-                compare_versions(&reported, &start) != Ordering::Less
-                    && compare_versions(&reported, &end) != Ordering::Greater
-            }
-        }
-    }
 }
 
 impl<'de> Deserialize<'de> for ModeratorFirmwareScope {
@@ -233,6 +209,13 @@ impl ModeratorEvidence {
 pub struct ModeratorRecord {
     pub confirmed: bool,
     pub evidence: ModeratorEvidence,
+}
+
+impl ModeratorRecord {
+    /// An unspecified scope covers no firmware.
+    pub fn applies_to(&self, firmware: &ReportedFirmware) -> bool {
+        moderator_applies_to(self, firmware.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,15 +334,12 @@ impl ManualConfirmationSummary {
             }
             let mut confirmed = BTreeSet::new();
             for result in &control.firmware {
-                if result.state == ConfirmationState::Confirmed {
+                if matches!(
+                    result.state,
+                    ConfirmationState::Confirmed | ConfirmationState::ModeratorConfirmed
+                ) {
                     confirmed.insert(result.firmware.clone());
                 }
-            }
-            if control.state == ConfirmationState::ModeratorConfirmed
-                && let Some(evidence) = &control.moderator
-                && let Some(firmware) = evidence.exact_firmware()
-            {
-                confirmed.insert(firmware);
             }
             if confirmed.is_empty() {
                 if control.documented_availability == Availability::Available
@@ -423,7 +403,7 @@ pub enum ManualCheckReviewStatus {
     Pending,
     /// Recorded against an older control definition.
     StaleDefinition,
-    /// Covered by the latest moderator decision watermark and firmware scope.
+    /// Received before a moderator decision that is unscoped or whose firmware scope covers it.
     Reviewed,
 }
 
@@ -443,7 +423,7 @@ pub struct ManualCheckReview {
 pub fn evaluate_camera(
     camera: &ManualCamera,
     evidence: &[ManualEvidence],
-    moderators: &BTreeMap<CapabilityKey, ModeratorRecord>,
+    moderators: &BTreeMap<CapabilityKey, Vec<ModeratorRecord>>,
 ) -> ManualConfirmationSummary {
     let mut controls = Vec::with_capacity(camera.capabilities.len());
     for capability in &camera.capabilities {
@@ -456,7 +436,10 @@ pub fn evaluate_camera(
             camera,
             capability,
             &observations,
-            moderators.get(&capability.key),
+            moderators
+                .get(&capability.key)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
         ));
     }
     let mut summary = ManualConfirmationSummary {
@@ -485,24 +468,8 @@ pub fn evaluate_control(
     camera: &ManualCamera,
     capability: &DocumentedCapability,
     evidence: &[ManualEvidence],
-    moderator: Option<&ModeratorRecord>,
+    moderators: &[ModeratorRecord],
 ) -> ControlConfirmation {
-    if let Some(record) = moderator {
-        return ControlConfirmation {
-            key: capability.key,
-            state: if record.confirmed {
-                ConfirmationState::ModeratorConfirmed
-            } else {
-                ConfirmationState::ModeratorRejected
-            },
-            agreeing_groups: 0,
-            contradictions: Vec::new(),
-            moderator: Some(record.evidence.clone()),
-            firmware: Vec::new(),
-            documented_availability: capability.availability,
-            intake: ManualControlIntake::default(),
-        };
-    }
     let definition = capability.definition_digest(camera);
     let mut latest: BTreeMap<(&IdentityGroupId, &ReportedFirmware), &ManualEvidence> =
         BTreeMap::new();
@@ -524,12 +491,65 @@ pub fn evaluate_control(
     for &entry in latest.values() {
         by_firmware.entry(&entry.firmware).or_default().push(entry);
     }
-    let firmware = by_firmware
+    let mut firmware = by_firmware
         .into_iter()
         .map(|(reported, entries)| {
             evaluate_firmware(capability, &definition, reported.clone(), &entries)
         })
         .collect::<Vec<_>>();
+    let moderator = moderators.first().map(|record| record.evidence.clone());
+    let mut known = firmware
+        .iter()
+        .map(|result| result.firmware.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    for record in moderators {
+        if let ModeratorFirmwareScope::Exact { firmware } = &record.evidence.firmware_scope {
+            known.insert(firmware.as_str().to_owned());
+        }
+    }
+    let decisions = known
+        .into_iter()
+        .filter_map(|firmware| {
+            let record = moderators
+                .iter()
+                .find(|record| moderator_applies_to(record, &firmware))?;
+            Some((firmware, record))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (reported_firmware, record) in decisions {
+        let state = if record.confirmed {
+            ConfirmationState::ModeratorConfirmed
+        } else {
+            ConfirmationState::ModeratorRejected
+        };
+        match firmware.iter_mut().find(|result| {
+            result
+                .firmware
+                .as_str()
+                .eq_ignore_ascii_case(&reported_firmware)
+        }) {
+            Some(result) => {
+                if !(record.confirmed && result.state == ConfirmationState::Confirmed) {
+                    result.state = state;
+                    result.basis = Some(ConfirmationBasis::Moderator);
+                    result.confirmed_actual = None;
+                }
+                result.contradictions.clear();
+            }
+            None => {
+                if let Ok(reported) = ReportedFirmware::new(&reported_firmware) {
+                    firmware.push(FirmwareConfirmation {
+                        firmware: reported,
+                        state,
+                        agreeing_groups: 0,
+                        contradictions: Vec::new(),
+                        basis: Some(ConfirmationBasis::Moderator),
+                        confirmed_actual: None,
+                    });
+                }
+            }
+        }
+    }
     let mut contradictions = firmware
         .iter()
         .flat_map(|result| result.contradictions.iter().cloned())
@@ -550,14 +570,30 @@ pub fn evaluate_control(
         .any(|result| result.state == ConfirmationState::Contradicted)
     {
         ConfirmationState::Contradicted
-    } else if !firmware.is_empty()
-        && firmware
-            .iter()
-            .all(|result| result.state == ConfirmationState::Confirmed)
+    } else if firmware
+        .iter()
+        .any(|result| result.state == ConfirmationState::Confirmed)
     {
         ConfirmationState::Confirmed
-    } else if firmware.is_empty() && capability.availability != Availability::Available {
-        ConfirmationState::Documented
+    } else if firmware
+        .iter()
+        .any(|result| result.state == ConfirmationState::ModeratorConfirmed)
+    {
+        ConfirmationState::ModeratorConfirmed
+    } else if firmware
+        .iter()
+        .any(|result| result.state == ConfirmationState::ModeratorRejected)
+    {
+        ConfirmationState::ModeratorRejected
+    } else if firmware.is_empty() {
+        match moderators.first() {
+            Some(record) if record.confirmed => ConfirmationState::ModeratorConfirmed,
+            Some(_) => ConfirmationState::ModeratorRejected,
+            None if capability.availability != Availability::Available => {
+                ConfirmationState::Documented
+            }
+            None => ConfirmationState::Unconfirmed,
+        }
     } else {
         ConfirmationState::Unconfirmed
     };
@@ -566,11 +602,33 @@ pub fn evaluate_control(
         state,
         agreeing_groups,
         contradictions,
-        moderator: None,
+        moderator,
         firmware,
         documented_availability: capability.availability,
         intake: ManualControlIntake::default(),
     }
+}
+
+fn moderator_applies_to(record: &ModeratorRecord, firmware: &str) -> bool {
+    match &record.evidence.firmware_scope {
+        ModeratorFirmwareScope::Exact { firmware: scoped } => {
+            scoped.as_str().eq_ignore_ascii_case(firmware)
+        }
+        ModeratorFirmwareScope::Range { from, to } => firmware_in_range(firmware, from, to),
+        ModeratorFirmwareScope::Unspecified {} => false,
+    }
+}
+
+fn firmware_in_range(firmware: &str, from: &FirmwareScope, to: &FirmwareScope) -> bool {
+    let (Some(version), Some(start), Some(end)) = (
+        parse_version(firmware),
+        parse_version(from.as_str()),
+        parse_version(to.as_str()),
+    ) else {
+        return false;
+    };
+    compare_versions(&version, &start) != Ordering::Less
+        && compare_versions(&version, &end) != Ordering::Greater
 }
 
 fn evaluate_firmware(
@@ -671,6 +729,14 @@ struct ActualClaim {
     domain: CapabilityDomain,
 }
 
+impl ConfirmedActual {
+    /// Whether `finding` claims this availability and domain.
+    pub fn agrees_with(&self, capability: &DocumentedCapability, finding: &Finding) -> bool {
+        let claim = ActualClaim::from_finding(capability, finding);
+        claim.availability == self.availability && claim.domain == self.domain
+    }
+}
+
 impl ActualClaim {
     fn from_finding(capability: &DocumentedCapability, finding: &Finding) -> Self {
         match finding {
@@ -718,25 +784,62 @@ pub fn firmware_scope_accepts(
     scopes.iter().any(|scope| scope_accepts(scope, reported))
 }
 
-fn scope_accepts(scope: &FirmwareScope, reported: &str) -> bool {
-    let scope = scope.as_str().trim();
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScopeRelation {
+    Unspecified,
+    LowerBound(Vec<u32>),
+    Range { from: Vec<u32>, to: Vec<u32> },
+    Exact(Vec<u32>),
+    Text(String),
+}
+
+fn scope_relation(scope: &str) -> ScopeRelation {
+    let scope = scope.trim();
     if scope.eq_ignore_ascii_case("unspecified") {
-        return true;
+        return ScopeRelation::Unspecified;
     }
-    if let Some((min, max)) = scope.split_once('-')
-        && let (Some(min), Some(max), Some(reported)) = (
-            parse_version(min),
-            parse_version(max),
-            parse_version(reported),
-        )
+    let lower = scope
+        .strip_suffix(" or later")
+        .or_else(|| scope.strip_suffix(" or newer"))
+        .or_else(|| scope.strip_prefix(">="))
+        .map(str::trim);
+    if let Some(lower) = lower
+        && let Some(lower) = parse_version(lower)
     {
-        return compare_versions(&reported, &min) != Ordering::Less
-            && compare_versions(&reported, &max) != Ordering::Greater;
+        return ScopeRelation::LowerBound(lower);
     }
-    if let (Some(scope), Some(reported)) = (parse_version(scope), parse_version(reported)) {
-        return compare_versions(&scope, &reported) == Ordering::Equal;
+    if let Some((from, to)) = scope.split_once('-')
+        && let (Some(from), Some(to)) = (parse_version(from), parse_version(to))
+    {
+        return ScopeRelation::Range { from, to };
     }
-    scope.eq_ignore_ascii_case(reported)
+    if let Some(exact) = parse_version(scope) {
+        return ScopeRelation::Exact(exact);
+    }
+    ScopeRelation::Text(scope.to_owned())
+}
+
+fn scope_accepts(scope: &FirmwareScope, reported: &str) -> bool {
+    let relation = scope_relation(scope.as_str());
+    let reported_text = reported.trim();
+    let Some(reported_version) = parse_version(reported_text) else {
+        return matches!(&relation, ScopeRelation::Unspecified)
+            || matches!(&relation, ScopeRelation::Text(text) if text.eq_ignore_ascii_case(reported_text));
+    };
+    match relation {
+        ScopeRelation::Unspecified => true,
+        ScopeRelation::LowerBound(lower) => {
+            compare_versions(&reported_version, &lower) != Ordering::Less
+        }
+        ScopeRelation::Range { from, to } => {
+            compare_versions(&reported_version, &from) != Ordering::Less
+                && compare_versions(&reported_version, &to) != Ordering::Greater
+        }
+        ScopeRelation::Exact(exact) => {
+            compare_versions(&reported_version, &exact) == Ordering::Equal
+        }
+        ScopeRelation::Text(text) => text.eq_ignore_ascii_case(reported_text),
+    }
 }
 
 fn parse_version(value: &str) -> Option<Vec<u32>> {

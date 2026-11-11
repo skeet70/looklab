@@ -13,6 +13,7 @@ use crate::ids::{
     BlobAttemptId, ContributionId, ContributionImageId, CredentialId, DeferredExpiryId, JobId,
     TokenHash, WithdrawalId,
 };
+use crate::manuals::Manuals;
 use crate::trust::{CredentialStanding, Tier};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1408,20 +1409,24 @@ pub async fn withdraw(
     contribution_ids: &[ContributionId],
     credential_id: &CredentialId,
     delete_after: i64,
+    manuals: &Manuals,
 ) -> Result<Option<i64>, sqlx::Error> {
     let mut tx = db.begin().await?;
     let mut delete_afters = Vec::with_capacity(contribution_ids.len());
     let mut send_nonces = BTreeSet::new();
+    let mut camera_ids = BTreeSet::new();
     for contribution_id in contribution_ids {
-        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT credential_id, status, send_nonce FROM contributions WHERE id = ?",
+        let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT credential_id, status, send_nonce, body_id
+                 FROM contributions WHERE id = ?",
         )
         .bind(contribution_id.as_str())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((owner, status, send_nonce)) = row else {
+        let Some((owner, status, send_nonce, body_id)) = row else {
             return Ok(None);
         };
+        camera_ids.insert(body_id);
         if owner != credential_id.as_str() {
             return Ok(None);
         }
@@ -1506,6 +1511,16 @@ pub async fn withdraw(
             .execute(&mut *tx)
             .await?;
         }
+    }
+    for camera_id in camera_ids {
+        let Ok(camera_id) = BodyId::new(&camera_id) else {
+            continue;
+        };
+        let Some(camera) = manuals.camera(&camera_id) else {
+            continue;
+        };
+        let summary = crate::manual_confirm::summary_with(&mut tx, camera).await?;
+        crate::manual_confirm::promotion_audit_with(&mut tx, camera, &summary).await?;
     }
     request_publication(&mut tx).await?;
     tx.commit().await?;

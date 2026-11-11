@@ -26,6 +26,7 @@ The GitHub Pages workflow builds a serverless preview by default. Set the reposi
 | `/var/lib/looklab/community` | approved versioned community snapshots and private publication staging | private, never served directly |
 | `/var/lib/looklab/server-secret` | 32 random HMAC bytes, mode 0600 | private, never served |
 | `/var/lib/looklab/data` | seeded `data/` tree: bodies, transforms, interfaces, probes, card conformance vectors | read-only to the worker |
+| `/var/lib/looklab/data/manuals` | documentation-derived camera catalog, refreshed from `looklab-manuals` | read-only to the worker |
 | `/var/lib/looklab/data/scenes` | prepared CC0 photo scene PNGs and their provenance index | read-only to the worker |
 | `/var/lib/looklab/site` | worker publication root (`--site`) | worker writes, not served |
 | `/var/lib/looklab/site/data` | published data tree | public under `/data/` |
@@ -37,11 +38,13 @@ Both units set `StateDirectoryMode=0700` and `UMask=0077`; `deploy/run-local.sh`
 
 Every worker publication writes `data/developers/conformance-v1.zip` and its SHA-256 metadata alongside the catalog, from the `data/card/conformance-v1` tree, so the live developer download works without the sample-site generator. A publication fails rather than omitting the download when that source tree is absent.
 
-The module writes `/etc/looklab/looklab.toml` from the options (`bind`, `origin`, `rpId`, `corsOrigins`, `stateDir`, `dataDir`, `site.distDir`), seeds `data/` from the flake on first start, and creates `site/data`. `init` runs before the server starts: it creates the missing state directories, generates the server secret once and runs every SQLite migration. A fresh database has no published catalog; the worker's startup publishes one from `data/` even when there are no Looks yet, so the SPA can render an explicit empty state. `/readyz` returns 503 until that first `data/index.json` exists.
+The module writes `/etc/looklab/looklab.toml` from the options (`bind`, `origin`, `rpId`, `corsOrigins`, `stateDir`, `dataDir`, `manualsDir`, `site.distDir`), seeds `data/` from the flake on first start, and creates `site/data`. `init` runs before the server starts: it creates the missing state directories, generates the server secret once and runs every SQLite migration. A fresh database has no published catalog; the worker's startup publishes one from `data/` even when there are no Looks yet, so the SPA can render an explicit empty state. `/readyz` returns 503 until that first `data/index.json` exists.
 
 The worker receives `--snapshot-dir /var/lib/looklab/community`, the same root as the server's `snapshot_dir`. Schema publication starts from the full authoritative baseline, applies the approved proposal and publishes a new snapshot version; server intake refreshes its snapshot view without a restart. The proposal's publication transition and catalog-publication request commit in one transaction. Worker publication names that version in the site index and publishes body pages even when no Look fit succeeds. Interrupted publication resumes from its recorded version and content hash. A binary switch does not approve new camera mappings or replace the seeded body files.
 
 The seeded data tree is a copy, not a store link: add a camera transform by writing `${dataDir}/transforms/<make>-<model>.yaml` as the `looklab` user. A re-install of the module does not overwrite it, and `rm ${dataDir}/.seeded` re-seeds from the flake on the next start.
+
+The module refreshes `${manualsDir}` from `packages.<system>.looklab-manuals` on every seed-service start, including when `.seeded` exists. Packaged records replace same-named files; files that exist only on the host remain. The refresh does not touch `bodies`, `transforms` or `.seeded`.
 
 Photographic preview scenes are prepared offline; the worker never fetches sources or decodes RAW. `packages.<system>.looklab-scenes` builds the directory: it fetches the six `scene-*.dng` fixtures named in `fixtures/manifest.toml` as fixed-output derivations (URL and SHA-256 from the manifest) and runs the packaged `prepare_scenes` over them. `services.looklab.scenesDir` defaults to that package, so a host publishes the photo scenes without a manual step.
 
@@ -54,15 +57,16 @@ nix develop -c cargo run --locked -p looklab-publish --features photo-scenes --e
   --manifest fixtures/manifest.toml --cache fixtures/cache --out /var/lib/looklab-scenes
 ```
 
-On a host that already published a catalog, seeding scenes does not trigger a new publication: the worker publishes at startup only when `data/index.json` is missing. Publish once as the service user after the switch:
+On a host that already published a catalog, seeding scenes or changing the manual catalog does not by itself trigger a new publication: the worker publishes at startup only when `data/index.json` is missing or the published index has no manuals. Publish once as the service user after the switch:
 
 ```sh
 sudo -u looklab looklab publish --db /var/lib/looklab/looklab.sqlite3 --blobs /var/lib/looklab/blobs \
-  --data /var/lib/looklab/data --snapshot-dir /var/lib/looklab/community \
+  --data /var/lib/looklab/data --manuals /var/lib/looklab/data/manuals \
+  --snapshot-dir /var/lib/looklab/community \
   --transforms /var/lib/looklab/data/transforms --out /var/lib/looklab/site
 ```
 
-Camera processing also requires `data/transforms/<make>-<model>.yaml`. The shipped X-S10 and X-T4 files contain DNG ColorMatrix endpoints extracted from the licensed or authorized local sources; they are input priors, not native Look measurements or root admissions. Body/schema YAML alone does not supply that calibration.
+Server-side colour fitting requires `data/transforms/<make>-<model>.yaml`. Browser preparation uses the RAW's local camera matrices, so a missing server prior does not block camera discovery or contribution admission. Local decoder, matrix and published control-schema checks still apply. The shipped X-S10 and X-T4 files contain DNG ColorMatrix endpoints extracted from the licensed or authorized local sources; they are input priors, not native Look measurements or root admissions.
 
 For another camera, `looklab prep --raw <RAW> --jpeg <JPEG> --out <private-directory>` emits a `transform.yaml` from the RAW's DNG profile. Review its body and version, then install that file under the worker's transform directory with the body's filename. Keep the photographs, samples and sensitive seed file private. Scoring fails when a required camera prior is absent; it does not substitute an identity matrix.
 
@@ -163,7 +167,7 @@ ssh root@<ip> 'nix-env --rollback -p /nix/var/nix/profiles/system \
   && /nix/var/nix/profiles/system/bin/switch-to-configuration switch'
 ```
 
-GRUB keeps the previous generations on the ESP; `boot.loader.timeout = 5` gives five seconds at boot to pick an older entry. A rollback restores binaries, unit files and generated config, not the state directory. Check database migration compatibility before starting an older binary.
+GRUB keeps the previous generations on the ESP; `boot.loader.timeout = 5` gives five seconds at boot to pick an older entry. A rollback restores binaries, the unit files and the generated config, but not the state directory, so a migration that already ran stays applied. Check database migration compatibility before starting an older binary.
 
 Routine deployments do not require a new provider snapshot or a manual SQLite backup. Recovery relies on the automatic daily VPS backups, retained NixOS generations and rebuilding derived data. Restoring a daily snapshot can lose changes since that snapshot; that recovery point is accepted for routine deployments.
 

@@ -54,7 +54,7 @@ pub use manifest::{
     ProvenanceSummary, RELEASE_ARTIFACT, SYNTHETIC_FIXTURE_GATE, SYNTHETIC_SAMPLE_GATE,
     VersionManifest, verify_artifact,
 };
-pub use manual::{ManualCapabilityPage, ManualPage, ManualSummary};
+pub use manual::{ManualArtifact, ManualCapabilityPage, ManualPage, ManualSummary};
 pub use match_bundle::{
     ExcludedSim, MATCH_BUNDLE_FORMAT, MatchBundle, MatchBundleFormat, MatchSim, SimArtifacts,
     SimExclusion, body_artifact, bundle_artifact, sim_artifacts, transform_artifact,
@@ -84,7 +84,7 @@ pub use site::{
     AUDIT_LOG_PATH, BodySummary, INDEX_PATH, LicensePage, LookListing, LookPage, LookSummary,
     LookVersionPage, LookVisibility, MANIFEST_NAME, ReferencePreview, SCENE_INDEX_PATH,
     SITE_FORMAT, SiteData, SiteIndex, SiteSink, VersionNotes, VersionSummary, WeakSpot,
-    audit_log_path, body_path, compare_versions, index_path, look_path, manifest_path,
+    audit_log_path, body_path, compare_versions, index_path, look_path, manifest_path, manual_path,
     scene_index_path, scene_path, scene_thumbnail_path, version_dir, write_site,
 };
 pub use source_lut::{

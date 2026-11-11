@@ -19,13 +19,14 @@ use looklab_publish::{
     SCENE_SOURCE_INDEX, SOURCE_LUT_ARTIFACT, Scene, SelectedTargetSummary, SelectionScope,
     SiteData, SitePath, SiteReport, SiteSink, SourceLutPreview, SplitKind, SubjectCurrentPage,
     TargetEligibilitySnapshot, Timestamp, VersionLookShape, VersionNotes, VersionRef,
-    compare_versions, look_shape, read_scene_sources, reference_round_trip, test_chart_scenes,
-    write_conformance_pack, write_site,
+    compare_versions, look_shape, manual_path, read_scene_sources, reference_round_trip,
+    test_chart_scenes, write_conformance_pack, write_site,
 };
 use looklab_schema::{
-    Applicability, ArtifactRole, BodyRealizationId, BodyRealizationVersionId, ControlEpochId,
-    FamilyHead, InvalidationReason, ModelReportId, ModelSubject, ModelVersionId, ProjectionUse,
-    QualificationCapability, RealizationRevisionId, RealizationStatus, SubjectKey,
+    Applicability, ArtifactRole, BodyId, BodyRealizationId, BodyRealizationVersionId,
+    CapabilityKey, ConfirmationBasis, ControlEpochId, FamilyHead, InvalidationReason, ManualUrl,
+    ModelReportId, ModelSubject, ModelVersionId, ModeratorEvidenceKind, ModeratorFirmwareScope,
+    ProjectionUse, QualificationCapability, RealizationRevisionId, RealizationStatus, SubjectKey,
     TargetEligibilityStatus,
 };
 use looklab_server::admin::{self, ListingState, LookListingRecord, ManifestArtifact};
@@ -240,6 +241,39 @@ fn prune_unlisted(root: &Path, site: &SiteData) -> Result<()> {
         let page = root.join("data/looks").join(format!("{slug}.json"));
         if page.exists() {
             std::fs::remove_file(&page)?;
+        }
+    }
+    prune_manuals(root, &site.manuals)
+}
+
+fn prune_manuals(root: &Path, manuals: &[ManualPage]) -> Result<()> {
+    let expected = manuals
+        .iter()
+        .map(|manual| manual_path(&manual.id).map(|path| path.as_str().to_owned()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let dir = root.join("data/manuals");
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for make in std::fs::read_dir(&dir)? {
+        let make = make?;
+        if !make.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(make.path())? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let relative = format!(
+                "data/manuals/{}/{}",
+                make.file_name().to_string_lossy(),
+                entry.file_name().to_string_lossy()
+            );
+            if !expected.contains(&relative) {
+                std::fs::remove_file(&path)?;
+            }
         }
     }
     Ok(())
@@ -1481,7 +1515,6 @@ async fn record_evidence_requests(pool: &SqlitePool, reports: &[StoredReport]) -
     }
     Ok(())
 }
-
 async fn load_manuals(
     path: &Path,
     bodies: &[BodyPage],
@@ -1660,12 +1693,119 @@ fn contribution_ref(value: &str) -> Result<looklab_publish::ContributionRef> {
         .map_err(|error| WorkerError::Data(error.to_owned()))
 }
 
+fn body_id(value: &str) -> Result<BodyId> {
+    BodyId::new(value).map_err(|error| WorkerError::Data(error.to_string()))
+}
+
+fn capability_key(value: &str) -> Result<CapabilityKey> {
+    value
+        .parse::<CapabilityKey>()
+        .map_err(|()| WorkerError::Data(format!("unknown documented control `{value}`")))
+}
+
+fn confirmation_basis(value: &serde_json::Value) -> Option<ConfirmationBasis> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+/// The public projection of a manual audit row: display fields only, never the
+/// moderator's internal credential id or a control definition digest.
+fn manual_audit_event(kind: &str, payload: &serde_json::Value) -> Result<Option<AuditEvent>> {
+    let event = match kind {
+        "manual_confirmation" => {
+            let (Some(camera), Some(firmware), Some(controls)) = (
+                text(payload, "camera"),
+                text(payload, "firmware"),
+                number(payload, "controls"),
+            ) else {
+                return Ok(None);
+            };
+            AuditEvent::ManualConfirmation {
+                camera: body_id(camera)?,
+                firmware: firmware.to_owned(),
+                controls: usize::try_from(controls).map_err(|_| {
+                    WorkerError::Data("manual confirmation control count does not fit".to_owned())
+                })?,
+            }
+        }
+        "manual_confirmation_promotion" => {
+            let (Some(camera), Some(control), Some(firmware)) = (
+                text(payload, "camera"),
+                text(payload, "control"),
+                text(payload, "firmware"),
+            ) else {
+                return Ok(None);
+            };
+            AuditEvent::ManualConfirmationPromotion {
+                camera: body_id(camera)?,
+                control: capability_key(control)?,
+                firmware: firmware.to_owned(),
+                groups: u32::try_from(number(payload, "groups").unwrap_or(0)).unwrap_or(u32::MAX),
+                basis: payload.get("basis").and_then(confirmation_basis),
+            }
+        }
+        "manual_confirmation_withdrawal" => {
+            let (Some(camera), Some(withdrawn)) =
+                (text(payload, "camera"), number(payload, "withdrawn"))
+            else {
+                return Ok(None);
+            };
+            AuditEvent::ManualConfirmationWithdrawal {
+                camera: body_id(camera)?,
+                withdrawn,
+            }
+        }
+        "manual_moderator_confirmation" => {
+            let (Some(camera), Some(control), Some(decision)) = (
+                text(payload, "camera"),
+                text(payload, "control"),
+                text(payload, "decision"),
+            ) else {
+                return Ok(None);
+            };
+            let confirmed = match decision {
+                "confirm" => true,
+                "reject" => false,
+                _ => return Ok(None),
+            };
+            let Some(scope) = payload.get("firmware_scope") else {
+                return Ok(None);
+            };
+            let firmware_scope = serde_json::from_value::<ModeratorFirmwareScope>(scope.clone())
+                .map_err(|error| {
+                    WorkerError::Data(format!("manual moderator firmware scope: {error}"))
+                })?;
+            let evidence = text(payload, "evidence_kind")
+                .and_then(|value| value.parse::<ModeratorEvidenceKind>().ok())
+                .ok_or_else(|| {
+                    WorkerError::Data("manual moderator evidence kind is missing".to_owned())
+                })?;
+            let evidence_url = text(payload, "evidence_url")
+                .map(ManualUrl::new)
+                .transpose()
+                .map_err(|error| WorkerError::Data(error.to_string()))?;
+            AuditEvent::ManualModeratorConfirmation {
+                camera: body_id(camera)?,
+                control: capability_key(control)?,
+                confirmed,
+                firmware_scope,
+                evidence,
+                evidence_url,
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(event))
+}
+
 async fn audit_event(
     pool: &SqlitePool,
     kind: &str,
     payload: &serde_json::Value,
     ts: i64,
 ) -> Result<Option<AuditEvent>> {
+    if let Some(event) = manual_audit_event(kind, payload)? {
+        return Ok(Some(event));
+    }
     let event = match kind {
         "grant_created" | "grant_revoked" => {
             let (Some(actor), Some(subject), Some(role)) = (
@@ -1923,4 +2063,82 @@ async fn root_contribution(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(id,)| id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MODERATOR: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    const DIGEST: &str = "aa2c1f4e6d8b0a3c5e7f90112233445566778899aabbccddeeff001122334455";
+
+    #[test]
+    fn manual_audit_rows_publish_display_fields_only() {
+        let payload = serde_json::json!({
+            "camera": "fujifilm/x-t5",
+            "control": "native_simulations",
+            "definition_digest": DIGEST,
+            "decision": "confirm",
+            "firmware_scope": {"kind": "exact", "firmware": "1.00"},
+            "moderator": MODERATOR,
+            "evidence_kind": "video",
+            "evidence_url": "https://example.com/manual",
+        });
+        let event = manual_audit_event("manual_moderator_confirmation", &payload)
+            .expect("valid row")
+            .expect("mapped event");
+        assert_eq!(event.kind(), "manual_moderator_confirmation");
+        let published = serde_json::to_string(&event).expect("serialize");
+        assert!(!published.contains(MODERATOR), "{published}");
+        assert!(!published.contains(DIGEST), "{published}");
+        assert!(published.contains("fujifilm/x-t5"), "{published}");
+        assert!(published.contains("native_simulations"), "{published}");
+        assert!(published.contains("1.00"), "{published}");
+    }
+
+    #[test]
+    fn every_manual_audit_kind_has_a_public_event() {
+        let rows = [
+            (
+                "manual_confirmation",
+                serde_json::json!({
+                    "confirmation": 3,
+                    "camera": "fujifilm/x-t5",
+                    "firmware": "1.00",
+                    "controls": 4,
+                }),
+            ),
+            (
+                "manual_confirmation_promotion",
+                serde_json::json!({
+                    "camera": "fujifilm/x-t5",
+                    "control": "native_simulations",
+                    "groups": 3,
+                    "firmware": "1.00",
+                    "basis": "corrected",
+                    "confirmed_actual": {"definition_digest": DIGEST},
+                }),
+            ),
+            (
+                "manual_confirmation_withdrawal",
+                serde_json::json!({
+                    "camera": "fujifilm/x-t5",
+                    "withdrawn": 2,
+                }),
+            ),
+        ];
+        for (kind, payload) in rows {
+            let event = manual_audit_event(kind, &payload)
+                .expect("valid row")
+                .expect("mapped event");
+            assert_eq!(event.kind(), kind);
+            let published = serde_json::to_string(&event).expect("serialize");
+            assert!(!published.contains(DIGEST), "{published}");
+        }
+        assert!(
+            manual_audit_event("grant_created", &serde_json::json!({}))
+                .expect("not a manual row")
+                .is_none()
+        );
+    }
 }

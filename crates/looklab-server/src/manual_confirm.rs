@@ -5,15 +5,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
 use looklab_schema::{
-    Availability, BodyId, CapabilityDomain, CapabilityKey, ConfirmationState, DocumentedCapability,
-    Finding, IdentityGroupId, ManualCamera, ManualCatalog, ManualCheckReview,
-    ManualCheckReviewStatus, ManualConfirmation, ManualConfirmationSummary, ManualControlIntake,
-    ManualEvidence, ManualOwnerLinkage, ManualUrl, ModeratorEvidence, ModeratorEvidenceKind,
-    ModeratorFirmwareScope, ModeratorRecord, ReportedFirmware, Sha256Hex, evaluate_camera,
+    BodyId, CapabilityKey, ConfirmationState, DocumentedCapability, Finding, IdentityGroupId,
+    ManualCamera, ManualCatalog, ManualCheckReview, ManualCheckReviewStatus, ManualConfirmation,
+    ManualConfirmationSummary, ManualControlIntake, ManualEvidence, ManualOwnerLinkage, ManualUrl,
+    ModeratorEvidence, ModeratorEvidenceKind, ModeratorFirmwareScope, ModeratorRecord,
+    ReportedFirmware, Sha256Hex, evaluate_camera,
 };
 use looklab_upload::Nonce;
 use serde_json::json;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::audit::{self, AuditKind};
 use crate::ids::CredentialId;
@@ -22,13 +22,13 @@ use crate::store;
 /// Two credentials that reported the same serial HMAC for this body share a
 /// group; the representative is the smallest credential id, never the HMAC.
 pub async fn identity_groups(
-    db: &SqlitePool,
+    conn: &mut SqliteConnection,
 ) -> Result<HashMap<CredentialId, CredentialId>, sqlx::Error> {
     let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
         "SELECT DISTINCT credential_id, serial_hmac FROM contributions
          WHERE serial_hmac IS NOT NULL",
     )
-    .fetch_all(db)
+    .fetch_all(&mut *conn)
     .await?;
     let mut parent: HashMap<IdentityNode, IdentityNode> = HashMap::new();
     let mut credentials: Vec<CredentialId> = Vec::new();
@@ -114,235 +114,106 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Credentials with a serial link. Identity groups come from all known links;
+/// a group counts for this camera only through this set.
+pub async fn camera_credentials(
+    conn: &mut SqliteConnection,
+    camera: &BodyId,
+) -> Result<HashSet<CredentialId>, sqlx::Error> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT credential_id FROM contributions
+         WHERE serial_hmac IS NOT NULL AND body_id = ? AND status != 'withdrawn'",
+    )
+    .bind(camera.as_str())
+    .fetch_all(&mut *conn)
+    .await?;
+    rows.into_iter()
+        .map(|(credential,)| {
+            CredentialId::try_from(credential)
+                .map_err(|_| sqlx::Error::Protocol("credential id is not a UUID".to_owned()))
+        })
+        .collect()
+}
+
 struct LatestObservation {
-    camera: BodyId,
-    control: CapabilityKey,
     occurrence: i64,
-    received_at: i64,
     withdrawn: bool,
-    linked: bool,
-    group: Option<CredentialId>,
-    firmware: ReportedFirmware,
-    digest: Sha256Hex,
-    finding: Finding,
+    firmware: String,
+    digest: Vec<u8>,
+    finding: String,
 }
 
-type ObservationKey = (
-    BodyId,
-    CredentialId,
-    CapabilityKey,
-    Sha256Hex,
-    ReportedFirmware,
-);
-type GroupClaimKey = (CredentialId, CapabilityKey, Sha256Hex, ReportedFirmware);
-
-async fn linked_credentials(
-    db: &SqlitePool,
-    camera: Option<&BodyId>,
-) -> Result<HashMap<BodyId, HashSet<CredentialId>>, sqlx::Error> {
-    let rows: Vec<(String, String)> = match camera {
-        Some(camera) => {
-            sqlx::query_as(
-                "SELECT DISTINCT body_id, credential_id FROM contributions
-                 WHERE serial_hmac IS NOT NULL AND body_id = ?",
-            )
-            .bind(camera.as_str())
-            .fetch_all(db)
-            .await?
-        }
-        None => {
-            sqlx::query_as(
-                "SELECT DISTINCT body_id, credential_id FROM contributions
-                 WHERE serial_hmac IS NOT NULL",
-            )
-            .fetch_all(db)
-            .await?
-        }
-    };
-    let mut linked: HashMap<BodyId, HashSet<CredentialId>> = HashMap::new();
-    for (body, credential) in rows {
-        let body = BodyId::new(&body)
-            .map_err(|_| sqlx::Error::Protocol("camera id is not a body id".to_owned()))?;
-        let credential = CredentialId::try_from(credential)
-            .map_err(|_| sqlx::Error::Protocol("credential id is not a UUID".to_owned()))?;
-        linked.entry(body).or_default().insert(credential);
-    }
-    Ok(linked)
-}
-
-/// The latest non-withdrawn occurrence per profile, control, definition and firmware.
-async fn latest_observations(
-    db: &SqlitePool,
-    camera: Option<&BodyId>,
-) -> Result<Vec<LatestObservation>, sqlx::Error> {
-    let groups = identity_groups(db).await?;
-    let linked = linked_credentials(db, camera).await?;
-    let rows = match camera {
-        Some(camera) => {
-            sqlx::query(
-                "SELECT c.credential_id, c.camera_id, c.firmware,
-                        c.withdrawn_at AS confirmation_withdrawn,
-                        o.capability_key, o.definition_digest, o.finding_json,
-                        occ.id AS occurrence_id, occ.received_at AS occurrence_received,
-                        occ.withdrawn_at AS occurrence_withdrawn
-                 FROM manual_confirmations c
-                 JOIN manual_observations o ON o.confirmation_id = c.id
-                 JOIN manual_confirmation_occurrences occ ON occ.confirmation_id = c.id
-                 WHERE c.camera_id = ?
-                 ORDER BY occ.id",
-            )
-            .bind(camera.as_str())
-            .fetch_all(db)
-            .await?
-        }
-        None => {
-            sqlx::query(
-                "SELECT c.credential_id, c.camera_id, c.firmware,
-                        c.withdrawn_at AS confirmation_withdrawn,
-                        o.capability_key, o.definition_digest, o.finding_json,
-                        occ.id AS occurrence_id, occ.received_at AS occurrence_received,
-                        occ.withdrawn_at AS occurrence_withdrawn
-                 FROM manual_confirmations c
-                 JOIN manual_observations o ON o.confirmation_id = c.id
-                 JOIN manual_confirmation_occurrences occ ON occ.confirmation_id = c.id
-                 ORDER BY occ.id",
-            )
-            .fetch_all(db)
-            .await?
-        }
-    };
-    let mut latest: HashMap<ObservationKey, LatestObservation> = HashMap::new();
+/// A credential with no serial HMAC for this body contributes no evidence.
+pub async fn evidence(
+    conn: &mut SqliteConnection,
+    camera: &BodyId,
+    groups: &HashMap<CredentialId, CredentialId>,
+    eligible: &HashSet<CredentialId>,
+) -> Result<Vec<ManualEvidence>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT c.credential_id, c.firmware, c.withdrawn_at AS confirmation_withdrawn,
+                o.capability_key, o.definition_digest, o.finding_json,
+                occ.id AS occurrence_id, occ.withdrawn_at AS occurrence_withdrawn
+         FROM manual_confirmations c
+         JOIN manual_observations o ON o.confirmation_id = c.id
+         JOIN manual_confirmation_occurrences occ ON occ.confirmation_id = c.id
+         WHERE c.camera_id = ?
+         ORDER BY occ.id",
+    )
+    .bind(camera.as_str())
+    .fetch_all(&mut *conn)
+    .await?;
+    type EvidenceKey = (CredentialId, CapabilityKey, Vec<u8>, String);
+    let mut latest: HashMap<EvidenceKey, LatestObservation> = HashMap::new();
     for row in rows {
-        let camera_text: String = row.get("camera_id");
-        let camera = BodyId::new(&camera_text)
-            .map_err(|_| sqlx::Error::Protocol("camera id is not a body id".to_owned()))?;
         let credential: String = row.get("credential_id");
         let credential = CredentialId::try_from(credential)
             .map_err(|_| sqlx::Error::Protocol("credential id is not a UUID".to_owned()))?;
-        let group = groups.get(&credential).cloned();
-        let linked = linked
-            .get(&camera)
-            .is_some_and(|credentials| credentials.contains(&credential))
-            && group.is_some();
+        if !eligible.contains(&credential) {
+            continue;
+        }
+        let Some(group) = groups.get(&credential) else {
+            continue;
+        };
         let key_text: String = row.get("capability_key");
-        let control = CapabilityKey::from_str(&key_text)
+        let key = CapabilityKey::from_str(&key_text)
             .map_err(|()| sqlx::Error::Protocol(format!("unknown control {key_text}")))?;
         let occurrence: i64 = row.get("occurrence_id");
-        let received_at: i64 = row.get("occurrence_received");
         let occurrence_withdrawn: Option<i64> = row.get("occurrence_withdrawn");
         let confirmation_withdrawn: Option<i64> = row.get("confirmation_withdrawn");
         let firmware: String = row.get("firmware");
-        let firmware = ReportedFirmware::new(&firmware)
-            .map_err(|_| sqlx::Error::Protocol("empty firmware".to_owned()))?;
         let digest: Vec<u8> = row.get("definition_digest");
-        let digest =
-            Sha256Hex::from_bytes(digest.try_into().map_err(|_| {
-                sqlx::Error::Protocol("definition digest is not 32 bytes".to_owned())
-            })?);
-        let finding: String = row.get("finding_json");
-        let finding = serde_json::from_str::<Finding>(&finding)
-            .map_err(|_| sqlx::Error::Protocol("finding is not readable".to_owned()))?;
-        let observation_key = (
-            camera.clone(),
-            credential,
-            control,
-            digest,
-            firmware.clone(),
-        );
+        let evidence_key = (group.clone(), key, digest.clone(), firmware.clone());
         let entry = LatestObservation {
-            camera,
-            control,
             occurrence,
-            received_at,
             withdrawn: occurrence_withdrawn.is_some() || confirmation_withdrawn.is_some(),
-            linked,
-            group,
             firmware,
             digest,
-            finding,
+            finding: row.get("finding_json"),
         };
-        match latest.get(&observation_key) {
+        match latest.get(&evidence_key) {
             Some(existing) if existing.occurrence >= occurrence => {}
             _ => {
-                latest.insert(observation_key, entry);
-            }
-        }
-    }
-    Ok(latest.into_values().collect())
-}
-
-fn finding_claim(
-    capability: &DocumentedCapability,
-    finding: &Finding,
-) -> (Availability, CapabilityDomain) {
-    match finding {
-        Finding::Matches => (capability.availability, capability.domain.clone()),
-        Finding::Corrected {
-            availability,
-            domain,
-        } => (*availability, domain.clone()),
-    }
-}
-
-fn counted_agreement(
-    summary: &ManualConfirmationSummary,
-    capability: &DocumentedCapability,
-    observation: &LatestObservation,
-) -> bool {
-    let Some(control) = summary.control(capability.key) else {
-        return false;
-    };
-    let Some(firmware) = control
-        .firmware
-        .iter()
-        .find(|firmware| firmware.firmware == observation.firmware)
-    else {
-        return false;
-    };
-    if firmware.state != ConfirmationState::Confirmed {
-        return false;
-    }
-    let Some(actual) = &firmware.confirmed_actual else {
-        return false;
-    };
-    let (availability, domain) = finding_claim(capability, &observation.finding);
-    actual.availability == availability && actual.domain == domain
-}
-
-fn group_evidence(observations: &[LatestObservation]) -> Result<Vec<ManualEvidence>, sqlx::Error> {
-    let mut latest: HashMap<GroupClaimKey, &LatestObservation> = HashMap::new();
-    for observation in observations {
-        if !observation.linked {
-            continue;
-        }
-        let Some(group) = &observation.group else {
-            continue;
-        };
-        let key = (
-            group.clone(),
-            observation.control,
-            observation.digest,
-            observation.firmware.clone(),
-        );
-        match latest.get(&key) {
-            Some(existing) if existing.occurrence >= observation.occurrence => {}
-            _ => {
-                latest.insert(key, observation);
+                latest.insert(evidence_key, entry);
             }
         }
     }
     let mut evidence = Vec::with_capacity(latest.len());
-    for ((group, control, digest, firmware), observation) in latest {
+    for ((group, key, _, _), observation) in latest {
         if observation.withdrawn {
             continue;
         }
         evidence.push(ManualEvidence {
             identity_group: IdentityGroupId::new(group.as_str())
                 .map_err(|_| sqlx::Error::Protocol("empty identity group".to_owned()))?,
-            firmware,
-            control,
-            definition_digest: digest,
-            finding: observation.finding.clone(),
+            firmware: ReportedFirmware::new(&observation.firmware)
+                .map_err(|_| sqlx::Error::Protocol("empty firmware".to_owned()))?,
+            control: key,
+            definition_digest: Sha256Hex::from_bytes(observation.digest.try_into().map_err(
+                |_| sqlx::Error::Protocol("definition digest is not 32 bytes".to_owned()),
+            )?),
+            finding: serde_json::from_str::<Finding>(&observation.finding)
+                .map_err(|_| sqlx::Error::Protocol("finding is not readable".to_owned()))?,
             // Occurrence ids are the monotonic submission order.
             submitted_at: observation.occurrence,
         });
@@ -350,182 +221,40 @@ fn group_evidence(observations: &[LatestObservation]) -> Result<Vec<ManualEviden
     Ok(evidence)
 }
 
-// A check submitted after the decision watermark, or outside its firmware scope, stays pending.
-fn reviewed_by_moderator(
-    decisions: &BTreeMap<CapabilityKey, ModeratorDecision>,
-    capability: &DocumentedCapability,
-    observation: &LatestObservation,
-) -> bool {
-    let Some(decision) = decisions.get(&capability.key) else {
-        return false;
-    };
-    let Some(watermark) = decision.watermark else {
-        return false;
-    };
-    observation.occurrence <= watermark
-        && decision
-            .record
-            .evidence
-            .firmware_scope
-            .covers(&observation.firmware)
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DecisionId(i64);
 
-fn latest_group_claims(observations: &[LatestObservation]) -> HashMap<GroupClaimKey, i64> {
-    let mut latest = HashMap::new();
-    for observation in observations {
-        if !observation.linked {
-            continue;
-        }
-        let Some(group) = &observation.group else {
-            continue;
-        };
-        let key = (
-            group.clone(),
-            observation.control,
-            observation.digest,
-            observation.firmware.clone(),
-        );
-        let entry = latest.entry(key).or_insert(observation.occurrence);
-        *entry = (*entry).max(observation.occurrence);
-    }
-    latest
-}
-
-fn is_latest_group_claim(
-    observation: &LatestObservation,
-    latest: &HashMap<GroupClaimKey, i64>,
-) -> bool {
-    let Some(group) = &observation.group else {
-        return false;
-    };
-    latest.get(&(
-        group.clone(),
-        observation.control,
-        observation.digest,
-        observation.firmware.clone(),
-    )) == Some(&observation.occurrence)
-}
-
-fn analyze_camera(
-    camera: &ManualCamera,
-    observations: &[LatestObservation],
-    moderators: &BTreeMap<CapabilityKey, ModeratorDecision>,
-) -> Result<(ManualConfirmationSummary, Vec<ManualCheckReview>), sqlx::Error> {
-    let evidence = group_evidence(observations)?;
-    let records: BTreeMap<CapabilityKey, ModeratorRecord> = moderators
-        .iter()
-        .map(|(key, decision)| (*key, decision.record.clone()))
-        .collect();
-    let mut summary = evaluate_camera(camera, &evidence, &records);
-    for control in &mut summary.controls {
-        let Some(capability) = camera
-            .capabilities
-            .iter()
-            .find(|capability| capability.key == control.key)
-        else {
-            continue;
-        };
-        let current = capability.definition_digest(camera);
-        let mut intake = ManualControlIntake::default();
-        for observation in observations {
-            if observation.withdrawn || observation.control != capability.key {
-                continue;
-            }
-            if observation.digest == current {
-                intake.recorded += 1;
-                if !observation.linked {
-                    intake.unlinked += 1;
-                }
-            } else {
-                intake.stale += 1;
-            }
-        }
-        control.intake = intake;
-    }
-    let latest_group = latest_group_claims(observations);
-    let mut reviews = Vec::new();
-    for observation in observations {
-        if observation.withdrawn {
-            continue;
-        }
-        let Some(capability) = camera
-            .capabilities
-            .iter()
-            .find(|capability| capability.key == observation.control)
-        else {
-            continue;
-        };
-        let status = if observation.digest != capability.definition_digest(camera) {
-            ManualCheckReviewStatus::StaleDefinition
-        } else if reviewed_by_moderator(moderators, capability, observation) {
-            ManualCheckReviewStatus::Reviewed
-        } else if is_latest_group_claim(observation, &latest_group)
-            && counted_agreement(&summary, capability, observation)
-        {
-            ManualCheckReviewStatus::Counted
-        } else {
-            ManualCheckReviewStatus::Pending
-        };
-        reviews.push(ManualCheckReview {
-            camera: camera.id.clone(),
-            control: capability.key,
-            label: capability.label.clone(),
-            firmware: observation.firmware.clone(),
-            finding: observation.finding.clone(),
-            definition_digest: observation.digest,
-            submitted_at: observation.received_at,
-            owner_linkage: if observation.linked {
-                ManualOwnerLinkage::Linked
-            } else {
-                ManualOwnerLinkage::Unlinked
-            },
-            status,
-        });
-    }
-    reviews.sort_by(|left, right| {
-        left.control
-            .cmp(&right.control)
-            .then_with(|| left.firmware.as_str().cmp(right.firmware.as_str()))
-            .then_with(|| left.submitted_at.cmp(&right.submitted_at))
-            .then_with(|| left.status.cmp(&right.status))
-    });
-    Ok((summary, reviews))
-}
+/// `manual_confirmation_occurrences.id`, the monotonic submission order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct OccurrenceId(i64);
 
 struct ModeratorDecision {
+    id: DecisionId,
+    key: CapabilityKey,
     record: ModeratorRecord,
-    watermark: Option<i64>,
 }
 
+/// Decisions for the current control definitions, newest first, one per control and firmware scope.
 async fn moderator_decisions(
-    db: &SqlitePool,
+    conn: &mut SqliteConnection,
     camera: &ManualCamera,
-) -> Result<BTreeMap<CapabilityKey, ModeratorDecision>, sqlx::Error> {
+) -> Result<Vec<ModeratorDecision>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT m.id, m.capability_key, m.definition_digest, m.firmware_scope, m.confirmed,
-                m.evidence_kind, m.evidence_url, m.evidence_description,
-                (SELECT json_extract(a.payload, '$.occurrence_watermark')
-                 FROM audit_log a
-                 WHERE a.type = ?
-                   AND json_extract(a.payload, '$.moderator_confirmation') = m.id
-                 ORDER BY a.seq DESC LIMIT 1) AS occurrence_watermark
-         FROM manual_moderator_confirmations m
-         WHERE m.camera_id = ?
-         ORDER BY m.created_at DESC, m.id DESC",
+        "SELECT id, capability_key, definition_digest, firmware_scope, confirmed, evidence_kind,
+                evidence_url, evidence_description
+         FROM manual_moderator_confirmations
+         WHERE camera_id = ?
+         ORDER BY created_at DESC, id DESC",
     )
-    .bind(AuditKind::ManualModeratorConfirmation.as_str())
     .bind(camera.id.as_str())
-    .fetch_all(db)
+    .fetch_all(&mut *conn)
     .await?;
-    let mut records = BTreeMap::new();
+    let mut decisions: Vec<ModeratorDecision> = Vec::new();
     for row in rows {
         let key_text: String = row.get("capability_key");
         let Ok(key) = CapabilityKey::from_str(&key_text) else {
             continue;
         };
-        if records.contains_key(&key) {
-            continue;
-        }
         let Some(capability) = camera
             .capabilities
             .iter()
@@ -548,63 +277,396 @@ async fn moderator_decisions(
         let evidence_kind: String = row.get("evidence_kind");
         let evidence_url: Option<String> = row.get("evidence_url");
         let evidence_description: String = row.get("evidence_description");
-        let watermark: Option<i64> = row.get("occurrence_watermark");
         let Ok(kind) = ModeratorEvidenceKind::from_str(&evidence_kind) else {
             continue;
         };
         let url = evidence_url
             .as_deref()
             .and_then(|value| ManualUrl::new(value).ok());
-        records.insert(
+        let record = ModeratorRecord {
+            confirmed: confirmed != 0,
+            evidence: ModeratorEvidence {
+                kind,
+                url,
+                description: evidence_description,
+                firmware_scope,
+            },
+        };
+        let superseded = decisions.iter().any(|existing| {
+            existing.key == key
+                && existing.record.evidence.firmware_scope == record.evidence.firmware_scope
+        });
+        if !superseded {
+            decisions.push(ModeratorDecision {
+                id: DecisionId(row.get("id")),
+                key,
+                record,
+            });
+        }
+    }
+    Ok(decisions)
+}
+
+pub async fn moderator_records(
+    conn: &mut SqliteConnection,
+    camera: &ManualCamera,
+) -> Result<BTreeMap<CapabilityKey, Vec<ModeratorRecord>>, sqlx::Error> {
+    let mut records: BTreeMap<CapabilityKey, Vec<ModeratorRecord>> = BTreeMap::new();
+    for decision in moderator_decisions(conn, camera).await? {
+        records
+            .entry(decision.key)
+            .or_default()
+            .push(decision.record);
+    }
+    Ok(records)
+}
+
+/// The occurrence watermark each moderator decision recorded in its audit row.
+async fn moderator_watermarks(
+    conn: &mut SqliteConnection,
+) -> Result<HashMap<DecisionId, OccurrenceId>, sqlx::Error> {
+    let rows: Vec<(Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT json_extract(payload, '$.moderator_confirmation'),
+                json_extract(payload, '$.occurrence_watermark')
+         FROM audit_log
+         WHERE type = ?",
+    )
+    .bind(AuditKind::ManualModeratorConfirmation.as_str())
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(decision, watermark)| Some((DecisionId(decision?), OccurrenceId(watermark?))))
+        .collect())
+}
+
+/// One profile's newest submission of a control check for a definition and firmware.
+struct LatestCheck {
+    camera: BodyId,
+    credential: CredentialId,
+    control: CapabilityKey,
+    occurrence: OccurrenceId,
+    received_at: i64,
+    withdrawn: bool,
+    firmware: ReportedFirmware,
+    digest: Sha256Hex,
+    finding: Finding,
+}
+
+/// Every profile's newest occurrence per control, definition and firmware, in submission order.
+async fn latest_checks(
+    conn: &mut SqliteConnection,
+    camera: Option<&BodyId>,
+) -> Result<Vec<LatestCheck>, sqlx::Error> {
+    const SELECT: &str = "SELECT c.credential_id, c.camera_id, c.firmware,
+                c.withdrawn_at AS confirmation_withdrawn,
+                o.capability_key, o.definition_digest, o.finding_json,
+                occ.id AS occurrence_id, occ.received_at AS occurrence_received,
+                occ.withdrawn_at AS occurrence_withdrawn
+         FROM manual_confirmations c
+         JOIN manual_observations o ON o.confirmation_id = c.id
+         JOIN manual_confirmation_occurrences occ ON occ.confirmation_id = c.id";
+    let rows = match camera {
+        Some(camera) => {
+            sqlx::query(&format!("{SELECT} WHERE c.camera_id = ? ORDER BY occ.id"))
+                .bind(camera.as_str())
+                .fetch_all(&mut *conn)
+                .await?
+        }
+        None => {
+            sqlx::query(&format!("{SELECT} ORDER BY occ.id"))
+                .fetch_all(&mut *conn)
+                .await?
+        }
+    };
+    type CheckKey = (
+        BodyId,
+        CredentialId,
+        CapabilityKey,
+        Sha256Hex,
+        ReportedFirmware,
+    );
+    let mut latest: HashMap<CheckKey, LatestCheck> = HashMap::new();
+    for row in rows {
+        let camera: String = row.get("camera_id");
+        let camera = BodyId::new(&camera)
+            .map_err(|_| sqlx::Error::Protocol("camera id is not a body id".to_owned()))?;
+        let credential: String = row.get("credential_id");
+        let credential = CredentialId::try_from(credential)
+            .map_err(|_| sqlx::Error::Protocol("credential id is not a UUID".to_owned()))?;
+        let key_text: String = row.get("capability_key");
+        let control = CapabilityKey::from_str(&key_text)
+            .map_err(|()| sqlx::Error::Protocol(format!("unknown control {key_text}")))?;
+        let firmware: String = row.get("firmware");
+        let firmware = ReportedFirmware::new(&firmware)
+            .map_err(|_| sqlx::Error::Protocol("empty firmware".to_owned()))?;
+        let digest: Vec<u8> = row.get("definition_digest");
+        let digest =
+            Sha256Hex::from_bytes(digest.try_into().map_err(|_| {
+                sqlx::Error::Protocol("definition digest is not 32 bytes".to_owned())
+            })?);
+        let finding: String = row.get("finding_json");
+        let finding = serde_json::from_str::<Finding>(&finding)
+            .map_err(|_| sqlx::Error::Protocol("finding is not readable".to_owned()))?;
+        let occurrence = OccurrenceId(row.get("occurrence_id"));
+        let occurrence_withdrawn: Option<i64> = row.get("occurrence_withdrawn");
+        let confirmation_withdrawn: Option<i64> = row.get("confirmation_withdrawn");
+        let key = (
+            camera.clone(),
+            credential.clone(),
+            control,
+            digest,
+            firmware.clone(),
+        );
+        if latest
+            .get(&key)
+            .is_some_and(|existing| existing.occurrence >= occurrence)
+        {
+            continue;
+        }
+        latest.insert(
             key,
-            ModeratorDecision {
-                record: ModeratorRecord {
-                    confirmed: confirmed != 0,
-                    evidence: ModeratorEvidence {
-                        kind,
-                        url,
-                        description: evidence_description,
-                        firmware_scope,
-                    },
-                },
-                watermark,
+            LatestCheck {
+                camera,
+                credential,
+                control,
+                occurrence,
+                received_at: row.get("occurrence_received"),
+                withdrawn: occurrence_withdrawn.is_some() || confirmation_withdrawn.is_some(),
+                firmware,
+                digest,
+                finding,
             },
         );
     }
-    Ok(records)
+    let mut checks: Vec<LatestCheck> = latest.into_values().collect();
+    checks.sort_by_key(|check| check.occurrence);
+    Ok(checks)
+}
+
+type AnswerKey<'a> = (&'a CredentialId, CapabilityKey, &'a ReportedFirmware);
+
+/// Each profile's newest occurrence per control and firmware, across definitions.
+fn newest_answers(checks: &[LatestCheck]) -> HashMap<AnswerKey<'_>, OccurrenceId> {
+    let mut newest = HashMap::new();
+    for check in checks {
+        let entry = newest
+            .entry((&check.credential, check.control, &check.firmware))
+            .or_insert(check.occurrence);
+        *entry = (*entry).max(check.occurrence);
+    }
+    newest
+}
+
+/// Whether the profile later answered the same control and firmware under another definition.
+fn superseded(check: &LatestCheck, newest: &HashMap<AnswerKey<'_>, OccurrenceId>) -> bool {
+    newest
+        .get(&(&check.credential, check.control, &check.firmware))
+        .is_some_and(|newest| *newest > check.occurrence)
+}
+
+fn fill_intake(
+    camera: &ManualCamera,
+    summary: &mut ManualConfirmationSummary,
+    checks: &[LatestCheck],
+    eligible: &HashSet<CredentialId>,
+) {
+    let newest = newest_answers(checks);
+    for control in &mut summary.controls {
+        let Some(capability) = camera
+            .capabilities
+            .iter()
+            .find(|capability| capability.key == control.key)
+        else {
+            continue;
+        };
+        let current = capability.definition_digest(camera);
+        let mut intake = ManualControlIntake::default();
+        for check in checks {
+            if check.withdrawn || check.control != control.key {
+                continue;
+            }
+            if check.digest != current {
+                if !superseded(check, &newest) {
+                    intake.stale += 1;
+                }
+                continue;
+            }
+            intake.recorded += 1;
+            if !eligible.contains(&check.credential) {
+                intake.unlinked += 1;
+            }
+        }
+        control.intake = intake;
+    }
+}
+
+fn counted_agreement(
+    summary: &ManualConfirmationSummary,
+    capability: &DocumentedCapability,
+    check: &LatestCheck,
+) -> bool {
+    summary
+        .control(capability.key)
+        .and_then(|control| {
+            control
+                .firmware
+                .iter()
+                .find(|firmware| firmware.firmware == check.firmware)
+        })
+        .filter(|firmware| firmware.state == ConfirmationState::Confirmed)
+        .and_then(|firmware| firmware.confirmed_actual.as_ref())
+        .is_some_and(|actual| actual.agrees_with(capability, &check.finding))
+}
+
+fn check_reviews(
+    camera: &ManualCamera,
+    summary: &ManualConfirmationSummary,
+    checks: &[LatestCheck],
+    eligible: &HashSet<CredentialId>,
+    groups: &HashMap<CredentialId, CredentialId>,
+    decisions: &[ModeratorDecision],
+    watermarks: &HashMap<DecisionId, OccurrenceId>,
+) -> Vec<ManualCheckReview> {
+    // `evidence` keeps one claim per identity group; a withdrawn newest claim retires the group's older ones.
+    let mut group_latest: HashMap<
+        (&CredentialId, CapabilityKey, Sha256Hex, &ReportedFirmware),
+        OccurrenceId,
+    > = HashMap::new();
+    for check in checks {
+        if !eligible.contains(&check.credential) {
+            continue;
+        }
+        let Some(group) = groups.get(&check.credential) else {
+            continue;
+        };
+        let newest = group_latest
+            .entry((group, check.control, check.digest, &check.firmware))
+            .or_insert(check.occurrence);
+        *newest = (*newest).max(check.occurrence);
+    }
+    let newest = newest_answers(checks);
+    let mut reviews = Vec::new();
+    for check in checks {
+        if check.withdrawn {
+            continue;
+        }
+        let Some(capability) = camera
+            .capabilities
+            .iter()
+            .find(|capability| capability.key == check.control)
+        else {
+            continue;
+        };
+        let stale = check.digest != capability.definition_digest(camera);
+        if stale && superseded(check, &newest) {
+            continue;
+        }
+        let linked = eligible.contains(&check.credential);
+        let reviewed = decisions.iter().any(|decision| {
+            let scope = &decision.record.evidence.firmware_scope;
+            decision.key == check.control
+                && watermarks
+                    .get(&decision.id)
+                    .is_some_and(|watermark| check.occurrence <= *watermark)
+                && (scope.is_unspecified() || decision.record.applies_to(&check.firmware))
+        });
+        let counted = linked
+            && groups.get(&check.credential).is_some_and(|group| {
+                group_latest.get(&(group, check.control, check.digest, &check.firmware))
+                    == Some(&check.occurrence)
+            })
+            && counted_agreement(summary, capability, check);
+        let status = if stale {
+            ManualCheckReviewStatus::StaleDefinition
+        } else if reviewed {
+            ManualCheckReviewStatus::Reviewed
+        } else if counted {
+            ManualCheckReviewStatus::Counted
+        } else {
+            ManualCheckReviewStatus::Pending
+        };
+        reviews.push(ManualCheckReview {
+            camera: camera.id.clone(),
+            control: capability.key,
+            label: capability.label.clone(),
+            firmware: check.firmware.clone(),
+            finding: check.finding.clone(),
+            definition_digest: check.digest,
+            submitted_at: check.received_at,
+            owner_linkage: if linked {
+                ManualOwnerLinkage::Linked
+            } else {
+                ManualOwnerLinkage::Unlinked
+            },
+            status,
+        });
+    }
+    reviews
 }
 
 pub async fn summary(
     db: &SqlitePool,
     camera: &ManualCamera,
 ) -> Result<ManualConfirmationSummary, sqlx::Error> {
-    let observations = latest_observations(db, Some(&camera.id)).await?;
-    let moderators = moderator_decisions(db, camera).await?;
-    let (summary, _) = analyze_camera(camera, &observations, &moderators)?;
+    let mut conn = db.acquire().await?;
+    summary_with(&mut conn, camera).await
+}
+
+pub async fn summary_with(
+    conn: &mut SqliteConnection,
+    camera: &ManualCamera,
+) -> Result<ManualConfirmationSummary, sqlx::Error> {
+    let groups = identity_groups(&mut *conn).await?;
+    let eligible = camera_credentials(&mut *conn, &camera.id).await?;
+    let evidence = evidence(&mut *conn, &camera.id, &groups, &eligible).await?;
+    let moderators = moderator_records(&mut *conn, camera).await?;
+    let mut summary = evaluate_camera(camera, &evidence, &moderators);
+    let checks = latest_checks(&mut *conn, Some(&camera.id)).await?;
+    fill_intake(camera, &mut summary, &checks, &eligible);
     Ok(summary)
 }
 
-/// The latest active check per profile, control, definition and firmware.
+/// Every profile's newest active check on a documented camera, for the moderator queue.
 pub async fn reviews(
     db: &SqlitePool,
     catalog: &ManualCatalog,
 ) -> Result<Vec<ManualCheckReview>, sqlx::Error> {
-    let observations = latest_observations(db, None).await?;
-    let mut by_camera: HashMap<BodyId, Vec<LatestObservation>> = HashMap::new();
-    for observation in observations {
+    let mut tx = db.begin().await?;
+    let groups = identity_groups(&mut tx).await?;
+    let mut by_camera: HashMap<BodyId, Vec<LatestCheck>> = HashMap::new();
+    for check in latest_checks(&mut tx, None).await? {
         by_camera
-            .entry(observation.camera.clone())
+            .entry(check.camera.clone())
             .or_default()
-            .push(observation);
+            .push(check);
     }
+    let watermarks = moderator_watermarks(&mut tx).await?;
     let mut reviews = Vec::new();
     for camera in &catalog.cameras {
-        let Some(observations) = by_camera.get(&camera.id) else {
+        let Some(checks) = by_camera.get(&camera.id) else {
             continue;
         };
-        let moderators = moderator_decisions(db, camera).await?;
-        let (_, mut checks) = analyze_camera(camera, observations, &moderators)?;
-        reviews.append(&mut checks);
+        let eligible = camera_credentials(&mut tx, &camera.id).await?;
+        let evidence = evidence(&mut tx, &camera.id, &groups, &eligible).await?;
+        let decisions = moderator_decisions(&mut tx, camera).await?;
+        let mut records: BTreeMap<CapabilityKey, Vec<ModeratorRecord>> = BTreeMap::new();
+        for decision in &decisions {
+            records
+                .entry(decision.key)
+                .or_default()
+                .push(decision.record.clone());
+        }
+        let summary = evaluate_camera(camera, &evidence, &records);
+        reviews.extend(check_reviews(
+            camera,
+            &summary,
+            checks,
+            &eligible,
+            &groups,
+            &decisions,
+            &watermarks,
+        ));
     }
     reviews.sort_by(|left, right| {
         left.camera
@@ -618,6 +680,7 @@ pub async fn reviews(
     Ok(reviews)
 }
 
+/// Whether a non-withdrawn serial-linked photo ties the profile to the camera.
 pub async fn owner_linkage(
     db: &SqlitePool,
     camera: &BodyId,
@@ -626,6 +689,7 @@ pub async fn owner_linkage(
     let linked: Option<(i64,)> = sqlx::query_as(
         "SELECT 1 FROM contributions
          WHERE credential_id = ? AND body_id = ? AND serial_hmac IS NOT NULL
+           AND status != 'withdrawn'
          LIMIT 1",
     )
     .bind(credential.as_str())
@@ -656,6 +720,7 @@ pub enum RecordError {
 pub async fn record(
     db: &SqlitePool,
     credential: &CredentialId,
+    camera: &ManualCamera,
     confirmation: &ManualConfirmation,
     payload_digest: Sha256Hex,
     assertion_hash: &[u8; 32],
@@ -665,7 +730,7 @@ pub async fn record(
         .map_err(|_| sqlx::Error::Protocol("scope does not serialize".to_owned()))?;
     let scope_kind = confirmation.scope.as_str();
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
-    if crate::store::intake_blocked_conn(&mut tx, credential).await? {
+    if store::intake_blocked_conn(&mut tx, credential).await? {
         return Err(RecordError::CredentialBlocked);
     }
     let blocked: Option<(i64,)> = sqlx::query_as(
@@ -749,6 +814,7 @@ pub async fn record(
         > 0;
     if inserted == 1 || reactivated {
         let payload = json!({
+            "event": "manual_confirmation",
             "confirmation": id,
             "camera": confirmation.camera.as_str(),
             "firmware": confirmation.firmware.as_str(),
@@ -756,6 +822,8 @@ pub async fn record(
         });
         audit::insert(&mut tx, AuditKind::ManualConfirmation, &payload).await?;
     }
+    let summary = summary_with(&mut tx, camera).await?;
+    promotion_audit_with(&mut tx, camera, &summary).await?;
     store::request_publication(&mut tx).await?;
     tx.commit().await?;
     Ok(())
@@ -765,7 +833,7 @@ pub async fn record(
 pub async fn withdraw(
     db: &SqlitePool,
     credential: &CredentialId,
-    camera: &BodyId,
+    camera: &ManualCamera,
 ) -> Result<u64, sqlx::Error> {
     let mut tx = db.begin().await?;
     let now = crate::db::now_unix();
@@ -776,7 +844,7 @@ pub async fn withdraw(
          WHERE credential_id = (SELECT credential_id FROM credentials WHERE id = ?)",
     )
     .bind(credential.as_str())
-    .bind(camera.as_str())
+    .bind(camera.id.as_str())
     .bind(credential.as_str())
     .execute(&mut *tx)
     .await?;
@@ -788,7 +856,7 @@ pub async fn withdraw(
     )
     .bind(now)
     .bind(credential.as_str())
-    .bind(camera.as_str())
+    .bind(camera.id.as_str())
     .execute(&mut *tx)
     .await?;
     let affected = sqlx::query(
@@ -797,17 +865,20 @@ pub async fn withdraw(
     )
     .bind(now)
     .bind(credential.as_str())
-    .bind(camera.as_str())
+    .bind(camera.id.as_str())
     .execute(&mut *tx)
     .await?
     .rows_affected();
     if affected > 0 {
         let payload = json!({
-            "camera": camera.as_str(),
+            "event": "manual_confirmation_withdrawal",
+            "camera": camera.id.as_str(),
             "withdrawn": affected,
         });
         audit::insert(&mut tx, AuditKind::ManualConfirmationWithdrawal, &payload).await?;
     }
+    let summary = summary_with(&mut tx, camera).await?;
+    promotion_audit_with(&mut tx, camera, &summary).await?;
     store::request_publication(&mut tx).await?;
     tx.commit().await?;
     Ok(affected)
@@ -845,21 +916,23 @@ pub async fn record_moderator(
     .execute(&mut *tx)
     .await?
     .last_insert_rowid();
+    // The insert above holds the write lock, so no check can land between it and this read.
     let occurrence_watermark: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM manual_confirmation_occurrences")
             .fetch_one(&mut *tx)
             .await?;
     let payload = json!({
+        "event": "manual_moderator_confirmation",
         "camera": camera.id.as_str(),
         "control": key.as_str(),
         "definition_digest": definition_digest.to_hex(),
         "decision": if record.confirmed { "confirm" } else { "reject" },
         "firmware_scope": &record.evidence.firmware_scope,
         "moderator": credential.as_str(),
-        "moderator_confirmation": moderator_confirmation,
-        "occurrence_watermark": occurrence_watermark,
         "evidence_kind": evidence_kind,
         "evidence_url": record.evidence.url.as_ref().map(ManualUrl::as_str),
+        "moderator_confirmation": moderator_confirmation,
+        "occurrence_watermark": occurrence_watermark,
     });
     audit::insert(&mut tx, AuditKind::ManualModeratorConfirmation, &payload).await?;
     store::request_publication(&mut tx).await?;
@@ -867,8 +940,8 @@ pub async fn record_moderator(
     Ok(())
 }
 
-pub async fn promotion_audit(
-    db: &SqlitePool,
+pub async fn promotion_audit_with(
+    conn: &mut SqliteConnection,
     camera: &ManualCamera,
     summary: &ManualConfirmationSummary,
 ) -> Result<(), sqlx::Error> {
@@ -878,6 +951,7 @@ pub async fn promotion_audit(
                 continue;
             }
             let payload = json!({
+                "event": "manual_confirmation_promotion",
                 "camera": camera.id.as_str(),
                 "control": control.key.as_str(),
                 "groups": firmware.agreeing_groups,
@@ -888,7 +962,7 @@ pub async fn promotion_audit(
             let rows: Vec<(String,)> =
                 sqlx::query_as("SELECT payload FROM audit_log WHERE type = ?")
                     .bind(AuditKind::ManualConfirmationPromotion.as_str())
-                    .fetch_all(db)
+                    .fetch_all(&mut *conn)
                     .await?;
             let already = rows.iter().any(|(stored,)| {
                 serde_json::from_str::<serde_json::Value>(stored)
@@ -904,8 +978,7 @@ pub async fn promotion_audit(
             if already {
                 continue;
             }
-            let mut conn = db.acquire().await?;
-            audit::insert(&mut conn, AuditKind::ManualConfirmationPromotion, &payload).await?;
+            audit::insert(&mut *conn, AuditKind::ManualConfirmationPromotion, &payload).await?;
         }
     }
     Ok(())

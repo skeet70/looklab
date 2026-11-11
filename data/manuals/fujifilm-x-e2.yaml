@@ -58,12 +58,13 @@ cameras:
   - key: raw_capture
     label: RAW RECORDING
     category: capture
-    availability: not_documented
+    availability: available
     domain:
       type: unspecified
     citations:
     - source: xe2-manual
-      locator: p. 90 (PDF 106), IMAGE QUALITY (no RAW compression option documented)
+      locator: p. 90 (PDF 106), IMAGE QUALITY documents RAW, FINE+RAW and NORMAL+RAW
+    notes: RAW compression choices are not documented.
   - key: heif_capture
     label: HEIF
     category: capture

@@ -81,7 +81,7 @@ impl<T> Load<T> {
 }
 
 thread_local! {
-    static SITE_INDEX: std::cell::OnceCell<SiteIndex> = const { std::cell::OnceCell::new() };
+    static SITE_INDEX: std::cell::RefCell<Option<SiteIndex>> = const { std::cell::RefCell::new(None) };
     static REFERENCE_PREVIEW: std::cell::OnceCell<Arc<Vec<u8>>> = const { std::cell::OnceCell::new() };
     static PREPARED_SCENES: std::cell::RefCell<std::collections::VecDeque<(SceneName, bool, PreparedScene)>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
@@ -109,19 +109,20 @@ async fn get_json<T: DeserializeOwned>(path: &str) -> Result<T, String> {
     serde_json::from_slice(&bytes).map_err(|error| format!("{path}: {error}"))
 }
 
-/// Verifies the index against the deployment's advertised root.
 pub async fn index() -> Result<SiteIndex, String> {
-    if let Some(index) = SITE_INDEX.with(|cache| cache.get().cloned()) {
+    if let Some(index) = SITE_INDEX.with(|cache| cache.borrow().clone()) {
         return Ok(index);
     }
-    let index = current_index().await?;
-    SITE_INDEX.with(|cache| {
-        let _ = cache.set(index.clone());
-    });
-    Ok(index)
+    fetch_index().await
 }
 
+/// Fetches the index even when a cached copy exists.
 pub async fn current_index() -> Result<SiteIndex, String> {
+    fetch_index().await
+}
+
+/// Verifies the index against the deployment's advertised root and replaces the cached copy.
+async fn fetch_index() -> Result<SiteIndex, String> {
     let bytes = get(&publication_url("/data/index.json")).await?;
     let expected = expected_site_root().await?;
     let actual = ArtifactHash::of(&bytes);
@@ -130,7 +131,10 @@ pub async fn current_index() -> Result<SiteIndex, String> {
             "site index does not match the advertised root: expected {expected}, got {actual}"
         ));
     }
-    serde_json::from_slice(&bytes).map_err(|error| format!("/data/index.json: {error}"))
+    let index: SiteIndex =
+        serde_json::from_slice(&bytes).map_err(|error| format!("/data/index.json: {error}"))?;
+    SITE_INDEX.with(|cache| *cache.borrow_mut() = Some(index.clone()));
+    Ok(index)
 }
 
 #[derive(Deserialize)]
@@ -159,10 +163,12 @@ pub async fn body(make: &str, model: &str) -> Result<BodyPage, String> {
 }
 
 pub async fn body_optional(make: &str, model: &str) -> Result<Option<BodyPage>, String> {
-    get_optional_json(&publication_url(&format!(
-        "/data/bodies/{make}/{model}.json"
-    )))
-    .await
+    let id = looklab_schema::BodyId::new(&format!("{make}/{model}"))
+        .map_err(|error| error.to_string())?;
+    if !index().await?.bodies.iter().any(|body| body.id == id) {
+        return Ok(None);
+    }
+    body(make, model).await.map(Some)
 }
 
 #[derive(Deserialize)]
@@ -175,59 +181,57 @@ pub async fn bodies_without_schema() -> Result<Vec<looklab_schema::Body>, String
     Ok(reply.bodies)
 }
 
+enum ManualFetchError {
+    /// The page bytes differ from the index entry.
+    IndexMismatch(String),
+    Other(String),
+}
+
 pub async fn manual(
     make: &str,
     model: &str,
 ) -> Result<Option<looklab_publish::ManualPage>, String> {
-    if crate::base::server_available() {
-        // The live page carries checks recorded since the last publication.
-        return match get_optional_json::<looklab_publish::ManualPage>(&api_url(&format!(
-            "/api/manuals/{make}/{model}"
-        )))
-        .await
-        {
-            Ok(Some(page)) => Ok(Some(page)),
-            Ok(None) => {
-                // A 404 is absence only when no published manual exists for the camera.
-                let published = get_optional_json::<looklab_publish::ManualPage>(&publication_url(
-                    &format!("/data/manuals/{make}/{model}.json"),
-                ))
-                .await;
-                match published {
-                    Ok(None) => Ok(None),
-                    Ok(Some(_)) => Err(format!(
-                        "/api/manuals/{make}/{model}: the live catalog does not serve this documented camera"
-                    )),
-                    Err(error) => Err(error),
-                }
-            }
-            Err(error) => Err(error),
-        };
+    let id = looklab_schema::BodyId::new(&format!("{make}/{model}"))
+        .map_err(|error| error.to_string())?;
+    match manual_from(&index().await?, &id, make, model).await {
+        Ok(page) => Ok(page),
+        // A publication since the index was cached replaces the page.
+        Err(ManualFetchError::IndexMismatch(_)) => {
+            manual_from(&fetch_index().await?, &id, make, model)
+                .await
+                .map_err(|error| match error {
+                    ManualFetchError::IndexMismatch(message) | ManualFetchError::Other(message) => {
+                        message
+                    }
+                })
+        }
+        Err(ManualFetchError::Other(message)) => Err(message),
     }
-    get_optional_json(&publication_url(&format!(
-        "/data/manuals/{make}/{model}.json"
-    )))
-    .await
 }
 
-async fn get_optional_json<T: DeserializeOwned>(path: &str) -> Result<Option<T>, String> {
-    let response = Request::get(path)
-        .send()
-        .await
-        .map_err(|error| format!("{path}: {error}"))?;
-    if response.status() == 404 {
+async fn manual_from(
+    index: &SiteIndex,
+    id: &looklab_schema::BodyId,
+    make: &str,
+    model: &str,
+) -> Result<Option<looklab_publish::ManualPage>, ManualFetchError> {
+    let Some(summary) = index.manuals.iter().find(|manual| manual.id == *id) else {
         return Ok(None);
-    }
-    if !response.ok() {
-        return Err(format!("{path}: HTTP {}", response.status()));
-    }
-    let bytes = response
-        .binary()
+    };
+    let path = summary.artifact.path.as_str();
+    let bytes = get(&publication_url(&format!("/{path}")))
         .await
-        .map_err(|error| format!("{path}: {error}"))?;
+        .map_err(ManualFetchError::Other)?;
+    let digest = ArtifactHash::of(&bytes);
+    if digest != summary.artifact.sha256 || bytes.len() as u64 != summary.artifact.bytes {
+        return Err(ManualFetchError::IndexMismatch(format!(
+            "{make}/{model}: manual page does not match the site index: expected {}, got {digest}",
+            summary.artifact.sha256
+        )));
+    }
     serde_json::from_slice(&bytes)
         .map(Some)
-        .map_err(|error| format!("{path}: {error}"))
+        .map_err(|error| ManualFetchError::Other(format!("/{path}: {error}")))
 }
 
 pub async fn look(slug: &str) -> Result<LookPage, String> {

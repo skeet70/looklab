@@ -60,12 +60,13 @@ cameras:
   - key: raw_capture
     label: RAW RECORDING
     category: capture
-    availability: not_documented
+    availability: available
     domain:
       type: unspecified
     citations:
     - source: xt1-manual
-      locator: p. 79 (PDF 95), IMAGE QUALITY (no RAW compression option documented)
+      locator: p. 79 (PDF 95), IMAGE QUALITY documents RAW, FINE+RAW and NORMAL+RAW
+    notes: RAW compression choices are not documented.
   - key: heif_capture
     label: HEIF
     category: capture

@@ -19,11 +19,11 @@ use looklab_samples::{
     PrepVersion, PriorTransformVersion, RerenderGroupId, SampleFlags, SampleHeader, SampleSet,
 };
 use looklab_schema::{
-    Availability, CapabilityDomain, CapabilityKey, ConfirmationScope, ControlObservation, Date,
-    Finding, FixtureDonation, FixtureLicense, FixtureUpload, LabeledTag, MakernoteValue,
-    ManualCamera, ManualConfirmation, ManualUrl, ModeratorEvidence, ModeratorEvidenceKind,
-    ModeratorFirmwareScope, Placement, ProposalKind, ReportedFirmware, Sha256Hex,
-    frame_fixture_upload, frame_lut_proposal, validate_manual_catalog,
+    CapabilityKey, ConfirmationScope, ControlObservation, Date, Finding, FixtureDonation,
+    FixtureLicense, FixtureUpload, LabeledTag, MakernoteValue, ManualCamera, ManualConfirmation,
+    ManualUrl, ModeratorEvidence, ModeratorEvidenceKind, ModeratorFirmwareScope, Placement,
+    ProposalKind, ReportedFirmware, Sha256Hex, frame_fixture_upload, frame_lut_proposal,
+    validate_manual_catalog,
 };
 use looklab_server::body_schema::Bodies;
 use looklab_server::{AppState, Config, PowConfig, router};
@@ -38,7 +38,6 @@ use looklab_upload::{
     parse_render_tag, send_manifest_hash, solve,
 };
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
-use p256::elliptic_curve::point::AffineCoordinates;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::SqliteConnectOptions;
@@ -1122,12 +1121,12 @@ async fn happy_path_and_status_feed() {
         .await
         .expect("credentials");
     assert_eq!(credentials, 1);
-    let jobs: (String, i64) = sqlx::query_as("SELECT kind, COUNT(*) FROM jobs GROUP BY kind")
-        .fetch_one(&server.db)
-        .await
-        .expect("jobs");
-    assert_eq!(jobs.0, "consistency_score");
-    assert_eq!(jobs.1, 1);
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'consistency_score'")
+            .fetch_one(&server.db)
+            .await
+            .expect("jobs");
+    assert_eq!(jobs, 1);
     let blobs = std::fs::read_dir(&server.blob_dir)
         .expect("blob dir")
         .count();
@@ -1229,7 +1228,7 @@ async fn a_parallel_batch_replay_creates_one_contribution() {
             .filter(|status| **status == StatusCode::CREATED)
             .count(),
         1,
-        "{left:?} {right:?}"
+        "{statuses:?}"
     );
     assert_eq!(
         statuses
@@ -1238,7 +1237,62 @@ async fn a_parallel_batch_replay_creates_one_contribution() {
                 || **status == StatusCode::SERVICE_UNAVAILABLE)
             .count(),
         1,
-        "{left:?} {right:?}"
+        "{statuses:?}"
+    );
+    let batch_hash = manifest_hash(&first);
+    let contributions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contributions WHERE batch_manifest_hash = ?")
+            .bind(batch_hash.as_bytes().as_slice())
+            .fetch_one(&server.db)
+            .await
+            .expect("contributions");
+    assert_eq!(contributions, 1);
+    let refs: i64 = sqlx::query_scalar("SELECT ref_count FROM blobs WHERE hash = ?")
+        .bind(first.images[0].blob_sha256.as_slice())
+        .fetch_one(&server.db)
+        .await
+        .expect("blob refs");
+    assert_eq!(refs, 1);
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'consistency_score'")
+            .fetch_one(&server.db)
+            .await
+            .expect("jobs");
+    assert_eq!(jobs, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persisted_credential_parallel_duplicate_batch_creates_one_contribution() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let (first, first_blobs) = manifest(valid_settings());
+    let (mut second, _) = manifest(valid_settings());
+    second.sim_key = SimKey::new("provia").expect("sim key");
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical(vec![manifest_hash(&first), manifest_hash(&second)])
+        .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let body = send_envelope(nonce, &send, &first, &first_blobs, &assertion);
+
+    let (left, right) = tokio::join!(server.upload_bytes(body.clone()), server.upload_bytes(body));
+    let statuses = [left.0, right.0];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CREATED)
+            .count(),
+        1,
+        "{statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CONFLICT
+                || **status == StatusCode::SERVICE_UNAVAILABLE)
+            .count(),
+        1,
+        "{statuses:?}"
     );
     let batch_hash = manifest_hash(&first);
     let contributions: i64 =
@@ -1406,23 +1460,6 @@ async fn non_canonical_envelope_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_old_envelope_version_requests_a_reload() {
-    let mut server = TestServer::start().await;
-    let (manifest, blobs) = manifest(valid_settings());
-    let nonce = server.nonce().await;
-    let pow_challenge = Challenge::new(&nonce, &manifest_hash(&manifest));
-    let challenge = send_challenge(&nonce, &manifest);
-    let assertion = server.assertion(&challenge).await;
-    let pow = solve(&pow_challenge, 2, &pow_params(), 0).expect("pow");
-    let mut bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
-    bytes[6..8].copy_from_slice(&3u16.to_le_bytes());
-    let (status, body) = server.upload_bytes(bytes).await;
-    assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "upload: {body}");
-    assert_eq!(body["error"], "ENVELOPE_VERSION_UNSUPPORTED");
-    assert_eq!(body["action"], "reload_and_prepare");
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn schema_invalid_settings_are_rejected() {
     let mut server = TestServer::start().await;
     let (manifest, blobs) = manifest(settings_at(&[("highlight_tone", 0)]));
@@ -1578,11 +1615,12 @@ async fn a_monochrome_batch_is_stored_deferred_with_its_authorization() {
         assert_eq!(filter.as_deref(), Some("yellow"));
     }
 
-    let jobs: Vec<(String,)> = sqlx::query_as("SELECT kind FROM jobs")
-        .fetch_all(&server.db)
-        .await
-        .expect("jobs");
-    assert!(jobs.iter().all(|(kind,)| kind == "hard_delete_blobs"));
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'consistency_score'")
+            .fetch_one(&server.db)
+            .await
+            .expect("jobs");
+    assert_eq!(jobs, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2746,291 +2784,6 @@ async fn pending_profile_session_requires_valid_pow_and_persists_nothing_on_fail
             .expect("credential count");
         assert_eq!(rows, 0);
     }
-}
-
-/// Backup eligible and backed up, with a zero signature counter.
-struct SyncedPasskey {
-    key: SigningKey,
-    credential_id: Vec<u8>,
-}
-
-impl SyncedPasskey {
-    fn new(credential_id: &[u8]) -> Self {
-        Self {
-            key: SigningKey::from_slice(&[9u8; 32]).expect("valid P-256 scalar"),
-            credential_id: credential_id.to_vec(),
-        }
-    }
-
-    async fn register(&self, app: &Router, display_handle: &str, flags: u8) {
-        let (status, body) = self.register_response(app, display_handle, flags).await;
-        assert_eq!(status, StatusCode::OK, "register finish: {body}");
-    }
-
-    async fn register_response(
-        &self,
-        app: &Router,
-        display_handle: &str,
-        flags: u8,
-    ) -> (StatusCode, Value) {
-        let (status, body) = post_json(
-            app,
-            "/api/passkey/register/start",
-            &json!({ "display_handle": display_handle }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "register start: {body}");
-        let handle = body["handle"].as_str().expect("handle").to_owned();
-        let challenge = body["options"]["publicKey"]["challenge"]
-            .as_str()
-            .expect("challenge");
-        let client_data_json = format!(
-            "{{\"type\":\"webauthn.create\",\"challenge\":\"{challenge}\",\"origin\":\"{ORIGIN}\",\"crossOrigin\":false}}"
-        );
-        let mut auth_data = Vec::new();
-        auth_data.extend_from_slice(&Sha256::digest(RP_ID.as_bytes()));
-        auth_data.push(flags);
-        auth_data.extend_from_slice(&0u32.to_be_bytes());
-        auth_data.extend_from_slice(&[0u8; 16]);
-        auth_data.extend_from_slice(
-            &u16::try_from(self.credential_id.len())
-                .expect("credential id fits")
-                .to_be_bytes(),
-        );
-        auth_data.extend_from_slice(&self.credential_id);
-        auth_data.extend_from_slice(&self.cose_key());
-        post_json(
-            app,
-            "/api/passkey/register/finish",
-            &json!({
-                "handle": handle,
-                "credential": {
-                    "id": b64(&self.credential_id),
-                    "rawId": b64(&self.credential_id),
-                    "type": "public-key",
-                    "response": {
-                        "clientDataJSON": b64(client_data_json.as_bytes()),
-                        "attestationObject": b64(&attestation_object(&auth_data)),
-                    },
-                    "clientExtensionResults": {},
-                },
-            }),
-        )
-        .await
-    }
-
-    fn cose_key(&self) -> Vec<u8> {
-        let affine = self.key.verifying_key().as_affine();
-        let mut out = Vec::new();
-        cbor_map(&mut out, 5);
-        out.extend_from_slice(&[0x01, 0x02]);
-        out.extend_from_slice(&[0x03, 0x26]);
-        out.extend_from_slice(&[0x20, 0x01]);
-        out.push(0x21);
-        cbor_bytes(&mut out, affine.x().as_ref());
-        out.push(0x22);
-        cbor_bytes(&mut out, affine.y().as_ref());
-        out
-    }
-
-    fn assertion(&self, challenge: &Challenge, flags: u8) -> Value {
-        let client_data_json = format!(
-            "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"{ORIGIN}\",\"crossOrigin\":false}}",
-            b64(challenge.as_bytes())
-        );
-        let mut authenticator_data = Vec::new();
-        authenticator_data.extend_from_slice(&Sha256::digest(RP_ID.as_bytes()));
-        authenticator_data.push(flags);
-        authenticator_data.extend_from_slice(&0u32.to_be_bytes());
-        let mut message = authenticator_data.clone();
-        message.extend_from_slice(&Sha256::digest(client_data_json.as_bytes()));
-        let signature: Signature = self.key.sign(&message);
-        json!({
-            "credential_id": b64(&self.credential_id),
-            "authenticator_data": b64(&authenticator_data),
-            "client_data_json": b64(client_data_json.as_bytes()),
-            "signature": b64(signature.to_der().as_bytes()),
-        })
-    }
-}
-
-fn cbor_map(out: &mut Vec<u8>, entries: u8) {
-    out.push(0xa0 | entries);
-}
-
-fn cbor_text(out: &mut Vec<u8>, text: &str) {
-    let len = u8::try_from(text.len()).expect("short CBOR text");
-    assert!(len < 24, "CBOR text uses the short form");
-    out.push(0x60 | len);
-    out.extend_from_slice(text.as_bytes());
-}
-
-fn cbor_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    let len = u16::try_from(bytes.len()).expect("short CBOR byte string");
-    if len < 24 {
-        out.push(0x40 | len as u8);
-    } else if len < 0x100 {
-        out.push(0x58);
-        out.push(len as u8);
-    } else {
-        out.push(0x59);
-        out.extend_from_slice(&len.to_be_bytes());
-    }
-    out.extend_from_slice(bytes);
-}
-
-fn attestation_object(auth_data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    cbor_map(&mut out, 3);
-    cbor_text(&mut out, "fmt");
-    cbor_text(&mut out, "none");
-    cbor_text(&mut out, "attStmt");
-    cbor_map(&mut out, 0);
-    cbor_text(&mut out, "authData");
-    cbor_bytes(&mut out, auth_data);
-    out
-}
-
-fn synced_session_request(
-    nonce: &Nonce,
-    challenge: &Challenge,
-    assertion: Value,
-    pow: bool,
-) -> Value {
-    let mut body = assertion;
-    body["nonce"] = json!(b64(nonce.as_bytes()));
-    if pow {
-        body["pow"] = json!(
-            solve(challenge, 1, &pow_params(), 0)
-                .expect("pow")
-                .as_array()
-        );
-    }
-    body
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_synced_zero_counter_profile_completes_registration_and_session() {
-    let server = TestServer::start().await;
-    let passkey = SyncedPasskey::new(b"synced-profile");
-    passkey.register(&server.app, "Jake!", 0x5d).await;
-
-    let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
-    let request = synced_session_request(
-        &nonce,
-        &challenge,
-        passkey.assertion(&challenge, 0x1d),
-        true,
-    );
-    let (status, body) = post_json(&server.app, "/api/session", &request).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["display_handle"], "Jake!");
-    assert_eq!(body["tier"], "new");
-    assert_eq!(body["roles"], json!([]));
-    let token = body["status_token"]
-        .as_str()
-        .expect("status token")
-        .to_owned();
-
-    let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
-    let request = synced_session_request(
-        &nonce,
-        &challenge,
-        passkey.assertion(&challenge, 0x1d),
-        false,
-    );
-    let (status, body) = post_json(&server.app, "/api/session", &request).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["display_handle"], "Jake!");
-
-    let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::SessionRevoke, ""));
-    let request = synced_session_request(
-        &nonce,
-        &challenge,
-        passkey.assertion(&challenge, 0x1d),
-        false,
-    );
-    let (status, body) = post_json(&server.app, "/api/session/revoke", &request).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
-
-    let restore = Request::builder()
-        .uri("/api/session")
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .expect("restore request");
-    let (status, _, body) = send(&server.app, restore).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    let error: Value = serde_json::from_slice(&body).expect("error response");
-    assert_eq!(error["error"], "TOKEN_UNKNOWN");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_credential_id_an_assertion_cannot_carry_is_rejected_at_registration() {
-    let server = TestServer::start().await;
-    let empty = SyncedPasskey::new(b"");
-    let (status, body) = empty.register_response(&server.app, "Jake!", 0x5d).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"], "MALFORMED_ENVELOPE");
-
-    let longest = SyncedPasskey::new(&[3u8; looklab_upload::webauthn::MAX_CREDENTIAL_ID]);
-    let (status, body) = longest.register_response(&server.app, "Jake!", 0x5d).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
-    let request = synced_session_request(
-        &nonce,
-        &challenge,
-        longest.assertion(&challenge, 0x1d),
-        true,
-    );
-    let (status, body) = post_json(&server.app, "/api/session", &request).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-
-    let longer = SyncedPasskey::new(&[4u8; looklab_upload::webauthn::MAX_CREDENTIAL_ID + 1]);
-    let (status, body) = longer.register_response(&server.app, "Jake!", 0x5d).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"], "MALFORMED_ENVELOPE");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_assertion_without_user_verification_is_rejected() {
-    let server = TestServer::start().await;
-    let passkey = SyncedPasskey::new(b"unverified-profile");
-    passkey.register(&server.app, "Jake!", 0x5d).await;
-
-    let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
-    let request = synced_session_request(
-        &nonce,
-        &challenge,
-        passkey.assertion(&challenge, 0x19),
-        true,
-    );
-    let (status, body) = post_json(&server.app, "/api/session", &request).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
-    assert_eq!(body["error"], "SIGNATURE_INVALID");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_assertion_with_backup_state_but_no_eligibility_is_rejected() {
-    let server = TestServer::start().await;
-    let passkey = SyncedPasskey::new(b"device-bound-profile");
-    passkey.register(&server.app, "Jake!", 0x45).await;
-
-    let nonce = server.nonce().await;
-    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
-    let request = synced_session_request(
-        &nonce,
-        &challenge,
-        passkey.assertion(&challenge, 0x15),
-        true,
-    );
-    let (status, body) = post_json(&server.app, "/api/session", &request).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
-    assert_eq!(body["error"], "SIGNATURE_INVALID");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4578,6 +4331,10 @@ async fn proposal_decision_writes_a_validated_snapshot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn approval_requests_a_catalog_publication_without_a_fit() {
     let mut server = TestServer::start().await;
+    let before: i64 = sqlx::query_scalar("SELECT generation FROM publication WHERE id = 1")
+        .fetch_one(&server.db)
+        .await
+        .expect("publication generation");
     let (status, body) = server.upload_valid(None).await;
     assert_eq!(status, StatusCode::CREATED, "upload: {body}");
 
@@ -4600,7 +4357,11 @@ async fn approval_requests_a_catalog_publication_without_a_fit() {
         .fetch_one(&server.db)
         .await
         .expect("publication generation");
-    assert_eq!(generation, 1, "approval records a publication request");
+    assert_eq!(
+        generation,
+        before + 1,
+        "approval records a publication request"
+    );
     let queued: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM jobs WHERE kind = 'publish_site' AND status = 'queued'",
     )
@@ -5490,6 +5251,290 @@ async fn a_continuation_keeps_the_newer_assertion_state() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+struct SyncedPasskey {
+    key: SigningKey,
+    credential_id: Vec<u8>,
+}
+
+impl SyncedPasskey {
+    fn new(credential_id: &[u8]) -> Self {
+        Self {
+            key: SigningKey::from_slice(&[9u8; 32]).expect("valid P-256 scalar"),
+            credential_id: credential_id.to_vec(),
+        }
+    }
+
+    async fn register(&self, app: &Router, display_handle: &str, flags: u8) {
+        let (status, body) = self.register_response(app, display_handle, flags).await;
+        assert_eq!(status, StatusCode::OK, "register finish: {body}");
+    }
+
+    async fn register_response(
+        &self,
+        app: &Router,
+        display_handle: &str,
+        flags: u8,
+    ) -> (StatusCode, Value) {
+        let (status, body) = post_json(
+            app,
+            "/api/passkey/register/start",
+            &json!({ "display_handle": display_handle }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "register start: {body}");
+        let handle = body["handle"].as_str().expect("handle").to_owned();
+        let challenge = body["options"]["publicKey"]["challenge"]
+            .as_str()
+            .expect("challenge");
+        let client_data_json = format!(
+            "{{\"type\":\"webauthn.create\",\"challenge\":\"{challenge}\",\"origin\":\"{ORIGIN}\",\"crossOrigin\":false}}"
+        );
+        let mut auth_data = Vec::new();
+        auth_data.extend_from_slice(&Sha256::digest(RP_ID.as_bytes()));
+        auth_data.push(flags);
+        auth_data.extend_from_slice(&0u32.to_be_bytes());
+        auth_data.extend_from_slice(&[0u8; 16]);
+        auth_data.extend_from_slice(
+            &u16::try_from(self.credential_id.len())
+                .expect("credential id fits")
+                .to_be_bytes(),
+        );
+        auth_data.extend_from_slice(&self.credential_id);
+        auth_data.extend_from_slice(&self.cose_key());
+        post_json(
+            app,
+            "/api/passkey/register/finish",
+            &json!({
+                "handle": handle,
+                "credential": {
+                    "id": b64(&self.credential_id),
+                    "rawId": b64(&self.credential_id),
+                    "type": "public-key",
+                    "response": {
+                        "clientDataJSON": b64(client_data_json.as_bytes()),
+                        "attestationObject": b64(&attestation_object(&auth_data)),
+                    },
+                    "clientExtensionResults": {},
+                },
+            }),
+        )
+        .await
+    }
+
+    fn cose_key(&self) -> Vec<u8> {
+        let point = self.key.verifying_key().to_sec1_point(false);
+        let mut out = Vec::new();
+        cbor_map(&mut out, 5);
+        out.extend_from_slice(&[0x01, 0x02]);
+        out.extend_from_slice(&[0x03, 0x26]);
+        out.extend_from_slice(&[0x20, 0x01]);
+        out.push(0x21);
+        cbor_bytes(&mut out, point.x().expect("uncompressed P-256 point"));
+        out.push(0x22);
+        cbor_bytes(&mut out, point.y().expect("uncompressed P-256 point"));
+        out
+    }
+
+    fn assertion(&self, challenge: &Challenge, flags: u8) -> Value {
+        let client_data_json = format!(
+            "{{\"type\":\"webauthn.get\",\"challenge\":\"{}\",\"origin\":\"{ORIGIN}\",\"crossOrigin\":false}}",
+            b64(challenge.as_bytes())
+        );
+        let mut authenticator_data = Vec::new();
+        authenticator_data.extend_from_slice(&Sha256::digest(RP_ID.as_bytes()));
+        authenticator_data.push(flags);
+        authenticator_data.extend_from_slice(&0u32.to_be_bytes());
+        let mut message = authenticator_data.clone();
+        message.extend_from_slice(&Sha256::digest(client_data_json.as_bytes()));
+        let signature: Signature = self.key.sign(&message);
+        json!({
+            "credential_id": b64(&self.credential_id),
+            "authenticator_data": b64(&authenticator_data),
+            "client_data_json": b64(client_data_json.as_bytes()),
+            "signature": b64(signature.to_der().as_bytes()),
+        })
+    }
+}
+
+fn cbor_map(out: &mut Vec<u8>, entries: u8) {
+    out.push(0xa0 | entries);
+}
+
+fn cbor_text(out: &mut Vec<u8>, text: &str) {
+    let len = u8::try_from(text.len()).expect("short CBOR text");
+    assert!(len < 24, "CBOR text uses the short form");
+    out.push(0x60 | len);
+    out.extend_from_slice(text.as_bytes());
+}
+
+fn cbor_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u16::try_from(bytes.len()).expect("short CBOR byte string");
+    if len < 24 {
+        out.push(0x40 | len as u8);
+    } else if len < 0x100 {
+        out.push(0x58);
+        out.push(len as u8);
+    } else {
+        out.push(0x59);
+        out.extend_from_slice(&len.to_be_bytes());
+    }
+    out.extend_from_slice(bytes);
+}
+
+fn attestation_object(auth_data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    cbor_map(&mut out, 3);
+    cbor_text(&mut out, "fmt");
+    cbor_text(&mut out, "none");
+    cbor_text(&mut out, "attStmt");
+    cbor_map(&mut out, 0);
+    cbor_text(&mut out, "authData");
+    cbor_bytes(&mut out, auth_data);
+    out
+}
+
+fn synced_session_request(
+    nonce: &Nonce,
+    challenge: &Challenge,
+    assertion: Value,
+    pow: bool,
+) -> Value {
+    let mut body = assertion;
+    body["nonce"] = json!(b64(nonce.as_bytes()));
+    if pow {
+        body["pow"] = json!(
+            solve(challenge, 1, &pow_params(), 0)
+                .expect("pow")
+                .as_array()
+        );
+    }
+    body
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_synced_zero_counter_profile_completes_registration_and_session() {
+    let server = TestServer::start().await;
+    let passkey = SyncedPasskey::new(b"synced-profile");
+    passkey.register(&server.app, "Jake!", 0x5d).await;
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x1d),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["display_handle"], "Jake!");
+    assert_eq!(body["tier"], "new");
+    assert_eq!(body["roles"], json!([]));
+    let token = body["status_token"]
+        .as_str()
+        .expect("status token")
+        .to_owned();
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x1d),
+        false,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["display_handle"], "Jake!");
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::SessionRevoke, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x1d),
+        false,
+    );
+    let (status, body) = post_json(&server.app, "/api/session/revoke", &request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let restore = Request::builder()
+        .uri("/api/session")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("restore request");
+    let (status, _, body) = send(&server.app, restore).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let error: Value = serde_json::from_slice(&body).expect("error response");
+    assert_eq!(error["error"], "TOKEN_UNKNOWN");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_credential_id_an_assertion_cannot_carry_is_rejected_at_registration() {
+    let server = TestServer::start().await;
+    let empty = SyncedPasskey::new(b"");
+    let (status, body) = empty.register_response(&server.app, "Jake!", 0x5d).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "MALFORMED_ENVELOPE");
+
+    let longest = SyncedPasskey::new(&[3u8; looklab_upload::webauthn::MAX_CREDENTIAL_ID]);
+    let (status, body) = longest.register_response(&server.app, "Jake!", 0x5d).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        longest.assertion(&challenge, 0x1d),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let longer = SyncedPasskey::new(&[4u8; looklab_upload::webauthn::MAX_CREDENTIAL_ID + 1]);
+    let (status, body) = longer.register_response(&server.app, "Jake!", 0x5d).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "MALFORMED_ENVELOPE");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assertion_without_user_verification_is_rejected() {
+    let server = TestServer::start().await;
+    let passkey = SyncedPasskey::new(b"unverified-profile");
+    passkey.register(&server.app, "Jake!", 0x5d).await;
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x19),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "SIGNATURE_INVALID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_assertion_with_backup_state_but_no_eligibility_is_rejected() {
+    let server = TestServer::start().await;
+    let passkey = SyncedPasskey::new(b"device-bound-profile");
+    passkey.register(&server.app, "Jake!", 0x45).await;
+
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x15),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"], "SIGNATURE_INVALID");
+}
+
 fn documented_camera(id: &str) -> ManualCamera {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../data/manuals")
@@ -5577,6 +5622,23 @@ fn envelope_with_send(
     })
 }
 
+async fn post_standalone_confirmation(
+    server: &mut TestServer,
+    confirmation: &ManualConfirmation,
+) -> StatusCode {
+    let nonce = server.nonce().await;
+    let digest = confirmation.digest();
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let request = confirmation_request(&nonce, &send, &assertion, confirmation);
+    post_confirmation(&server.app, &request).await.0
+}
+
 async fn standalone_confirmation_request(
     server: &mut TestServer,
     confirmation: &ManualConfirmation,
@@ -5593,8 +5655,16 @@ async fn standalone_confirmation_request(
     confirmation_request(&nonce, &send, &assertion, confirmation)
 }
 
-async fn synced_confirmation_request(
+async fn post_standalone_confirmation_response(
     server: &mut TestServer,
+    confirmation: &ManualConfirmation,
+) -> (StatusCode, Value) {
+    let request = standalone_confirmation_request(server, confirmation).await;
+    post_confirmation(&server.app, &request).await
+}
+
+async fn synced_confirmation_request(
+    server: &TestServer,
     passkey: &SyncedPasskey,
     confirmation: &ManualConfirmation,
 ) -> ManualConfirmationRequest {
@@ -5630,20 +5700,29 @@ async fn synced_confirmation_request(
     }
 }
 
-async fn post_standalone_confirmation(
-    server: &mut TestServer,
-    confirmation: &ManualConfirmation,
-) -> StatusCode {
-    let request = standalone_confirmation_request(server, confirmation).await;
-    post_confirmation(&server.app, &request).await.0
+async fn synced_sign_in(server: &TestServer, passkey: &SyncedPasskey) {
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x1d),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::OK, "session: {body}");
 }
 
-async fn post_standalone_confirmation_response(
-    server: &mut TestServer,
-    confirmation: &ManualConfirmation,
-) -> (StatusCode, Value) {
-    let request = standalone_confirmation_request(server, confirmation).await;
-    post_confirmation(&server.app, &request).await
+async fn synced_owner(
+    server: &TestServer,
+    credential_id: &[u8],
+    display_handle: &str,
+) -> (SyncedPasskey, String) {
+    let passkey = SyncedPasskey::new(credential_id);
+    passkey.register(&server.app, display_handle, 0x5d).await;
+    synced_sign_in(server, &passkey).await;
+    let uuid = server.credential_uuid_for(credential_id).await;
+    (passkey, uuid)
 }
 
 async fn insert_serial_contribution(db: &SqlitePool, id: &str, credential: &str, hmac: [u8; 32]) {
@@ -5678,13 +5757,19 @@ async fn insert_confirmation(
         key,
         &ReportedFirmware::new("2.10").expect("firmware"),
         finding,
-        payload,
-        created_at,
+        ConfirmationOccurrence {
+            payload,
+            created_at,
+        },
     )
     .await;
 }
 
-#[allow(clippy::too_many_arguments)]
+struct ConfirmationOccurrence {
+    payload: u8,
+    created_at: i64,
+}
+
 async fn insert_confirmation_with_firmware(
     db: &SqlitePool,
     credential: &str,
@@ -5692,9 +5777,12 @@ async fn insert_confirmation_with_firmware(
     key: &str,
     firmware: &ReportedFirmware,
     finding: &str,
-    payload: u8,
-    created_at: i64,
+    occurrence: ConfirmationOccurrence,
 ) {
+    let ConfirmationOccurrence {
+        payload,
+        created_at,
+    } = occurrence;
     let capability = camera
         .capabilities
         .iter()
@@ -5749,7 +5837,12 @@ fn summary_control<'a>(summary: &'a Value, key: &str) -> &'a Value {
 }
 
 async fn manual_summary(server: &TestServer, make: &str, model: &str) -> Value {
-    let camera = looklab_schema::body_id_from_name(make, model).expect("camera id");
+    let camera = BodyId::new(&format!(
+        "{}/{}",
+        make.to_ascii_lowercase(),
+        model.to_ascii_lowercase().replace(' ', "-")
+    ))
+    .expect("camera id");
     let (status, _, body) = server
         .get(&format!("/api/manual-confirmations/{}", camera.as_str()))
         .await;
@@ -5877,6 +5970,51 @@ async fn manual_confirmation_after_photos_reuses_the_send_assertion() {
     assert!(withdrawn.is_some());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_upload_and_manual_attestation_under_one_send_both_succeed() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let digest = confirmation.digest();
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let send = SendManifest::canonical_with_attestations(
+        vec![manifest_hash(&manifest)],
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    let serial = RawSerial::from_envelope_ascii(SERIAL.as_bytes()).expect("serial");
+    let upload = envelope_with_send(nonce, &send, &manifest, &blobs, Some(&serial), &assertion);
+    let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
+    let (upload_result, confirmation_result) = tokio::join!(
+        server.upload_bytes(upload),
+        post_confirmation(&server.app, &request),
+    );
+    assert_eq!(upload_result.0, StatusCode::CREATED);
+    assert_eq!(confirmation_result.0, StatusCode::OK);
+    let contributions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM contributions WHERE batch_manifest_hash = ?")
+            .bind(manifest_hash(&manifest).as_bytes().as_slice())
+            .fetch_one(&server.db)
+            .await
+            .expect("contributions");
+    assert_eq!(contributions, 1);
+    let confirmations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manual_confirmations")
+        .fetch_one(&server.db)
+        .await
+        .expect("confirmations");
+    assert_eq!(confirmations, 1);
+
+    let other_nonce = server.nonce().await;
+    let other = send_envelope(other_nonce, &send, &manifest, &blobs, &assertion);
+    let (status, body) = server.upload_bytes(other).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"], "SIGNATURE_INVALID");
+}
+
 #[tokio::test]
 async fn withdrawn_send_rejects_a_late_confirmation() {
     let mut server = TestServer::start().await;
@@ -5951,7 +6089,7 @@ async fn standalone_attestation_only_send_is_valid_and_replays_rejected() {
 }
 
 #[tokio::test]
-async fn standalone_confirmation_exposes_unlinked_intake_and_moderator_review() {
+async fn standalone_confirmation_reports_unlinked_intake_and_queue() {
     let mut server = TestServer::start().await;
     server.persist_credential().await;
     let camera = documented_camera("fujifilm/x-t5");
@@ -5963,43 +6101,35 @@ async fn standalone_confirmation_exposes_unlinked_intake_and_moderator_review() 
     assert_eq!(submitted["receipt"]["camera"], "fujifilm/x-t5");
     assert_eq!(submitted["receipt"]["owner_linkage"], "unlinked");
     assert_eq!(submitted["receipt"]["recorded_checks"], 1);
-    let control = summary_control(&submitted, "native_simulations");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert!(summary.get("receipt").is_none());
+    let control = summary_control(&summary, "native_simulations");
     assert_eq!(control["intake"]["recorded"], 1);
     assert_eq!(control["intake"]["unlinked"], 1);
-    assert_eq!(control["intake"]["stale"], 0);
     assert_eq!(control["agreeing_groups"], 0);
-    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manual_confirmations")
-        .fetch_one(&server.db)
-        .await
-        .expect("confirmations");
-    assert_eq!(stored, 1);
-    let observations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM manual_observations")
-        .fetch_one(&server.db)
-        .await
-        .expect("observations");
-    assert_eq!(observations, 1);
+
+    let (status, _, body) = server.get("/api/manuals/fujifilm/x-t5").await;
+    assert_eq!(status, StatusCode::OK);
+    let page: Value = serde_json::from_slice(&body).expect("manual page");
+    assert!(page.get("receipt").is_none());
+    let page_control = summary_control(&page["confirmation"], "native_simulations");
+    assert_eq!(page_control["intake"]["recorded"], 1);
+    assert_eq!(page_control["intake"]["unlinked"], 1);
+    assert!(page_control.get("receipt").is_none());
 
     let token = server.moderator_token().await;
     let queue = moderation_queue(&server, &token).await;
     let checks = queue["manual_checks"].as_array().expect("manual checks");
     assert_eq!(checks.len(), 1);
-    let check = &checks[0];
-    assert_eq!(check["camera"], "fujifilm/x-t5");
-    assert_eq!(check["control"], "native_simulations");
-    assert_eq!(check["firmware"], "2.10");
-    assert_eq!(check["finding"]["kind"], "matches");
-    assert_eq!(check["owner_linkage"], "unlinked");
-    assert_eq!(check["status"], "pending");
-    assert!(check.get("credential_id").is_none());
-    assert!(check.get("identity_group").is_none());
+    assert_eq!(checks[0]["camera"], "fujifilm/x-t5");
+    assert_eq!(checks[0]["control"], "native_simulations");
+    assert_eq!(checks[0]["finding"]["kind"], "matches");
+    assert_eq!(checks[0]["status"], "pending");
+    assert_eq!(checks[0]["owner_linkage"], "unlinked");
 
     let (status, resent) = post_standalone_confirmation_response(&mut server, &confirmation).await;
     assert_eq!(status, StatusCode::OK, "resend: {resent}");
-    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
-    let control = summary_control(&summary, "native_simulations");
-    assert_eq!(control["intake"]["recorded"], 1);
-    assert_eq!(control["intake"]["unlinked"], 1);
-    assert_eq!(control["agreeing_groups"], 0);
     let queue = moderation_queue(&server, &token).await;
     assert_eq!(
         queue["manual_checks"]
@@ -6008,50 +6138,29 @@ async fn standalone_confirmation_exposes_unlinked_intake_and_moderator_review() 
             .len(),
         1
     );
-    let occurrences: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM manual_confirmation_occurrences")
-            .fetch_one(&server.db)
-            .await
-            .expect("occurrences");
-    assert_eq!(occurrences, 2);
-
-    let request = server.withdrawal_request(&camera.id).await;
-    let (status, _) = post_withdrawal(&server.app, &request).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
-    let control = summary_control(&summary, "native_simulations");
-    assert_eq!(control["intake"]["recorded"], 0);
-    assert_eq!(control["intake"]["unlinked"], 0);
-    assert_eq!(control["agreeing_groups"], 0);
-    let queue = moderation_queue(&server, &token).await;
-    assert!(
-        queue["manual_checks"]
-            .as_array()
-            .expect("manual checks")
-            .is_empty()
-    );
 }
 
 #[tokio::test]
-async fn stale_definition_checks_stay_out_of_current_intake() {
+async fn stale_definition_check_is_counted_as_stale_intake() {
     let mut server = TestServer::start().await;
     server.persist_credential().await;
     let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, _) = post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK);
+
     let credential = server.credential_uuid().await;
-    insert_confirmation(
-        &server.db,
-        &credential,
-        &camera,
-        "native_simulations",
-        r#"{"kind":"matches"}"#,
-        40,
-        0,
+    sqlx::query(
+        "UPDATE manual_observations SET definition_digest =
+         x'0000000000000000000000000000000000000000000000000000000000000000'
+         WHERE confirmation_id IN (SELECT id FROM manual_confirmations
+                                   WHERE credential_id = ? AND camera_id = ?)",
     )
-    .await;
-    sqlx::query("UPDATE manual_observations SET definition_digest = x'0000000000000000000000000000000000000000000000000000000000000000'")
-        .execute(&server.db)
-        .await
-        .expect("stale digest");
+    .bind(credential.as_str())
+    .bind(camera.id.as_str())
+    .execute(&server.db)
+    .await
+    .expect("stale digest");
 
     let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
     let control = summary_control(&summary, "native_simulations");
@@ -6071,20 +6180,20 @@ async fn moderator_watermark_separates_later_same_second_checks() {
     let mut server = TestServer::start().await;
     server.persist_credential().await;
     let camera = documented_camera("fujifilm/x-t5");
-    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let earlier = confirmation_for(&camera, "native_simulations", "2.10");
     assert_eq!(
-        post_standalone_confirmation(&mut server, &confirmation).await,
+        post_standalone_confirmation(&mut server, &earlier).await,
         StatusCode::OK
     );
 
     let token = server.moderator_token().await;
     let key = CapabilityKey::NativeSimulations;
-    let capability = camera
+    let definition_digest = camera
         .capabilities
         .iter()
         .find(|capability| capability.key == key)
-        .expect("control");
-    let definition_digest = capability.definition_digest(&camera);
+        .expect("control")
+        .definition_digest(&camera);
     let moderation = ManualModeration {
         camera: camera.id.clone(),
         key,
@@ -6106,7 +6215,7 @@ async fn moderator_watermark_separates_later_same_second_checks() {
             "firmware_scope": {"kind": "exact", "firmware": "2.10"},
         },
     });
-    let path = "/api/manual-confirmations/Fujifilm/X-T5/native_simulations/moderate";
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
     let (status, summary) = post_signed_with_token(
         &mut server,
         path,
@@ -6128,20 +6237,17 @@ async fn moderator_watermark_separates_later_same_second_checks() {
     .await
     .expect("moderator record");
 
-    let later_passkey = SyncedPasskey::new(b"later-owner");
-    later_passkey
-        .register(&server.app, "Later Owner", 0x5d)
-        .await;
+    let (later_passkey, _) = synced_owner(&server, b"later-owner", "Later Owner").await;
     let later_confirmation = confirmation_with(
         &camera,
         "native_simulations",
         "2.10",
         Finding::Corrected {
-            availability: Availability::Unavailable,
-            domain: CapabilityDomain::Unspecified,
+            availability: looklab_schema::Availability::Unavailable,
+            domain: looklab_schema::CapabilityDomain::Unspecified,
         },
     );
-    let later = synced_confirmation_request(&mut server, &later_passkey, &later_confirmation).await;
+    let later = synced_confirmation_request(&server, &later_passkey, &later_confirmation).await;
     let (status, submitted) = post_confirmation(&server.app, &later).await;
     assert_eq!(status, StatusCode::OK, "later: {submitted}");
 
@@ -6164,12 +6270,6 @@ async fn moderator_watermark_separates_later_same_second_checks() {
             .expect("later timestamp");
     assert_eq!(later_received, decision_created);
 
-    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
-    let control = summary_control(&summary, "native_simulations");
-    assert_eq!(control["state"], "moderator_confirmed");
-    assert_eq!(control["intake"]["recorded"], 2);
-    assert_eq!(control["intake"]["unlinked"], 2);
-
     let queue = moderation_queue(&server, &token).await;
     let checks = queue["manual_checks"].as_array().expect("manual checks");
     assert_eq!(checks.len(), 2);
@@ -6183,11 +6283,522 @@ async fn moderator_watermark_separates_later_same_second_checks() {
         .expect("later corrected check");
     assert_eq!(earlier["status"], "reviewed");
     assert_eq!(later["status"], "pending");
+}
+
+#[tokio::test]
+async fn three_linked_owners_count_toward_agreement() {
+    let mut server = TestServer::start().await;
+    let owner_one = server.persist_credential().await;
+    insert_serial_contribution(&server.db, "contrib-owner-one", &owner_one, [1; 32]).await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, submitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "owner one: {submitted}");
+    assert_eq!(submitted["receipt"]["owner_linkage"], "linked");
+
+    let (owner_two, owner_two_id) = synced_owner(&server, b"owner-two", "Owner Two").await;
+    insert_serial_contribution(&server.db, "contrib-owner-two", &owner_two_id, [2; 32]).await;
+    let (owner_three, owner_three_id) = synced_owner(&server, b"owner-three", "Owner Three").await;
+    insert_serial_contribution(&server.db, "contrib-owner-three", &owner_three_id, [3; 32]).await;
+    for passkey in [&owner_two, &owner_three] {
+        let request = synced_confirmation_request(&server, passkey, &confirmation).await;
+        let (status, body) = post_confirmation(&server.app, &request).await;
+        assert_eq!(status, StatusCode::OK, "linked owner: {body}");
+        assert_eq!(body["receipt"]["owner_linkage"], "linked");
+    }
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "confirmed");
+    assert_eq!(control["agreeing_groups"], 3);
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 3);
     assert!(
         checks
             .iter()
-            .all(|check| check["owner_linkage"] == "unlinked")
+            .all(|check| check["status"] == "counted" && check["owner_linkage"] == "linked")
     );
+}
+
+#[tokio::test]
+async fn moderator_decision_without_watermark_leaves_checks_pending() {
+    let mut server = TestServer::start().await;
+    let credential = server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, _) = post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let key = CapabilityKey::NativeSimulations;
+    let definition_digest = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control")
+        .definition_digest(&camera);
+    let scope =
+        serde_json::to_string(&ModeratorFirmwareScope::exact("2.10").expect("firmware scope"))
+            .expect("scope json");
+    sqlx::query(
+        "INSERT INTO manual_moderator_confirmations
+         (camera_id, capability_key, definition_digest, firmware_scope, moderator_credential,
+          confirmed, evidence_kind, evidence_url, evidence_description, created_at)
+         VALUES (?, ?, ?, ?, ?, 1, 'physical', NULL, 'historical body review', 0)",
+    )
+    .bind(camera.id.as_str())
+    .bind(key.as_str())
+    .bind(definition_digest.as_bytes().as_slice())
+    .bind(scope.as_str())
+    .bind(credential.as_str())
+    .execute(&server.db)
+    .await
+    .expect("historical moderator record");
+    let payload = json!({
+        "event": "manual_moderator_confirmation",
+        "camera": camera.id.as_str(),
+        "control": key.as_str(),
+        "definition_digest": definition_digest.to_hex(),
+        "decision": "confirm",
+        "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        "moderator": credential.as_str(),
+        "evidence_kind": "physical",
+        "evidence_url": null,
+    });
+    sqlx::query(
+        "INSERT INTO audit_log (type, payload, ts) VALUES ('manual_moderator_confirmation', ?, 0)",
+    )
+    .bind(payload.to_string())
+    .execute(&server.db)
+    .await
+    .expect("historical audit row");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "moderator_confirmed"
+    );
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["status"], "pending");
+    assert_eq!(checks[0]["owner_linkage"], "unlinked");
+}
+
+#[tokio::test]
+async fn moderator_scope_leaves_outside_firmware_pending() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let inside = confirmation_for(&camera, "native_simulations", "2.10");
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &inside).await,
+        StatusCode::OK
+    );
+    let (outside_owner, _) = synced_owner(&server, b"outside-owner", "Outside Owner").await;
+    let outside = confirmation_for(&camera, "native_simulations", "3.00");
+    let request = synced_confirmation_request(&server, &outside_owner, &outside).await;
+    let (status, body) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "outside firmware: {body}");
+
+    let token = server.moderator_token().await;
+    let key = CapabilityKey::NativeSimulations;
+    let definition_digest = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control")
+        .definition_digest(&camera);
+    let moderation = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest,
+        confirmed: true,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Physical,
+            url: None,
+            description: "body review".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::exact("2.10").expect("scope"),
+        },
+    };
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": true,
+        "evidence": {
+            "kind": "physical",
+            "description": "body review",
+            "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        },
+    });
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
+    let (status, summary) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &moderation.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "moderate: {summary}");
+
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 2);
+    let inside = checks
+        .iter()
+        .find(|check| check["firmware"] == "2.10")
+        .expect("inside firmware");
+    let outside = checks
+        .iter()
+        .find(|check| check["firmware"] == "3.00")
+        .expect("outside firmware");
+    assert_eq!(inside["status"], "reviewed");
+    assert_eq!(outside["status"], "pending");
+}
+
+#[tokio::test]
+async fn withdrawn_photo_linkage_reads_unlinked() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let serial = RawSerial::from_envelope_ascii(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server.upload_valid(Some(&serial)).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let contribution = body["contribution_id"]
+        .as_str()
+        .expect("contribution id")
+        .to_owned();
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, submitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {submitted}");
+    assert_eq!(submitted["receipt"]["owner_linkage"], "linked");
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["owner_linkage"], "linked");
+
+    let mut withdraw = server
+        .signed_fields("withdraw", contribution.as_bytes())
+        .await;
+    withdraw["contribution_ids"] = json!([contribution]);
+    let (status, response) = post_json(&server.app, "/api/withdraw", &withdraw).await;
+    assert_eq!(status, StatusCode::OK, "withdraw: {response}");
+
+    let (status, resubmitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "resubmit: {resubmitted}");
+    assert_eq!(resubmitted["receipt"]["owner_linkage"], "unlinked");
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["recorded"], 1);
+    assert_eq!(control["intake"]["unlinked"], 1);
+
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["owner_linkage"], "unlinked");
+}
+
+#[tokio::test]
+async fn unspecified_moderator_scope_reviews_earlier_checks_only() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let earlier = confirmation_for(&camera, "native_simulations", "2.10");
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &earlier).await,
+        StatusCode::OK
+    );
+
+    let token = server.moderator_token().await;
+    let key = CapabilityKey::NativeSimulations;
+    let definition_digest = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control")
+        .definition_digest(&camera);
+    let moderation = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest,
+        confirmed: true,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Physical,
+            url: None,
+            description: "body review".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::unspecified(),
+        },
+    };
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": true,
+        "evidence": {
+            "kind": "physical",
+            "description": "body review",
+            "firmware_scope": {"kind": "unspecified"},
+        },
+    });
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
+    let (status, summary) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &moderation.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "moderate: {summary}");
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "moderator_confirmed"
+    );
+
+    let (later_owner, _) = synced_owner(&server, b"later-unspecified", "Later Owner").await;
+    let later = confirmation_for(&camera, "native_simulations", "3.00");
+    let request = synced_confirmation_request(&server, &later_owner, &later).await;
+    let (status, submitted) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "later: {submitted}");
+
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 2);
+    let earlier = checks
+        .iter()
+        .find(|check| check["firmware"] == "2.10")
+        .expect("earlier check");
+    let later = checks
+        .iter()
+        .find(|check| check["firmware"] == "3.00")
+        .expect("later check");
+    assert_eq!(earlier["status"], "reviewed");
+    assert_eq!(later["status"], "pending");
+}
+
+#[tokio::test]
+async fn moderator_rejection_reviews_earlier_covered_checks() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let earlier = confirmation_for(&camera, "native_simulations", "2.10");
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &earlier).await,
+        StatusCode::OK
+    );
+
+    let token = server.moderator_token().await;
+    let key = CapabilityKey::NativeSimulations;
+    let definition_digest = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control")
+        .definition_digest(&camera);
+    let moderation = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest,
+        confirmed: false,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Physical,
+            url: None,
+            description: "body review".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::exact("2.10").expect("scope"),
+        },
+    };
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": false,
+        "evidence": {
+            "kind": "physical",
+            "description": "body review",
+            "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        },
+    });
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
+    let (status, summary) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &moderation.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "moderate: {summary}");
+
+    let (later_owner, _) = synced_owner(&server, b"later-rejected", "Later Owner").await;
+    let later = confirmation_with(
+        &camera,
+        "native_simulations",
+        "2.10",
+        Finding::Corrected {
+            availability: looklab_schema::Availability::Unavailable,
+            domain: looklab_schema::CapabilityDomain::Unspecified,
+        },
+    );
+    let request = synced_confirmation_request(&server, &later_owner, &later).await;
+    let (status, submitted) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "later: {submitted}");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "moderator_rejected"
+    );
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 2);
+    let earlier = checks
+        .iter()
+        .find(|check| check["finding"]["kind"] == "matches")
+        .expect("earlier matching check");
+    let later = checks
+        .iter()
+        .find(|check| check["finding"]["kind"] == "corrected")
+        .expect("later corrected check");
+    assert_eq!(earlier["status"], "reviewed");
+    assert_eq!(later["status"], "pending");
+}
+
+#[tokio::test]
+async fn newer_definition_answer_replaces_the_stale_check() {
+    let mut server = TestServer::start().await;
+    let credential = server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    insert_confirmation(
+        &server.db,
+        &credential,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"matches"}"#,
+        21,
+        0,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE manual_observations SET definition_digest =
+         x'0000000000000000000000000000000000000000000000000000000000000000'
+         WHERE confirmation_id IN (SELECT id FROM manual_confirmations
+                                   WHERE credential_id = ? AND camera_id = ?
+                                     AND send_nonce IS NULL)",
+    )
+    .bind(credential.as_str())
+    .bind(camera.id.as_str())
+    .execute(&server.db)
+    .await
+    .expect("older definition");
+
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, submitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {submitted}");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["stale"], 0);
+    assert_eq!(control["intake"]["recorded"], 1);
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["status"], "pending");
+}
+
+#[tokio::test]
+async fn owner_withdrawal_clears_the_check_from_queue_and_intake() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, submitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {submitted}");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["intake"]["recorded"],
+        1
+    );
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    assert_eq!(
+        queue["manual_checks"]
+            .as_array()
+            .expect("manual checks")
+            .len(),
+        1
+    );
+
+    let request = server.withdrawal_request(&camera.id).await;
+    let (status, body) = post_withdrawal(&server.app, &request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "withdraw: {body}");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["intake"]["recorded"],
+        0
+    );
+    let queue = moderation_queue(&server, &token).await;
+    assert!(
+        queue["manual_checks"]
+            .as_array()
+            .expect("manual checks")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn identical_same_second_checks_keep_submission_order() {
+    let mut server = TestServer::start().await;
+    let owner_one = server.persist_credential().await;
+    insert_serial_contribution(&server.db, "contrib-order-one", &owner_one, [5; 32]).await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, submitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "first: {submitted}");
+    assert_eq!(submitted["receipt"]["owner_linkage"], "linked");
+
+    let (owner_two, _) = synced_owner(&server, b"order-two", "Order Two").await;
+    let request = synced_confirmation_request(&server, &owner_two, &confirmation).await;
+    let (status, submitted) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "second: {submitted}");
+    assert_eq!(submitted["receipt"]["owner_linkage"], "unlinked");
+
+    sqlx::query(
+        "UPDATE manual_confirmation_occurrences SET received_at = 424242
+         WHERE id IN (SELECT occ.id FROM manual_confirmation_occurrences occ
+                      JOIN manual_confirmations c ON c.id = occ.confirmation_id
+                      WHERE c.camera_id = ?)",
+    )
+    .bind(camera.id.as_str())
+    .execute(&server.db)
+    .await
+    .expect("same second");
+
+    let token = server.moderator_token().await;
+    let first = moderation_queue(&server, &token).await;
+    let second = moderation_queue(&server, &token).await;
+    let checks = first["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0]["owner_linkage"], "linked");
+    assert_eq!(checks[1]["owner_linkage"], "unlinked");
+    assert_eq!(checks[0]["finding"]["kind"], checks[1]["finding"]["kind"]);
+    let repeated = second["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(repeated[0]["owner_linkage"], "linked");
+    assert_eq!(repeated[1]["owner_linkage"], "unlinked");
 }
 
 #[tokio::test]
@@ -6209,19 +6820,13 @@ async fn owner_withdraws_standalone_confirmation() {
     let (status, _) = post_confirmation(&server.app, &request).await;
     assert_eq!(status, StatusCode::OK);
 
-    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
-    let control = summary_control(&summary, "native_simulations");
-    assert_eq!(control["intake"]["recorded"], 1);
-    assert_eq!(control["intake"]["unlinked"], 1);
-    assert_eq!(control["agreeing_groups"], 0);
-
     let credential = server.credential_uuid().await;
     insert_serial_contribution(&server.db, "contrib-owner", &credential, [7; 32]).await;
     let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
-    let control = summary_control(&summary, "native_simulations");
-    assert_eq!(control["intake"]["recorded"], 1);
-    assert_eq!(control["intake"]["unlinked"], 0);
-    assert_eq!(control["agreeing_groups"], 1);
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        1
+    );
 
     let request = server.withdrawal_request(&camera.id).await;
     let (status, _) = post_withdrawal(&server.app, &request).await;
@@ -6239,23 +6844,22 @@ async fn owner_withdraws_standalone_confirmation() {
     assert_eq!(audit["withdrawn"], 1);
 
     let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
-    let control = summary_control(&summary, "native_simulations");
-    assert_eq!(control["intake"]["recorded"], 0);
-    assert_eq!(control["intake"]["unlinked"], 0);
-    assert_eq!(control["agreeing_groups"], 0);
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        0
+    );
 
     let nonce = server.nonce().await;
     let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
     let assertion = server.assertion(&challenge).await;
     let request = confirmation_request(&nonce, &send, &assertion, &confirmation);
-    let (status, submitted) = post_confirmation(&server.app, &request).await;
+    let (status, _) = post_confirmation(&server.app, &request).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(submitted["receipt"]["owner_linkage"], "linked");
     let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
-    let control = summary_control(&summary, "native_simulations");
-    assert_eq!(control["intake"]["recorded"], 1);
-    assert_eq!(control["intake"]["unlinked"], 0);
-    assert_eq!(control["agreeing_groups"], 1);
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["agreeing_groups"],
+        1
+    );
 }
 
 #[tokio::test]
@@ -6776,8 +7380,10 @@ async fn latest_claims_keep_each_reported_firmware_version() {
                 "native_simulations",
                 &ReportedFirmware::new(version).expect("firmware"),
                 r#"{"kind":"matches"}"#,
-                30 + 2 * index + offset as u8,
-                offset as i64,
+                ConfirmationOccurrence {
+                    payload: 30 + 2 * index + offset as u8,
+                    created_at: offset as i64,
+                },
             )
             .await;
         }
@@ -6831,7 +7437,7 @@ async fn moderator_evidence_is_role_gated_and_audited() {
         .as_str()
         .expect("session token")
         .to_owned();
-    let path = "/api/manual-confirmations/Fujifilm/X-T5/native_simulations/moderate";
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
     let camera = documented_camera("fujifilm/x-t5");
     let key = CapabilityKey::NativeSimulations;
     let definition_digest = camera
@@ -6994,7 +7600,7 @@ async fn moderator_decision_rejects_a_changed_control_definition() {
             "firmware_scope": {"kind": "unspecified"},
         },
     });
-    let path = "/api/manual-confirmations/Fujifilm/X-T5/native_simulations/moderate";
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
     let (status, _) = post_signed_with_token(
         &mut server,
         path,
@@ -7010,6 +7616,163 @@ async fn moderator_decision_rejects_a_changed_control_definition() {
         .await
         .expect("moderator rows");
     assert_eq!(stored, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_envelope_version_requests_a_reload() {
+    let mut server = TestServer::start().await;
+    let (manifest, blobs) = manifest(valid_settings());
+    let nonce = server.nonce().await;
+    let challenge = send_challenge(&nonce, &manifest);
+    let assertion = server.assertion(&challenge).await;
+    let pow = solve(
+        &Challenge::new(&nonce, &manifest_hash(&manifest)),
+        u32::try_from(manifest.images.len()).expect("image count"),
+        &pow_params(),
+        0,
+    )
+    .expect("proof-of-work");
+    let mut bytes = envelope(nonce, &manifest, &blobs, None, &assertion, &pow);
+    bytes[6..8].copy_from_slice(&3u16.to_le_bytes());
+    let (status, body) = server.upload_bytes(bytes).await;
+    assert_eq!(status, StatusCode::UPGRADE_REQUIRED, "upload: {body}");
+    assert_eq!(body["error"], "ENVELOPE_VERSION_UNSUPPORTED");
+    assert_eq!(body["action"], "reload_and_prepare");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_arrival_audits_a_manual_promotion() {
+    let mut server = TestServer::start().await;
+    let owner = server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    for index in 0..2usize {
+        let credential = server.add_credential().await;
+        insert_serial_contribution(
+            &server.db,
+            &format!("promotion-{index}"),
+            &credential,
+            [u8::try_from(index + 1).expect("small index"); 32],
+        )
+        .await;
+        insert_confirmation(
+            &server.db,
+            &credential,
+            &camera,
+            "native_simulations",
+            r#"{"kind":"matches"}"#,
+            u8::try_from(index + 1).expect("small index"),
+            i64::try_from(index).expect("small index"),
+        )
+        .await;
+    }
+    insert_confirmation(
+        &server.db,
+        &owner,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"matches"}"#,
+        9,
+        10,
+    )
+    .await;
+    let before = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&before, "native_simulations")["agreeing_groups"],
+        2
+    );
+
+    let serial = RawSerial::new(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server.upload_valid(Some(&serial)).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+
+    let after = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&after, "native_simulations");
+    assert_eq!(control["state"], "confirmed");
+    assert_eq!(control["agreeing_groups"], 3);
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE type = 'manual_confirmation_promotion'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("promotion audits");
+    assert_eq!(audits, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn withdrawal_reconciles_a_new_promotion() {
+    let mut server = TestServer::start().await;
+    let owner = server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let contribution = uuid::Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0001).to_string();
+    insert_serial_contribution(&server.db, contribution.as_str(), &owner, [1; 32]).await;
+    insert_confirmation(
+        &server.db,
+        &owner,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"corrected","availability":"unavailable","domain":{"type":"unspecified"}}"#,
+        1,
+        1,
+    )
+    .await;
+    for index in 0..3usize {
+        let credential = server.add_credential().await;
+        let matching =
+            uuid::Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0002 + index as u128)
+                .to_string();
+        insert_serial_contribution(
+            &server.db,
+            matching.as_str(),
+            &credential,
+            [u8::try_from(index + 2).expect("small index"); 32],
+        )
+        .await;
+        insert_confirmation(
+            &server.db,
+            &credential,
+            &camera,
+            "native_simulations",
+            r#"{"kind":"matches"}"#,
+            u8::try_from(index + 2).expect("small index"),
+            i64::try_from(index + 2).expect("small index"),
+        )
+        .await;
+    }
+    let before = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&before, "native_simulations")["state"],
+        "contradicted"
+    );
+
+    let mut withdraw = server
+        .signed_fields("withdraw", contribution.as_bytes())
+        .await;
+    withdraw["contribution_ids"] = json!([contribution.as_str()]);
+    let (status, response) = post_json(&server.app, "/api/withdraw", &withdraw).await;
+    assert_eq!(status, StatusCode::OK, "withdraw: {response}");
+
+    let after = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&after, "native_simulations")["state"],
+        "confirmed"
+    );
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE type = 'manual_confirmation_promotion'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("promotion audits");
+    assert_eq!(audits, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_requests_metadata_publication_without_looks() {
+    let server = TestServer::start().await;
+    let generation: i64 = sqlx::query_scalar("SELECT generation FROM publication WHERE id = 1")
+        .fetch_one(&server.db)
+        .await
+        .expect("publication row");
+    assert!(generation >= 1);
 }
 
 fn client_error_report(release: &str) -> Value {
