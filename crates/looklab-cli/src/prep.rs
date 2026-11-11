@@ -336,11 +336,15 @@ fn report_folder(dir: &Path) -> Result<()> {
         });
         let metadata = match parsed {
             Ok(metadata) => metadata,
-            Err(_) => {
-                eprintln!(
-                    "{}: This file couldn't be decoded (decoder error).",
-                    path.display()
-                );
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|message| (*message).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned());
+                match message {
+                    Some(message) => eprintln!("{}: {message}", path.display()),
+                    None => eprintln!("{}: metadata parsing panicked", path.display()),
+                }
                 unreadable.push(name);
                 continue;
             }

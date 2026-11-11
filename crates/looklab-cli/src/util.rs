@@ -77,20 +77,19 @@ pub enum FileResult<T> {
     Failed,
 }
 
-/// Decode or prep one file, containing a panic and reporting a decoder error.
+/// Decode or prep one file, containing a panic and reporting the step's error.
 /// The caller decides whether the remaining files are worth processing.
 pub fn catch_file<T>(file: &Path, step: impl FnOnce() -> Result<T>) -> FileResult<T> {
     match catch_panic(step) {
         Ok(Ok(value)) => FileResult::Done(value),
         Ok(Err(error)) => {
-            report_decoder_error(file);
-            eprintln!("  {error:#}");
+            eprintln!("{}: {error:#}", file.display());
             FileResult::Failed
         }
         Err(payload) => {
-            report_decoder_error(file);
-            if let Some(message) = panic_message(payload) {
-                eprintln!("  {message}");
+            match panic_message(payload) {
+                Some(message) => eprintln!("{}: preparation panicked: {message}", file.display()),
+                None => eprintln!("{}: preparation panicked", file.display()),
             }
             FileResult::Failed
         }
@@ -99,13 +98,6 @@ pub fn catch_file<T>(file: &Path, step: impl FnOnce() -> Result<T>) -> FileResul
 
 pub fn catch_panic<T>(step: impl FnOnce() -> T) -> Result<T, Box<dyn std::any::Any + Send>> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(step))
-}
-
-fn report_decoder_error(file: &Path) {
-    eprintln!(
-        "{}: This file couldn't be decoded (decoder error).",
-        file.display()
-    );
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> Option<String> {
