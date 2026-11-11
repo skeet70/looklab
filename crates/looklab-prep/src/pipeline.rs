@@ -26,7 +26,7 @@ use crate::sample::{PixelSelection, SampleParams, select_pixels};
 use crate::seed::SamplingSeed;
 
 /// Registered preparation version id, [docs/03 §2.2](../../../docs/03-data-model.md).
-pub const PREP_VERSION: u32 = 3;
+pub const PREP_VERSION: u32 = 4;
 
 const DEFAULT_DOWNSAMPLE_MAX_PIXELS: u32 = 1_500_000;
 
@@ -706,6 +706,14 @@ fn prepare_selection<J: JpegPixels + ?Sized>(
 
     let mut mask = build_mask(&downsampled, &params.mask);
     mask.exclude_clipped(&clipped_flags);
+    mask.exclude_outside(&jpeg_overlap(
+        &alignment,
+        reference.width(),
+        reference.height(),
+        &downsampled,
+        raw_width,
+        raw_height,
+    ));
     if let Some(region) = options.chart {
         mask.exclude_region(&chart_exclusion(
             region,
@@ -940,6 +948,55 @@ impl LinearPixels for ClipMask<'_> {
         let clipped = channels.iter().any(|channel| *channel >= RAW_CLIP_LEVEL);
         Some([if clipped { 1.0 } else { 0.0 }; 3])
     }
+}
+
+/// Downsampled RAW pixels whose sampling footprint lies outside the JPEG's
+/// field of view. An aspect-ratio crop leaves part of the RAW without a JPEG
+/// counterpart; those pixels cannot carry a sample.
+fn jpeg_overlap(
+    alignment: &Alignment,
+    jpeg_width: u32,
+    jpeg_height: u32,
+    target: &Image3,
+    raw_width: u32,
+    raw_height: u32,
+) -> Vec<bool> {
+    let scale_x = f64::from(raw_width) / f64::from(target.width);
+    let scale_y = f64::from(raw_height) / f64::from(target.height);
+    let max_x = f64::from(jpeg_width) - 1.0;
+    let max_y = f64::from(jpeg_height) - 1.0;
+    let mut outside = vec![false; target.data.len()];
+    for y in 0..target.height {
+        for x in 0..target.width {
+            let centre_x = (f64::from(x) + 0.5) * scale_x - 0.5;
+            let centre_y = (f64::from(y) + 0.5) * scale_y - 0.5;
+            let mut inside = true;
+            for (dx, dy) in [
+                (-0.5, -0.5),
+                (0.5, -0.5),
+                (-0.5, 0.5),
+                (0.5, 0.5),
+                (0.0, 0.0),
+            ] {
+                let raw_x = centre_x + dx * scale_x;
+                let raw_y = centre_y + dy * scale_y;
+                let (jpeg_x, jpeg_y) = alignment.raw_to_jpeg(
+                    raw_x,
+                    raw_y,
+                    raw_width,
+                    raw_height,
+                    jpeg_width,
+                    jpeg_height,
+                );
+                if !(jpeg_x >= 0.0 && jpeg_y >= 0.0 && jpeg_x <= max_x && jpeg_y <= max_y) {
+                    inside = false;
+                    break;
+                }
+            }
+            outside[y as usize * target.width as usize + x as usize] = !inside;
+        }
+    }
+    outside
 }
 
 /// Per-pixel membership of `region`, mapped through the alignment onto the

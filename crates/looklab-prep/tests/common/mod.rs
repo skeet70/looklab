@@ -257,6 +257,7 @@ pub fn jpeg_from(image: Image3) -> DecodedJpeg {
 pub fn identity_alignment() -> Alignment {
     Alignment {
         scale: 1.0,
+        scale_y: 1.0,
         rotation_rad: 0.0,
         tx: 0.0,
         ty: 0.0,

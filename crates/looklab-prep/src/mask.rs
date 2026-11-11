@@ -38,6 +38,8 @@ pub struct MaskCounts {
     pub invalid: usize,
     /// Inside a chart region, counted by [`Mask::exclude_region`].
     pub chart: usize,
+    /// Outside the JPEG's field of view, counted by [`Mask::exclude_outside`].
+    pub outside: usize,
 }
 
 /// Per-pixel keep bits for one image. Reasons are exclusive: border and
@@ -101,6 +103,15 @@ impl Mask {
             if *excluded && self.keep.get(index).copied().unwrap_or(false) {
                 self.keep[index] = false;
                 self.counts.chart += 1;
+            }
+        }
+    }
+
+    pub fn exclude_outside(&mut self, outside: &[bool]) {
+        for (index, excluded) in outside.iter().enumerate() {
+            if *excluded && self.keep.get(index).copied().unwrap_or(false) {
+                self.keep[index] = false;
+                self.counts.outside += 1;
             }
         }
     }
