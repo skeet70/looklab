@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Neutral-anchored domain penalty over the two fitting inverse paths
 //! (docs/02 §3.9).
+//!
+//! The reference tone `T` and the shared output lightness `j` carry the mirrored
+//! pair of logarithmic barriers `-log1p(-x/limit) - log(x/limit)` with one fixed
+//! strength and the caller's sample weight (Fiacco & McCormick, *Nonlinear
+//! Programming*, 1968, §3). The chroma response paths carry the neutral-anchored
+//! Bregman divergence below.
 // The negated comparisons reject NaN together with out-of-range values.
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 
@@ -363,6 +369,10 @@ fn set_symmetric(
 }
 
 /// Evaluate the penalty and its exact derivatives in the seven domain axes.
+///
+/// The value is `-log1p(-T/limit) - log(T/limit) - log1p(-j/limit) - log(j/limit)`
+/// plus the weighted path Bregman divergences; the lower terms contribute
+/// `-1/x` to the gradient and `1/x^2` to the exact and Gauss-Newton Hessians.
 pub fn evaluate(
     values: &LayerValues,
     paths: &ChromaPaths,
@@ -413,12 +423,20 @@ pub fn evaluate(
     let blend = paths.blend;
     let near = 1.0 - blend;
 
-    let tone_slope = 1.0 / (limit - values.t);
-    let tone_curvature = tone_slope * tone_slope;
-    let lightness_slope = 1.0 / (limit - lightness);
-    let lightness_curvature = lightness_slope * lightness_slope;
+    let tone_upper_slope = 1.0 / (limit - values.t);
+    let tone_lower_slope = 1.0 / values.t;
+    let tone_slope = tone_upper_slope - tone_lower_slope;
+    let tone_curvature = tone_upper_slope * tone_upper_slope + tone_lower_slope * tone_lower_slope;
+    let lightness_upper_slope = 1.0 / (limit - lightness);
+    let lightness_lower_slope = 1.0 / lightness;
+    let lightness_slope = lightness_upper_slope - lightness_lower_slope;
+    let lightness_curvature = lightness_upper_slope * lightness_upper_slope
+        + lightness_lower_slope * lightness_lower_slope;
 
-    let value = -libm::log1p(-values.t / limit) - libm::log1p(-lightness / limit)
+    let value = -libm::log1p(-values.t / limit)
+        - libm::log(values.t / limit)
+        - libm::log1p(-lightness / limit)
+        - libm::log(lightness / limit)
         + near * inner.value
         + blend * outer.value;
 
