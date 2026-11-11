@@ -3031,9 +3031,14 @@ async fn three_non_converged_batches_open_one_moderation_item() {
         0
     );
     assert_eq!(count(worker, "SELECT COUNT(*) FROM fit_holds").await, 1);
-    let queue = looklab_server::admin::mod_queue(worker.pool(), looklab_server::Tier::Seeder)
-        .await
-        .expect("moderation queue");
+    let catalog = looklab_schema::ManualCatalog {
+        catalog_version: looklab_schema::MANUAL_CATALOG_VERSION,
+        cameras: Vec::new(),
+    };
+    let queue =
+        looklab_server::admin::mod_queue(worker.pool(), looklab_server::Tier::Seeder, &catalog)
+            .await
+            .expect("moderation queue");
     assert_eq!(queue.fit_holds.len(), 1);
     assert_eq!(queue.fit_holds[0].consecutive, 4);
 }

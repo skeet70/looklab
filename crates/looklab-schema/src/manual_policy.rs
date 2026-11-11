@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ids::BodyId;
 use crate::manual::{
     Availability, CapabilityDomain, CapabilityKey, DocumentedCapability, FirmwareScope,
     FirmwareScopeError, ManualCamera, ManualUrl,
@@ -210,6 +211,13 @@ pub struct ModeratorRecord {
     pub evidence: ModeratorEvidence,
 }
 
+impl ModeratorRecord {
+    /// An unspecified scope covers no firmware.
+    pub fn applies_to(&self, firmware: &ReportedFirmware) -> bool {
+        moderator_applies_to(self, firmware.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfirmationState {
@@ -256,6 +264,17 @@ pub struct FirmwareConfirmation {
     pub confirmed_actual: Option<ConfirmedActual>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManualControlIntake {
+    /// Latest non-withdrawn checks recorded against the current control definition.
+    pub recorded: u32,
+    /// The subset of `recorded` whose profile has no serial-linked photo for this camera.
+    pub unlinked: u32,
+    /// Latest non-withdrawn checks recorded against an older control definition.
+    pub stale: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlConfirmation {
     pub key: CapabilityKey,
@@ -268,6 +287,8 @@ pub struct ControlConfirmation {
     pub firmware: Vec<FirmwareConfirmation>,
     #[serde(default = "default_documented_availability")]
     pub documented_availability: Availability,
+    #[serde(default)]
+    pub intake: ManualControlIntake,
 }
 
 fn default_documented_availability() -> Availability {
@@ -349,6 +370,54 @@ impl ManualConfirmationSummary {
     pub fn human_confirmed(&self) -> bool {
         !self.common_confirmed_firmware().is_empty()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualOwnerLinkage {
+    Linked,
+    Unlinked,
+}
+
+/// What a signed confirmation submission recorded for its sender.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualSubmissionReceipt {
+    pub camera: BodyId,
+    pub owner_linkage: ManualOwnerLinkage,
+    pub recorded_checks: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualConfirmationSubmission {
+    #[serde(flatten)]
+    pub summary: ManualConfirmationSummary,
+    pub receipt: ManualSubmissionReceipt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualCheckReviewStatus {
+    /// Linked owner agreement counted for this firmware.
+    Counted,
+    /// Current, but neither counted nor covered by moderator evidence.
+    Pending,
+    /// Recorded against an older control definition.
+    StaleDefinition,
+    /// Received before a moderator decision that is unscoped or whose firmware scope covers it.
+    Reviewed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualCheckReview {
+    pub camera: BodyId,
+    pub control: CapabilityKey,
+    pub label: String,
+    pub firmware: ReportedFirmware,
+    pub finding: Finding,
+    pub definition_digest: Sha256Hex,
+    pub submitted_at: i64,
+    pub owner_linkage: ManualOwnerLinkage,
+    pub status: ManualCheckReviewStatus,
 }
 
 pub fn evaluate_camera(
@@ -536,6 +605,7 @@ pub fn evaluate_control(
         moderator,
         firmware,
         documented_availability: capability.availability,
+        intake: ManualControlIntake::default(),
     }
 }
 
@@ -657,6 +727,14 @@ fn evaluate_firmware(
 struct ActualClaim {
     availability: Availability,
     domain: CapabilityDomain,
+}
+
+impl ConfirmedActual {
+    /// Whether `finding` claims this availability and domain.
+    pub fn agrees_with(&self, capability: &DocumentedCapability, finding: &Finding) -> bool {
+        let claim = ActualClaim::from_finding(capability, finding);
+        claim.availability == self.availability && claim.domain == self.domain
+    }
 }
 
 impl ActualClaim {

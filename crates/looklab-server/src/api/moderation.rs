@@ -52,7 +52,7 @@ pub async fn session(
 pub async fn queue(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
     let actor = auth::moderator_session(&state, &headers).await?;
     let tier = auth::roles(&state, &actor).await?.tier;
-    let queue: ModQueue = admin::mod_queue(&state.db, tier).await?;
+    let queue: ModQueue = admin::mod_queue(&state.db, tier, state.manuals.catalog()).await?;
     Ok(Json(queue).into_response())
 }
 

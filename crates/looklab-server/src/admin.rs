@@ -2962,11 +2962,16 @@ pub struct ModQueue {
     pub fit_holds: Vec<FitHold>,
     pub serial_reuse: Vec<SerialReuseFlag>,
     pub nominations: Vec<Nomination>,
+    pub manual_checks: Vec<looklab_schema::ManualCheckReview>,
 }
 
 /// The queue a session at `tier` may read; endorsement nominations are seeder-only
 /// (docs/08 §6).
-pub async fn mod_queue(db: &SqlitePool, tier: Tier) -> Result<ModQueue, AdminError> {
+pub async fn mod_queue(
+    db: &SqlitePool,
+    tier: Tier,
+    manual_catalog: &looklab_schema::ManualCatalog,
+) -> Result<ModQueue, AdminError> {
     let proposals = sqlx::query(
         "SELECT id, type, human_summary, created_at FROM proposals
          WHERE status IN ('pending', 'needs_info') ORDER BY created_at, id",
@@ -3099,6 +3104,7 @@ pub async fn mod_queue(db: &SqlitePool, tier: Tier) -> Result<ModQueue, AdminErr
         fit_holds,
         serial_reuse,
         nominations,
+        manual_checks: crate::manual_confirm::reviews(db, manual_catalog).await?,
     })
 }
 

@@ -3301,8 +3301,9 @@ async fn moderator_session_serves_the_queue_and_records_decisions() {
             "INSERT INTO contributions
              (id, credential_id, batch_manifest_hash, signature, pow, kind, serial_hmac, intent,
               body_id, firmware_version, sim_key, settings, status, created_at)
-             VALUES (?, ?, x'00', x'00', 'pow', 'chart', x'abab', 'native',
-                     'fujifilm/x-t5', '2.10', 'classic-chrome', '{}', 'pending', 0)",
+             VALUES (?, ?, x'00', x'00', 'pow', 'chart',
+                     x'0101010101010101010101010101010101010101010101010101010101010101',
+                     'native', 'fujifilm/x-t5', '2.10', 'classic-chrome', '{}', 'pending', 0)",
         )
         .bind(id.as_str())
         .bind(credential)
@@ -4963,6 +4964,92 @@ async fn post_standalone_confirmation(
     post_confirmation(&server.app, &request).await.0
 }
 
+async fn standalone_confirmation_request(
+    server: &mut TestServer,
+    confirmation: &ManualConfirmation,
+) -> ManualConfirmationRequest {
+    let nonce = server.nonce().await;
+    let digest = confirmation.digest();
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = server.assertion(&challenge).await;
+    confirmation_request(&nonce, &send, &assertion, confirmation)
+}
+
+async fn post_standalone_confirmation_response(
+    server: &mut TestServer,
+    confirmation: &ManualConfirmation,
+) -> (StatusCode, Value) {
+    let request = standalone_confirmation_request(server, confirmation).await;
+    post_confirmation(&server.app, &request).await
+}
+
+async fn synced_confirmation_request(
+    server: &TestServer,
+    passkey: &SyncedPasskey,
+    confirmation: &ManualConfirmation,
+) -> ManualConfirmationRequest {
+    let nonce = server.nonce().await;
+    let digest = confirmation.digest();
+    let send = SendManifest::canonical_with_attestations(
+        Vec::new(),
+        vec![AttestationHash::from_bytes(*digest.as_bytes())],
+    )
+    .expect("send manifest");
+    let challenge = Challenge::for_send(&nonce, &send_manifest_hash(&send));
+    let assertion = passkey.assertion(&challenge, 0x1d);
+    ManualConfirmationRequest {
+        nonce: b64(nonce.as_bytes()),
+        credential_id: assertion["credential_id"]
+            .as_str()
+            .expect("credential id")
+            .to_owned(),
+        authenticator_data: assertion["authenticator_data"]
+            .as_str()
+            .expect("authenticator data")
+            .to_owned(),
+        client_data_json: assertion["client_data_json"]
+            .as_str()
+            .expect("client data")
+            .to_owned(),
+        signature: assertion["signature"]
+            .as_str()
+            .expect("signature")
+            .to_owned(),
+        send_manifest: b64(&canonical_send_manifest_bytes(&send)),
+        confirmation: confirmation.clone(),
+    }
+}
+
+async fn synced_sign_in(server: &TestServer, passkey: &SyncedPasskey) {
+    let nonce = server.nonce().await;
+    let challenge = Challenge::new(&nonce, &request_digest(RequestDomain::Session, ""));
+    let request = synced_session_request(
+        &nonce,
+        &challenge,
+        passkey.assertion(&challenge, 0x1d),
+        true,
+    );
+    let (status, body) = post_json(&server.app, "/api/session", &request).await;
+    assert_eq!(status, StatusCode::OK, "session: {body}");
+}
+
+async fn synced_owner(
+    server: &TestServer,
+    credential_id: &[u8],
+    display_handle: &str,
+) -> (SyncedPasskey, String) {
+    let passkey = SyncedPasskey::new(credential_id);
+    passkey.register(&server.app, display_handle, 0x5d).await;
+    synced_sign_in(server, &passkey).await;
+    let uuid = server.credential_uuid_for(credential_id).await;
+    (passkey, uuid)
+}
+
 async fn insert_serial_contribution(db: &SqlitePool, id: &str, credential: &str, hmac: [u8; 32]) {
     sqlx::query(
         "INSERT INTO contributions
@@ -5086,6 +5173,18 @@ async fn manual_summary(server: &TestServer, make: &str, model: &str) -> Value {
         .await;
     assert_eq!(status, StatusCode::OK, "summary: {body:?}");
     serde_json::from_slice(&body).expect("summary json")
+}
+
+async fn moderation_queue(server: &TestServer, token: &str) -> Value {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/mod/queue")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("queue request");
+    let (status, _, body) = send(&server.app, request).await;
+    assert_eq!(status, StatusCode::OK, "queue: {body:?}");
+    serde_json::from_slice(&body).expect("queue json")
 }
 
 async fn post_json_with_token(
@@ -5312,6 +5411,719 @@ async fn standalone_attestation_only_send_is_valid_and_replays_rejected() {
 
     let (status, _) = post_confirmation(&server.app, &request).await;
     assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn standalone_confirmation_reports_unlinked_intake_and_queue() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+
+    let (status, submitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {submitted}");
+    assert_eq!(submitted["receipt"]["camera"], "fujifilm/x-t5");
+    assert_eq!(submitted["receipt"]["owner_linkage"], "unlinked");
+    assert_eq!(submitted["receipt"]["recorded_checks"], 1);
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert!(summary.get("receipt").is_none());
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["recorded"], 1);
+    assert_eq!(control["intake"]["unlinked"], 1);
+    assert_eq!(control["agreeing_groups"], 0);
+
+    let (status, _, body) = server.get("/api/manuals/fujifilm/x-t5").await;
+    assert_eq!(status, StatusCode::OK);
+    let page: Value = serde_json::from_slice(&body).expect("manual page");
+    assert!(page.get("receipt").is_none());
+    let page_control = summary_control(&page["confirmation"], "native_simulations");
+    assert_eq!(page_control["intake"]["recorded"], 1);
+    assert_eq!(page_control["intake"]["unlinked"], 1);
+    assert!(page_control.get("receipt").is_none());
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["camera"], "fujifilm/x-t5");
+    assert_eq!(checks[0]["control"], "native_simulations");
+    assert_eq!(checks[0]["finding"]["kind"], "matches");
+    assert_eq!(checks[0]["status"], "pending");
+    assert_eq!(checks[0]["owner_linkage"], "unlinked");
+
+    let (status, resent) = post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "resend: {resent}");
+    let queue = moderation_queue(&server, &token).await;
+    assert_eq!(
+        queue["manual_checks"]
+            .as_array()
+            .expect("manual checks")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn stale_definition_check_is_counted_as_stale_intake() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, _) = post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let credential = server.credential_uuid().await;
+    sqlx::query(
+        "UPDATE manual_observations SET definition_digest =
+         x'0000000000000000000000000000000000000000000000000000000000000000'
+         WHERE confirmation_id IN (SELECT id FROM manual_confirmations
+                                   WHERE credential_id = ? AND camera_id = ?)",
+    )
+    .bind(credential.as_str())
+    .bind(camera.id.as_str())
+    .execute(&server.db)
+    .await
+    .expect("stale digest");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["recorded"], 0);
+    assert_eq!(control["intake"]["stale"], 1);
+    assert_eq!(control["agreeing_groups"], 0);
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["status"], "stale_definition");
+}
+
+#[tokio::test]
+async fn moderator_watermark_separates_later_same_second_checks() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let earlier = confirmation_for(&camera, "native_simulations", "2.10");
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &earlier).await,
+        StatusCode::OK
+    );
+
+    let token = server.moderator_token().await;
+    let key = CapabilityKey::NativeSimulations;
+    let definition_digest = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control")
+        .definition_digest(&camera);
+    let moderation = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest,
+        confirmed: true,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Physical,
+            url: None,
+            description: "body review".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::exact("2.10").expect("scope"),
+        },
+    };
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": true,
+        "evidence": {
+            "kind": "physical",
+            "description": "body review",
+            "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        },
+    });
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
+    let (status, summary) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &moderation.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "moderate: {summary}");
+
+    let decision_created: i64 = sqlx::query_scalar(
+        "SELECT created_at FROM manual_moderator_confirmations
+         WHERE camera_id = ? AND capability_key = 'native_simulations'
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(camera.id.as_str())
+    .fetch_one(&server.db)
+    .await
+    .expect("moderator record");
+
+    let (later_passkey, _) = synced_owner(&server, b"later-owner", "Later Owner").await;
+    let later_confirmation = confirmation_with(
+        &camera,
+        "native_simulations",
+        "2.10",
+        Finding::Corrected {
+            availability: looklab_schema::Availability::Unavailable,
+            domain: looklab_schema::CapabilityDomain::Unspecified,
+        },
+    );
+    let later = synced_confirmation_request(&server, &later_passkey, &later_confirmation).await;
+    let (status, submitted) = post_confirmation(&server.app, &later).await;
+    assert_eq!(status, StatusCode::OK, "later: {submitted}");
+
+    let later_occurrence: i64 =
+        sqlx::query_scalar("SELECT MAX(id) FROM manual_confirmation_occurrences")
+            .fetch_one(&server.db)
+            .await
+            .expect("later occurrence");
+    sqlx::query("UPDATE manual_confirmation_occurrences SET received_at = ? WHERE id = ?")
+        .bind(decision_created)
+        .bind(later_occurrence)
+        .execute(&server.db)
+        .await
+        .expect("colliding timestamp");
+    let later_received: i64 =
+        sqlx::query_scalar("SELECT received_at FROM manual_confirmation_occurrences WHERE id = ?")
+            .bind(later_occurrence)
+            .fetch_one(&server.db)
+            .await
+            .expect("later timestamp");
+    assert_eq!(later_received, decision_created);
+
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 2);
+    let earlier = checks
+        .iter()
+        .find(|check| check["finding"]["kind"] == "matches")
+        .expect("earlier matching check");
+    let later = checks
+        .iter()
+        .find(|check| check["finding"]["kind"] == "corrected")
+        .expect("later corrected check");
+    assert_eq!(earlier["status"], "reviewed");
+    assert_eq!(later["status"], "pending");
+}
+
+#[tokio::test]
+async fn three_linked_owners_count_toward_agreement() {
+    let mut server = TestServer::start().await;
+    let owner_one = server.persist_credential().await;
+    insert_serial_contribution(&server.db, "contrib-owner-one", &owner_one, [1; 32]).await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, submitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "owner one: {submitted}");
+    assert_eq!(submitted["receipt"]["owner_linkage"], "linked");
+
+    let (owner_two, owner_two_id) = synced_owner(&server, b"owner-two", "Owner Two").await;
+    insert_serial_contribution(&server.db, "contrib-owner-two", &owner_two_id, [2; 32]).await;
+    let (owner_three, owner_three_id) = synced_owner(&server, b"owner-three", "Owner Three").await;
+    insert_serial_contribution(&server.db, "contrib-owner-three", &owner_three_id, [3; 32]).await;
+    for passkey in [&owner_two, &owner_three] {
+        let request = synced_confirmation_request(&server, passkey, &confirmation).await;
+        let (status, body) = post_confirmation(&server.app, &request).await;
+        assert_eq!(status, StatusCode::OK, "linked owner: {body}");
+        assert_eq!(body["receipt"]["owner_linkage"], "linked");
+    }
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "confirmed");
+    assert_eq!(control["agreeing_groups"], 3);
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 3);
+    assert!(
+        checks
+            .iter()
+            .all(|check| check["status"] == "counted" && check["owner_linkage"] == "linked")
+    );
+}
+
+#[tokio::test]
+async fn moderator_decision_without_watermark_leaves_checks_pending() {
+    let mut server = TestServer::start().await;
+    let credential = server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, _) = post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let key = CapabilityKey::NativeSimulations;
+    let definition_digest = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control")
+        .definition_digest(&camera);
+    let scope =
+        serde_json::to_string(&ModeratorFirmwareScope::exact("2.10").expect("firmware scope"))
+            .expect("scope json");
+    sqlx::query(
+        "INSERT INTO manual_moderator_confirmations
+         (camera_id, capability_key, definition_digest, firmware_scope, moderator_credential,
+          confirmed, evidence_kind, evidence_url, evidence_description, created_at)
+         VALUES (?, ?, ?, ?, ?, 1, 'physical', NULL, 'historical body review', 0)",
+    )
+    .bind(camera.id.as_str())
+    .bind(key.as_str())
+    .bind(definition_digest.as_bytes().as_slice())
+    .bind(scope.as_str())
+    .bind(credential.as_str())
+    .execute(&server.db)
+    .await
+    .expect("historical moderator record");
+    let payload = json!({
+        "event": "manual_moderator_confirmation",
+        "camera": camera.id.as_str(),
+        "control": key.as_str(),
+        "definition_digest": definition_digest.to_hex(),
+        "decision": "confirm",
+        "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        "moderator": credential.as_str(),
+        "evidence_kind": "physical",
+        "evidence_url": null,
+    });
+    sqlx::query(
+        "INSERT INTO audit_log (type, payload, ts) VALUES ('manual_moderator_confirmation', ?, 0)",
+    )
+    .bind(payload.to_string())
+    .execute(&server.db)
+    .await
+    .expect("historical audit row");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "moderator_confirmed"
+    );
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["status"], "pending");
+    assert_eq!(checks[0]["owner_linkage"], "unlinked");
+}
+
+#[tokio::test]
+async fn moderator_scope_leaves_outside_firmware_pending() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let inside = confirmation_for(&camera, "native_simulations", "2.10");
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &inside).await,
+        StatusCode::OK
+    );
+    let (outside_owner, _) = synced_owner(&server, b"outside-owner", "Outside Owner").await;
+    let outside = confirmation_for(&camera, "native_simulations", "3.00");
+    let request = synced_confirmation_request(&server, &outside_owner, &outside).await;
+    let (status, body) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "outside firmware: {body}");
+
+    let token = server.moderator_token().await;
+    let key = CapabilityKey::NativeSimulations;
+    let definition_digest = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control")
+        .definition_digest(&camera);
+    let moderation = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest,
+        confirmed: true,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Physical,
+            url: None,
+            description: "body review".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::exact("2.10").expect("scope"),
+        },
+    };
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": true,
+        "evidence": {
+            "kind": "physical",
+            "description": "body review",
+            "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        },
+    });
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
+    let (status, summary) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &moderation.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "moderate: {summary}");
+
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 2);
+    let inside = checks
+        .iter()
+        .find(|check| check["firmware"] == "2.10")
+        .expect("inside firmware");
+    let outside = checks
+        .iter()
+        .find(|check| check["firmware"] == "3.00")
+        .expect("outside firmware");
+    assert_eq!(inside["status"], "reviewed");
+    assert_eq!(outside["status"], "pending");
+}
+
+#[tokio::test]
+async fn withdrawn_photo_linkage_reads_unlinked() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let serial = RawSerial::from_envelope_ascii(SERIAL.as_bytes()).expect("serial");
+    let (status, body) = server.upload_valid(Some(&serial)).await;
+    assert_eq!(status, StatusCode::CREATED, "upload: {body}");
+    let contribution = body["contribution_id"]
+        .as_str()
+        .expect("contribution id")
+        .to_owned();
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, submitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {submitted}");
+    assert_eq!(submitted["receipt"]["owner_linkage"], "linked");
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["owner_linkage"], "linked");
+
+    let mut withdraw = server
+        .signed_fields("withdraw", contribution.as_bytes())
+        .await;
+    withdraw["contribution_ids"] = json!([contribution]);
+    let (status, response) = post_json(&server.app, "/api/withdraw", &withdraw).await;
+    assert_eq!(status, StatusCode::OK, "withdraw: {response}");
+
+    let (status, resubmitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "resubmit: {resubmitted}");
+    assert_eq!(resubmitted["receipt"]["owner_linkage"], "unlinked");
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["recorded"], 1);
+    assert_eq!(control["intake"]["unlinked"], 1);
+
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["owner_linkage"], "unlinked");
+}
+
+#[tokio::test]
+async fn unspecified_moderator_scope_reviews_earlier_checks_only() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let earlier = confirmation_for(&camera, "native_simulations", "2.10");
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &earlier).await,
+        StatusCode::OK
+    );
+
+    let token = server.moderator_token().await;
+    let key = CapabilityKey::NativeSimulations;
+    let definition_digest = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control")
+        .definition_digest(&camera);
+    let moderation = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest,
+        confirmed: true,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Physical,
+            url: None,
+            description: "body review".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::unspecified(),
+        },
+    };
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": true,
+        "evidence": {
+            "kind": "physical",
+            "description": "body review",
+            "firmware_scope": {"kind": "unspecified"},
+        },
+    });
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
+    let (status, summary) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &moderation.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "moderate: {summary}");
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "moderator_confirmed"
+    );
+
+    let (later_owner, _) = synced_owner(&server, b"later-unspecified", "Later Owner").await;
+    let later = confirmation_for(&camera, "native_simulations", "3.00");
+    let request = synced_confirmation_request(&server, &later_owner, &later).await;
+    let (status, submitted) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "later: {submitted}");
+
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 2);
+    let earlier = checks
+        .iter()
+        .find(|check| check["firmware"] == "2.10")
+        .expect("earlier check");
+    let later = checks
+        .iter()
+        .find(|check| check["firmware"] == "3.00")
+        .expect("later check");
+    assert_eq!(earlier["status"], "reviewed");
+    assert_eq!(later["status"], "pending");
+}
+
+#[tokio::test]
+async fn moderator_rejection_reviews_earlier_covered_checks() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let earlier = confirmation_for(&camera, "native_simulations", "2.10");
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &earlier).await,
+        StatusCode::OK
+    );
+
+    let token = server.moderator_token().await;
+    let key = CapabilityKey::NativeSimulations;
+    let definition_digest = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control")
+        .definition_digest(&camera);
+    let moderation = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest,
+        confirmed: false,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Physical,
+            url: None,
+            description: "body review".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::exact("2.10").expect("scope"),
+        },
+    };
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": false,
+        "evidence": {
+            "kind": "physical",
+            "description": "body review",
+            "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        },
+    });
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
+    let (status, summary) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &moderation.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "moderate: {summary}");
+
+    let (later_owner, _) = synced_owner(&server, b"later-rejected", "Later Owner").await;
+    let later = confirmation_with(
+        &camera,
+        "native_simulations",
+        "2.10",
+        Finding::Corrected {
+            availability: looklab_schema::Availability::Unavailable,
+            domain: looklab_schema::CapabilityDomain::Unspecified,
+        },
+    );
+    let request = synced_confirmation_request(&server, &later_owner, &later).await;
+    let (status, submitted) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "later: {submitted}");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "moderator_rejected"
+    );
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 2);
+    let earlier = checks
+        .iter()
+        .find(|check| check["finding"]["kind"] == "matches")
+        .expect("earlier matching check");
+    let later = checks
+        .iter()
+        .find(|check| check["finding"]["kind"] == "corrected")
+        .expect("later corrected check");
+    assert_eq!(earlier["status"], "reviewed");
+    assert_eq!(later["status"], "pending");
+}
+
+#[tokio::test]
+async fn newer_definition_answer_replaces_the_stale_check() {
+    let mut server = TestServer::start().await;
+    let credential = server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    insert_confirmation(
+        &server.db,
+        &credential,
+        &camera,
+        "native_simulations",
+        r#"{"kind":"matches"}"#,
+        21,
+        0,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE manual_observations SET definition_digest =
+         x'0000000000000000000000000000000000000000000000000000000000000000'
+         WHERE confirmation_id IN (SELECT id FROM manual_confirmations
+                                   WHERE credential_id = ? AND camera_id = ?
+                                     AND send_nonce IS NULL)",
+    )
+    .bind(credential.as_str())
+    .bind(camera.id.as_str())
+    .execute(&server.db)
+    .await
+    .expect("older definition");
+
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, submitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {submitted}");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["stale"], 0);
+    assert_eq!(control["intake"]["recorded"], 1);
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["status"], "pending");
+}
+
+#[tokio::test]
+async fn owner_withdrawal_clears_the_check_from_queue_and_intake() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, submitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "confirmation: {submitted}");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["intake"]["recorded"],
+        1
+    );
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    assert_eq!(
+        queue["manual_checks"]
+            .as_array()
+            .expect("manual checks")
+            .len(),
+        1
+    );
+
+    let request = server.withdrawal_request(&camera.id).await;
+    let (status, body) = post_withdrawal(&server.app, &request).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "withdraw: {body}");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["intake"]["recorded"],
+        0
+    );
+    let queue = moderation_queue(&server, &token).await;
+    assert!(
+        queue["manual_checks"]
+            .as_array()
+            .expect("manual checks")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn identical_same_second_checks_keep_submission_order() {
+    let mut server = TestServer::start().await;
+    let owner_one = server.persist_credential().await;
+    insert_serial_contribution(&server.db, "contrib-order-one", &owner_one, [5; 32]).await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, submitted) =
+        post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "first: {submitted}");
+    assert_eq!(submitted["receipt"]["owner_linkage"], "linked");
+
+    let (owner_two, _) = synced_owner(&server, b"order-two", "Order Two").await;
+    let request = synced_confirmation_request(&server, &owner_two, &confirmation).await;
+    let (status, submitted) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "second: {submitted}");
+    assert_eq!(submitted["receipt"]["owner_linkage"], "unlinked");
+
+    sqlx::query(
+        "UPDATE manual_confirmation_occurrences SET received_at = 424242
+         WHERE id IN (SELECT occ.id FROM manual_confirmation_occurrences occ
+                      JOIN manual_confirmations c ON c.id = occ.confirmation_id
+                      WHERE c.camera_id = ?)",
+    )
+    .bind(camera.id.as_str())
+    .execute(&server.db)
+    .await
+    .expect("same second");
+
+    let token = server.moderator_token().await;
+    let first = moderation_queue(&server, &token).await;
+    let second = moderation_queue(&server, &token).await;
+    let checks = first["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0]["owner_linkage"], "linked");
+    assert_eq!(checks[1]["owner_linkage"], "unlinked");
+    assert_eq!(checks[0]["finding"]["kind"], checks[1]["finding"]["kind"]);
+    let repeated = second["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(repeated[0]["owner_linkage"], "linked");
+    assert_eq!(repeated[1]["owner_linkage"], "unlinked");
 }
 
 #[tokio::test]
