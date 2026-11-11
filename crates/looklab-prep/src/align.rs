@@ -373,6 +373,7 @@ pub(crate) fn align_with_pixel_pitch<R: LinearPixels + ?Sized, J: LinearPixels +
     Ok(alignment)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refine_geometry<R: LinearPixels + ?Sized>(
     raw: &R,
     jpeg_luma: &[f64],
@@ -732,6 +733,7 @@ fn base_mask<R: LinearPixels + ?Sized>(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_cost<R: LinearPixels + ?Sized>(
     raw: &R,
     jpeg_luma: &[f64],
@@ -760,6 +762,7 @@ fn evaluate_cost<R: LinearPixels + ?Sized>(
     Some((cost, count as f64))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_residual<R: LinearPixels + ?Sized>(
     raw: &R,
     jpeg_luma: &[f64],
