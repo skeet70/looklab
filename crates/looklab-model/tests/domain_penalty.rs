@@ -166,8 +166,6 @@ fn mirrored_wall_value_matches_the_closed_form_and_keeps_the_upper_term() {
     let limit = looklab_model::neutral_j_prime_max();
     let base_values = layer_values();
     let base = evaluate(&base_values, &paths).expect("base point is feasible");
-    let upper = |x: f64| -libm::log1p(-x / limit);
-    let lower = |x: f64| -libm::log(x / limit);
     for tone in [1.0, 5.0, 20.0, 80.0, 0.9 * limit] {
         let mut values = base_values;
         values.t = tone;
@@ -179,10 +177,20 @@ fn mirrored_wall_value_matches_the_closed_form_and_keeps_the_upper_term() {
             "tone {tone}: {} vs {expected}",
             penalty.value
         );
-        let upper_delta = upper(tone) - upper(base_values.t);
-        let lower_delta = lower(tone) - lower(base_values.t);
-        assert!((penalty.value - (base.value + upper_delta + lower_delta)).abs() / scale < 1e-12);
     }
+    let paths = ChromaPaths {
+        ucs: Ucs::new(50.0, 0.0, 0.0),
+        internal: [0.0, 0.0],
+        blend: 0.5,
+    };
+    let penalty = evaluate(&base_values, &paths).expect("neutral point is feasible");
+    let expected = wall(base_values.t, limit) + wall(paths.ucs.j, limit);
+    let scale = expected.abs().max(penalty.value.abs()).max(1.0);
+    assert!(
+        (penalty.value - expected).abs() / scale < 1e-12,
+        "neutral value {} vs {expected}",
+        penalty.value
+    );
 }
 
 #[test]
@@ -209,10 +217,6 @@ fn wall_derivatives_match_the_closed_form_at_neutral_chroma() {
             "{axis:?} gradient {} vs {slope}",
             penalty.gradient[index]
         );
-        assert!(
-            (penalty.gradient[index] - lower_slope - upper_slope).abs() / scale < 1e-12,
-            "{axis:?} upper gradient changed"
-        );
         let upper_curvature = upper_slope * upper_slope;
         let lower_curvature = lower_slope * lower_slope;
         let curvature = upper_curvature + lower_curvature;
@@ -222,16 +226,49 @@ fn wall_derivatives_match_the_closed_form_at_neutral_chroma() {
             "{axis:?} hessian {} vs {curvature}",
             penalty.hessian[index][index]
         );
-        assert!(
-            (penalty.hessian[index][index] - lower_curvature - upper_curvature).abs() / scale
-                < 1e-12,
-            "{axis:?} hessian upper curvature changed"
-        );
         let gn = penalty.gn_hessian[index][index];
         assert!(
             (gn - lower_curvature) / scale >= upper_curvature / scale - 1e-12,
             "{axis:?} gn_hessian {gn} upper curvature changed"
         );
+    }
+}
+
+#[test]
+fn lower_lightness_wall_blows_up_at_neutral_chroma() {
+    let values = layer_values();
+    let limit = looklab_model::neutral_j_prime_max();
+    let mut previous = f64::NEG_INFINITY;
+    for lightness in [1e-2, 1e-4, 1e-6, 1e-9] {
+        let paths = ChromaPaths {
+            ucs: Ucs::new(lightness, 0.0, 0.0),
+            internal: [0.0, 0.0],
+            blend: 0.5,
+        };
+        let penalty = evaluate(&values, &paths).expect("positive lightness stays feasible");
+        assert!(penalty.value.is_finite());
+        assert!(
+            penalty.value > previous,
+            "lightness {lightness:e}: value {} did not increase from {previous}",
+            penalty.value
+        );
+        let index = DomainAxis::Lightness as usize;
+        let slope = 1.0 / (limit - lightness) - 1.0 / lightness;
+        let scale = slope.abs().max(1.0);
+        assert!(
+            (penalty.gradient[index] - slope).abs() / scale < 1e-9,
+            "lightness {lightness:e}: gradient {} vs {slope}",
+            penalty.gradient[index]
+        );
+        let curvature =
+            1.0 / ((limit - lightness) * (limit - lightness)) + 1.0 / (lightness * lightness);
+        let scale = curvature.abs().max(1.0);
+        assert!(
+            (penalty.hessian[index][index] - curvature).abs() / scale < 1e-9,
+            "lightness {lightness:e}: hessian {} vs {curvature}",
+            penalty.hessian[index][index]
+        );
+        previous = penalty.value;
     }
 }
 
