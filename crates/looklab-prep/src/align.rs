@@ -2589,6 +2589,138 @@ mod tests {
         }
     }
 
+    fn dark_scene(u: f64, v: f64) -> [f64; 3] {
+        let base = 0.04
+            + 0.015 * libm::sin(5.0 * u + 1.3)
+            + 0.012 * libm::cos(7.0 * v - 0.4)
+            + 0.008 * libm::sin(11.0 * (u + v));
+        let blocks = if ((u * 4.0).floor() as i32 + (v * 3.0).floor() as i32) % 2 == 0 {
+            0.008
+        } else {
+            -0.005
+        };
+        let edge = if libm::sin(17.0 * u) * libm::cos(13.0 * v) > 0.25 {
+            0.006
+        } else {
+            0.0
+        };
+        [
+            (base + blocks + edge).clamp(0.005, 0.12),
+            (base + 0.7 * blocks + 0.004 * libm::cos(9.0 * u)).clamp(0.005, 0.12),
+            (base - blocks + 0.004 * libm::sin(6.0 * v + 0.7)).clamp(0.005, 0.12),
+        ]
+    }
+
+    fn other_dark_scene(u: f64, v: f64) -> [f64; 3] {
+        let base = 0.04
+            + 0.015 * libm::cos(13.0 * v + 0.2)
+            + 0.012 * libm::sin(4.0 * u - 1.1)
+            + 0.008 * libm::cos(9.0 * (u - v));
+        let blocks = if ((u * 3.0).floor() as i32 + (v * 5.0).floor() as i32) % 2 == 0 {
+            0.007
+        } else {
+            -0.006
+        };
+        [
+            (base + blocks).clamp(0.005, 0.12),
+            (base + 0.6 * blocks).clamp(0.005, 0.12),
+            (base - blocks).clamp(0.005, 0.12),
+        ]
+    }
+
+    fn dark_tone(value: f64) -> f64 {
+        (0.02 + 0.96 * libm::pow((value / 0.12).clamp(0.0, 1.0), 0.32)).clamp(0.0, 1.0)
+    }
+
+    fn make_dark_pair(
+        width: u32,
+        height: u32,
+        scene_at: fn(f64, f64) -> [f64; 3],
+        seed: u8,
+    ) -> (Image3, DecodedJpeg) {
+        use rand_chacha::ChaCha20Rng;
+        use rand_chacha::rand_core::{RngCore, SeedableRng};
+
+        let mut rng = ChaCha20Rng::from_seed([seed; 32]);
+        let mut next_noise = || (f64::from(rng.next_u32()) / f64::from(u32::MAX) - 0.5) * 2.0;
+        let truth = ground_truth();
+        let (cx, cy) = centre(width, height);
+        let mut raw_data = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let u = (f64::from(x) - cx) / cx;
+                let v = (f64::from(y) - cy) / cy;
+                let radius = libm::hypot(u, v);
+                let color = scene_at(u, v);
+                let shading = 1.0 / true_gain(radius);
+                let noise = 1.0 + 0.02 * next_noise();
+                raw_data.push([
+                    (color[0] * shading * noise) as f32,
+                    (color[1] * shading * noise) as f32,
+                    (color[2] * shading * noise) as f32,
+                ]);
+            }
+        }
+        let raw = Image3::new(width, height, raw_data).expect("raw image");
+        let mut linear = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let (rx, ry) =
+                    truth.jpeg_to_raw(f64::from(x), f64::from(y), width, height, width, height);
+                let u = (rx - cx) / cx;
+                let v = (ry - cy) / cy;
+                let color = scene_at(u, v);
+                let noise = 0.01 * next_noise();
+                linear.push([
+                    (dark_tone(color[0]) + noise) as f32,
+                    (dark_tone(color[1]) + noise) as f32,
+                    (dark_tone(color[2]) + noise) as f32,
+                ]);
+            }
+        }
+        (
+            raw,
+            DecodedJpeg {
+                image: Image3::new(width, height, linear).expect("jpeg image"),
+                space: OutputSpace::Srgb,
+                space_assumed: true,
+                code_values_near_clip: vec![false; (width * height) as usize],
+            },
+        )
+    }
+
+    #[test]
+    fn a_dark_high_iso_pair_passes_the_rank_gate_but_not_the_linear_one() {
+        let (raw, jpeg) = make_dark_pair(RAW_WIDTH, RAW_HEIGHT, dark_scene, 0x31);
+        let alignment = align(&raw, &jpeg, &AlignParams::default()).expect("genuine dark pair");
+        assert!(alignment.central_correlation >= 0.98, "{alignment:?}");
+
+        let grid = 192;
+        let (u, v) = normalized_coords(grid, grid);
+        let score_jpeg = AreaDownsample::new(&jpeg, raw.width.saturating_mul(raw.height).max(1));
+        let score_luma = downsampled_luma(&score_jpeg, jpeg.width(), jpeg.height(), grid, grid);
+        let photometry = fit_photometry(&raw, &alignment, &u, &v, &score_luma)
+            .unwrap_or_else(Photometry::luminance);
+        let (naive, _, _) = correlation_at(&raw, &score_luma, &alignment, &u, &v, photometry)
+            .expect("linear score");
+        assert!(naive < 0.98, "the linear statistic already passes: {naive}");
+    }
+
+    #[test]
+    fn a_dark_render_of_a_different_scene_is_rejected() {
+        let (raw, _) = make_dark_pair(RAW_WIDTH, RAW_HEIGHT, dark_scene, 0x31);
+        let (_, wrong) = make_dark_pair(RAW_WIDTH, RAW_HEIGHT, other_dark_scene, 0x31);
+        let error = align(&raw, &wrong, &AlignParams::default())
+            .expect_err("an unrelated dark render cannot align");
+        assert!(
+            matches!(
+                error,
+                PrepError::AlignLowCorrelation { .. } | PrepError::AlignNoOverlap
+            ),
+            "{error}"
+        );
+    }
+
     #[test]
     fn a_wrong_scene_does_not_align_through_the_projection() {
         let (raw, _) = make_filtered_pair(450, 300);
