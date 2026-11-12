@@ -115,6 +115,7 @@ fn inspect(path: &Path) -> Result<()> {
     println!("  version: {}", meta.version);
     println!("  name: {}", meta.name);
     println!("  short name: {}", meta.short_name);
+    println!("  status: {}", meta.status.as_str());
     if let Some(description) = &meta.description {
         println!("  description: {description}");
     }

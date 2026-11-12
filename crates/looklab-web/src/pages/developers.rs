@@ -112,7 +112,7 @@ async fn file_bytes(file: &File) -> Result<Vec<u8>, String> {
 fn inspect(bytes: &[u8]) -> Result<String, String> {
     let card = read_card(bytes).map_err(|error| format!("{error:?}: {error}"))?;
     let mut text = format!(
-        "Magic: LLCF\nFormat version: 1\nHeader length: 64 bytes\nFile length: {} bytes\nSections: {}\nHeader CRC32: {:08x}\nContent id: {}\nLook: {} @ {}\nName: {}\nShort name: {}\nSemantics: {:?}\nNeutral samples: {}\nFit samples: {}\nGrid: {}\n",
+        "Magic: LLCF\nFormat version: 1\nHeader length: 64 bytes\nFile length: {} bytes\nSections: {}\nHeader CRC32: {:08x}\nContent id: {}\nLook: {} @ {}\nName: {}\nShort name: {}\nStatus: {}\nSemantics: {:?}\nNeutral samples: {}\nFit samples: {}\nGrid: {}\n",
         bytes.len(),
         card.sections().len(),
         u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
@@ -121,6 +121,7 @@ fn inspect(bytes: &[u8]) -> Result<String, String> {
         card.meta().version,
         card.meta().name,
         card.meta().short_name,
+        card.meta().status.as_str(),
         card.semantics(),
         card.neutral().len(),
         card.fit().len(),

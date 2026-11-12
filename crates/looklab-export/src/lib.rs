@@ -26,9 +26,9 @@ pub use bake::{
 };
 pub use camera::{DngInputTransform, InputTransform};
 pub use card::{
-    Card, CardError, CardMeta, CardOptions, CardSections, FitRecord, Grid, GridSide, InputSpace,
-    Meta, OutputSpace as CardOutputSpace, SectionInfo, Semantics, Shaper, Viewing,
-    WbPolicy as CardWbPolicy, read_card, write_card, write_card_sections,
+    Card, CardError, CardMeta, CardOptions, CardSections, CardStatus, FitRecord, Grid, GridSide,
+    InputSpace, Meta, OutputSpace as CardOutputSpace, SectionInfo, Semantics, Shaper, Viewing,
+    WbPolicy as CardWbPolicy, card_status, read_card, write_card, write_card_sections,
 };
 pub use cct::{BAKE_CCTS, CctK};
 pub use downstream::{

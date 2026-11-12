@@ -2,10 +2,10 @@
 //! Native/wasm bit-identity workload for the card writer and grid evaluator;
 //! `cargo xtask bitid` compares it with a `wasm32-wasip1` run.
 
-use looklab_export::card::{CardMeta, CardOptions, read_card, write_card};
+use looklab_export::card::{CardMeta, CardOptions, CardStatus, read_card, write_card};
 use looklab_model::file::{LookIdentity, LookKind, WbPolicy};
 use looklab_model::look::{ColorLayer, Look, Residual, Tint};
-use looklab_model::{ClipSettings, LookDocument, Tone};
+use looklab_model::{ClipSettings, LookDocument, ProbeScalars, Tone, UncertaintyData};
 
 const SAMPLES: usize = 100_000;
 
@@ -138,4 +138,40 @@ fn main() {
         fit.mix_u32(record.probe);
     }
     println!("fit {:016x}", fit.finish());
+
+    let experimental_document = zero_support_document(&document);
+    let experimental_meta = CardMeta::new("Bit Identity", "Bit ID")
+        .with_description("Synthetic experimental card for native/wasm comparison.")
+        .with_status(CardStatus::Experimental);
+    let experimental_bytes = write_card(
+        &experimental_document,
+        &experimental_meta,
+        &CardOptions::default(),
+    )
+    .expect("experimental card");
+    let experimental = read_card(&experimental_bytes).expect("experimental card reads");
+    println!(
+        "experimental-status {}",
+        match experimental.status() {
+            CardStatus::Qualified => "qualified",
+            CardStatus::Experimental => "experimental",
+        }
+    );
+    let mut experimental_id = Fnv::new();
+    for byte in experimental.content_id() {
+        experimental_id.mix_byte(byte);
+    }
+    println!("experimental-content-id {:016x}", experimental_id.finish());
+}
+
+fn zero_support_document(document: &LookDocument) -> LookDocument {
+    let support =
+        ProbeScalars::new(vec![0.0; looklab_model::probes::V1_PROBE_COUNT]).expect("support mask");
+    document
+        .clone()
+        .with_uncertainty(UncertaintyData {
+            support: Some(support),
+            ..UncertaintyData::default()
+        })
+        .expect("experimental document")
 }
