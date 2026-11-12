@@ -1331,18 +1331,38 @@ fn condition_nuisances_inner(
     for block in &mut blocks {
         block.reset();
     }
-    let mut pass = problem.pass_with_analytic_rows(
-        &params,
-        active,
-        &mut blocks,
-        false,
-        false,
-        false,
-        IntentFilter::All,
-        HessianRows::All,
-    );
-    let mut rows = core::mem::take(&mut pass.coupled_rows);
-    if pass.infeasible || pass.active_samples > FULL_ROW_LIMIT {
+    let use_analytic = problem.samples.len() <= FULL_ROW_LIMIT;
+    let mut pass = if use_analytic {
+        problem.pass_with_analytic_rows(
+            &params,
+            active,
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::All,
+            HessianRows::All,
+        )
+    } else {
+        problem.pass(
+            &params,
+            active,
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::All,
+        )
+    };
+    let mut exact = if use_analytic && !pass.infeasible {
+        let rows = core::mem::take(&mut pass.coupled_rows);
+        let exact = exact_nuisance_curvature(&layout, &blocks, &rows);
+        drop(rows);
+        exact
+    } else {
+        Vec::new()
+    };
+    if pass.infeasible {
         for block in &mut blocks {
             block.reset();
         }
@@ -1355,13 +1375,8 @@ fn condition_nuisances_inner(
             false,
             IntentFilter::All,
         );
-        rows.clear();
+        exact.clear();
     }
-    let mut exact = if rows.is_empty() {
-        Vec::new()
-    } else {
-        exact_nuisance_curvature(&layout, &blocks, &rows)
-    };
     let mut radii = vec![STEP_RADIUS; problem.images.len()];
     let mut predicted = vec![0.0_f64; problem.images.len()];
     let mut at_boundary = vec![false; problem.images.len()];
@@ -1403,12 +1418,16 @@ fn condition_nuisances_inner(
             }
         }
         let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
-        let scale = if exact.is_empty() { hessian_scale } else { 1.0 };
         predicted.fill(0.0);
         at_boundary.fill(false);
         let mut step = vec![0.0_f64; layout.total];
         let mut failed = false;
         for (index, block) in blocks.iter().enumerate() {
+            let block_scale = if exact.get(index).is_some_and(|matrix| !matrix.is_empty()) {
+                1.0
+            } else {
+                hessian_scale
+            };
             let n = block.len();
             let (prior_gradient, prior_curvature) =
                 prior_terms(&problem, &roles, &params, options, block);
@@ -1421,7 +1440,7 @@ fn condition_nuisances_inner(
                 let mut smooth = 0.0;
                 let mut prior = 0.0;
                 for j in 0..n {
-                    hessian[i][j] = scale * block.hessian[i * n + j]
+                    hessian[i][j] = block_scale * block.hessian[i * n + j]
                         + lambda * penalties[index][i * n + j]
                         + identity[i * n + j];
                     smooth += penalties[index][i * n + j] * params.theta[block.params[j]];
@@ -1454,7 +1473,7 @@ fn condition_nuisances_inner(
                         &params,
                         &lambdas,
                         damping,
-                        scale,
+                        block_scale,
                         StepLimit::WholeStep,
                     );
                     match outcome {
@@ -1511,26 +1530,50 @@ fn condition_nuisances_inner(
         if accepted(cost, trial_cost) {
             accepted_count += 1;
             params = trial;
-            for block in &mut blocks {
-                block.reset();
-            }
-            let mut analytic = problem.pass_with_analytic_rows(
-                &params,
-                active,
-                &mut blocks,
-                false,
-                false,
-                false,
-                IntentFilter::All,
-                HessianRows::All,
-            );
-            if analytic.infeasible || analytic.active_samples > FULL_ROW_LIMIT {
-                if fit_diag() {
-                    eprintln!(
-                        "nuisance attempt {attempts} analytic curvature unavailable at the accepted state"
-                    );
+            if use_analytic {
+                for block in &mut blocks {
+                    block.reset();
                 }
-                rows.clear();
+                let mut analytic = problem.pass_with_analytic_rows(
+                    &params,
+                    active,
+                    &mut blocks,
+                    false,
+                    false,
+                    false,
+                    IntentFilter::All,
+                    HessianRows::All,
+                );
+                if analytic.infeasible {
+                    if fit_diag() {
+                        eprintln!(
+                            "nuisance attempt {attempts} analytic curvature unavailable at the accepted state"
+                        );
+                    }
+                    exact.clear();
+                    for block in &mut blocks {
+                        block.reset();
+                    }
+                    pass = problem.pass(
+                        &params,
+                        active,
+                        &mut blocks,
+                        false,
+                        false,
+                        false,
+                        IntentFilter::All,
+                    );
+                    cost = pass.cost
+                        + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
+                } else {
+                    let rows = core::mem::take(&mut analytic.coupled_rows);
+                    exact = exact_nuisance_curvature(&layout, &blocks, &rows);
+                    drop(rows);
+                    pass = analytic;
+                    cost = pass.cost
+                        + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
+                }
+            } else {
                 exact.clear();
                 for block in &mut blocks {
                     block.reset();
@@ -1544,12 +1587,6 @@ fn condition_nuisances_inner(
                     false,
                     IntentFilter::All,
                 );
-                cost = pass.cost
-                    + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
-            } else {
-                rows = core::mem::take(&mut analytic.coupled_rows);
-                exact = exact_nuisance_curvature(&layout, &blocks, &rows);
-                pass = analytic;
                 cost = pass.cost
                     + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
             }

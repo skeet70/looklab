@@ -1034,6 +1034,7 @@ impl Problem {
             Err(_) => {
                 output.infeasible = true;
                 output.cost = f64::INFINITY;
+                output.image_cost.fill(f64::INFINITY);
                 return output;
             }
         };
