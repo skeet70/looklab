@@ -1106,7 +1106,7 @@ pub fn ManualConfirmationPanel(
                         <tr>
                             <th scope="col">"Control"</th>
                             <th scope="col">"Category"</th>
-                            <th scope="col">"Confirmed actual"</th>
+                            <th scope="col">"Actual value"</th>
                             <th scope="col">"Manual says (documentation-derived)"</th>
                             <th scope="col">"Confirmation basis"</th>
                             <th scope="col">"Your answer"</th>

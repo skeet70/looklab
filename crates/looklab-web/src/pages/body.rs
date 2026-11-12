@@ -527,7 +527,7 @@ fn ManualSection(
                 }
             }}
             <p class="muted">"From official manuals and firmware notes. Owner-confirmed corrections are shown separately from the manual claim. Documentation does not imply RAW decoding, contribution support or fit eligibility."</p>
-            <p class="muted">"Owner agreement counts profiles linked to this camera by contribution metadata. Unlinked checks are saved but do not count toward confirmation."</p>
+            <p class="muted">"Checks from any profile count as owner reports. Owner-reported shows when reports agree. Confirmed needs three profiles linked to the camera by a photo contribution, or a moderator decision with evidence. Disagreement goes to review."</p>
             {move || can_moderate().then(|| view! {
                 <p>
                     <A href=crate::base::site_url("/review?filter=camera-checks")>
@@ -604,7 +604,7 @@ fn ManualSection(
                     <tr>
                         <th scope="col">"Control"</th>
                         <th scope="col">"Category"</th>
-                        <th scope="col">"Confirmed actual"</th>
+                        <th scope="col">"Actual value"</th>
                         <th scope="col">"Manual says (documentation-derived)"</th>
                         <th scope="col">"Confirmation basis"</th>
                         <th scope="col">"Citations"</th>
@@ -858,7 +858,7 @@ pub(crate) fn control_actual_text(confirmation: &looklab_schema::ControlConfirma
         },
         ConfirmationState::ModeratorRejected => "Rejected by moderator".to_owned(),
         ConfirmationState::Confirmed => "Confirmed; actual value not recorded".to_owned(),
-        ConfirmationState::OwnerReported => "Reported; not confirmed".to_owned(),
+        ConfirmationState::OwnerReported => "Owner-reported; not confirmed".to_owned(),
         _ => "Not confirmed".to_owned(),
     }
 }
@@ -877,10 +877,7 @@ pub(crate) fn firmware_basis_text(result: &FirmwareConfirmation) -> String {
         None => match result.state {
             ConfirmationState::Contradicted => "owner reports disagree".to_owned(),
             ConfirmationState::OwnerReported => {
-                let mut text = format!(
-                    "reported by {}; not confirmed",
-                    profile_count_text(result.reported_profiles)
-                );
+                let mut text = "owner reports; not confirmed".to_owned();
                 if result.agreeing_groups > 0 {
                     text.push_str(&format!(" · {} of 3 linked groups", result.agreeing_groups));
                 }
@@ -916,20 +913,29 @@ pub(crate) fn finding_text(finding: &Finding) -> String {
 pub(crate) fn firmware_actual_text(result: &FirmwareConfirmation) -> String {
     match &result.confirmed_actual {
         Some(actual) => format!(
-            "{} · {}",
+            "Confirmed, {} · {}",
             actual_availability_text(actual.availability),
             domain_text(&actual.domain)
         ),
         None => match result.state {
-            ConfirmationState::Contradicted => "No single actual value confirmed".to_owned(),
-            ConfirmationState::OwnerReported => result
-                .reported_options
-                .first()
-                .map(|option| finding_text(&option.finding))
-                .unwrap_or_else(|| "Reported; actual value not recorded".to_owned()),
+            ConfirmationState::Contradicted => format!(
+                "Owners disagree: {}",
+                reported_options_list(&result.reported_options)
+            ),
+            ConfirmationState::OwnerReported => {
+                let actual = result
+                    .reported_options
+                    .first()
+                    .map(|option| finding_text(&option.finding))
+                    .unwrap_or_else(|| "actual value not recorded".to_owned());
+                format!(
+                    "Owner-reported, {actual} (reported by {})",
+                    profile_count_text(result.reported_profiles)
+                )
+            }
             ConfirmationState::Confirmed => "Confirmed; actual value not recorded".to_owned(),
             ConfirmationState::ModeratorConfirmed => {
-                "Confirmed by moderator; actual value in evidence".to_owned()
+                "Moderator confirmed; actual value in evidence".to_owned()
             }
             ConfirmationState::ModeratorRejected => "Rejected by moderator".to_owned(),
             ConfirmationState::Unconfirmed | ConfirmationState::Documented => {
@@ -954,22 +960,7 @@ pub(crate) fn firmware_detail(result: &FirmwareConfirmation) -> Option<String> {
         }
         return Some(text);
     }
-    match result.state {
-        ConfirmationState::OwnerReported => Some(format!(
-            "reported by {} · {}",
-            profile_count_text(result.reported_profiles),
-            result
-                .reported_options
-                .first()
-                .map(|option| finding_text(&option.finding))
-                .unwrap_or_default()
-        )),
-        ConfirmationState::Contradicted => Some(format!(
-            "Owners disagree: {}",
-            reported_options_text(result)
-        )),
-        _ => None,
-    }
+    None
 }
 
 fn profile_count_text(profiles: u32) -> String {
@@ -1233,11 +1224,11 @@ fn EpochDifferences(epochs: Vec<EpochPage>) -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use looklab_schema::{
-        Availability, CapabilityKey, ConfirmationState, ControlConfirmation, FirmwareConfirmation,
-        ManualControlIntake, ReportedFirmware,
+        Availability, CapabilityKey, ConfirmationState, ControlConfirmation, Finding,
+        FirmwareConfirmation, ManualControlIntake, ReportedFirmware, ReportedOption,
     };
 
-    use super::confirmation_text;
+    use super::{confirmation_text, firmware_actual_text};
 
     fn control(
         state: ConfirmationState,
@@ -1277,5 +1268,68 @@ mod tests {
     fn public_control_text_names_disagreement() {
         let text = confirmation_text(&control(ConfirmationState::Contradicted, Vec::new()));
         assert!(text.starts_with("Owners disagree"), "{text}");
+    }
+
+    fn firmware(
+        state: ConfirmationState,
+        options: Vec<ReportedOption>,
+        profiles: u32,
+    ) -> FirmwareConfirmation {
+        FirmwareConfirmation {
+            firmware: ReportedFirmware::new("1.00").expect("firmware"),
+            state,
+            agreeing_groups: 0,
+            contradictions: Vec::new(),
+            basis: None,
+            confirmed_actual: None,
+            reported_options: options,
+            owner_profiles: profiles,
+            reported_profiles: profiles,
+        }
+    }
+
+    #[test]
+    fn owner_reported_actual_is_not_called_confirmed() {
+        let text = firmware_actual_text(&firmware(
+            ConfirmationState::OwnerReported,
+            vec![ReportedOption {
+                finding: Finding::Matches,
+                linked_groups: 0,
+                owner_profiles: 2,
+            }],
+            2,
+        ));
+        assert!(text.starts_with("Owner-reported"), "{text}");
+        assert!(!text.contains("Confirmed"), "{text}");
+        assert!(text.contains("reported by 2 profiles"), "{text}");
+    }
+
+    #[test]
+    fn disagreement_actual_lists_each_option_and_count() {
+        let text = firmware_actual_text(&firmware(
+            ConfirmationState::Contradicted,
+            vec![
+                ReportedOption {
+                    finding: Finding::Matches,
+                    linked_groups: 0,
+                    owner_profiles: 1,
+                },
+                ReportedOption {
+                    finding: Finding::Corrected {
+                        availability: Availability::Unavailable,
+                        domain: looklab_schema::CapabilityDomain::Unspecified,
+                    },
+                    linked_groups: 0,
+                    owner_profiles: 1,
+                },
+            ],
+            2,
+        ));
+        assert!(text.starts_with("Owners disagree:"), "{text}");
+        assert!(text.contains("matches the manual (1 profile)"), "{text}");
+        assert!(
+            text.contains("Not available · Not documented numerically (1 profile)"),
+            "{text}"
+        );
     }
 }
