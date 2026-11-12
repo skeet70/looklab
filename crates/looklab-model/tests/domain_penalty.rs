@@ -202,8 +202,7 @@ fn toe_wall_value_matches_the_closed_form() {
         let mut values = base_values;
         values.t = tone;
         let penalty = evaluate(&values, &paths).expect("tone stays feasible");
-        let expected =
-            base.value + wall(tone, limit, anchor) - wall(base_values.t, limit, anchor);
+        let expected = base.value + wall(tone, limit, anchor) - wall(base_values.t, limit, anchor);
         let scale = expected.abs().max(penalty.value.abs()).max(1.0);
         assert!(
             (penalty.value - expected).abs() / scale < 1e-12,

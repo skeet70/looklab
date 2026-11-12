@@ -504,8 +504,7 @@ pub fn evaluate(
     let lightness_curvature = lightness_upper_slope * lightness_upper_slope
         + toe_curvature(lightness_x) / (anchor_j * anchor_j);
 
-    let value = -libm::log1p(-values.t / limit)
-        - libm::log1p(-lightness / limit)
+    let value = -libm::log1p(-values.t / limit) - libm::log1p(-lightness / limit)
         + toe_value(tone_x)
         + toe_value(lightness_x)
         + near * inner.value
@@ -867,7 +866,10 @@ mod tests {
         for (lightness, expected) in [(10.0, 1.0 / 3.0), (15.0, 1.0 / 9.0)] {
             let ratio = (toe_slope(lightness / anchor) / anchor) / (-1.0 / lightness);
             let closed = (1.0 - lightness / anchor) * (1.0 - lightness / anchor);
-            assert!((ratio - closed).abs() < 1e-12, "J' {lightness}: {ratio} vs {closed}");
+            assert!(
+                (ratio - closed).abs() < 1e-12,
+                "J' {lightness}: {ratio} vs {closed}"
+            );
             assert!(
                 (ratio - expected).abs() < 0.03,
                 "J' {lightness}: ratio {ratio} vs {expected}"
