@@ -26,7 +26,7 @@ use crate::sample::{PixelSelection, SampleParams, select_pixels};
 use crate::seed::SamplingSeed;
 
 /// Registered preparation version id, [docs/03 §2.2](../../../docs/03-data-model.md).
-pub const PREP_VERSION: u32 = 3;
+pub const PREP_VERSION: u32 = 4;
 
 const DEFAULT_DOWNSAMPLE_MAX_PIXELS: u32 = 1_500_000;
 
@@ -35,6 +35,23 @@ const RAW_CLIP_LEVEL: f32 = 0.98;
 
 /// Integration points per axis when averaging the JPEG over a sample's footprint.
 const JPEG_FOOTPRINT_TAPS: u32 = 3;
+
+/// The sample footprint's tap offsets, shared by sampling and the overlap mask.
+fn jpeg_taps() -> [(f64, f64); 9] {
+    let taps = f64::from(JPEG_FOOTPRINT_TAPS);
+    let mut out = [(0.0, 0.0); 9];
+    let mut index = 0;
+    for ty in 0..JPEG_FOOTPRINT_TAPS {
+        for tx in 0..JPEG_FOOTPRINT_TAPS {
+            out[index] = (
+                (f64::from(tx) + 0.5) / taps - 0.5,
+                (f64::from(ty) + 0.5) / taps - 0.5,
+            );
+            index += 1;
+        }
+    }
+    out
+}
 
 /// Camera-to-XYZ for white-balanced linear camera RGB, with the CCT and the
 /// version of the body input transform it came from.
@@ -293,10 +310,14 @@ fn prepare_group_images(
     raw_sanitized.set_as_shot_wb(white_balance(prepared_raw.wb));
     let exposure_hint = exposure_hint_ev(metadata);
 
-    let first = decode_group_jpeg(jpegs[0])?;
+    let mut members = Vec::with_capacity(jpegs.len());
+    for bytes in jpegs {
+        members.push(decode_group_jpeg(bytes)?);
+    }
+    let planes: Vec<&JpegPlane> = members.iter().map(|member| &member.plane).collect();
     let shared = prepare_selection(
         prepared_raw,
-        &first.plane,
+        &planes,
         prior,
         GroupOptions {
             exposure_hint_ev: exposure_hint,
@@ -306,36 +327,21 @@ fn prepare_group_images(
         seed,
         params,
     )?;
-    let mut images = Vec::with_capacity(jpegs.len());
-    images.push(prepared_image(
-        &shared,
-        first.plane,
-        first.rendering,
-        &raw_sanitized,
-        &raw_removed,
-        &shared.alignment,
-        AlignmentFrame::Raw,
-    )?);
-    for (index, bytes) in jpegs[1..].iter().enumerate() {
-        let member = decode_group_jpeg(bytes)?;
-        let member_alignment = align_with_pixel_pitch(
-            &shared.downsampled,
-            &member.plane,
-            &params.align,
-            (shared.scale_x, shared.scale_y),
-        )
-        .map_err(|source| PrepError::MemberAlignment {
-            index: index + 2,
-            message: source.to_string(),
-        })?;
+    let mut images = Vec::with_capacity(members.len());
+    for (index, member) in members.into_iter().enumerate() {
+        let frame = if index == 0 {
+            AlignmentFrame::Raw
+        } else {
+            AlignmentFrame::Downsampled
+        };
         images.push(prepared_image(
             &shared,
             member.plane,
             member.rendering,
             &raw_sanitized,
             &raw_removed,
-            &member_alignment,
-            AlignmentFrame::Downsampled,
+            &shared.alignments[index],
+            frame,
         )?);
     }
     Ok(images)
@@ -427,11 +433,10 @@ fn prepare_decoded_chart(
     if jpegs.is_empty() {
         return Err(PrepError::NoJpeg);
     }
-    let reference = jpegs[0];
     let shared = prepare_selection(
         // The caller keeps this decode.
         prepare_raw(raw.clone(), params)?,
-        reference,
+        jpegs,
         prior,
         GroupOptions {
             exposure_hint_ev: 0.0,
@@ -445,21 +450,12 @@ fn prepare_decoded_chart(
         .iter()
         .enumerate()
         .map(|(index, jpeg)| {
-            if index == 0 {
-                sample_member(&shared, *jpeg, &shared.alignment, AlignmentFrame::Raw)
+            let frame = if index == 0 {
+                AlignmentFrame::Raw
             } else {
-                let alignment = align_with_pixel_pitch(
-                    &shared.downsampled,
-                    *jpeg,
-                    &params.align,
-                    (shared.scale_x, shared.scale_y),
-                )
-                .map_err(|source| PrepError::MemberAlignment {
-                    index: index + 1,
-                    message: source.to_string(),
-                })?;
-                sample_member(&shared, *jpeg, &alignment, AlignmentFrame::Downsampled)
-            }
+                AlignmentFrame::Downsampled
+            };
+            sample_member(&shared, *jpeg, &shared.alignments[index], frame)
         })
         .collect()
 }
@@ -670,7 +666,7 @@ struct SelectionState {
     raw_width: u32,
     raw_height: u32,
     header_base: SampleHeader,
-    alignment: Alignment,
+    alignments: Vec<Alignment>,
 }
 
 struct GroupOptions<'a> {
@@ -681,12 +677,13 @@ struct GroupOptions<'a> {
 
 fn prepare_selection<J: JpegPixels + ?Sized>(
     prepared_raw: PreparedRaw,
-    reference: &J,
+    members: &[&J],
     prior: &PriorTransform,
     options: GroupOptions<'_>,
     seed: SamplingSeed,
     params: &PrepParams,
 ) -> Result<SelectionState, PrepError> {
+    let reference = *members.first().ok_or(PrepError::NoJpeg)?;
     let PreparedRaw {
         image: raw_image,
         clipped_flags,
@@ -703,9 +700,42 @@ fn prepare_selection<J: JpegPixels + ?Sized>(
     .downsample_area(params.downsample_max_pixels);
     drop(raw_image);
     debug_assert_eq!(clipped_flags.len(), downsampled.data.len());
+    let scale_x = f64::from(raw_width) / f64::from(downsampled.width);
+    let scale_y = f64::from(raw_height) / f64::from(downsampled.height);
+    let alignments: Vec<Alignment> = members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            if index == 0 {
+                Ok(alignment)
+            } else {
+                align_with_pixel_pitch(&downsampled, *member, &params.align, (scale_x, scale_y))
+                    .map_err(|source| PrepError::MemberAlignment {
+                        index: index + 1,
+                        message: source.to_string(),
+                    })
+            }
+        })
+        .collect::<Result<_, _>>()?;
 
     let mut mask = build_mask(&downsampled, &params.mask);
     mask.exclude_clipped(&clipped_flags);
+    for (index, (member, member_alignment)) in members.iter().zip(&alignments).enumerate() {
+        let frame = if index == 0 {
+            AlignmentFrame::Raw
+        } else {
+            AlignmentFrame::Downsampled
+        };
+        mask.exclude_outside(&jpeg_overlap(
+            member_alignment,
+            member.width(),
+            member.height(),
+            &downsampled,
+            raw_width,
+            raw_height,
+            frame,
+        ));
+    }
     if let Some(region) = options.chart {
         mask.exclude_region(&chart_exclusion(
             region,
@@ -734,9 +764,6 @@ fn prepare_selection<J: JpegPixels + ?Sized>(
         .iter()
         .map(|index| clamp_rgb(downsampled.data[*index]))
         .collect();
-    let scale_x = f64::from(raw_width) / f64::from(downsampled.width);
-    let scale_y = f64::from(raw_height) / f64::from(downsampled.height);
-
     let cct_hint_k = if prior.cct_k().is_finite() {
         prior.cct_k().clamp(0.0, 100_000.0) as f32
     } else {
@@ -767,7 +794,7 @@ fn prepare_selection<J: JpegPixels + ?Sized>(
         raw_width,
         raw_height,
         header_base,
-        alignment,
+        alignments,
     })
 }
 
@@ -942,6 +969,99 @@ impl LinearPixels for ClipMask<'_> {
     }
 }
 
+/// Downsampled RAW pixels whose sampling footprint lies outside the JPEG's
+/// field of view. An aspect-ratio crop leaves part of the RAW without a JPEG
+/// counterpart; those pixels cannot carry a sample.
+fn jpeg_overlap(
+    alignment: &Alignment,
+    jpeg_width: u32,
+    jpeg_height: u32,
+    target: &Image3,
+    raw_width: u32,
+    raw_height: u32,
+    frame: AlignmentFrame,
+) -> Vec<bool> {
+    let max_x = f64::from(jpeg_width) - 1.0;
+    let max_y = f64::from(jpeg_height) - 1.0;
+    let footprint_x = (f64::from(jpeg_width - 1)
+        / (f64::from(target.width) * alignment.scale.abs().max(1e-12)))
+    .max(1.0);
+    let footprint_y = (f64::from(jpeg_height - 1)
+        / (f64::from(target.height) * alignment.scale_y.abs().max(1e-12)))
+    .max(1.0);
+    let margin_x = 2.0 * footprint_x;
+    let margin_y = 2.0 * footprint_y;
+    let (sin, cos) = (
+        libm::sin(alignment.rotation_rad),
+        libm::cos(alignment.rotation_rad),
+    );
+    let mut outside = vec![false; target.data.len()];
+    for y in 0..target.height {
+        for x in 0..target.width {
+            let (centre_x, centre_y, footprint_x, footprint_y, frame_width, frame_height) =
+                match frame {
+                    AlignmentFrame::Raw => {
+                        let scale_x = f64::from(raw_width) / f64::from(target.width);
+                        let scale_y = f64::from(raw_height) / f64::from(target.height);
+                        (
+                            (f64::from(x) + 0.5) * scale_x - 0.5,
+                            (f64::from(y) + 0.5) * scale_y - 0.5,
+                            scale_x,
+                            scale_y,
+                            raw_width,
+                            raw_height,
+                        )
+                    }
+                    AlignmentFrame::Downsampled => (
+                        f64::from(x),
+                        f64::from(y),
+                        1.0,
+                        1.0,
+                        target.width,
+                        target.height,
+                    ),
+                };
+            let (centre_jpeg_x, centre_jpeg_y) = alignment.raw_to_jpeg_with(
+                centre_x,
+                centre_y,
+                frame_width,
+                frame_height,
+                jpeg_width,
+                jpeg_height,
+                sin,
+                cos,
+            );
+            let mut inside = centre_jpeg_x >= margin_x
+                && centre_jpeg_y >= margin_y
+                && centre_jpeg_x <= max_x - margin_x
+                && centre_jpeg_y <= max_y - margin_y;
+            for (fx, fy) in jpeg_taps() {
+                if !inside {
+                    break;
+                }
+                let raw_x = centre_x + fx * footprint_x;
+                let raw_y = centre_y + fy * footprint_y;
+                let (jpeg_x, jpeg_y) = alignment.raw_to_jpeg_with(
+                    raw_x,
+                    raw_y,
+                    frame_width,
+                    frame_height,
+                    jpeg_width,
+                    jpeg_height,
+                    sin,
+                    cos,
+                );
+                if !(jpeg_x >= 0.0 && jpeg_y >= 0.0 && jpeg_x <= max_x && jpeg_y <= max_y) {
+                    inside = false;
+                    break;
+                }
+            }
+            outside[y as usize * target.width as usize + x as usize] = !inside;
+        }
+    }
+    outside
+}
+
 /// Per-pixel membership of `region`, mapped through the alignment onto the
 /// downsampled RAW grid.
 fn chart_exclusion(
@@ -1043,31 +1163,26 @@ fn jpeg_footprint<J: JpegPixels + ?Sized>(
     frame_width: u32,
     frame_height: u32,
 ) -> Result<([f32; 3], bool), PrepError> {
-    let taps = f64::from(JPEG_FOOTPRINT_TAPS);
     let mut sum = [0.0f64; 3];
     let mut count = 0.0f64;
     let mut near_clip = false;
-    for ty in 0..JPEG_FOOTPRINT_TAPS {
-        for tx in 0..JPEG_FOOTPRINT_TAPS {
-            let fx = (f64::from(tx) + 0.5) / taps - 0.5;
-            let fy = (f64::from(ty) + 0.5) / taps - 0.5;
-            let x = center.0 + fx * footprint.0;
-            let y = center.1 + fy * footprint.1;
-            let (jx, jy) =
-                alignment.raw_to_jpeg(x, y, frame_width, frame_height, jpeg.width(), jpeg.height());
-            let Some(rgb) = jpeg.sample_bilinear(jx, jy) else {
-                return Err(PrepError::SampleOutsideJpeg);
-            };
-            if !rgb.iter().all(|channel| channel.is_finite()) {
-                return Err(PrepError::NonFiniteSample);
-            }
-            for (total, value) in sum.iter_mut().zip(rgb) {
-                *total += f64::from(value);
-            }
-            count += 1.0;
-            let (px, py) = nearest_pixel(jx, jy, jpeg.width(), jpeg.height());
-            near_clip |= jpeg.near_clip(px, py);
+    for (fx, fy) in jpeg_taps() {
+        let x = center.0 + fx * footprint.0;
+        let y = center.1 + fy * footprint.1;
+        let (jx, jy) =
+            alignment.raw_to_jpeg(x, y, frame_width, frame_height, jpeg.width(), jpeg.height());
+        let Some(rgb) = jpeg.sample_bilinear(jx, jy) else {
+            return Err(PrepError::SampleOutsideJpeg);
+        };
+        if !rgb.iter().all(|channel| channel.is_finite()) {
+            return Err(PrepError::NonFiniteSample);
         }
+        for (total, value) in sum.iter_mut().zip(rgb) {
+            *total += f64::from(value);
+        }
+        count += 1.0;
+        let (px, py) = nearest_pixel(jx, jy, jpeg.width(), jpeg.height());
+        near_clip |= jpeg.near_clip(px, py);
     }
     Ok((
         [
@@ -1124,4 +1239,44 @@ fn exposure_hint_ev(metadata: &ParsedMetadata) -> f32 {
         -f64::from(looklab_samples::MAX_EXPOSURE_HINT_EV),
         f64::from(looklab_samples::MAX_EXPOSURE_HINT_EV),
     ) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::align::Alignment;
+
+    #[test]
+    fn an_aspect_crop_excludes_raw_pixels_outside_the_jpeg() {
+        let target = Image3::new(100, 100, vec![[0.1; 3]; 10_000]).expect("target");
+        let alignment = Alignment {
+            scale: 1.0,
+            scale_y: 505.0 / 599.0,
+            rotation_rad: 0.0,
+            tx: 0.0,
+            ty: 0.0,
+            k1: 0.0,
+            k2: 0.0,
+            gain: [0.0; 3],
+            central_correlation: 1.0,
+            residual_px: 0.0,
+        };
+        let outside = jpeg_overlap(&alignment, 900, 506, &target, 900, 600, AlignmentFrame::Raw);
+        assert_eq!(outside.len(), 10_000);
+        assert!(outside[0], "the top row is outside a centred 16:9 crop");
+        assert!(
+            outside[99 * 100 + 50],
+            "the bottom row is outside a centred 16:9 crop"
+        );
+        assert!(
+            !outside[50 * 100 + 50],
+            "the centre is inside a centred 16:9 crop"
+        );
+        let count = outside.iter().filter(|value| **value).count();
+        assert!(count > 0 && count < 10_000);
+
+        let mut mask = build_mask(&target, &MaskOptions::default());
+        mask.exclude_outside(&outside);
+        assert!(mask.counts().outside > 0);
+    }
 }

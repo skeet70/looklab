@@ -613,7 +613,7 @@ fn fit_skips_an_undecodable_sample_and_keeps_going() {
     });
     assert!(stdout.contains("skipped 1 undecodable file"), "{stdout}");
     assert!(
-        stderr.contains("This file couldn't be decoded (decoder error)."),
+        stderr.contains("zzz-corrupt.llsamp: input is 6 bytes, too short"),
         "{stderr}"
     );
     assert!(out.exists());

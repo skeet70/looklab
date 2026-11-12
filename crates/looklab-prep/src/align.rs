@@ -3,11 +3,15 @@
 //! its RAW.
 //!
 //! Multi-scale phase correlation and a Fourier-Mellin estimate seed a
-//! Levenberg-Marquardt refinement on normalized cross-correlation. The radial
-//! gain `g(r) = 1 + a1 r^2 + a2 r^4 + a3 r^6` is fitted jointly with a
-//! temporary monotone 12-knot tone map on projected RAW intensity
+//! Levenberg-Marquardt refinement on normalized cross-correlation. The model
+//! maps the JPEG's normalized frame onto the RAW's with a per-axis scale, a
+//! rotation, a translation and radial distortion, so an in-camera aspect-ratio
+//! crop is a pair of scales rather than a compromise. The radial gain
+//! `g(r) = 1 + a1 r^2 + a2 r^4 + a3 r^6` is fitted jointly with a temporary
+//! monotone 12-knot tone map on projected RAW intensity
 //! ([docs/03 §2.1](../../../docs/03-data-model.md)).
 
+use looklab_samples::{MAX_RGB, MIN_RGB};
 use serde::{Deserialize, Serialize};
 
 use crate::error::PrepError;
@@ -15,6 +19,38 @@ use crate::image::{AreaDownsample, LinearPixels};
 
 const LUMINANCE: [f64; 3] = [0.2126, 0.7152, 0.0722];
 const TONE_KNOTS: usize = 12;
+/// Ratio of the JPEG's vertical to horizontal normalized scale implied by the
+/// two pixel grids for square pixels. It seeds the per-axis scale; the ratio
+/// remains free in the fit.
+fn dimension_aspect(jpeg_w: u32, jpeg_h: u32, raw_w: u32, raw_h: u32) -> f64 {
+    if jpeg_w > 1 && jpeg_h > 1 && raw_w > 1 && raw_h > 1 {
+        let aspect =
+            (f64::from(jpeg_h) * f64::from(raw_w)) / (f64::from(jpeg_w) * f64::from(raw_h));
+        if aspect.is_finite() {
+            return aspect.clamp(0.2, 5.0);
+        }
+    }
+    1.0
+}
+
+/// Equal-aspect renders hold equal per-axis scales unless the content moves
+/// them, so a same-aspect pair's ratio is kept at the dimension seed. This is
+/// a prior, not an identifiability claim: the content can still move the ratio.
+fn aspect_prior_weight(aspect_seed: f64) -> f64 {
+    if (aspect_seed - 1.0).abs() < 1e-3 {
+        1e6
+    } else {
+        0.0
+    }
+}
+
+fn valid_pixel(rgb: [f32; 3]) -> bool {
+    rgb.iter().all(|channel| {
+        channel.is_finite()
+            && f64::from(*channel) >= f64::from(MIN_RGB)
+            && f64::from(*channel) <= f64::from(MAX_RGB)
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Photometry {
@@ -78,7 +114,11 @@ impl Default for AlignParams {
 /// Corners are at about `sqrt(2)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Alignment {
+    /// Scale on the normalized horizontal axis.
     pub scale: f64,
+    /// Scale on the normalized vertical axis. Equal to `scale` for a render
+    /// that covers the RAW frame at the same aspect ratio.
+    pub scale_y: f64,
     pub rotation_rad: f64,
     pub tx: f64,
     pub ty: f64,
@@ -97,10 +137,8 @@ impl Alignment {
     }
 
     fn linear_with(&self, u: f64, v: f64, sin: f64, cos: f64) -> (f64, f64) {
-        (
-            self.scale * (cos * u - sin * v) + self.tx,
-            self.scale * (sin * u + cos * v) + self.ty,
-        )
+        let (su, sv) = (self.scale * u, self.scale_y * v);
+        (cos * su - sin * sv + self.tx, sin * su + cos * sv + self.ty)
     }
 
     fn distort(&self, a: f64, b: f64) -> (f64, f64) {
@@ -165,7 +203,7 @@ impl Alignment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn raw_to_jpeg_with(
+    pub(crate) fn raw_to_jpeg_with(
         &self,
         x: f64,
         y: f64,
@@ -180,13 +218,17 @@ impl Alignment {
         let (u, v) = (ratio(x, raw_cx, raw_w), ratio(y, raw_cy, raw_h));
         let (a, b) = self.undistort(u, v);
         let (qx, qy) = (a - self.tx, b - self.ty);
-        let inverse_scale = if self.scale.abs() > 1e-12 {
-            1.0 / self.scale
+        let (rotated_u, rotated_v) = (cos * qx + sin * qy, -sin * qx + cos * qy);
+        let uj = if self.scale.abs() > 1e-12 {
+            rotated_u / self.scale
         } else {
             0.0
         };
-        let uj = inverse_scale * (cos * qx + sin * qy);
-        let vj = inverse_scale * (-sin * qx + cos * qy);
+        let vj = if self.scale_y.abs() > 1e-12 {
+            rotated_v / self.scale_y
+        } else {
+            0.0
+        };
         to_pixels(uj, vj, jpeg_w, jpeg_h)
     }
 
@@ -257,6 +299,12 @@ pub(crate) fn align_with_pixel_pitch<R: LinearPixels + ?Sized, J: LinearPixels +
     let grid = 192;
     let jpeg_luma = normalized_luma(jpeg, grid, grid);
     let (u, v) = normalized_coords(grid, grid);
+    let aspect_seed = dimension_aspect(
+        jpeg.width(),
+        jpeg.height(),
+        raw_wb_linear.width(),
+        raw_wb_linear.height(),
+    );
     // The reduced decode integrates a CFA tile per pixel, so JPEG detail finer
     // than a raw pixel has no counterpart and aliases the correlation score.
     let score_luma = {
@@ -286,6 +334,7 @@ pub(crate) fn align_with_pixel_pitch<R: LinearPixels + ?Sized, J: LinearPixels +
             photometry,
             &u,
             &v,
+            aspect_seed,
         )?;
         alignment.gain = fit_gain(
             &gain_samples(raw_wb_linear, jpeg, &alignment, photometry),
@@ -303,6 +352,7 @@ pub(crate) fn align_with_pixel_pitch<R: LinearPixels + ?Sized, J: LinearPixels +
         photometry,
         &u,
         &v,
+        aspect_seed,
     )?;
     alignment.gain = fit_gain(
         &gain_samples(raw_wb_linear, jpeg, &alignment, photometry),
@@ -310,7 +360,7 @@ pub(crate) fn align_with_pixel_pitch<R: LinearPixels + ?Sized, J: LinearPixels +
     );
 
     let (central_correlation, central_count, central_eligible) =
-        correlation_at(raw_wb_linear, &score_luma, &alignment, &u, &v, photometry)
+        rank_correlation_at(raw_wb_linear, &score_luma, &alignment, &u, &v, photometry)
             .ok_or(PrepError::AlignNoOverlap)?;
     if central_count == 0
         || (central_count as f64) < params.min_overlap_fraction * central_eligible as f64
@@ -332,6 +382,7 @@ pub(crate) fn align_with_pixel_pitch<R: LinearPixels + ?Sized, J: LinearPixels +
     Ok(alignment)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refine_geometry<R: LinearPixels + ?Sized>(
     raw: &R,
     jpeg_luma: &[f64],
@@ -340,27 +391,48 @@ fn refine_geometry<R: LinearPixels + ?Sized>(
     photometry: Photometry,
     u: &[f64],
     v: &[f64],
+    aspect_seed: f64,
 ) -> Result<(), PrepError> {
     let mask = base_mask(raw, alignment, u, v);
-    let mut cost = evaluate_cost(raw, jpeg_luma, alignment, u, v, &mask, photometry)
-        .map(|(cost, _)| cost)
-        .ok_or(PrepError::AlignNoOverlap)?;
+    let mut cost = evaluate_cost(
+        raw,
+        jpeg_luma,
+        alignment,
+        u,
+        v,
+        &mask,
+        photometry,
+        aspect_seed,
+    )
+    .map(|(cost, _)| cost)
+    .ok_or(PrepError::AlignNoOverlap)?;
     let mut lambda = 1e-3_f64;
     for _ in 0..params.max_iterations.min(12) {
-        let base = evaluate_residual(raw, jpeg_luma, alignment, u, v, &mask, photometry)
-            .ok_or(PrepError::AlignNoOverlap)?;
-        let mut jacobian = vec![vec![0.0_f64; base.len()]; 6];
+        let base = evaluate_residual(
+            raw,
+            jpeg_luma,
+            alignment,
+            u,
+            v,
+            &mask,
+            photometry,
+            aspect_seed,
+        )
+        .ok_or(PrepError::AlignNoOverlap)?;
+        let mut jacobian = vec![vec![0.0_f64; base.len()]; 7];
         for (parameter, row) in jacobian.iter_mut().enumerate() {
             let step = parameter_step(parameter, *alignment);
             let mut plus = *alignment;
             let mut minus = *alignment;
             add_parameter(&mut plus, parameter, step);
             add_parameter(&mut minus, parameter, -step);
-            let Some(e_plus) = evaluate_residual(raw, jpeg_luma, &plus, u, v, &mask, photometry)
+            let Some(e_plus) =
+                evaluate_residual(raw, jpeg_luma, &plus, u, v, &mask, photometry, aspect_seed)
             else {
                 continue;
             };
-            let Some(e_minus) = evaluate_residual(raw, jpeg_luma, &minus, u, v, &mask, photometry)
+            let Some(e_minus) =
+                evaluate_residual(raw, jpeg_luma, &minus, u, v, &mask, photometry, aspect_seed)
             else {
                 continue;
             };
@@ -369,8 +441,8 @@ fn refine_geometry<R: LinearPixels + ?Sized>(
                 *slot = (plus - minus) * scale;
             }
         }
-        let mut normal = [[0.0_f64; 6]; 6];
-        let mut gradient = [0.0_f64; 6];
+        let mut normal = [[0.0_f64; 7]; 7];
+        let mut gradient = [0.0_f64; 7];
         for (parameter, row) in jacobian.iter().enumerate() {
             for (other, column) in jacobian.iter().enumerate() {
                 normal[parameter][other] = row.iter().zip(column).map(|(a, b)| a * b).sum();
@@ -383,11 +455,11 @@ fn refine_geometry<R: LinearPixels + ?Sized>(
             }
             row[index] += lambda * row[index];
         }
-        let mut rhs = [0.0_f64; 6];
+        let mut rhs = [0.0_f64; 7];
         for (index, value) in rhs.iter_mut().enumerate() {
             *value = -gradient[index];
         }
-        let Some(delta) = solve6(normal, rhs) else {
+        let Some(delta) = solve7(normal, rhs) else {
             break;
         };
         let mut trial = *alignment;
@@ -395,7 +467,7 @@ fn refine_geometry<R: LinearPixels + ?Sized>(
             add_parameter(&mut trial, parameter, *value);
         }
         if let Some((trial_cost, _)) =
-            evaluate_cost(raw, jpeg_luma, &trial, u, v, &mask, photometry)
+            evaluate_cost(raw, jpeg_luma, &trial, u, v, &mask, photometry, aspect_seed)
         {
             if trial_cost < cost {
                 let improvement = cost - trial_cost;
@@ -444,7 +516,13 @@ fn normalized_luma_with<I: LinearPixels + ?Sized>(
         out.push(
             image
                 .sample_bilinear(x, y)
-                .map(|rgb| photometry.project(rgb))
+                .map(|rgb| {
+                    if valid_pixel(rgb) {
+                        photometry.project(rgb)
+                    } else {
+                        0.0
+                    }
+                })
                 .unwrap_or(0.0),
         );
     }
@@ -545,16 +623,28 @@ fn seed_alignment<R: LinearPixels + ?Sized, J: LinearPixels + ?Sized>(
     rotation = rotation.clamp(-0.35, 0.35);
     scale = scale.clamp(0.5, 2.0);
 
+    // An aspect-ratio crop needs different scales on the two normalized axes.
+    // A same-aspect render of any pixel size needs equal scales, so the ratio
+    // of the two aspect ratios is the seed and is 1.0 for that case.
+    let aspect = dimension_aspect(jpeg.width(), jpeg.height(), raw.width(), raw.height());
     let candidates = [
-        (1.0_f64, 0.0_f64),
-        (scale, rotation),
-        (1.0 / scale, rotation),
-        (scale, -rotation),
-        (1.0 / scale, -rotation),
-        (1.0, rotation),
-        (1.0, -rotation),
-        (scale, 0.0),
-        (1.0 / scale, 0.0),
+        (1.0, 1.0, 0.0_f64),
+        (1.0, aspect, rotation),
+        (1.0 / aspect, 1.0, rotation),
+        (1.0, aspect, 0.0),
+        (1.0 / aspect, 1.0, 0.0),
+        (1.0, 1.0, rotation),
+        (1.0, 1.0, -rotation),
+        (scale, scale * aspect, rotation),
+        (scale / aspect, scale, rotation),
+        (scale, scale * aspect, 0.0),
+        (scale / aspect, scale, 0.0),
+        (scale, scale, rotation),
+        (1.0 / scale, 1.0 / scale, rotation),
+        (scale, scale, -rotation),
+        (1.0 / scale, 1.0 / scale, -rotation),
+        (scale, scale, 0.0),
+        (1.0 / scale, 1.0 / scale, 0.0),
     ];
     let coarse = 64;
     let (u, v) = normalized_coords(coarse, coarse);
@@ -562,6 +652,7 @@ fn seed_alignment<R: LinearPixels + ?Sized, J: LinearPixels + ?Sized>(
     let raw_gray = normalized_luma_with(raw, coarse, coarse, photometry);
     let mut best = Alignment {
         scale: 1.0,
+        scale_y: 1.0,
         rotation_rad: 0.0,
         tx: 0.0,
         ty: 0.0,
@@ -571,11 +662,18 @@ fn seed_alignment<R: LinearPixels + ?Sized, J: LinearPixels + ?Sized>(
         central_correlation: f64::NEG_INFINITY,
         residual_px: 0.0,
     };
-    for (candidate_scale, candidate_rotation) in candidates {
-        let warped = warped_grid(jpeg, candidate_scale, candidate_rotation, coarse);
+    for (candidate_scale, candidate_scale_y, candidate_rotation) in candidates {
+        let warped = warped_grid(
+            jpeg,
+            candidate_scale,
+            candidate_scale_y,
+            candidate_rotation,
+            coarse,
+        );
         let (dx, dy, _) = phase_translation_multiscale(&raw_gray, &warped, coarse);
         let mut candidate = Alignment {
             scale: candidate_scale,
+            scale_y: candidate_scale_y,
             rotation_rad: candidate_rotation,
             tx: 2.0 * dx / (coarse as f64 - 1.0),
             ty: 2.0 * dy / (coarse as f64 - 1.0),
@@ -600,6 +698,7 @@ fn seed_alignment<R: LinearPixels + ?Sized, J: LinearPixels + ?Sized>(
 fn warped_grid<J: LinearPixels + ?Sized>(
     jpeg: &J,
     scale: f64,
+    scale_y: f64,
     rotation: f64,
     size: usize,
 ) -> Vec<f64> {
@@ -610,11 +709,16 @@ fn warped_grid<J: LinearPixels + ?Sized>(
     } else {
         0.0
     };
+    let inverse_scale_y = if scale_y.abs() > 1e-12 {
+        1.0 / scale_y
+    } else {
+        0.0
+    };
     let (cx, cy) = centre(jpeg.width(), jpeg.height());
     let mut out = Vec::with_capacity(u.len());
     for (u, v) in u.into_iter().zip(v) {
         let uj = inverse_scale * (cos * u + sin * v);
-        let vj = inverse_scale * (-sin * u + cos * v);
+        let vj = inverse_scale_y * (-sin * u + cos * v);
         let x = cx + uj * cx;
         let y = cy + vj * cy;
         out.push(jpeg.sample_bilinear(x, y).map(luminance).unwrap_or(0.0));
@@ -644,6 +748,7 @@ fn base_mask<R: LinearPixels + ?Sized>(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_cost<R: LinearPixels + ?Sized>(
     raw: &R,
     jpeg_luma: &[f64],
@@ -652,8 +757,18 @@ fn evaluate_cost<R: LinearPixels + ?Sized>(
     v: &[f64],
     mask: &[bool],
     photometry: Photometry,
+    aspect_seed: f64,
 ) -> Option<(f64, f64)> {
-    let residual = evaluate_residual(raw, jpeg_luma, alignment, u, v, mask, photometry)?;
+    let residual = evaluate_residual(
+        raw,
+        jpeg_luma,
+        alignment,
+        u,
+        v,
+        mask,
+        photometry,
+        aspect_seed,
+    )?;
     let count = residual.len();
     if count < 16 {
         return None;
@@ -662,6 +777,7 @@ fn evaluate_cost<R: LinearPixels + ?Sized>(
     Some((cost, count as f64))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_residual<R: LinearPixels + ?Sized>(
     raw: &R,
     jpeg_luma: &[f64],
@@ -670,12 +786,13 @@ fn evaluate_residual<R: LinearPixels + ?Sized>(
     v: &[f64],
     mask: &[bool],
     photometry: Photometry,
+    aspect_seed: f64,
 ) -> Option<Vec<f64>> {
     let (cx, cy) = centre(raw.width(), raw.height());
     let (max_x, max_y) = (f64::from(raw.width() - 1), f64::from(raw.height() - 1));
     let mut raw_values = Vec::with_capacity(mask.len());
     let mut jpeg_values = Vec::with_capacity(mask.len());
-    let mut indices = Vec::with_capacity(mask.len());
+    let mut valid_flags = Vec::with_capacity(mask.len());
     let (sin, cos) = (
         libm::sin(alignment.rotation_rad),
         libm::cos(alignment.rotation_rad),
@@ -691,31 +808,49 @@ fn evaluate_residual<R: LinearPixels + ?Sized>(
         if x < 0.0 || y < 0.0 || x > max_x || y > max_y {
             return None;
         }
-        let value = raw.sample_bilinear(x, y).map(|rgb| {
-            let radius = libm::hypot(ad, bd);
-            photometry.project_gained(rgb, alignment.gain_at(radius))
-        })?;
-        raw_values.push(value);
-        jpeg_values.push(
-            jpeg_luma
-                .get(index)
-                .copied()
-                .expect("jpeg grid has the base mask's length"),
-        );
-        indices.push(index);
+        let jpeg = jpeg_luma
+            .get(index)
+            .copied()
+            .expect("jpeg grid has the base mask's length");
+        let value = raw
+            .sample_bilinear(x, y)
+            .filter(|rgb| valid_pixel(*rgb))
+            .map(|rgb| {
+                let radius = libm::hypot(ad, bd);
+                photometry.project_gained(rgb, alignment.gain_at(radius))
+            })
+            .filter(|value| value.is_finite() && jpeg.is_finite());
+        let valid = value.is_some();
+        raw_values.push(value.unwrap_or(0.0));
+        jpeg_values.push(jpeg);
+        valid_flags.push(valid);
     }
     if raw_values.len() < 16 {
         return None;
     }
-    let mean_raw = mean(&raw_values);
-    let mean_jpeg = mean(&jpeg_values);
+    let mut count = 0usize;
+    let mut sum_raw = 0.0;
+    let mut sum_jpeg = 0.0;
+    for index in 0..raw_values.len() {
+        if valid_flags[index] {
+            count += 1;
+            sum_raw += raw_values[index];
+            sum_jpeg += jpeg_values[index];
+        }
+    }
+    if count < 16 {
+        return None;
+    }
+    let mean_raw = sum_raw / count as f64;
+    let mean_jpeg = sum_jpeg / count as f64;
     let mut covariance = 0.0;
     let mut variance_raw = 0.0;
     for index in 0..raw_values.len() {
-        let dr = raw_values[index] - mean_raw;
-        let dj = jpeg_values[index] - mean_jpeg;
-        covariance += dr * dj;
-        variance_raw += dr * dr;
+        if valid_flags[index] {
+            let dr = raw_values[index] - mean_raw;
+            covariance += dr * (jpeg_values[index] - mean_jpeg);
+            variance_raw += dr * dr;
+        }
     }
     if variance_raw < 1e-18 {
         return None;
@@ -723,8 +858,16 @@ fn evaluate_residual<R: LinearPixels + ?Sized>(
     let gain = covariance / variance_raw;
     let mut residual = Vec::with_capacity(raw_values.len());
     for index in 0..raw_values.len() {
-        let modelled = mean_jpeg + gain * (raw_values[index] - mean_raw);
-        residual.push(modelled - jpeg_values[index]);
+        if valid_flags[index] {
+            let modelled = mean_jpeg + gain * (raw_values[index] - mean_raw);
+            residual.push(modelled - jpeg_values[index]);
+        } else {
+            residual.push(0.0);
+        }
+    }
+    let weight = aspect_prior_weight(aspect_seed);
+    if weight > 0.0 {
+        residual.push(weight * (aspect_of(*alignment) - aspect_seed));
     }
     Some(residual)
 }
@@ -737,6 +880,43 @@ fn correlation_at<R: LinearPixels + ?Sized>(
     v: &[f64],
     photometry: Photometry,
 ) -> Option<(f64, usize, usize)> {
+    let (raw_values, jpeg_values, count, eligible) =
+        gate_samples(raw, jpeg_luma, alignment, u, v, photometry)?;
+    Some((
+        pearson_correlation(&raw_values, &jpeg_values)?,
+        count,
+        eligible,
+    ))
+}
+
+/// The acceptance gate's statistic: a monotone tone curve between the two
+/// renderings changes no rank, so Spearman rank correlation is not lowered by
+/// it (Spearman, Am. J. Psychol. 15 (1904) 72-101).
+fn rank_correlation_at<R: LinearPixels + ?Sized>(
+    raw: &R,
+    jpeg_luma: &[f64],
+    alignment: &Alignment,
+    u: &[f64],
+    v: &[f64],
+    photometry: Photometry,
+) -> Option<(f64, usize, usize)> {
+    let (raw_values, jpeg_values, count, eligible) =
+        gate_samples(raw, jpeg_luma, alignment, u, v, photometry)?;
+    Some((
+        rank_correlation(&raw_values, &jpeg_values)?,
+        count,
+        eligible,
+    ))
+}
+
+fn gate_samples<R: LinearPixels + ?Sized>(
+    raw: &R,
+    jpeg_luma: &[f64],
+    alignment: &Alignment,
+    u: &[f64],
+    v: &[f64],
+    photometry: Photometry,
+) -> Option<(Vec<f64>, Vec<f64>, usize, usize)> {
     let (cx, cy) = centre(raw.width(), raw.height());
     let (max_x, max_y) = (f64::from(raw.width() - 1), f64::from(raw.height() - 1));
     let mut raw_values = Vec::new();
@@ -764,6 +944,9 @@ fn correlation_at<R: LinearPixels + ?Sized>(
         }) else {
             continue;
         };
+        if !value.is_finite() || value < f64::from(MIN_RGB) || value > f64::from(MAX_RGB) {
+            continue;
+        }
         raw_values.push(value);
         jpeg_values.push(jpeg_luma[index]);
     }
@@ -771,22 +954,56 @@ fn correlation_at<R: LinearPixels + ?Sized>(
     if count < 16 {
         return None;
     }
-    let mean_raw = mean(&raw_values);
-    let mean_jpeg = mean(&jpeg_values);
-    let mut covariance = 0.0;
-    let mut var_raw = 0.0;
-    let mut var_jpeg = 0.0;
-    for index in 0..count {
-        let dr = raw_values[index] - mean_raw;
-        let dj = jpeg_values[index] - mean_jpeg;
-        covariance += dr * dj;
-        var_raw += dr * dr;
-        var_jpeg += dj * dj;
-    }
-    if var_raw <= 0.0 || var_jpeg <= 0.0 {
+    Some((raw_values, jpeg_values, count, eligible))
+}
+
+fn pearson_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
+    if left.len() != right.len() || left.len() < 2 {
         return None;
     }
-    Some((covariance / (var_raw * var_jpeg).sqrt(), count, eligible))
+    let mean_left = mean(left);
+    let mean_right = mean(right);
+    let mut covariance = 0.0;
+    let mut var_left = 0.0;
+    let mut var_right = 0.0;
+    for (left, right) in left.iter().zip(right) {
+        let dl = left - mean_left;
+        let dr = right - mean_right;
+        covariance += dl * dr;
+        var_left += dl * dl;
+        var_right += dr * dr;
+    }
+    if var_left <= 0.0 || var_right <= 0.0 {
+        return None;
+    }
+    Some(covariance / (var_left * var_right).sqrt())
+}
+
+fn rank_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
+    if left.len() != right.len() || left.len() < 2 {
+        return None;
+    }
+    pearson_correlation(&ranks(left), &ranks(right))
+}
+
+/// Average 1-based ranks; ties share the mean of their positions.
+fn ranks(values: &[f64]) -> Vec<f64> {
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_by(|&left, &right| values[left].total_cmp(&values[right]));
+    let mut out = vec![0.0; values.len()];
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && values[order[end]] == values[order[start]] {
+            end += 1;
+        }
+        let rank = (start + 1 + end) as f64 * 0.5;
+        for slot in &order[start..end] {
+            out[*slot] = rank;
+        }
+        start = end;
+    }
+    out
 }
 
 #[derive(Clone, Copy)]
@@ -893,6 +1110,9 @@ fn fit_photometry<R: LinearPixels + ?Sized>(
         let Some(value) = raw.sample_bilinear(x, y) else {
             continue;
         };
+        if !valid_pixel(value) {
+            continue;
+        }
         let gain = alignment.gain_at(libm::hypot(ad, bd));
         stats.add(
             [
@@ -908,11 +1128,9 @@ fn fit_photometry<R: LinearPixels + ?Sized>(
 
 fn parameter_step(parameter: usize, alignment: Alignment) -> f64 {
     let base: f64 = match parameter {
-        0 => 1e-6,
-        1 => 1e-6,
-        2 => 1e-5,
-        3 => 1e-5,
-        4 => 1e-4,
+        0 | 1 => 1e-6,
+        2 => 1e-6,
+        3 | 4 => 1e-5,
         _ => 1e-4,
     };
     base.max(1e-9 * add_scale(parameter, alignment))
@@ -921,8 +1139,9 @@ fn parameter_step(parameter: usize, alignment: Alignment) -> f64 {
 fn add_scale(parameter: usize, alignment: Alignment) -> f64 {
     match parameter {
         0 => alignment.scale.abs(),
-        1 => alignment.rotation_rad.abs(),
-        2 | 3 => 1.0,
+        1 => alignment.scale_y.abs(),
+        2 => alignment.rotation_rad.abs(),
+        3 | 4 => 1.0,
         _ => 1.0,
     }
 }
@@ -930,18 +1149,27 @@ fn add_scale(parameter: usize, alignment: Alignment) -> f64 {
 fn add_parameter(alignment: &mut Alignment, parameter: usize, delta: f64) {
     match parameter {
         0 => alignment.scale += delta,
-        1 => alignment.rotation_rad += delta,
-        2 => alignment.tx += delta,
-        3 => alignment.ty += delta,
-        4 => alignment.k1 += delta,
+        1 => alignment.scale_y += delta,
+        2 => alignment.rotation_rad += delta,
+        3 => alignment.tx += delta,
+        4 => alignment.ty += delta,
+        5 => alignment.k1 += delta,
         _ => alignment.k2 += delta,
     }
 }
 
-fn solve6(mut a: [[f64; 6]; 6], mut b: [f64; 6]) -> Option<[f64; 6]> {
-    for column in 0..6 {
+fn aspect_of(alignment: Alignment) -> f64 {
+    if alignment.scale.abs() > 1e-12 {
+        alignment.scale_y / alignment.scale
+    } else {
+        1.0
+    }
+}
+
+fn solve7(mut a: [[f64; 7]; 7], mut b: [f64; 7]) -> Option<[f64; 7]> {
+    for column in 0..7 {
         let mut pivot = column;
-        for row in (column + 1)..6 {
+        for row in (column + 1)..7 {
             if a[row][column].abs() > a[pivot][column].abs() {
                 pivot = row;
             }
@@ -953,7 +1181,7 @@ fn solve6(mut a: [[f64; 6]; 6], mut b: [f64; 6]) -> Option<[f64; 6]> {
         b.swap(column, pivot);
         let denominator = a[column][column];
         let pivot_row = a[column];
-        for row in (column + 1)..6 {
+        for row in (column + 1)..7 {
             let factor = a[row][column] / denominator;
             for (index, value) in a[row].iter_mut().enumerate().skip(column) {
                 *value -= factor * pivot_row[index];
@@ -961,10 +1189,10 @@ fn solve6(mut a: [[f64; 6]; 6], mut b: [f64; 6]) -> Option<[f64; 6]> {
             b[row] -= factor * b[column];
         }
     }
-    let mut out = [0.0_f64; 6];
-    for row in (0..6).rev() {
+    let mut out = [0.0_f64; 7];
+    for row in (0..7).rev() {
         let mut sum = b[row];
-        for column in (row + 1)..6 {
+        for column in (row + 1)..7 {
             sum -= a[row][column] * out[column];
         }
         out[row] = sum / a[row][row];
@@ -1339,6 +1567,9 @@ fn gain_samples<R: LinearPixels + ?Sized, J: LinearPixels + ?Sized>(
         let Some(raw_pixel) = raw.sample_bilinear(x, y) else {
             continue;
         };
+        if !valid_pixel(raw_pixel) {
+            continue;
+        }
         let raw_luma = photometry.linear(raw_pixel);
         if !raw_luma.is_finite() || raw_luma <= 1e-7 {
             continue;
@@ -1588,6 +1819,10 @@ fn block_residual<R: LinearPixels + ?Sized, J: LinearPixels + ?Sized>(
                     let raw_pixel = raw
                         .pixel((x + px) as u32, (y + py) as u32)
                         .expect("block is inside the image");
+                    if !valid_pixel(raw_pixel) {
+                        valid = false;
+                        break;
+                    }
                     let (jx, jy) = alignment.raw_to_jpeg_with(
                         sx,
                         sy,
@@ -1729,6 +1964,7 @@ mod tests {
     fn ground_truth() -> Alignment {
         Alignment {
             scale: 1.0,
+            scale_y: 1.0,
             rotation_rad: 0.004,
             tx: 0.012,
             ty: -0.009,
@@ -1871,6 +2107,238 @@ mod tests {
         }
     }
 
+    /// A RAW covering the whole frame and a JPEG rendered from the sub-frame
+    /// its alignment selects. The JPEG's pixel aspect is square.
+    fn make_cropped_pair(
+        raw_width: u32,
+        raw_height: u32,
+        jpeg_width: u32,
+        jpeg_height: u32,
+        truth: Alignment,
+        curve: fn(f64) -> f64,
+        scene_at: fn(f64, f64) -> [f64; 3],
+    ) -> (Image3, DecodedJpeg) {
+        let (cx, cy) = centre(raw_width, raw_height);
+        let mut raw_data = Vec::with_capacity((raw_width * raw_height) as usize);
+        for y in 0..raw_height {
+            for x in 0..raw_width {
+                let u = (f64::from(x) - cx) / cx;
+                let v = (f64::from(y) - cy) / cy;
+                let radius = libm::hypot(u, v);
+                let color = scene_at(u, v);
+                let shading = 1.0 / true_gain(radius);
+                raw_data.push([
+                    (color[0] * shading) as f32,
+                    (color[1] * shading) as f32,
+                    (color[2] * shading) as f32,
+                ]);
+            }
+        }
+        let raw = Image3::new(raw_width, raw_height, raw_data).expect("raw image");
+        let mut linear = Vec::with_capacity((jpeg_width * jpeg_height) as usize);
+        for y in 0..jpeg_height {
+            for x in 0..jpeg_width {
+                let (rx, ry) = truth.jpeg_to_raw(
+                    f64::from(x),
+                    f64::from(y),
+                    jpeg_width,
+                    jpeg_height,
+                    raw_width,
+                    raw_height,
+                );
+                let u = (rx - cx) / cx;
+                let v = (ry - cy) / cy;
+                let color = scene_at(u, v);
+                linear.push([
+                    curve(color[0]) as f32,
+                    curve(color[1]) as f32,
+                    curve(color[2]) as f32,
+                ]);
+            }
+        }
+        (
+            raw,
+            DecodedJpeg {
+                image: Image3::new(jpeg_width, jpeg_height, linear).expect("jpeg image"),
+                space: OutputSpace::Srgb,
+                space_assumed: true,
+                code_values_near_clip: vec![false; (jpeg_width * jpeg_height) as usize],
+            },
+        )
+    }
+
+    fn cropped_truth(scale: f64, scale_y: f64, tx: f64, ty: f64) -> Alignment {
+        Alignment {
+            scale,
+            scale_y,
+            tx,
+            ty,
+            ..ground_truth()
+        }
+    }
+
+    #[test]
+    fn a_sixteen_by_nine_crop_recovers_per_axis_scales() {
+        let (raw, jpeg) = make_cropped_pair(
+            RAW_WIDTH,
+            RAW_HEIGHT,
+            900,
+            506,
+            cropped_truth(1.0, 505.0 / 599.0, 0.0, 0.0),
+            tone,
+            scene,
+        );
+        let alignment = align(&raw, &jpeg, &AlignParams::default()).expect("alignment");
+        assert!(alignment.central_correlation >= 0.98, "{alignment:?}");
+        assert!(
+            (alignment.scale - 1.0).abs() < 0.01,
+            "scale {}, {alignment:?}",
+            alignment.scale
+        );
+        assert!(
+            (alignment.scale_y - 505.0 / 599.0).abs() < 0.01,
+            "scale_y {}, {alignment:?}",
+            alignment.scale_y
+        );
+        assert!(
+            alignment.tx.abs() < 0.01 && alignment.ty.abs() < 0.01,
+            "{alignment:?}"
+        );
+        assert!(alignment.residual_px < 0.3, "{alignment:?}");
+        let error = mapping_error(
+            &alignment,
+            &cropped_truth(1.0, 505.0 / 599.0, 0.0, 0.0),
+            900,
+            506,
+            RAW_WIDTH,
+            RAW_HEIGHT,
+        );
+        assert!(
+            error < 0.3,
+            "mapping error {error}, alignment {alignment:?}"
+        );
+    }
+
+    #[test]
+    fn a_square_crop_recovers_per_axis_scales() {
+        let (raw, jpeg) = make_cropped_pair(
+            RAW_WIDTH,
+            RAW_HEIGHT,
+            600,
+            600,
+            cropped_truth(599.0 / 899.0, 1.0, 0.0, 0.0),
+            tone,
+            scene,
+        );
+        let alignment = align(&raw, &jpeg, &AlignParams::default()).expect("alignment");
+        assert!(alignment.central_correlation >= 0.98, "{alignment:?}");
+        assert!(
+            (alignment.scale - 599.0 / 899.0).abs() < 0.01,
+            "scale {}, {alignment:?}",
+            alignment.scale
+        );
+        assert!(
+            (alignment.scale_y - 1.0).abs() < 0.01,
+            "scale_y {}, {alignment:?}",
+            alignment.scale_y
+        );
+        assert!(alignment.residual_px < 0.5, "{alignment:?}");
+        let error = mapping_error(
+            &alignment,
+            &cropped_truth(599.0 / 899.0, 1.0, 0.0, 0.0),
+            600,
+            600,
+            RAW_WIDTH,
+            RAW_HEIGHT,
+        );
+        assert!(
+            error < 0.3,
+            "mapping error {error}, alignment {alignment:?}"
+        );
+    }
+
+    #[test]
+    fn a_uniform_same_aspect_crop_recovers_one_scale() {
+        let truth = cropped_truth(0.8, 0.8, 0.03, -0.02);
+        let (raw, jpeg) = make_cropped_pair(RAW_WIDTH, RAW_HEIGHT, 720, 480, truth, tone, scene);
+        let alignment = align(&raw, &jpeg, &AlignParams::default()).expect("alignment");
+        assert!(alignment.central_correlation >= 0.98, "{alignment:?}");
+        assert!(
+            (alignment.scale - truth.scale).abs() < 0.01
+                && (alignment.scale_y - truth.scale_y).abs() < 0.01,
+            "{alignment:?}"
+        );
+        assert!(
+            (alignment.tx - truth.tx).abs() < 0.01 && (alignment.ty - truth.ty).abs() < 0.01,
+            "{alignment:?}"
+        );
+        let error = mapping_error(&alignment, &truth, 720, 480, RAW_WIDTH, RAW_HEIGHT);
+        assert!(
+            error < 0.3,
+            "mapping error {error}, alignment {alignment:?}"
+        );
+    }
+
+    #[test]
+    fn an_off_centre_crop_recovers_scales_and_offset() {
+        let truth = cropped_truth(0.9, 0.6, 0.05, 0.1);
+        let (raw, jpeg) = make_cropped_pair(RAW_WIDTH, RAW_HEIGHT, 900, 400, truth, tone, scene);
+        let alignment = align(&raw, &jpeg, &AlignParams::default()).expect("alignment");
+        assert!(alignment.central_correlation >= 0.98, "{alignment:?}");
+        assert!(
+            (alignment.scale - truth.scale).abs() < 0.01
+                && (alignment.scale_y - truth.scale_y).abs() < 0.01,
+            "{alignment:?}"
+        );
+        assert!(
+            (alignment.tx - truth.tx).abs() < 0.01 && (alignment.ty - truth.ty).abs() < 0.01,
+            "{alignment:?}"
+        );
+        assert!(alignment.residual_px < 0.3, "{alignment:?}");
+        let error = mapping_error(&alignment, &truth, 900, 400, RAW_WIDTH, RAW_HEIGHT);
+        assert!(
+            error < 0.3,
+            "mapping error {error}, alignment {alignment:?}"
+        );
+    }
+
+    #[test]
+    fn aspect_crops_of_a_different_scene_do_not_align() {
+        for (jpeg_width, jpeg_height, truth) in [
+            (900, 506, cropped_truth(1.0, 505.0 / 599.0, 0.0, 0.0)),
+            (600, 600, cropped_truth(599.0 / 899.0, 1.0, 0.0, 0.0)),
+            (900, 400, cropped_truth(0.9, 0.6, 0.05, 0.1)),
+        ] {
+            let (raw, _) = make_cropped_pair(
+                RAW_WIDTH,
+                RAW_HEIGHT,
+                jpeg_width,
+                jpeg_height,
+                truth,
+                tone,
+                scene,
+            );
+            let (_, wrong) = make_cropped_pair(
+                RAW_WIDTH,
+                RAW_HEIGHT,
+                jpeg_width,
+                jpeg_height,
+                truth,
+                tone,
+                other_texture,
+            );
+            let error = align(&raw, &wrong, &AlignParams::default())
+                .expect_err("an unrelated render cannot align");
+            assert!(
+                matches!(
+                    error,
+                    PrepError::AlignLowCorrelation { .. } | PrepError::AlignNoOverlap
+                ),
+                "{jpeg_width}x{jpeg_height}: {error}"
+            );
+        }
+    }
+
     /// A pair whose JPEG is `scale` times the raw's linear size and carries a
     /// two-pixel pattern that averages out within one raw pixel.
     fn make_detailed_pair(
@@ -1984,6 +2452,33 @@ mod tests {
                     truth.jpeg_to_raw(x, y, JPEG_WIDTH, JPEG_HEIGHT, RAW_WIDTH, RAW_HEIGHT);
                 let (jx, jy) =
                     truth.raw_to_jpeg(rx, ry, RAW_WIDTH, RAW_HEIGHT, JPEG_WIDTH, JPEG_HEIGHT);
+                assert!(
+                    (jx - x).abs() < 1e-6 && (jy - y).abs() < 1e-6,
+                    "({x}, {y}) -> ({rx}, {ry}) -> ({jx}, {jy})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anisotropic_raw_to_jpeg_inverts_jpeg_to_raw() {
+        let truth = Alignment {
+            scale: 1.0,
+            scale_y: 505.0 / 599.0,
+            rotation_rad: 0.01,
+            tx: 0.02,
+            ty: -0.015,
+            k1: -0.01,
+            k2: 0.003,
+            ..ground_truth()
+        };
+        let (jpeg_width, jpeg_height) = (900, 506);
+        for y in [0.0, 100.0, 252.5, 505.0] {
+            for x in [0.0, 150.0, 450.0, 899.0] {
+                let (rx, ry) =
+                    truth.jpeg_to_raw(x, y, jpeg_width, jpeg_height, RAW_WIDTH, RAW_HEIGHT);
+                let (jx, jy) =
+                    truth.raw_to_jpeg(rx, ry, RAW_WIDTH, RAW_HEIGHT, jpeg_width, jpeg_height);
                 assert!(
                     (jx - x).abs() < 1e-6 && (jy - y).abs() < 1e-6,
                     "({x}, {y}) -> ({rx}, {ry}) -> ({jx}, {jy})"
@@ -2194,6 +2689,195 @@ mod tests {
             space_assumed: true,
             code_values_near_clip: vec![false; (width * height) as usize],
         }
+    }
+
+    fn dark_scene(u: f64, v: f64) -> [f64; 3] {
+        let base = 0.04
+            + 0.015 * libm::sin(5.0 * u + 1.3)
+            + 0.012 * libm::cos(7.0 * v - 0.4)
+            + 0.008 * libm::sin(11.0 * (u + v));
+        let blocks = if ((u * 4.0).floor() as i32 + (v * 3.0).floor() as i32) % 2 == 0 {
+            0.008
+        } else {
+            -0.005
+        };
+        let edge = if libm::sin(17.0 * u) * libm::cos(13.0 * v) > 0.25 {
+            0.006
+        } else {
+            0.0
+        };
+        [
+            (base + blocks + edge).clamp(0.005, 0.12),
+            (base + 0.7 * blocks + 0.004 * libm::cos(9.0 * u)).clamp(0.005, 0.12),
+            (base - blocks + 0.004 * libm::sin(6.0 * v + 0.7)).clamp(0.005, 0.12),
+        ]
+    }
+
+    fn textured_dark_scene(u: f64, v: f64) -> [f64; 3] {
+        let x = u * (f64::from(RAW_WIDTH - 1) * 0.5);
+        let y = v * (f64::from(RAW_HEIGHT - 1) * 0.5);
+        let mut value = 0.06;
+        for (period, angle, phase) in [
+            (10.0_f64, 0.0_f64, 0.3_f64),
+            (12.0, 0.6, 1.7),
+            (14.0, 1.2, 2.9),
+            (10.5, 1.9, 4.1),
+            (12.5, 2.5, 5.3),
+            (13.5, 3.0, 0.9),
+        ] {
+            let phase = 2.0 * std::f64::consts::PI / period
+                * (libm::cos(angle) * x + libm::sin(angle) * y)
+                + phase;
+            value += 0.008 * libm::sin(phase);
+        }
+        [
+            value.clamp(0.005, 0.12),
+            (value + 0.002 * libm::sin(9.0 * u)).clamp(0.005, 0.12),
+            (value + 0.002 * libm::cos(6.0 * v + 0.7)).clamp(0.005, 0.12),
+        ]
+    }
+
+    fn other_dark_scene(u: f64, v: f64) -> [f64; 3] {
+        let base = 0.04
+            + 0.015 * libm::cos(13.0 * v + 0.2)
+            + 0.012 * libm::sin(4.0 * u - 1.1)
+            + 0.008 * libm::cos(9.0 * (u - v));
+        let blocks = if ((u * 3.0).floor() as i32 + (v * 5.0).floor() as i32) % 2 == 0 {
+            0.007
+        } else {
+            -0.006
+        };
+        [
+            (base + blocks).clamp(0.005, 0.12),
+            (base + 0.6 * blocks).clamp(0.005, 0.12),
+            (base - blocks).clamp(0.005, 0.12),
+        ]
+    }
+
+    fn dark_tone(value: f64) -> f64 {
+        (0.02 + 0.96 * libm::pow((value / 0.12).clamp(0.0, 1.0), 0.32)).clamp(0.0, 1.0)
+    }
+
+    fn make_dark_pair(
+        width: u32,
+        height: u32,
+        scene_at: fn(f64, f64) -> [f64; 3],
+        seed: u8,
+    ) -> (Image3, DecodedJpeg) {
+        use rand_chacha::ChaCha20Rng;
+        use rand_chacha::rand_core::{RngCore, SeedableRng};
+
+        let mut rng = ChaCha20Rng::from_seed([seed; 32]);
+        let mut next_noise = || (f64::from(rng.next_u32()) / f64::from(u32::MAX) - 0.5) * 2.0;
+        let truth = ground_truth();
+        let (cx, cy) = centre(width, height);
+        let mut raw_data = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let u = (f64::from(x) - cx) / cx;
+                let v = (f64::from(y) - cy) / cy;
+                let radius = libm::hypot(u, v);
+                let color = scene_at(u, v);
+                let shading = 1.0 / true_gain(radius);
+                let noise = 1.0 + 0.02 * next_noise();
+                raw_data.push([
+                    (color[0] * shading * noise) as f32,
+                    (color[1] * shading * noise) as f32,
+                    (color[2] * shading * noise) as f32,
+                ]);
+            }
+        }
+        let raw = Image3::new(width, height, raw_data).expect("raw image");
+        let mut linear = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let (rx, ry) =
+                    truth.jpeg_to_raw(f64::from(x), f64::from(y), width, height, width, height);
+                let u = (rx - cx) / cx;
+                let v = (ry - cy) / cy;
+                let color = scene_at(u, v);
+                let noise = 0.01 * next_noise();
+                linear.push([
+                    (dark_tone(color[0]) + noise) as f32,
+                    (dark_tone(color[1]) + noise) as f32,
+                    (dark_tone(color[2]) + noise) as f32,
+                ]);
+            }
+        }
+        (
+            raw,
+            DecodedJpeg {
+                image: Image3::new(width, height, linear).expect("jpeg image"),
+                space: OutputSpace::Srgb,
+                space_assumed: true,
+                code_values_near_clip: vec![false; (width * height) as usize],
+            },
+        )
+    }
+
+    #[test]
+    fn a_dark_high_iso_pair_passes_the_rank_gate_but_not_the_linear_one() {
+        let (raw, jpeg) = make_dark_pair(RAW_WIDTH, RAW_HEIGHT, dark_scene, 0x31);
+        let alignment = align(&raw, &jpeg, &AlignParams::default()).expect("genuine dark pair");
+        assert!(alignment.central_correlation >= 0.98, "{alignment:?}");
+
+        let grid = 192;
+        let (u, v) = normalized_coords(grid, grid);
+        let score_jpeg = AreaDownsample::new(&jpeg, raw.width.saturating_mul(raw.height).max(1));
+        let score_luma = downsampled_luma(&score_jpeg, jpeg.width(), jpeg.height(), grid, grid);
+        let photometry = fit_photometry(&raw, &alignment, &u, &v, &score_luma)
+            .unwrap_or_else(Photometry::luminance);
+        let (naive, _, _) = correlation_at(&raw, &score_luma, &alignment, &u, &v, photometry)
+            .expect("linear score");
+        assert!(naive < 0.98, "the linear statistic already passes: {naive}");
+    }
+
+    #[test]
+    fn a_dark_rank_gate_rejects_a_shift_and_a_rotation() {
+        let (raw, jpeg) = make_dark_pair(RAW_WIDTH, RAW_HEIGHT, textured_dark_scene, 0x31);
+        let truth = ground_truth();
+        let grid = 192;
+        let (u, v) = normalized_coords(grid, grid);
+        let score_jpeg = AreaDownsample::new(&jpeg, raw.width.saturating_mul(raw.height).max(1));
+        let score_luma = downsampled_luma(&score_jpeg, jpeg.width(), jpeg.height(), grid, grid);
+        let photometry =
+            fit_photometry(&raw, &truth, &u, &v, &score_luma).unwrap_or_else(Photometry::luminance);
+        let (genuine, _, _) = rank_correlation_at(&raw, &score_luma, &truth, &u, &v, photometry)
+            .expect("genuine score");
+        assert!(genuine >= 0.98, "genuine textured pair: {genuine}");
+        let mut shifted = truth;
+        shifted.tx += 6.0 / f64::from(RAW_WIDTH - 1);
+        let (shifted_correlation, _, _) =
+            rank_correlation_at(&raw, &score_luma, &shifted, &u, &v, photometry)
+                .expect("shifted score");
+        assert!(
+            shifted_correlation < 0.98,
+            "a three-pixel shift passes the gate: {shifted_correlation}"
+        );
+        let mut rotated = truth;
+        rotated.rotation_rad += 0.01;
+        let (rotated_correlation, _, _) =
+            rank_correlation_at(&raw, &score_luma, &rotated, &u, &v, photometry)
+                .expect("rotated score");
+        assert!(
+            rotated_correlation < 0.98,
+            "a 0.01 rad rotation passes the gate: {rotated_correlation}"
+        );
+    }
+
+    #[test]
+    fn a_dark_render_of_a_different_scene_is_rejected() {
+        let (raw, _) = make_dark_pair(RAW_WIDTH, RAW_HEIGHT, dark_scene, 0x31);
+        let (_, wrong) = make_dark_pair(RAW_WIDTH, RAW_HEIGHT, other_dark_scene, 0x31);
+        let error = align(&raw, &wrong, &AlignParams::default())
+            .expect_err("an unrelated dark render cannot align");
+        assert!(
+            matches!(
+                error,
+                PrepError::AlignLowCorrelation { .. } | PrepError::AlignNoOverlap
+            ),
+            "{error}"
+        );
     }
 
     #[test]

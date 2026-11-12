@@ -77,20 +77,25 @@ pub enum FileResult<T> {
     Failed,
 }
 
-/// Decode or prep one file, containing a panic and reporting a decoder error.
+/// Decode or prep one file, containing a panic and reporting the step's error.
 /// The caller decides whether the remaining files are worth processing.
-pub fn catch_file<T>(file: &Path, step: impl FnOnce() -> Result<T>) -> FileResult<T> {
+pub fn catch_file<T>(
+    file: &Path,
+    step_name: &str,
+    step: impl FnOnce() -> Result<T>,
+) -> FileResult<T> {
     match catch_panic(step) {
         Ok(Ok(value)) => FileResult::Done(value),
         Ok(Err(error)) => {
-            report_decoder_error(file);
-            eprintln!("  {error:#}");
+            eprintln!("{}: {error:#}", file.display());
             FileResult::Failed
         }
         Err(payload) => {
-            report_decoder_error(file);
-            if let Some(message) = panic_message(payload) {
-                eprintln!("  {message}");
+            match panic_message(payload) {
+                Some(message) => {
+                    eprintln!("{}: {step_name} panicked: {message}", file.display());
+                }
+                None => eprintln!("{}: {step_name} panicked", file.display()),
             }
             FileResult::Failed
         }
@@ -99,13 +104,6 @@ pub fn catch_file<T>(file: &Path, step: impl FnOnce() -> Result<T>) -> FileResul
 
 pub fn catch_panic<T>(step: impl FnOnce() -> T) -> Result<T, Box<dyn std::any::Any + Send>> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(step))
-}
-
-fn report_decoder_error(file: &Path) {
-    eprintln!(
-        "{}: This file couldn't be decoded (decoder error).",
-        file.display()
-    );
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> Option<String> {
@@ -132,6 +130,7 @@ mod tests {
         let mut ran = false;
         let outcome = catch_file(
             std::path::Path::new("broken.raf"),
+            "test step",
             || -> anyhow::Result<()> {
                 ran = true;
                 panic!("decoder exploded")
@@ -145,13 +144,13 @@ mod tests {
     fn ordinary_errors_and_values_pass_through_the_same_wrapper() {
         let file = std::path::Path::new("broken.raf");
         assert!(matches!(
-            catch_file(file, || -> anyhow::Result<()> {
+            catch_file(file, "test step", || -> anyhow::Result<()> {
                 anyhow::bail!("bad header")
             }),
             FileResult::Failed
         ));
         assert!(matches!(
-            catch_file(file, || -> anyhow::Result<u32> { Ok(7) }),
+            catch_file(file, "test step", || -> anyhow::Result<u32> { Ok(7) }),
             FileResult::Done(7)
         ));
         assert!(catch_panic(|| 1_u32).is_ok());
