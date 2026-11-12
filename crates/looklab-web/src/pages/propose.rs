@@ -1439,7 +1439,7 @@ fn KindPicker(form: Form) -> impl IntoView {
             "Correct the controls a camera offers, their ranges or menu choices. Get the look uses them to write settings cards."
         }
         ProposalKind::LutLook => {
-            "Add a custom look built from a .cube LUT file. The file is uploaded with the proposal and stays private until approval; published custom looks appear on Looks, in Compare and in Get the look."
+            "Add a custom look built from a .cube LUT file. The file is uploaded with the proposal and stays private until approval; published custom looks appear on Looks and in Compare, and matchable ones also appear in Get the look."
         }
         ProposalKind::InterfaceProfile => {
             "Define how an editing app applies exported looks with a looklab YAML profile. Published profiles appear on For developers → Editing apps and enable the Editing app result in Get the look."
