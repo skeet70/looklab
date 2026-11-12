@@ -306,7 +306,7 @@ struct FallbackLimits {
 }
 
 fn fallback_limits(baseline_products: usize) -> FallbackLimits {
-    let production = JOINT_CG_LIMIT.saturating_sub(4);
+    let production = ANALYTIC_WORK_LIMIT;
     let remaining = SHARED_INNER_PRODUCTS.saturating_sub(baseline_products);
     FallbackLimits {
         baseline: production.min(SHARED_INNER_PRODUCTS),
@@ -1178,7 +1178,10 @@ fn evaluate_arm(
     let mut trial = ordinary_trial;
     if box_ranked_first && let Some(prediction) = box_positive {
         let box_trial = evaluate(&box_params, prediction);
-        if box_trial.decrease > trial.map_or(f64::NEG_INFINITY, |trial| trial.decrease) {
+        if strictly_larger_decrease(
+            box_trial.decrease,
+            trial.map_or(f64::NEG_INFINITY, |trial| trial.decrease),
+        ) {
             winner = FixedLinearizationWinner::Box;
             winner_candidate = report.box_candidate;
             trial = Some(box_trial);
@@ -1549,8 +1552,8 @@ mod tests {
     #[test]
     fn shared_inner_allowance_is_split_not_duplicated() {
         let fresh = fallback_limits(0);
-        assert_eq!(fresh.baseline, SHARED_INNER_PRODUCTS);
-        assert_eq!(fresh.candidate, SHARED_INNER_PRODUCTS);
+        assert_eq!(fresh.baseline, ANALYTIC_WORK_LIMIT);
+        assert_eq!(fresh.candidate, ANALYTIC_WORK_LIMIT);
         assert!(!fresh.binding);
 
         let one_left = fallback_limits(SHARED_INNER_PRODUCTS - 1);

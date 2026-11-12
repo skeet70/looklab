@@ -240,6 +240,7 @@ fn checkpoint_state(
         sweep,
         damping,
         trust_radius: None,
+        positive_trust_radius: None,
         converged: false,
         plateau: PlateauHistory::snapshot(
             recent,
@@ -1433,6 +1434,7 @@ fn run_inner(
     let mut cert_warm: Option<Vec<f64>> = None;
     let mut recent: Vec<f64> = Vec::new();
     let mut trust_radius = resume.and_then(|state| state.trust_radius);
+    let mut positive_trust_radius = resume.and_then(|state| state.positive_trust_radius);
     let mut final_scratch = FinalScratch::default();
     let start_stage = resume.map_or(0, |state| state.stage.min(STAGES.len()));
     for (stage_index, stage) in STAGES.iter().enumerate() {
@@ -1680,6 +1682,7 @@ fn run_inner(
                     hessian_scale,
                     cost,
                     &mut trust_radius,
+                    &mut positive_trust_radius,
                     &mut gradient_scale,
                     &mut evaluations,
                     &mut sample_evaluations,
@@ -2316,6 +2319,7 @@ fn run_inner(
 
     if let Some(state) = &mut resume_state {
         state.trust_radius = trust_radius;
+        state.positive_trust_radius = positive_trust_radius;
     }
 
     Ok((
@@ -2371,6 +2375,7 @@ fn final_stage_step(
     data_scale: f64,
     cost: f64,
     radius: &mut Option<crate::TrustRadius>,
+    positive_radius: &mut Option<crate::TrustRadius>,
     gradient_scale: &mut Option<f64>,
     evaluations: &mut usize,
     sample_evaluations: &mut SampleEvaluations,
@@ -2412,6 +2417,7 @@ fn final_stage_step(
         pass,
         cost,
         radius,
+        positive_radius,
         gradient_scale,
         evaluations,
         sample_evaluations,
@@ -2449,19 +2455,12 @@ fn stationary_outcome(
     )
 }
 
-fn shrink_trust_radius(radius: &mut Option<crate::TrustRadius>) -> bool {
-    let Some(next) = radius.and_then(|current| current.shrink(0.25)) else {
-        return false;
-    };
-    *radius = Some(next);
-    true
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppliedStep {
     TrustRegion,
     Cauchy,
     Box,
+    Positive,
 }
 
 impl AppliedStep {
@@ -2470,6 +2469,7 @@ impl AppliedStep {
             Self::TrustRegion => "tr",
             Self::Cauchy => "cauchy",
             Self::Box => "box",
+            Self::Positive => "positive",
         }
     }
 }
@@ -2490,6 +2490,11 @@ impl From<OrdinaryStep> for AppliedStep {
     }
 }
 
+/// Whether `candidate` is a finite decrease strictly larger than `current`.
+fn strictly_larger_decrease(candidate: f64, current: f64) -> bool {
+    candidate.is_finite() && (!current.is_finite() || candidate > current)
+}
+
 /// The box alternative replaces the ordinary winner only when it ranks first on predicted
 /// decrease and its realized decrease is strictly larger.
 fn guarded_selection(
@@ -2498,11 +2503,323 @@ fn guarded_selection(
     ordinary_decrease: f64,
     box_decrease: f64,
 ) -> AppliedStep {
-    if box_ranked_first && box_decrease > ordinary_decrease {
+    if box_ranked_first && strictly_larger_decrease(box_decrease, ordinary_decrease) {
         AppliedStep::Box
     } else {
         ordinary.into()
     }
+}
+
+/// Per-attempt Hessian-product allowance for the analytic model; the remainder is reserved
+/// for its Cauchy gradient and realized applied-step products.
+const ANALYTIC_WORK_LIMIT: usize = JOINT_CG_LIMIT - JOINT_CG_LIMIT / 2 - 4;
+
+/// Per-attempt Hessian-product allowance for the positive model, reserving its realized
+/// applied-step product.
+const POSITIVE_WORK_LIMIT: usize = JOINT_CG_LIMIT / 2 - 1;
+
+/// One model's candidate after evaluation on the true objective.
+struct AttemptCandidate {
+    step: AppliedStep,
+    cost: f64,
+    feasible: bool,
+    prediction: f64,
+    metric_norm: f64,
+    diagnostics: Option<SolveDiagnostics>,
+    candidate: PassOutput,
+}
+
+/// A subproblem's reported state for the accepted-trial line.
+#[derive(Clone, Copy, Debug)]
+struct SolveDiagnostics {
+    iterations: usize,
+    relative_residual: f64,
+    termination: &'static str,
+    scale: f64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct RealizedTrace {
+    step: AppliedStep,
+    cost: f64,
+    feasible: bool,
+    prediction: f64,
+    metric_norm: f64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct AttemptTrace {
+    cost: f64,
+    applied: AppliedStep,
+    analytic: Option<RealizedTrace>,
+    positive: Option<RealizedTrace>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static POSITIVE_WORK_LIMIT_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static LAST_ATTEMPT: std::cell::Cell<Option<AttemptTrace>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn positive_work_limit() -> usize {
+    POSITIVE_WORK_LIMIT_OVERRIDE
+        .with(|slot| slot.get())
+        .unwrap_or(POSITIVE_WORK_LIMIT)
+}
+
+#[cfg(not(test))]
+fn positive_work_limit() -> usize {
+    POSITIVE_WORK_LIMIT
+}
+
+#[cfg(test)]
+fn record_attempt(trace: AttemptTrace) {
+    LAST_ATTEMPT.with(|slot| slot.set(Some(trace)));
+}
+
+#[cfg(test)]
+fn last_attempt() -> Option<AttemptTrace> {
+    LAST_ATTEMPT.with(|slot| slot.get())
+}
+
+#[cfg(test)]
+fn set_positive_work_limit(value: Option<usize>) {
+    POSITIVE_WORK_LIMIT_OVERRIDE.with(|slot| slot.set(value));
+}
+
+/// The realized objective of one model's candidate, before the objective pick.
+#[derive(Clone, Copy, Debug)]
+struct RealizedCandidate {
+    step: AppliedStep,
+    cost: f64,
+    feasible: bool,
+}
+
+/// Picks the feasible candidate with the lower realized objective; ties keep the analytic one.
+fn objective_pick(
+    cost: f64,
+    analytic: Option<RealizedCandidate>,
+    positive: Option<RealizedCandidate>,
+) -> Option<AppliedStep> {
+    match (analytic, positive) {
+        (Some(analytic), Some(positive)) => {
+            let analytic_decrease = cost - analytic.cost;
+            let positive_decrease = cost - positive.cost;
+            if positive.feasible
+                && (!analytic.feasible
+                    || strictly_larger_decrease(positive_decrease, analytic_decrease))
+            {
+                Some(positive.step)
+            } else {
+                Some(analytic.step)
+            }
+        }
+        (Some(analytic), None) => Some(analytic.step),
+        (None, Some(positive)) => Some(positive.step),
+        (None, None) => None,
+    }
+}
+
+/// Applies one model's ratio thresholds to its own radius; an unacceptable candidate shrinks it.
+fn adapt_trust_radius(
+    current: crate::TrustRadius,
+    ratio: f64,
+    metric_norm: f64,
+    acceptable: bool,
+) -> crate::TrustRadius {
+    if !acceptable || !ratio.is_finite() || ratio < 0.25 {
+        current.shrink(0.25).unwrap_or(current)
+    } else if ratio > 0.75 && metric_norm.is_finite() && metric_norm >= 0.8 * current.get() {
+        current.expand(2.0).unwrap_or(current)
+    } else {
+        current
+    }
+}
+
+fn realized_ratio(cost: f64, trial_cost: f64, prediction: f64) -> f64 {
+    (cost - trial_cost) / prediction
+}
+
+/// The acceptance rule shared by both step models.
+fn candidate_passes(cost: f64, trial_cost: f64, prediction: f64, feasible: bool) -> bool {
+    feasible
+        && trial_cost.is_finite()
+        && cost - trial_cost > 1e-12 * cost.abs().max(1.0)
+        && realized_ratio(cost, trial_cost, prediction) >= 1e-4
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_trial(
+    stage_problem: &Problem,
+    problem: &Problem,
+    stage: &Stage,
+    params: &Params,
+    blocks: &[BlockAcc],
+    penalties: &[Vec<f64>],
+    lambdas: &StageLambdas,
+    options: &FitOptions,
+    evaluations: &mut usize,
+    sample_evaluations: &mut SampleEvaluations,
+    samples_per_pass: usize,
+) -> Option<(PassOutput, f64)> {
+    if sample_evaluations.get() as f64 + samples_per_pass as f64 > options.sweep_budget {
+        return None;
+    }
+    let candidate = stage_problem.pass(
+        params,
+        stage.active,
+        &mut [],
+        false,
+        false,
+        stage.neutral,
+        IntentFilter::NativeOnly,
+    );
+    *evaluations += 1;
+    *sample_evaluations += samples_per_pass;
+    let trial_cost =
+        candidate.cost + total_cost(problem, params, blocks, penalties, lambdas, options);
+    Some((candidate, trial_cost))
+}
+
+/// One candidate from the positive Gauss-Newton trust region.
+#[derive(Clone, Copy, Debug)]
+struct PositiveStep {
+    prediction: f64,
+    metric_norm: f64,
+    diagnostics: SolveDiagnostics,
+}
+
+/// Whether a positive subproblem produced a candidate, can retry, or cannot.
+#[derive(Clone, Copy, Debug)]
+enum PositiveAttempt {
+    Step(PositiveStep),
+    Retryable,
+    Fatal,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn positive_attempt(
+    model: &JointModel<'_>,
+    layout: &Layout,
+    params: &Params,
+    gradient: &[f64],
+    diagonal: &[f64],
+    radius: &mut Option<crate::TrustRadius>,
+    tolerance: f64,
+    work_limit: usize,
+    mask: &ResidualMask,
+    residual_active: bool,
+    stage_index: usize,
+    sweep_index: usize,
+    attempt: usize,
+    preconditioner: &JointSolve,
+    solver: &mut crate::trust_region::TrustRegionScratch,
+    effective: &mut [f64],
+    product: &mut [f64],
+    trial: &mut Option<Params>,
+    reduced: &mut [f64],
+    reduced_out: &mut [f64],
+) -> PositiveAttempt {
+    use crate::trust_region::{TrustRegionError, TrustRegionTermination};
+
+    let Some(current_radius) = *radius else {
+        return PositiveAttempt::Fatal;
+    };
+    let outcome = crate::trust_region::solve(
+        gradient,
+        diagonal,
+        current_radius,
+        work_limit,
+        tolerance,
+        |direction, out| {
+            model.apply_positive(direction, out);
+            Ok::<(), ()>(())
+        },
+        |residual, out| {
+            preconditioner.precondition_full(model, residual, out, reduced, reduced_out)
+        },
+        solver,
+    );
+    let solution = match outcome {
+        Ok(solution) => solution,
+        Err(failure) => {
+            if fit_diag() {
+                eprintln!(
+                    "fit stage {stage_index} sweep {sweep_index} positive solve failed {failure:?} radius {:.3e} attempt {attempt}",
+                    current_radius.get()
+                );
+            }
+            return if matches!(
+                failure,
+                TrustRegionError::WorkLimit { .. } | TrustRegionError::Breakdown
+            ) {
+                PositiveAttempt::Retryable
+            } else {
+                PositiveAttempt::Fatal
+            };
+        }
+    };
+    if solution.termination == TrustRegionTermination::ZeroGradient {
+        return PositiveAttempt::Fatal;
+    }
+    let largest = solution
+        .step
+        .iter()
+        .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+    let scale = if largest > STEP_RADIUS {
+        STEP_RADIUS / largest
+    } else {
+        1.0
+    };
+    let trial_params = trial.get_or_insert_with(|| params.clone());
+    trial_params.theta.copy_from_slice(&params.theta);
+    for (index, value) in solution.step.iter().enumerate() {
+        trial_params.theta[model.globals[index]] =
+            params.theta[model.globals[index]] + scale * value;
+    }
+    if residual_active {
+        mask.pin(&mut trial_params.theta[layout.residual.clone()]);
+    }
+    for (index, global) in model.globals.iter().enumerate() {
+        effective[index] = trial_params.theta[*global] - params.theta[*global];
+    }
+    if effective.iter().all(|value| *value == 0.0) {
+        return PositiveAttempt::Fatal;
+    }
+    model.apply_positive(effective, product);
+    let prediction = match crate::trust_region::predicted_decrease(gradient, effective, product) {
+        Some(value) if value > 0.0 => value,
+        _ => return PositiveAttempt::Fatal,
+    };
+    let metric_norm = effective
+        .iter()
+        .zip(diagonal.iter())
+        .fold(0.0, |norm, (step, diagonal)| {
+            libm::hypot(norm, step * diagonal.sqrt())
+        });
+    if !metric_norm.is_finite() {
+        return PositiveAttempt::Fatal;
+    }
+    PositiveAttempt::Step(PositiveStep {
+        prediction,
+        metric_norm,
+        diagnostics: SolveDiagnostics {
+            iterations: solution.iterations + 1,
+            relative_residual: solution.relative_residual,
+            termination: match solution.termination {
+                TrustRegionTermination::Stationary => "interior",
+                TrustRegionTermination::Boundary => "boundary",
+                TrustRegionTermination::NegativeCurvature => "negative",
+                TrustRegionTermination::ZeroGradient => "zero",
+            },
+            scale,
+        },
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2520,6 +2837,7 @@ fn analytic_attempts(
     pass: &PassOutput,
     cost: f64,
     radius: &mut Option<crate::TrustRadius>,
+    positive_radius: &mut Option<crate::TrustRadius>,
     gradient_scale: &mut Option<f64>,
     evaluations: &mut usize,
     sample_evaluations: &mut SampleEvaluations,
@@ -2565,15 +2883,18 @@ fn analytic_attempts(
     }
     let reference = *gradient_scale.get_or_insert(norm.max(1e-300));
     let tolerance = (0.02 * norm / reference).clamp(1e-3, 0.02);
+    let initial = scratch
+        .gradient
+        .iter()
+        .zip(&scratch.diagonal)
+        .fold(0.0, |norm, (gradient, diagonal)| {
+            libm::hypot(norm, gradient / diagonal.sqrt())
+        });
     if radius.is_none() {
-        let initial = scratch
-            .gradient
-            .iter()
-            .zip(&scratch.diagonal)
-            .fold(0.0, |norm, (gradient, diagonal)| {
-                libm::hypot(norm, gradient / diagonal.sqrt())
-            });
         *radius = crate::TrustRadius::checked(initial.max(1.0));
+    }
+    if positive_radius.is_none() {
+        *positive_radius = crate::TrustRadius::checked(initial.max(1.0));
     }
     let preconditioner = match JointSolve::new(model, 0.0) {
         Ok(preconditioner) => preconditioner,
@@ -2587,6 +2908,7 @@ fn analytic_attempts(
     let FinalScratch {
         hessian,
         solver,
+        positive_solver,
         gradient,
         diagonal,
         effective,
@@ -2595,11 +2917,14 @@ fn analytic_attempts(
         cauchy_product,
         box_effective,
         box_product,
+        positive_effective,
+        positive_product,
         reduced,
         reduced_out,
         trial,
         cauchy_trial,
         box_trial,
+        positive_trial,
     } = scratch;
     if let Some(trial) = trial.as_mut() {
         trial.theta.copy_from_slice(&params.theta);
@@ -2614,342 +2939,576 @@ fn analytic_attempts(
     let cauchy_params = cauchy_trial.get_or_insert_with(|| params.clone());
     let box_params = box_trial.get_or_insert_with(|| params.clone());
     let cauchy_ray = std::cell::OnceCell::new();
+    let mut analytic_exhausted = false;
+    let mut recorded_analytic_diagnostics = None;
     for attempt in 1..=12 {
         let Some(current_radius) = *radius else {
             return FinalOutcome::Stalled;
         };
+        let positive_current_radius = *positive_radius;
         if sample_evaluations.get() as f64 + samples_per_pass as f64 > options.sweep_budget {
             return FinalOutcome::Budget;
         }
-        // Reserve the Cauchy gradient product, both realized applied-step products and the box product.
-        let outcome = crate::trust_region::solve(
-            gradient,
-            diagonal,
-            current_radius,
-            JOINT_CG_LIMIT.saturating_sub(4),
-            tolerance,
-            |direction, out| full.apply(direction, out, hessian),
-            |residual, out| {
-                preconditioner.precondition_full(model, residual, out, reduced, reduced_out)
-            },
-            solver,
-        );
-        let solution = match outcome {
-            Ok(solution) => solution,
-            Err(failure) => {
-                if fit_diag() {
-                    eprintln!(
-                        "fit stage {stage_index} sweep {sweep_index} analytic solve failed {failure:?} radius {:.3e} attempt {attempt}",
-                        current_radius.get()
-                    );
-                }
-                if !matches!(
-                    failure,
-                    TrustRegionError::WorkLimit { .. } | TrustRegionError::Breakdown
-                ) || !shrink_trust_radius(radius)
-                {
-                    return FinalOutcome::Stalled;
-                }
-                continue;
-            }
-        };
-        if solution.termination == TrustRegionTermination::ZeroGradient {
-            return stationary_outcome(problem, params, pass, options, model, cert_warm)
-                .unwrap_or(FinalOutcome::Stalled);
-        }
-        let largest = solution
-            .step
-            .iter()
-            .fold(0.0_f64, |largest, value| largest.max(value.abs()));
-        let scale = if largest > STEP_RADIUS {
-            STEP_RADIUS / largest
-        } else {
-            1.0
-        };
-        for (index, value) in solution.step.iter().enumerate() {
-            trial_params.theta[model.globals[index]] =
-                params.theta[model.globals[index]] + scale * value;
-        }
-        if residual_active {
-            mask.pin(&mut trial_params.theta[layout.residual.clone()]);
-        }
-        for (index, global) in model.globals.iter().enumerate() {
-            effective[index] = trial_params.theta[*global] - params.theta[*global];
-        }
-        let tr_zero = effective.iter().all(|value| *value == 0.0);
-        let tr_eligible = solution.termination != TrustRegionTermination::Stationary
-            || solution.relative_residual <= tolerance;
-        let mut products = 0usize;
-        let tr_prediction = if tr_zero || !tr_eligible {
-            None
-        } else {
-            if let Err(failure) = full.apply(effective, product, hessian) {
-                if fit_diag() {
-                    eprintln!(
-                        "fit analytic applied-step curvature failed ({}) {failure:?}",
-                        failure.label()
-                    );
-                }
-                return FinalOutcome::Stalled;
-            }
-            products += 1;
-            match crate::trust_region::predicted_decrease(gradient, effective, product) {
-                Some(value) if value > 0.0 => Some(value),
-                Some(_) => None,
-                None => return FinalOutcome::Stalled,
-            }
-        };
-        let ray = cauchy_ray.get_or_init(|| {
-            products += 1;
-            full.apply(gradient, cauchy_product, hessian).map(|()| {
-                crate::trust_region::CauchyRay::new(gradient, diagonal, STEP_RADIUS, cauchy_product)
-            })
-        });
-        let ray = match ray {
-            Ok(ray) => *ray,
-            Err(failure) => {
-                if fit_diag() {
-                    eprintln!(
-                        "fit analytic Cauchy gradient curvature failed ({}) {failure:?}",
-                        failure.label()
-                    );
-                }
-                return FinalOutcome::Stalled;
-            }
-        };
-        let mut cauchy_metric_norm = None;
-        let cauchy_prediction = if let Some(alpha) =
-            ray.and_then(|ray| ray.step_length(current_radius))
-        {
-            for (index, value) in gradient.iter().enumerate() {
-                cauchy_params.theta[model.globals[index]] =
-                    params.theta[model.globals[index]] - alpha * value;
-            }
-            if residual_active {
-                mask.pin(&mut cauchy_params.theta[layout.residual.clone()]);
-            }
-            for (index, global) in model.globals.iter().enumerate() {
-                cauchy_effective[index] = cauchy_params.theta[*global] - params.theta[*global];
-            }
-            if cauchy_effective.iter().all(|value| *value == 0.0) {
-                None
-            } else {
-                let metric_norm = cauchy_effective
-                    .iter()
-                    .zip(diagonal.iter())
-                    .fold(0.0, |norm, (step, diagonal)| {
-                        libm::hypot(norm, step * diagonal.sqrt())
-                    });
-                let largest = cauchy_effective
-                    .iter()
-                    .fold(0.0_f64, |largest, value| largest.max(value.abs()));
-                let slack = 1.0 + 8.0 * f64::EPSILON;
-                if metric_norm.is_finite()
-                    && metric_norm <= current_radius.get() * slack
-                    && largest.is_finite()
-                    && largest <= STEP_RADIUS * slack
-                {
-                    cauchy_metric_norm = Some(metric_norm);
-                    if let Err(failure) = full.apply(cauchy_effective, cauchy_product, hessian) {
-                        if fit_diag() {
-                            eprintln!(
-                                "fit analytic Cauchy applied-step curvature failed ({}) {failure:?}",
-                                failure.label()
-                            );
-                        }
-                        return FinalOutcome::Stalled;
-                    }
-                    products += 1;
-                    match crate::trust_region::predicted_decrease(
-                        gradient,
-                        cauchy_effective,
-                        cauchy_product,
-                    ) {
-                        Some(value) if value > 0.0 => Some(value),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let cauchy_wins = match (tr_prediction, cauchy_prediction) {
-            (Some(tr), Some(cauchy)) => cauchy > tr,
-            (None, Some(_)) => true,
-            _ => false,
-        };
-        let ordinary = if cauchy_wins {
-            Some(OrdinaryStep::Cauchy)
-        } else if tr_prediction.is_some() {
-            Some(OrdinaryStep::TrustRegion)
-        } else {
-            None
-        };
-        let Some(ordinary) = ordinary else {
-            if tr_zero
-                && solution.predicted_decrease.is_finite()
-                && solution.predicted_decrease > 0.0
-                && tr_eligible
-            {
-                return stationary_outcome(problem, params, pass, options, model, cert_warm)
-                    .unwrap_or(FinalOutcome::Stalled);
-            }
-            if !shrink_trust_radius(radius) {
-                return FinalOutcome::Stalled;
-            }
-            continue;
-        };
-        let mut box_prediction = None;
-        let mut box_metric_norm = None;
-        for (index, value) in solution.step.iter().enumerate() {
-            box_params.theta[model.globals[index]] =
-                params.theta[model.globals[index]] + (*value).clamp(-STEP_RADIUS, STEP_RADIUS);
-        }
-        if residual_active {
-            mask.pin(&mut box_params.theta[layout.residual.clone()]);
-        }
-        for (index, global) in model.globals.iter().enumerate() {
-            box_effective[index] = box_params.theta[*global] - params.theta[*global];
-        }
-        if box_effective[..] != effective[..] {
-            let metric_norm = box_effective
-                .iter()
-                .zip(diagonal.iter())
-                .fold(0.0, |norm, (step, diagonal)| {
-                    libm::hypot(norm, step * diagonal.sqrt())
-                });
-            let largest = box_effective
-                .iter()
-                .fold(0.0_f64, |largest, value| largest.max(value.abs()));
-            let slack = 1.0 + 8.0 * f64::EPSILON;
-            if metric_norm.is_finite()
-                && metric_norm <= current_radius.get() * slack
-                && largest.is_finite()
-                && largest <= STEP_RADIUS * slack
-            {
-                products += 1;
-                match full.apply(box_effective, box_product, hessian) {
-                    Ok(()) => {
-                        if let Some(value) = crate::trust_region::predicted_decrease(
-                            gradient,
-                            box_effective,
-                            box_product,
-                        ) && value > 0.0
-                        {
-                            box_prediction = Some(value);
-                            box_metric_norm = Some(metric_norm);
-                        }
-                    }
+        let mut analytic_retryable = false;
+        let mut analytic_diagnostics = recorded_analytic_diagnostics;
+        let mut analytic = None;
+        if !analytic_exhausted {
+            analytic = 'analytic: {
+                // Reserve the Cauchy gradient product, both realized applied-step products and the box product.
+                let outcome = crate::trust_region::solve(
+                    gradient,
+                    diagonal,
+                    current_radius,
+                    ANALYTIC_WORK_LIMIT,
+                    tolerance,
+                    |direction, out| full.apply(direction, out, hessian),
+                    |residual, out| {
+                        preconditioner.precondition_full(model, residual, out, reduced, reduced_out)
+                    },
+                    solver,
+                );
+                let solution = match outcome {
+                    Ok(solution) => solution,
                     Err(failure) => {
                         if fit_diag() {
                             eprintln!(
-                                "fit analytic box applied-step curvature failed ({}) {failure:?}",
+                                "fit stage {stage_index} sweep {sweep_index} analytic solve failed {failure:?} radius {:.3e} attempt {attempt}",
+                                current_radius.get()
+                            );
+                        }
+                        analytic_retryable = matches!(
+                            failure,
+                            TrustRegionError::WorkLimit { .. } | TrustRegionError::Breakdown
+                        );
+                        break 'analytic None;
+                    }
+                };
+                if solution.termination == TrustRegionTermination::ZeroGradient {
+                    return stationary_outcome(problem, params, pass, options, model, cert_warm)
+                        .unwrap_or(FinalOutcome::Stalled);
+                }
+                let largest = solution
+                    .step
+                    .iter()
+                    .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+                let scale = if largest > STEP_RADIUS {
+                    STEP_RADIUS / largest
+                } else {
+                    1.0
+                };
+                analytic_diagnostics = Some(SolveDiagnostics {
+                    iterations: solution.iterations,
+                    relative_residual: solution.relative_residual,
+                    termination: match solution.termination {
+                        TrustRegionTermination::Stationary => "interior",
+                        TrustRegionTermination::Boundary => "boundary",
+                        TrustRegionTermination::NegativeCurvature => "negative",
+                        TrustRegionTermination::ZeroGradient => "zero",
+                    },
+                    scale,
+                });
+                for (index, value) in solution.step.iter().enumerate() {
+                    trial_params.theta[model.globals[index]] =
+                        params.theta[model.globals[index]] + scale * value;
+                }
+                if residual_active {
+                    mask.pin(&mut trial_params.theta[layout.residual.clone()]);
+                }
+                for (index, global) in model.globals.iter().enumerate() {
+                    effective[index] = trial_params.theta[*global] - params.theta[*global];
+                }
+                let tr_zero = effective.iter().all(|value| *value == 0.0);
+                let tr_eligible = solution.termination != TrustRegionTermination::Stationary
+                    || solution.relative_residual <= tolerance;
+                let mut products = 0usize;
+                let tr_prediction = if tr_zero || !tr_eligible {
+                    None
+                } else {
+                    if let Err(failure) = full.apply(effective, product, hessian) {
+                        if fit_diag() {
+                            eprintln!(
+                                "fit analytic applied-step curvature failed ({}) {failure:?}",
                                 failure.label()
                             );
                         }
+                        break 'analytic None;
+                    }
+                    products += 1;
+                    match crate::trust_region::predicted_decrease(gradient, effective, product) {
+                        Some(value) if value > 0.0 => Some(value),
+                        Some(_) => None,
+                        None => break 'analytic None,
+                    }
+                };
+                let ray = cauchy_ray.get_or_init(|| {
+                    products += 1;
+                    full.apply(gradient, cauchy_product, hessian).map(|()| {
+                        crate::trust_region::CauchyRay::new(
+                            gradient,
+                            diagonal,
+                            STEP_RADIUS,
+                            cauchy_product,
+                        )
+                    })
+                });
+                let ray = match ray {
+                    Ok(ray) => *ray,
+                    Err(failure) => {
+                        if fit_diag() {
+                            eprintln!(
+                                "fit analytic Cauchy gradient curvature failed ({}) {failure:?}",
+                                failure.label()
+                            );
+                        }
+                        break 'analytic None;
+                    }
+                };
+                let mut cauchy_metric_norm = None;
+                let cauchy_prediction = if let Some(alpha) =
+                    ray.and_then(|ray| ray.step_length(current_radius))
+                {
+                    for (index, value) in gradient.iter().enumerate() {
+                        cauchy_params.theta[model.globals[index]] =
+                            params.theta[model.globals[index]] - alpha * value;
+                    }
+                    if residual_active {
+                        mask.pin(&mut cauchy_params.theta[layout.residual.clone()]);
+                    }
+                    for (index, global) in model.globals.iter().enumerate() {
+                        cauchy_effective[index] =
+                            cauchy_params.theta[*global] - params.theta[*global];
+                    }
+                    if cauchy_effective.iter().all(|value| *value == 0.0) {
+                        None
+                    } else {
+                        let metric_norm = cauchy_effective
+                            .iter()
+                            .zip(diagonal.iter())
+                            .fold(0.0, |norm, (step, diagonal)| {
+                                libm::hypot(norm, step * diagonal.sqrt())
+                            });
+                        let largest = cauchy_effective
+                            .iter()
+                            .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+                        let slack = 1.0 + 8.0 * f64::EPSILON;
+                        if metric_norm.is_finite()
+                            && metric_norm <= current_radius.get() * slack
+                            && largest.is_finite()
+                            && largest <= STEP_RADIUS * slack
+                        {
+                            cauchy_metric_norm = Some(metric_norm);
+                            if let Err(failure) =
+                                full.apply(cauchy_effective, cauchy_product, hessian)
+                            {
+                                if fit_diag() {
+                                    eprintln!(
+                                        "fit analytic Cauchy applied-step curvature failed ({}) {failure:?}",
+                                        failure.label()
+                                    );
+                                }
+                                break 'analytic None;
+                            }
+                            products += 1;
+                            match crate::trust_region::predicted_decrease(
+                                gradient,
+                                cauchy_effective,
+                                cauchy_product,
+                            ) {
+                                Some(value) if value > 0.0 => Some(value),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let cauchy_wins = match (tr_prediction, cauchy_prediction) {
+                    (Some(tr), Some(cauchy)) => cauchy > tr,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                let ordinary = if cauchy_wins {
+                    Some(OrdinaryStep::Cauchy)
+                } else if tr_prediction.is_some() {
+                    Some(OrdinaryStep::TrustRegion)
+                } else {
+                    None
+                };
+                let Some(ordinary) = ordinary else {
+                    let zero_step = tr_zero
+                        && solution.predicted_decrease.is_finite()
+                        && solution.predicted_decrease > 0.0
+                        && tr_eligible;
+                    if zero_step
+                        && let Some(outcome) =
+                            stationary_outcome(problem, params, pass, options, model, cert_warm)
+                    {
+                        return outcome;
+                    }
+                    analytic_retryable = !zero_step;
+                    break 'analytic None;
+                };
+                let mut box_prediction = None;
+                let mut box_metric_norm = None;
+                for (index, value) in solution.step.iter().enumerate() {
+                    box_params.theta[model.globals[index]] = params.theta[model.globals[index]]
+                        + (*value).clamp(-STEP_RADIUS, STEP_RADIUS);
+                }
+                if residual_active {
+                    mask.pin(&mut box_params.theta[layout.residual.clone()]);
+                }
+                for (index, global) in model.globals.iter().enumerate() {
+                    box_effective[index] = box_params.theta[*global] - params.theta[*global];
+                }
+                if box_effective[..] != effective[..] {
+                    let metric_norm = box_effective
+                        .iter()
+                        .zip(diagonal.iter())
+                        .fold(0.0, |norm, (step, diagonal)| {
+                            libm::hypot(norm, step * diagonal.sqrt())
+                        });
+                    let largest = box_effective
+                        .iter()
+                        .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+                    let slack = 1.0 + 8.0 * f64::EPSILON;
+                    if metric_norm.is_finite()
+                        && metric_norm <= current_radius.get() * slack
+                        && largest.is_finite()
+                        && largest <= STEP_RADIUS * slack
+                    {
+                        products += 1;
+                        match full.apply(box_effective, box_product, hessian) {
+                            Ok(()) => {
+                                if let Some(value) = crate::trust_region::predicted_decrease(
+                                    gradient,
+                                    box_effective,
+                                    box_product,
+                                ) && value > 0.0
+                                {
+                                    box_prediction = Some(value);
+                                    box_metric_norm = Some(metric_norm);
+                                }
+                            }
+                            Err(failure) => {
+                                if fit_diag() {
+                                    eprintln!(
+                                        "fit analytic box applied-step curvature failed ({}) {failure:?}",
+                                        failure.label()
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
+                let ordinary_prediction = match ordinary {
+                    OrdinaryStep::TrustRegion => tr_prediction,
+                    OrdinaryStep::Cauchy => cauchy_prediction,
+                };
+                let box_ranked_first = box_prediction
+                    .zip(ordinary_prediction)
+                    .is_some_and(|(boxed, ordinary)| boxed > ordinary);
+                let ordinary_params = match ordinary {
+                    OrdinaryStep::TrustRegion => &*trial_params,
+                    OrdinaryStep::Cauchy => &*cauchy_params,
+                };
+                let Some((mut candidate, mut trial_cost)) = evaluate_trial(
+                    stage_problem,
+                    problem,
+                    stage,
+                    ordinary_params,
+                    blocks,
+                    penalties,
+                    lambdas,
+                    options,
+                    evaluations,
+                    sample_evaluations,
+                    samples_per_pass,
+                ) else {
+                    return FinalOutcome::Budget;
+                };
+                let selected = if box_ranked_first {
+                    match evaluate_trial(
+                        stage_problem,
+                        problem,
+                        stage,
+                        &*box_params,
+                        blocks,
+                        penalties,
+                        lambdas,
+                        options,
+                        evaluations,
+                        sample_evaluations,
+                        samples_per_pass,
+                    ) {
+                        Some((box_candidate, box_cost)) => {
+                            let applied = guarded_selection(
+                                ordinary,
+                                box_ranked_first,
+                                cost - trial_cost,
+                                cost - box_cost,
+                            );
+                            if applied == AppliedStep::Box {
+                                candidate = box_candidate;
+                                trial_cost = box_cost;
+                            }
+                            applied
+                        }
+                        None => return FinalOutcome::Budget,
+                    }
+                } else {
+                    ordinary.into()
+                };
+                let (prediction, metric_norm) = match selected {
+                    AppliedStep::TrustRegion => (
+                        tr_prediction.unwrap_or(f64::NAN),
+                        effective
+                            .iter()
+                            .zip(diagonal.iter())
+                            .fold(0.0, |norm, (step, diagonal)| {
+                                libm::hypot(norm, step * diagonal.sqrt())
+                            }),
+                    ),
+                    AppliedStep::Cauchy => (
+                        cauchy_prediction.unwrap_or(f64::NAN),
+                        cauchy_metric_norm.unwrap_or(f64::NAN),
+                    ),
+                    AppliedStep::Box => (
+                        box_prediction.unwrap_or(f64::NAN),
+                        box_metric_norm.unwrap_or(f64::NAN),
+                    ),
+                    AppliedStep::Positive => {
+                        unreachable!("the analytic model selects no positive step")
+                    }
+                };
+                if let Some(diagnostics) = analytic_diagnostics.as_mut() {
+                    diagnostics.iterations = solution.iterations + products;
+                }
+                Some(AttemptCandidate {
+                    step: selected,
+                    cost: trial_cost,
+                    feasible: !candidate.infeasible,
+                    prediction,
+                    metric_norm,
+                    diagnostics: analytic_diagnostics,
+                    candidate,
+                })
+            };
+            if analytic.is_none() && !analytic_retryable {
+                analytic_exhausted = true;
+                recorded_analytic_diagnostics = analytic_diagnostics;
             }
         }
-        let ordinary_prediction = match ordinary {
-            OrdinaryStep::TrustRegion => tr_prediction,
-            OrdinaryStep::Cauchy => cauchy_prediction,
-        };
-        let box_ranked_first = box_prediction
-            .zip(ordinary_prediction)
-            .is_some_and(|(boxed, ordinary)| boxed > ordinary);
-        let mut evaluate = |trial_params: &Params| {
-            let candidate = stage_problem.pass(
-                trial_params,
-                stage.active,
-                &mut [],
-                false,
-                false,
-                stage.neutral,
-                IntentFilter::NativeOnly,
-            );
-            *evaluations += 1;
-            *sample_evaluations += samples_per_pass;
-            let trial_cost = candidate.cost
-                + total_cost(problem, trial_params, blocks, penalties, lambdas, options);
-            (candidate, trial_cost)
-        };
-        let (mut candidate, mut trial_cost) = evaluate(match ordinary {
-            OrdinaryStep::TrustRegion => &*trial_params,
-            OrdinaryStep::Cauchy => &*cauchy_params,
-        });
-        let selected = if box_ranked_first {
-            let (box_candidate, box_cost) = evaluate(box_params);
-            let applied = guarded_selection(
-                ordinary,
-                box_ranked_first,
-                cost - trial_cost,
-                cost - box_cost,
-            );
-            if applied == AppliedStep::Box {
-                candidate = box_candidate;
-                trial_cost = box_cost;
+
+        let mut positive_retryable = false;
+        let mut positive = match positive_attempt(
+            model,
+            layout,
+            params,
+            gradient,
+            diagonal,
+            positive_radius,
+            tolerance,
+            positive_work_limit(),
+            mask,
+            residual_active,
+            stage_index,
+            sweep_index,
+            attempt,
+            &preconditioner,
+            positive_solver,
+            positive_effective,
+            positive_product,
+            positive_trial,
+            reduced,
+            reduced_out,
+        ) {
+            PositiveAttempt::Step(step) => {
+                let positive_params = positive_trial
+                    .as_ref()
+                    .expect("a positive step leaves its trial");
+                let Some((candidate, cost)) = evaluate_trial(
+                    stage_problem,
+                    problem,
+                    stage,
+                    positive_params,
+                    blocks,
+                    penalties,
+                    lambdas,
+                    options,
+                    evaluations,
+                    sample_evaluations,
+                    samples_per_pass,
+                ) else {
+                    return FinalOutcome::Budget;
+                };
+                Some(AttemptCandidate {
+                    step: AppliedStep::Positive,
+                    cost,
+                    feasible: !candidate.infeasible,
+                    prediction: step.prediction,
+                    metric_norm: step.metric_norm,
+                    diagnostics: Some(step.diagnostics),
+                    candidate,
+                })
             }
-            applied
-        } else {
-            ordinary.into()
+            PositiveAttempt::Retryable => {
+                positive_retryable = true;
+                None
+            }
+            PositiveAttempt::Fatal => None,
         };
-        let (selected_params, selected_step, selected_product, prediction) = match selected {
+
+        if analytic.is_none() && positive.is_none() {
+            if !analytic_retryable && !positive_retryable {
+                return FinalOutcome::Stalled;
+            }
+            let next_analytic = (*radius).and_then(|current| current.shrink(0.25));
+            let next_positive = (*positive_radius).and_then(|current| current.shrink(0.25));
+            if next_analytic.is_none() && next_positive.is_none() {
+                return FinalOutcome::Stalled;
+            }
+            if next_analytic.is_some() {
+                *radius = next_analytic;
+            }
+            if next_positive.is_some() {
+                *positive_radius = next_positive;
+            }
+            continue;
+        }
+
+        let analytic_present = analytic.is_some();
+        let selected_label = analytic
+            .as_ref()
+            .map_or("none", |candidate| candidate.step.label());
+        let analytic_gain = analytic
+            .as_ref()
+            .map(|candidate| realized_ratio(cost, candidate.cost, candidate.prediction));
+        let positive_gain = positive
+            .as_ref()
+            .map(|candidate| realized_ratio(cost, candidate.cost, candidate.prediction));
+        let analytic_acceptable = analytic.as_ref().is_some_and(|candidate| {
+            candidate_passes(
+                cost,
+                candidate.cost,
+                candidate.prediction,
+                candidate.feasible,
+            )
+        });
+        let positive_acceptable = positive.as_ref().is_some_and(|candidate| {
+            candidate_passes(
+                cost,
+                candidate.cost,
+                candidate.prediction,
+                candidate.feasible,
+            )
+        });
+        let next_radius = match (*radius, analytic.as_ref()) {
+            (Some(current), Some(candidate)) => Some(adapt_trust_radius(
+                current,
+                analytic_gain.unwrap_or(f64::NAN),
+                candidate.metric_norm,
+                analytic_acceptable,
+            )),
+            (Some(current), None) => Some(adapt_trust_radius(current, f64::NAN, f64::NAN, false)),
+            (None, _) => None,
+        };
+        let next_positive_radius = match (*positive_radius, positive.as_ref()) {
+            (Some(current), Some(candidate)) => Some(adapt_trust_radius(
+                current,
+                positive_gain.unwrap_or(f64::NAN),
+                candidate.metric_norm,
+                positive_acceptable,
+            )),
+            (Some(current), None) => Some(adapt_trust_radius(current, f64::NAN, f64::NAN, false)),
+            (None, _) => None,
+        };
+        let analytic_realized = analytic.as_ref().map(|candidate| RealizedCandidate {
+            step: candidate.step,
+            cost: candidate.cost,
+            feasible: candidate.feasible,
+        });
+        let positive_realized = positive.as_ref().map(|candidate| RealizedCandidate {
+            step: candidate.step,
+            cost: candidate.cost,
+            feasible: candidate.feasible,
+        });
+        let applied = objective_pick(cost, analytic_realized, positive_realized)
+            .expect("one model produced a candidate");
+        #[cfg(test)]
+        record_attempt(AttemptTrace {
+            cost,
+            applied,
+            analytic: analytic.as_ref().map(|candidate| RealizedTrace {
+                step: candidate.step,
+                cost: candidate.cost,
+                feasible: candidate.feasible,
+                prediction: candidate.prediction,
+                metric_norm: candidate.metric_norm,
+            }),
+            positive: positive.as_ref().map(|candidate| RealizedTrace {
+                step: candidate.step,
+                cost: candidate.cost,
+                feasible: candidate.feasible,
+                prediction: candidate.prediction,
+                metric_norm: candidate.metric_norm,
+            }),
+        });
+        let applied_radius = match applied {
+            AppliedStep::Positive => {
+                positive_current_radius.map_or(f64::NAN, |radius| radius.get())
+            }
+            _ => current_radius.get(),
+        };
+        let (applied_candidate, applied_params) = match applied {
+            AppliedStep::Positive => (
+                positive.take().expect("positive candidate"),
+                positive_trial.as_mut().expect("positive trial"),
+            ),
             AppliedStep::TrustRegion => (
+                analytic.take().expect("analytic candidate"),
                 &mut *trial_params,
-                &effective[..],
-                &product[..],
-                tr_prediction.unwrap_or(f64::NAN),
             ),
             AppliedStep::Cauchy => (
+                analytic.take().expect("analytic candidate"),
                 &mut *cauchy_params,
-                &cauchy_effective[..],
-                &cauchy_product[..],
-                cauchy_prediction.unwrap_or(f64::NAN),
             ),
             AppliedStep::Box => (
+                analytic.take().expect("analytic candidate"),
                 &mut *box_params,
-                &box_effective[..],
-                &box_product[..],
-                box_prediction.unwrap_or(f64::NAN),
             ),
         };
-        let decrease = cost - trial_cost;
-        let ratio = decrease / prediction;
-        if !candidate.infeasible
-            && trial_cost.is_finite()
-            && decrease > 1e-12 * cost.abs().max(1.0)
-            && ratio >= 1e-4
-        {
-            let metric_norm = match selected {
-                AppliedStep::TrustRegion => effective
-                    .iter()
-                    .zip(diagonal.iter())
-                    .fold(0.0, |norm, (step, diagonal)| {
-                        libm::hypot(norm, step * diagonal.sqrt())
-                    }),
-                AppliedStep::Cauchy => cauchy_metric_norm.unwrap_or(f64::NAN),
-                AppliedStep::Box => box_metric_norm.unwrap_or(f64::NAN),
-            };
-            let next = if ratio < 0.25 {
-                current_radius.shrink(0.25).unwrap_or(current_radius)
-            } else if ratio > 0.75 && metric_norm >= 0.8 * current_radius.get() {
-                current_radius.expand(2.0).unwrap_or(current_radius)
-            } else {
-                current_radius
-            };
-            *radius = Some(next);
+        let ratio = realized_ratio(cost, applied_candidate.cost, applied_candidate.prediction);
+        *radius = next_radius;
+        *positive_radius = next_positive_radius;
+        if candidate_passes(
+            cost,
+            applied_candidate.cost,
+            applied_candidate.prediction,
+            applied_candidate.feasible,
+        ) {
             if fit_diag() {
+                let applied_step = match applied {
+                    AppliedStep::Positive => &positive_effective[..],
+                    AppliedStep::TrustRegion => &effective[..],
+                    AppliedStep::Cauchy => &cauchy_effective[..],
+                    AppliedStep::Box => &box_effective[..],
+                };
+                let applied_product = match applied {
+                    AppliedStep::Positive => &positive_product[..],
+                    AppliedStep::TrustRegion => &product[..],
+                    AppliedStep::Cauchy => &cauchy_product[..],
+                    AppliedStep::Box => &box_product[..],
+                };
                 let residual_norm = gradient
                     .iter()
-                    .zip(selected_product.iter())
+                    .zip(applied_product.iter())
                     .fold(0.0, |norm, (gradient, product)| {
                         libm::hypot(norm, gradient + product)
                     });
                 let relative = residual_norm / norm;
-                let (worst, step_max) = selected_step.iter().enumerate().fold(
+                let (worst, step_max) = applied_step.iter().enumerate().fold(
                     (0, 0.0_f64),
                     |(worst, largest), (index, value)| {
                         if value.abs() > largest {
@@ -2959,29 +3518,65 @@ fn analytic_attempts(
                         }
                     },
                 );
-                let termination = match solution.termination {
-                    TrustRegionTermination::Stationary => "interior",
-                    TrustRegionTermination::Boundary => "boundary",
-                    TrustRegionTermination::NegativeCurvature => "negative",
-                    TrustRegionTermination::ZeroGradient => "zero",
+                let solver_slots = match applied {
+                    AppliedStep::Positive => match applied_candidate.diagnostics {
+                        Some(diagnostics) => format!(
+                            "solver positive termination {} proposal_residual {:.17e} scale {:.17e} selected positive ",
+                            diagnostics.termination,
+                            diagnostics.relative_residual,
+                            diagnostics.scale
+                        ),
+                        None => String::new(),
+                    },
+                    _ => match analytic_diagnostics {
+                        Some(diagnostics) => format!(
+                            "solver analytic-tr termination {} proposal_residual {:.17e} scale {:.17e} selected {selected_label} ",
+                            diagnostics.termination,
+                            diagnostics.relative_residual,
+                            diagnostics.scale
+                        ),
+                        None => String::new(),
+                    },
+                };
+                let analytic_slots = if applied == AppliedStep::Positive && analytic_present {
+                    match analytic_diagnostics {
+                        Some(diagnostics) => format!(
+                            "analytic_termination {} analytic_residual {:.17e} ",
+                            diagnostics.termination, diagnostics.relative_residual
+                        ),
+                        None => String::new(),
+                    }
+                } else {
+                    String::new()
                 };
                 eprintln!(
-                    "fit stage {stage_index} sweep {sweep_index} accepted trial {trial_cost:.17e} ratio {ratio:.17e} prediction {prediction:.17e} step {step_max:.17e} at {worst} radius {:.17e} next_radius {:.17e} iterations {} residual {relative:.17e} tolerance {tolerance:.17e} stalled 0 failure none dim {} residual_coords {} history {history} solver analytic-tr termination {termination} proposal_residual {:.17e} scale {scale:.17e} selected {} gradient_reference {reference:.17e}",
-                    current_radius.get(),
-                    next.get(),
-                    solution.iterations + products,
+                    "fit stage {stage_index} sweep {sweep_index} accepted trial {:.17e} ratio {ratio:.17e} prediction {:.17e} step {step_max:.17e} at {worst} radius {applied_radius:.17e} next_radius {:.17e} iterations {} residual {relative:.17e} tolerance {tolerance:.17e} stalled 0 failure none dim {} residual_coords {} history {history} {solver_slots}{analytic_slots}applied {} analytic_gain {:.17e} positive_gain {:.17e} analytic_radius {:.17e} positive_radius {:.17e} gradient_reference {reference:.17e}",
+                    applied_candidate.cost,
+                    applied_candidate.prediction,
+                    match applied {
+                        AppliedStep::Positive => {
+                            next_positive_radius.map_or(f64::NAN, |radius| radius.get())
+                        }
+                        _ => next_radius.map_or(f64::NAN, |radius| radius.get()),
+                    },
+                    applied_candidate
+                        .diagnostics
+                        .map_or(0, |diagnostics| diagnostics.iterations),
                     model.dim,
                     model.residual_count,
-                    solution.relative_residual,
-                    selected.label()
+                    applied.label(),
+                    analytic_gain.unwrap_or(f64::NAN),
+                    positive_gain.unwrap_or(f64::NAN),
+                    next_radius.map_or(f64::NAN, |radius| radius.get()),
+                    next_positive_radius.map_or(f64::NAN, |radius| radius.get()),
                 );
             }
-            core::mem::swap(params, selected_params);
-            return FinalOutcome::Accepted(Box::new(candidate));
+            core::mem::swap(params, applied_params);
+            return FinalOutcome::Accepted(Box::new(applied_candidate.candidate));
         }
-        if !candidate.infeasible
-            && trial_cost.is_finite()
-            && accepted(cost, trial_cost)
+        if applied_candidate.feasible
+            && applied_candidate.cost.is_finite()
+            && accepted(cost, applied_candidate.cost)
             && let Some(outcome) =
                 stationary_outcome(problem, params, pass, options, model, cert_warm)
         {
@@ -2989,13 +3584,13 @@ fn analytic_attempts(
         }
         if fit_diag() {
             eprintln!(
-                "fit stage {stage_index} sweep {sweep_index} rejected trial {trial_cost:.17e} current {cost:.17e} ratio {ratio:.17e} prediction {prediction:.17e} radius {:.17e} attempt {attempt} selected {} gradient_reference {reference:.17e}",
-                current_radius.get(),
-                selected.label()
+                "fit stage {stage_index} sweep {sweep_index} rejected trial {:.17e} current {cost:.17e} ratio {ratio:.17e} prediction {:.17e} radius {applied_radius:.17e} attempt {attempt} selected {selected_label} applied {} analytic_gain {:.17e} positive_gain {:.17e} gradient_reference {reference:.17e}",
+                applied_candidate.cost,
+                applied_candidate.prediction,
+                applied.label(),
+                analytic_gain.unwrap_or(f64::NAN),
+                positive_gain.unwrap_or(f64::NAN),
             );
-        }
-        if !shrink_trust_radius(radius) {
-            return FinalOutcome::Stalled;
         }
     }
     FinalOutcome::Stalled
@@ -3740,7 +4335,7 @@ pub fn diagnose_fixed_linearization(
             gradient: &gradient[..],
             metric_diagonal: &diagonal[..],
             radius,
-            work_limit: JOINT_CG_LIMIT.saturating_sub(4),
+            work_limit: ANALYTIC_WORK_LIMIT,
             relative_tolerance: tolerance,
         },
         |direction, out| full.apply(direction, out, hessian),
@@ -4126,7 +4721,9 @@ pub fn diagnose_fixed_linearization(
         && report
             .ordinary_trial
             .zip(report.box_trial)
-            .is_some_and(|(ordinary, boxed)| boxed.decrease > ordinary.decrease);
+            .is_some_and(|(ordinary, boxed)| {
+                strictly_larger_decrease(boxed.decrease, ordinary.decrease)
+            });
     report.winner = if box_applied {
         FixedLinearizationWinner::Box
     } else {
@@ -6834,7 +7431,102 @@ impl<'a> JointModel<'a> {
                 let local = self.residual_local_of[global];
                 (local != u32::MAX).then_some(local as usize)
             },
+            |sample| &sample.penalty_curvature,
         );
+    }
+
+    /// Positive Gauss-Newton curvature: retained rows and residual data with `penalty_gn`,
+    /// the fixed diagonal and `λ·P`.
+    fn apply_positive(&self, v: &[f64], out: &mut [f64]) {
+        out.fill(0.0);
+        self.apply_rows_positive(v, out);
+        if self.residual_count > 0 {
+            residual_data_accumulate(
+                self.residual_samples,
+                &v[self.residual_start..self.residual_start + self.residual_count],
+                &mut out[self.residual_start..self.residual_start + self.residual_count],
+                self.residual_data_scale,
+                |global| {
+                    let local = self.residual_local_of[global];
+                    (local != u32::MAX).then_some(local as usize)
+                },
+                |sample| &sample.penalty_gn,
+            );
+        }
+        for (index, slot) in out.iter_mut().enumerate() {
+            *slot += self.fixed[index] * v[index];
+        }
+        for &(row, column, value) in &self.penalty {
+            out[row as usize] += value * v[column as usize];
+        }
+    }
+
+    /// Retained-row part of [`Self::apply_positive`].
+    fn apply_rows_positive(&self, v: &[f64], out: &mut [f64]) {
+        for row in &self.rows {
+            let mut projected = [0.0_f64; 3];
+            let mut robust_projection = 0.0_f64;
+            let mut axis_projection = [0.0_f64; DOMAIN_AXES];
+            for (position, (column, derivative)) in row.columns.iter().enumerate() {
+                let value = v[*column as usize];
+                projected[0] += derivative[0] * value;
+                projected[1] += derivative[1] * value;
+                projected[2] += derivative[2] * value;
+                robust_projection += row.robust_terms[position] * value;
+                for (axis, total) in axis_projection.iter_mut().enumerate() {
+                    *total += row.axis_terms[position][axis] * value;
+                }
+            }
+            let weight = row.weight;
+            let robust = if self.robust { row.robust } else { 0.0 };
+            let mut residual_projected = [0.0_f64; 3];
+            let mut residual_robust = 0.0_f64;
+            let mut residual_axis = [0.0_f64; DOMAIN_AXES];
+            for (local, derivative, robust_term, axis) in &row.residual_columns {
+                let value = v[self.residual_start + *local as usize];
+                residual_projected[0] += derivative[0] * value;
+                residual_projected[1] += derivative[1] * value;
+                residual_projected[2] += derivative[2] * value;
+                residual_robust += robust_term * value;
+                for (slot, total) in residual_axis.iter_mut().enumerate() {
+                    *total += axis[slot] * value;
+                }
+            }
+            let mut penalty_projection = [0.0_f64; DOMAIN_AXES];
+            let mut residual_penalty = [0.0_f64; DOMAIN_AXES];
+            for a in 0..DOMAIN_AXES {
+                for b in 0..DOMAIN_AXES {
+                    penalty_projection[a] += row.penalty_gn[a][b] * axis_projection[b];
+                    residual_penalty[a] += row.penalty_gn[a][b] * residual_axis[b];
+                }
+            }
+            for (position, (column, derivative)) in row.columns.iter().enumerate() {
+                let axis = row.axis_terms[position];
+                let mut penalty = 0.0;
+                for (slot, value) in axis.iter().enumerate() {
+                    penalty += value * (penalty_projection[slot] + residual_penalty[slot]);
+                }
+                let total = weight * dot3(*derivative, projected)
+                    + robust * row.robust_terms[position] * robust_projection
+                    + penalty
+                    + weight * dot3(*derivative, residual_projected)
+                    + robust * row.robust_terms[position] * residual_robust;
+                out[*column as usize] += total;
+            }
+            for (local, derivative, robust_term, axis) in &row.residual_columns {
+                let mut penalty = 0.0;
+                for (slot, value) in axis.iter().enumerate() {
+                    penalty += value * penalty_projection[slot];
+                }
+                let mut total = weight * dot3(*derivative, projected)
+                    + robust * robust_term * robust_projection
+                    + penalty;
+                if robust != 0.0 {
+                    total += robust * robust_term * residual_robust;
+                }
+                out[self.residual_start + *local as usize] += total;
+            }
+        }
     }
 }
 
@@ -6876,6 +7568,7 @@ struct AnalyticProductScratch {
 struct FinalScratch {
     hessian: AnalyticProductScratch,
     solver: crate::trust_region::TrustRegionScratch,
+    positive_solver: crate::trust_region::TrustRegionScratch,
     gradient: Vec<f64>,
     diagonal: Vec<f64>,
     effective: Vec<f64>,
@@ -6884,11 +7577,14 @@ struct FinalScratch {
     cauchy_product: Vec<f64>,
     box_effective: Vec<f64>,
     box_product: Vec<f64>,
+    positive_effective: Vec<f64>,
+    positive_product: Vec<f64>,
     reduced: Vec<f64>,
     reduced_out: Vec<f64>,
     trial: Option<Params>,
     cauchy_trial: Option<Params>,
     box_trial: Option<Params>,
+    positive_trial: Option<Params>,
 }
 
 struct AnalyticModel<'a, 'b> {
@@ -6948,6 +7644,8 @@ impl<'a, 'b> AnalyticModel<'a, 'b> {
         scratch.cauchy_product.resize(dim, 0.0);
         scratch.box_effective.resize(dim, 0.0);
         scratch.box_product.resize(dim, 0.0);
+        scratch.positive_effective.resize(dim, 0.0);
+        scratch.positive_product.resize(dim, 0.0);
         let reduced = self.metric.outer_count + self.metric.residual_count;
         scratch.reduced.resize(reduced, 0.0);
         scratch.reduced_out.resize(reduced, 0.0);
@@ -8776,10 +9474,17 @@ impl ResidualSpace {
         identity: f64,
     ) {
         out.fill(0.0);
-        residual_data_accumulate(samples, v, out, hessian_scale, |global| {
-            let local = self.local_of[global];
-            (local != u32::MAX).then_some(local as usize)
-        });
+        residual_data_accumulate(
+            samples,
+            v,
+            out,
+            hessian_scale,
+            |global| {
+                let local = self.local_of[global];
+                (local != u32::MAX).then_some(local as usize)
+            },
+            |sample| &sample.penalty_curvature,
+        );
         for &(row, column, value) in &self.penalty {
             out[row as usize] += value * v[column as usize];
         }
@@ -9145,13 +9850,17 @@ fn residual_diagonal(samples: &[ResidualSample]) -> Vec<f64> {
 
 /// Residual data curvature `B_data v` over the coordinates selected by `local`, where `local`
 /// maps a global residual coordinate to its index in `v`/`product`.
-fn residual_data_accumulate<F: Fn(usize) -> Option<usize>>(
+fn residual_data_accumulate<F, P>(
     samples: &[ResidualSample],
     v: &[f64],
     product: &mut [f64],
     hessian_scale: f64,
     local: F,
-) {
+    penalty: P,
+) where
+    F: Fn(usize) -> Option<usize>,
+    P: Fn(&ResidualSample) -> &[[f64; 3]; 3],
+{
     for sample in samples {
         let mut y = [0.0_f64; 3];
         let mut residual_projection = [0.0_f64; 3];
@@ -9171,7 +9880,7 @@ fn residual_data_accumulate<F: Fn(usize) -> Option<usize>>(
         let mut penalty_projection = [0.0_f64; 3];
         for (row, total) in penalty_projection.iter_mut().enumerate() {
             for (column, value) in residual_projection.iter().enumerate() {
-                *total += sample.penalty_curvature[row][column] * value;
+                *total += penalty(sample)[row][column] * value;
             }
         }
         for (m, node) in sample.nodes.iter().enumerate() {
@@ -9200,7 +9909,9 @@ fn residual_undamped_accumulate(
     identity: f64,
     hessian_scale: f64,
 ) {
-    residual_data_accumulate(samples, v, product, hessian_scale, Some);
+    residual_data_accumulate(samples, v, product, hessian_scale, Some, |sample| {
+        &sample.penalty_curvature
+    });
     for index in 0..RESIDUAL_COEFS {
         product[index] += ridge * laplacian_at(v, index, penalty_diagonal);
         product[index] += identity * v[index];
@@ -9456,6 +10167,123 @@ mod review_tests {
         assert!((5.0 * solution.delta[0] + 6.0 * solution.delta[1] - 2.0).abs() < 1e-10);
         assert!((6.0 * solution.delta[0] + 9.25 * solution.delta[1] - 3.0).abs() < 1e-10);
         assert!(solution.prediction > STATIONARY_DECREMENT_NATS);
+    }
+
+    #[cfg(feature = "synth")]
+    #[test]
+    fn positive_operator_includes_the_gn_domain_penalty() {
+        let data = crate::synth::dataset(&crate::synth::SynthConfig {
+            images: 2,
+            samples_per_image: 16,
+            ..crate::synth::SynthConfig::default()
+        });
+        let options = FitOptions {
+            fit_residual: false,
+            ..FitOptions::default()
+        };
+        let problem = Problem::new_with(&data.images, None, &options).expect("problem");
+        let layout = &problem.layout;
+        let params = initial_params(&problem, &options);
+        let roles = prior_roles(&problem, layout);
+        let lambdas = StageLambdas::default();
+        let mut blocks = super::schur_tests::joint_blocks(&problem, false);
+        let penalties: Vec<Vec<f64>> = blocks
+            .iter()
+            .map(|block| block_penalty(&problem, block))
+            .collect();
+        let mut pass = problem.pass_with_rows(
+            &params,
+            ActiveColumns::ALL,
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::NativeOnly,
+            true,
+            true,
+        );
+        let mut penalty_gn = [[0.0_f64; DOMAIN_AXES]; DOMAIN_AXES];
+        penalty_gn[0][0] = 1.0;
+        penalty_gn[0][1] = 0.5;
+        penalty_gn[1][0] = 0.5;
+        penalty_gn[1][1] = 1.0;
+        pass.coupled_rows = vec![crate::problem::HessianRow {
+            columns: vec![
+                (layout.tone_c0 as u32, [2.0, 0.0, 0.0]),
+                (layout.tint_a.start as u32, [3.0, 0.0, 0.0]),
+            ],
+            weight: 1.0,
+            robust_terms: vec![0.0, 0.0],
+            robust: 0.0,
+            axis_terms: vec![
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            penalty: [[0.0; DOMAIN_AXES]; DOMAIN_AXES],
+            penalty_gn,
+            curvature: None,
+            residual_columns: Vec::new(),
+            layers: vec![None; 2],
+            layer_weights: vec![[0.0; 4]; 2],
+            layer_slopes: vec![0.0; 2],
+            motion: [0.0; 3],
+            tint: [0.0; 4],
+            second: Box::new([0.0; 81]),
+        }];
+        let model = JointModel::new(
+            layout,
+            &problem,
+            &params,
+            &options,
+            &blocks,
+            &penalties,
+            &lambdas,
+            &roles,
+            &pass,
+            1.0,
+            false,
+            false,
+            &ResidualMask::empty(),
+        )
+        .expect("joint model");
+        let (a, _, globals, local) = super::schur_tests::dense_joint_matrix(
+            layout, &problem, &params, &options, &blocks, &penalties, &lambdas, &roles, &pass, 0.0,
+            false,
+        );
+        let n = globals.len();
+        let mut v = vec![0.0_f64; model.dim];
+        let mut dense = vec![0.0_f64; n];
+        for index in 0..model.dim {
+            let value = ((index * 37 + 5) % 23) as f64 - 11.0;
+            v[index] = value;
+            dense[local[model.globals[index]]] = value;
+        }
+        let mut positive = vec![0.0_f64; model.dim];
+        model.apply_positive(&v, &mut positive);
+        let mut analytic = vec![0.0_f64; model.dim];
+        model.apply_undamped_with(&v, &mut analytic, false);
+        for index in 0..model.dim {
+            let row = local[model.globals[index]];
+            let mut sum = 0.0;
+            for column in 0..n {
+                sum += a[row * n + column] * dense[column];
+            }
+            assert!(
+                (positive[index] - sum).abs() <= 1e-9 * sum.abs().max(1.0),
+                "positive operator entry {index}: model {} dense {}",
+                positive[index],
+                sum
+            );
+        }
+        let tone = model
+            .globals
+            .iter()
+            .position(|global| *global == layout.tone_c0)
+            .expect("tone global");
+        assert!(
+            (positive[tone] - analytic[tone]).abs() > 1e-6,
+            "the positive operator dropped the domain penalty"
+        );
     }
 
     #[test]
@@ -9795,7 +10623,7 @@ mod schur_tests {
     }
 
     #[cfg(feature = "synth")]
-    fn joint_blocks(problem: &Problem, layers: bool) -> Vec<BlockAcc> {
+    pub(super) fn joint_blocks(problem: &Problem, layers: bool) -> Vec<BlockAcc> {
         let layout = &problem.layout;
         let split = problem.images.len() > 64;
         let mut blocks: Vec<BlockAcc> = STAGES[4]
@@ -9829,7 +10657,7 @@ mod schur_tests {
     /// The same joint curvature and right-hand side, assembled densely with no elimination.
     #[cfg(feature = "synth")]
     #[allow(clippy::too_many_arguments)]
-    fn dense_joint_matrix(
+    pub(super) fn dense_joint_matrix(
         layout: &Layout,
         problem: &Problem,
         params: &Params,
@@ -12350,9 +13178,35 @@ mod lifecycle_tests {
         residual_active: bool,
     ) -> FinalOutcome {
         let mut radius = None;
-        let mut gradient_scale = None;
+        let mut positive_radius = None;
         let mut evaluations = 0usize;
         let mut sample_evaluations = SampleEvaluations::default();
+        run_step_with(
+            f,
+            params,
+            mask,
+            residual_active,
+            &f.options,
+            &mut radius,
+            &mut positive_radius,
+            &mut evaluations,
+            &mut sample_evaluations,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_step_with(
+        f: &Fixture,
+        params: &mut Params,
+        mask: &ResidualMask,
+        residual_active: bool,
+        options: &FitOptions,
+        radius: &mut Option<crate::TrustRadius>,
+        positive_radius: &mut Option<crate::TrustRadius>,
+        evaluations: &mut usize,
+        sample_evaluations: &mut SampleEvaluations,
+    ) -> FinalOutcome {
+        let mut gradient_scale = None;
         let mut scratch = FinalScratch::default();
         let mut cert_warm = None;
         final_stage_step(
@@ -12360,7 +13214,7 @@ mod lifecycle_tests {
             &f.problem,
             &f.problem,
             &STAGES[4],
-            &f.options,
+            options,
             params,
             &f.blocks,
             &f.penalties,
@@ -12369,10 +13223,11 @@ mod lifecycle_tests {
             &f.pass,
             f.pass.active_samples.max(1) as f64 / f.pass.hessian_rows.max(1) as f64,
             f.cost(),
-            &mut radius,
+            radius,
+            positive_radius,
             &mut gradient_scale,
-            &mut evaluations,
-            &mut sample_evaluations,
+            evaluations,
+            sample_evaluations,
             f.problem.samples.len(),
             4,
             0,
@@ -12382,6 +13237,29 @@ mod lifecycle_tests {
             mask,
             residual_active,
         )
+    }
+
+    fn initial_radius(f: &Fixture) -> crate::TrustRadius {
+        let model = f.model();
+        let mut scratch = FinalScratch::default();
+        AnalyticModel::new(
+            &model,
+            &f.pass,
+            &f.params,
+            &f.options,
+            model.residual_data_scale,
+        )
+        .expect("analytic model")
+        .prepare(&mut scratch)
+        .expect("analytic workspace");
+        let initial = scratch
+            .gradient
+            .iter()
+            .zip(&scratch.diagonal)
+            .fold(0.0, |norm, (gradient, diagonal)| {
+                libm::hypot(norm, gradient / diagonal.sqrt())
+            });
+        crate::TrustRadius::checked(initial.max(1.0)).expect("initial radius")
     }
 
     fn freeze_stationary(f: &mut Fixture) {
@@ -12731,6 +13609,324 @@ mod lifecycle_tests {
             resume_history(&state, &other_stage).is_empty(),
             "history crossed a stage change"
         );
+    }
+
+    #[test]
+    fn objective_pick_prefers_the_lower_realized_objective() {
+        let analytic = RealizedCandidate {
+            step: AppliedStep::TrustRegion,
+            cost: 10.0,
+            feasible: true,
+        };
+        let positive = RealizedCandidate {
+            step: AppliedStep::Positive,
+            cost: 9.0,
+            feasible: true,
+        };
+        let cost = 20.0;
+        assert_eq!(
+            objective_pick(cost, Some(analytic), Some(positive)),
+            Some(AppliedStep::Positive)
+        );
+        assert_eq!(
+            objective_pick(
+                cost,
+                Some(analytic),
+                Some(RealizedCandidate {
+                    cost: 10.0,
+                    ..positive
+                })
+            ),
+            Some(AppliedStep::TrustRegion),
+            "an objective tie did not keep the analytic candidate"
+        );
+        assert_eq!(
+            objective_pick(
+                cost,
+                Some(analytic),
+                Some(RealizedCandidate {
+                    cost: 8.0,
+                    feasible: false,
+                    ..positive
+                })
+            ),
+            Some(AppliedStep::TrustRegion),
+            "an infeasible positive candidate displaced the analytic candidate"
+        );
+        assert_eq!(
+            objective_pick(
+                cost,
+                Some(RealizedCandidate {
+                    cost: f64::NAN,
+                    ..analytic
+                }),
+                Some(positive)
+            ),
+            Some(AppliedStep::Positive),
+            "a non-finite analytic decrease beat a finite positive decrease"
+        );
+        assert_eq!(
+            objective_pick(
+                cost,
+                Some(analytic),
+                Some(RealizedCandidate {
+                    cost: f64::NAN,
+                    ..positive
+                })
+            ),
+            Some(AppliedStep::TrustRegion),
+            "a non-finite positive decrease beat a finite analytic decrease"
+        );
+        assert_eq!(
+            objective_pick(cost, None, Some(positive)),
+            Some(AppliedStep::Positive)
+        );
+        assert_eq!(
+            objective_pick(cost, Some(analytic), None),
+            Some(AppliedStep::TrustRegion)
+        );
+        assert_eq!(objective_pick(cost, None, None), None);
+    }
+
+    #[test]
+    fn finite_box_decrease_beats_a_non_finite_ordinary_decrease() {
+        assert_eq!(
+            guarded_selection(OrdinaryStep::TrustRegion, true, f64::NAN, 3.0),
+            AppliedStep::Box
+        );
+        assert_eq!(
+            guarded_selection(OrdinaryStep::TrustRegion, true, 3.0, f64::NAN),
+            AppliedStep::TrustRegion
+        );
+        assert_eq!(
+            guarded_selection(OrdinaryStep::TrustRegion, true, 3.0, 3.0),
+            AppliedStep::TrustRegion
+        );
+    }
+
+    #[test]
+    fn applied_step_is_the_lower_objective_candidate() {
+        let seeds = [0x51a8u64, 0x51a9, 0x51aa, 0x51ab, 0x51ac, 0x51ad];
+        let perturbations = [
+            (0.7, 0.4, 0.2),
+            (1.0, 0.6, 0.3),
+            (1.3, 0.8, 0.4),
+            (0.4, 0.2, 0.1),
+            (1.6, 0.9, 0.45),
+        ];
+        let mut found = None;
+        'search: for seed in seeds {
+            for (tone, image, clip) in perturbations {
+                let mut f = fixture(2, 8, true, seed);
+                f.params.theta[f.problem.layout.tone_c0] += tone;
+                f.params.theta[f.problem.layout.image(0).start] += image;
+                f.params.theta[f.problem.layout.clip] += clip;
+                f.rebuild();
+                let initial = initial_radius(&f);
+                let mask = ResidualMask::from_samples(&f.pass.residual_samples);
+                let mut params = f.params.clone();
+                let mut radius = Some(initial);
+                let mut positive_radius = Some(initial);
+                let mut evaluations = 0usize;
+                let mut sample_evaluations = SampleEvaluations::default();
+                let outcome = run_step_with(
+                    &f,
+                    &mut params,
+                    &mask,
+                    true,
+                    &f.options,
+                    &mut radius,
+                    &mut positive_radius,
+                    &mut evaluations,
+                    &mut sample_evaluations,
+                );
+                if !matches!(outcome, FinalOutcome::Accepted(_)) {
+                    continue;
+                }
+                let Some(trace) = last_attempt() else {
+                    continue;
+                };
+                let (Some(analytic), Some(positive)) = (trace.analytic, trace.positive) else {
+                    continue;
+                };
+                let analytic_ratio = realized_ratio(trace.cost, analytic.cost, analytic.prediction);
+                let positive_ratio = realized_ratio(trace.cost, positive.cost, positive.prediction);
+                if analytic_ratio == positive_ratio {
+                    continue;
+                }
+                let analytic_expected = adapt_trust_radius(
+                    initial,
+                    analytic_ratio,
+                    analytic.metric_norm,
+                    candidate_passes(
+                        trace.cost,
+                        analytic.cost,
+                        analytic.prediction,
+                        analytic.feasible,
+                    ),
+                );
+                let positive_expected = adapt_trust_radius(
+                    initial,
+                    positive_ratio,
+                    positive.metric_norm,
+                    candidate_passes(
+                        trace.cost,
+                        positive.cost,
+                        positive.prediction,
+                        positive.feasible,
+                    ),
+                );
+                if analytic_expected == positive_expected {
+                    continue;
+                }
+                found = Some((
+                    trace,
+                    radius,
+                    positive_radius,
+                    analytic_expected,
+                    positive_expected,
+                ));
+                break 'search;
+            }
+        }
+        let (trace, radius, positive_radius, analytic_expected, positive_expected) =
+            found.expect("no fixture separates the two gains");
+        let analytic = trace.analytic.expect("analytic candidate");
+        let positive = trace.positive.expect("positive candidate");
+        assert_eq!(
+            Some(trace.applied),
+            objective_pick(
+                trace.cost,
+                Some(RealizedCandidate {
+                    step: analytic.step,
+                    cost: analytic.cost,
+                    feasible: analytic.feasible,
+                }),
+                Some(RealizedCandidate {
+                    step: positive.step,
+                    cost: positive.cost,
+                    feasible: positive.feasible,
+                }),
+            ),
+            "the applied step was not the objective pick"
+        );
+        let applied = match trace.applied {
+            AppliedStep::Positive => positive,
+            _ => analytic,
+        };
+        assert!(
+            candidate_passes(
+                trace.cost,
+                applied.cost,
+                applied.prediction,
+                applied.feasible
+            ),
+            "the applied step did not pass its own ratio"
+        );
+        assert_eq!(
+            radius,
+            Some(analytic_expected),
+            "the analytic radius did not use its own gain"
+        );
+        assert_eq!(
+            positive_radius,
+            Some(positive_expected),
+            "the positive radius did not use its own gain"
+        );
+    }
+
+    #[test]
+    fn positive_work_limit_shrinks_only_the_positive_radius() {
+        let mut f = fixture(2, 8, true, 0x51a8);
+        perturb(&mut f);
+        let initial = initial_radius(&f);
+        let mask = ResidualMask::from_samples(&f.pass.residual_samples);
+        let mut params = f.params.clone();
+        let mut radius = Some(initial);
+        let mut positive_radius = Some(initial);
+        let mut evaluations = 0usize;
+        let mut sample_evaluations = SampleEvaluations::default();
+        set_positive_work_limit(Some(0));
+        let outcome = run_step_with(
+            &f,
+            &mut params,
+            &mask,
+            true,
+            &f.options,
+            &mut radius,
+            &mut positive_radius,
+            &mut evaluations,
+            &mut sample_evaluations,
+        );
+        set_positive_work_limit(None);
+        assert!(matches!(outcome, FinalOutcome::Accepted(_)));
+        let trace = last_attempt().expect("an accepted attempt was recorded");
+        assert!(trace.positive.is_none(), "the positive solve did not fail");
+        let analytic = trace.analytic.expect("analytic candidate");
+        let ratio = realized_ratio(trace.cost, analytic.cost, analytic.prediction);
+        let acceptable = candidate_passes(
+            trace.cost,
+            analytic.cost,
+            analytic.prediction,
+            analytic.feasible,
+        );
+        assert!(
+            ratio >= 0.25,
+            "the fixture's analytic gain does not distinguish a swapped gain"
+        );
+        assert_ne!(
+            radius,
+            initial.shrink(0.25),
+            "the analytic radius matches the positive failure shrink"
+        );
+        assert_eq!(
+            radius,
+            Some(adapt_trust_radius(
+                initial,
+                ratio,
+                analytic.metric_norm,
+                acceptable,
+            )),
+            "the analytic radius did not follow its own ratio"
+        );
+        assert_eq!(
+            positive_radius,
+            initial.shrink(0.25),
+            "the failed positive solve did not shrink only its own radius"
+        );
+    }
+
+    #[test]
+    fn budget_stops_before_a_second_pass() {
+        let mut f = fixture(2, 8, true, 0x51a8);
+        perturb(&mut f);
+        let samples = f.problem.samples.len();
+        let options = FitOptions {
+            sweep_budget: samples as f64,
+            ..f.options
+        };
+        let mask = ResidualMask::from_samples(&f.pass.residual_samples);
+        let mut params = f.params.clone();
+        let before = params.theta.clone();
+        let mut radius = None;
+        let mut positive_radius = None;
+        let mut evaluations = 0usize;
+        let mut sample_evaluations = SampleEvaluations::default();
+        let outcome = run_step_with(
+            &f,
+            &mut params,
+            &mask,
+            true,
+            &options,
+            &mut radius,
+            &mut positive_radius,
+            &mut evaluations,
+            &mut sample_evaluations,
+        );
+        assert!(matches!(outcome, FinalOutcome::Budget));
+        assert_eq!(evaluations, 1);
+        assert_eq!(sample_evaluations.get(), samples as u64);
+        assert_eq!(params.theta, before, "a budget stop applied a candidate");
     }
 }
 
