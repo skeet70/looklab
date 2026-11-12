@@ -26,6 +26,8 @@ const FIRMWARE: &str = "1.50";
 const SIM: &str = "classic_chrome";
 const CONTROL: &str = "native_simulations";
 
+type Outputs = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
 struct Fixture {
     _dir: TempDir,
     worker: Worker,
@@ -407,7 +409,7 @@ async fn confirmation_state_never_reaches_fit_match_or_export() {
 
     let body = UploadBodyId::new(BODY).expect("body");
     let look = LookSlug::new(LOOK).expect("look");
-    let mut expected: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = None;
+    let mut expected: Option<Outputs> = None;
     for state in ["none", "owner_reported", "confirmed"] {
         clear_manual_checks(worker, &camera).await;
         match state {
