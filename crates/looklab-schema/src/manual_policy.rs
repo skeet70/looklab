@@ -293,6 +293,9 @@ pub struct FirmwareConfirmation {
     /// The number of unlinked profiles whose latest answer is counted for this firmware.
     #[serde(default)]
     pub owner_profiles: u32,
+    /// Every profile whose latest answer is counted, including one per linked group.
+    #[serde(default)]
+    pub reported_profiles: u32,
 }
 
 impl FirmwareConfirmation {
@@ -618,6 +621,7 @@ pub fn evaluate_control(
                         confirmed_actual: None,
                         reported_options: Vec::new(),
                         owner_profiles: 0,
+                        reported_profiles: 0,
                     });
                 }
             }
@@ -738,6 +742,12 @@ fn evaluate_firmware(
         .iter()
         .map(|group| group.evidence.len() as u32)
         .sum::<u32>();
+    let reported_profiles = owner_profiles.saturating_add(
+        linked_groups
+            .iter()
+            .map(|group| group.evidence.len() as u32)
+            .sum::<u32>(),
+    );
     let mut reported_options = reported_options(capability, &linked_groups, &owner_groups);
     reported_options.sort_by(|left, right| {
         right
@@ -761,6 +771,7 @@ fn evaluate_firmware(
                 confirmed_actual: None,
                 reported_options,
                 owner_profiles,
+                reported_profiles,
             };
         }
         return FirmwareConfirmation {
@@ -776,6 +787,7 @@ fn evaluate_firmware(
             confirmed_actual: None,
             reported_options,
             owner_profiles,
+            reported_profiles,
         };
     };
     let agreeing_groups = leading.evidence.len() as u32;
@@ -808,6 +820,7 @@ fn evaluate_firmware(
             confirmed_actual: None,
             reported_options,
             owner_profiles,
+            reported_profiles,
         };
     }
     if agreeing_groups as usize >= AGREEMENT_GROUPS {
@@ -835,21 +848,19 @@ fn evaluate_firmware(
             confirmed_actual: Some(confirmed_actual),
             reported_options,
             owner_profiles,
+            reported_profiles,
         };
     }
     FirmwareConfirmation {
         firmware,
-        state: if owner_profiles > 0 {
-            ConfirmationState::OwnerReported
-        } else {
-            ConfirmationState::Unconfirmed
-        },
+        state: ConfirmationState::OwnerReported,
         agreeing_groups,
         contradictions: Vec::new(),
         basis: None,
         confirmed_actual: None,
         reported_options,
         owner_profiles,
+        reported_profiles,
     }
 }
 

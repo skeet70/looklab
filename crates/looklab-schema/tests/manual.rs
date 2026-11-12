@@ -841,10 +841,11 @@ fn two_corrections_are_not_a_quorum() {
     ];
 
     let control = evaluate_control(camera, target, &entries, &[]);
-    assert_eq!(control.state, ConfirmationState::Unconfirmed);
+    assert_eq!(control.state, ConfirmationState::OwnerReported);
     assert_eq!(control.agreeing_groups, 2);
     let result = firmware_result(&control, "1.00");
-    assert_eq!(result.state, ConfirmationState::Unconfirmed);
+    assert_eq!(result.state, ConfirmationState::OwnerReported);
+    assert_eq!(result.reported_profiles, 2);
     assert_eq!(result.basis, None);
     assert!(result.confirmed_actual.is_none());
 }
@@ -1193,14 +1194,14 @@ fn unspecified_scope_does_not_merge_firmware_votes() {
     ];
 
     let control = evaluate_control(camera, target, &entries, &[]);
-    assert_eq!(control.state, ConfirmationState::Unconfirmed);
+    assert_eq!(control.state, ConfirmationState::OwnerReported);
     assert_eq!(control.agreeing_groups, 1);
     assert_eq!(control.firmware.len(), 3);
     assert!(
         control
             .firmware
             .iter()
-            .all(|result| result.state == ConfirmationState::Unconfirmed)
+            .all(|result| result.state == ConfirmationState::OwnerReported)
     );
     assert!(
         control
@@ -1488,7 +1489,7 @@ fn contradictions_block_and_known_groups_dedup() {
         evidence(camera, target, &group("b"), "1.00", 3),
     ];
     let control = evaluate_control(camera, target, &repeated, &[]);
-    assert_eq!(control.state, ConfirmationState::Unconfirmed);
+    assert_eq!(control.state, ConfirmationState::OwnerReported);
     assert_eq!(control.agreeing_groups, 2);
 }
 

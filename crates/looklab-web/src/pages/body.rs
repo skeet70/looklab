@@ -812,7 +812,7 @@ pub(crate) fn confirmation_text(confirmation: &looklab_schema::ControlConfirmati
                 confirmation
                     .firmware
                     .iter()
-                    .map(|result| result.owner_profiles)
+                    .map(|result| result.reported_profiles)
                     .max()
                     .unwrap_or(0)
             )
@@ -879,7 +879,7 @@ pub(crate) fn firmware_basis_text(result: &FirmwareConfirmation) -> String {
             ConfirmationState::Contradicted => "owner reports disagree".to_owned(),
             ConfirmationState::OwnerReported => format!(
                 "reported by {}; not confirmed",
-                profile_count_text(result.owner_profiles)
+                profile_count_text(result.reported_profiles)
             ),
             ConfirmationState::Unconfirmed => {
                 format!("{} group(s); 3 needed", result.agreeing_groups)
@@ -952,7 +952,7 @@ pub(crate) fn firmware_detail(result: &FirmwareConfirmation) -> Option<String> {
     match result.state {
         ConfirmationState::OwnerReported => Some(format!(
             "reported by {} · {}",
-            profile_count_text(result.owner_profiles),
+            profile_count_text(result.reported_profiles),
             result
                 .reported_options
                 .first()
