@@ -127,6 +127,8 @@ fn evidence(
         definition_digest: capability.definition_digest(camera),
         finding: Finding::Matches,
         submitted_at,
+        linked: true,
+        profiles: 1,
     }
 }
 
@@ -149,6 +151,8 @@ fn corrected_evidence(
             domain,
         },
         submitted_at,
+        linked: true,
+        profiles: 1,
     }
 }
 
@@ -839,12 +843,184 @@ fn two_corrections_are_not_a_quorum() {
     ];
 
     let control = evaluate_control(camera, target, &entries, &[]);
-    assert_eq!(control.state, ConfirmationState::Unconfirmed);
+    assert_eq!(control.state, ConfirmationState::OwnerReported);
     assert_eq!(control.agreeing_groups, 2);
     let result = firmware_result(&control, "1.00");
-    assert_eq!(result.state, ConfirmationState::Unconfirmed);
+    assert_eq!(result.state, ConfirmationState::OwnerReported);
+    assert_eq!(result.reported_profiles, 2);
     assert_eq!(result.basis, None);
     assert!(result.confirmed_actual.is_none());
+}
+
+fn unlinked(mut entry: ManualEvidence) -> ManualEvidence {
+    entry.linked = false;
+    entry
+}
+
+#[test]
+fn unlinked_reports_are_owner_reported_without_a_quorum() {
+    let catalog = catalog(NATIVE);
+    let camera = &catalog.cameras[0];
+    let target = capability(camera, CapabilityKey::NativeSimulations);
+    let entries = vec![
+        unlinked(evidence(camera, target, &group("one"), "1.00", 1)),
+        unlinked(evidence(camera, target, &group("two"), "1.00", 2)),
+    ];
+
+    let control = evaluate_control(camera, target, &entries, &[]);
+    assert_eq!(control.state, ConfirmationState::OwnerReported);
+    assert_eq!(control.agreeing_groups, 0);
+    let result = firmware_result(&control, "1.00");
+    assert_eq!(result.state, ConfirmationState::OwnerReported);
+    assert_eq!(result.owner_profiles, 2);
+    assert_eq!(result.reported_options.len(), 1);
+    assert_eq!(result.reported_options[0].owner_profiles, 2);
+    assert_eq!(result.reported_options[0].linked_groups, 0);
+    assert!(result.confirmed_actual.is_none());
+}
+
+#[test]
+fn unlinked_disagreement_lists_every_option_and_takes_no_majority() {
+    let catalog = catalog(NATIVE);
+    let camera = &catalog.cameras[0];
+    let target = capability(camera, CapabilityKey::NativeSimulations);
+    let entries = vec![
+        unlinked(evidence(camera, target, &group("one"), "1.00", 1)),
+        unlinked(evidence(camera, target, &group("two"), "1.00", 2)),
+        unlinked(corrected_evidence(
+            camera,
+            target,
+            &group("three"),
+            "1.00",
+            3,
+            Availability::Unavailable,
+            CapabilityDomain::Unspecified,
+        )),
+    ];
+
+    let control = evaluate_control(camera, target, &entries, &[]);
+    assert_eq!(control.state, ConfirmationState::Contradicted);
+    let result = firmware_result(&control, "1.00");
+    assert_eq!(result.state, ConfirmationState::Contradicted);
+    assert!(result.confirmed_actual.is_none());
+    assert_eq!(result.owner_profiles, 3);
+    assert_eq!(result.reported_options.len(), 2);
+    assert_eq!(result.reported_options[0].owner_profiles, 2);
+    assert_eq!(result.reported_options[1].owner_profiles, 1);
+    assert_eq!(control.contradictions.len(), 1);
+}
+
+#[test]
+fn moderator_override_covers_its_firmware_only() {
+    let catalog = catalog(NATIVE);
+    let camera = &catalog.cameras[0];
+    let target = capability(camera, CapabilityKey::NativeSimulations);
+    let entries = vec![
+        unlinked(evidence(camera, target, &group("one"), "1.00", 1)),
+        unlinked(evidence(camera, target, &group("two"), "2.00", 2)),
+    ];
+    let moderators = vec![moderator(
+        ModeratorFirmwareScope::exact("1.00").expect("scope"),
+    )];
+
+    let control = evaluate_control(camera, target, &entries, &moderators);
+    let first = firmware_result(&control, "1.00");
+    let second = firmware_result(&control, "2.00");
+    assert_eq!(first.state, ConfirmationState::ModeratorConfirmed);
+    assert_eq!(second.state, ConfirmationState::OwnerReported);
+    assert_eq!(second.owner_profiles, 1);
+}
+
+#[test]
+fn agreeing_linked_and_unlinked_reports_count_once_each() {
+    let catalog = catalog(NATIVE);
+    let camera = &catalog.cameras[0];
+    let target = capability(camera, CapabilityKey::NativeSimulations);
+
+    let mixed = vec![
+        evidence(camera, target, &group("linked"), "1.00", 1),
+        unlinked(evidence(camera, target, &group("owner"), "1.00", 2)),
+    ];
+    let control = evaluate_control(camera, target, &mixed, &[]);
+    assert_eq!(control.state, ConfirmationState::OwnerReported);
+    let result = firmware_result(&control, "1.00");
+    assert_eq!(result.owner_profiles, 1);
+    assert_eq!(result.reported_options.len(), 1);
+    assert_eq!(result.reported_options[0].linked_groups, 1);
+    assert_eq!(result.reported_options[0].owner_profiles, 1);
+    assert!(result.confirmed_actual.is_none());
+
+    let mut quorum = corrections(
+        camera,
+        target,
+        "1.00",
+        Availability::Available,
+        enum_domain(&["PROVIA"]),
+    );
+    quorum.push(unlinked(evidence(
+        camera,
+        target,
+        &group("owner"),
+        "1.00",
+        9,
+    )));
+    let control = evaluate_control(camera, target, &quorum, &[]);
+    assert_eq!(control.state, ConfirmationState::Confirmed);
+    let result = firmware_result(&control, "1.00");
+    assert_eq!(result.reported_options.len(), 1);
+    assert_eq!(result.reported_options[0].linked_groups, 3);
+    assert_eq!(result.reported_options[0].owner_profiles, 1);
+    assert!(result.confirmed_actual.is_some());
+}
+
+#[test]
+fn linked_quorum_confirms_despite_owner_dissent() {
+    let catalog = catalog(NATIVE);
+    let camera = &catalog.cameras[0];
+    let target = capability(camera, CapabilityKey::NativeSimulations);
+    let mut entries = corrections(
+        camera,
+        target,
+        "1.00",
+        Availability::Available,
+        enum_domain(&["PROVIA"]),
+    );
+    entries.push(unlinked(corrected_evidence(
+        camera,
+        target,
+        &group("owner"),
+        "1.00",
+        9,
+        Availability::Unavailable,
+        CapabilityDomain::Unspecified,
+    )));
+
+    let control = evaluate_control(camera, target, &entries, &[]);
+    assert_eq!(control.state, ConfirmationState::Confirmed);
+    let result = firmware_result(&control, "1.00");
+    assert_eq!(result.state, ConfirmationState::Confirmed);
+    assert_eq!(result.agreeing_groups, 3);
+    assert_eq!(result.owner_profiles, 1);
+    assert_eq!(result.reported_options.len(), 2);
+    assert!(result.reports_conflict());
+    assert!(result.confirmed_actual.is_some());
+}
+
+#[test]
+fn owner_reported_is_not_human_confirmed() {
+    let catalog = catalog(NATIVE);
+    let camera = &catalog.cameras[0];
+    let target = capability(camera, CapabilityKey::NativeSimulations);
+    let entries = vec![
+        unlinked(evidence(camera, target, &group("one"), "1.00", 1)),
+        unlinked(evidence(camera, target, &group("two"), "1.00", 2)),
+    ];
+
+    let summary = evaluate_camera(camera, &entries, &BTreeMap::new());
+    assert_eq!(summary.owner_reported, 1);
+    assert_eq!(summary.confirmed, 0);
+    assert!(!summary.human_confirmed());
+    assert!(summary.common_confirmed_firmware().is_empty());
 }
 
 #[test]
@@ -1020,14 +1196,14 @@ fn unspecified_scope_does_not_merge_firmware_votes() {
     ];
 
     let control = evaluate_control(camera, target, &entries, &[]);
-    assert_eq!(control.state, ConfirmationState::Unconfirmed);
+    assert_eq!(control.state, ConfirmationState::OwnerReported);
     assert_eq!(control.agreeing_groups, 1);
     assert_eq!(control.firmware.len(), 3);
     assert!(
         control
             .firmware
             .iter()
-            .all(|result| result.state == ConfirmationState::Unconfirmed)
+            .all(|result| result.state == ConfirmationState::OwnerReported)
     );
     assert!(
         control
@@ -1315,7 +1491,7 @@ fn contradictions_block_and_known_groups_dedup() {
         evidence(camera, target, &group("b"), "1.00", 3),
     ];
     let control = evaluate_control(camera, target, &repeated, &[]);
-    assert_eq!(control.state, ConfirmationState::Unconfirmed);
+    assert_eq!(control.state, ConfirmationState::OwnerReported);
     assert_eq!(control.agreeing_groups, 2);
 }
 

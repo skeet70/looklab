@@ -5941,8 +5941,9 @@ async fn manual_confirmation_after_photos_reuses_the_send_assertion() {
     let (status, summary) = post_confirmation(&server.app, &request).await;
     assert_eq!(status, StatusCode::OK, "confirmation: {summary}");
     let control = summary_control(&summary, "native_simulations");
-    assert_eq!(control["state"], "unconfirmed");
+    assert_eq!(control["state"], "owner_reported");
     assert_eq!(control["agreeing_groups"], 1);
+    assert_eq!(control["firmware"][0]["reported_profiles"], 1);
 
     let hmac = serial.hmac(&server.state.secret.hmac_key(), "Fujifilm", "X-T5");
     let summary_text = serde_json::to_string(&summary).expect("summary text");
@@ -6107,7 +6108,10 @@ async fn standalone_confirmation_reports_unlinked_intake_and_queue() {
     let control = summary_control(&summary, "native_simulations");
     assert_eq!(control["intake"]["recorded"], 1);
     assert_eq!(control["intake"]["unlinked"], 1);
+    assert_eq!(control["state"], "owner_reported");
     assert_eq!(control["agreeing_groups"], 0);
+    assert_eq!(control["firmware"][0]["owner_profiles"], 1);
+    assert_eq!(summary["owner_reported"], 1);
 
     let (status, _, body) = server.get("/api/manuals/fujifilm/x-t5").await;
     assert_eq!(status, StatusCode::OK);
@@ -6125,8 +6129,14 @@ async fn standalone_confirmation_reports_unlinked_intake_and_queue() {
     assert_eq!(checks[0]["camera"], "fujifilm/x-t5");
     assert_eq!(checks[0]["control"], "native_simulations");
     assert_eq!(checks[0]["finding"]["kind"], "matches");
-    assert_eq!(checks[0]["status"], "pending");
+    assert_eq!(checks[0]["status"], "counted");
     assert_eq!(checks[0]["owner_linkage"], "unlinked");
+    assert!(
+        queue["manual_conflicts"]
+            .as_array()
+            .expect("conflicts")
+            .is_empty()
+    );
 
     let (status, resent) = post_standalone_confirmation_response(&mut server, &confirmation).await;
     assert_eq!(status, StatusCode::OK, "resend: {resent}");
@@ -6138,6 +6148,394 @@ async fn standalone_confirmation_reports_unlinked_intake_and_queue() {
             .len(),
         1
     );
+}
+
+#[tokio::test]
+async fn two_unlinked_profiles_report_owner_reported_without_a_conflict() {
+    let mut server = TestServer::start().await;
+    let first_owner = server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, first) = post_standalone_confirmation_response(&mut server, &confirmation).await;
+    assert_eq!(status, StatusCode::OK, "first: {first}");
+    assert_eq!(first["receipt"]["owner_linkage"], "unlinked");
+
+    let (owner_two, owner_two_id) = synced_owner(&server, b"owner-reported-two", "Owner Two").await;
+    let request = synced_confirmation_request(&server, &owner_two, &confirmation).await;
+    let (status, second) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "second: {second}");
+    assert_eq!(second["receipt"]["owner_linkage"], "unlinked");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "owner_reported");
+    assert_eq!(control["agreeing_groups"], 0);
+    assert_eq!(control["firmware"][0]["owner_profiles"], 2);
+    assert_eq!(
+        control["firmware"][0]["reported_options"][0]["owner_profiles"],
+        2
+    );
+    assert_eq!(summary["confirmed"], 0);
+    assert_eq!(summary["owner_reported"], 1);
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 2);
+    assert!(
+        checks
+            .iter()
+            .all(|check| { check["status"] == "counted" && check["owner_linkage"] == "unlinked" })
+    );
+    assert!(
+        queue["manual_conflicts"]
+            .as_array()
+            .expect("conflicts")
+            .is_empty()
+    );
+
+    insert_serial_contribution(&server.db, "owner-one-linked", &first_owner, [21; 32]).await;
+    insert_serial_contribution(&server.db, "owner-two-linked", &owner_two_id, [21; 32]).await;
+    let linked = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&linked, "native_simulations");
+    assert_eq!(control["state"], "owner_reported");
+    assert_eq!(control["agreeing_groups"], 1);
+    let result = &control["firmware"][0];
+    assert_eq!(result["owner_profiles"], 0);
+    assert_eq!(result["reported_profiles"], 2);
+
+    let promotions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE type = 'manual_confirmation_promotion'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("promotion rows");
+    assert_eq!(promotions, 0);
+}
+
+#[tokio::test]
+async fn unlinked_disagreement_creates_one_conflict_with_every_option() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let matching = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, first) = post_standalone_confirmation_response(&mut server, &matching).await;
+    assert_eq!(status, StatusCode::OK, "first: {first}");
+
+    let (owner_two, _) = synced_owner(&server, b"disagree-two", "Owner Two").await;
+    let request = synced_confirmation_request(&server, &owner_two, &matching).await;
+    let (status, second) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "second: {second}");
+
+    let corrected = confirmation_with(
+        &camera,
+        "native_simulations",
+        "2.10",
+        Finding::Corrected {
+            availability: looklab_schema::Availability::Unavailable,
+            domain: looklab_schema::CapabilityDomain::Unspecified,
+        },
+    );
+    let (owner_three, _) = synced_owner(&server, b"disagree-three", "Owner Three").await;
+    let request = synced_confirmation_request(&server, &owner_three, &corrected).await;
+    let (status, third) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "third: {third}");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "contradicted");
+    let options = control["firmware"][0]["reported_options"]
+        .as_array()
+        .expect("options");
+    assert_eq!(options.len(), 2);
+    assert_eq!(options[0]["finding"]["kind"], "matches");
+    assert_eq!(options[0]["owner_profiles"], 2);
+    assert_eq!(options[1]["finding"]["kind"], "corrected");
+    assert_eq!(options[1]["owner_profiles"], 1);
+
+    let token = server.moderator_token().await;
+    let queue = moderation_queue(&server, &token).await;
+    let checks = queue["manual_checks"].as_array().expect("manual checks");
+    assert_eq!(checks.len(), 3);
+    assert!(checks.iter().all(|check| check["status"] == "conflicted"));
+    let conflicts = queue["manual_conflicts"].as_array().expect("conflicts");
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0]["firmware"], "2.10");
+    assert_eq!(
+        conflicts[0]["options"].as_array().expect("options").len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn moderator_decision_overrides_owner_reports_for_its_scope() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let matching_two = confirmation_for(&camera, "native_simulations", "2.10");
+    let matching_three = confirmation_for(&camera, "native_simulations", "3.00");
+    let corrected = |firmware: &str| {
+        confirmation_with(
+            &camera,
+            "native_simulations",
+            firmware,
+            Finding::Corrected {
+                availability: looklab_schema::Availability::Unavailable,
+                domain: looklab_schema::CapabilityDomain::Unspecified,
+            },
+        )
+    };
+    for (label, confirmation) in [
+        ("two-match", matching_two.clone()),
+        ("two-corrected", corrected("2.10")),
+        ("three-match", matching_three.clone()),
+        ("three-corrected", corrected("3.00")),
+    ] {
+        let (owner, _) = synced_owner(&server, label.as_bytes(), label).await;
+        let request = synced_confirmation_request(&server, &owner, &confirmation).await;
+        let (status, body) = post_confirmation(&server.app, &request).await;
+        assert_eq!(status, StatusCode::OK, "{label}: {body}");
+    }
+
+    let token = server.moderator_token().await;
+    let key = CapabilityKey::NativeSimulations;
+    let definition_digest = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control")
+        .definition_digest(&camera);
+    let moderation = ManualModeration {
+        camera: camera.id.clone(),
+        key,
+        definition_digest,
+        confirmed: true,
+        evidence: ModeratorEvidence {
+            kind: ModeratorEvidenceKind::Physical,
+            url: None,
+            description: "body review".to_owned(),
+            firmware_scope: ModeratorFirmwareScope::exact("2.10").expect("scope"),
+        },
+    };
+    let body = json!({
+        "definition_digest": definition_digest,
+        "confirmed": true,
+        "evidence": {
+            "kind": "physical",
+            "description": "body review",
+            "firmware_scope": {"kind": "exact", "firmware": "2.10"},
+        },
+    });
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
+    let (status, summary) = post_signed_with_token(
+        &mut server,
+        path,
+        &token,
+        "moderate-manual-confirmation",
+        &moderation.canonical_bytes(),
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "moderate: {summary}");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    let two = control["firmware"]
+        .as_array()
+        .expect("firmware")
+        .iter()
+        .find(|result| result["firmware"] == "2.10")
+        .expect("2.10 result");
+    let three = control["firmware"]
+        .as_array()
+        .expect("firmware")
+        .iter()
+        .find(|result| result["firmware"] == "3.00")
+        .expect("3.00 result");
+    assert_eq!(two["state"], "moderator_confirmed");
+    assert_eq!(three["state"], "contradicted");
+
+    let queue = moderation_queue(&server, &token).await;
+    let conflicts = queue["manual_conflicts"].as_array().expect("conflicts");
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0]["firmware"], "3.00");
+}
+
+#[tokio::test]
+async fn conflict_needs_a_matching_moderator_scope() {
+    let mut server = TestServer::start().await;
+    server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let matching = confirmation_for(&camera, "native_simulations", "2.10");
+    assert_eq!(
+        post_standalone_confirmation(&mut server, &matching).await,
+        StatusCode::OK
+    );
+    let corrected = confirmation_with(
+        &camera,
+        "native_simulations",
+        "2.10",
+        Finding::Corrected {
+            availability: looklab_schema::Availability::Unavailable,
+            domain: looklab_schema::CapabilityDomain::Unspecified,
+        },
+    );
+    let (owner_two, _) = synced_owner(&server, b"scope-conflict", "Scope Conflict").await;
+    let request = synced_confirmation_request(&server, &owner_two, &corrected).await;
+    let (status, body) = post_confirmation(&server.app, &request).await;
+    assert_eq!(status, StatusCode::OK, "second: {body}");
+
+    let token = server.moderator_token().await;
+    let key = CapabilityKey::NativeSimulations;
+    let definition_digest = camera
+        .capabilities
+        .iter()
+        .find(|capability| capability.key == key)
+        .expect("control")
+        .definition_digest(&camera);
+    let path = "/api/manual-confirmations/fujifilm/x-t5/native_simulations/moderate";
+    for (scope, expected, expected_state) in [
+        (ModeratorFirmwareScope::unspecified(), 1, "contradicted"),
+        (
+            ModeratorFirmwareScope::exact("3.00").expect("scope"),
+            1,
+            "contradicted",
+        ),
+        (
+            ModeratorFirmwareScope::exact("2.10").expect("scope"),
+            0,
+            "moderator_confirmed",
+        ),
+    ] {
+        let moderation = ManualModeration {
+            camera: camera.id.clone(),
+            key,
+            definition_digest,
+            confirmed: true,
+            evidence: ModeratorEvidence {
+                kind: ModeratorEvidenceKind::Physical,
+                url: None,
+                description: "body review".to_owned(),
+                firmware_scope: scope.clone(),
+            },
+        };
+        let body = json!({
+            "definition_digest": definition_digest,
+            "confirmed": true,
+            "evidence": {
+                "kind": "physical",
+                "description": "body review",
+                "firmware_scope": serde_json::to_value(&scope).expect("scope json"),
+            },
+        });
+        let (status, summary) = post_signed_with_token(
+            &mut server,
+            path,
+            &token,
+            "moderate-manual-confirmation",
+            &moderation.canonical_bytes(),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "moderate: {summary}");
+        assert_eq!(
+            summary_control(&summary, "native_simulations")["state"],
+            expected_state
+        );
+        let queue = moderation_queue(&server, &token).await;
+        assert_eq!(
+            queue["manual_conflicts"]
+                .as_array()
+                .expect("conflicts")
+                .len(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn serial_photo_moves_the_newest_answer_into_the_linked_count() {
+    let mut server = TestServer::start().await;
+    let owner_one = server.persist_credential().await;
+    let camera = documented_camera("fujifilm/x-t5");
+    let matching = confirmation_for(&camera, "native_simulations", "2.10");
+    let (status, submitted) = post_standalone_confirmation_response(&mut server, &matching).await;
+    assert_eq!(status, StatusCode::OK, "first: {submitted}");
+    assert_eq!(submitted["receipt"]["owner_linkage"], "unlinked");
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    assert_eq!(
+        summary_control(&summary, "native_simulations")["state"],
+        "owner_reported"
+    );
+
+    insert_serial_contribution(&server.db, "contrib-linked-one", &owner_one, [11; 32]).await;
+    let moved = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&moved, "native_simulations");
+    assert_eq!(control["state"], "owner_reported");
+    assert_eq!(control["agreeing_groups"], 1);
+    let result = &control["firmware"][0];
+    assert_eq!(result["owner_profiles"], 0);
+    assert_eq!(result["reported_profiles"], 1);
+    let options = result["reported_options"].as_array().expect("options");
+    assert_eq!(options.len(), 1, "the answer must not be counted twice");
+    assert_eq!(options[0]["finding"]["kind"], "matches");
+    assert_eq!(options[0]["linked_groups"], 1);
+    assert_eq!(options[0]["owner_profiles"], 0);
+
+    let corrected = confirmation_with(
+        &camera,
+        "native_simulations",
+        "2.10",
+        Finding::Corrected {
+            availability: looklab_schema::Availability::Unavailable,
+            domain: looklab_schema::CapabilityDomain::Unspecified,
+        },
+    );
+    let (status, submitted) = post_standalone_confirmation_response(&mut server, &corrected).await;
+    assert_eq!(status, StatusCode::OK, "linked: {submitted}");
+    assert_eq!(submitted["receipt"]["owner_linkage"], "linked");
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "owner_reported");
+    assert_eq!(control["agreeing_groups"], 1);
+    let result = &control["firmware"][0];
+    assert_eq!(result["owner_profiles"], 0);
+    assert_eq!(result["reported_profiles"], 1);
+    let options = result["reported_options"].as_array().expect("options");
+    assert_eq!(options.len(), 1);
+    assert_eq!(options[0]["finding"]["kind"], "corrected");
+    assert_eq!(options[0]["linked_groups"], 1);
+    assert_eq!(options[0]["owner_profiles"], 0);
+
+    let promotions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE type = 'manual_confirmation_promotion'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("promotion rows");
+    assert_eq!(promotions, 0);
+
+    for (label, serial) in [("linked-two", [12; 32]), ("linked-three", [13; 32])] {
+        let (owner, owner_id) = synced_owner(&server, label.as_bytes(), label).await;
+        insert_serial_contribution(&server.db, &format!("contrib-{label}"), &owner_id, serial)
+            .await;
+        let request = synced_confirmation_request(&server, &owner, &corrected).await;
+        let (status, body) = post_confirmation(&server.app, &request).await;
+        assert_eq!(status, StatusCode::OK, "{label}: {body}");
+    }
+
+    let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["state"], "confirmed");
+    assert_eq!(control["agreeing_groups"], 3);
+    let promotions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE type = 'manual_confirmation_promotion'",
+    )
+    .fetch_one(&server.db)
+    .await
+    .expect("promotion rows");
+    assert_eq!(promotions, 1);
 }
 
 #[tokio::test]
@@ -6282,7 +6680,14 @@ async fn moderator_watermark_separates_later_same_second_checks() {
         .find(|check| check["finding"]["kind"] == "corrected")
         .expect("later corrected check");
     assert_eq!(earlier["status"], "reviewed");
-    assert_eq!(later["status"], "pending");
+    assert_eq!(later["status"], "conflicted");
+    let conflicts = queue["manual_conflicts"].as_array().expect("conflicts");
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0]["firmware"], "2.10");
+    assert_eq!(
+        conflicts[0]["options"].as_array().expect("options").len(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -6325,7 +6730,7 @@ async fn three_linked_owners_count_toward_agreement() {
 }
 
 #[tokio::test]
-async fn moderator_decision_without_watermark_leaves_checks_pending() {
+async fn moderator_decision_without_watermark_counts_agreeing_check() {
     let mut server = TestServer::start().await;
     let credential = server.persist_credential().await;
     let camera = documented_camera("fujifilm/x-t5");
@@ -6386,12 +6791,18 @@ async fn moderator_decision_without_watermark_leaves_checks_pending() {
     let queue = moderation_queue(&server, &token).await;
     let checks = queue["manual_checks"].as_array().expect("manual checks");
     assert_eq!(checks.len(), 1);
-    assert_eq!(checks[0]["status"], "pending");
+    assert_eq!(checks[0]["status"], "counted");
     assert_eq!(checks[0]["owner_linkage"], "unlinked");
+    assert!(
+        queue["manual_conflicts"]
+            .as_array()
+            .expect("conflicts")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
-async fn moderator_scope_leaves_outside_firmware_pending() {
+async fn moderator_scope_leaves_outside_firmware_counted() {
     let mut server = TestServer::start().await;
     server.persist_credential().await;
     let camera = documented_camera("fujifilm/x-t5");
@@ -6459,7 +6870,13 @@ async fn moderator_scope_leaves_outside_firmware_pending() {
         .find(|check| check["firmware"] == "3.00")
         .expect("outside firmware");
     assert_eq!(inside["status"], "reviewed");
-    assert_eq!(outside["status"], "pending");
+    assert_eq!(outside["status"], "counted");
+    assert!(
+        queue["manual_conflicts"]
+            .as_array()
+            .expect("conflicts")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -6561,7 +6978,7 @@ async fn unspecified_moderator_scope_reviews_earlier_checks_only() {
     assert_eq!(status, StatusCode::OK, "moderate: {summary}");
     assert_eq!(
         summary_control(&summary, "native_simulations")["state"],
-        "moderator_confirmed"
+        "owner_reported"
     );
 
     let (later_owner, _) = synced_owner(&server, b"later-unspecified", "Later Owner").await;
@@ -6582,7 +6999,13 @@ async fn unspecified_moderator_scope_reviews_earlier_checks_only() {
         .find(|check| check["firmware"] == "3.00")
         .expect("later check");
     assert_eq!(earlier["status"], "reviewed");
-    assert_eq!(later["status"], "pending");
+    assert_eq!(later["status"], "counted");
+    assert!(
+        queue["manual_conflicts"]
+            .as_array()
+            .expect("conflicts")
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -6668,7 +7091,13 @@ async fn moderator_rejection_reviews_earlier_covered_checks() {
         .find(|check| check["finding"]["kind"] == "corrected")
         .expect("later corrected check");
     assert_eq!(earlier["status"], "reviewed");
-    assert_eq!(later["status"], "pending");
+    assert_eq!(later["status"], "conflicted");
+    let conflicts = queue["manual_conflicts"].as_array().expect("conflicts");
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(
+        conflicts[0]["options"].as_array().expect("options").len(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -6713,7 +7142,7 @@ async fn newer_definition_answer_replaces_the_stale_check() {
     let queue = moderation_queue(&server, &token).await;
     let checks = queue["manual_checks"].as_array().expect("manual checks");
     assert_eq!(checks.len(), 1);
-    assert_eq!(checks[0]["status"], "pending");
+    assert_eq!(checks[0]["status"], "counted");
 }
 
 #[tokio::test]
@@ -6746,15 +7175,25 @@ async fn owner_withdrawal_clears_the_check_from_queue_and_intake() {
     assert_eq!(status, StatusCode::NO_CONTENT, "withdraw: {body}");
 
     let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
-    assert_eq!(
-        summary_control(&summary, "native_simulations")["intake"]["recorded"],
-        0
+    let control = summary_control(&summary, "native_simulations");
+    assert_eq!(control["intake"]["recorded"], 0);
+    assert_eq!(control["state"], "unconfirmed");
+    assert!(
+        control
+            .get("firmware")
+            .is_none_or(|value| { value.as_array().is_none_or(Vec::is_empty) })
     );
     let queue = moderation_queue(&server, &token).await;
     assert!(
         queue["manual_checks"]
             .as_array()
             .expect("manual checks")
+            .is_empty()
+    );
+    assert!(
+        queue["manual_conflicts"]
+            .as_array()
+            .expect("conflicts")
             .is_empty()
     );
 }
@@ -7355,8 +7794,9 @@ async fn same_second_linked_claims_order_by_occurrence_and_tombstone() {
 
     let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
     let control = summary_control(&summary, "native_simulations");
-    assert_eq!(control["state"], "unconfirmed");
+    assert_eq!(control["state"], "owner_reported");
     assert_eq!(control["agreeing_groups"], 2);
+    assert_eq!(control["firmware"][0]["reported_profiles"], 2);
 }
 
 #[tokio::test]
@@ -7401,7 +7841,7 @@ async fn latest_claims_keep_each_reported_firmware_version() {
 }
 
 #[tokio::test]
-async fn fresh_credentials_without_serial_evidence_cannot_form_a_quorum() {
+async fn fresh_credentials_without_serial_evidence_are_owner_reported_not_confirmed() {
     let server = TestServer::start().await;
     let camera = documented_camera("fujifilm/x-t5");
     for index in 0..3u8 {
@@ -7419,8 +7859,9 @@ async fn fresh_credentials_without_serial_evidence_cannot_form_a_quorum() {
     }
     let summary = manual_summary(&server, "Fujifilm", "X-T5").await;
     let control = summary_control(&summary, "native_simulations");
-    assert_eq!(control["state"], "unconfirmed");
+    assert_eq!(control["state"], "owner_reported");
     assert_eq!(control["agreeing_groups"], 0);
+    assert_eq!(control["firmware"][0]["owner_profiles"], 3);
 }
 
 #[tokio::test]
