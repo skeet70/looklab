@@ -10109,7 +10109,10 @@ mod review_tests {
             BlockAcc::new(BlockKind::Tint, vec![globals[1]], layout.total),
         ];
         for (i, block) in blocks.iter_mut().enumerate() {
-            params.theta[globals[i]] = 0.0;
+            // The identity prior is centered on the colorimetric tone mean (docs/02 §4.1).
+            // Start at that center so the prior gradient is zero and the fabricated
+            // gradient alone drives the right-hand side.
+            params.theta[globals[i]] = layout.identity_mean(globals[i]);
             let derivative = (i + 2) as f64;
             block.hessian[0] = derivative * derivative;
             block.full_diagonal[0] = derivative * derivative;
@@ -13269,6 +13272,10 @@ mod lifecycle_tests {
         for index in 0..f.problem.layout.images.start {
             f.params.theta[index] = f.problem.layout.identity_mean(index);
         }
+        // The tone prior is centered on the colorimetric tone, whose coordinates are not
+        // zero, so a tone smoothness penalty has a nonzero gradient there. The fixture
+        // freezes the prior-only objective, whose stationary point is the prior center.
+        f.lambdas.tone = 0.0;
         let (a, b) = f.options.sigma_prior;
         let root = 0.5 * libm::log(b / a);
         for index in 0..f.problem.contributors.len() {
