@@ -51,6 +51,7 @@ fn synth(dir: &Path, seed: &str, images: &str, samples: &str) {
     assert!(stdout.contains("synth"), "{stdout}");
 }
 
+#[cfg(feature = "long-tests")]
 fn fit(dir: &Path, slug: &str, out: &Path) {
     let (stdout, _) = ok({
         let mut command = looklab();
@@ -65,6 +66,7 @@ fn fit(dir: &Path, slug: &str, out: &Path) {
     assert!(out.exists());
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn synthetic_flow_fits_reports_compares_and_attempts_export() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -589,6 +591,7 @@ fn validate_exits_non_zero_and_names_the_file() {
     assert!(stdout.contains("broken.yaml"), "{stdout}");
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn fit_skips_an_undecodable_sample_and_keeps_going() {
     let temp = tempfile::tempdir().expect("tempdir");

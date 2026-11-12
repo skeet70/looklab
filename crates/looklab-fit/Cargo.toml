@@ -11,7 +11,10 @@ publish = false
 default = []
 # `synth` is reused by the trust red-team harness and by report/export tests.
 synth = ["dep:rand_chacha"]
-full-scale = ["synth"]
+# Long recovery cases; ordinary CI runs only tests that finish within 120 s solo.
+long-tests = ["synth"]
+# Full-scale studies run the complete recovery inventory, including the long cases.
+full-scale = ["long-tests"]
 
 [dependencies]
 looklab-body.workspace = true
@@ -37,6 +40,14 @@ required-features = ["full-scale"]
 [[test]]
 name = "sigma_stability"
 required-features = ["full-scale"]
+
+[[test]]
+name = "fit"
+required-features = ["long-tests"]
+
+[[test]]
+name = "uncertainty_study"
+required-features = ["long-tests"]
 
 [lints]
 workspace = true
