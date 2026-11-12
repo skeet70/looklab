@@ -2939,6 +2939,8 @@ fn analytic_attempts(
     let cauchy_params = cauchy_trial.get_or_insert_with(|| params.clone());
     let box_params = box_trial.get_or_insert_with(|| params.clone());
     let cauchy_ray = std::cell::OnceCell::new();
+    let mut analytic_exhausted = false;
+    let mut recorded_analytic_diagnostics = None;
     for attempt in 1..=12 {
         let Some(current_radius) = *radius else {
             return FinalOutcome::Stalled;
@@ -2948,141 +2950,226 @@ fn analytic_attempts(
             return FinalOutcome::Budget;
         }
         let mut analytic_retryable = false;
-        let mut analytic_diagnostics = None;
-        let mut analytic = 'analytic: {
-            // Reserve the Cauchy gradient product, both realized applied-step products and the box product.
-            let outcome = crate::trust_region::solve(
-                gradient,
-                diagonal,
-                current_radius,
-                ANALYTIC_WORK_LIMIT,
-                tolerance,
-                |direction, out| full.apply(direction, out, hessian),
-                |residual, out| {
-                    preconditioner.precondition_full(model, residual, out, reduced, reduced_out)
-                },
-                solver,
-            );
-            let solution = match outcome {
-                Ok(solution) => solution,
-                Err(failure) => {
-                    if fit_diag() {
-                        eprintln!(
-                            "fit stage {stage_index} sweep {sweep_index} analytic solve failed {failure:?} radius {:.3e} attempt {attempt}",
-                            current_radius.get()
+        let mut analytic_diagnostics = recorded_analytic_diagnostics;
+        let mut analytic = None;
+        if !analytic_exhausted {
+            analytic = 'analytic: {
+                // Reserve the Cauchy gradient product, both realized applied-step products and the box product.
+                let outcome = crate::trust_region::solve(
+                    gradient,
+                    diagonal,
+                    current_radius,
+                    ANALYTIC_WORK_LIMIT,
+                    tolerance,
+                    |direction, out| full.apply(direction, out, hessian),
+                    |residual, out| {
+                        preconditioner.precondition_full(model, residual, out, reduced, reduced_out)
+                    },
+                    solver,
+                );
+                let solution = match outcome {
+                    Ok(solution) => solution,
+                    Err(failure) => {
+                        if fit_diag() {
+                            eprintln!(
+                                "fit stage {stage_index} sweep {sweep_index} analytic solve failed {failure:?} radius {:.3e} attempt {attempt}",
+                                current_radius.get()
+                            );
+                        }
+                        analytic_retryable = matches!(
+                            failure,
+                            TrustRegionError::WorkLimit { .. } | TrustRegionError::Breakdown
                         );
+                        break 'analytic None;
                     }
-                    analytic_retryable = matches!(
-                        failure,
-                        TrustRegionError::WorkLimit { .. } | TrustRegionError::Breakdown
-                    );
-                    break 'analytic None;
+                };
+                if solution.termination == TrustRegionTermination::ZeroGradient {
+                    return stationary_outcome(problem, params, pass, options, model, cert_warm)
+                        .unwrap_or(FinalOutcome::Stalled);
                 }
-            };
-            if solution.termination == TrustRegionTermination::ZeroGradient {
-                return stationary_outcome(problem, params, pass, options, model, cert_warm)
-                    .unwrap_or(FinalOutcome::Stalled);
-            }
-            let largest = solution
-                .step
-                .iter()
-                .fold(0.0_f64, |largest, value| largest.max(value.abs()));
-            let scale = if largest > STEP_RADIUS {
-                STEP_RADIUS / largest
-            } else {
-                1.0
-            };
-            analytic_diagnostics = Some(SolveDiagnostics {
-                iterations: solution.iterations,
-                relative_residual: solution.relative_residual,
-                termination: match solution.termination {
-                    TrustRegionTermination::Stationary => "interior",
-                    TrustRegionTermination::Boundary => "boundary",
-                    TrustRegionTermination::NegativeCurvature => "negative",
-                    TrustRegionTermination::ZeroGradient => "zero",
-                },
-                scale,
-            });
-            for (index, value) in solution.step.iter().enumerate() {
-                trial_params.theta[model.globals[index]] =
-                    params.theta[model.globals[index]] + scale * value;
-            }
-            if residual_active {
-                mask.pin(&mut trial_params.theta[layout.residual.clone()]);
-            }
-            for (index, global) in model.globals.iter().enumerate() {
-                effective[index] = trial_params.theta[*global] - params.theta[*global];
-            }
-            let tr_zero = effective.iter().all(|value| *value == 0.0);
-            let tr_eligible = solution.termination != TrustRegionTermination::Stationary
-                || solution.relative_residual <= tolerance;
-            let mut products = 0usize;
-            let tr_prediction = if tr_zero || !tr_eligible {
-                None
-            } else {
-                if let Err(failure) = full.apply(effective, product, hessian) {
-                    if fit_diag() {
-                        eprintln!(
-                            "fit analytic applied-step curvature failed ({}) {failure:?}",
-                            failure.label()
-                        );
-                    }
-                    break 'analytic None;
-                }
-                products += 1;
-                match crate::trust_region::predicted_decrease(gradient, effective, product) {
-                    Some(value) if value > 0.0 => Some(value),
-                    Some(_) => None,
-                    None => break 'analytic None,
-                }
-            };
-            let ray = cauchy_ray.get_or_init(|| {
-                products += 1;
-                full.apply(gradient, cauchy_product, hessian).map(|()| {
-                    crate::trust_region::CauchyRay::new(
-                        gradient,
-                        diagonal,
-                        STEP_RADIUS,
-                        cauchy_product,
-                    )
-                })
-            });
-            let ray = match ray {
-                Ok(ray) => *ray,
-                Err(failure) => {
-                    if fit_diag() {
-                        eprintln!(
-                            "fit analytic Cauchy gradient curvature failed ({}) {failure:?}",
-                            failure.label()
-                        );
-                    }
-                    break 'analytic None;
-                }
-            };
-            let mut cauchy_metric_norm = None;
-            let cauchy_prediction = if let Some(alpha) =
-                ray.and_then(|ray| ray.step_length(current_radius))
-            {
-                for (index, value) in gradient.iter().enumerate() {
-                    cauchy_params.theta[model.globals[index]] =
-                        params.theta[model.globals[index]] - alpha * value;
+                let largest = solution
+                    .step
+                    .iter()
+                    .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+                let scale = if largest > STEP_RADIUS {
+                    STEP_RADIUS / largest
+                } else {
+                    1.0
+                };
+                analytic_diagnostics = Some(SolveDiagnostics {
+                    iterations: solution.iterations,
+                    relative_residual: solution.relative_residual,
+                    termination: match solution.termination {
+                        TrustRegionTermination::Stationary => "interior",
+                        TrustRegionTermination::Boundary => "boundary",
+                        TrustRegionTermination::NegativeCurvature => "negative",
+                        TrustRegionTermination::ZeroGradient => "zero",
+                    },
+                    scale,
+                });
+                for (index, value) in solution.step.iter().enumerate() {
+                    trial_params.theta[model.globals[index]] =
+                        params.theta[model.globals[index]] + scale * value;
                 }
                 if residual_active {
-                    mask.pin(&mut cauchy_params.theta[layout.residual.clone()]);
+                    mask.pin(&mut trial_params.theta[layout.residual.clone()]);
                 }
                 for (index, global) in model.globals.iter().enumerate() {
-                    cauchy_effective[index] = cauchy_params.theta[*global] - params.theta[*global];
+                    effective[index] = trial_params.theta[*global] - params.theta[*global];
                 }
-                if cauchy_effective.iter().all(|value| *value == 0.0) {
+                let tr_zero = effective.iter().all(|value| *value == 0.0);
+                let tr_eligible = solution.termination != TrustRegionTermination::Stationary
+                    || solution.relative_residual <= tolerance;
+                let mut products = 0usize;
+                let tr_prediction = if tr_zero || !tr_eligible {
                     None
                 } else {
-                    let metric_norm = cauchy_effective
+                    if let Err(failure) = full.apply(effective, product, hessian) {
+                        if fit_diag() {
+                            eprintln!(
+                                "fit analytic applied-step curvature failed ({}) {failure:?}",
+                                failure.label()
+                            );
+                        }
+                        break 'analytic None;
+                    }
+                    products += 1;
+                    match crate::trust_region::predicted_decrease(gradient, effective, product) {
+                        Some(value) if value > 0.0 => Some(value),
+                        Some(_) => None,
+                        None => break 'analytic None,
+                    }
+                };
+                let ray = cauchy_ray.get_or_init(|| {
+                    products += 1;
+                    full.apply(gradient, cauchy_product, hessian).map(|()| {
+                        crate::trust_region::CauchyRay::new(
+                            gradient,
+                            diagonal,
+                            STEP_RADIUS,
+                            cauchy_product,
+                        )
+                    })
+                });
+                let ray = match ray {
+                    Ok(ray) => *ray,
+                    Err(failure) => {
+                        if fit_diag() {
+                            eprintln!(
+                                "fit analytic Cauchy gradient curvature failed ({}) {failure:?}",
+                                failure.label()
+                            );
+                        }
+                        break 'analytic None;
+                    }
+                };
+                let mut cauchy_metric_norm = None;
+                let cauchy_prediction = if let Some(alpha) =
+                    ray.and_then(|ray| ray.step_length(current_radius))
+                {
+                    for (index, value) in gradient.iter().enumerate() {
+                        cauchy_params.theta[model.globals[index]] =
+                            params.theta[model.globals[index]] - alpha * value;
+                    }
+                    if residual_active {
+                        mask.pin(&mut cauchy_params.theta[layout.residual.clone()]);
+                    }
+                    for (index, global) in model.globals.iter().enumerate() {
+                        cauchy_effective[index] =
+                            cauchy_params.theta[*global] - params.theta[*global];
+                    }
+                    if cauchy_effective.iter().all(|value| *value == 0.0) {
+                        None
+                    } else {
+                        let metric_norm = cauchy_effective
+                            .iter()
+                            .zip(diagonal.iter())
+                            .fold(0.0, |norm, (step, diagonal)| {
+                                libm::hypot(norm, step * diagonal.sqrt())
+                            });
+                        let largest = cauchy_effective
+                            .iter()
+                            .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+                        let slack = 1.0 + 8.0 * f64::EPSILON;
+                        if metric_norm.is_finite()
+                            && metric_norm <= current_radius.get() * slack
+                            && largest.is_finite()
+                            && largest <= STEP_RADIUS * slack
+                        {
+                            cauchy_metric_norm = Some(metric_norm);
+                            if let Err(failure) =
+                                full.apply(cauchy_effective, cauchy_product, hessian)
+                            {
+                                if fit_diag() {
+                                    eprintln!(
+                                        "fit analytic Cauchy applied-step curvature failed ({}) {failure:?}",
+                                        failure.label()
+                                    );
+                                }
+                                break 'analytic None;
+                            }
+                            products += 1;
+                            match crate::trust_region::predicted_decrease(
+                                gradient,
+                                cauchy_effective,
+                                cauchy_product,
+                            ) {
+                                Some(value) if value > 0.0 => Some(value),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let cauchy_wins = match (tr_prediction, cauchy_prediction) {
+                    (Some(tr), Some(cauchy)) => cauchy > tr,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                let ordinary = if cauchy_wins {
+                    Some(OrdinaryStep::Cauchy)
+                } else if tr_prediction.is_some() {
+                    Some(OrdinaryStep::TrustRegion)
+                } else {
+                    None
+                };
+                let Some(ordinary) = ordinary else {
+                    let zero_step = tr_zero
+                        && solution.predicted_decrease.is_finite()
+                        && solution.predicted_decrease > 0.0
+                        && tr_eligible;
+                    if zero_step
+                        && let Some(outcome) =
+                            stationary_outcome(problem, params, pass, options, model, cert_warm)
+                    {
+                        return outcome;
+                    }
+                    analytic_retryable = !zero_step;
+                    break 'analytic None;
+                };
+                let mut box_prediction = None;
+                let mut box_metric_norm = None;
+                for (index, value) in solution.step.iter().enumerate() {
+                    box_params.theta[model.globals[index]] = params.theta[model.globals[index]]
+                        + (*value).clamp(-STEP_RADIUS, STEP_RADIUS);
+                }
+                if residual_active {
+                    mask.pin(&mut box_params.theta[layout.residual.clone()]);
+                }
+                for (index, global) in model.globals.iter().enumerate() {
+                    box_effective[index] = box_params.theta[*global] - params.theta[*global];
+                }
+                if box_effective[..] != effective[..] {
+                    let metric_norm = box_effective
                         .iter()
                         .zip(diagonal.iter())
                         .fold(0.0, |norm, (step, diagonal)| {
                             libm::hypot(norm, step * diagonal.sqrt())
                         });
-                    let largest = cauchy_effective
+                    let largest = box_effective
                         .iter()
                         .fold(0.0_f64, |largest, value| largest.max(value.abs()));
                     let slack = 1.0 + 8.0 * f64::EPSILON;
@@ -3091,143 +3178,46 @@ fn analytic_attempts(
                         && largest.is_finite()
                         && largest <= STEP_RADIUS * slack
                     {
-                        cauchy_metric_norm = Some(metric_norm);
-                        if let Err(failure) = full.apply(cauchy_effective, cauchy_product, hessian)
-                        {
-                            if fit_diag() {
-                                eprintln!(
-                                    "fit analytic Cauchy applied-step curvature failed ({}) {failure:?}",
-                                    failure.label()
-                                );
-                            }
-                            break 'analytic None;
-                        }
                         products += 1;
-                        match crate::trust_region::predicted_decrease(
-                            gradient,
-                            cauchy_effective,
-                            cauchy_product,
-                        ) {
-                            Some(value) if value > 0.0 => Some(value),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            let cauchy_wins = match (tr_prediction, cauchy_prediction) {
-                (Some(tr), Some(cauchy)) => cauchy > tr,
-                (None, Some(_)) => true,
-                _ => false,
-            };
-            let ordinary = if cauchy_wins {
-                Some(OrdinaryStep::Cauchy)
-            } else if tr_prediction.is_some() {
-                Some(OrdinaryStep::TrustRegion)
-            } else {
-                None
-            };
-            let Some(ordinary) = ordinary else {
-                let zero_step = tr_zero
-                    && solution.predicted_decrease.is_finite()
-                    && solution.predicted_decrease > 0.0
-                    && tr_eligible;
-                if zero_step
-                    && let Some(outcome) =
-                        stationary_outcome(problem, params, pass, options, model, cert_warm)
-                {
-                    return outcome;
-                }
-                analytic_retryable = !zero_step;
-                break 'analytic None;
-            };
-            let mut box_prediction = None;
-            let mut box_metric_norm = None;
-            for (index, value) in solution.step.iter().enumerate() {
-                box_params.theta[model.globals[index]] =
-                    params.theta[model.globals[index]] + (*value).clamp(-STEP_RADIUS, STEP_RADIUS);
-            }
-            if residual_active {
-                mask.pin(&mut box_params.theta[layout.residual.clone()]);
-            }
-            for (index, global) in model.globals.iter().enumerate() {
-                box_effective[index] = box_params.theta[*global] - params.theta[*global];
-            }
-            if box_effective[..] != effective[..] {
-                let metric_norm = box_effective
-                    .iter()
-                    .zip(diagonal.iter())
-                    .fold(0.0, |norm, (step, diagonal)| {
-                        libm::hypot(norm, step * diagonal.sqrt())
-                    });
-                let largest = box_effective
-                    .iter()
-                    .fold(0.0_f64, |largest, value| largest.max(value.abs()));
-                let slack = 1.0 + 8.0 * f64::EPSILON;
-                if metric_norm.is_finite()
-                    && metric_norm <= current_radius.get() * slack
-                    && largest.is_finite()
-                    && largest <= STEP_RADIUS * slack
-                {
-                    products += 1;
-                    match full.apply(box_effective, box_product, hessian) {
-                        Ok(()) => {
-                            if let Some(value) = crate::trust_region::predicted_decrease(
-                                gradient,
-                                box_effective,
-                                box_product,
-                            ) && value > 0.0
-                            {
-                                box_prediction = Some(value);
-                                box_metric_norm = Some(metric_norm);
+                        match full.apply(box_effective, box_product, hessian) {
+                            Ok(()) => {
+                                if let Some(value) = crate::trust_region::predicted_decrease(
+                                    gradient,
+                                    box_effective,
+                                    box_product,
+                                ) && value > 0.0
+                                {
+                                    box_prediction = Some(value);
+                                    box_metric_norm = Some(metric_norm);
+                                }
                             }
-                        }
-                        Err(failure) => {
-                            if fit_diag() {
-                                eprintln!(
-                                    "fit analytic box applied-step curvature failed ({}) {failure:?}",
-                                    failure.label()
-                                );
+                            Err(failure) => {
+                                if fit_diag() {
+                                    eprintln!(
+                                        "fit analytic box applied-step curvature failed ({}) {failure:?}",
+                                        failure.label()
+                                    );
+                                }
                             }
                         }
                     }
                 }
-            }
-            let ordinary_prediction = match ordinary {
-                OrdinaryStep::TrustRegion => tr_prediction,
-                OrdinaryStep::Cauchy => cauchy_prediction,
-            };
-            let box_ranked_first = box_prediction
-                .zip(ordinary_prediction)
-                .is_some_and(|(boxed, ordinary)| boxed > ordinary);
-            let ordinary_params = match ordinary {
-                OrdinaryStep::TrustRegion => &*trial_params,
-                OrdinaryStep::Cauchy => &*cauchy_params,
-            };
-            let Some((mut candidate, mut trial_cost)) = evaluate_trial(
-                stage_problem,
-                problem,
-                stage,
-                ordinary_params,
-                blocks,
-                penalties,
-                lambdas,
-                options,
-                evaluations,
-                sample_evaluations,
-                samples_per_pass,
-            ) else {
-                return FinalOutcome::Budget;
-            };
-            let selected = if box_ranked_first {
-                match evaluate_trial(
+                let ordinary_prediction = match ordinary {
+                    OrdinaryStep::TrustRegion => tr_prediction,
+                    OrdinaryStep::Cauchy => cauchy_prediction,
+                };
+                let box_ranked_first = box_prediction
+                    .zip(ordinary_prediction)
+                    .is_some_and(|(boxed, ordinary)| boxed > ordinary);
+                let ordinary_params = match ordinary {
+                    OrdinaryStep::TrustRegion => &*trial_params,
+                    OrdinaryStep::Cauchy => &*cauchy_params,
+                };
+                let Some((mut candidate, mut trial_cost)) = evaluate_trial(
                     stage_problem,
                     problem,
                     stage,
-                    &*box_params,
+                    ordinary_params,
                     blocks,
                     penalties,
                     lambdas,
@@ -3235,60 +3225,81 @@ fn analytic_attempts(
                     evaluations,
                     sample_evaluations,
                     samples_per_pass,
-                ) {
-                    Some((box_candidate, box_cost)) => {
-                        let applied = guarded_selection(
-                            ordinary,
-                            box_ranked_first,
-                            cost - trial_cost,
-                            cost - box_cost,
-                        );
-                        if applied == AppliedStep::Box {
-                            candidate = box_candidate;
-                            trial_cost = box_cost;
+                ) else {
+                    return FinalOutcome::Budget;
+                };
+                let selected = if box_ranked_first {
+                    match evaluate_trial(
+                        stage_problem,
+                        problem,
+                        stage,
+                        &*box_params,
+                        blocks,
+                        penalties,
+                        lambdas,
+                        options,
+                        evaluations,
+                        sample_evaluations,
+                        samples_per_pass,
+                    ) {
+                        Some((box_candidate, box_cost)) => {
+                            let applied = guarded_selection(
+                                ordinary,
+                                box_ranked_first,
+                                cost - trial_cost,
+                                cost - box_cost,
+                            );
+                            if applied == AppliedStep::Box {
+                                candidate = box_candidate;
+                                trial_cost = box_cost;
+                            }
+                            applied
                         }
-                        applied
+                        None => return FinalOutcome::Budget,
                     }
-                    None => return FinalOutcome::Budget,
+                } else {
+                    ordinary.into()
+                };
+                let (prediction, metric_norm) = match selected {
+                    AppliedStep::TrustRegion => (
+                        tr_prediction.unwrap_or(f64::NAN),
+                        effective
+                            .iter()
+                            .zip(diagonal.iter())
+                            .fold(0.0, |norm, (step, diagonal)| {
+                                libm::hypot(norm, step * diagonal.sqrt())
+                            }),
+                    ),
+                    AppliedStep::Cauchy => (
+                        cauchy_prediction.unwrap_or(f64::NAN),
+                        cauchy_metric_norm.unwrap_or(f64::NAN),
+                    ),
+                    AppliedStep::Box => (
+                        box_prediction.unwrap_or(f64::NAN),
+                        box_metric_norm.unwrap_or(f64::NAN),
+                    ),
+                    AppliedStep::Positive => {
+                        unreachable!("the analytic model selects no positive step")
+                    }
+                };
+                if let Some(diagnostics) = analytic_diagnostics.as_mut() {
+                    diagnostics.iterations = solution.iterations + products;
                 }
-            } else {
-                ordinary.into()
+                Some(AttemptCandidate {
+                    step: selected,
+                    cost: trial_cost,
+                    feasible: !candidate.infeasible,
+                    prediction,
+                    metric_norm,
+                    diagnostics: analytic_diagnostics,
+                    candidate,
+                })
             };
-            let (prediction, metric_norm) = match selected {
-                AppliedStep::TrustRegion => (
-                    tr_prediction.unwrap_or(f64::NAN),
-                    effective
-                        .iter()
-                        .zip(diagonal.iter())
-                        .fold(0.0, |norm, (step, diagonal)| {
-                            libm::hypot(norm, step * diagonal.sqrt())
-                        }),
-                ),
-                AppliedStep::Cauchy => (
-                    cauchy_prediction.unwrap_or(f64::NAN),
-                    cauchy_metric_norm.unwrap_or(f64::NAN),
-                ),
-                AppliedStep::Box => (
-                    box_prediction.unwrap_or(f64::NAN),
-                    box_metric_norm.unwrap_or(f64::NAN),
-                ),
-                AppliedStep::Positive => {
-                    unreachable!("the analytic model selects no positive step")
-                }
-            };
-            if let Some(diagnostics) = analytic_diagnostics.as_mut() {
-                diagnostics.iterations = solution.iterations + products;
+            if analytic.is_none() && !analytic_retryable {
+                analytic_exhausted = true;
+                recorded_analytic_diagnostics = analytic_diagnostics;
             }
-            Some(AttemptCandidate {
-                step: selected,
-                cost: trial_cost,
-                feasible: !candidate.infeasible,
-                prediction,
-                metric_norm,
-                diagnostics: analytic_diagnostics,
-                candidate,
-            })
-        };
+        }
 
         let mut positive_retryable = false;
         let mut positive = match positive_attempt(
@@ -13695,31 +13706,113 @@ mod lifecycle_tests {
 
     #[test]
     fn applied_step_is_the_lower_objective_candidate() {
-        let mut f = fixture(2, 8, true, 0x51a8);
-        perturb(&mut f);
-        let mask = ResidualMask::from_samples(&f.pass.residual_samples);
-        let mut params = f.params.clone();
-        let outcome = run_step(&f, &mut params, &mask, true);
-        assert!(matches!(outcome, FinalOutcome::Accepted(_)));
-        let trace = last_attempt().expect("an accepted attempt was recorded");
-        let analytic = trace.analytic.map(|candidate| RealizedCandidate {
-            step: candidate.step,
-            cost: candidate.cost,
-            feasible: candidate.feasible,
-        });
-        let positive = trace.positive.map(|candidate| RealizedCandidate {
-            step: candidate.step,
-            cost: candidate.cost,
-            feasible: candidate.feasible,
-        });
+        let seeds = [0x51a8u64, 0x51a9, 0x51aa, 0x51ab, 0x51ac, 0x51ad];
+        let perturbations = [
+            (0.7, 0.4, 0.2),
+            (1.0, 0.6, 0.3),
+            (1.3, 0.8, 0.4),
+            (0.4, 0.2, 0.1),
+            (1.6, 0.9, 0.45),
+        ];
+        let mut found = None;
+        'search: for seed in seeds {
+            for (tone, image, clip) in perturbations {
+                let mut f = fixture(2, 8, true, seed);
+                f.params.theta[f.problem.layout.tone_c0] += tone;
+                f.params.theta[f.problem.layout.image(0).start] += image;
+                f.params.theta[f.problem.layout.clip] += clip;
+                f.rebuild();
+                let initial = initial_radius(&f);
+                let mask = ResidualMask::from_samples(&f.pass.residual_samples);
+                let mut params = f.params.clone();
+                let mut radius = Some(initial);
+                let mut positive_radius = Some(initial);
+                let mut evaluations = 0usize;
+                let mut sample_evaluations = SampleEvaluations::default();
+                let outcome = run_step_with(
+                    &f,
+                    &mut params,
+                    &mask,
+                    true,
+                    &f.options,
+                    &mut radius,
+                    &mut positive_radius,
+                    &mut evaluations,
+                    &mut sample_evaluations,
+                );
+                if !matches!(outcome, FinalOutcome::Accepted(_)) {
+                    continue;
+                }
+                let Some(trace) = last_attempt() else {
+                    continue;
+                };
+                let (Some(analytic), Some(positive)) = (trace.analytic, trace.positive) else {
+                    continue;
+                };
+                let analytic_ratio = realized_ratio(trace.cost, analytic.cost, analytic.prediction);
+                let positive_ratio = realized_ratio(trace.cost, positive.cost, positive.prediction);
+                if analytic_ratio == positive_ratio {
+                    continue;
+                }
+                let analytic_expected = adapt_trust_radius(
+                    initial,
+                    analytic_ratio,
+                    analytic.metric_norm,
+                    candidate_passes(
+                        trace.cost,
+                        analytic.cost,
+                        analytic.prediction,
+                        analytic.feasible,
+                    ),
+                );
+                let positive_expected = adapt_trust_radius(
+                    initial,
+                    positive_ratio,
+                    positive.metric_norm,
+                    candidate_passes(
+                        trace.cost,
+                        positive.cost,
+                        positive.prediction,
+                        positive.feasible,
+                    ),
+                );
+                if analytic_expected == positive_expected {
+                    continue;
+                }
+                found = Some((
+                    trace,
+                    radius,
+                    positive_radius,
+                    analytic_expected,
+                    positive_expected,
+                ));
+                break 'search;
+            }
+        }
+        let (trace, radius, positive_radius, analytic_expected, positive_expected) =
+            found.expect("no fixture separates the two gains");
+        let analytic = trace.analytic.expect("analytic candidate");
+        let positive = trace.positive.expect("positive candidate");
         assert_eq!(
             Some(trace.applied),
-            objective_pick(trace.cost, analytic, positive),
+            objective_pick(
+                trace.cost,
+                Some(RealizedCandidate {
+                    step: analytic.step,
+                    cost: analytic.cost,
+                    feasible: analytic.feasible,
+                }),
+                Some(RealizedCandidate {
+                    step: positive.step,
+                    cost: positive.cost,
+                    feasible: positive.feasible,
+                }),
+            ),
             "the applied step was not the objective pick"
         );
         let applied = match trace.applied {
-            AppliedStep::Positive => trace.positive.expect("positive candidate"),
-            _ => trace.analytic.expect("analytic candidate"),
+            AppliedStep::Positive => positive,
+            _ => analytic,
         };
         assert!(
             candidate_passes(
@@ -13729,6 +13822,16 @@ mod lifecycle_tests {
                 applied.feasible
             ),
             "the applied step did not pass its own ratio"
+        );
+        assert_eq!(
+            radius,
+            Some(analytic_expected),
+            "the analytic radius did not use its own gain"
+        );
+        assert_eq!(
+            positive_radius,
+            Some(positive_expected),
+            "the positive radius did not use its own gain"
         );
     }
 
@@ -13766,6 +13869,15 @@ mod lifecycle_tests {
             analytic.cost,
             analytic.prediction,
             analytic.feasible,
+        );
+        assert!(
+            ratio >= 0.25,
+            "the fixture's analytic gain does not distinguish a swapped gain"
+        );
+        assert_ne!(
+            radius,
+            initial.shrink(0.25),
+            "the analytic radius matches the positive failure shrink"
         );
         assert_eq!(
             radius,
