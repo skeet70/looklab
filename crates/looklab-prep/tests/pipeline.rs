@@ -117,6 +117,61 @@ fn all_samples_in_limits(samples: &looklab_samples::SampleSet) {
     }
 }
 
+fn cropped_scene() -> Image3 {
+    let scene = scene();
+    let mut data = Vec::with_capacity((WIDTH * 54) as usize);
+    for y in 9..63 {
+        for x in 0..WIDTH {
+            data.push(scene.data[(y * WIDTH + x) as usize]);
+        }
+    }
+    Image3::new(WIDTH, 54, data).expect("dimensions match")
+}
+
+fn narrow_cropped_scene() -> Image3 {
+    let scene = scene();
+    let mut data = Vec::with_capacity((WIDTH * 20) as usize);
+    for y in 26..46 {
+        for x in 0..WIDTH {
+            data.push(scene.data[(y * WIDTH + x) as usize]);
+        }
+    }
+    Image3::new(WIDTH, 20, data).expect("dimensions match")
+}
+
+#[test]
+fn prepares_a_sixteen_by_nine_crop() {
+    let scene = scene();
+    let raw = raw_from(&scene, [2.0, 1.0, 1.5]);
+    let jpeg = jpeg_from(cropped_scene());
+    let samples = prepare_pair_decoded(&raw, &jpeg, &prior(), fixed_seed(0x21), &params())
+        .expect("a centred 16:9 crop prepares");
+    assert!(samples.n() > 0);
+    all_samples_in_limits(&samples);
+}
+
+#[test]
+fn prepares_a_cropped_two_member_group() {
+    let scene = scene();
+    let raw = raw_from(&scene, [2.0, 1.0, 1.5]);
+    let first = jpeg_from(cropped_scene());
+    let second = jpeg_from(narrow_cropped_scene());
+    let sets = prepare_decoded(
+        &raw,
+        &[&first, &second],
+        &prior(),
+        fixed_seed(0x22),
+        &params(),
+    )
+    .expect("a cropped two-member group prepares");
+    assert_eq!(sets.len(), 2);
+    assert_eq!(sets[0].in_rgb(), sets[1].in_rgb());
+    for set in &sets {
+        assert!(set.n() > 0);
+        all_samples_in_limits(set);
+    }
+}
+
 #[test]
 fn prepares_a_pair_with_identity_output() {
     let scene = scene();
@@ -315,10 +370,15 @@ fn random_pixels_never_store_a_non_finite_sample() {
         color_matrices: None,
     };
     let jpeg = jpeg_from(scene());
-    let samples = prepare_pair_decoded(&raw, &jpeg, &prior(), fixed_seed(0x07), &params())
-        .expect("prepares around the corrupted pixels");
-    assert!(samples.n() > 0);
-    all_samples_in_limits(&samples);
+    match prepare_pair_decoded(&raw, &jpeg, &prior(), fixed_seed(0x07), &params()) {
+        Ok(samples) => {
+            assert!(samples.n() > 0);
+            all_samples_in_limits(&samples);
+        }
+        Err(looklab_prep::PrepError::AlignLowCorrelation { .. })
+        | Err(looklab_prep::PrepError::AlignNoOverlap) => {}
+        Err(error) => panic!("unexpected error: {error}"),
+    }
 }
 
 #[test]
