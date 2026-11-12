@@ -274,7 +274,7 @@ fn toe_series_branch_matches_the_direct_closed_form() {
     let anchor = toe_anchor();
     let limit = looklab_model::neutral_j_prime_max();
     let upper_tone = -libm::log1p(-values.t / limit);
-    for lightness in [22.1, 22.2] {
+    for lightness in [22.05, 22.1, 22.2] {
         let paths = ChromaPaths {
             ucs: Ucs::new(lightness, 0.0, 0.0),
             internal: [0.0, 0.0],
@@ -287,27 +287,27 @@ fn toe_series_branch_matches_the_direct_closed_form() {
         let u = 1.0 - ratio;
         assert!(u < 1e-2, "fixture must hit the series branch: u {u:e}");
         let direct = -libm::log1p(-u) - u - 0.5 * u * u;
-        let scale = direct.abs().max(1.0);
+        let scale = direct.abs().max(1e-300);
         assert!(
-            (observed - direct).abs() / scale < 1e-9,
+            (observed - direct).abs() / scale < 1e-8,
             "lightness {lightness}: {observed:e} vs {direct:e}"
         );
         let index = DomainAxis::Lightness as usize;
         let upper_slope = 1.0 / (limit - lightness);
         let direct_slope = (-1.0 / ratio + 2.0 - ratio) / anchor;
-        let scale = direct_slope.abs().max(1.0);
+        let scale = direct_slope.abs().max(1e-300);
         assert!(
-            (penalty.gradient[index] - upper_slope - direct_slope).abs() / scale < 1e-9,
+            (penalty.gradient[index] - upper_slope - direct_slope).abs() / scale < 1e-8,
             "lightness {lightness}: gradient {} vs {}",
             penalty.gradient[index],
             upper_slope + direct_slope
         );
         let upper_curvature = 1.0 / ((limit - lightness) * (limit - lightness));
         let direct_curvature = (1.0 / (ratio * ratio) - 1.0) / (anchor * anchor);
-        let scale = direct_curvature.abs().max(1.0);
+        let scale = direct_curvature.abs().max(1e-300);
         assert!(
             (penalty.hessian[index][index] - upper_curvature - direct_curvature).abs() / scale
-                < 1e-9,
+                < 1e-8,
             "lightness {lightness}: hessian {} vs {}",
             penalty.hessian[index][index],
             upper_curvature + direct_curvature
