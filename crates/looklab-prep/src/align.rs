@@ -11,6 +11,7 @@
 //! monotone 12-knot tone map on projected RAW intensity
 //! ([docs/03 §2.1](../../../docs/03-data-model.md)).
 
+use looklab_samples::{MAX_RGB, MIN_RGB};
 use serde::{Deserialize, Serialize};
 
 use crate::error::PrepError;
@@ -18,20 +19,9 @@ use crate::image::{AreaDownsample, LinearPixels};
 
 const LUMINANCE: [f64; 3] = [0.2126, 0.7152, 0.0722];
 const TONE_KNOTS: usize = 12;
-/// Square-root weight of the prior that keeps a same-aspect render's per-axis
-/// scales equal. The ratio is unidentifiable when the two frames have the same
-/// aspect, so the seed fixes it; a render with a different aspect leaves the
-/// two scales free.
-fn aspect_prior_weight(aspect_seed: f64) -> f64 {
-    if (aspect_seed - 1.0).abs() < 1e-3 {
-        1e6
-    } else {
-        0.0
-    }
-}
-
-/// Ratio of the JPEG's aspect to the RAW's, the per-axis scale ratio a render
-/// with square pixels and the same field of view has.
+/// Ratio of the JPEG's vertical to horizontal normalized scale implied by the
+/// two pixel grids for square pixels. It seeds the per-axis scale; the ratio
+/// remains free in the fit.
 fn dimension_aspect(jpeg_w: u32, jpeg_h: u32, raw_w: u32, raw_h: u32) -> f64 {
     if jpeg_w > 1 && jpeg_h > 1 && raw_w > 1 && raw_h > 1 {
         let aspect =
@@ -41,6 +31,25 @@ fn dimension_aspect(jpeg_w: u32, jpeg_h: u32, raw_w: u32, raw_h: u32) -> f64 {
         }
     }
     1.0
+}
+
+/// Equal-aspect renders hold equal per-axis scales unless the content moves
+/// them, so a same-aspect pair's ratio is kept at the dimension seed. This is
+/// a prior, not an identifiability claim: the content can still move the ratio.
+fn aspect_prior_weight(aspect_seed: f64) -> f64 {
+    if (aspect_seed - 1.0).abs() < 1e-3 {
+        1e6
+    } else {
+        0.0
+    }
+}
+
+fn valid_pixel(rgb: [f32; 3]) -> bool {
+    rgb.iter().all(|channel| {
+        channel.is_finite()
+            && f64::from(*channel) >= f64::from(MIN_RGB)
+            && f64::from(*channel) <= f64::from(MAX_RGB)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -194,7 +203,7 @@ impl Alignment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn raw_to_jpeg_with(
+    pub(crate) fn raw_to_jpeg_with(
         &self,
         x: f64,
         y: f64,
@@ -507,7 +516,13 @@ fn normalized_luma_with<I: LinearPixels + ?Sized>(
         out.push(
             image
                 .sample_bilinear(x, y)
-                .map(|rgb| photometry.project(rgb))
+                .map(|rgb| {
+                    if valid_pixel(rgb) {
+                        photometry.project(rgb)
+                    } else {
+                        0.0
+                    }
+                })
                 .unwrap_or(0.0),
         );
     }
@@ -777,7 +792,7 @@ fn evaluate_residual<R: LinearPixels + ?Sized>(
     let (max_x, max_y) = (f64::from(raw.width() - 1), f64::from(raw.height() - 1));
     let mut raw_values = Vec::with_capacity(mask.len());
     let mut jpeg_values = Vec::with_capacity(mask.len());
-    let mut indices = Vec::with_capacity(mask.len());
+    let mut valid_flags = Vec::with_capacity(mask.len());
     let (sin, cos) = (
         libm::sin(alignment.rotation_rad),
         libm::cos(alignment.rotation_rad),
@@ -793,31 +808,49 @@ fn evaluate_residual<R: LinearPixels + ?Sized>(
         if x < 0.0 || y < 0.0 || x > max_x || y > max_y {
             return None;
         }
-        let value = raw.sample_bilinear(x, y).map(|rgb| {
-            let radius = libm::hypot(ad, bd);
-            photometry.project_gained(rgb, alignment.gain_at(radius))
-        })?;
-        raw_values.push(value);
-        jpeg_values.push(
-            jpeg_luma
-                .get(index)
-                .copied()
-                .expect("jpeg grid has the base mask's length"),
-        );
-        indices.push(index);
+        let jpeg = jpeg_luma
+            .get(index)
+            .copied()
+            .expect("jpeg grid has the base mask's length");
+        let value = raw
+            .sample_bilinear(x, y)
+            .filter(|rgb| valid_pixel(*rgb))
+            .map(|rgb| {
+                let radius = libm::hypot(ad, bd);
+                photometry.project_gained(rgb, alignment.gain_at(radius))
+            })
+            .filter(|value| value.is_finite() && jpeg.is_finite());
+        let valid = value.is_some();
+        raw_values.push(value.unwrap_or(0.0));
+        jpeg_values.push(jpeg);
+        valid_flags.push(valid);
     }
     if raw_values.len() < 16 {
         return None;
     }
-    let mean_raw = mean(&raw_values);
-    let mean_jpeg = mean(&jpeg_values);
+    let mut count = 0usize;
+    let mut sum_raw = 0.0;
+    let mut sum_jpeg = 0.0;
+    for index in 0..raw_values.len() {
+        if valid_flags[index] {
+            count += 1;
+            sum_raw += raw_values[index];
+            sum_jpeg += jpeg_values[index];
+        }
+    }
+    if count < 16 {
+        return None;
+    }
+    let mean_raw = sum_raw / count as f64;
+    let mean_jpeg = sum_jpeg / count as f64;
     let mut covariance = 0.0;
     let mut variance_raw = 0.0;
     for index in 0..raw_values.len() {
-        let dr = raw_values[index] - mean_raw;
-        let dj = jpeg_values[index] - mean_jpeg;
-        covariance += dr * dj;
-        variance_raw += dr * dr;
+        if valid_flags[index] {
+            let dr = raw_values[index] - mean_raw;
+            covariance += dr * (jpeg_values[index] - mean_jpeg);
+            variance_raw += dr * dr;
+        }
     }
     if variance_raw < 1e-18 {
         return None;
@@ -825,17 +858,16 @@ fn evaluate_residual<R: LinearPixels + ?Sized>(
     let gain = covariance / variance_raw;
     let mut residual = Vec::with_capacity(raw_values.len());
     for index in 0..raw_values.len() {
-        let modelled = mean_jpeg + gain * (raw_values[index] - mean_raw);
-        residual.push(modelled - jpeg_values[index]);
+        if valid_flags[index] {
+            let modelled = mean_jpeg + gain * (raw_values[index] - mean_raw);
+            residual.push(modelled - jpeg_values[index]);
+        } else {
+            residual.push(0.0);
+        }
     }
     let weight = aspect_prior_weight(aspect_seed);
     if weight > 0.0 {
-        let aspect = if alignment.scale.abs() > 1e-12 {
-            alignment.scale_y / alignment.scale
-        } else {
-            aspect_seed
-        };
-        residual.push(weight * (aspect - aspect_seed));
+        residual.push(weight * (aspect_of(*alignment) - aspect_seed));
     }
     Some(residual)
 }
@@ -912,6 +944,9 @@ fn gate_samples<R: LinearPixels + ?Sized>(
         }) else {
             continue;
         };
+        if !value.is_finite() || value < f64::from(MIN_RGB) || value > f64::from(MAX_RGB) {
+            continue;
+        }
         raw_values.push(value);
         jpeg_values.push(jpeg_luma[index]);
     }
@@ -947,9 +982,6 @@ fn pearson_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
 fn rank_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
     if left.len() != right.len() || left.len() < 2 {
         return None;
-    }
-    if left.iter().chain(right).any(|value| !value.is_finite()) {
-        return Some(f64::NAN);
     }
     pearson_correlation(&ranks(left), &ranks(right))
 }
@@ -1078,6 +1110,9 @@ fn fit_photometry<R: LinearPixels + ?Sized>(
         let Some(value) = raw.sample_bilinear(x, y) else {
             continue;
         };
+        if !valid_pixel(value) {
+            continue;
+        }
         let gain = alignment.gain_at(libm::hypot(ad, bd));
         stats.add(
             [
@@ -1120,6 +1155,14 @@ fn add_parameter(alignment: &mut Alignment, parameter: usize, delta: f64) {
         4 => alignment.ty += delta,
         5 => alignment.k1 += delta,
         _ => alignment.k2 += delta,
+    }
+}
+
+fn aspect_of(alignment: Alignment) -> f64 {
+    if alignment.scale.abs() > 1e-12 {
+        alignment.scale_y / alignment.scale
+    } else {
+        1.0
     }
 }
 
@@ -1524,6 +1567,9 @@ fn gain_samples<R: LinearPixels + ?Sized, J: LinearPixels + ?Sized>(
         let Some(raw_pixel) = raw.sample_bilinear(x, y) else {
             continue;
         };
+        if !valid_pixel(raw_pixel) {
+            continue;
+        }
         let raw_luma = photometry.linear(raw_pixel);
         if !raw_luma.is_finite() || raw_luma <= 1e-7 {
             continue;
@@ -1773,6 +1819,10 @@ fn block_residual<R: LinearPixels + ?Sized, J: LinearPixels + ?Sized>(
                     let raw_pixel = raw
                         .pixel((x + px) as u32, (y + py) as u32)
                         .expect("block is inside the image");
+                    if !valid_pixel(raw_pixel) {
+                        valid = false;
+                        break;
+                    }
                     let (jx, jy) = alignment.raw_to_jpeg_with(
                         sx,
                         sy,
@@ -2411,6 +2461,33 @@ mod tests {
     }
 
     #[test]
+    fn anisotropic_raw_to_jpeg_inverts_jpeg_to_raw() {
+        let truth = Alignment {
+            scale: 1.0,
+            scale_y: 505.0 / 599.0,
+            rotation_rad: 0.01,
+            tx: 0.02,
+            ty: -0.015,
+            k1: -0.01,
+            k2: 0.003,
+            ..ground_truth()
+        };
+        let (jpeg_width, jpeg_height) = (900, 506);
+        for y in [0.0, 100.0, 252.5, 505.0] {
+            for x in [0.0, 150.0, 450.0, 899.0] {
+                let (rx, ry) =
+                    truth.jpeg_to_raw(x, y, jpeg_width, jpeg_height, RAW_WIDTH, RAW_HEIGHT);
+                let (jx, jy) =
+                    truth.raw_to_jpeg(rx, ry, RAW_WIDTH, RAW_HEIGHT, jpeg_width, jpeg_height);
+                assert!(
+                    (jx - x).abs() < 1e-6 && (jy - y).abs() < 1e-6,
+                    "({x}, {y}) -> ({rx}, {ry}) -> ({jx}, {jy})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn recovers_geometry_and_gain_from_a_synthetic_pair() {
         let (raw, jpeg) = make_pair(RAW_WIDTH, RAW_HEIGHT, true);
         let alignment = align(&raw, &jpeg, &AlignParams::default()).expect("alignment");
@@ -2636,6 +2713,30 @@ mod tests {
         ]
     }
 
+    fn textured_dark_scene(u: f64, v: f64) -> [f64; 3] {
+        let x = u * (f64::from(RAW_WIDTH - 1) * 0.5);
+        let y = v * (f64::from(RAW_HEIGHT - 1) * 0.5);
+        let mut value = 0.06;
+        for (period, angle, phase) in [
+            (10.0_f64, 0.0_f64, 0.3_f64),
+            (12.0, 0.6, 1.7),
+            (14.0, 1.2, 2.9),
+            (10.5, 1.9, 4.1),
+            (12.5, 2.5, 5.3),
+            (13.5, 3.0, 0.9),
+        ] {
+            let phase = 2.0 * std::f64::consts::PI / period
+                * (libm::cos(angle) * x + libm::sin(angle) * y)
+                + phase;
+            value += 0.008 * libm::sin(phase);
+        }
+        [
+            value.clamp(0.005, 0.12),
+            (value + 0.002 * libm::sin(9.0 * u)).clamp(0.005, 0.12),
+            (value + 0.002 * libm::cos(6.0 * v + 0.7)).clamp(0.005, 0.12),
+        ]
+    }
+
     fn other_dark_scene(u: f64, v: f64) -> [f64; 3] {
         let base = 0.04
             + 0.015 * libm::cos(13.0 * v + 0.2)
@@ -2729,6 +2830,39 @@ mod tests {
         let (naive, _, _) = correlation_at(&raw, &score_luma, &alignment, &u, &v, photometry)
             .expect("linear score");
         assert!(naive < 0.98, "the linear statistic already passes: {naive}");
+    }
+
+    #[test]
+    fn a_dark_rank_gate_rejects_a_shift_and_a_rotation() {
+        let (raw, jpeg) = make_dark_pair(RAW_WIDTH, RAW_HEIGHT, textured_dark_scene, 0x31);
+        let truth = ground_truth();
+        let grid = 192;
+        let (u, v) = normalized_coords(grid, grid);
+        let score_jpeg = AreaDownsample::new(&jpeg, raw.width.saturating_mul(raw.height).max(1));
+        let score_luma = downsampled_luma(&score_jpeg, jpeg.width(), jpeg.height(), grid, grid);
+        let photometry =
+            fit_photometry(&raw, &truth, &u, &v, &score_luma).unwrap_or_else(Photometry::luminance);
+        let (genuine, _, _) = rank_correlation_at(&raw, &score_luma, &truth, &u, &v, photometry)
+            .expect("genuine score");
+        assert!(genuine >= 0.98, "genuine textured pair: {genuine}");
+        let mut shifted = truth;
+        shifted.tx += 6.0 / f64::from(RAW_WIDTH - 1);
+        let (shifted_correlation, _, _) =
+            rank_correlation_at(&raw, &score_luma, &shifted, &u, &v, photometry)
+                .expect("shifted score");
+        assert!(
+            shifted_correlation < 0.98,
+            "a three-pixel shift passes the gate: {shifted_correlation}"
+        );
+        let mut rotated = truth;
+        rotated.rotation_rad += 0.01;
+        let (rotated_correlation, _, _) =
+            rank_correlation_at(&raw, &score_luma, &rotated, &u, &v, photometry)
+                .expect("rotated score");
+        assert!(
+            rotated_correlation < 0.98,
+            "a 0.01 rad rotation passes the gate: {rotated_correlation}"
+        );
     }
 
     #[test]
