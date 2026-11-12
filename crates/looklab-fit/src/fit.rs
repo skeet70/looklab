@@ -15867,4 +15867,36 @@ mod nuisance_curvature_tests {
         assert_eq!(adapt_radius(radius, 1.0, 1.0, true), 4.0);
         assert_eq!(adapt_radius(radius, 0.5, 1.0, false), 2.0);
     }
+
+    #[test]
+    fn an_infeasible_state_marks_its_image_cost_infinite() {
+        let data = dataset(&SynthConfig {
+            images: 2,
+            samples_per_image: 32,
+            ..SynthConfig::default()
+        });
+        let options = FitOptions {
+            fit_residual: false,
+            ..FitOptions::default()
+        };
+        let problem = Problem::new_with(&data.images, None, &options).expect("problem");
+        let mut params = params_from_look(&problem, &data.truth);
+        params.theta[problem.layout.tone_c0] += 1.0e6;
+        let mut blocks = image_blocks(&problem.layout, &problem);
+        let pass = problem.pass(
+            &params,
+            active(),
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::All,
+        );
+        assert!(pass.infeasible);
+        assert!(
+            pass.image_cost.iter().any(|value| value.is_infinite()),
+            "an unusable image must set its own cost to infinity: {:?}",
+            pass.image_cost
+        );
+    }
 }
