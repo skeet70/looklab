@@ -233,20 +233,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     write("unknown-section.llk", assemble(&unknown).0, true, "")?;
 
     let card = read_card(&card33)?;
-    let experimental_sections = split_sections(&experimental)?;
-    let mut bad_status = experimental_sections;
-    let meta_index = bad_status
-        .iter()
-        .position(|(kind, _)| *kind == 1)
-        .expect("experimental card carries META");
-    let status = bad_status[meta_index]
-        .1
-        .windows(b"experimental".len())
-        .position(|window| window == b"experimental")
-        .expect("experimental card carries its status");
-    bad_status[meta_index].1[status..status + b"experimental".len()]
-        .copy_from_slice(b"questionable");
-    write("bad-status.llk", assemble(&bad_status).0, false, "status")?;
     let index = serde_json::json!({
         "format": "looklab-card-conformance/1",
         "files": files

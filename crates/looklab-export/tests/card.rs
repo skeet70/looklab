@@ -77,6 +77,25 @@ fn the_experimental_card_vector_round_trips() {
 }
 
 #[test]
+fn the_experimental_card_flags_probes_by_the_experimental_rule() {
+    let card = read_card(&load("valid/card-experimental.llk")).expect("experimental card");
+    assert!(
+        card.fit().iter().any(|record| record.supported),
+        "an experimental card carries usable FIT records"
+    );
+    let total: f64 = card
+        .fit()
+        .iter()
+        .map(|record| f64::from(record.weight))
+        .sum();
+    assert!((total - 1.0).abs() < 1.0e-5, "weights sum to {total}");
+    for record in card.fit() {
+        assert!(record.supported);
+        assert!(record.sigma <= 1.5);
+    }
+}
+
+#[test]
 fn a_card_status_must_match_the_target_evidence() {
     assert_eq!(card().status(), CardStatus::Qualified);
     let qualified = LookDocument::decode(&load("valid/look.looklab")).expect("document");

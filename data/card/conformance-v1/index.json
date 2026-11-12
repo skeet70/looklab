@@ -119,11 +119,6 @@
       "outcome": "valid",
       "path": "valid/unknown-section.llk",
       "reason": ""
-    },
-    {
-      "outcome": "rejected",
-      "path": "malformed/bad-status.llk",
-      "reason": "status"
     }
   ],
   "format": "looklab-card-conformance/1"

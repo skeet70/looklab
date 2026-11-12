@@ -32,6 +32,11 @@ const LOW_EV: f64 = 12.0;
 const HIGH_EV: f64 = 6.0;
 const PIVOT: f64 = 0.18;
 
+/// The experimental probe rule's σ_ΔE ceiling and density floor (docs/02 §5),
+/// used when a published support mask supports no probe.
+const EXPERIMENTAL_SIGMA: f64 = 1.5;
+const EXPERIMENTAL_DENSITY_FLOOR: f64 = 0.01;
+
 /// Every variant rejects the whole file.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum CardError {
@@ -1066,14 +1071,30 @@ fn neutral_axis(document: &LookDocument) -> Vec<[f32; 3]> {
 fn fit_records(document: &LookDocument) -> Vec<FitRecord> {
     let probes = probes::v1();
     let support = document.uncertainty.support.as_ref();
+    // A native-family target whose published mask supports no probe is the
+    // experimental path: the σ and density predicates choose the FIT records
+    // instead (docs/02 §5).
+    let experimental = document.file.look.kind == LookKind::NativeFamily
+        && support.is_some_and(|mask| mask.values.iter().all(|value| *value <= 0.5));
     let mut records = Vec::with_capacity(probes.probes.len());
     for (index, probe) in probes.probes.iter().enumerate() {
         let input = RgbSpace::Rec2020.xyz_to_rgb_linear(probe.xyz);
         let input = [input.r as f32, input.g as f32, input.b as f32];
         let output = output_rgb(document, probe.xyz);
-        let supported = support
-            .and_then(|mask| mask.values.get(index))
-            .is_some_and(|value| *value == 1.0);
+        let supported = if experimental {
+            let density = document
+                .uncertainty
+                .density
+                .as_ref()
+                .and_then(|density| density.values.get(index).copied())
+                .unwrap_or(f64::INFINITY);
+            f64::from(post_sigma(document, index)) <= EXPERIMENTAL_SIGMA
+                && density >= EXPERIMENTAL_DENSITY_FLOOR
+        } else {
+            support
+                .and_then(|mask| mask.values.get(index))
+                .is_some_and(|value| *value == 1.0)
+        };
         let sigma = if supported {
             post_sigma(document, index)
         } else {
@@ -1245,5 +1266,21 @@ impl Crc32 {
 
     fn finish(&self) -> u32 {
         !self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_meta_status_is_rejected() {
+        let mut meta = Vec::new();
+        push_tlv(&mut meta, 1, b"conformance-tone").expect("slug");
+        push_tlv(&mut meta, 2, b"1.0.0").expect("version");
+        push_tlv(&mut meta, 3, b"Conformance Tone").expect("name");
+        push_tlv(&mut meta, 4, b"Conf Tone").expect("short name");
+        push_tlv(&mut meta, 7, b"questionable").expect("status");
+        assert_eq!(parse_meta(&meta).unwrap_err(), CardError::Meta("status"));
     }
 }

@@ -21,7 +21,7 @@ The generator is deterministic: two fixed synthetic Looks (`valid/look.looklab` 
 | `valid/unknown-section.llk` | The no-grid card plus section kind 77, which readers must skip. |
 | `valid/look.looklab` | The Look document the cards were written from. |
 | `valid/look-experimental.looklab` | The Look document the experimental card was written from: the same Look with an all-zero support mask. |
-| `malformed/*.llk` | One file per rejection rule: truncations, magic, version, header length, file length, header CRC, section CRC, content id, missing section, duplicate section, unsorted table, overlap, out-of-range section, semantics ids, status value, grid side, and non-finite NEUTRAL, FIT and GRID values. |
+| `malformed/*.llk` | One file per rejection rule: truncations, magic, version, header length, file length, header CRC, section CRC, content id, missing section, duplicate section, unsorted table, overlap, out-of-range section, semantics ids, grid side, and non-finite NEUTRAL, FIT and GRID values. |
 | `grid-vectors.json` | Shaped input triples and the expected output under the normative tetrahedral interpolation, evaluated on `valid/card-33.llk`. |
 | `render-tags.json` | Render-tag strings with the parsed fields, or an error marker for strings a parser must reject. |
 
