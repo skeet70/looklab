@@ -1230,6 +1230,7 @@ impl Problem {
                 if !usable {
                     output.infeasible = true;
                     output.cost = f64::INFINITY;
+                    output.image_cost[image] = f64::INFINITY;
                 }
                 if usable && retain_rows && is_hessian {
                     let analytic = matches!(curvature, CurvatureMode::Analytic);
@@ -1242,6 +1243,7 @@ impl Problem {
                             _ => {
                                 output.infeasible = true;
                                 output.cost = f64::INFINITY;
+                                output.image_cost[image] = f64::INFINITY;
                                 continue;
                             }
                         }
