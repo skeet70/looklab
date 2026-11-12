@@ -502,9 +502,9 @@ impl PlateauHistory {
 pub struct FitStateGeneration(pub u32);
 
 impl FitStateGeneration {
-    /// Stable clipped-white composition, fixed per-image retained rows and the two final-stage
-    /// trust-region radii.
-    pub const CURRENT: Self = Self(7);
+    /// Stable clipped-white composition, fixed per-image retained rows, the two final-stage
+    /// trust-region radii and the four-wall domain penalty.
+    pub const CURRENT: Self = Self(8);
 }
 
 /// Everything needed to continue a fit that exhausted its budget.

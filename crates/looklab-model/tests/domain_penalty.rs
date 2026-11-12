@@ -156,6 +156,257 @@ fn mixed_direction_second_difference_matches_the_quadratic_form() {
     assert!(best < 5e-3, "best mixed second-difference error {best:e}");
 }
 
+fn toe_anchor() -> f64 {
+    looklab_model::solve::reference_model()
+        .ucs_j_and_dj_dy(looklab_model::solve::reference_white(), 0.03)
+        .0
+}
+
+fn toe(x: f64, anchor: f64) -> f64 {
+    let ratio = x / anchor;
+    if ratio >= 1.0 {
+        return 0.0;
+    }
+    let u = 1.0 - ratio;
+    -libm::log1p(-u) - u - 0.5 * u * u
+}
+
+fn toe_slope(x: f64, anchor: f64) -> f64 {
+    let ratio = x / anchor;
+    if ratio >= 1.0 {
+        return 0.0;
+    }
+    (-1.0 / ratio + 2.0 - ratio) / anchor
+}
+
+fn toe_curvature(x: f64, anchor: f64) -> f64 {
+    let ratio = x / anchor;
+    if ratio >= 1.0 {
+        return 0.0;
+    }
+    (1.0 / (ratio * ratio) - 1.0) / (anchor * anchor)
+}
+
+fn wall(x: f64, limit: f64, anchor: f64) -> f64 {
+    -libm::log1p(-x / limit) + toe(x, anchor)
+}
+
+#[test]
+fn toe_wall_value_matches_the_closed_form() {
+    let anchor = toe_anchor();
+    let paths = chroma_paths();
+    let limit = looklab_model::neutral_j_prime_max();
+    let base_values = layer_values();
+    let base = evaluate(&base_values, &paths).expect("base point is feasible");
+    for tone in [1.0, 5.0, 10.0, 20.0, 50.0, 80.0, 0.9 * limit] {
+        let mut values = base_values;
+        values.t = tone;
+        let penalty = evaluate(&values, &paths).expect("tone stays feasible");
+        let expected = base.value + wall(tone, limit, anchor) - wall(base_values.t, limit, anchor);
+        let scale = expected.abs().max(penalty.value.abs()).max(1.0);
+        assert!(
+            (penalty.value - expected).abs() / scale < 1e-12,
+            "tone {tone}: {} vs {expected}",
+            penalty.value
+        );
+    }
+    for lightness in [5.0, 10.0, 15.0, 20.0, 30.0, 50.0] {
+        let paths = ChromaPaths {
+            ucs: Ucs::new(lightness, 0.0, 0.0),
+            internal: [0.0, 0.0],
+            blend: 0.5,
+        };
+        let penalty = evaluate(&base_values, &paths).expect("neutral point is feasible");
+        let expected = wall(base_values.t, limit, anchor) + wall(lightness, limit, anchor);
+        let scale = expected.abs().max(penalty.value.abs()).max(1.0);
+        assert!(
+            (penalty.value - expected).abs() / scale < 1e-12,
+            "lightness {lightness}: {} vs {expected}",
+            penalty.value
+        );
+    }
+}
+
+#[test]
+fn toe_wall_derivatives_match_the_closed_form_at_neutral_chroma() {
+    let values = layer_values();
+    let anchor = toe_anchor();
+    let limit = looklab_model::neutral_j_prime_max();
+    for lightness in [10.0, 15.0, 20.0, 50.0] {
+        let paths = ChromaPaths {
+            ucs: Ucs::new(lightness, 0.0, 0.0),
+            internal: [0.0, 0.0],
+            blend: 0.5,
+        };
+        let penalty = evaluate(&values, &paths).expect("neutral point is feasible");
+        for (axis, x) in [
+            (DomainAxis::Tone, values.t),
+            (DomainAxis::Lightness, lightness),
+        ] {
+            let index = axis as usize;
+            let slope = 1.0 / (limit - x) + toe_slope(x, anchor);
+            let scale = slope.abs().max(penalty.gradient[index].abs()).max(1.0);
+            assert!(
+                (penalty.gradient[index] - slope).abs() / scale < 1e-12,
+                "lightness {lightness} {axis:?} gradient {} vs {slope}",
+                penalty.gradient[index]
+            );
+            let upper_curvature = 1.0 / ((limit - x) * (limit - x));
+            let curvature = upper_curvature + toe_curvature(x, anchor);
+            let scale = curvature.abs().max(1.0);
+            assert!(
+                (penalty.hessian[index][index] - curvature).abs() / scale < 1e-12,
+                "lightness {lightness} {axis:?} hessian {} vs {curvature}",
+                penalty.hessian[index][index]
+            );
+            let gn = penalty.gn_hessian[index][index];
+            assert!(
+                gn / scale >= curvature / scale - 1e-12,
+                "lightness {lightness} {axis:?} gn_hessian {gn} lost the wall curvature"
+            );
+        }
+    }
+}
+
+#[test]
+fn toe_series_branch_matches_the_direct_closed_form() {
+    let values = layer_values();
+    let anchor = toe_anchor();
+    let limit = looklab_model::neutral_j_prime_max();
+    let upper_tone = -libm::log1p(-values.t / limit);
+    for lightness in [22.05, 22.1, 22.2] {
+        let paths = ChromaPaths {
+            ucs: Ucs::new(lightness, 0.0, 0.0),
+            internal: [0.0, 0.0],
+            blend: 0.5,
+        };
+        let penalty = evaluate(&values, &paths).expect("neutral point is feasible");
+        let upper_lightness = -libm::log1p(-lightness / limit);
+        let observed = penalty.value - upper_tone - upper_lightness;
+        let ratio = lightness / anchor;
+        let u = 1.0 - ratio;
+        assert!(u < 1e-2, "fixture must hit the series branch: u {u:e}");
+        let direct = -libm::log1p(-u) - u - 0.5 * u * u;
+        let scale = direct.abs().max(1e-300);
+        assert!(
+            (observed - direct).abs() / scale < 1e-8,
+            "lightness {lightness}: {observed:e} vs {direct:e}"
+        );
+        let index = DomainAxis::Lightness as usize;
+        let upper_slope = 1.0 / (limit - lightness);
+        let direct_slope = (-1.0 / ratio + 2.0 - ratio) / anchor;
+        let scale = direct_slope.abs().max(1e-300);
+        assert!(
+            (penalty.gradient[index] - upper_slope - direct_slope).abs() / scale < 1e-8,
+            "lightness {lightness}: gradient {} vs {}",
+            penalty.gradient[index],
+            upper_slope + direct_slope
+        );
+        let upper_curvature = 1.0 / ((limit - lightness) * (limit - lightness));
+        let direct_curvature = (1.0 / (ratio * ratio) - 1.0) / (anchor * anchor);
+        let scale = direct_curvature.abs().max(1e-300);
+        assert!(
+            (penalty.hessian[index][index] - upper_curvature - direct_curvature).abs() / scale
+                < 1e-8,
+            "lightness {lightness}: hessian {} vs {}",
+            penalty.hessian[index][index],
+            upper_curvature + direct_curvature
+        );
+    }
+}
+
+#[test]
+fn toe_lower_wall_blows_up_at_neutral_chroma() {
+    let values = layer_values();
+    let anchor = toe_anchor();
+    let limit = looklab_model::neutral_j_prime_max();
+    let mut previous = f64::NEG_INFINITY;
+    for lightness in [1e-2, 1e-4, 1e-6, 1e-9] {
+        let paths = ChromaPaths {
+            ucs: Ucs::new(lightness, 0.0, 0.0),
+            internal: [0.0, 0.0],
+            blend: 0.5,
+        };
+        let penalty = evaluate(&values, &paths).expect("positive lightness stays feasible");
+        assert!(penalty.value.is_finite());
+        assert!(
+            penalty.value > previous,
+            "lightness {lightness:e}: value {} did not increase from {previous}",
+            penalty.value
+        );
+        let index = DomainAxis::Lightness as usize;
+        let slope = 1.0 / (limit - lightness) + toe_slope(lightness, anchor);
+        let scale = slope.abs().max(1.0);
+        assert!(
+            (penalty.gradient[index] - slope).abs() / scale < 1e-9,
+            "lightness {lightness:e}: gradient {} vs {slope}",
+            penalty.gradient[index]
+        );
+        let curvature =
+            1.0 / ((limit - lightness) * (limit - lightness)) + toe_curvature(lightness, anchor);
+        let scale = curvature.abs().max(1.0);
+        assert!(
+            (penalty.hessian[index][index] - curvature).abs() / scale < 1e-9,
+            "lightness {lightness:e}: hessian {} vs {curvature}",
+            penalty.hessian[index][index]
+        );
+        previous = penalty.value;
+    }
+}
+
+#[test]
+fn toe_wall_blows_up_and_rejects_the_boundary() {
+    let paths = chroma_paths();
+    let anchor = toe_anchor();
+    let limit = looklab_model::neutral_j_prime_max();
+    let mut previous = f64::NEG_INFINITY;
+    for tone in [1e-2, 1e-4, 1e-6, 1e-9] {
+        let mut values = layer_values();
+        values.t = tone;
+        let penalty = evaluate(&values, &paths).expect("positive tone stays feasible");
+        assert!(penalty.value.is_finite());
+        assert!(
+            penalty.value > previous,
+            "tone {tone:e}: value {} did not increase from {previous}",
+            penalty.value
+        );
+        let slope = 1.0 / (limit - tone) + toe_slope(tone, anchor);
+        let scale = slope.abs().max(1.0);
+        assert!(
+            (penalty.gradient[DomainAxis::Tone as usize] - slope).abs() / scale < 1e-9,
+            "tone {tone:e}: gradient {} vs {slope}",
+            penalty.gradient[DomainAxis::Tone as usize]
+        );
+        previous = penalty.value;
+    }
+    let mut values = layer_values();
+    values.t = limit * (1.0 - 1e-9);
+    let penalty = evaluate(&values, &paths).expect("tone below the upper limit is feasible");
+    assert!(
+        penalty.value > 15.0,
+        "upper wall did not blow up: {}",
+        penalty.value
+    );
+    values.t = 0.0;
+    assert!(matches!(
+        evaluate(&values, &paths)
+            .expect_err("zero tone is outside the domain")
+            .kind,
+        DomainViolationKind::ReferenceTone { .. }
+    ));
+    let values = layer_values();
+    let paths = ChromaPaths {
+        ucs: Ucs::new(0.0, 0.0, 0.0),
+        ..chroma_paths()
+    };
+    assert!(matches!(
+        evaluate(&values, &paths)
+            .expect_err("zero lightness is outside the domain")
+            .kind,
+        DomainViolationKind::Lightness { .. }
+    ));
+}
+
 #[test]
 fn neutral_anchor_has_zero_output_chromatic_curvature_and_nonzero_lightness_curvature() {
     let values = layer_values();

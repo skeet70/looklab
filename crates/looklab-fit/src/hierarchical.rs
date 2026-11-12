@@ -163,8 +163,9 @@ pub struct HierInput {
 pub struct HierStateGeneration(pub u32);
 
 impl HierStateGeneration {
-    /// Generation 3: family-scoped firmware keys, frozen retained rows and free/fixed body coordinates.
-    pub const CURRENT: Self = Self(3);
+    /// Generation 4: family-scoped firmware keys, frozen retained rows, free/fixed body
+    /// coordinates and the four-wall domain penalty.
+    pub const CURRENT: Self = Self(4);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
