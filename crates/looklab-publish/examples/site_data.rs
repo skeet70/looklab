@@ -750,10 +750,6 @@ fn sample_match_artifacts(
                     base: names.base,
                     crm: names.crm,
                     covariance: Some(names.covariance),
-                    realization: None,
-                    target: None,
-                    scope: None,
-                    artifacts: Vec::new(),
                 });
             }
             let bundle = MatchBundle::new(body.clone(), epoch.id, sims, excluded)?;
