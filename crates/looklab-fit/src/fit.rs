@@ -1190,7 +1190,9 @@ fn trust_region_step_3(
             return Some((step, predicted(step)));
         }
     }
-    let scale = transformed.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let scale = transformed
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
     if values[0] < 0.0 && transformed[0].abs() <= 1e-12 * scale.max(1.0) {
         let mut direction = [0.0_f64; 3];
         for i in 1..3 {
@@ -1250,8 +1252,7 @@ fn nuisance_prior_cost(
     let exposure = params.theta[range.start] - problem.images[image].exposure_hint;
     let wb_r = params.theta[range.start + 1];
     let wb_b = params.theta[range.start + 2];
-    0.5 * (exposure * exposure
-        / (options.exposure_prior_sd * options.exposure_prior_sd)
+    0.5 * (exposure * exposure / (options.exposure_prior_sd * options.exposure_prior_sd)
         + (wb_r * wb_r + wb_b * wb_b) / (options.wb_prior_sd * options.wb_prior_sd))
 }
 
@@ -1366,8 +1367,7 @@ fn condition_nuisances_inner(
                         + identity[i * n + j];
                     smooth += penalties[index][i * n + j] * params.theta[block.params[j]];
                     prior += identity[i * n + j]
-                        * (params.theta[block.params[j]]
-                            - layout.identity_mean(block.params[j]));
+                        * (params.theta[block.params[j]] - layout.identity_mean(block.params[j]));
                 }
                 hessian[i][i] += prior_curvature[i];
                 gradient[i] += lambda * smooth + prior;
@@ -1425,8 +1425,8 @@ fn condition_nuisances_inner(
         for index in 0..problem.images.len() {
             let base =
                 pass.image_cost[index] + nuisance_prior_cost(&problem, &params, index, options);
-            let trial_image =
-                trial_pass.image_cost[index] + nuisance_prior_cost(&problem, &trial, index, options);
+            let trial_image = trial_pass.image_cost[index]
+                + nuisance_prior_cost(&problem, &trial, index, options);
             let realized = base - trial_image;
             let ratio = if predicted[index] > 1e-12 {
                 realized / predicted[index]
@@ -1467,8 +1467,8 @@ fn condition_nuisances_inner(
             } else {
                 rows = core::mem::take(&mut analytic.coupled_rows);
                 pass = analytic;
-                cost =
-                    pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
+                cost = pass.cost
+                    + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
             }
             let gradient = gradient_max(GradientArgs {
                 layout: &layout,
