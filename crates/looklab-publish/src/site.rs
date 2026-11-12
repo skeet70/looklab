@@ -84,7 +84,8 @@ pub enum PublishedSupport {
     Unstated,
     /// The published mask supports at least one probe.
     Checked,
-    /// The published mask supports no probe; only experimental matching can use it.
+    /// The published mask supports no probe; matching uses the experimental
+    /// probe rule and the version offers an experimental card.
     EarlyEstimate,
 }
 
@@ -162,7 +163,7 @@ impl LookVersionPage {
     ///
     /// A layered native-family target whose published support mask supports no
     /// probe is an early estimate: it stays matchable and previewable, records
-    /// the missing independent check, and offers no firmware card.
+    /// the missing independent check, and offers a card marked experimental.
     pub fn apply_document(&mut self, document: &LookDocument) {
         self.matchable = document.is_matchable();
         self.approximated = document
@@ -179,11 +180,11 @@ impl LookVersionPage {
             Some(_) => PublishedSupport::EarlyEstimate,
             None => PublishedSupport::Unstated,
         };
-        if self.support == PublishedSupport::EarlyEstimate {
-            self.card_eligible = false;
-        }
         let unsupported = document.file.look.kind == LookKind::NativeFamily
             && self.support == PublishedSupport::EarlyEstimate;
+        if self.support == PublishedSupport::EarlyEstimate && !unsupported {
+            self.card_eligible = false;
+        }
         if unsupported {
             // The document refuses an ordinary match, but experimental selection
             // can use it, so the version stays matchable.
@@ -1905,7 +1906,12 @@ mod tests {
         let count = looklab_model::probes::v1().probes.len();
         let mut version = layered_version(true);
         assert!(version.card_eligible, "the card artifact makes it eligible");
-        version.apply_document(&layered_document(Some(vec![0.0; count])));
+        let document = layered_document(Some(vec![0.0; count]));
+        assert_eq!(
+            looklab_export::card_status(&document),
+            Some(looklab_export::CardStatus::Experimental)
+        );
+        version.apply_document(&document);
         assert!(version.matchable);
         assert!(
             version
@@ -1913,7 +1919,10 @@ mod tests {
                 .iter()
                 .any(|artifact| artifact.name.as_str() == crate::manifest::PREVIEW_LUT_ARTIFACT)
         );
-        assert!(!version.card_eligible);
+        assert!(
+            version.card_eligible,
+            "an experimental target keeps its manifested card"
+        );
         assert_eq!(version.support, PublishedSupport::EarlyEstimate);
         assert_eq!(
             version.notes.notice.as_deref(),

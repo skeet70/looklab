@@ -11,6 +11,11 @@
       "reason": ""
     },
     {
+      "outcome": "valid",
+      "path": "valid/card-experimental.llk",
+      "reason": ""
+    },
+    {
       "outcome": "rejected",
       "path": "malformed/truncated-header.llk",
       "reason": "truncated header"
@@ -114,6 +119,11 @@
       "outcome": "valid",
       "path": "valid/unknown-section.llk",
       "reason": ""
+    },
+    {
+      "outcome": "rejected",
+      "path": "malformed/bad-status.llk",
+      "reason": "status"
     }
   ],
   "format": "looklab-card-conformance/1"

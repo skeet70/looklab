@@ -5,7 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(feature = "integration")]
-use looklab_export::card::read_card;
+use looklab_export::card::{CardStatus, read_card};
 #[cfg(feature = "integration")]
 use looklab_fit::synth::LookSelector;
 use looklab_fit::synth::{SynthConfig, SyntheticDataset};
@@ -3911,7 +3911,19 @@ async fn single_group_seed_is_source_limited_and_published() {
     .expect("manifest");
     assert!(artifacts.contains("look.looklab"));
     assert!(artifacts.contains("preview.lut33"));
-    assert!(!artifacts.contains("card.llk"));
+    assert!(
+        artifacts.contains("card.llk"),
+        "an experimental target publishes a card"
+    );
+    let card_bytes = std::fs::read(
+        fixture
+            .site
+            .join("data/looks/classic-chrome/1.0.0/card.llk"),
+    )
+    .expect("card artifact");
+    let card = read_card(&card_bytes).expect("card decodes");
+    assert_eq!(card.status(), CardStatus::Experimental);
+    assert!(card.grid().is_some());
     let look_bytes = std::fs::read(
         fixture
             .site

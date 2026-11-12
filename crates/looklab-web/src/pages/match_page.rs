@@ -882,6 +882,7 @@ fn MatchResult(
     let copy_card = reply.card.clone();
     let save = permalink.clone();
     let card = reply.card.clone();
+    let card_experimental = reply.card.experimental;
     let export_slug = reply.target_slug.to_string();
     let export_version = reply.target_version.to_string();
     let software_href = crate::base::site_url(&format!(
@@ -987,6 +988,17 @@ fn MatchResult(
                 <section class="match-download">
                     <h3>"Card file"</h3>
                     <p>"This is the look's target card, not a camera realization. It does not use this camera's model or settings. Firmware translation is verified separately and is not guaranteed."</p>
+                    {card_experimental.map(|images| view! {
+                        <p class="notice" role="note">
+                            {format!(
+                                "This card is experimental: the target rests on {} {} with no independently checked region yet. ",
+                                images.get(),
+                                if images.get() == 1 { "image" } else { "images" }
+                            )}
+                            <a href=crate::base::site_url("/contribute/wanted")>"Help with a few more shots →"</a>
+                        </p>
+                        <p class="muted">"More independent photos (different scenes) of this film simulation on this camera help."</p>
+                    })}
                     <p>"Use firmware that supports looklab cards. Copy this file to your card’s look folder, then choose it in the firmware’s look menu."</p>
                     <a href=crate::base::site_url("/developers")>
                         "Compatible firmware and installation help"
@@ -1640,6 +1652,7 @@ fn TargetCardDownload(
     let available = RwSignal::new(None::<bool>);
     let scope = RwSignal::new(None::<(looklab_publish::SelectionScope, Vec<String>)>);
     let approximated = RwSignal::new(false);
+    let experimental = RwSignal::new(false);
     let check_slug = slug.clone();
     let check_version = version.clone();
     Effect::new(move |_| {
@@ -1658,6 +1671,8 @@ fn TargetCardDownload(
                             return false;
                         };
                         approximated.set(entry.approximated);
+                        experimental
+                            .set(entry.support == looklab_publish::PublishedSupport::EarlyEstimate);
                         scope.set(Some(crate::selection::catalog_version_scope(
                             look, &version,
                         )));
@@ -1692,12 +1707,20 @@ fn TargetCardDownload(
             <button on:click=move |_| download.run(())>"Download the look's target card (.LLK)"</button>
             <p class="muted">"Verified against the target version manifest. This download does not use a camera realization, control-response model or matching result."</p>
         })}
+        {move || (available.get() == Some(true) && experimental.get()).then(|| view! {
+            <p class="notice" role="note">
+                "This card is experimental: the target is an early estimate with no independently checked region yet. "
+                <a href=crate::base::site_url("/contribute/wanted")>"Help with a few more shots →"</a>
+            </p>
+            <p class="muted">"More independent photos (different scenes) of this film simulation on this camera help."</p>
+            <p class="muted">"An editing-app export is not offered for this target: export validation needs a supported probe, and this target has none yet."</p>
+        })}
         {move || (available.get() == Some(false)).then(|| view! {
             <p class="muted">{if approximated.get() {
                 "No card is offered for this target version: its fitted coefficients approximate a declared base, so it is an experimental approximation rather than the base itself."
             } else {
                 match scope.get() {
-                    Some((looklab_publish::SelectionScope::Experimental, _)) => "No card is offered for this target version: it is an experimental early estimate with no independently checked region yet. More independent photos would make a card available.",
+                    Some((looklab_publish::SelectionScope::Experimental, _)) => "No card is offered for this target version: its published files carry no card.",
                     _ => "This look version has no publishable target card.",
                 }
             }}</p>

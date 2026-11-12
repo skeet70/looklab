@@ -568,7 +568,7 @@ fn experimental_fixture(support: Vec<f64>) -> ExperimentalFixture {
     }
 }
 
-fn run_experimental_cli(fixture: &ExperimentalFixture) -> String {
+fn run_experimental_cli(fixture: &ExperimentalFixture) -> (String, String) {
     let output = looklab()
         .current_dir(fixture.temp.path())
         .arg("match")
@@ -592,7 +592,8 @@ fn run_experimental_cli(fixture: &ExperimentalFixture) -> String {
         output.status.success(),
         "command failed\nstdout: {stdout}\nstderr: {stderr}"
     );
-    std::fs::read_to_string(&fixture.permalink).expect("permalink")
+    let permalink = std::fs::read_to_string(&fixture.permalink).expect("permalink");
+    (permalink, stdout)
 }
 
 fn run_experimental_cli_without_selection(fixture: &ExperimentalFixture) -> std::process::Output {
@@ -663,7 +664,11 @@ fn experimental_inputs(fixture: &ExperimentalFixture) -> MatchInputs {
 #[test]
 fn an_empty_support_mask_matches_experimentally_in_the_cli_and_the_browser() {
     let fixture = experimental_fixture(vec![0.0; looklab_model::probes::v1().probes.len()]);
-    let cli_permalink = run_experimental_cli(&fixture);
+    let (cli_permalink, stdout) = run_experimental_cli(&fixture);
+    assert!(
+        stdout.contains("support: experimental estimate resting on"),
+        "{stdout}"
+    );
     assert!(
         cli_permalink.contains("|selection=experimental"),
         "{cli_permalink}"
@@ -720,5 +725,5 @@ fn a_support_mask_is_used_even_when_experimental_selection_is_requested() {
         native.card.experimental, None,
         "a non-empty published mask is not the experimental fallback"
     );
-    assert_eq!(run_experimental_cli(&fixture), native.permalink);
+    assert_eq!(run_experimental_cli(&fixture).0, native.permalink);
 }

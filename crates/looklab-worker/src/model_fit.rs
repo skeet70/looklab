@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use looklab_body::{Cct, Delta6, InputTransform, TransformVersion};
-use looklab_export::card::{CardMeta, CardOptions, write_card};
+use looklab_export::card::{CardMeta, CardOptions, card_status, write_card};
 use looklab_export::checked_appearance;
 use looklab_fit::gauge::{ComponentGauge, WbModeClass};
 use looklab_fit::hierarchical::{
@@ -5863,11 +5863,15 @@ async fn publish_target(
             role: ArtifactRole::Preview,
         },
     ];
-    if document.is_matchable() {
+    if let Some(status) = card_status(document) {
         let card = store_artifact(
             config,
             CARD_ARTIFACT,
-            &write_card(document, &card_meta(&plan.family), &CardOptions::default())?,
+            &write_card(
+                document,
+                &card_meta(&plan.family).with_status(status),
+                &CardOptions::default(),
+            )?,
         )?;
         bindings.push(ArtifactBinding {
             sha256: Sha256Hex::parse(&card.sha256)

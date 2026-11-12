@@ -683,7 +683,17 @@ fn card_inspect_and_eval_read_the_conformance_card() {
     assert!(stdout.contains("magic LLCF"), "{stdout}");
     assert!(stdout.contains("content id: "), "{stdout}");
     assert!(stdout.contains("slug: conformance-tone"), "{stdout}");
+    assert!(stdout.contains("status: qualified"), "{stdout}");
     assert!(stdout.contains("grid: 33^3"), "{stdout}");
+
+    let experimental = workspace().join("data/card/conformance-v1/valid/card-experimental.llk");
+    let (stdout, _) = ok({
+        let mut command = looklab();
+        command.args(["card", "inspect"]).arg(&experimental);
+        command
+    });
+    assert!(stdout.contains("status: experimental"), "{stdout}");
+    assert!(stdout.contains("slug: conformance-tone"), "{stdout}");
 
     let (stdout, _) = ok({
         let mut command = looklab();

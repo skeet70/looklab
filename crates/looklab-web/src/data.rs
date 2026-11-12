@@ -669,6 +669,12 @@ pub async fn export_target(
     if !summary.matchable {
         return Err("This target version is not eligible for a software export.".to_owned());
     }
+    if summary.support == looklab_publish::PublishedSupport::EarlyEstimate {
+        return Err(
+            "This target is an experimental early estimate with no supported probe, so a software export cannot be validated."
+                .to_owned(),
+        );
+    }
     if !summary.permits_new_outputs() {
         return Err(
             "This target version is no longer applicable. This export is unavailable.".to_owned(),

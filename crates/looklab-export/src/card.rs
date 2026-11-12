@@ -6,7 +6,7 @@ use looklab_color::RgbSpace;
 use looklab_color::cam16::{Cam16Model, ViewingConditions};
 use looklab_color::ucs::{UcsSpace, ucs_to_jmh};
 use looklab_color::{Illuminant, Rgb, Xyz};
-use looklab_model::file::{LookIdentity, LookVersion, Slug, WbPolicy as LookWbPolicy};
+use looklab_model::file::{LookIdentity, LookKind, LookVersion, Slug, WbPolicy as LookWbPolicy};
 use looklab_model::probes;
 use looklab_model::{LookDocument, MatchRefusal};
 use sha2::{Digest, Sha256};
@@ -122,6 +122,26 @@ impl Semantics {
     };
 }
 
+/// Whether a card's target has an independently checked region.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CardStatus {
+    /// The target's published support mask supports at least one probe.
+    #[default]
+    Qualified,
+    /// The target's published support mask supports no probe, so the card is
+    /// offered for experimental use only (docs/04 §8).
+    Experimental,
+}
+
+impl CardStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Qualified => "qualified",
+            Self::Experimental => "experimental",
+        }
+    }
+}
+
 /// META fields other than slug and version, which come from the Look identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CardMeta {
@@ -129,6 +149,7 @@ pub struct CardMeta {
     pub short_name: String,
     pub description: Option<String>,
     pub license: Option<String>,
+    pub status: CardStatus,
 }
 
 impl CardMeta {
@@ -138,6 +159,7 @@ impl CardMeta {
             short_name: short_name.into(),
             description: None,
             license: None,
+            status: CardStatus::Qualified,
         }
     }
 
@@ -150,6 +172,11 @@ impl CardMeta {
         self.license = Some(license.into());
         self
     }
+
+    pub fn with_status(mut self, status: CardStatus) -> Self {
+        self.status = status;
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +187,7 @@ pub struct Meta {
     pub short_name: String,
     pub description: Option<String>,
     pub license: Option<String>,
+    pub status: CardStatus,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +321,10 @@ impl Card {
         &self.meta
     }
 
+    pub fn status(&self) -> CardStatus {
+        self.meta.status
+    }
+
     pub fn semantics(&self) -> &Semantics {
         &self.semantics
     }
@@ -395,15 +427,42 @@ impl Card {
     }
 }
 
+/// The status a card may carry for this document, or `None` when the document
+/// cannot have a card.
+///
+/// A native-family document whose published support mask supports no probe is
+/// the experimental target path: its card states that no region is checked yet.
+pub fn card_status(document: &LookDocument) -> Option<CardStatus> {
+    match document.match_refusal() {
+        None => Some(CardStatus::Qualified),
+        Some(MatchRefusal::Unsupported) if document.file.look.kind == LookKind::NativeFamily => {
+            Some(CardStatus::Experimental)
+        }
+        Some(_) => None,
+    }
+}
+
 /// # Errors
-/// Rejects out-of-range metadata, a non-adaptive or non-matchable look, or non-finite values.
+/// Rejects out-of-range metadata, a non-adaptive or non-matchable look, a status
+/// that does not match the document's evidence, or non-finite values.
 pub fn write_card(
     document: &LookDocument,
     meta: &CardMeta,
     options: &CardOptions,
 ) -> Result<Vec<u8>, CardError> {
-    if let Some(refusal) = document.match_refusal() {
-        return Err(CardError::NotMatchable(refusal));
+    match card_status(document) {
+        None => {
+            return Err(match document.match_refusal() {
+                Some(refusal) => CardError::NotMatchable(refusal),
+                None => CardError::Meta("card status"),
+            });
+        }
+        Some(expected) if expected != meta.status => {
+            return Err(CardError::Meta(
+                "card status does not match the target's evidence",
+            ));
+        }
+        Some(_) => {}
     }
     if document.file.look.wb_policy != LookWbPolicy::Adaptive {
         return Err(CardError::Meta("wb_policy is not adaptive"));
@@ -560,6 +619,9 @@ fn encode_meta(identity: &LookIdentity, meta: &CardMeta) -> Result<Vec<u8>, Card
     }
     if let Some(license) = &meta.license {
         push_tlv(&mut out, 6, license.as_bytes())?;
+    }
+    if meta.status != CardStatus::Qualified {
+        push_tlv(&mut out, 7, meta.status.as_str().as_bytes())?;
     }
     Ok(out)
 }
@@ -751,6 +813,7 @@ fn parse_meta(bytes: &[u8]) -> Result<Meta, CardError> {
     let mut short_name = None;
     let mut description = None;
     let mut license = None;
+    let mut status = None;
     while cursor < bytes.len() {
         if bytes.len() - cursor < 3 {
             return Err(CardError::Section("META", "truncated TLV record"));
@@ -836,6 +899,16 @@ fn parse_meta(bytes: &[u8]) -> Result<Meta, CardError> {
                 }
                 license = Some(text.to_owned());
             }
+            7 => {
+                if status.is_some() {
+                    return Err(CardError::Section("META", "duplicate status"));
+                }
+                status = Some(match data {
+                    b"qualified" => CardStatus::Qualified,
+                    b"experimental" => CardStatus::Experimental,
+                    _ => return Err(CardError::Meta("status")),
+                });
+            }
             _ => {}
         }
     }
@@ -846,6 +919,7 @@ fn parse_meta(bytes: &[u8]) -> Result<Meta, CardError> {
         short_name: short_name.ok_or(CardError::Section("META", "missing short name"))?,
         description,
         license,
+        status: status.unwrap_or_default(),
     })
 }
 

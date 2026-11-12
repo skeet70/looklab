@@ -7,7 +7,7 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 
-use looklab_export::card::{CardMeta, CardOptions, read_card, write_card};
+use looklab_export::card::{CardMeta, CardOptions, CardStatus, read_card, write_card};
 use looklab_model::file::{LookIdentity, LookKind, WbPolicy};
 use looklab_model::look::Look;
 use looklab_model::{LookDocument, ProbeScalars, UncertaintyData};
@@ -22,7 +22,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(dir.join("valid"))?;
     fs::create_dir_all(dir.join("malformed"))?;
 
-    let document = conformance_document()?;
+    let count = looklab_model::probes::V1_PROBE_COUNT;
+    let document = conformance_document(
+        (0..count)
+            .map(|index| if index % 3 == 0 { 0.0 } else { 1.0 })
+            .collect(),
+    )?;
     let meta = card_meta();
     fs::write(dir.join("valid/look.looklab"), document.encode()?)?;
 
@@ -31,6 +36,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::write(dir.join("valid/card-33.llk"), &card33)?;
     fs::write(dir.join("valid/card-no-grid.llk"), &no_grid)?;
 
+    let experimental_document = conformance_document(vec![0.0; count])?;
+    fs::write(
+        dir.join("valid/look-experimental.looklab"),
+        experimental_document.encode()?,
+    )?;
+    let experimental = write_card(
+        &experimental_document,
+        &meta.clone().with_status(CardStatus::Experimental),
+        &CardOptions::default(),
+    )?;
+    fs::write(dir.join("valid/card-experimental.llk"), &experimental)?;
+
     let sections = split_sections(&no_grid)?;
     let (valid_bytes, entries) = assemble(&sections);
     debug_assert_eq!(valid_bytes, no_grid);
@@ -38,6 +55,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut files: Vec<(String, bool, &'static str)> = vec![
         ("valid/card-33.llk".to_string(), true, ""),
         ("valid/card-no-grid.llk".to_string(), true, ""),
+        ("valid/card-experimental.llk".to_string(), true, ""),
     ];
     let mut write = |name: &str,
                      bytes: Vec<u8>,
@@ -215,6 +233,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     write("unknown-section.llk", assemble(&unknown).0, true, "")?;
 
     let card = read_card(&card33)?;
+    let experimental_sections = split_sections(&experimental)?;
+    let mut bad_status = experimental_sections;
+    let meta_index = bad_status
+        .iter()
+        .position(|(kind, _)| *kind == 1)
+        .expect("experimental card carries META");
+    let status = bad_status[meta_index]
+        .1
+        .windows(b"experimental".len())
+        .position(|window| window == b"experimental")
+        .expect("experimental card carries its status");
+    bad_status[meta_index].1[status..status + b"experimental".len()]
+        .copy_from_slice(b"questionable");
+    write("bad-status.llk", assemble(&bad_status).0, false, "status")?;
     let index = serde_json::json!({
         "format": "looklab-card-conformance/1",
         "files": files
@@ -240,7 +272,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn conformance_document() -> Result<LookDocument, Box<dyn Error>> {
+fn conformance_document(support_values: Vec<f64>) -> Result<LookDocument, Box<dyn Error>> {
     let mut look = Look::colorimetric_spline()?;
     for (index, coefficient) in look
         .color
@@ -270,11 +302,8 @@ fn conformance_document() -> Result<LookDocument, Box<dyn Error>> {
     )?;
     let mut document = LookDocument::from_look(identity, look)?;
     let count = looklab_model::probes::V1_PROBE_COUNT;
-    let support = ProbeScalars::new(
-        (0..count)
-            .map(|index| if index % 3 == 0 { 0.0 } else { 1.0 })
-            .collect(),
-    )?;
+    assert_eq!(support_values.len(), count);
+    let support = ProbeScalars::new(support_values)?;
     let sigma = ProbeScalars::new(
         (0..count)
             .map(|index| 0.05 + 0.01 * (index % 7) as f64)

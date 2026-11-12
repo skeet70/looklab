@@ -8,7 +8,8 @@ use looklab_color::cam16::{Cam16Model, ViewingConditions};
 use looklab_color::ucs::{UcsSpace, ucs_to_jmh};
 use looklab_color::{Illuminant, Rgb, RgbSpace};
 use looklab_export::card::{
-    Card, CardError, CardMeta, CardOptions, GridSide, read_card, write_card,
+    Card, CardError, CardMeta, CardOptions, CardStatus, GridSide, card_status, read_card,
+    write_card,
 };
 use looklab_export::quantize::{f16_bits, f16_value};
 use looklab_model::probes;
@@ -59,6 +60,56 @@ fn the_writer_is_deterministic_for_one_version() {
     assert_eq!(no_grid, load("valid/card-no-grid.llk"));
 }
 
+#[test]
+fn the_experimental_card_vector_round_trips() {
+    let document =
+        LookDocument::decode(&load("valid/look-experimental.looklab")).expect("document");
+    assert_eq!(card_status(&document), Some(CardStatus::Experimental));
+    let reference = read_card(&load("valid/card-experimental.llk")).expect("experimental card");
+    assert_eq!(reference.status(), CardStatus::Experimental);
+    let written = write_card(
+        &document,
+        &meta_of(reference.meta()),
+        &CardOptions::with_grid(reference.grid().map(|grid| grid.side())),
+    )
+    .expect("card");
+    assert_eq!(written, load("valid/card-experimental.llk"));
+}
+
+#[test]
+fn a_card_status_must_match_the_target_evidence() {
+    assert_eq!(card().status(), CardStatus::Qualified);
+    let qualified = LookDocument::decode(&load("valid/look.looklab")).expect("document");
+    assert_eq!(card_status(&qualified), Some(CardStatus::Qualified));
+    let meta = meta_of(card().meta());
+    assert_eq!(
+        write_card(
+            &qualified,
+            &meta.clone().with_status(CardStatus::Experimental),
+            &CardOptions::default(),
+        ),
+        Err(CardError::Meta(
+            "card status does not match the target's evidence"
+        ))
+    );
+    let experimental =
+        LookDocument::decode(&load("valid/look-experimental.looklab")).expect("document");
+    assert_eq!(
+        write_card(&experimental, &meta, &CardOptions::default()),
+        Err(CardError::Meta(
+            "card status does not match the target's evidence"
+        ))
+    );
+}
+
+#[test]
+fn a_lut_defined_target_with_no_supported_probe_has_no_card_status() {
+    let mut document =
+        LookDocument::decode(&load("valid/look-experimental.looklab")).expect("document");
+    document.file.look.kind = looklab_model::file::LookKind::LutDefined;
+    assert_eq!(card_status(&document), None);
+}
+
 fn meta_of(meta: &looklab_export::card::Meta) -> CardMeta {
     let mut out = CardMeta::new(meta.name.clone(), meta.short_name.clone());
     if let Some(description) = &meta.description {
@@ -67,7 +118,7 @@ fn meta_of(meta: &looklab_export::card::Meta) -> CardMeta {
     if let Some(license) = &meta.license {
         out = out.with_license(license.clone());
     }
-    out
+    out.with_status(meta.status)
 }
 
 #[test]
