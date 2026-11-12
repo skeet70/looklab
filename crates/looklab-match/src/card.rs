@@ -4,6 +4,7 @@ use core::fmt;
 
 use looklab_color::Xyz;
 use looklab_color::ucs::{Ucs, delta_e_ucs};
+use looklab_model::file::BaseReference;
 use looklab_model::realization::{Realization, Settings};
 use looklab_model::{LayerValues, Look, LookInput, ProbeSet};
 use looklab_report::compare::LookFunction;
@@ -129,6 +130,10 @@ pub struct SettingsCard {
     /// Set when the target's published support mask supported nothing and the
     /// sigma and density predicates chose the probes.
     pub experimental: Option<ImageCount>,
+    /// Set when the target's fitted coefficients approximate a declared base.
+    pub approximated_base: Option<String>,
+    /// Set when the destination realization excludes or approximates the target.
+    pub destination_scope: Option<String>,
 }
 
 impl SettingsCard {
@@ -138,6 +143,14 @@ impl SettingsCard {
         match &self.output {
             Some(context) => out.push_str(&format!("output: {}\n", context.canonical())),
             None => out.push_str("output: not rendered\n"),
+        }
+        if let Some(base) = &self.approximated_base {
+            out.push_str(&format!(
+                "approximation: the settings approximate the declared base {base}\n"
+            ));
+        }
+        if let Some(scope) = &self.destination_scope {
+            out.push_str(&format!("destination realization: {scope}\n"));
         }
         for entry in &self.entries {
             out.push_str(&format!("  {}: {}", entry.key, entry.value));
@@ -436,7 +449,24 @@ pub fn settings_card_with_support(
         missed,
         confidence,
         experimental,
+        approximated_base: None,
+        destination_scope: None,
     })
+}
+
+/// The plain label a settings card uses for a declared base.
+pub fn base_label(base: &BaseReference) -> String {
+    match base {
+        BaseReference::Look { slug, version } => {
+            format!("{}@{}", slug.as_str(), version.as_str())
+        }
+        BaseReference::FamilyRendering {
+            maker, rendering, ..
+        } => {
+            format!("{maker} {rendering}")
+        }
+        BaseReference::BodyRealization { body, .. } => body.as_str().to_owned(),
+    }
 }
 
 struct RealizedFunction<'a> {

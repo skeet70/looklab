@@ -1043,6 +1043,14 @@ fn recipe_text(
         )),
         None => text.push_str("Historical pre-clip recipe: no output encoding recorded.\n"),
     }
+    if let Some(base) = &card.approximated_base {
+        text.push_str(&format!(
+            "Approximation: the settings approximate the declared base {base}.\n"
+        ));
+    }
+    if let Some(scope) = &card.destination_scope {
+        text.push_str(&format!("Destination realization: {scope}.\n"));
+    }
     text.push_str(&format!(
         "Reachability: {}\n",
         reachability_text(&card.reachability)

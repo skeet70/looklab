@@ -326,11 +326,13 @@ pub async fn inputs_for_camera(request: MatchRequest<'_>) -> Result<ScopedInputs
     } else {
         SelectionScope::Experimental
     };
+    let excluded = excluded_sims(&manifest);
+    let destination = destination_scope(scope, &excluded);
     Ok(ScopedInputs {
         inputs: MatchInputs {
             target_look: artifact(version, "look.looklab")?.to_vec(),
             sims,
-            excluded: excluded_sims(&manifest),
+            excluded,
             body_yaml: String::from_utf8(body_yaml)
                 .map_err(|_| "Camera settings are unreadable.".to_owned())?,
             transform_yaml: Some(transform_yaml),
@@ -358,6 +360,8 @@ pub async fn inputs_for_camera(request: MatchRequest<'_>) -> Result<ScopedInputs
             }),
             metric: ScoringMetric::RenderedPostClipV1,
             output_encoding: Some(output_encoding),
+            approximated_base: approximated_base(version),
+            destination_scope: destination,
         },
         scope,
         blockers,
@@ -407,6 +411,41 @@ async fn bundle_file(
         ));
     }
     Ok(bytes)
+}
+
+fn approximated_base(version: &LoadedVersion) -> Option<String> {
+    match &version.content {
+        crate::data::VersionContent::Layered(layered) => layered
+            .document
+            .file
+            .definition
+            .as_ref()
+            .and_then(|definition| definition.declared_base.as_ref())
+            .map(crate::data::base_label),
+        crate::data::VersionContent::SourcePreview(_) => None,
+    }
+}
+
+fn destination_scope(scope: SelectionScope, excluded: &[ExcludedSim]) -> Option<String> {
+    let mut parts = Vec::new();
+    match scope {
+        SelectionScope::Qualified => {}
+        SelectionScope::Experimental => {
+            parts.push("the camera realization is experimental".to_owned());
+        }
+        SelectionScope::Unassessed => {
+            parts.push("the camera realization is unassessed".to_owned());
+        }
+    }
+    if !excluded.is_empty() {
+        let sims = excluded
+            .iter()
+            .map(|entry| entry.sim.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("the camera bundle excludes {sims}"));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 fn excluded_sims(manifest: &MatchBundleRevision) -> Vec<ExcludedSim> {
@@ -790,11 +829,13 @@ async fn scoped_inputs_from_permalink(
         looklab_match::SelectionMode::Qualified => SelectionScope::Qualified,
         looklab_match::SelectionMode::Experimental => SelectionScope::Experimental,
     };
+    let excluded = excluded_sims(&manifest);
+    let destination = destination_scope(scope, &excluded);
     Ok(ScopedInputs {
         inputs: MatchInputs {
             target_look: artifact(&target, "look.looklab")?.to_vec(),
             sims,
-            excluded: excluded_sims(&manifest),
+            excluded,
             body_yaml: String::from_utf8(body_yaml)
                 .map_err(|_| "Camera settings are unreadable.".to_owned())?,
             input_transform_version: looklab_wasm::match_api::transform_version(&transform_yaml)
@@ -820,6 +861,8 @@ async fn scoped_inputs_from_permalink(
             }),
             metric: permalink.metric,
             output_encoding: permalink.output.map(|context| context.camera.encoding),
+            approximated_base: approximated_base(&target),
+            destination_scope: destination,
         },
         scope,
         blockers: notices,
@@ -903,6 +946,7 @@ async fn legacy_inputs_for_camera(
             firmware: None,
         });
     }
+    let destination = destination_scope(SelectionScope::Unassessed, &bundle.excluded);
     Ok(MatchInputs {
         target_look: artifact(version, "look.looklab")?.to_vec(),
         sims,
@@ -924,6 +968,8 @@ async fn legacy_inputs_for_camera(
         selection: None,
         metric: ScoringMetric::LegacyPreClipV1,
         output_encoding: None,
+        approximated_base: approximated_base(version),
+        destination_scope: destination,
     })
 }
 
@@ -1069,6 +1115,7 @@ async fn legacy_inputs_from_permalink(
             firmware: None,
         });
     }
+    let destination = destination_scope(SelectionScope::Unassessed, &bundle.excluded);
     Ok((
         MatchInputs {
             target_look: target_look.to_vec(),
@@ -1090,6 +1137,8 @@ async fn legacy_inputs_from_permalink(
             selection: None,
             metric: permalink.metric,
             output_encoding: permalink.output.map(|context| context.camera.encoding),
+            approximated_base: approximated_base(&target),
+            destination_scope: destination,
         },
         target.manifest.camera_model_provenance(),
         target.manifest.version.clone(),

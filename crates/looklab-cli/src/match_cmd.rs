@@ -309,8 +309,18 @@ pub fn run_match(args: &MatchArgs) -> Result<()> {
             suggestion.p95_delta_e
         );
     }
-    let card =
+    let mut card =
         settings_card_with_support(&target, &plan, &winner.model, best, domains.get(&best.sim))?;
+    card.approximated_base = document
+        .file
+        .definition
+        .as_ref()
+        .and_then(|definition| definition.declared_base.as_ref())
+        .map(looklab_match::base_label);
+    card.destination_scope = selection
+        .as_ref()
+        .is_some_and(|context| context.mode == SelectionMode::Experimental)
+        .then(|| "the camera realization is experimental".to_owned());
     print!("{}", card.render_text());
     match &selection {
         Some(context) => println!(
@@ -1454,13 +1464,24 @@ pub fn run_verify(args: &VerifyArgs) -> Result<()> {
     } else {
         &updated_models[second_index]
     };
-    let card = settings_card_with_support(
+    let mut card = settings_card_with_support(
         &second_target,
         &plan,
         card_model,
         second,
         domains.get(&second.sim),
     )?;
+    card.approximated_base = document
+        .file
+        .definition
+        .as_ref()
+        .and_then(|definition| definition.declared_base.as_ref())
+        .map(looklab_match::base_label);
+    card.destination_scope = permalink
+        .selection
+        .as_ref()
+        .is_some_and(|selection| selection.mode == SelectionMode::Experimental)
+        .then(|| "the camera realization is experimental".to_owned());
 
     let crm_out = args
         .out_crm

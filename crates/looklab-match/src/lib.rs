@@ -28,7 +28,7 @@ pub mod synth;
 pub use calibration::Calibration;
 pub use card::{
     Confidence, ConfidenceLevel, ControlEntry, MissedRegion, REACHABILITY_TOLERANCE_DE,
-    Reachability, ReachabilityStatus, SettingsCard, SettingsSupport, settings_card,
+    Reachability, ReachabilityStatus, SettingsCard, SettingsSupport, base_label, settings_card,
     settings_card_with_support,
 };
 pub use covariance::{

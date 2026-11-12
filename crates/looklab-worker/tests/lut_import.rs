@@ -532,6 +532,98 @@ async fn an_approximated_import_falls_back_to_the_recorded_preview() {
 }
 
 #[tokio::test]
+async fn a_neutral_source_preview_upgrades_when_its_declared_base_publishes() {
+    let fixture = fixture().await;
+    publish_source_preview_base(&fixture.worker, "base-look", 1).await;
+    let proposal = ProposalId::new();
+    run_import(&fixture.worker, &proposal, "upgraded-lut", &identity_cube()).await;
+
+    let pool = fixture.worker.pool();
+    let before = looklab_worker::db::manifest_artifacts(pool, "upgraded-lut", 1)
+        .await
+        .expect("manifest")
+        .expect("version 1");
+    let descriptor = before
+        .iter()
+        .find(|artifact| artifact.name == SOURCE_LUT_ARTIFACT)
+        .map(|artifact| {
+            std::fs::read(fixture.worker.config().blobs.join(&artifact.sha256))
+                .expect("descriptor bytes")
+        })
+        .expect("descriptor");
+    let descriptor = SourceLutPreview::decode(&descriptor).expect("decode");
+    assert_eq!(
+        descriptor.preview.baseline,
+        PreviewBaseline::NeutralFallback
+    );
+    let before_bytes: Vec<(String, Vec<u8>)> = before
+        .iter()
+        .map(|artifact| {
+            (
+                artifact.name.clone(),
+                std::fs::read(fixture.worker.config().blobs.join(&artifact.sha256))
+                    .expect("old artifact bytes"),
+            )
+        })
+        .collect();
+
+    publish_layered_base(
+        &fixture.worker,
+        "base-look",
+        2,
+        false,
+        "Fujifilm",
+        "Classic Chrome",
+    )
+    .await;
+    sqlx::query("DELETE FROM jobs")
+        .execute(pool)
+        .await
+        .expect("clear jobs");
+    jobs::enqueue(pool, &JobPayload::LutRebase, 0)
+        .await
+        .expect("enqueue");
+    fixture.worker.run_once().await.expect("rebase");
+
+    let after = looklab_worker::db::manifest_artifacts(pool, "upgraded-lut", 2)
+        .await
+        .expect("manifest")
+        .expect("version 2");
+    let descriptor = after
+        .iter()
+        .find(|artifact| artifact.name == SOURCE_LUT_ARTIFACT)
+        .map(|artifact| {
+            std::fs::read(fixture.worker.config().blobs.join(&artifact.sha256))
+                .expect("descriptor bytes")
+        })
+        .expect("descriptor");
+    let descriptor = SourceLutPreview::decode(&descriptor).expect("decode");
+    assert_eq!(
+        descriptor.preview.baseline,
+        PreviewBaseline::Approximated {
+            base: base_reference("base-look", "2.0.0"),
+        }
+    );
+
+    let unchanged = looklab_worker::db::manifest_artifacts(pool, "upgraded-lut", 1)
+        .await
+        .expect("manifest")
+        .expect("version 1");
+    for (name, bytes) in before_bytes {
+        let artifact = unchanged
+            .iter()
+            .find(|artifact| artifact.name == name)
+            .expect("old artifact listed");
+        assert_eq!(artifact.sha256, hex(&Sha256::digest(&bytes)));
+        assert_eq!(
+            std::fs::read(fixture.worker.config().blobs.join(&artifact.sha256))
+                .expect("old artifact bytes"),
+            bytes
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_preview_on_the_latest_base_is_not_re_marked() {
     let fixture = fixture().await;
     publish_layered_base(

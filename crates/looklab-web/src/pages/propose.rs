@@ -2152,6 +2152,8 @@ fn LutFields(form: Form, index: SiteIndex) -> impl IntoView {
     view! {
         <section aria-labelledby="lut-heading">
             <h2 id="lut-heading">"The custom look"</h2>
+            <p>"A custom look is a .cube LUT that changes how colors and brightness render. Published custom looks appear on Looks, in Compare and in Get the look."</p>
+            <p><a href="https://github.com/skeet70/looklab/blob/main/docs/02-color-pipeline.md#38-lut-defined-looks">"How custom looks are built"</a></p>
             <crate::ui::DropZone on_files=Callback::new(move |selected| {
                 let Some(file) = files::selected_files(selected).into_iter().next() else { return; };
                 let generation = form.lut_generation.get_untracked().wrapping_add(1);

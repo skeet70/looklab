@@ -1009,3 +1009,100 @@ async fn a_matchable_lut_without_eligibility_is_not_listed_as_a_target() {
     assert!(!index.looks.iter().any(|look| look.slug.as_str() == OTHER));
     assert!(page(&out, OTHER).is_none());
 }
+
+#[tokio::test]
+async fn revert_and_intake_block_rows_reach_the_public_audit_log() {
+    let fixture = fixture().await;
+    add_look(
+        &fixture,
+        OTHER,
+        &lut_document(
+            OTHER,
+            LutEmulation::FilmStock {
+                name: "Synthetic film".to_owned(),
+            },
+        ),
+    )
+    .await;
+    let rows = [
+        (
+            "revert",
+            serde_json::json!({
+                "event": "revert",
+                "actor": "cli",
+                "look": "reverted-look",
+                "reason": "the source LUT was mislabelled",
+                "plan": {
+                    "target_version": 2,
+                    "rejected_contributions": ["contribution-a", "contribution-b"],
+                    "restoration": {"historical_needs_rebuild": {"reason": "dependency_invalidated"}},
+                },
+            }),
+        ),
+        (
+            "credential_intake_blocked",
+            serde_json::json!({
+                "event": "credential_intake_blocked",
+                "actor": "cli",
+                "subject": "blocked-credential",
+                "reason": "repeated mislabelled uploads",
+            }),
+        ),
+    ];
+    for (kind, payload) in rows {
+        sqlx::query("INSERT INTO audit_log (type, payload, ts) VALUES (?, ?, 0)")
+            .bind(kind)
+            .bind(payload.to_string())
+            .execute(&fixture.pool)
+            .await
+            .expect("audit row");
+    }
+    let (_, out) = publish(&fixture, "audit-events").await;
+    let log: looklab_publish::AuditLog =
+        serde_json::from_slice(&std::fs::read(out.join("data/audit-log.json")).expect("log"))
+            .expect("log json");
+
+    let revert = log
+        .entries
+        .iter()
+        .find_map(|entry| match &entry.event {
+            looklab_publish::AuditEvent::Revert {
+                look,
+                to_version,
+                rejected,
+                held,
+                reason,
+                ..
+            } => Some((look, to_version, rejected, held, reason)),
+            _ => None,
+        })
+        .expect("published revert");
+    assert_eq!(revert.0.as_str(), "reverted-look");
+    assert_eq!(revert.1.as_str(), "2");
+    assert_eq!(
+        revert
+            .2
+            .iter()
+            .map(looklab_publish::ContributionRef::as_str)
+            .collect::<Vec<_>>(),
+        ["contribution-a", "contribution-b"]
+    );
+    assert!(*revert.3);
+    assert_eq!(revert.4, "the source LUT was mislabelled");
+
+    let block = log
+        .entries
+        .iter()
+        .find_map(|entry| match &entry.event {
+            looklab_publish::AuditEvent::CredentialIntakeBlocked {
+                moderator,
+                subject,
+                reason,
+            } => Some((moderator, subject, reason)),
+            _ => None,
+        })
+        .expect("published intake block");
+    assert_eq!(block.0.as_str(), "cli");
+    assert_eq!(block.1.as_str(), "blocked-credential");
+    assert_eq!(block.2, "repeated mislabelled uploads");
+}

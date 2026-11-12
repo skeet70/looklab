@@ -248,6 +248,8 @@ fn browser_inputs(fixture: &Fixture) -> MatchInputs {
         selection: None,
         metric: ScoringMetric::RenderedPostClipV1,
         output_encoding: Some(OutputEncoding::Srgb),
+        approximated_base: None,
+        destination_scope: None,
     }
 }
 
@@ -657,6 +659,8 @@ fn experimental_inputs(fixture: &ExperimentalFixture) -> MatchInputs {
         }),
         metric: ScoringMetric::RenderedPostClipV1,
         output_encoding: Some(OutputEncoding::Srgb),
+        approximated_base: None,
+        destination_scope: None,
     }
 }
 
