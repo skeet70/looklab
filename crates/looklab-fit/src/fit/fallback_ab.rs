@@ -13,8 +13,9 @@ use crate::trust_region::{
 const SHARED_INNER_PRODUCTS: usize = 4088;
 /// Post-solve products reserved for the two arms.
 const RESERVED_POST_PRODUCTS: usize = 8;
-/// Sample evaluations over the frozen 3360-row case: one linearization and two trials.
-const SAMPLE_CEILING: u64 = 10_080;
+/// Sample evaluations over the frozen 3360-row case: one linearization and up to three trials
+/// per arm.
+const SAMPLE_CEILING: u64 = 23_520;
 const TOTAL_PRODUCT_CEILING: usize = 4096;
 
 /// `artifact://17034`, printed to ten significant digits.
@@ -1178,7 +1179,10 @@ fn evaluate_arm(
     let mut trial = ordinary_trial;
     if box_ranked_first && let Some(prediction) = box_positive {
         let box_trial = evaluate(&box_params, prediction);
-        if box_trial.decrease > trial.map_or(f64::NEG_INFINITY, |trial| trial.decrease) {
+        if strictly_larger_decrease(
+            box_trial.decrease,
+            trial.map_or(f64::NEG_INFINITY, |trial| trial.decrease),
+        ) {
             winner = FixedLinearizationWinner::Box;
             winner_candidate = report.box_candidate;
             trial = Some(box_trial);

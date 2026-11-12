@@ -502,8 +502,9 @@ impl PlateauHistory {
 pub struct FitStateGeneration(pub u32);
 
 impl FitStateGeneration {
-    /// Stable clipped-white composition and fixed per-image retained rows.
-    pub const CURRENT: Self = Self(6);
+    /// Stable clipped-white composition, fixed per-image retained rows and the two final-stage
+    /// trust-region radii.
+    pub const CURRENT: Self = Self(7);
 }
 
 /// Everything needed to continue a fit that exhausted its budget.
@@ -521,6 +522,9 @@ pub struct FitState {
     /// `None` until the final-stage trust region is initialized.
     #[serde(default)]
     pub trust_radius: Option<crate::TrustRadius>,
+    /// `None` until the positive Gauss-Newton trust region is initialized.
+    #[serde(default)]
+    pub positive_trust_radius: Option<crate::TrustRadius>,
     pub converged: bool,
     /// Accepted-state objective samples from the final stage.
     #[serde(default)]
