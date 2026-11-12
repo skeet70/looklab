@@ -807,7 +807,7 @@ fn coverage_text(summary: &looklab_schema::ManualConfirmationSummary) -> (&'stat
 pub(crate) fn confirmation_text(confirmation: &looklab_schema::ControlConfirmation) -> String {
     match confirmation.state {
         ConfirmationState::OwnerReported => format!(
-            "reported by {}; not confirmed",
+            "Owner-reported · reported by {}; not confirmed",
             profile_count_text(
                 confirmation
                     .firmware
@@ -818,8 +818,7 @@ pub(crate) fn confirmation_text(confirmation: &looklab_schema::ControlConfirmati
             )
         ),
         ConfirmationState::Contradicted => {
-            "Owner reports disagree on at least one firmware value; no single actual value confirmed"
-                .to_owned()
+            "Owners disagree · no single actual value confirmed".to_owned()
         }
         ConfirmationState::Confirmed => format!(
             "Confirmed on at least one firmware value; {} group(s) at the strongest firmware",
@@ -1228,5 +1227,55 @@ fn EpochDifferences(epochs: Vec<EpochPage>) -> impl IntoView {
             <ul>{rows.into_iter().map(|row| view! { <li>{row}</li> }).collect_view()}</ul>
         }
         .into_any()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use looklab_schema::{
+        Availability, CapabilityKey, ConfirmationState, ControlConfirmation, FirmwareConfirmation,
+        ManualControlIntake, ReportedFirmware,
+    };
+
+    use super::confirmation_text;
+
+    fn control(
+        state: ConfirmationState,
+        firmware: Vec<FirmwareConfirmation>,
+    ) -> ControlConfirmation {
+        ControlConfirmation {
+            key: CapabilityKey::NativeSimulations,
+            state,
+            agreeing_groups: 0,
+            contradictions: Vec::new(),
+            moderator: None,
+            firmware,
+            documented_availability: Availability::Available,
+            intake: ManualControlIntake::default(),
+        }
+    }
+
+    #[test]
+    fn public_control_text_names_owner_reported_and_its_count() {
+        let firmware = FirmwareConfirmation {
+            firmware: ReportedFirmware::new("1.00").expect("firmware"),
+            state: ConfirmationState::OwnerReported,
+            agreeing_groups: 0,
+            contradictions: Vec::new(),
+            basis: None,
+            confirmed_actual: None,
+            reported_options: Vec::new(),
+            owner_profiles: 2,
+            reported_profiles: 2,
+        };
+        let text = confirmation_text(&control(ConfirmationState::OwnerReported, vec![firmware]));
+        assert!(text.starts_with("Owner-reported"), "{text}");
+        assert!(text.contains("reported by 2 profiles"), "{text}");
+    }
+
+    #[test]
+    fn public_control_text_names_disagreement() {
+        let text = confirmation_text(&control(ConfirmationState::Contradicted, Vec::new()));
+        assert!(text.starts_with("Owners disagree"), "{text}");
     }
 }
