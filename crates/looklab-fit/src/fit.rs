@@ -1016,7 +1016,7 @@ fn exact_nuisance_curvature(layout: &Layout, blocks: &mut [BlockAcc], rows: &[He
         if n == 0 {
             continue;
         }
-        let mut hessian = block.hessian.clone();
+        let mut hessian = vec![0.0_f64; n * n];
         let mut failed = false;
         for row in rows {
             let mut positions = vec![usize::MAX; n];
@@ -1032,22 +1032,20 @@ fn exact_nuisance_curvature(layout: &Layout, blocks: &mut [BlockAcc], rows: &[He
             if positions.contains(&usize::MAX) {
                 continue;
             }
-            let axes: Vec<[f64; DOMAIN_AXES]> = positions
+            let derivatives: Vec<[f64; 3]> = positions
                 .iter()
-                .map(|position| row.axis_terms[*position])
+                .map(|position| row.columns[*position].1)
+                .collect();
+            let terms: Vec<f64> = positions
+                .iter()
+                .map(|position| row.robust_terms[*position])
                 .collect();
             for i in 0..n {
                 for j in 0..n {
-                    let mut penalty = 0.0;
-                    for a in 0..DOMAIN_AXES {
-                        if axes[i][a] == 0.0 {
-                            continue;
-                        }
-                        for b in 0..DOMAIN_AXES {
-                            penalty += row.penalty_gn[a][b] * axes[i][a] * axes[j][b];
-                        }
-                    }
-                    hessian[i * n + j] -= penalty;
+                    let dot = derivatives[i][0] * derivatives[j][0]
+                        + derivatives[i][1] * derivatives[j][1]
+                        + derivatives[i][2] * derivatives[j][2];
+                    hessian[i * n + j] += row.weight * dot + row.robust * terms[i] * terms[j];
                 }
             }
             let Some(curvature) = &row.curvature else {
@@ -1093,35 +1091,168 @@ fn exact_nuisance_curvature(layout: &Layout, blocks: &mut [BlockAcc], rows: &[He
     }
 }
 
-/// Shifts each block's exact curvature to a positive-definite trust-region model.
-fn regularize_nuisance_curvature(blocks: &mut [BlockAcc]) {
-    for block in blocks.iter_mut() {
-        let n = block.len();
-        if n == 0 {
-            continue;
-        }
-        let mut lower = f64::INFINITY;
-        let mut scale = 1.0_f64;
-        for i in 0..n {
-            scale = scale.max(block.hessian[i * n + i].abs());
-            let mut radius = 0.0;
-            for j in 0..n {
-                if i != j {
-                    radius += block.hessian[i * n + j].abs();
-                }
-            }
-            lower = lower.min(block.hessian[i * n + i] - radius);
-        }
-        if lower < 0.0 {
-            let shift = -lower + 1e-9 * scale;
-            for i in 0..n {
-                block.hessian[i * n + i] += shift;
-            }
-        }
-        for i in 0..n {
-            block.full_diagonal[i] = block.hessian[i * n + i].abs().max(1.0);
+fn rotate3(vectors: &[[f64; 3]; 3], direction: [f64; 3]) -> [f64; 3] {
+    let mut out = [0.0_f64; 3];
+    for (row, value) in out.iter_mut().enumerate() {
+        for column in 0..3 {
+            *value += vectors[row][column] * direction[column];
         }
     }
+    out
+}
+
+fn jacobi_eigen_3(matrix: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
+    let mut a = matrix;
+    let mut vectors = [[1.0_f64, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    for _ in 0..12 {
+        for (p, q) in [(0usize, 1usize), (0, 2), (1, 2)] {
+            let off = a[p][q];
+            if off.abs() < 1e-18 {
+                continue;
+            }
+            let theta = (a[q][q] - a[p][p]) / (2.0 * off);
+            let t = if theta >= 0.0 {
+                1.0 / (theta + (1.0 + theta * theta).sqrt())
+            } else {
+                -1.0 / (-theta + (1.0 + theta * theta).sqrt())
+            };
+            let c = 1.0 / (1.0 + t * t).sqrt();
+            let s = t * c;
+            let app = a[p][p];
+            let aqq = a[q][q];
+            a[p][p] = c * c * app - 2.0 * s * c * off + s * s * aqq;
+            a[q][q] = s * s * app + 2.0 * s * c * off + c * c * aqq;
+            a[p][q] = 0.0;
+            a[q][p] = 0.0;
+            for k in 0..3 {
+                if k != p && k != q {
+                    let akp = a[k][p];
+                    let akq = a[k][q];
+                    a[k][p] = c * akp - s * akq;
+                    a[p][k] = a[k][p];
+                    a[k][q] = s * akp + c * akq;
+                    a[q][k] = a[k][q];
+                }
+                let vkp = vectors[k][p];
+                let vkq = vectors[k][q];
+                vectors[k][p] = c * vkp - s * vkq;
+                vectors[k][q] = s * vkp + c * vkq;
+            }
+        }
+    }
+    let mut values = [a[0][0], a[1][1], a[2][2]];
+    for i in 0..3 {
+        for j in i + 1..3 {
+            if values[j] < values[i] {
+                values.swap(i, j);
+                for row in &mut vectors {
+                    row.swap(i, j);
+                }
+            }
+        }
+    }
+    (values, vectors)
+}
+
+/// Exact trust-region Newton step for a symmetric 3x3 model.
+fn trust_region_step_3(
+    hessian: [[f64; 3]; 3],
+    gradient: [f64; 3],
+    radius: f64,
+) -> Option<([f64; 3], f64)> {
+    let (values, vectors) = jacobi_eigen_3(hessian);
+    let mut transformed = [0.0_f64; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            transformed[i] += vectors[j][i] * gradient[j];
+        }
+    }
+    let norm = |d: [f64; 3]| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let predicted = |step: [f64; 3]| {
+        let mut linear = 0.0;
+        let mut quadratic = 0.0;
+        for i in 0..3 {
+            linear += gradient[i] * step[i];
+            for j in 0..3 {
+                quadratic += step[i] * hessian[i][j] * step[j];
+            }
+        }
+        -linear - 0.5 * quadratic
+    };
+    if values[0] > 0.0 {
+        let direction = [
+            -transformed[0] / values[0],
+            -transformed[1] / values[1],
+            -transformed[2] / values[2],
+        ];
+        if norm(direction) <= radius {
+            let step = rotate3(&vectors, direction);
+            return Some((step, predicted(step)));
+        }
+    }
+    let scale = transformed.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    if values[0] < 0.0 && transformed[0].abs() <= 1e-12 * scale.max(1.0) {
+        let mut direction = [0.0_f64; 3];
+        for i in 1..3 {
+            direction[i] = -transformed[i] / (values[i] - values[0]);
+        }
+        let squared = direction[1] * direction[1] + direction[2] * direction[2];
+        if squared < radius * radius {
+            direction[0] = (radius * radius - squared).sqrt();
+            let step = rotate3(&vectors, direction);
+            return Some((step, predicted(step)));
+        }
+    }
+    let lower = (-values[0]).max(0.0);
+    let mut low = lower + 1e-12 * (1.0 + lower);
+    let gnorm = (transformed[0] * transformed[0]
+        + transformed[1] * transformed[1]
+        + transformed[2] * transformed[2])
+        .sqrt();
+    let mut high = (gnorm / radius - values[0]).max(low + 1.0);
+    for _ in 0..64 {
+        let middle = 0.5 * (low + high);
+        let mut squared = 0.0;
+        for i in 0..3 {
+            let denominator = values[i] + middle;
+            if denominator <= 0.0 {
+                squared = f64::INFINITY;
+                break;
+            }
+            let value = transformed[i] / denominator;
+            squared += value * value;
+        }
+        if squared > radius * radius {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    let shift = 0.5 * (low + high);
+    let mut direction = [0.0_f64; 3];
+    for i in 0..3 {
+        direction[i] = -transformed[i] / (values[i] + shift);
+    }
+    if direction.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let step = rotate3(&vectors, direction);
+    Some((step, predicted(step)))
+}
+
+fn nuisance_prior_cost(
+    problem: &Problem,
+    params: &Params,
+    image: usize,
+    options: &FitOptions,
+) -> f64 {
+    let range = params.layout.image(image);
+    let exposure = params.theta[range.start] - problem.images[image].exposure_hint;
+    let wb_r = params.theta[range.start + 1];
+    let wb_b = params.theta[range.start + 2];
+    0.5 * (exposure * exposure
+        / (options.exposure_prior_sd * options.exposure_prior_sd)
+        + (wb_r * wb_r + wb_b * wb_b) / (options.wb_prior_sd * options.wb_prior_sd))
 }
 
 fn condition_nuisances_inner(
@@ -1161,7 +1292,7 @@ fn condition_nuisances_inner(
         .collect();
     let roles = prior_roles(&problem, &layout);
     let lambdas = options.initial_lambdas;
-    let mut damping = 1e-3;
+    let mut damping: f64 = 1e-3;
     let mut recent: Vec<f64> = Vec::new();
     let mut accepted_count = 0usize;
     let mut attempts = 0usize;
@@ -1180,6 +1311,10 @@ fn condition_nuisances_inner(
         IntentFilter::All,
         HessianRows::All,
     );
+    let mut rows = core::mem::take(&mut pass.coupled_rows);
+    let mut radii = vec![STEP_RADIUS; problem.images.len()];
+    let mut predicted = vec![0.0_f64; problem.images.len()];
+    let mut at_boundary = vec![false; problem.images.len()];
     let mut cost =
         pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
     recent.push(cost);
@@ -1206,44 +1341,57 @@ fn condition_nuisances_inner(
                 recent.len()
             );
         }
-        let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
-        exact_nuisance_curvature(&layout, &mut blocks, &pass.coupled_rows);
-        regularize_nuisance_curvature(&mut blocks);
+        if !rows.is_empty() {
+            exact_nuisance_curvature(&layout, &mut blocks, &rows);
+        }
+        predicted.fill(0.0);
+        at_boundary.fill(false);
         let mut step = vec![0.0_f64; layout.total];
-        let mut failed: Option<usize> = None;
+        let mut failed = false;
         for (index, block) in blocks.iter().enumerate() {
+            let n = block.len();
             let (prior_gradient, prior_curvature) =
                 prior_terms(&problem, &roles, &params, options, block);
-            let outcome = solve_block(
-                &layout,
-                block,
-                &mut step,
-                &penalties[index],
-                &prior_gradient,
-                &prior_curvature,
-                &params,
-                &lambdas,
-                damping,
-                hessian_scale,
-                StepLimit::WholeStep,
-            );
-            if outcome == BlockStep::Failed && failed.is_none() {
-                failed = Some(index);
+            let lambda = block_lambda(block, &lambdas);
+            let identity = identity_matrix(&layout, block);
+            let mut hessian = [[0.0_f64; 3]; 3];
+            let mut gradient = [0.0_f64; 3];
+            for i in 0..n {
+                gradient[i] = block.gradient[i] + prior_gradient[i];
+                let mut smooth = 0.0;
+                let mut prior = 0.0;
+                for j in 0..n {
+                    hessian[i][j] = block.hessian[i * n + j]
+                        + lambda * penalties[index][i * n + j]
+                        + identity[i * n + j];
+                    smooth += penalties[index][i * n + j] * params.theta[block.params[j]];
+                    prior += identity[i * n + j]
+                        * (params.theta[block.params[j]]
+                            - layout.identity_mean(block.params[j]));
+                }
+                hessian[i][i] += prior_curvature[i];
+                gradient[i] += lambda * smooth + prior;
+            }
+            match trust_region_step_3(hessian, gradient, radii[index]) {
+                Some((direction, reduction)) => {
+                    for i in 0..n {
+                        step[block.params[i]] = direction[i];
+                    }
+                    let norm = (direction[0] * direction[0]
+                        + direction[1] * direction[1]
+                        + direction[2] * direction[2])
+                        .sqrt();
+                    at_boundary[index] = norm >= 0.99 * radii[index];
+                    predicted[index] = reduction;
+                }
+                None => failed = true,
             }
         }
-        if let Some(index) = failed {
-            // An unsolved image block leaves its nuisances unmoved; accepting the trial
-            // would count a no-op as progress and lower the damping.
+        if failed {
             damping = (damping * 10.0).min(1e6);
             if fit_diag() {
-                let block = &blocks[index];
-                let n = block.len();
                 eprintln!(
-                    "nuisance attempt {attempts} block {index} factorization failed damping {damping:.3e} n {n} diagonal {:?} gradient {:?}",
-                    (0..n)
-                        .map(|i| block.hessian[i * n + i])
-                        .collect::<Vec<f64>>(),
-                    block.gradient
+                    "nuisance attempt {attempts} trust-region step failed damping {damping:.3e}"
                 );
             }
             if damping >= 1e6 {
@@ -1263,7 +1411,7 @@ fn condition_nuisances_inner(
         for block in &mut blocks {
             block.reset();
         }
-        let trial_pass = problem.pass_with_analytic_rows(
+        let trial_pass = problem.pass(
             &trial,
             active,
             &mut blocks,
@@ -1271,15 +1419,57 @@ fn condition_nuisances_inner(
             false,
             false,
             IntentFilter::All,
-            HessianRows::All,
         );
         let trial_cost =
             trial_pass.cost + total_cost(&problem, &trial, &blocks, &penalties, &lambdas, options);
+        for index in 0..problem.images.len() {
+            let base =
+                pass.image_cost[index] + nuisance_prior_cost(&problem, &params, index, options);
+            let trial_image =
+                trial_pass.image_cost[index] + nuisance_prior_cost(&problem, &trial, index, options);
+            let realized = base - trial_image;
+            let ratio = if predicted[index] > 1e-12 {
+                realized / predicted[index]
+            } else {
+                0.0
+            };
+            if ratio < 0.25 {
+                radii[index] = (radii[index] * 0.25).max(1e-6);
+            } else if ratio > 0.75 && at_boundary[index] {
+                radii[index] = (radii[index] * 2.0).min(1e3);
+            }
+        }
         if accepted(cost, trial_cost) {
             accepted_count += 1;
             params = trial;
-            pass = trial_pass;
-            cost = trial_cost;
+            for block in &mut blocks {
+                block.reset();
+            }
+            let mut analytic = problem.pass_with_analytic_rows(
+                &params,
+                active,
+                &mut blocks,
+                false,
+                false,
+                false,
+                IntentFilter::All,
+                HessianRows::All,
+            );
+            if analytic.infeasible {
+                if fit_diag() {
+                    eprintln!(
+                        "nuisance attempt {attempts} analytic curvature infeasible at the accepted state"
+                    );
+                }
+                rows.clear();
+                pass = trial_pass;
+                cost = trial_cost;
+            } else {
+                rows = core::mem::take(&mut analytic.coupled_rows);
+                pass = analytic;
+                cost =
+                    pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
+            }
             let gradient = gradient_max(GradientArgs {
                 layout: &layout,
                 problem: &problem,
@@ -1336,7 +1526,7 @@ fn condition_nuisances_inner(
             for block in &mut blocks {
                 block.reset();
             }
-            pass = problem.pass_with_analytic_rows(
+            pass = problem.pass(
                 &params,
                 active,
                 &mut blocks,
@@ -1344,7 +1534,6 @@ fn condition_nuisances_inner(
                 false,
                 false,
                 IntentFilter::All,
-                HessianRows::All,
             );
             cost =
                 pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);

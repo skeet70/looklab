@@ -415,6 +415,8 @@ pub(crate) struct PassOutput {
     pub residuals: Vec<[f64; 3]>,
     pub image_rss: Vec<f64>,
     pub image_weight: Vec<f64>,
+    /// Per-image negative log-likelihood plus domain penalty, excluding priors.
+    pub image_cost: Vec<f64>,
     pub per_image_gradient: Vec<Vec<f64>>,
     pub residual_samples: Vec<ResidualSample>,
     /// Full-data residual gradient.
@@ -1002,6 +1004,7 @@ impl Problem {
             ],
             image_rss: vec![0.0_f64; self.images.len()],
             image_weight: vec![0.0_f64; self.images.len()],
+            image_cost: vec![0.0_f64; self.images.len()],
             per_image_gradient: if want_per_image {
                 vec![vec![0.0_f64; total]; self.images.len()]
             } else {
@@ -1161,10 +1164,13 @@ impl Problem {
                 output.hessian_rows += 1;
             }
             output.cost += weight * (log_likelihood + scale.log_scale);
+            output.image_cost[image] += weight * (log_likelihood + scale.log_scale);
             if feasible {
                 output.cost += weight * penalty_value;
+                output.image_cost[image] += weight * penalty_value;
             } else {
                 output.cost = f64::INFINITY;
+                output.image_cost[image] = f64::INFINITY;
             }
             output.image_rss[image] += weight * squared;
             output.image_weight[image] += weight;
