@@ -15,7 +15,8 @@ use crate::model_error::{apply_model_error, estimate_model_error};
 use crate::outlier;
 use crate::predict::Layer;
 use crate::problem::{
-    ActiveColumns, BlockAcc, IntentFilter, PassOutput, Problem, ResidualSample, RowModel,
+    ActiveColumns, BlockAcc, HessianRow, HessianRows, IntentFilter, PassOutput, Problem,
+    ResidualSample, RowModel,
 };
 use crate::solve::{factor_in_place, select_lambda, select_lambda_diagonal, solve_in_place};
 use crate::types::{
@@ -1002,6 +1003,127 @@ pub(crate) fn condition_nuisances(
     condition_nuisances_inner(images, options, look, model, clip_k)
 }
 
+/// Replaces each image block's curvature with the exact Hessian of the objective
+/// in that image's three nuisance coordinates: the Student-t terms plus the
+/// exact domain penalty, not the IRLS/Gauss-Newton approximation.
+fn exact_nuisance_curvature(layout: &Layout, blocks: &mut [BlockAcc], rows: &[HessianRow]) {
+    let total = layout.total;
+    let mut direction = vec![0.0_f64; total];
+    let mut product = vec![0.0_f64; total];
+    let mut scratch = crate::predict::CurvatureScratch::default();
+    for block in blocks.iter_mut() {
+        let n = block.len();
+        if n == 0 {
+            continue;
+        }
+        let mut hessian = block.hessian.clone();
+        let mut failed = false;
+        for row in rows {
+            let mut positions = vec![usize::MAX; n];
+            for (slot, global) in block.params.iter().enumerate() {
+                if let Some(position) = row
+                    .columns
+                    .iter()
+                    .position(|(column, _)| *column as usize == *global)
+                {
+                    positions[slot] = position;
+                }
+            }
+            if positions.contains(&usize::MAX) {
+                continue;
+            }
+            let axes: Vec<[f64; DOMAIN_AXES]> = positions
+                .iter()
+                .map(|position| row.axis_terms[*position])
+                .collect();
+            for i in 0..n {
+                for j in 0..n {
+                    let mut penalty = 0.0;
+                    for a in 0..DOMAIN_AXES {
+                        if axes[i][a] == 0.0 {
+                            continue;
+                        }
+                        for b in 0..DOMAIN_AXES {
+                            penalty += row.penalty_gn[a][b] * axes[i][a] * axes[j][b];
+                        }
+                    }
+                    hessian[i * n + j] -= penalty;
+                }
+            }
+            let Some(curvature) = &row.curvature else {
+                continue;
+            };
+            if curvature.prepare_scratch(&mut scratch).is_err() {
+                failed = true;
+                break;
+            }
+            for i in 0..n {
+                direction.fill(0.0);
+                direction[block.params[i]] = 1.0;
+                product.fill(0.0);
+                if curvature
+                    .add_hvp(&direction, &mut product, &mut scratch)
+                    .is_err()
+                {
+                    failed = true;
+                    break;
+                }
+                for j in 0..n {
+                    hessian[i * n + j] += product[block.params[j]];
+                }
+            }
+            if failed {
+                break;
+            }
+        }
+        if failed {
+            continue;
+        }
+        for i in 0..n {
+            for j in i + 1..n {
+                let value = 0.5 * (hessian[i * n + j] + hessian[j * n + i]);
+                hessian[i * n + j] = value;
+                hessian[j * n + i] = value;
+            }
+        }
+        for i in 0..n {
+            block.full_diagonal[i] = hessian[i * n + i].abs().max(1.0);
+        }
+        block.hessian = hessian;
+    }
+}
+
+/// Shifts each block's exact curvature to a positive-definite trust-region model.
+fn regularize_nuisance_curvature(blocks: &mut [BlockAcc]) {
+    for block in blocks.iter_mut() {
+        let n = block.len();
+        if n == 0 {
+            continue;
+        }
+        let mut lower = f64::INFINITY;
+        let mut scale = 1.0_f64;
+        for i in 0..n {
+            scale = scale.max(block.hessian[i * n + i].abs());
+            let mut radius = 0.0;
+            for j in 0..n {
+                if i != j {
+                    radius += block.hessian[i * n + j].abs();
+                }
+            }
+            lower = lower.min(block.hessian[i * n + i] - radius);
+        }
+        if lower < 0.0 {
+            let shift = -lower + 1e-9 * scale;
+            for i in 0..n {
+                block.hessian[i * n + i] += shift;
+            }
+        }
+        for i in 0..n {
+            block.full_diagonal[i] = block.hessian[i * n + i].abs().max(1.0);
+        }
+    }
+}
+
 fn condition_nuisances_inner(
     images: &[FitImage],
     options: &FitOptions,
@@ -1048,7 +1170,7 @@ fn condition_nuisances_inner(
     for block in &mut blocks {
         block.reset();
     }
-    let mut pass = problem.pass(
+    let mut pass = problem.pass_with_analytic_rows(
         &params,
         active,
         &mut blocks,
@@ -1056,6 +1178,7 @@ fn condition_nuisances_inner(
         false,
         false,
         IntentFilter::All,
+        HessianRows::All,
     );
     let mut cost =
         pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
@@ -1084,6 +1207,8 @@ fn condition_nuisances_inner(
             );
         }
         let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
+        exact_nuisance_curvature(&layout, &mut blocks, &pass.coupled_rows);
+        regularize_nuisance_curvature(&mut blocks);
         let mut step = vec![0.0_f64; layout.total];
         let mut failed: Option<usize> = None;
         for (index, block) in blocks.iter().enumerate() {
@@ -1138,7 +1263,7 @@ fn condition_nuisances_inner(
         for block in &mut blocks {
             block.reset();
         }
-        let trial_pass = problem.pass(
+        let trial_pass = problem.pass_with_analytic_rows(
             &trial,
             active,
             &mut blocks,
@@ -1146,6 +1271,7 @@ fn condition_nuisances_inner(
             false,
             false,
             IntentFilter::All,
+            HessianRows::All,
         );
         let trial_cost =
             trial_pass.cost + total_cost(&problem, &trial, &blocks, &penalties, &lambdas, options);
@@ -1210,7 +1336,7 @@ fn condition_nuisances_inner(
             for block in &mut blocks {
                 block.reset();
             }
-            pass = problem.pass(
+            pass = problem.pass_with_analytic_rows(
                 &params,
                 active,
                 &mut blocks,
@@ -1218,6 +1344,7 @@ fn condition_nuisances_inner(
                 false,
                 false,
                 IntentFilter::All,
+                HessianRows::All,
             );
             cost =
                 pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
@@ -15282,5 +15409,106 @@ mod look_only_domain_tests {
             matches!(error, FitError::RowContext(_)),
             "unexpected error: {error:?}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "synth"))]
+mod nuisance_curvature_tests {
+    use super::*;
+    use crate::synth::{SynthConfig, dataset};
+
+    fn active() -> ActiveColumns {
+        ActiveColumns {
+            image: true,
+            mode: false,
+            wb: true,
+            clip: false,
+            response: false,
+        }
+    }
+
+    fn image_blocks(layout: &Layout, problem: &Problem) -> Vec<BlockAcc> {
+        let mut blocks: Vec<BlockAcc> = (0..problem.images.len())
+            .map(|index| make_image_block(layout, index, active()))
+            .collect();
+        for block in &mut blocks {
+            block.reset();
+        }
+        blocks
+    }
+
+    #[test]
+    fn exact_nuisance_curvature_matches_gradient_differences() {
+        let data = dataset(&SynthConfig {
+            images: 2,
+            samples_per_image: 64,
+            ..SynthConfig::default()
+        });
+        let options = FitOptions {
+            fit_residual: false,
+            ..FitOptions::default()
+        };
+        let problem = Problem::new_with(&data.images, None, &options).expect("problem");
+        let layout = problem.layout.clone();
+        let mut params = params_from_look(&problem, &data.truth);
+        for (index, nuisance) in data.nuisances.iter().enumerate() {
+            let range = layout.image(index);
+            params.theta[range.start] = nuisance.exposure;
+            params.theta[range.start + 1] = nuisance.wb_log_r;
+            params.theta[range.start + 2] = nuisance.wb_log_b;
+        }
+        params.theta[layout.clip] = crate::layout::zeta_from_clip(data.clip_k);
+        let mut blocks = image_blocks(&layout, &problem);
+        let pass = problem.pass_with_analytic_rows(
+            &params,
+            active(),
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::All,
+            HessianRows::All,
+        );
+        exact_nuisance_curvature(&layout, &mut blocks, &pass.coupled_rows);
+        let exact: Vec<Vec<f64>> = blocks.iter().map(|block| block.hessian.clone()).collect();
+        let step = 1e-5;
+        let gradient = |params: &Params, image: usize| {
+            let mut blocks = image_blocks(&layout, &problem);
+            let _ = problem.pass(
+                params,
+                active(),
+                &mut blocks,
+                false,
+                false,
+                false,
+                IntentFilter::All,
+            );
+            blocks[image].gradient.clone()
+        };
+        let mut worst = 0.0_f64;
+        for (image, block) in blocks.iter().enumerate() {
+            let n = block.len();
+            for coordinate in 0..n {
+                let global = block.params[coordinate];
+                let mut plus = params.clone();
+                let mut minus = params.clone();
+                plus.theta[global] += step;
+                minus.theta[global] -= step;
+                let plus = gradient(&plus, image);
+                let minus = gradient(&minus, image);
+                for other in 0..n {
+                    let numerical = (plus[other] - minus[other]) / (2.0 * step);
+                    let analytic = exact[image][coordinate * n + other];
+                    let scale = analytic.abs().max(numerical.abs()).max(1.0);
+                    let error = (analytic - numerical).abs() / scale;
+                    worst = worst.max(error);
+                    assert!(
+                        error < 1e-4,
+                        "image {image} coordinate {coordinate} row {other}: analytic {analytic:.9e} numerical {numerical:.9e} error {error:.3e}"
+                    );
+                }
+            }
+        }
+        eprintln!("exact nuisance curvature worst relative error {worst:.3e}");
     }
 }
