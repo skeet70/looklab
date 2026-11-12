@@ -874,6 +874,7 @@ mod tests {
                 (ratio - expected).abs() < 0.03,
                 "J' {lightness}: ratio {ratio} vs {expected}"
             );
+            println!("toe push ratio at J' {lightness}: {ratio:.9e} (bare-term fraction)");
         }
     }
 }

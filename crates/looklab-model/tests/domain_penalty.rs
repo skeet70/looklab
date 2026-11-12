@@ -269,6 +269,53 @@ fn toe_wall_derivatives_match_the_closed_form_at_neutral_chroma() {
 }
 
 #[test]
+fn toe_series_branch_matches_the_direct_closed_form() {
+    let values = layer_values();
+    let anchor = toe_anchor();
+    let limit = looklab_model::neutral_j_prime_max();
+    let upper_tone = -libm::log1p(-values.t / limit);
+    for lightness in [22.1, 22.2] {
+        let paths = ChromaPaths {
+            ucs: Ucs::new(lightness, 0.0, 0.0),
+            internal: [0.0, 0.0],
+            blend: 0.5,
+        };
+        let penalty = evaluate(&values, &paths).expect("neutral point is feasible");
+        let upper_lightness = -libm::log1p(-lightness / limit);
+        let observed = penalty.value - upper_tone - upper_lightness;
+        let ratio = lightness / anchor;
+        let u = 1.0 - ratio;
+        assert!(u < 1e-2, "fixture must hit the series branch: u {u:e}");
+        let direct = -libm::log1p(-u) - u - 0.5 * u * u;
+        let scale = direct.abs().max(1.0);
+        assert!(
+            (observed - direct).abs() / scale < 1e-9,
+            "lightness {lightness}: {observed:e} vs {direct:e}"
+        );
+        let index = DomainAxis::Lightness as usize;
+        let upper_slope = 1.0 / (limit - lightness);
+        let direct_slope = (-1.0 / ratio + 2.0 - ratio) / anchor;
+        let scale = direct_slope.abs().max(1.0);
+        assert!(
+            (penalty.gradient[index] - upper_slope - direct_slope).abs() / scale < 1e-9,
+            "lightness {lightness}: gradient {} vs {}",
+            penalty.gradient[index],
+            upper_slope + direct_slope
+        );
+        let upper_curvature = 1.0 / ((limit - lightness) * (limit - lightness));
+        let direct_curvature = (1.0 / (ratio * ratio) - 1.0) / (anchor * anchor);
+        let scale = direct_curvature.abs().max(1.0);
+        assert!(
+            (penalty.hessian[index][index] - upper_curvature - direct_curvature).abs() / scale
+                < 1e-9,
+            "lightness {lightness}: hessian {} vs {}",
+            penalty.hessian[index][index],
+            upper_curvature + direct_curvature
+        );
+    }
+}
+
+#[test]
 fn toe_lower_wall_blows_up_at_neutral_chroma() {
     let values = layer_values();
     let anchor = toe_anchor();
