@@ -2,15 +2,18 @@
 //! Neutral-anchored domain penalty over the two fitting inverse paths
 //! (docs/02 §3.9).
 //!
-//! The reference tone `T` and the shared output lightness `j` carry the mirrored
-//! pair of logarithmic barriers `-log1p(-x/limit) - log(x/limit)` with one fixed
-//! strength and the caller's sample weight (Fiacco & McCormick, *Nonlinear
-//! Programming*, 1968, §3). The chroma response paths carry the neutral-anchored
-//! Bregman divergence below.
+//! The reference tone `T` and the shared output lightness `j` carry the upper
+//! wall `-log1p(-x/limit)` and the toe-scoped lower term below the anchor
+//! `j0`: `-log(x/j0) + (x/j0 - 1) - (x/j0 - 1)^2/2`, zero at and above the
+//! anchor. Both use one fixed strength and the caller's sample weight (Fiacco &
+//! McCormick, *Nonlinear Programming*, 1968, §3). The chroma response paths
+//! carry the neutral-anchored Bregman divergence below.
 // The negated comparisons reject NaN together with out-of-range values.
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 
 use core::fmt;
+use std::sync::LazyLock;
+
 use looklab_color::cam16::{Cam16Model, ResponsePathDerivatives, temporary_denominator};
 use looklab_color::ucs::{Ucs, UcsSpace, ucs_to_jmh};
 
@@ -120,6 +123,71 @@ fn violation(
 
 fn lightness_limit() -> f64 {
     solve::reference_model().inverse_j_prime_limit()
+}
+
+/// `J'` anchor of the toe-scoped lower term: the reference neutral at linear
+/// output `0.03`, the clip prior mean.
+static TOE_ANCHOR: LazyLock<f64> = LazyLock::new(|| {
+    solve::reference_model()
+        .ucs_j_and_dj_dy(solve::reference_white(), 0.03)
+        .0
+});
+
+fn toe_anchor() -> f64 {
+    *TOE_ANCHOR
+}
+
+const TOE_THRESHOLD: f64 = 1e-2;
+
+/// `f(x) = -log(x) + (x - 1) - (x - 1)^2/2` below the anchor, zero above.
+fn toe_value(x: f64) -> f64 {
+    if x >= 1.0 {
+        return 0.0;
+    }
+    let u = 1.0 - x;
+    if u < TOE_THRESHOLD {
+        let mut acc = 0.0;
+        for k in (3..=10).rev() {
+            acc = 1.0 / k as f64 + u * acc;
+        }
+        u * u * u * acc
+    } else {
+        -libm::log1p(-u) - u - 0.5 * u * u
+    }
+}
+
+/// `f'(x) = -1/x + 2 - x` below the anchor, zero above.
+fn toe_slope(x: f64) -> f64 {
+    if x >= 1.0 {
+        return 0.0;
+    }
+    let u = 1.0 - x;
+    if u < TOE_THRESHOLD {
+        let mut acc = 0.0;
+        for _ in 0..8 {
+            acc = 1.0 + u * acc;
+        }
+        -(u * u * acc)
+    } else {
+        -1.0 / x + 2.0 - x
+    }
+}
+
+/// `f''(x) = 1/x^2 - 1` below the anchor, zero above.
+fn toe_curvature(x: f64) -> f64 {
+    if x >= 1.0 {
+        return 0.0;
+    }
+    let u = 1.0 - x;
+    if u < TOE_THRESHOLD {
+        let mut acc = 9.0;
+        for coefficient in (2..=8).rev() {
+            acc = coefficient as f64 + u * acc;
+        }
+        u * acc
+    } else {
+        1.0 / (x * x) - 1.0
+    }
 }
 
 /// Guard the tone consumed by the neutral-reference inverse.
@@ -370,9 +438,10 @@ fn set_symmetric(
 
 /// Evaluate the penalty and its exact derivatives in the seven domain axes.
 ///
-/// The value is `-log1p(-T/limit) - log(T/limit) - log1p(-j/limit) - log(j/limit)`
-/// plus the weighted path Bregman divergences; the lower terms contribute
-/// `-1/x` to the gradient and `1/x^2` to the exact and Gauss-Newton Hessians.
+/// The value is `-log1p(-T/limit) - log1p(-j/limit) + toe(T/j0) + toe(j/j0)`
+/// plus the weighted path Bregman divergences. The toe term contributes
+/// `(-1/x + 2 - x)/j0` to the gradient and `(1/x^2 - 1)/j0^2` to the exact and
+/// Gauss-Newton Hessians, zero at and above the anchor.
 pub fn evaluate(
     values: &LayerValues,
     paths: &ChromaPaths,
@@ -423,20 +492,22 @@ pub fn evaluate(
     let blend = paths.blend;
     let near = 1.0 - blend;
 
+    let anchor_j = toe_anchor();
+    let tone_x = values.t / anchor_j;
+    let lightness_x = lightness / anchor_j;
     let tone_upper_slope = 1.0 / (limit - values.t);
-    let tone_lower_slope = 1.0 / values.t;
-    let tone_slope = tone_upper_slope - tone_lower_slope;
-    let tone_curvature = tone_upper_slope * tone_upper_slope + tone_lower_slope * tone_lower_slope;
+    let tone_slope = tone_upper_slope + toe_slope(tone_x) / anchor_j;
+    let tone_curvature =
+        tone_upper_slope * tone_upper_slope + toe_curvature(tone_x) / (anchor_j * anchor_j);
     let lightness_upper_slope = 1.0 / (limit - lightness);
-    let lightness_lower_slope = 1.0 / lightness;
-    let lightness_slope = lightness_upper_slope - lightness_lower_slope;
+    let lightness_slope = lightness_upper_slope + toe_slope(lightness_x) / anchor_j;
     let lightness_curvature = lightness_upper_slope * lightness_upper_slope
-        + lightness_lower_slope * lightness_lower_slope;
+        + toe_curvature(lightness_x) / (anchor_j * anchor_j);
 
     let value = -libm::log1p(-values.t / limit)
-        - libm::log(values.t / limit)
         - libm::log1p(-lightness / limit)
-        - libm::log(lightness / limit)
+        + toe_value(tone_x)
+        + toe_value(lightness_x)
         + near * inner.value
         + blend * outer.value;
 
@@ -704,5 +775,103 @@ mod tests {
             );
         }
         assert_eq!(bregman_divergence(q0, q0), 0.0);
+    }
+
+    fn toe_series_value(u: f64) -> f64 {
+        let mut acc = 0.0;
+        for k in (3..=10).rev() {
+            acc = 1.0 / k as f64 + u * acc;
+        }
+        u * u * u * acc
+    }
+
+    #[test]
+    fn toe_series_matches_direct_forms() {
+        for u in [1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-3] {
+            let x = 1.0 - u;
+            let u = 1.0 - x;
+            let expected = toe_series_value(u);
+            let value = toe_value(x);
+            let scale = expected.abs().max(1e-300);
+            assert!(
+                (value - expected).abs() / scale < 1e-12,
+                "u {u:e}: value {value:e} vs {expected:e}"
+            );
+            let expected_slope = -(u * u * (1.0 + u + u * u + u * u * u));
+            let slope = toe_slope(x);
+            let scale = expected_slope.abs().max(1e-300);
+            assert!(
+                (slope - expected_slope).abs() / scale < 1e-9,
+                "u {u:e}: slope {slope:e} vs {expected_slope:e}"
+            );
+            let expected_curvature = u * (2.0 + 3.0 * u + 4.0 * u * u + 5.0 * u * u * u);
+            let curvature = toe_curvature(x);
+            let scale = expected_curvature.abs().max(1e-300);
+            assert!(
+                (curvature - expected_curvature).abs() / scale < 1e-9,
+                "u {u:e}: curvature {curvature:e} vs {expected_curvature:e}"
+            );
+        }
+        for u in [0.05, 0.1, 0.3] {
+            let x = 1.0 - u;
+            let direct = -libm::log1p(-u) - u - 0.5 * u * u;
+            let value = toe_value(x);
+            let scale = direct.abs().max(1e-300);
+            assert!(
+                (value - direct).abs() / scale < 1e-12,
+                "u {u:e}: value {value:e} vs {direct:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn toe_is_zero_above_the_anchor() {
+        for x in [1.0, 1.1, 1.5, 2.0] {
+            assert_eq!(toe_value(x), 0.0);
+            assert_eq!(toe_slope(x), 0.0);
+            assert_eq!(toe_curvature(x), 0.0);
+        }
+    }
+
+    #[test]
+    fn toe_is_continuous_at_the_anchor() {
+        let near = 1.0 - 1e-12;
+        assert!(toe_value(near) < 1e-36);
+        assert!(toe_slope(near).abs() < 1e-23);
+        assert!(toe_curvature(near).abs() < 1e-11);
+        assert_eq!(toe_value(1.0), 0.0);
+        assert_eq!(toe_slope(1.0), 0.0);
+        assert_eq!(toe_curvature(1.0), 0.0);
+        for x in [0.9, 0.99] {
+            let step = 1e-6;
+            let numerical = (toe_value(x + step) - toe_value(x - step)) / (2.0 * step);
+            let analytic = toe_slope(x);
+            let scale = analytic.abs().max(numerical.abs()).max(1e-12);
+            assert!(
+                (analytic - numerical).abs() / scale < 1e-6,
+                "x {x}: slope {analytic:e} vs {numerical:e}"
+            );
+            let numerical = (toe_slope(x + step) - toe_slope(x - step)) / (2.0 * step);
+            let analytic = toe_curvature(x);
+            let scale = analytic.abs().max(numerical.abs()).max(1e-12);
+            assert!(
+                (analytic - numerical).abs() / scale < 1e-6,
+                "x {x}: curvature {analytic:e} vs {numerical:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn toe_push_ratio_falls_with_the_anchor_distance() {
+        let anchor = toe_anchor();
+        for (lightness, expected) in [(10.0, 1.0 / 3.0), (15.0, 1.0 / 9.0)] {
+            let ratio = (toe_slope(lightness / anchor) / anchor) / (-1.0 / lightness);
+            let closed = (1.0 - lightness / anchor) * (1.0 - lightness / anchor);
+            assert!((ratio - closed).abs() < 1e-12, "J' {lightness}: {ratio} vs {closed}");
+            assert!(
+                (ratio - expected).abs() < 0.03,
+                "J' {lightness}: ratio {ratio} vs {expected}"
+            );
+        }
     }
 }
