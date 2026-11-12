@@ -1867,11 +1867,18 @@ pub(crate) fn predict_only(
     let w = paths.blend;
     let near = 1.0 - w;
     let space = image.space;
-    let ucs_post = (w > 0.0).then(|| {
+    let ucs_post = if w > 0.0 {
+        if outer_path_state(space, paths.ucs, clip_k).is_err() {
+            return (Ucs::new(0.0, 0.0, 0.0), [0.0; 3], None);
+        }
         let channels = output_channels(paths.ucs, space);
         let clipped = channels.map(|value| soft_clip(value, clip_k));
-        ucs_of_xyz(space.rgb_linear_to_xyz(Rgb::new(clipped[0], clipped[1], clipped[2])))
-    });
+        Some(ucs_of_xyz(space.rgb_linear_to_xyz(Rgb::new(
+            clipped[0], clipped[1], clipped[2],
+        ))))
+    } else {
+        None
+    };
     let internal_post = (near > 0.0).then(|| {
         let xyz_pre = looklab_model::look::internal_chroma_to_xyz(paths.internal, paths.ucs.j);
         let channels = xyz_channels(space, xyz_pre);
@@ -2028,6 +2035,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::layout::{Params, softplus_slope};
     use looklab_color::RgbSpace;
+    use looklab_model::ClipSettings;
+    use looklab_model::look::{ColorLayer, Residual, Tint};
+    use looklab_model::tone::Tone;
 
     const LIPSCHITZ_ENVELOPE: f64 = 1.0;
 
@@ -2062,6 +2072,50 @@ pub(crate) mod tests {
 
     fn target() -> Target {
         Target::new(Ucs::new(55.0, 0.5, -0.3))
+    }
+
+    #[test]
+    fn predict_only_rejects_an_outer_path_violation() {
+        let look = Look::new(
+            Tone::spline(136.425_760_286_722_24, [0.0; TONE_COEFS]).expect("constant tone"),
+            Tint::zeros(),
+            ColorLayer::zeros(),
+            Residual::zeros(),
+            ClipSettings::default_v1(),
+        )
+        .expect("look");
+        let context = ImageCtx {
+            transform: Mat3::IDENTITY,
+            a0: Mat3::IDENTITY,
+            space: RgbSpace::Srgb,
+            exposure_scale: 1.0,
+            wb_r: 1.0,
+            wb_b: 1.0,
+            tone_clamp: [ToneClamp::Interior; TONE_COEFS],
+        };
+        let rgb = [2.8917183876037598, 3.0424540042877197, 3.313408136367798];
+        let clip_k = 5.000_095e-3;
+        let input = LookInput::new(Xyz::from_array(context.transform.mul_vec(rgb)));
+        let values = look.layer_values(&input);
+        let paths = look.chroma_paths(&input, &values);
+        assert!(
+            domain_penalty::check_reference_tone(&values).is_ok(),
+            "the fixture fails the shared reference-tone check"
+        );
+        assert!(
+            domain_penalty::evaluate(&values, &paths).is_ok(),
+            "the fixture fails the shared domain penalty"
+        );
+        assert!(
+            outer_path_state(context.space, paths.ucs, clip_k).is_err(),
+            "the fixture outer path is feasible: {:?}",
+            paths.ucs
+        );
+        let (_, _, penalty) = predict_only(&look, &context, rgb, clip_k, &Target::new(paths.ucs));
+        assert!(
+            penalty.is_none(),
+            "predict_only accepted an outer path the full evaluation rejects"
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
