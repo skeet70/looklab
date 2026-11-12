@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #![cfg(feature = "synth")]
 #![allow(clippy::disallowed_types)]
+// The long recovery cases are compiled only for the pre-release tier.
+#![cfg_attr(not(feature = "long-tests"), allow(dead_code, unused_imports))]
 
 use looklab_color::{Rgb, RgbSpace};
 use looklab_fit::synth::{
@@ -300,6 +302,7 @@ fn held_out_vs_sweeps() {
     }
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn predicts_held_out_rerenders_at_unseen_settings() {
     let config = config();
@@ -360,6 +363,7 @@ fn predicts_held_out_rerenders_at_unseen_settings() {
     assert!(median(errors) <= 1.5);
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn hue_localized_blue_response_is_predicted() {
     use looklab_model::realization::GRL_FEATURES;
@@ -465,6 +469,7 @@ fn refit_recovers_responses_with_theta_fixed() {
     assert!(error_median < 2.5);
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn non_default_images_reduce_theta_uncertainty() {
     let dataset = controlled_dataset(&config());
@@ -490,6 +495,7 @@ fn non_default_images_reduce_theta_uncertainty() {
     );
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn recipe_images_do_not_move_theta() {
     let config = config();
@@ -548,6 +554,7 @@ fn rerender_groups_share_input_pixels_and_support_inflates() {
     let _ = model;
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn exposure_mode_prior_resolves_the_gauge() {
     let dataset = controlled_dataset(&config());
@@ -606,6 +613,7 @@ fn exposure_mode_prior_resolves_the_gauge() {
     );
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn capped_hessian_rows_converge_on_a_noisy_fit() {
     let dataset = controlled_dataset(&config());
@@ -666,6 +674,7 @@ fn capped_hessian_rows_converge_on_a_noisy_fit() {
     assert!(median(errors) <= 2.5);
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn capped_hessian_rows_still_use_the_full_operator_row_set() {
     let dataset = controlled_dataset(&config());

@@ -11,6 +11,15 @@ publish = false
 name = "looklab"
 path = "src/main.rs"
 
+[features]
+default = []
+# Long end-to-end fit cases; ordinary CI runs only tests that finish within 120 s solo.
+long-tests = []
+
+[[test]]
+name = "fit_exposure_hint"
+required-features = ["long-tests"]
+
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true

@@ -3,6 +3,8 @@
 
 #![cfg(feature = "synth")]
 #![allow(clippy::disallowed_types)]
+// The long recovery cases are compiled only for the pre-release tier.
+#![cfg_attr(not(feature = "long-tests"), allow(dead_code, unused_imports))]
 
 use looklab_fit::synth::{self, LookSelector, SynthConfig};
 use looklab_fit::{FitImage, FitOptions, fit};
@@ -19,6 +21,7 @@ fn pool(seed: u64, images: usize) -> Vec<FitImage> {
     synth::dataset_with(&config, &truth, &LookSelector::Single(&truth)).images
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn zero_sample_trust_removes_an_image_from_the_likelihood() {
     let options = FitOptions {
@@ -63,6 +66,7 @@ fn sample_trust_must_match_the_sample_count() {
     ));
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn down_weighted_samples_pull_less() {
     let options = FitOptions {

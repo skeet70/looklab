@@ -3,6 +3,8 @@
 
 #![cfg(feature = "synth")]
 #![allow(clippy::disallowed_types)]
+// The long recovery cases are compiled only for the pre-release tier.
+#![cfg_attr(not(feature = "long-tests"), allow(dead_code, unused_imports))]
 
 use looklab_color::ucs::{Ucs, UcsSpace, ucs_to_jmh};
 use looklab_color::{Rgb, RgbSpace, Xyz};
@@ -207,6 +209,7 @@ fn fixed_average(
     )
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn more_independent_bodies_reduce_mean_response_uncertainty() {
     let truth = synth::truth_look(7);
@@ -258,6 +261,7 @@ fn more_independent_bodies_reduce_mean_response_uncertainty() {
     );
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn same_body_independent_images_reduce_mean_response_uncertainty() {
     let truth = synth::truth_look(17);
@@ -308,6 +312,7 @@ fn max_sigma_v(result: &FitResult) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn coherent_underfit_survives_growing_sigma_v() {
     let truth = amplified(31);
@@ -386,6 +391,7 @@ fn rotated(seed: u64, degrees: f64) -> Look {
     look
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn opposite_body_bias_does_not_dilute_with_more_bodies() {
     let plus = rotated(41, 9.0);
@@ -590,6 +596,7 @@ fn inject_balanced_chroma(images: &mut [FitImage], value: f64) -> Option<usize> 
     Some(target)
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn opposing_chroma_errors_inside_a_region_are_retained() {
     let truth = synth::truth_look(81);
@@ -630,6 +637,7 @@ fn opposing_chroma_errors_inside_a_region_are_retained() {
     );
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn sparse_and_missing_regions_stay_conservative() {
     let truth = synth::truth_look(51);
@@ -693,6 +701,7 @@ fn sparse_and_missing_regions_stay_conservative() {
     );
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn single_sample_cell_uses_global_fallback() {
     let truth = synth::truth_look(91);
@@ -801,6 +810,7 @@ fn retain_one_sample_in_cell(images: &mut [FitImage], target: usize) -> bool {
     kept
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn estimated_field_marks_thin_cell_without_evidence_and_keeps_encodings_separate() {
     let seed = 121;
@@ -931,6 +941,7 @@ fn insufficient_evidence_is_a_typed_failure() {
     assert!(matches!(error, FitError::NoImages));
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn a_pool_without_a_held_out_fold_returns_an_unsupported_result() {
     let data = synth::dataset(&SynthConfig {
@@ -1009,6 +1020,7 @@ fn copies_without_independent_units_are_a_typed_failure() {
     assert!(matches!(error, FitError::NoModelErrorEvidence));
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn image_copies_do_not_add_confidence() {
     let truth = synth::truth_look(71);
@@ -1057,6 +1069,7 @@ fn image_copies_do_not_add_confidence() {
     );
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn distinct_same_raw_renders_are_preserved() {
     let truth = synth::truth_look(101);
@@ -1122,6 +1135,7 @@ fn distinct_same_raw_renders_are_preserved() {
     );
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn controlled_responses_do_not_become_model_error() {
     let schema = validate_control_schema(include_str!("../../../data/bodies/fujifilm-x-t5.yaml"))
@@ -1208,6 +1222,7 @@ fn controlled_responses_do_not_become_model_error() {
     );
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn held_nuisance_offsets_do_not_become_model_error() {
     let truth = synth::truth_look(61);
