@@ -877,10 +877,16 @@ pub(crate) fn firmware_basis_text(result: &FirmwareConfirmation) -> String {
         Some(ConfirmationBasis::Moderator) => "moderator decision".to_owned(),
         None => match result.state {
             ConfirmationState::Contradicted => "owner reports disagree".to_owned(),
-            ConfirmationState::OwnerReported => format!(
-                "reported by {}; not confirmed",
-                profile_count_text(result.reported_profiles)
-            ),
+            ConfirmationState::OwnerReported => {
+                let mut text = format!(
+                    "reported by {}; not confirmed",
+                    profile_count_text(result.reported_profiles)
+                );
+                if result.agreeing_groups > 0 {
+                    text.push_str(&format!(" · {} of 3 linked groups", result.agreeing_groups));
+                }
+                text
+            }
             ConfirmationState::Unconfirmed => {
                 format!("{} group(s); 3 needed", result.agreeing_groups)
             }

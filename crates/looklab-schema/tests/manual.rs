@@ -128,6 +128,7 @@ fn evidence(
         finding: Finding::Matches,
         submitted_at,
         linked: true,
+        profiles: 1,
     }
 }
 
@@ -151,6 +152,7 @@ fn corrected_evidence(
         },
         submitted_at,
         linked: true,
+        profiles: 1,
     }
 }
 

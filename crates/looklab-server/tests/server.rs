@@ -6153,14 +6153,14 @@ async fn standalone_confirmation_reports_unlinked_intake_and_queue() {
 #[tokio::test]
 async fn two_unlinked_profiles_report_owner_reported_without_a_conflict() {
     let mut server = TestServer::start().await;
-    server.persist_credential().await;
+    let first_owner = server.persist_credential().await;
     let camera = documented_camera("fujifilm/x-t5");
     let confirmation = confirmation_for(&camera, "native_simulations", "2.10");
     let (status, first) = post_standalone_confirmation_response(&mut server, &confirmation).await;
     assert_eq!(status, StatusCode::OK, "first: {first}");
     assert_eq!(first["receipt"]["owner_linkage"], "unlinked");
 
-    let (owner_two, _) = synced_owner(&server, b"owner-reported-two", "Owner Two").await;
+    let (owner_two, owner_two_id) = synced_owner(&server, b"owner-reported-two", "Owner Two").await;
     let request = synced_confirmation_request(&server, &owner_two, &confirmation).await;
     let (status, second) = post_confirmation(&server.app, &request).await;
     assert_eq!(status, StatusCode::OK, "second: {second}");
@@ -6193,6 +6193,16 @@ async fn two_unlinked_profiles_report_owner_reported_without_a_conflict() {
             .expect("conflicts")
             .is_empty()
     );
+
+    insert_serial_contribution(&server.db, "owner-one-linked", &first_owner, [21; 32]).await;
+    insert_serial_contribution(&server.db, "owner-two-linked", &owner_two_id, [21; 32]).await;
+    let linked = manual_summary(&server, "Fujifilm", "X-T5").await;
+    let control = summary_control(&linked, "native_simulations");
+    assert_eq!(control["state"], "owner_reported");
+    assert_eq!(control["agreeing_groups"], 1);
+    let result = &control["firmware"][0];
+    assert_eq!(result["owner_profiles"], 0);
+    assert_eq!(result["reported_profiles"], 2);
 
     let promotions: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM audit_log WHERE type = 'manual_confirmation_promotion'",

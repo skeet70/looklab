@@ -65,10 +65,17 @@ pub struct ManualEvidence {
     /// Whether the reporting profile has a non-withdrawn serial-bearing photo of this camera.
     #[serde(default = "default_linked")]
     pub linked: bool,
+    /// Distinct profiles in this identity group whose newest answer agrees with the group's.
+    #[serde(default = "one_profile")]
+    pub profiles: u32,
 }
 
 const fn default_linked() -> bool {
     true
+}
+
+const fn one_profile() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -492,6 +499,11 @@ pub struct ManualCheckReview {
     pub status: ManualCheckReviewStatus,
 }
 
+/// Whether two findings claim the same availability and domain for `capability`.
+pub fn findings_agree(capability: &DocumentedCapability, left: &Finding, right: &Finding) -> bool {
+    ActualClaim::from_finding(capability, left) == ActualClaim::from_finding(capability, right)
+}
+
 pub fn evaluate_camera(
     camera: &ManualCamera,
     evidence: &[ManualEvidence],
@@ -740,14 +752,15 @@ fn evaluate_firmware(
     owner_groups.sort_by_key(|group| std::cmp::Reverse(group.evidence.len()));
     let owner_profiles = owner_groups
         .iter()
-        .map(|group| group.evidence.len() as u32)
+        .flat_map(|group| group.evidence.iter())
+        .map(|entry| entry.profiles)
         .sum::<u32>();
-    let reported_profiles = owner_profiles.saturating_add(
-        linked_groups
-            .iter()
-            .map(|group| group.evidence.len() as u32)
-            .sum::<u32>(),
-    );
+    let reported_profiles = linked_groups
+        .iter()
+        .chain(owner_groups.iter())
+        .flat_map(|group| group.evidence.iter())
+        .map(|entry| entry.profiles)
+        .sum::<u32>();
     let mut reported_options = reported_options(capability, &linked_groups, &owner_groups);
     reported_options.sort_by(|left, right| {
         right

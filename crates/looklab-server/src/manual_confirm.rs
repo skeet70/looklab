@@ -143,18 +143,12 @@ struct ProfileObservation {
     finding: String,
 }
 
-struct GroupObservation {
-    occurrence: i64,
-    linked: bool,
-    observation: ProfileObservation,
-}
-
 /// Every profile's newest answer per control, definition and firmware. Linked profiles share an
 /// identity group; each unlinked profile is its own group under a namespaced id, so a later
 /// serial-bearing photo moves the newest answer into the linked group.
 pub async fn evidence(
     conn: &mut SqliteConnection,
-    camera: &BodyId,
+    camera: &ManualCamera,
     groups: &HashMap<CredentialId, CredentialId>,
     eligible: &HashSet<CredentialId>,
 ) -> Result<Vec<ManualEvidence>, sqlx::Error> {
@@ -168,7 +162,7 @@ pub async fn evidence(
          WHERE c.camera_id = ?
          ORDER BY occ.id",
     )
-    .bind(camera.as_str())
+    .bind(camera.id.as_str())
     .fetch_all(&mut *conn)
     .await?;
     type ProfileKey = (CredentialId, CapabilityKey, Vec<u8>, String);
@@ -200,33 +194,77 @@ pub async fn evidence(
             }
         }
     }
-    type GroupKey = (String, CapabilityKey, Vec<u8>, String);
-    let mut group_latest: HashMap<GroupKey, GroupObservation> = HashMap::new();
+    struct ProfileEntry {
+        credential: CredentialId,
+        group: String,
+        linked: bool,
+        key: CapabilityKey,
+        digest: Vec<u8>,
+        firmware: String,
+        observation: ProfileObservation,
+    }
+    let mut entries = Vec::with_capacity(profile_latest.len());
     for ((credential, key, digest, firmware), observation) in profile_latest {
         let linked = eligible.contains(&credential) && groups.contains_key(&credential);
         let group = match groups.get(&credential) {
             Some(group) if linked => group.as_str().to_owned(),
             _ => format!("profile:{}", credential.as_str()),
         };
-        let group_key = (group, key, digest, firmware);
+        entries.push(ProfileEntry {
+            credential,
+            group,
+            linked,
+            key,
+            digest,
+            firmware,
+            observation,
+        });
+    }
+    type GroupKey = (String, CapabilityKey, Vec<u8>, String);
+    let mut group_latest: HashMap<GroupKey, usize> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let group_key = (
+            entry.group.clone(),
+            entry.key,
+            entry.digest.clone(),
+            entry.firmware.clone(),
+        );
         match group_latest.get(&group_key) {
-            Some(existing) if existing.occurrence >= observation.occurrence => {}
+            Some(&existing)
+                if entries[existing].observation.occurrence >= entry.observation.occurrence => {}
             _ => {
-                group_latest.insert(
-                    group_key,
-                    GroupObservation {
-                        occurrence: observation.occurrence,
-                        linked,
-                        observation,
-                    },
-                );
+                group_latest.insert(group_key, index);
             }
         }
     }
     let mut evidence = Vec::with_capacity(group_latest.len());
-    for ((group, key, _, _), entry) in group_latest {
+    for ((group, key, _, _), index) in group_latest {
+        let entry = &entries[index];
         if entry.observation.withdrawn {
             continue;
+        }
+        let capability = camera
+            .capabilities
+            .iter()
+            .find(|capability| capability.key == key)
+            .ok_or_else(|| sqlx::Error::Protocol(format!("unknown control {}", key.as_str())))?;
+        let finding = serde_json::from_str::<Finding>(&entry.observation.finding)
+            .map_err(|_| sqlx::Error::Protocol("finding is not readable".to_owned()))?;
+        let mut profiles = std::collections::BTreeSet::new();
+        for other in &entries {
+            if other.group != group
+                || other.key != key
+                || other.digest != entry.digest
+                || other.firmware != entry.firmware
+                || other.observation.withdrawn
+            {
+                continue;
+            }
+            let other_finding = serde_json::from_str::<Finding>(&other.observation.finding)
+                .map_err(|_| sqlx::Error::Protocol("finding is not readable".to_owned()))?;
+            if looklab_schema::findings_agree(capability, &finding, &other_finding) {
+                profiles.insert(other.credential.clone());
+            }
         }
         evidence.push(ManualEvidence {
             identity_group: IdentityGroupId::new(&group)
@@ -234,14 +272,16 @@ pub async fn evidence(
             firmware: ReportedFirmware::new(&entry.observation.firmware)
                 .map_err(|_| sqlx::Error::Protocol("empty firmware".to_owned()))?,
             control: key,
-            definition_digest: Sha256Hex::from_bytes(entry.observation.digest.try_into().map_err(
-                |_| sqlx::Error::Protocol("definition digest is not 32 bytes".to_owned()),
-            )?),
-            finding: serde_json::from_str::<Finding>(&entry.observation.finding)
-                .map_err(|_| sqlx::Error::Protocol("finding is not readable".to_owned()))?,
+            definition_digest: Sha256Hex::from_bytes(
+                entry.observation.digest.clone().try_into().map_err(|_| {
+                    sqlx::Error::Protocol("definition digest is not 32 bytes".to_owned())
+                })?,
+            ),
+            finding,
             // Occurrence ids are the monotonic submission order.
             submitted_at: entry.observation.occurrence,
             linked: entry.linked,
+            profiles: u32::try_from(profiles.len()).unwrap_or(u32::MAX),
         });
     }
     Ok(evidence)
@@ -683,7 +723,7 @@ pub async fn summary_with(
 ) -> Result<ManualConfirmationSummary, sqlx::Error> {
     let groups = identity_groups(&mut *conn).await?;
     let eligible = camera_credentials(&mut *conn, &camera.id).await?;
-    let evidence = evidence(&mut *conn, &camera.id, &groups, &eligible).await?;
+    let evidence = evidence(&mut *conn, camera, &groups, &eligible).await?;
     let moderators = moderator_records(&mut *conn, camera).await?;
     let mut summary = evaluate_camera(camera, &evidence, &moderators);
     let checks = latest_checks(&mut *conn, Some(&camera.id)).await?;
@@ -718,7 +758,7 @@ pub async fn reviews(
             continue;
         };
         let eligible = camera_credentials(&mut tx, &camera.id).await?;
-        let evidence = evidence(&mut tx, &camera.id, &groups, &eligible).await?;
+        let evidence = evidence(&mut tx, camera, &groups, &eligible).await?;
         let decisions = moderator_decisions(&mut tx, camera).await?;
         let mut records: BTreeMap<CapabilityKey, Vec<ModeratorRecord>> = BTreeMap::new();
         for decision in &decisions {
