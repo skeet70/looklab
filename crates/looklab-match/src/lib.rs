@@ -28,8 +28,8 @@ pub mod synth;
 pub use calibration::Calibration;
 pub use card::{
     Confidence, ConfidenceLevel, ControlEntry, MissedRegion, REACHABILITY_TOLERANCE_DE,
-    Reachability, ReachabilityStatus, SettingsCard, SettingsSupport, base_label, settings_card,
-    settings_card_with_support,
+    Reachability, ReachabilityStatus, SettingsCard, SettingsSupport, base_label, destination_scope,
+    settings_card, settings_card_with_support,
 };
 pub use covariance::{
     ControlCovariance, CovTerm, CovarianceFile, CovarianceGroup, SparseDelta, predicted_trace,

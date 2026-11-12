@@ -146,7 +146,7 @@ impl SettingsCard {
         }
         if let Some(base) = &self.approximated_base {
             out.push_str(&format!(
-                "approximation: the settings approximate the declared base {base}\n"
+                "approximation: the target's fitted coefficients approximate the declared base {base}\n"
             ));
         }
         if let Some(scope) = &self.destination_scope {
@@ -452,6 +452,28 @@ pub fn settings_card_with_support(
         approximated_base: None,
         destination_scope: None,
     })
+}
+
+/// The plain settings-text label for how the destination realization stands.
+pub fn destination_scope(
+    mode: Option<crate::permalink::SelectionMode>,
+    excluded: &[String],
+) -> Option<String> {
+    let mut parts = Vec::new();
+    match mode {
+        Some(crate::permalink::SelectionMode::Qualified) => {}
+        Some(crate::permalink::SelectionMode::Experimental) => {
+            parts.push("the camera realization is experimental".to_owned());
+        }
+        None => parts.push("the camera realization is unassessed".to_owned()),
+    }
+    if !excluded.is_empty() {
+        parts.push(format!(
+            "the camera bundle excludes {}",
+            excluded.join(", ")
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// The plain label a settings card uses for a declared base.

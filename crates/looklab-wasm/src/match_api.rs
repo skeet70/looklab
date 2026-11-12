@@ -824,7 +824,16 @@ pub fn run_verify(message: &VerifyRequestMessage) -> Result<VerifyReply, FacadeE
     let mut card =
         settings_card_with_support(target_for_second, &plan, card_model, &second, support)?;
     card.approximated_base = case.inputs.approximated_base.clone();
-    card.destination_scope = case.inputs.destination_scope.clone();
+    card.destination_scope = if downgraded {
+        let excluded: Vec<String> = case
+            .excluded
+            .iter()
+            .map(|entry| entry.sim.as_str().to_owned())
+            .collect();
+        looklab_match::destination_scope(next_mode, &excluded)
+    } else {
+        case.inputs.destination_scope.clone()
+    };
     let next_sim = case.sim(&second.sim)?;
     Ok(VerifyReply {
         permalink: case.permalink(next_sim, &second.sim, &next_calibration, next_mode)?,

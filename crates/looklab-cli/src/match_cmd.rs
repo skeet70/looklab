@@ -317,10 +317,8 @@ pub fn run_match(args: &MatchArgs) -> Result<()> {
         .as_ref()
         .and_then(|definition| definition.declared_base.as_ref())
         .map(looklab_match::base_label);
-    card.destination_scope = selection
-        .as_ref()
-        .is_some_and(|context| context.mode == SelectionMode::Experimental)
-        .then(|| "the camera realization is experimental".to_owned());
+    card.destination_scope =
+        looklab_match::destination_scope(selection.as_ref().map(|context| context.mode), &[]);
     print!("{}", card.render_text());
     match &selection {
         Some(context) => println!(
@@ -1477,11 +1475,7 @@ pub fn run_verify(args: &VerifyArgs) -> Result<()> {
         .as_ref()
         .and_then(|definition| definition.declared_base.as_ref())
         .map(looklab_match::base_label);
-    card.destination_scope = permalink
-        .selection
-        .as_ref()
-        .is_some_and(|selection| selection.mode == SelectionMode::Experimental)
-        .then(|| "the camera realization is experimental".to_owned());
+    card.destination_scope = looklab_match::destination_scope(next_mode, &[]);
 
     let crm_out = args
         .out_crm

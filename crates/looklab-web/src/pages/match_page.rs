@@ -1045,7 +1045,7 @@ fn recipe_text(
     }
     if let Some(base) = &card.approximated_base {
         text.push_str(&format!(
-            "Approximation: the settings approximate the declared base {base}.\n"
+            "Approximation: the target's fitted coefficients approximate the declared base {base}.\n"
         ));
     }
     if let Some(scope) = &card.destination_scope {

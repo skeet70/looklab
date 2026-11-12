@@ -421,31 +421,22 @@ fn approximated_base(version: &LoadedVersion) -> Option<String> {
             .definition
             .as_ref()
             .and_then(|definition| definition.declared_base.as_ref())
-            .map(crate::data::base_label),
+            .map(looklab_match::base_label),
         crate::data::VersionContent::SourcePreview(_) => None,
     }
 }
 
 fn destination_scope(scope: SelectionScope, excluded: &[ExcludedSim]) -> Option<String> {
-    let mut parts = Vec::new();
-    match scope {
-        SelectionScope::Qualified => {}
-        SelectionScope::Experimental => {
-            parts.push("the camera realization is experimental".to_owned());
-        }
-        SelectionScope::Unassessed => {
-            parts.push("the camera realization is unassessed".to_owned());
-        }
-    }
-    if !excluded.is_empty() {
-        let sims = excluded
-            .iter()
-            .map(|entry| entry.sim.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        parts.push(format!("the camera bundle excludes {sims}"));
-    }
-    (!parts.is_empty()).then(|| parts.join("; "))
+    let mode = match scope {
+        SelectionScope::Qualified => Some(looklab_match::SelectionMode::Qualified),
+        SelectionScope::Experimental => Some(looklab_match::SelectionMode::Experimental),
+        SelectionScope::Unassessed => None,
+    };
+    let sims: Vec<String> = excluded
+        .iter()
+        .map(|entry| entry.sim.as_str().to_owned())
+        .collect();
+    looklab_match::destination_scope(mode, &sims)
 }
 
 fn excluded_sims(manifest: &MatchBundleRevision) -> Vec<ExcludedSim> {

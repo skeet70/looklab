@@ -820,7 +820,9 @@ fn settings_text_names_the_declared_base_it_approximates() {
     card.destination_scope = Some("the camera realization is experimental".to_owned());
     let text = card.render_text();
     assert!(
-        text.contains("the settings approximate the declared base classic-chrome@2.0.0"),
+        text.contains(
+            "the target's fitted coefficients approximate the declared base classic-chrome@2.0.0"
+        ),
         "{text}"
     );
     assert!(
