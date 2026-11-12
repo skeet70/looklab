@@ -13,9 +13,8 @@ use crate::trust_region::{
 const SHARED_INNER_PRODUCTS: usize = 4088;
 /// Post-solve products reserved for the two arms.
 const RESERVED_POST_PRODUCTS: usize = 8;
-/// Sample evaluations over the frozen 3360-row case: one linearization and up to three trials
-/// per arm.
-const SAMPLE_CEILING: u64 = 23_520;
+/// Sample evaluations over the frozen 3360-row case: one linearization and two trials.
+const SAMPLE_CEILING: u64 = 10_080;
 const TOTAL_PRODUCT_CEILING: usize = 4096;
 
 /// `artifact://17034`, printed to ten significant digits.
@@ -307,7 +306,7 @@ struct FallbackLimits {
 }
 
 fn fallback_limits(baseline_products: usize) -> FallbackLimits {
-    let production = JOINT_CG_LIMIT.saturating_sub(4);
+    let production = ANALYTIC_WORK_LIMIT;
     let remaining = SHARED_INNER_PRODUCTS.saturating_sub(baseline_products);
     FallbackLimits {
         baseline: production.min(SHARED_INNER_PRODUCTS),
@@ -1553,8 +1552,8 @@ mod tests {
     #[test]
     fn shared_inner_allowance_is_split_not_duplicated() {
         let fresh = fallback_limits(0);
-        assert_eq!(fresh.baseline, SHARED_INNER_PRODUCTS);
-        assert_eq!(fresh.candidate, SHARED_INNER_PRODUCTS);
+        assert_eq!(fresh.baseline, ANALYTIC_WORK_LIMIT);
+        assert_eq!(fresh.candidate, ANALYTIC_WORK_LIMIT);
         assert!(!fresh.binding);
 
         let one_left = fallback_limits(SHARED_INNER_PRODUCTS - 1);

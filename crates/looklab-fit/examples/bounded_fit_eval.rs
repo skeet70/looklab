@@ -857,6 +857,7 @@ mod bounded {
         TrustRegion,
         Cauchy,
         Box,
+        Positive,
         Invalid,
     }
 
@@ -1047,15 +1048,18 @@ mod bounded {
             solve_status,
             trust: token_after(line, "solver ").map(|solver| TrustTrial {
                 termination: match (solver, token_after(line, "termination ")) {
-                    ("analytic-tr", Some("interior")) => TrustTermination::Interior,
-                    ("analytic-tr", Some("boundary")) => TrustTermination::Boundary,
-                    ("analytic-tr", Some("negative")) => TrustTermination::NegativeCurvature,
+                    ("analytic-tr" | "positive", Some("interior")) => TrustTermination::Interior,
+                    ("analytic-tr" | "positive", Some("boundary")) => TrustTermination::Boundary,
+                    ("analytic-tr" | "positive", Some("negative")) => {
+                        TrustTermination::NegativeCurvature
+                    }
                     _ => TrustTermination::Invalid,
                 },
                 selected: match token_after(line, "selected ") {
                     Some("tr") => StepSelection::TrustRegion,
                     Some("cauchy") => StepSelection::Cauchy,
                     Some("box") => StepSelection::Box,
+                    Some("positive") => StepSelection::Positive,
                     _ => StepSelection::Invalid,
                 },
                 proposal_residual: number_after(line, "proposal_residual "),
@@ -1472,17 +1476,21 @@ mod bounded {
                 return false;
             }
             return match (trust.selected, trust.termination) {
-                (StepSelection::TrustRegion, TrustTermination::Interior) => {
-                    match (trust.proposal_residual, trial.tolerance) {
-                        (Some(residual), Some(tolerance)) => {
-                            tolerance.is_finite() && tolerance > 0.0 && residual <= tolerance
-                        }
-                        _ => false,
+                (
+                    StepSelection::TrustRegion | StepSelection::Positive,
+                    TrustTermination::Interior,
+                ) => match (trust.proposal_residual, trial.tolerance) {
+                    (Some(residual), Some(tolerance)) => {
+                        tolerance.is_finite() && tolerance > 0.0 && residual <= tolerance
                     }
-                }
+                    _ => false,
+                },
                 (StepSelection::Cauchy | StepSelection::Box, TrustTermination::Interior)
                 | (
-                    StepSelection::Cauchy | StepSelection::Box | StepSelection::TrustRegion,
+                    StepSelection::Cauchy
+                    | StepSelection::Box
+                    | StepSelection::TrustRegion
+                    | StepSelection::Positive,
                     TrustTermination::Boundary | TrustTermination::NegativeCurvature,
                 ) => true,
                 _ => false,
