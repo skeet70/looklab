@@ -34,6 +34,10 @@ enum AdminCommand {
     ReAnchor(ReAnchorArgs),
     /// Admit a community LUT as an approved custom look.
     ImportLut(Box<ImportLutArgs>),
+    /// Revert a Look to a published version and reject named contributions.
+    Revert(RevertArgs),
+    /// Block a profile from every future intake route.
+    BlockIntake(BlockIntakeArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -103,6 +107,35 @@ struct ReAnchorArgs {
     look: String,
     #[arg(long)]
     version: u32,
+    #[arg(long)]
+    reason: String,
+}
+
+#[derive(Debug, Args)]
+struct RevertArgs {
+    #[arg(long)]
+    db: PathBuf,
+    #[arg(long)]
+    blobs: PathBuf,
+    #[arg(long)]
+    look: String,
+    /// The published version to restore.
+    #[arg(long)]
+    version: u32,
+    /// A contribution to reject; repeatable.
+    #[arg(long = "reject-contribution")]
+    reject_contribution: Vec<String>,
+    #[arg(long)]
+    reason: String,
+}
+
+#[derive(Debug, Args)]
+struct BlockIntakeArgs {
+    #[arg(long)]
+    db: PathBuf,
+    /// The internal credential id of the profile to block.
+    #[arg(long)]
+    profile: String,
     #[arg(long)]
     reason: String,
 }
@@ -313,6 +346,8 @@ async fn run_async(args: &AdminArgs) -> Result<()> {
         AdminCommand::List(args) => list(args).await,
         AdminCommand::ReAnchor(args) => reanchor(args).await,
         AdminCommand::ImportLut(args) => import_lut(args).await,
+        AdminCommand::Revert(args) => revert(args).await,
+        AdminCommand::BlockIntake(args) => block_intake(args).await,
     }
 }
 
@@ -429,6 +464,67 @@ async fn import_lut(args: &ImportLutArgs) -> Result<()> {
     println!(
         "admitted {} as proposal {} (approved by cli); the import job is queued",
         admitted.look, admitted.proposal
+    );
+    Ok(())
+}
+
+async fn revert(args: &RevertArgs) -> Result<()> {
+    if !args.db.is_file() {
+        bail!("{} is not an existing database file", args.db.display());
+    }
+    if !args.blobs.is_dir() {
+        bail!("{} is not an existing blob directory", args.blobs.display());
+    }
+    let look = LookSlug::try_from(args.look.as_str())
+        .with_context(|| format!("{} is not a look slug", args.look))?;
+    let rejected = args
+        .reject_contribution
+        .iter()
+        .map(|id| {
+            looklab_server::ContributionId::try_from(id.as_str())
+                .with_context(|| format!("{id} is not an internal contribution id"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let db = open(&args.db).await?;
+    let record = looklab_server::admin::revert(
+        &db,
+        &args.blobs,
+        Actor::Cli,
+        &look,
+        args.version,
+        &rejected,
+        &args.reason,
+    )
+    .await
+    .context("reverting the Look")?;
+    let restoration = match record.restoration {
+        looklab_server::admin::Restoration::Current => "current".to_owned(),
+        looklab_server::admin::Restoration::HistoricalNeedsRebuild { reason } => {
+            format!("historical copy that needs rebuilding ({reason:?})")
+        }
+    };
+    println!(
+        "reverted {} to version {} as version {} (approved by cli)",
+        record.look, record.target_version, record.new_version
+    );
+    println!("restoration: {restoration}");
+    println!("rejected contributions: {}", record.rejected.len());
+    println!("dependent LUT rebases: {}", record.lut_dependents.len());
+    println!("refit queued: {}", record.refit_queued);
+    Ok(())
+}
+
+async fn block_intake(args: &BlockIntakeArgs) -> Result<()> {
+    if !args.db.is_file() {
+        bail!("{} is not an existing database file", args.db.display());
+    }
+    let db = open(&args.db).await?;
+    let profile = subject(&args.profile)?;
+    let record =
+        looklab_server::admin::block_intake(&db, Actor::Cli, &profile, &args.reason).await?;
+    println!(
+        "blocked intake for {} at {} (approved by cli)",
+        record.credential, record.blocked_at
     );
     Ok(())
 }

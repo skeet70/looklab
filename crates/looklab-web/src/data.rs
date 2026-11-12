@@ -496,17 +496,7 @@ pub fn source_preview_composition(preview: &SourceLutPreview) -> String {
 }
 
 pub(crate) fn base_label(base: &looklab_model::file::BaseReference) -> String {
-    match base {
-        looklab_model::file::BaseReference::Look { slug, version } => {
-            format!("{}@{}", slug.as_str(), version.as_str())
-        }
-        looklab_model::file::BaseReference::BodyRealization { body, .. } => {
-            body.as_str().to_owned()
-        }
-        looklab_model::file::BaseReference::FamilyRendering {
-            maker, rendering, ..
-        } => format!("{maker} {rendering}"),
-    }
+    looklab_match::base_label(base)
 }
 
 fn version_summary<'a>(

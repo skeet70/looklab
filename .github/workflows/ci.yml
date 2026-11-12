@@ -39,6 +39,8 @@ jobs:
         run: nix develop -c python3 -m unittest discover -s tools/tests -v
       - name: Clippy
         run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+      - name: Feature-gated examples
+        run: nix develop -c cargo clippy -p looklab-publish --features photo-scenes --examples -- -D warnings
       - name: Web client clippy (wasm32)
         run: nix develop -c cargo clippy -p looklab-web --target wasm32-unknown-unknown -- -D warnings
       - name: Float method allow-list

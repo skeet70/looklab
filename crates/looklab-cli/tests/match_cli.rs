@@ -203,3 +203,105 @@ fn match_prints_a_card_and_verify_runs_one_iteration() {
         command
     });
 }
+
+#[test]
+fn a_lut_target_prints_its_declared_base_and_destination_scope() {
+    use looklab_model::file::{
+        BaseReference, BaseStatus, DeclaredEncoding, LicenseRecord, LookVersion, LutData,
+        LutDefinition, OutputEncoding, Slug,
+    };
+    use looklab_model::{LookKind, WbPolicy};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let body = synth::body(9).expect("synthetic body");
+    let base = BaseReference::Look {
+        slug: Slug::new("base").expect("slug"),
+        version: LookVersion::new("1.0.0").expect("version"),
+    };
+    let declared = BaseReference::Look {
+        slug: Slug::new("declared-base").expect("slug"),
+        version: LookVersion::new("1.0.0").expect("version"),
+    };
+    let mut values = Vec::new();
+    for b in 0..2 {
+        for g in 0..2 {
+            for r in 0..2 {
+                values.extend([f64::from(r), f64::from(g), f64::from(b)]);
+            }
+        }
+    }
+    let lut = LutData::new(2, [0.0; 3], [1.0; 3], values).expect("lut");
+    let definition = LutDefinition {
+        name: "Declared LUT".to_owned(),
+        license: LicenseRecord {
+            own_work: true,
+            source_license: None,
+            source_url: None,
+            attribution: "a donor".to_owned(),
+        },
+        encoding: DeclaredEncoding::DisplayReferred {
+            base: base.clone(),
+            status: BaseStatus::Pinned,
+        },
+        declared_base: Some(declared),
+        output: OutputEncoding::Srgb,
+        lut: lut.record(),
+        emulates: None,
+        superseded_by: None,
+        notes: Vec::new(),
+    };
+    let identity = looklab_model::file::identity("lut-target", "1.0.0").expect("identity");
+    let document = LookDocument::from_lut_definition(
+        looklab_model::file::LookIdentity::new(
+            identity.slug.as_str(),
+            identity.version.as_str(),
+            LookKind::LutDefined,
+            WbPolicy::Adaptive,
+        )
+        .expect("identity"),
+        looklab_model::Look::colorimetric(),
+        definition,
+        lut,
+    )
+    .expect("lut document");
+    let target_path = temp.path().join("target.looklab");
+    std::fs::write(&target_path, document.encode().expect("encode")).expect("write target");
+    let base_path = temp.path().join("base.looklab");
+    write_document(&base_path, "base", &body.model.base_look);
+    let crm_path = temp.path().join("crm.json");
+    std::fs::write(&crm_path, encode_crm(&body.model.crm).expect("encode crm")).expect("write crm");
+    let transform = looklab_cli::TransformFile {
+        format: "looklab-transform/1".to_string(),
+        version: 1,
+        body: None,
+        cct: None,
+        camera_to_xyz: Some(synth::transform()),
+        color_matrices: Vec::new(),
+        forward_matrices: Vec::new(),
+        per_image: Vec::new(),
+    };
+    let transform_path = temp.path().join("transform.yaml");
+    std::fs::write(&transform_path, transform.to_yaml().expect("yaml")).expect("write transform");
+
+    let output = flat_match(&target_path, &crm_path, &base_path, &transform_path)
+        .args(["--realization-version", "1"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "match failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(
+        text.contains(
+            "the target's fitted coefficients approximate the declared base declared-base@1.0.0"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("destination realization: the camera realization is unassessed"),
+        "{text}"
+    );
+}

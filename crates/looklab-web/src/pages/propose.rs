@@ -1439,7 +1439,7 @@ fn KindPicker(form: Form) -> impl IntoView {
             "Correct the controls a camera offers, their ranges or menu choices. Get the look uses them to write settings cards."
         }
         ProposalKind::LutLook => {
-            "Add a custom look built from a .cube LUT file. The file is uploaded with the proposal and stays private until approval; published custom looks appear on Looks, in Compare and in Get the look."
+            "Add a custom look built from a .cube LUT file. The file is uploaded with the proposal and stays private until approval; published custom looks appear on Looks and in Compare, and matchable ones also appear in Get the look."
         }
         ProposalKind::InterfaceProfile => {
             "Define how an editing app applies exported looks with a looklab YAML profile. Published profiles appear on For developers → Editing apps and enable the Editing app result in Get the look."
@@ -2152,6 +2152,8 @@ fn LutFields(form: Form, index: SiteIndex) -> impl IntoView {
     view! {
         <section aria-labelledby="lut-heading">
             <h2 id="lut-heading">"The custom look"</h2>
+            <p>"A custom look is a .cube LUT that changes how colors and brightness render. Published custom looks appear on Looks and in Compare; matchable ones also appear in Get the look."</p>
+            <p><a href="https://github.com/skeet70/looklab/blob/main/docs/02-color-pipeline.md#38-lut-defined-looks">"How custom looks are built"</a></p>
             <crate::ui::DropZone on_files=Callback::new(move |selected| {
                 let Some(file) = files::selected_files(selected).into_iter().next() else { return; };
                 let generation = form.lut_generation.get_untracked().wrapping_add(1);

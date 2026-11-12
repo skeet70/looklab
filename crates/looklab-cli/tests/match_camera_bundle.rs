@@ -719,7 +719,11 @@ fn unselected_camera_matching_rejects_physical_context_flags() {
 #[test]
 fn verify_downgrades_a_calibrated_qualified_selection_and_replays_it() {
     let fixture = camera_fixture();
-    ok(qualified_match(&fixture));
+    let first_stdout = ok_output(qualified_match(&fixture).output().expect("run"));
+    assert!(
+        !first_stdout.contains("destination realization:"),
+        "{first_stdout}"
+    );
     let permalink_path = fixture.temp.path().join("match.permalink");
     let original = Permalink::parse(&std::fs::read_to_string(&permalink_path).expect("permalink"))
         .expect("parse");
@@ -733,6 +737,10 @@ fn verify_downgrades_a_calibrated_qualified_selection_and_replays_it() {
     let stdout = ok_output(verify(&permalink_path, &observed, &fixture.site));
     assert!(
         stdout.contains("the local calibration makes the next selection experimental"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("destination realization: the camera realization is experimental"),
         "{stdout}"
     );
 

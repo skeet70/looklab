@@ -807,3 +807,38 @@ fn fixed_target_without_domain_is_unassessed_not_reachable() {
     assert!(card.missed.is_empty());
     assert!(!card.render_text().contains("unreachable"));
 }
+
+#[test]
+fn settings_text_names_the_declared_base_it_approximates() {
+    let plan = synth::plan();
+    let probes = synth::probes();
+    let body = synth::body(6).expect("synthetic body");
+    let fixed = FixedTarget(Ucs::new(50.0, 0.0, 0.0));
+    let target = prepared(&probes, &fixed, body.appearance());
+    let mut card = card_for(&target, &plan, &body.model, &plan.default);
+    card.approximated_base = Some("classic-chrome@2.0.0".to_owned());
+    card.destination_scope = Some("the camera realization is experimental".to_owned());
+    let text = card.render_text();
+    assert!(
+        text.contains(
+            "the target's fitted coefficients approximate the declared base classic-chrome@2.0.0"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("destination realization: the camera realization is experimental"),
+        "{text}"
+    );
+}
+
+#[test]
+fn settings_text_omits_approximation_without_a_declared_base() {
+    let plan = synth::plan();
+    let probes = synth::probes();
+    let body = synth::body(6).expect("synthetic body");
+    let fixed = FixedTarget(Ucs::new(50.0, 0.0, 0.0));
+    let target = prepared(&probes, &fixed, body.appearance());
+    let text = card_for(&target, &plan, &body.model, &plan.default).render_text();
+    assert!(!text.contains("approximation:"), "{text}");
+    assert!(!text.contains("destination realization"), "{text}");
+}

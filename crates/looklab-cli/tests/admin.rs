@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use assert_cmd::Command;
-use looklab_server::CredentialId;
+use looklab_model::file::{LookDocument, LookIdentity};
+use looklab_model::{Look, LookKind, WbPolicy};
+use looklab_server::admin::{self, ManifestArtifact, VersionStatus};
+use looklab_server::{ContributionId, CredentialId};
+use looklab_trust::VersionId;
 use looklab_trust::{Scope, ScopeRule};
-use looklab_upload::BodyId;
+use looklab_upload::{BodyId, LookSlug};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -419,4 +424,242 @@ async fn admin_imports_an_explicit_lut_with_an_unnamed_renderer() {
         .await
         .expect("proposals");
     assert_eq!(proposals, 0);
+}
+
+fn store_blob(blobs: &std::path::Path, bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    std::fs::write(blobs.join(&hex), bytes).expect("blob");
+    hex
+}
+
+fn version_artifacts(blobs: &std::path::Path, look: &str, version: u32) -> Vec<ManifestArtifact> {
+    let identity = LookIdentity::new(
+        look,
+        &format!("{version}.0.0"),
+        LookKind::NativeFamily,
+        WbPolicy::Adaptive,
+    )
+    .expect("identity");
+    let document = LookDocument::from_look(identity, Look::colorimetric()).expect("document");
+    let release = serde_json::json!({
+        "version": version,
+        "gauge": 0.0,
+        "anchor": version,
+        "clip_k": 1.0,
+        "probes": [],
+        "gated_since_anchor": {"probes": []},
+        "converged": true,
+        "gate": {},
+        "provenance": {"anchor_version": format!("{version}.0.0")},
+        "created_at": 0,
+    });
+    vec![
+        ManifestArtifact {
+            name: looklab_publish::DOCUMENT_ARTIFACT.to_owned(),
+            sha256: store_blob(blobs, &document.encode().expect("look bytes")),
+        },
+        ManifestArtifact {
+            name: "release.json".to_owned(),
+            sha256: store_blob(blobs, &serde_json::to_vec(&release).expect("release json")),
+        },
+    ]
+}
+
+async fn accept_family_version(db: &sqlx::SqlitePool, look: &str, version: u32) {
+    let subject = format!("shared_family:{look}");
+    sqlx::query(
+        "INSERT INTO model_subjects (key, kind, family, created_at)
+         VALUES (?, 'shared_family', ?, 0)
+         ON CONFLICT(key) DO NOTHING",
+    )
+    .bind(&subject)
+    .bind(look)
+    .execute(db)
+    .await
+    .expect("subject");
+    sqlx::query(
+        "INSERT INTO model_subject_revisions (subject_key, revision, role, recorded_at)
+         VALUES (?, ?, 'target', 0)
+         ON CONFLICT(subject_key, revision) DO NOTHING",
+    )
+    .bind(&subject)
+    .bind(i64::from(version))
+    .execute(db)
+    .await
+    .expect("accepted marker");
+}
+
+#[tokio::test]
+async fn admin_reverts_a_look_through_the_cli_actor() {
+    const LOOK: &str = "classic-chrome";
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("looklab.sqlite3");
+    let blobs = dir.path().join("blobs");
+    std::fs::create_dir_all(&blobs).expect("blob dir");
+    let pool = looklab_server::open_database(&path)
+        .await
+        .expect("database");
+    let contributor = CredentialId::new();
+    sqlx::query(
+        "INSERT INTO credentials
+         (id, credential_id, webauthn_credential, tier, roles, reputation, created_at, status)
+         VALUES (?, ?, '{}', 'new', '[]', 0.0, 0, 'active')",
+    )
+    .bind(contributor.as_str())
+    .bind(contributor.as_str().as_bytes())
+    .execute(&pool)
+    .await
+    .expect("credential");
+    let contribution = ContributionId::new();
+    sqlx::query(
+        "INSERT INTO contributions
+         (id, credential_id, batch_manifest_hash, signature, pow, kind, intent, target_look_id,
+          body_id, firmware_version, sim_key, settings, status, created_at)
+         VALUES (?, ?, x'00', x'00', 'pow', 'library', 'native', ?, 'fujifilm/x-t5', '2.10',
+                 'sim', '{}', 'accepted', 0)",
+    )
+    .bind(contribution.as_str())
+    .bind(contributor.as_str())
+    .bind(LOOK)
+    .execute(&pool)
+    .await
+    .expect("contribution");
+    accept_family_version(&pool, LOOK, 1).await;
+    admin::write_version_manifest(
+        &pool,
+        &LookSlug::try_from(LOOK).expect("slug"),
+        VersionId::new(1),
+        VersionStatus::Published,
+        &version_artifacts(&blobs, LOOK, 1),
+        &[],
+    )
+    .await
+    .expect("version 1");
+
+    Command::cargo_bin("looklab")
+        .expect("binary")
+        .args([
+            "admin",
+            "revert",
+            "--db",
+            path.to_str().expect("path"),
+            "--blobs",
+            blobs.to_str().expect("blobs"),
+            "--look",
+            LOOK,
+            "--version",
+            "1",
+            "--reject-contribution",
+            contribution.as_str(),
+            "--reason",
+            "the contribution mislabels the look",
+        ])
+        .assert()
+        .success();
+
+    let versions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM look_versions WHERE look = ?")
+        .bind(LOOK)
+        .fetch_one(&pool)
+        .await
+        .expect("versions");
+    assert_eq!(versions, 2);
+    let successor: String =
+        sqlx::query_scalar("SELECT status FROM look_versions WHERE look = ? AND version = 2")
+            .bind(LOOK)
+            .fetch_one(&pool)
+            .await
+            .expect("successor status");
+    assert_eq!(successor, "deprecated");
+    let rejected: String = sqlx::query_scalar("SELECT status FROM contributions WHERE id = ?")
+        .bind(contribution.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("contribution status");
+    assert_eq!(rejected, "quarantined");
+    let audit: String = sqlx::query_scalar(
+        "SELECT payload FROM audit_log WHERE type = 'revert' ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit row");
+    let audit: serde_json::Value = serde_json::from_str(&audit).expect("audit json");
+    assert_eq!(audit["actor"], "cli");
+    assert_eq!(audit["look"], LOOK);
+    assert_eq!(
+        audit["plan"]["rejected_contributions"],
+        serde_json::json!([contribution.as_str()])
+    );
+    assert!(
+        audit["plan"]["restoration"]
+            .get("historical_needs_rebuild")
+            .is_some(),
+        "the successor is a held restoration"
+    );
+    let refit: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE kind = 'revert_refit' AND status = 'queued'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("refit job");
+    assert_eq!(refit, 1);
+}
+
+#[tokio::test]
+async fn admin_blocks_future_intake_through_the_cli_actor_once() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("looklab.sqlite3");
+    let pool = looklab_server::open_database(&path)
+        .await
+        .expect("database");
+    let profile = CredentialId::new();
+    sqlx::query(
+        "INSERT INTO credentials (id, credential_id, webauthn_credential, created_at)
+         VALUES (?, x'01', '{}', 0)",
+    )
+    .bind(profile.as_str())
+    .execute(&pool)
+    .await
+    .expect("credential");
+
+    for _ in 0..2 {
+        Command::cargo_bin("looklab")
+            .expect("binary")
+            .args([
+                "admin",
+                "block-intake",
+                "--db",
+                path.to_str().expect("path"),
+                "--profile",
+                profile.as_str(),
+                "--reason",
+                "repeated mislabelled uploads",
+            ])
+            .assert()
+            .success();
+    }
+
+    let blocks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM credential_intake_blocks WHERE credential_id = ?")
+            .bind(profile.as_str())
+            .fetch_one(&pool)
+            .await
+            .expect("blocks");
+    assert_eq!(blocks, 1);
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE type = 'credential_intake_blocked'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit rows");
+    assert_eq!(audits, 1);
+    let audit: String = sqlx::query_scalar(
+        "SELECT payload FROM audit_log WHERE type = 'credential_intake_blocked'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit row");
+    let audit: serde_json::Value = serde_json::from_str(&audit).expect("audit json");
+    assert_eq!(audit["actor"], "cli");
+    assert_eq!(audit["subject"], profile.as_str());
 }

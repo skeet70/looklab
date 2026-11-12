@@ -309,8 +309,16 @@ pub fn run_match(args: &MatchArgs) -> Result<()> {
             suggestion.p95_delta_e
         );
     }
-    let card =
+    let mut card =
         settings_card_with_support(&target, &plan, &winner.model, best, domains.get(&best.sim))?;
+    card.approximated_base = document
+        .file
+        .definition
+        .as_ref()
+        .and_then(|definition| definition.declared_base.as_ref())
+        .map(looklab_match::base_label);
+    card.destination_scope =
+        looklab_match::destination_scope(selection.as_ref().map(|context| context.mode), &[]);
     print!("{}", card.render_text());
     match &selection {
         Some(context) => println!(
@@ -1454,13 +1462,20 @@ pub fn run_verify(args: &VerifyArgs) -> Result<()> {
     } else {
         &updated_models[second_index]
     };
-    let card = settings_card_with_support(
+    let mut card = settings_card_with_support(
         &second_target,
         &plan,
         card_model,
         second,
         domains.get(&second.sim),
     )?;
+    card.approximated_base = document
+        .file
+        .definition
+        .as_ref()
+        .and_then(|definition| definition.declared_base.as_ref())
+        .map(looklab_match::base_label);
+    card.destination_scope = looklab_match::destination_scope(next_mode, &[]);
 
     let crm_out = args
         .out_crm
