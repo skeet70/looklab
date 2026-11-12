@@ -1218,6 +1218,8 @@ pub struct ReviewQueue {
     pub nominations: Vec<EndorsementNomination>,
     #[serde(default)]
     pub manual_checks: Vec<looklab_schema::ManualCheckReview>,
+    #[serde(default)]
+    pub manual_conflicts: Vec<looklab_schema::ManualCheckConflict>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
