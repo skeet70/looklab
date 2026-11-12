@@ -74,6 +74,28 @@ fn mono_card_fixture() -> &'static Fixture {
     &FIXTURE
 }
 
+/// One full-frame render and one centred 16:9 crop of the same RAW.
+fn cropped_fixture() -> &'static Fixture {
+    static FIXTURE: LazyLock<Fixture> = LazyLock::new(|| {
+        build_fixture("verify-payload-cropped", None, |renders| {
+            let decoded = decode_jpeg(&renders[0]).expect("decode render");
+            let width = decoded.image.width;
+            let height = decoded.image.height;
+            let crop_height = width * 9 / 16;
+            let y0 = (height - crop_height) / 2;
+            let mut data = Vec::with_capacity((width * crop_height) as usize);
+            for y in y0..y0 + crop_height {
+                for x in 0..width {
+                    data.push(decoded.image.data[(y * width + x) as usize]);
+                }
+            }
+            let cropped = Image3::new(width, crop_height, data).expect("cropped image");
+            renders[0] = splice_exif(&renders[0], &jpeg_from_image(&cropped, 0.9));
+        })
+    });
+    &FIXTURE
+}
+
 /// Two colour renders of one RAW: identical EXIF apart from the film simulation.
 fn simulation_fixture() -> &'static Fixture {
     static FIXTURE: LazyLock<Fixture> = LazyLock::new(|| {
@@ -1280,6 +1302,13 @@ fn session_body(site: &Site, digest: [u8; 32], extra: Option<(&str, Value)>) -> 
         value[key] = extra;
     }
     serde_json::to_vec(&value).expect("session body JSON")
+}
+
+#[test]
+fn reproduces_a_cropped_upload_and_passes() {
+    let fixture = cropped_fixture();
+    let site = Site::from_fixture(fixture);
+    assert_upload_passes(fixture, &site, "cropped");
 }
 
 #[test]

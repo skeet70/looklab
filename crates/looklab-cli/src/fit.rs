@@ -60,7 +60,7 @@ pub fn run(args: &FitArgs) -> Result<()> {
     let mut skipped = 0;
     for file in &files {
         let name = file_name(file);
-        let loaded = util::catch_file(file, || {
+        let loaded = util::catch_file(file, "sample decode", || {
             let bytes =
                 std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
             let samples = looklab_samples::decode(&bytes)

@@ -97,7 +97,7 @@ fn prepare_one(args: &PrepArgs) -> Result<()> {
     seeds.insert(seed_key.clone(), seed);
 
     let params = PrepParams::default();
-    let prepared = match util::catch_file(raw_path, || {
+    let prepared = match util::catch_file(raw_path, "preparation", || {
         let (prior, transform, decoded) = load_prior(args, &raw_bytes)?;
         let prepared = match decoded {
             Some(decoded) => prepare_group_with_decoded_raw(
@@ -129,10 +129,12 @@ fn prepare_one(args: &PrepArgs) -> Result<()> {
             image,
         ));
         println!(
-            "{}: {} samples, {} bytes from {}",
+            "{}: {} samples, {} bytes, correlation {:.6}, residual {:.3} px from {}",
             blob_path.display(),
             image.samples.n(),
             written,
+            image.alignment.correlation,
+            image.alignment.residual_px,
             args.jpeg
                 .get(index)
                 .map(|path| path.display().to_string())
@@ -268,6 +270,8 @@ struct SummaryImage {
     samples: u32,
     cct_hint_k: f32,
     output_space: String,
+    correlation: f64,
+    residual_px: f64,
     sanitized: SanitizedMetadata,
     removed_fields: Vec<RemovedField>,
 }
@@ -289,6 +293,8 @@ impl SummaryImage {
             samples: header.n,
             cct_hint_k: header.cct_hint_k,
             output_space: format!("{:?}", header.output_space),
+            correlation: prepared.alignment.correlation,
+            residual_px: prepared.alignment.residual_px,
             sanitized: prepared.sanitized.clone(),
             removed_fields: prepared.removed.clone(),
         }
@@ -444,7 +450,7 @@ fn print_preselection(dir: &Path, outcome: &PairingOutcome) -> Result<()> {
             continue;
         };
         let path = dir.join(member.key.as_str());
-        let decoded = util::catch_file(&path, || {
+        let decoded = util::catch_file(&path, "JPEG decode", || {
             let bytes = std::fs::read(&path)?;
             Ok(decode_jpeg(&bytes)?)
         });
