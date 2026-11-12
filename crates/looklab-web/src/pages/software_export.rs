@@ -216,13 +216,13 @@ pub(super) fn SoftwareExportPanel(
                     let camera = camera.as_ref().ok_or("Choose a camera for this pipeline's camera-RGB input.")?;
                     let transform = match pin.as_ref() {
                         Some(pin) => pin.input_transform.as_ref().cloned().ok_or(
-                            "The pinned export has no input calibration for this camera-RGB pipeline.".to_owned(),
+                            "The saved export has no camera input calibration for this pipeline.".to_owned(),
                         )?,
                         None => transforms.into_iter().find(|entry| &entry.body == camera)
-                            .ok_or("No input calibration is published for this camera. This pipeline needs one; it does not need a camera settings model.")?,
+                            .ok_or("No camera input calibration is published for this camera. This pipeline needs one; it does not need a camera settings model.")?,
                     };
                     if &transform.body != camera {
-                        return Err("The input calibration names a different camera.".to_owned());
+                        return Err("The camera input calibration names a different camera.".to_owned());
                     }
                     Some(transform)
                 } else {
@@ -265,7 +265,7 @@ pub(super) fn SoftwareExportPanel(
                     return Err("The export reply differs from its pinned inputs.".to_owned());
                 }
                 if reply.input_transform_version != transform_pin.as_ref().map(|entry| entry.version) {
-                    return Err("The consumed input calibration version differs from its pin.".to_owned());
+                    return Err("The camera input calibration version differs from the saved one.".to_owned());
                 }
                 let expected_illuminant = match profile.profile.insertion.illuminant_handling {
                     IlluminantHandling::Single => ExportIlluminant::Single,
@@ -287,7 +287,7 @@ pub(super) fn SoftwareExportPanel(
                 }
                 let mut blockers = target.blockers;
                 let scope = if transform_pin.is_some() {
-                    blockers.push("The installed camera input prior has no empirical calibration qualification attached to this export.".to_owned());
+                    blockers.push("This export uses the camera's published input calibration. No check covers that calibration for this export.".to_owned());
                     if target.scope == SelectionScope::Qualified { SelectionScope::Experimental } else { target.scope }
                 } else { target.scope };
                 Ok(Arc::new(CompletedExport {
@@ -364,7 +364,7 @@ pub(super) fn SoftwareExportPanel(
                                         view! { <option value=camera.to_string() prop:selected=move || body.get().as_ref() == Some(&identity)>{label}</option> }
                                     }).collect_view()}
                                 </select>
-                                <p class="muted">{if needs_camera { "This pipeline consumes a published camera input prior, not a stock-settings model or control-response fit." } else { "This pipeline is declared for these cameras; it uses a fixed scene-space conversion, not their settings models." }}</p>
+                                <p class="muted">{if needs_camera { "This pipeline uses a published camera input calibration, not a stock-settings model." } else { "This pipeline is declared for these cameras; it uses a fixed scene-space conversion, not their settings models." }}</p>
                             })}
                             <label for="export-format">"File format"</label>
                             <select id="export-format" on:change=move |event| {

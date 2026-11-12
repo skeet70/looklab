@@ -362,7 +362,11 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                 }, _ => ().into_any() }}
                 {superseded_by.map(|pin| {
                     let href = crate::base::site_url(&format!("/looks/{}", pin.slug.as_str()));
-                    let label = format!("{} {}", pin.slug.as_str(), pin.version.as_str());
+                    let label = format!(
+                        "the {} look, version {}",
+                        data::plain_id(pin.slug.as_str()),
+                        pin.version.as_str()
+                    );
                     view! { <p class="notice">"Superseded by " <a href=href>{label}</a></p> }
                 })}
             </header>
@@ -458,9 +462,9 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                             let declared = definition.declared_base.as_ref()?;
                             let computation = definition.encoding.base()?;
                             Some(format!(
-                                "Experimental: the fitted coefficients use {} as an identified approximation of the declared base {}. This is not a claim that the declared base's camera controls or firmware are known.",
-                                data::base_label(computation),
-                                data::base_label(declared),
+                                "Experimental: this version was built with {} as an approximation of the declared base {}. This does not mean the declared base's camera controls or firmware are known.",
+                                data::plain_base_label(computation),
+                                data::plain_base_label(declared),
                             ))
                         });
                         view! {
@@ -474,7 +478,7 @@ fn LookPageView(page: LookPage) -> impl IntoView {
             {move || {
                 if !version_matchability.get() {
                     return view! {
-                        <p class="muted">"This version is a preview only and cannot be matched."</p>
+                        <p class="muted">"This version is a preview only. There are no settings to match and no download."</p>
                     }.into_any();
                 }
                 match index.get() {
@@ -506,16 +510,16 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                                     let _ = crate::files::download("LOOK0001.LLK", &bytes, "application/octet-stream");
                                 }
                             });
-                        }>"Download the look's target card (.LLK)"</button>
+                        }>"Download the firmware card (.LLK)"</button>
                     </p>
-                    <p class="muted">"Target-only card: this download does not use a camera realization, control-response model or matching result. Firmware translation is verified separately and is not guaranteed."</p>
+                    <p class="muted">"This card is for the look itself, not for one camera. It does not use camera settings or a matching result. Firmware translates it, and that translation is not checked here."</p>
                 }
             })}
             {move || (!card_eligible.get() && version_scope.get() == looklab_publish::SelectionScope::Experimental).then(|| view! {
                 <p class="muted">{if approximated.get() {
-                    "No firmware card is offered for this version: its fitted coefficients approximate a declared base, so it is an experimental approximation rather than the base itself."
+                    "A firmware card for this version will appear here when available. This version approximates a declared base, so it is an experimental approximation, not the base itself."
                 } else {
-                    "No firmware card is offered for this version: it is an experimental early estimate with no independently checked region yet."
+                    "A firmware card for this version will appear here when available. It is an experimental early estimate, and no region has been checked against independent photos."
                 }}</p>
             })}
             {move || overview_details.iter().find(|details| details.version == selected.get()).map(|details| view! {
@@ -734,7 +738,7 @@ pub(crate) fn character(loaded: &LoadedVersion, name: &str, description: &str) -
         data::VersionContent::Layered(layered) => {
             layered_character(&layered.document, name, description)
         }
-        data::VersionContent::SourcePreview(preview) => data::source_preview_label(preview),
+        data::VersionContent::SourcePreview(preview) => data::source_preview_character(preview),
     }
 }
 

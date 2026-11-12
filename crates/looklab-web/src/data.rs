@@ -454,47 +454,82 @@ pub struct LoadedVersion {
 /// The label a source-only preview carries instead of a measured character.
 pub fn source_preview_label(preview: &SourceLutPreview) -> String {
     let mut label = match &preview.preview.baseline {
-        PreviewBaseline::NeutralFallback => format!(
-            "Preview only. The published preview LUT applies the source LUT to the neutral baseline {}@{} because no identified rendering of the declared base is available.",
-            looklab_model::file::NEUTRAL_BASELINE_SLUG,
-            looklab_model::file::NEUTRAL_BASELINE_VERSION,
-        ),
+        PreviewBaseline::NeutralFallback => {
+            "Preview only. No measured rendering of the declared base is available, so the published preview applies the source LUT over the neutral baseline.".to_owned()
+        }
         PreviewBaseline::Approximated { base } => format!(
-            "Preview only. The published preview LUT applies the source LUT to {}, an identified approximation of the declared base.",
-            base_label(base)
+            "Preview only. The published preview applies the source LUT over {}, an identified approximation of the declared base.",
+            plain_base_label(base)
         ),
     };
     match preview.encoding.base() {
         Some(base) => label.push_str(&format!(
-            " The declared display base {} is not measured, so this version has no fitted layers and no measured character.",
-            base_label(base)
+            " The declared base ({}) is not measured, so this version has no measured character.",
+            plain_base_label(base)
         )),
-        None => label.push_str(
-            " This version has no fitted layers, so it has no measured character.",
-        ),
+        None => label.push_str(" This version has no measured character."),
     }
     label
+}
+
+/// A one-line character for a source-only preview, where a measured character would go.
+pub fn source_preview_character(preview: &SourceLutPreview) -> String {
+    match &preview.preview.baseline {
+        PreviewBaseline::NeutralFallback => {
+            "A preview of a source LUT, built on the neutral baseline.".to_owned()
+        }
+        PreviewBaseline::Approximated { .. } => {
+            "A preview of a source LUT, built on an approximation of its declared base.".to_owned()
+        }
+    }
 }
 
 /// The composition the source-only preview applies, in pipeline order.
 pub fn source_preview_composition(preview: &SourceLutPreview) -> String {
     let base = match &preview.preview.baseline {
-        PreviewBaseline::NeutralFallback => format!(
-            "neutral baseline {}@{}",
-            looklab_model::file::NEUTRAL_BASELINE_SLUG,
-            looklab_model::file::NEUTRAL_BASELINE_VERSION
-        ),
+        PreviewBaseline::NeutralFallback => "the neutral baseline".to_owned(),
         PreviewBaseline::Approximated { base } => {
-            format!("{} (approximation)", base_label(base))
+            format!("{} (an approximation)", plain_base_label(base))
         }
     };
     let input = match preview.encoding.base() {
         Some(_) => base,
-        None => "declared scene-referred encoding".to_owned(),
+        None => "the declared scene-referred encoding".to_owned(),
     };
-    format!("scene XYZ -> {input} -> original LUT -> sRGB")
+    format!("scene colour, then {input}, then the look's LUT, then sRGB")
 }
 
+/// A slug or body id as words, for text a photographer reads.
+pub(crate) fn plain_id(id: &str) -> String {
+    id.split(['-', '_', '.'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A base reference in plain words, without a raw `slug@version` identity.
+pub(crate) fn plain_base_label(base: &looklab_model::file::BaseReference) -> String {
+    match base {
+        looklab_model::file::BaseReference::Look { slug, .. }
+            if slug.as_str() == looklab_model::file::NEUTRAL_BASELINE_SLUG =>
+        {
+            "the neutral baseline".to_owned()
+        }
+        looklab_model::file::BaseReference::Look { slug, version } => format!(
+            "the {} look, version {}",
+            plain_id(slug.as_str()),
+            version.as_str()
+        ),
+        looklab_model::file::BaseReference::BodyRealization { body, .. } => {
+            format!("the {} camera rendering", plain_id(body.as_str()))
+        }
+        looklab_model::file::BaseReference::FamilyRendering {
+            maker, rendering, ..
+        } => format!("{maker} {rendering}"),
+    }
+}
+
+/// The exact base identity, for technical details.
 pub(crate) fn base_label(base: &looklab_model::file::BaseReference) -> String {
     match base {
         looklab_model::file::BaseReference::Look { slug, version } => {
@@ -617,23 +652,19 @@ pub async fn card(slug: &str, version: &str, purpose: CardUse) -> Result<Vec<u8>
     };
     let summary = version_summary(&index, slug, version)?;
     if purpose == CardUse::Download && (!summary.card_eligible || !summary.permits_new_outputs()) {
-        return Err(format!(
-            "{slug} {version}: this target has no eligible firmware-card download"
-        ));
+        return Err("No firmware card is available for this version.".to_owned());
     }
     let manifest = verified_manifest(slug, version, summary).await?;
     if look_shape(&manifest).map_err(|error| format!("{slug} {version}: {error}"))?
         == VersionLookShape::SourcePreview
     {
-        return Err(format!(
-            "{slug} {version}: a source-only LUT preview has no card file"
-        ));
+        return Err("This version is a preview only, so there is no card file.".to_owned());
     }
     let entry = manifest
         .artifacts
         .iter()
         .find(|entry| matches!(LookArtifact::of(&entry.name), LookArtifact::Card))
-        .ok_or_else(|| format!("{slug} {version}: no card file in the manifest"))?;
+        .ok_or_else(|| "This version has no card file.".to_owned())?;
     let bytes = get(&publication_url(&format!(
         "/data/looks/{slug}/{version}/{}",
         entry.name.as_str()
@@ -667,22 +698,19 @@ pub async fn export_target(
     let index = fetch_index().await?;
     let summary = version_summary(&index, slug.as_str(), version.as_str())?;
     if !summary.matchable {
-        return Err("This target version is not eligible for a software export.".to_owned());
+        return Err("This version cannot be exported to an editing app.".to_owned());
     }
     if !summary.permits_new_outputs() {
-        return Err(
-            "This target version is no longer applicable. This export is unavailable.".to_owned(),
-        );
+        return Err("This version is no longer valid, so this export is unavailable.".to_owned());
     }
     if expected_manifest.is_some_and(|expected| expected != &summary.manifest_sha256) {
-        return Err("The target manifest differs from the pinned export.".to_owned());
+        return Err("This export's files differ from the saved version.".to_owned());
     }
     let manifest = verified_manifest(slug.as_str(), version.as_str(), summary).await?;
     if look_shape(&manifest).map_err(|error| error.to_string())? == VersionLookShape::SourcePreview
     {
         return Err(
-            "A source-only LUT preview has no fitted layers, so no software export exists."
-                .to_owned(),
+            "This version is a preview only, so there is no editing-app export.".to_owned(),
         );
     }
     let artifact = manifest
@@ -699,13 +727,13 @@ pub async fn export_target(
         return Err("The Look document differs from the pinned target identity.".to_owned());
     }
     if !document.is_matchable() {
-        return Err("This Look document is not eligible for export.".to_owned());
+        return Err("This look cannot be exported to an editing app.".to_owned());
     }
     let look = index
         .looks
         .iter()
         .find(|look| look.slug == *slug)
-        .ok_or("The target is not in the published catalog.")?;
+        .ok_or("This look is not in the published catalog.")?;
     let (scope, blockers) = crate::selection::catalog_version_scope(look, version);
     Ok(ExportTarget {
         manifest_sha256: summary.manifest_sha256.clone(),
@@ -781,21 +809,15 @@ async fn load_version(
     };
     let summary = version_summary(&index, slug, version)?;
     if matches!(purpose, VersionPurpose::Match) && !summary.matchable {
-        return Err(format!(
-            "{slug} {version}: this version is a preview only and cannot be matched."
-        ));
+        return Err("This version is a preview only and cannot be matched.".to_owned());
     }
     if matches!(purpose, VersionPurpose::Match) && !summary.permits_new_outputs() {
-        return Err(format!(
-            "{slug} {version}: this target is no longer eligible for matching."
-        ));
+        return Err("This version can no longer be used for matching.".to_owned());
     }
     let manifest = verified_manifest(slug, version, summary).await?;
     let shape = look_shape(&manifest).map_err(|error| format!("{slug} {version}: {error}"))?;
     if matches!(purpose, VersionPurpose::Match) && shape != VersionLookShape::Layered {
-        return Err(format!(
-            "{slug} {version}: this version is a source-only LUT preview and cannot be matched."
-        ));
+        return Err("This version is a preview only and cannot be matched.".to_owned());
     }
     let mut look_bytes = None;
     let mut descriptor = None;
@@ -849,9 +871,7 @@ async fn load_version(
                 && !document.is_matchable()
                 && !experimental_only
             {
-                return Err(format!(
-                    "{slug} {version}: this version is a preview only and cannot be matched."
-                ));
+                return Err("This version is a preview only and cannot be matched.".to_owned());
             }
             let probes = looklab_model::probes::v1();
             let adapter = crate::diagnostics::DocumentLook::new(&document, &probes);
@@ -1095,9 +1115,7 @@ pub async fn bundle_modes(
         let path = dir.join(&hash.to_hex());
         let bytes = published_raw(&path).await?;
         if ArtifactHash::of(&bytes).as_str() != hash.to_hex() {
-            return Err(
-                "A realization parameter blob does not match the bundle revision.".to_owned(),
-            );
+            return Err("A camera settings file does not match the saved version.".to_owned());
         }
         let realization: looklab_schema::MatchRealizationParams = serde_json::from_slice(&bytes)
             .map_err(|error| format!("{}: {error}", path.as_str()))?;
@@ -1160,19 +1178,53 @@ pub async fn bundle_qualification(
     }
 }
 
+/// A film simulation key in menu words.
+pub(crate) fn sim_name(sim: &looklab_schema::SimKey) -> String {
+    match sim.as_str() {
+        "classic_chrome" => "Classic Chrome".into(),
+        "provia" => "PROVIA / Standard".into(),
+        "velvia" => "Velvia / Vivid".into(),
+        "astia" => "ASTIA / Soft".into(),
+        key => key.replace(['_', '-'], " "),
+    }
+}
+
 pub fn selection_scope_label(scope: SelectionScope) -> &'static str {
     match scope {
-        SelectionScope::Qualified => "measured for these settings",
-        SelectionScope::Experimental => "experimental",
-        SelectionScope::Unassessed => "unassessed",
+        SelectionScope::Qualified => "Measured for these settings",
+        SelectionScope::Experimental => "Experimental",
+        SelectionScope::Unassessed => "Not checked",
     }
 }
 
 pub fn applicability_label(applicability: &Applicability) -> String {
     match applicability {
         Applicability::Current => "current".to_owned(),
-        Applicability::Invalidated { reason } => format!("invalidated: {}", reason.as_str()),
-        Applicability::Unassessed => "unassessed".to_owned(),
+        Applicability::Invalidated { reason } => {
+            format!("no longer valid: {}", invalidation_reason_label(*reason))
+        }
+        Applicability::Unassessed => "not checked".to_owned(),
+    }
+}
+
+fn invalidation_reason_label(reason: looklab_schema::InvalidationReason) -> &'static str {
+    use looklab_schema::InvalidationReason;
+    match reason {
+        InvalidationReason::Withdrawal => "a contribution was withdrawn",
+        InvalidationReason::Exclusion => "evidence was excluded",
+        InvalidationReason::IdentityMerge => "two contributor identities were merged",
+        InvalidationReason::RootRevocation => "a root admission was revoked",
+        InvalidationReason::EvidenceLoss => "its evidence was lost",
+        InvalidationReason::TransformReinterpretation => "the input transform was reinterpreted",
+        InvalidationReason::ProfileReinterpretation => "the profile was reinterpreted",
+        InvalidationReason::SchemaReinterpretation => "the camera schema was reinterpreted",
+        InvalidationReason::RuleReinterpretation => "a rule changed",
+        InvalidationReason::ModelSourceChange => "a model source changed",
+        InvalidationReason::StandingReinterpretation => "contributor standing changed",
+        InvalidationReason::CohortReinterpretation => "its evidence group changed",
+        InvalidationReason::GaugeReinterpretation => "the exposure gauge changed",
+        InvalidationReason::RootWeightingChange => "root weighting changed",
+        InvalidationReason::Superseded => "a newer version replaced it",
     }
 }
 

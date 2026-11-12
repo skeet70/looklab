@@ -77,7 +77,7 @@ pub async fn inputs_for_camera(request: MatchRequest<'_>) -> Result<ScopedInputs
     let approximated = version_page.approximated;
     let effective_mode = if approximated {
         blockers.push(
-            "This target is an experimental approximation of its declared base; it is not qualified for these settings."
+            "This target approximates its declared base, so it is experimental and not checked for these settings."
                 .to_owned(),
         );
         SelectionScope::Experimental
@@ -94,7 +94,7 @@ pub async fn inputs_for_camera(request: MatchRequest<'_>) -> Result<ScopedInputs
     if let Some(id) = &version_page.eligibility {
         let snapshot = data::eligibility(&index, id).await?;
         if snapshot.status != looklab_schema::TargetEligibilityStatus::Eligible {
-            blockers.push("The target's eligibility snapshot is not eligible.".to_owned());
+            blockers.push("This version cannot be used for new matches or downloads.".to_owned());
         }
         reports.push(ReportPin {
             subject: ReportSubject::Target(target.clone()),
@@ -119,7 +119,7 @@ pub async fn inputs_for_camera(request: MatchRequest<'_>) -> Result<ScopedInputs
             ));
         }
     } else {
-        blockers.push("The target has no current applicable assessment.".to_owned());
+        blockers.push("This target has not been checked for these settings.".to_owned());
     }
 
     let Some(selection) = data::selected_bundle(body_page, epoch) else {
@@ -132,11 +132,13 @@ pub async fn inputs_for_camera(request: MatchRequest<'_>) -> Result<ScopedInputs
         ));
     }
     let entry = data::bundle_sim_entry(&index, camera, epoch, &selection.bundle.to_hex())
-        .ok_or_else(|| "The selected camera bundle is not listed in the site index.".to_owned())?;
+        .ok_or_else(|| "This camera's settings model is not published.".to_owned())?;
     let manifest = data::bundle_revision(&index, entry).await?;
     let artifacts = data::bundle_artifacts(&index, entry).await?;
     if &manifest.body != camera || manifest.epoch.get() != epoch {
-        return Err("This camera bundle is for a different camera or firmware version.".to_owned());
+        return Err(
+            "This settings model belongs to a different camera or firmware version.".to_owned(),
+        );
     }
     let body_params = shared_body_params(camera, epoch, &manifest, &artifacts).await?;
     let body_model: looklab_schema::MatchParams = serde_json::from_slice(&body_params)
@@ -151,8 +153,8 @@ pub async fn inputs_for_camera(request: MatchRequest<'_>) -> Result<ScopedInputs
     for sim in &manifest.sims {
         let Some(hash) = sim.realization_params else {
             blockers.push(format!(
-                "{} has no pinned realization parameters.",
-                sim.native_sim
+                "{} has no saved camera settings.",
+                data::sim_name(&sim.native_sim)
             ));
             continue;
         };
@@ -179,8 +181,8 @@ pub async fn inputs_for_camera(request: MatchRequest<'_>) -> Result<ScopedInputs
                 .await?;
         if scope == SelectionScope::Unassessed {
             blockers.push(format!(
-                "{} has no current bundle selection.",
-                sim.native_sim
+                "{} has no current settings model for this camera.",
+                data::sim_name(&sim.native_sim)
             ));
             continue;
         }
@@ -205,8 +207,8 @@ pub async fn inputs_for_camera(request: MatchRequest<'_>) -> Result<ScopedInputs
         }
         if effective_mode == SelectionScope::Qualified && scope != SelectionScope::Qualified {
             blockers.push(format!(
-                "{} is not qualified for these settings.",
-                sim.native_sim
+                "{} has not been checked for these settings.",
+                data::sim_name(&sim.native_sim)
             ));
             continue;
         }
@@ -455,6 +457,14 @@ fn physical_covers(
     firmware && wb
 }
 
+fn eligibility_status_label(status: looklab_schema::TargetEligibilityStatus) -> &'static str {
+    match status {
+        looklab_schema::TargetEligibilityStatus::Eligible => "eligible",
+        looklab_schema::TargetEligibilityStatus::Ineligible => "not eligible",
+        looklab_schema::TargetEligibilityStatus::Invalidated => "no longer valid",
+    }
+}
+
 fn no_usable_realization(blockers: &[String]) -> String {
     if blockers.is_empty() {
         NO_MODEL.to_owned()
@@ -473,7 +483,7 @@ pub async fn inputs_from_permalink(permalink: &Permalink) -> Result<ScopedInputs
         inputs,
         scope: SelectionScope::Unassessed,
         blockers: vec![
-            "This link records no selection scope; it replays as historical and unassessed."
+            "This saved link records no check, so it replays as an older, unchecked recipe."
                 .to_owned(),
         ],
         target_version,
@@ -594,7 +604,7 @@ async fn scoped_inputs_from_permalink(
     )?;
     let crm_hash = winner.control_response.to_hex();
     pinned_hashed_source(
-        "control-response model",
+        "camera settings model",
         permalink.sources.crm.as_deref(),
         Some(crm_hash.as_str()),
         &candidates,
@@ -646,12 +656,13 @@ async fn scoped_inputs_from_permalink(
             }
             QualificationRef::Eligibility(id) => {
                 let entry = data::eligibility_entry(&index, id).ok_or_else(|| {
-                    format!("The pinned eligibility snapshot {id} is not published.")
+                    "This saved link pins an eligibility record that is no longer published."
+                        .to_owned()
                 })?;
                 if entry.status != looklab_schema::TargetEligibilityStatus::Eligible {
                     notices.push(format!(
-                        "Pinned eligibility snapshot {id} is {:?}.",
-                        entry.status
+                        "This saved link pins an eligibility record that is {}.",
+                        eligibility_status_label(entry.status)
                     ));
                 }
             }
@@ -838,7 +849,7 @@ async fn legacy_inputs(
 ) -> Result<ScopedInputs, String> {
     let inputs = legacy_inputs_for_camera(version, camera, emphasis, epoch, seed).await?;
     blockers.push(
-        "This camera has no scoped bundle revision, so its legacy bundle is unassessed.".to_owned(),
+        "This camera has no current settings model. The older one has not been checked.".to_owned(),
     );
     Ok(ScopedInputs {
         inputs,
@@ -976,7 +987,7 @@ async fn legacy_inputs_from_permalink(
         &allowed_dirs,
     )?;
     pinned_named_source(
-        "control-response model",
+        "camera settings model",
         permalink.sources.crm.as_deref(),
         Some(winner.crm.as_str()),
         &candidates,

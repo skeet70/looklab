@@ -31,7 +31,7 @@ pub fn browsable_scope(look: &LookSummary) -> (SelectionScope, Vec<String>) {
     } else {
         (
             SelectionScope::Unassessed,
-            vec!["No current target is selected for this look.".to_owned()],
+            vec!["This look has no current version selected.".to_owned()],
         )
     }
 }
@@ -40,13 +40,13 @@ pub fn catalog_scope(look: &LookSummary) -> (SelectionScope, Vec<String>) {
     let Some(selected) = look.selected.as_ref() else {
         return (
             SelectionScope::Unassessed,
-            vec!["No current target is selected for this look.".to_owned()],
+            vec!["This look has no current version selected.".to_owned()],
         );
     };
     let mut blockers = Vec::new();
     if !selected.applicability.is_current() {
         blockers.push(format!(
-            "The selected target is {}.",
+            "The selected version is {}.",
             crate::data::applicability_label(&selected.applicability)
         ));
     }
@@ -58,7 +58,7 @@ pub fn catalog_scope(look: &LookSummary) -> (SelectionScope, Vec<String>) {
         LookKind::LutDefined => selected.eligibility.is_some(),
     };
     if !evidence {
-        blockers.push("The selected target has no applicable assessment.".to_owned());
+        blockers.push("The selected version has not been checked for these settings.".to_owned());
     }
     let current = selected.applicability.is_current();
     let selected_version = look
@@ -92,7 +92,10 @@ pub fn catalog_version_scope(
     } else {
         (
             SelectionScope::Unassessed,
-            vec!["Pinned historical target; no current qualification is claimed.".to_owned()],
+            vec![
+                "This is an older version. It has not been checked against the current data."
+                    .to_owned(),
+            ],
         )
     }
 }
@@ -130,8 +133,7 @@ pub fn version_scope(
         Ok(VersionLookShape::SourcePreview)
     ) {
         blockers.push(
-            "Source-LUT preview without fitted layers; it cannot be matched, exported or downloaded as a card."
-                .to_owned(),
+            "Preview only: no settings to match, no editing-app export and no card.".to_owned(),
         );
     }
     let selected = page
@@ -139,7 +141,7 @@ pub fn version_scope(
         .as_ref()
         .is_some_and(|selected| selected.version == *version.version());
     if !selected {
-        blockers.push("This version is not the selected target for its look.".to_owned());
+        blockers.push("This is not the current version of this look.".to_owned());
     }
     let evidence = if page.head.as_ref().is_some_and(|head| {
         page.kind == LookKind::NativeFamily && head.version == *version.version()
@@ -149,11 +151,15 @@ pub fn version_scope(
         match index.eligibility.iter().find(|entry| entry.id == *id) {
             Some(entry) if entry.status == TargetEligibilityStatus::Eligible => true,
             Some(_) => {
-                blockers.push("The target eligibility snapshot is not eligible.".to_owned());
+                blockers
+                    .push("This version cannot be used for new matches or downloads.".to_owned());
                 false
             }
             None => {
-                blockers.push("The target eligibility snapshot is not published.".to_owned());
+                blockers.push(
+                    "This version cannot be used for new matches yet: its eligibility record is missing."
+                        .to_owned(),
+                );
                 false
             }
         }

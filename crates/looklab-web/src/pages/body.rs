@@ -204,14 +204,14 @@ fn BodyDetailView(body: BodyPage, manual: Option<ManualPage>) -> impl IntoView {
         } else {
             view! {
                 <p class="muted">"Settings matching becomes available when this camera's input transform is published."</p>
-                <a href=crate::base::site_url("/match?apply=card")>"Get a target card for custom firmware →"</a>
+                <a href=crate::base::site_url("/match?apply=card")>"Get a firmware card for custom firmware →"</a>
             }.into_any()
         }}
         {body.native_looks.iter().flat_map(|card| card.blockers.clone()).next().map(|blocker| view! {
-            <p class="muted">{format!("Stock-settings matching needs a usable camera realization. {blocker}")}</p>
+            <p class="muted">{format!("Stock-settings matching needs a usable camera settings model. {blocker}")}</p>
         })}
         {(!body.native_looks.iter().any(|card| card.scope != looklab_publish::SelectionScope::Unassessed)).then(|| view! {
-            <p class="muted">"This camera has no measured realization yet. Custom firmware can still load a look's target card; sharing photos helps build its stock-settings model."</p>
+            <p class="muted">"This camera has no measured settings model yet. Custom firmware can load a look's firmware card when available; sharing photos helps build its stock-settings model."</p>
         })}
         <section><h2>"Help with this camera"</h2><a href=crate::base::site_url("/contribute/wanted")>"See wanted shots →"</a></section>
         <super::recipes::RecipeSection camera=body.id.clone()/>
