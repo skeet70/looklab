@@ -33,7 +33,7 @@ fn synthesise(dir: &Path) {
             "--images",
             "3",
             "--samples",
-            "64",
+            "512",
         ]);
         command
     });
