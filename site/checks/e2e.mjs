@@ -17,7 +17,7 @@ const USAGE = `usage: node site/checks/e2e.mjs [options]
                                __EGL_VENDOR_LIBRARY_FILENAMES for Mesa's
                                libEGL_mesa, EGL_PLATFORM=surfaceless and
                                MESA_LOADER_DRIVER_OVERRIDE=swrast
-  --flow all|match|contribute|all-bw|pages|flatness|propose|developers|compare|account|lazy
+  --flow all|match|contribute|required-fields|all-bw|pages|flatness|propose|developers|compare|account|lazy
   --origin URL                 stub server origin (default http://localhost:8099)
   --out DIR                    artifact directory (default /tmp/looklab-e2e)
   --state DIR                  stub server state, must match --state (default /tmp/looklab-stub-state)
@@ -880,6 +880,56 @@ async function contribute(size) {
   } finally {
     await close(session);
     await patchHar(harPath, session.bodies);
+  }
+}
+
+async function requiredFields() {
+  const session = await open(VIEWPORTS.desktop);
+  const { page, problems } = session;
+  try {
+    await page.goto(`${options.origin}/contribute`);
+    await page.getByRole('heading', { name: 'Help build looks', exact: true }).waitFor();
+    // An unreadable dynamic range makes the control a required declaration.
+    const jpeg = await renderWithTag('render-missing-dynamic-range', 0x1403, 0x9999);
+    await page.setInputFiles('.drop-zone input[type=file]:not([webkitdirectory])', [options.raw, jpeg]);
+    await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).waitFor({ timeout: 120_000 });
+    const gate = page.locator('.required-fields');
+    await gate.waitFor({ timeout: 120_000 });
+    const gateText = await gate.innerText();
+    check(gateText.includes('dynamic range'), `required-fields: the gate names dynamic range (${JSON.stringify(gateText)})`);
+    const process = page.getByRole('button', { name: 'Process locally', exact: true });
+    check(await process.isDisabled(), 'required-fields: Process is disabled while dynamic range is missing');
+    const progress = page.getByRole('navigation', { name: 'Progress' });
+    for (const name of ['Process', 'Review', 'Send']) {
+      check(
+        await progress.getByRole('button', { name, exact: true }).isDisabled(),
+        `required-fields: the ${name} step stays unreachable`,
+      );
+    }
+    await page.screenshot({ path: `${options.out}/required-fields-blocked.png`, fullPage: true });
+    const field = gate.getByRole('button', { name: 'dynamic range', exact: true });
+    await field.click();
+    await page.waitForFunction(() => document.activeElement?.id?.startsWith('unmapped-'));
+    const focused = await page.evaluate(() => document.activeElement.id);
+    check(focused.startsWith('unmapped-'), `required-fields: the missing field is focused (${focused})`);
+    const inputs = page.locator('.unmapped-controls .menu-setting input');
+    for (let index = 0; index < await inputs.count(); index += 1) {
+      await inputs.nth(index).fill('0');
+    }
+    await gate.waitFor({ state: 'detached', timeout: 30_000 });
+    check(!(await process.isDisabled()), 'required-fields: filling the value enables Process');
+    await page.screenshot({ path: `${options.out}/required-fields-ready.png`, fullPage: true });
+    await process.click();
+    await page.getByRole('heading', { name: /Review what/ }).waitFor({ timeout: 900_000 });
+    await page.screenshot({ path: `${options.out}/required-fields-processed.png`, fullPage: true });
+    check(problems.length === 0, `required-fields: no page errors (${problems.join('; ')})`);
+    return { gate: gateText, field: focused };
+  } catch (error) {
+    await page.screenshot({ path: `${options.out}/required-fields-failed.png`, fullPage: true }).catch(() => {});
+    console.error(`required-fields page state: ${await page.locator('body').innerText()}`);
+    throw error;
+  } finally {
+    await close(session);
   }
 }
 
@@ -1885,6 +1935,9 @@ if (options.flow === 'all' || options.flow === 'contribute') {
   await verifyContributionPayload('desktop', result.contribute);
   result.contribute_mobile = await contribute('mobile');
   await verifyContributionPayload('mobile', result.contribute_mobile);
+}
+if (options.flow === 'required-fields') {
+  result.required_fields = await requiredFields();
 }
 if (options.flow === 'all-bw') {
   options['bw-all'] = true;

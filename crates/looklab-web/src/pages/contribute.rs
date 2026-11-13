@@ -149,6 +149,57 @@ fn active_bodies(set: &BatchSet) -> BTreeSet<String> {
         .collect()
 }
 
+/// A batch that cannot be processed until its missing settings have declared values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MissingRequired {
+    batch: BatchId,
+    fields: Vec<String>,
+}
+
+/// Look-affecting controls the batch needs but its settings text does not supply.
+///
+/// This is the missing-value half of [`group_settings`], so the step gate and the
+/// send check cannot disagree about what is still required.
+fn missing_control_values(controls: &str, unmapped: &[String]) -> Vec<String> {
+    let entered = menu_settings(controls);
+    unmapped
+        .iter()
+        .filter(|key| {
+            !entered
+                .iter()
+                .any(|setting| setting.key.as_str() == key.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// The included batches whose required values are still missing, in batch order.
+///
+/// B&W batches without monochrome model development consent are left out of the
+/// send, so their missing values do not block the step.
+fn missing_required_values(set: &BatchSet) -> Vec<MissingRequired> {
+    set.groups()
+        .iter()
+        .filter(|group| !group.renders.is_empty())
+        .filter(|group| !(group.is_monochrome() && !group.fields.monochrome_opt_in))
+        .filter_map(|group| {
+            let fields = missing_control_values(&group.fields.controls, &group.unmapped);
+            (!fields.is_empty()).then_some(MissingRequired {
+                batch: group.id,
+                fields,
+            })
+        })
+        .collect()
+}
+
+fn control_label(key: &str) -> String {
+    key.replace('_', " ")
+}
+
+fn unmapped_field_id(batch: BatchId, key: &str) -> String {
+    format!("unmapped-{}-{key}", batch.0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MonochromeConsent {
     None,
@@ -914,6 +965,9 @@ pub fn ContributePage() -> impl IntoView {
     let all_files = RwSignal::new_local(Vec::<LocalFile>::new());
     let parsed_metadata = StoredValue::new_local(Vec::<(String, ParsedMetadata)>::new());
     let batches = RwSignal::new(BatchSet::default());
+    let required_missing = Signal::derive(move || batches.with(missing_required_values));
+    let required_blocked = Signal::derive(move || !required_missing.get().is_empty());
+    let focus_field = RwSignal::new(None::<(BatchId, String)>);
     let batch_epoch = RwSignal::new(0_u64);
     let manuals = RwSignal::new(BTreeMap::<String, looklab_publish::ManualPage>::new());
     let manual_envelopes = RwSignal::new(BTreeMap::<String, ManualConfirmationEnvelope>::new());
@@ -952,6 +1006,26 @@ pub fn ContributePage() -> impl IntoView {
         }
     });
     let selected_batch = RwSignal::new(None::<BatchId>);
+    Effect::new(move |_| {
+        let Some((batch, key)) = focus_field.get() else {
+            return;
+        };
+        if selected_batch.get() != Some(batch) {
+            return;
+        }
+        focus_field.set(None);
+        let id = unmapped_field_id(batch, &key);
+        let _ = set_timeout_with_handle(
+            move || {
+                if let Some(element) = document().get_element_by_id(&id)
+                    && let Ok(element) = element.dyn_into::<web_sys::HtmlElement>()
+                {
+                    let _ = element.focus();
+                }
+            },
+            std::time::Duration::ZERO,
+        );
+    });
     let catalog = RwSignal::new(None::<GroupCatalog>);
     let snapshot_version = RwSignal::new(0_u64);
     let prefill_ledger = StoredValue::new_local(PrefillLedger::default());
@@ -1249,9 +1323,18 @@ pub fn ContributePage() -> impl IntoView {
                 if processed.with(Vec::is_empty) {
                     current.set(StepIndex(1));
                 }
-                message.set(Some(
-                    "Your local draft is ready to resume. Nothing has been sent.".to_owned(),
-                ));
+                if batches.with_untracked(|set| !missing_required_values(set).is_empty()) {
+                    current.set(StepIndex(1));
+                    furthest.set(StepIndex(1));
+                    message.set(Some(
+                        "Your local draft is ready to resume. Enter the missing camera settings before processing."
+                            .to_owned(),
+                    ));
+                } else {
+                    message.set(Some(
+                        "Your local draft is ready to resume. Nothing has been sent.".to_owned(),
+                    ));
+                }
             }
         }
         draft_loaded.set(true);
@@ -1371,6 +1454,13 @@ pub fn ContributePage() -> impl IntoView {
         let files = all_files.get();
         let batches = batches.get_untracked();
         let count = worker_count.get().max(1);
+        if !missing_required_values(&batches).is_empty() {
+            message.set(Some(
+                "Enter a value for every missing camera setting before processing.".to_owned(),
+            ));
+            current.set(StepIndex(1));
+            return;
+        }
         busy.set(true);
         processed.set(Vec::new());
         furthest.set(StepIndex(2));
@@ -1801,10 +1891,12 @@ pub fn ContributePage() -> impl IntoView {
             locked=Signal::derive(move || busy.get() || draft_complete.get())
             finished=Signal::derive(move || draft_complete.get())
             can_advance=Signal::derive(move || {
-                !busy.get()
+                !required_blocked.get()
+                    && !busy.get()
                     && (matches!(stage.get(), Stage::Inspector)
                         || (stage.get() == Stage::Processing && preparation_ready()))
             })
+            blocked_beyond=Signal::derive(move || required_blocked.get().then_some(1_usize))
         />
         {move || (stage.get() != Stage::Send).then(|| message.get()).flatten().map(|text| view! { <p class="notice" role="status">{text}</p> })}
         {move || draft_unavailable.get().then(|| view! {
@@ -1966,7 +2058,40 @@ pub fn ContributePage() -> impl IntoView {
                 }).collect_view()}
             </select>
             </Disclosure>
-            <button class="button-primary" on:click=process disabled=move || busy.get()>"Process locally"</button>
+            {move || {
+                let missing = required_missing.get();
+                (!missing.is_empty()).then(|| view! {
+                    <div class="required-fields" id="required-fields" role="alert">
+                        <p>"These batches cannot be processed until every camera setting your files did not record has a value. Enter the value you used for:"</p>
+                        <ul>
+                            {missing.into_iter().map(|missing| {
+                                let batch = missing.batch;
+                                view! {
+                                    <li>
+                                        <span>{format!("Batch {}: ", batch.0)}</span>
+                                        {missing.fields.into_iter().map(|key| {
+                                            let label = control_label(&key);
+                                            let field_id = unmapped_field_id(batch, &key);
+                                            view! {
+                                                <button type="button" class="required-field"
+                                                    aria-controls=field_id
+                                                    on:click=move |_| {
+                                                        selected_batch.set(Some(batch));
+                                                        focus_field.set(Some((batch, key.clone())));
+                                                    }>{label}</button>
+                                                " "
+                                            }
+                                        }).collect_view()}
+                                    </li>
+                                }
+                            }).collect_view()}
+                        </ul>
+                    </div>
+                })
+            }}
+            <button class="button-primary" on:click=process
+                disabled=move || busy.get() || required_blocked.get()
+                aria-describedby=move || required_blocked.get().then_some("required-fields")>"Process locally"</button>
         </section>
 
         <section class="step" hidden=move || stage.get() != Stage::Processing>
@@ -2523,7 +2648,8 @@ fn BatchEditor(
                 <div class="unmapped-controls">
                     {rows.into_iter().filter_map(|raw| looklab_schema::ControlKey::new(&raw).ok()).map(|key| {
                         let read_key = key.clone();
-                        let label = key.as_str().replace('_', " ");
+                        let label = control_label(key.as_str());
+                        let field_id = unmapped_field_id(id, key.as_str());
                         let text = controls;
                         let read = move || {
                             control_step(&text(), &read_key)
@@ -2532,7 +2658,7 @@ fn BatchEditor(
                         };
                         view! {
                             <label class="menu-setting">{label}
-                                <input type="number" prop:value=read on:input=move |event| {
+                                <input id=field_id type="number" prop:value=read on:input=move |event| {
                                     if let Ok(step) = event_target_value(&event).parse::<i64>() {
                                         set_control_step(batches, id, &key, step);
                                     }
@@ -3281,12 +3407,7 @@ fn group_settings(draft: DraftGroup<'_>) -> Result<GroupSettings, String> {
             source,
         });
     }
-    let missing = draft
-        .unmapped
-        .iter()
-        .filter(|key| !entries.iter().any(|entry| &entry.key == *key))
-        .cloned()
-        .collect::<Vec<_>>();
+    let missing = missing_control_values(draft.controls, draft.unmapped);
     if !missing.is_empty() {
         return Err(format!(
             "This batch still needs a value for {}. Enter the value you used under Camera settings, or remove those photos from the batch.",
@@ -4556,6 +4677,57 @@ mod tests {
             "{:?}",
             settings.controls[1]
         );
+    }
+
+    fn required_group(id: BatchId, unmapped: &[&str], controls: &str) -> ContributionGroup {
+        let mut reading = reading("a.raf", "fujifilm", "x-s10", "provia", 0);
+        reading.controls = Vec::new();
+        let mut group = ContributionGroup::from_reading(id, &reading);
+        group.fields.controls = controls.to_owned();
+        group.unmapped = unmapped.iter().map(|key| (*key).to_owned()).collect();
+        group
+    }
+
+    #[test]
+    fn a_missing_required_value_blocks_the_process_step() {
+        let set = BatchSet::from_groups(vec![required_group(
+            BatchId(1),
+            &["dynamic_range"],
+            "color=0",
+        )]);
+        assert_eq!(
+            missing_required_values(&set),
+            vec![MissingRequired {
+                batch: BatchId(1),
+                fields: vec!["dynamic_range".to_owned()],
+            }]
+        );
+    }
+
+    #[test]
+    fn declared_required_values_allow_the_process_step() {
+        let set = BatchSet::from_groups(vec![required_group(
+            BatchId(1),
+            &["dynamic_range"],
+            "color=0\ndynamic_range=1",
+        )]);
+        assert!(missing_required_values(&set).is_empty());
+    }
+
+    #[test]
+    fn an_excluded_monochrome_batch_does_not_block_the_process_step() {
+        let mut group = required_group(BatchId(1), &["dynamic_range"], "");
+        group.monochrome = vec![looklab_wasm::MonochromeRender {
+            file: group.renders[0].as_str().to_owned(),
+            sim: "acros".to_owned(),
+        }];
+        let set = BatchSet::from_groups(vec![group]);
+        assert!(missing_required_values(&set).is_empty());
+
+        let mut included = set.groups()[0].clone();
+        included.fields.monochrome_opt_in = true;
+        let set = BatchSet::from_groups(vec![included]);
+        assert_eq!(missing_required_values(&set).len(), 1);
     }
 
     #[test]

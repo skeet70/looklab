@@ -59,6 +59,11 @@
 .batch-choice-title { font-weight: 650; }
 .batch-choice-meta { color: var(--muted); font-size: .85rem; overflow-wrap: anywhere; }
 .batch-editor { max-width: 42rem; margin-block: 1rem 1.5rem; }
+.required-fields { max-width: 42rem; margin-block: 1.25rem 0; padding: 1rem 1.25rem; border: 1px solid var(--accent); border-radius: .6rem; background: var(--panel); }
+.required-fields p { margin: 0 0 .5rem; }
+.required-fields ul { margin: 0; padding-left: 1.25rem; }
+.required-fields li { margin-block: .3rem; }
+.required-field { padding: 0; border: 0; background: none; color: var(--ink); font: inherit; text-decoration: underline; cursor: pointer; text-transform: capitalize; }
 .batch-serial label { margin-block: .2rem; font-weight: 400; }
 .wanted-intro { max-width: 70ch; margin-bottom: 2rem; }
 @media (max-width: 600px) { .contribute-page .step { padding: 1rem; } .help-grid { gap: .75rem; } }
