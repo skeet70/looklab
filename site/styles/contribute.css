@@ -36,8 +36,9 @@
 .contribute-page progress { width: min(100%, 36rem); }
 .payload-summary { font-size: 1.15rem; font-weight: 600; max-width: 65ch; }
 .pairing-card p { overflow-wrap: anywhere; }
-.menu-setting { display: flex; align-items: center; justify-content: space-between; gap: 1rem; max-width: 36rem; text-transform: capitalize; }
+.menu-setting { display: flex; align-items: center; justify-content: space-between; gap: 1rem; max-width: 36rem; }
 .menu-setting input { width: 7rem; }
+.menu-setting select { width: 13rem; }
 .contribution-done > a { display: inline-block; margin: .5rem 1rem .5rem 0; }
 .contribution-done a { overflow-wrap: anywhere; max-width: 100%; }
 .done-summary { font-size: 1.15rem; font-weight: 600; max-width: 65ch; }
@@ -63,7 +64,7 @@
 .required-fields p { margin: 0 0 .5rem; }
 .required-fields ul { margin: 0; padding-left: 1.25rem; }
 .required-fields li { margin-block: .3rem; }
-.required-field { padding: 0; border: 0; background: none; color: var(--ink); font: inherit; text-decoration: underline; cursor: pointer; text-transform: capitalize; }
+.required-field { padding: 0; border: 0; background: none; color: var(--ink); font: inherit; text-decoration: underline; cursor: pointer; }
 .batch-serial label { margin-block: .2rem; font-weight: 400; }
 .wanted-intro { max-width: 70ch; margin-bottom: 2rem; }
 @media (max-width: 600px) { .contribute-page .step { padding: 1rem; } .help-grid { gap: .75rem; } }

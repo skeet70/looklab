@@ -184,6 +184,23 @@ async function renderWithTag(name, tag, value) {
   throw new Error('the EXIF has no MakerNote');
 }
 
+async function fillControl(field, value = '0') {
+  const select = field.locator('select');
+  if (await select.count()) {
+    const choices = await select.locator('option').evaluateAll((options) =>
+      options.filter((option) => option.value !== '').map((option) => option.value),
+    );
+    if (choices.length) await select.selectOption(choices[0]);
+    return;
+  }
+  const checkbox = field.locator('input[type=checkbox]');
+  if (await checkbox.count()) {
+    await checkbox.check();
+    return;
+  }
+  await field.locator('input').fill(value);
+}
+
 async function addVirtualAuthenticator(page) {
   if (options.browser !== 'chromium') {
     await page.context().credentials.install();
@@ -644,11 +661,11 @@ async function contribute(size) {
           `${size}: Acros Ye keeps its normalized filter`,
         );
       }
-      const unmappedLabels = page.locator('.unmapped-controls .menu-setting');
-      for (let index = 0; index < await unmappedLabels.count(); index += 1) {
-        const field = unmappedLabels.nth(index);
-        const key = (await field.textContent()).trim().replaceAll(' ', '_');
-        await field.locator('input').fill('0');
+      const unmappedFields = page.locator('.unmapped-controls .menu-setting');
+      for (let index = 0; index < await unmappedFields.count(); index += 1) {
+        const field = unmappedFields.nth(index);
+        const key = await field.locator('[data-key]').getAttribute('data-key');
+        await fillControl(field);
         declarations.add(key);
       }
     }
@@ -890,13 +907,20 @@ async function requiredFields() {
     await page.goto(`${options.origin}/contribute`);
     await page.getByRole('heading', { name: 'Help build looks', exact: true }).waitFor();
     // An unreadable dynamic range makes the control a required declaration.
-    const jpeg = await renderWithTag('render-missing-dynamic-range', 0x1403, 0x9999);
+    let jpeg;
+    try {
+      jpeg = await renderWithTag('render-missing-dynamic-range', 0x1403, 0x9999);
+    } catch (error) {
+      console.log(`ok required-fields: the JPEG has no dynamic range tag, so it is already unreadable (${error.message})`);
+      jpeg = options.jpeg;
+    }
     await page.setInputFiles('.drop-zone input[type=file]:not([webkitdirectory])', [options.raw, jpeg]);
     await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).waitFor({ timeout: 120_000 });
     const gate = page.locator('.required-fields');
     await gate.waitFor({ timeout: 120_000 });
     const gateText = await gate.innerText();
-    check(gateText.includes('dynamic range'), `required-fields: the gate names dynamic range (${JSON.stringify(gateText)})`);
+    check(/dynamic range/i.test(gateText), `required-fields: the gate names dynamic range (${JSON.stringify(gateText)})`);
+    check(gateText.includes('DR100, DR200, DR400'), 'required-fields: the gate names the dynamic range choices');
     const process = page.getByRole('button', { name: 'Process locally', exact: true });
     check(await process.isDisabled(), 'required-fields: Process is disabled while dynamic range is missing');
     const progress = page.getByRole('navigation', { name: 'Progress' });
@@ -906,15 +930,69 @@ async function requiredFields() {
         `required-fields: the ${name} step stays unreachable`,
       );
     }
+    const dynamicRange = page.locator('.unmapped-controls select[data-key="dynamic_range"]');
+    check(await dynamicRange.count() === 1, 'required-fields: dynamic range is a dropdown');
+    const dynamicChoices = await dynamicRange.locator('option').evaluateAll((options) =>
+      options.filter((option) => option.value !== '').map((option) => option.textContent.trim()),
+    );
+    check(
+      JSON.stringify(dynamicChoices) === JSON.stringify(['DR100', 'DR200', 'DR400']),
+      `required-fields: dynamic range offers DR100, DR200 and DR400 (${JSON.stringify(dynamicChoices)})`,
+    );
+    const whiteBalance = page.locator('.unmapped-controls select[data-key="white_balance"]');
+    if (await whiteBalance.count()) {
+      const whiteChoices = await whiteBalance.locator('option').evaluateAll((options) =>
+        options.filter((option) => option.value !== '').map((option) => option.textContent.trim()),
+      );
+      check(whiteChoices.includes('Auto'), `required-fields: white balance offers Auto (${JSON.stringify(whiteChoices)})`);
+    }
+    const shiftRed = page.locator('.unmapped-controls input[data-key="wb_shift_r"]');
+    if (await shiftRed.count()) {
+      check(await shiftRed.inputValue() === '0', 'required-fields: WB shift R starts at 0');
+      check(await shiftRed.getAttribute('min') === '-9' && await shiftRed.getAttribute('max') === '9', 'required-fields: WB shift R is bounded -9..9');
+    }
+    const shiftBlue = page.locator('.unmapped-controls input[data-key="wb_shift_b"]');
+    if (await shiftBlue.count()) {
+      check(await shiftBlue.inputValue() === '0', 'required-fields: WB shift B starts at 0');
+      check(await shiftBlue.getAttribute('min') === '-9' && await shiftBlue.getAttribute('max') === '9', 'required-fields: WB shift B is bounded -9..9');
+    }
+    await dynamicRange.evaluate((select) => { select.size = select.options.length; });
+    if (await whiteBalance.count()) {
+      await whiteBalance.evaluate((select) => { select.size = select.options.length; });
+    }
+    await page.screenshot({ path: `${options.out}/required-fields-choices.png`, fullPage: true });
+    await dynamicRange.evaluate((select) => { select.size = 0; });
+    if (await whiteBalance.count()) {
+      await whiteBalance.evaluate((select) => { select.size = 0; });
+    }
     await page.screenshot({ path: `${options.out}/required-fields-blocked.png`, fullPage: true });
-    const field = gate.getByRole('button', { name: 'dynamic range', exact: true });
+    const field = gate.locator('[data-key="dynamic_range"]');
     await field.click();
     await page.waitForFunction(() => document.activeElement?.id?.startsWith('unmapped-'));
     const focused = await page.evaluate(() => document.activeElement.id);
     check(focused.startsWith('unmapped-'), `required-fields: the missing field is focused (${focused})`);
-    const inputs = page.locator('.unmapped-controls .menu-setting input');
-    for (let index = 0; index < await inputs.count(); index += 1) {
-      await inputs.nth(index).fill('0');
+    if (await whiteBalance.count()) await whiteBalance.selectOption({ label: 'Auto' });
+    await dynamicRange.selectOption({ label: 'DR200' });
+    if (await shiftRed.count()) await shiftRed.fill('0');
+    if (await shiftBlue.count()) await shiftBlue.fill('0');
+    const unmappedFields = page.locator('.unmapped-controls .menu-setting');
+    for (let index = 0; index < await unmappedFields.count(); index += 1) {
+      const control = unmappedFields.nth(index);
+      const key = await control.locator('[data-key]').getAttribute('data-key');
+      if (['white_balance', 'dynamic_range', 'wb_shift_r', 'wb_shift_b'].includes(key)) continue;
+      await fillControl(control);
+    }
+    await page.locator('summary:has-text("Setting sources")').click();
+    const sources = await page.locator('.setting-sources').innerText();
+    if (await whiteBalance.count()) {
+      check(sources.includes('white_balance = 0'), `required-fields: choosing Auto writes white_balance=0 (${JSON.stringify(sources)})`);
+    }
+    check(sources.includes('dynamic_range = 1'), `required-fields: choosing DR200 writes dynamic_range=1 (${JSON.stringify(sources)})`);
+    if (await shiftRed.count()) {
+      check(sources.includes('wb_shift_r = 0'), 'required-fields: WB shift R writes wb_shift_r=0');
+    }
+    if (await shiftBlue.count()) {
+      check(sources.includes('wb_shift_b = 0'), 'required-fields: WB shift B writes wb_shift_b=0');
     }
     await gate.waitFor({ state: 'detached', timeout: 30_000 });
     check(!(await process.isDisabled()), 'required-fields: filling the value enables Process');
@@ -923,7 +1001,7 @@ async function requiredFields() {
     await page.getByRole('heading', { name: /Review what/ }).waitFor({ timeout: 900_000 });
     await page.screenshot({ path: `${options.out}/required-fields-processed.png`, fullPage: true });
     check(problems.length === 0, `required-fields: no page errors (${problems.join('; ')})`);
-    return { gate: gateText, field: focused };
+    return { gate: gateText, field: focused, choices: dynamicChoices };
   } catch (error) {
     await page.screenshot({ path: `${options.out}/required-fields-failed.png`, fullPage: true }).catch(() => {});
     console.error(`required-fields page state: ${await page.locator('body').innerText()}`);
