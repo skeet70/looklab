@@ -198,7 +198,9 @@ async function fillControl(field, value = '0') {
     await checkbox.check();
     return;
   }
-  await field.locator('input').fill(value);
+  const input = field.locator('input');
+  await input.fill(value);
+  await input.blur();
 }
 
 async function addVirtualAuthenticator(page) {
@@ -903,6 +905,7 @@ async function contribute(size) {
 async function requiredFields() {
   const session = await open(VIEWPORTS.desktop);
   const { page, problems } = session;
+  const xm1 = options.body === 'fujifilm/x-m1';
   try {
     await page.goto(`${options.origin}/contribute`);
     await page.getByRole('heading', { name: 'Help build looks', exact: true }).waitFor();
@@ -941,6 +944,9 @@ async function requiredFields() {
       `required-fields: dynamic range offers DR100, DR200 and DR400 (${JSON.stringify(dynamicChoices)})`,
     );
     const whiteBalance = page.locator('.unmapped-controls select[data-key="white_balance"]');
+    if (xm1) {
+      check(await whiteBalance.count() === 1, 'required-fields: X-M1 white balance is an unmapped dropdown');
+    }
     if (await whiteBalance.count()) {
       const whiteChoices = await whiteBalance.locator('option').evaluateAll((options) =>
         options.filter((option) => option.value !== '').map((option) => option.textContent.trim()),
@@ -948,12 +954,18 @@ async function requiredFields() {
       check(whiteChoices.includes('Auto'), `required-fields: white balance offers Auto (${JSON.stringify(whiteChoices)})`);
     }
     const shiftRed = page.locator('.unmapped-controls input[data-key="wb_shift_r"]');
+    if (xm1) {
+      check(await shiftRed.count() === 1, 'required-fields: X-M1 WB shift R is an unmapped number input');
+    }
     if (await shiftRed.count()) {
       check(await shiftRed.inputValue() === '', 'required-fields: WB shift R starts empty');
       check(await shiftRed.getAttribute('placeholder') === '0', 'required-fields: WB shift R shows 0 as a placeholder');
       check(await shiftRed.getAttribute('min') === '-9' && await shiftRed.getAttribute('max') === '9', 'required-fields: WB shift R is bounded -9..9');
     }
     const shiftBlue = page.locator('.unmapped-controls input[data-key="wb_shift_b"]');
+    if (xm1) {
+      check(await shiftBlue.count() === 1, 'required-fields: X-M1 WB shift B is an unmapped number input');
+    }
     if (await shiftBlue.count()) {
       check(await shiftBlue.inputValue() === '', 'required-fields: WB shift B starts empty');
       check(await shiftBlue.getAttribute('placeholder') === '0', 'required-fields: WB shift B shows 0 as a placeholder');
@@ -970,14 +982,21 @@ async function requiredFields() {
     }
     await page.screenshot({ path: `${options.out}/required-fields-blocked.png`, fullPage: true });
     const field = gate.locator('[data-key="dynamic_range"]');
+    const controlsId = await field.getAttribute('aria-controls');
     await field.click();
     await page.waitForFunction(() => document.activeElement?.id?.startsWith('unmapped-'));
     const focused = await page.evaluate(() => document.activeElement.id);
-    check(focused.startsWith('unmapped-'), `required-fields: the missing field is focused (${focused})`);
+    check(focused === controlsId, `required-fields: the missing field is focused (${focused} vs ${controlsId})`);
     if (await whiteBalance.count()) await whiteBalance.selectOption({ label: 'Auto' });
     await dynamicRange.selectOption({ label: 'DR200' });
-    if (await shiftRed.count()) await shiftRed.fill('0');
-    if (await shiftBlue.count()) await shiftBlue.fill('0');
+    if (await shiftRed.count()) {
+      await shiftRed.fill('0');
+      await shiftRed.blur();
+    }
+    if (await shiftBlue.count()) {
+      await shiftBlue.fill('0');
+      await shiftBlue.blur();
+    }
     const unmappedFields = page.locator('.unmapped-controls .menu-setting');
     for (let index = 0; index < await unmappedFields.count(); index += 1) {
       const control = unmappedFields.nth(index);
@@ -985,7 +1004,32 @@ async function requiredFields() {
       if (['white_balance', 'dynamic_range', 'wb_shift_r', 'wb_shift_b'].includes(key)) continue;
       await fillControl(control);
     }
+    await gate.waitFor({ state: 'detached', timeout: 30_000 });
+    check(!(await process.isDisabled()), 'required-fields: filling the value enables Process');
+    if (await shiftRed.count()) {
+      await shiftRed.fill('');
+      await shiftRed.blur();
+      await gate.waitFor({ timeout: 30_000 });
+      check((await gate.innerText()).includes('WB shift R'), 'required-fields: clearing WB shift R removes its step');
+      await shiftRed.fill('0');
+      await shiftRed.blur();
+      await gate.waitFor({ state: 'detached', timeout: 30_000 });
+    }
     await page.locator('summary:has-text("Setting sources")').click();
+    if (xm1) {
+      const exposure = page.locator('.batch-editor input[data-key="exposure_compensation"]');
+      check(await exposure.count() === 1, 'required-fields: X-M1 exposure compensation is a number input');
+      await exposure.fill('');
+      await exposure.pressSequentially('-0.333333');
+      await exposure.blur();
+      await page.waitForFunction(
+        () => document.querySelector('input[data-key="exposure_compensation"]')?.value === '-0.333333',
+        null,
+        { timeout: 30_000 },
+      );
+      check(await exposure.inputValue() === '-0.333333', 'required-fields: typing a negative third stop keeps its sign');
+      await gate.waitFor({ state: 'detached', timeout: 30_000 });
+    }
     const sources = await page.locator('.setting-sources').innerText();
     if (await whiteBalance.count()) {
       check(sources.includes('white_balance = 0'), `required-fields: choosing Auto writes white_balance=0 (${JSON.stringify(sources)})`);
@@ -997,12 +1041,42 @@ async function requiredFields() {
     if (await shiftBlue.count()) {
       check(sources.includes('wb_shift_b = 0'), 'required-fields: WB shift B writes wb_shift_b=0');
     }
-    await gate.waitFor({ state: 'detached', timeout: 30_000 });
-    check(!(await process.isDisabled()), 'required-fields: filling the value enables Process');
+    if (xm1) {
+      check(sources.includes('exposure_compensation = -1'), `required-fields: negative third stop writes its step (${JSON.stringify(sources)})`);
+    }
     await page.screenshot({ path: `${options.out}/required-fields-ready.png`, fullPage: true });
     await process.click();
     await page.getByRole('heading', { name: /Review what/ }).waitFor({ timeout: 900_000 });
     await page.screenshot({ path: `${options.out}/required-fields-processed.png`, fullPage: true });
+    await progress.getByRole('button', { name: 'Check groups', exact: true }).click();
+    await page.locator('summary:has-text("Technical settings editor")').click();
+    const textarea = page.getByLabel('Settings (key=step, one per line)', { exact: true });
+    const controlsText = await textarea.inputValue();
+    check(controlsText.includes('dynamic_range=1'), 'required-fields: the technical editor holds the declared value');
+    await textarea.fill(controlsText.replace('dynamic_range=1', 'dynamic_range=200'));
+    await gate.waitFor({ timeout: 30_000 });
+    check((await gate.innerText()).includes('Dynamic range'), 'required-fields: an invalid technical value is named');
+    await page.waitForTimeout(1000);
+    await page.reload();
+    await page.getByRole('heading', { name: /Check the groups/ }).waitFor({ timeout: 120_000 });
+    await gate.waitFor({ timeout: 120_000 });
+    await page.waitForFunction(
+      () => document.querySelectorAll('.stepper .step-item')[1]?.getAttribute('aria-current') === 'step',
+      null,
+      { timeout: 30_000 },
+    );
+    check(await process.isDisabled(), 'required-fields: a restored invalid draft disables Process');
+    check(
+      await page.locator('button:has-text("Continue to send")').isDisabled(),
+      'required-fields: a restored invalid draft gates Continue to send',
+    );
+    for (const name of ['Review', 'Send']) {
+      check(
+        await progress.getByRole('button', { name, exact: true }).isDisabled(),
+        `required-fields: a restored invalid draft keeps ${name} unreachable`,
+      );
+    }
+    await page.screenshot({ path: `${options.out}/required-fields-restored-invalid.png`, fullPage: true });
     check(problems.length === 0, `required-fields: no page errors (${problems.join('; ')})`);
     return { gate: gateText, field: focused, choices: dynamicChoices };
   } catch (error) {

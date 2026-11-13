@@ -163,6 +163,21 @@ struct MissingField {
 struct MissingRequired {
     batch: BatchId,
     fields: Vec<MissingField>,
+    /// Lines the settings parser or the schema rejects.
+    problems: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ControlValidation {
+    entries: Vec<MenuSetting>,
+    fields: Vec<MissingField>,
+    problems: Vec<String>,
+}
+
+impl ControlValidation {
+    fn blocked(&self) -> bool {
+        !self.fields.is_empty() || !self.problems.is_empty()
+    }
 }
 
 fn control_for<'a>(
@@ -217,51 +232,82 @@ fn control_choices(control: &looklab_schema::Control) -> String {
     }
 }
 
-/// The fields whose entered value is missing or outside the schema's steps.
-///
-/// This is the validation half of [`group_settings`], so the step gate and the
-/// send check cannot disagree about what is still required.
-fn missing_control_values(
+/// Parses every settings line strictly, so the gate and Send agree on what the
+/// technical editor carries.
+fn validate_controls(
     controls: &str,
     unmapped: &[String],
+    reproduced: &[(String, i64)],
     schema: Option<&looklab_schema::ControlSchema>,
     firmware: &str,
-) -> Vec<MissingField> {
-    let entered = menu_settings(controls);
+) -> ControlValidation {
+    let mut validation = ControlValidation::default();
+    let mut seen = HashSet::new();
+    for line in controls
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        match parse_control_line(line) {
+            Ok(entry) => {
+                if !seen.insert(entry.key.as_str().to_owned()) {
+                    validation
+                        .problems
+                        .push(format!("{}: entered more than once", entry.key));
+                }
+                validation.entries.push(entry);
+            }
+            Err(message) => validation.problems.push(message),
+        }
+    }
     let field = |key: &str| MissingField {
         key: key.to_owned(),
         choices: control_for(schema, firmware, key).map_or_else(String::new, control_choices),
     };
-    let mut missing = Vec::new();
+    let mut required = Vec::new();
     for key in unmapped {
-        match entered
+        required.push(key.clone());
+    }
+    for (key, _) in reproduced {
+        if !required.iter().any(|known| known == key) {
+            required.push(key.clone());
+        }
+    }
+    for key in &required {
+        match validation
+            .entries
             .iter()
-            .find(|setting| setting.key.as_str() == key.as_str())
+            .find(|entry| entry.key.as_str() == key.as_str())
         {
-            None => missing.push(field(key)),
-            Some(setting) => {
+            None => validation.fields.push(field(key)),
+            Some(entry) => {
                 if let Some(control) = control_for(schema, firmware, key)
-                    && !step_allowed(control, setting.step)
+                    && !step_allowed(control, entry.step)
                 {
-                    missing.push(field(key));
+                    validation.fields.push(field(key));
                 }
             }
         }
     }
-    for setting in &entered {
-        if unmapped
-            .iter()
-            .any(|key| key.as_str() == setting.key.as_str())
-        {
-            continue;
-        }
-        if let Some(control) = control_for(schema, firmware, setting.key.as_str())
-            && !step_allowed(control, setting.step)
-        {
-            missing.push(field(setting.key.as_str()));
+    if schema.is_some() {
+        for entry in &validation.entries {
+            let Some(control) = control_for(schema, firmware, entry.key.as_str()) else {
+                validation
+                    .problems
+                    .push(format!("{}: not a control on this camera", entry.key));
+                continue;
+            };
+            if !step_allowed(control, entry.step)
+                && !validation
+                    .fields
+                    .iter()
+                    .any(|field| field.key == entry.key.as_str())
+            {
+                validation.fields.push(field(entry.key.as_str()));
+            }
         }
     }
-    missing
+    validation
 }
 
 /// The included batches whose required values are still missing or invalid, in
@@ -269,23 +315,44 @@ fn missing_control_values(
 ///
 /// B&W batches without monochrome model development consent are left out of the
 /// send, so their missing values do not block the step.
-fn missing_required_values(set: &BatchSet, catalog: Option<&GroupCatalog>) -> Vec<MissingRequired> {
+fn missing_required_values(
+    set: &BatchSet,
+    catalog: Option<&GroupCatalog>,
+    schema_attempted: bool,
+) -> Vec<MissingRequired> {
     set.groups()
         .iter()
         .filter(|group| !group.renders.is_empty())
         .filter(|group| !(group.is_monochrome() && !group.fields.monochrome_opt_in))
         .filter_map(|group| {
             let schema = catalog.and_then(|catalog| catalog.schema_for(group));
-            let fields = missing_control_values(
+            let validation = validate_controls(
                 &group.fields.controls,
                 &group.unmapped,
+                &group.reproduced,
                 schema,
                 &group.fields.firmware,
             );
-            (!fields.is_empty()).then_some(MissingRequired {
-                batch: group.id,
-                fields,
-            })
+            let mut problems = validation.problems;
+            if schema_attempted
+                && group.camera_ready
+                && schema.is_none()
+                && !group.fields.body.is_empty()
+            {
+                problems.push(format!(
+                    "Camera {} settings did not load. Reload the page to try again.",
+                    group.fields.body
+                ));
+            }
+            if !validation.fields.is_empty() || !problems.is_empty() {
+                Some(MissingRequired {
+                    batch: group.id,
+                    fields: validation.fields,
+                    problems,
+                })
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -778,9 +845,23 @@ struct DraftPreparedGroup {
     memory: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct MenuSetting {
     key: looklab_schema::ControlKey,
     step: i64,
+}
+
+fn parse_control_line(line: &str) -> Result<MenuSetting, String> {
+    let (key, step) = line
+        .split_once('=')
+        .ok_or_else(|| format!("{line}: expected key=step"))?;
+    let key =
+        looklab_schema::ControlKey::new(key.trim()).map_err(|error| format!("{line}: {error}"))?;
+    let step = step
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| format!("{line}: step is not an integer"))?;
+    Ok(MenuSetting { key, step })
 }
 
 fn menu_settings(text: &str) -> Vec<MenuSetting> {
@@ -885,6 +966,18 @@ fn control_step_from_text(control: &looklab_schema::Control, text: &str) -> Opti
     }
 }
 
+/// The option values for a boolean control; only an unreadable setting gets an
+/// empty state.
+fn bool_choices(allow_empty: bool) -> Vec<(&'static str, &'static str)> {
+    let mut choices = Vec::new();
+    if allow_empty {
+        choices.push(("", "Choose"));
+    }
+    choices.push(("0", "Off"));
+    choices.push(("1", "On"));
+    choices
+}
+
 /// One camera setting rendered by the schema's control type.
 fn control_input(
     batches: RwSignal<BatchSet>,
@@ -893,6 +986,7 @@ fn control_input(
     control: Option<looklab_schema::Control>,
     field_id: Option<String>,
     label: String,
+    allow_empty: bool,
 ) -> AnyView {
     let data_key = key.as_str().to_owned();
     let read_key = key.clone();
@@ -908,8 +1002,11 @@ fn control_input(
             <label class="menu-setting">{label}
                 <input type="number" id=field_id data-key=data_key
                     prop:value=move || read().map(|step| step.to_string()).unwrap_or_default()
-                    on:input=move |event| {
-                        if let Ok(step) = event_target_value(&event).parse::<i64>() {
+                    on:change=move |event| {
+                        let text = event_target_value(&event);
+                        if text.trim().is_empty() {
+                            clear_control(batches, batch, &write_key);
+                        } else if let Ok(step) = text.parse::<i64>() {
                             set_control_step(batches, batch, &write_key, step);
                         }
                     }/>
@@ -930,6 +1027,7 @@ fn control_input(
                     }
                 })
                 .collect_view();
+            let empty = allow_empty.then(|| view! { <option value="">"Choose"</option> });
             let read_key = key.clone();
             let write_key = key.clone();
             view! {
@@ -950,7 +1048,7 @@ fn control_input(
                                 set_control_step(batches, batch, &write_key, step);
                             }
                         }>
-                        <option value="">"Choose"</option>
+                        {empty}
                         {options}
                     </select>
                 </label>
@@ -958,25 +1056,31 @@ fn control_input(
             .into_any()
         }
         looklab_schema::ControlType::Bool => {
+            let options = bool_choices(allow_empty)
+                .into_iter()
+                .map(|(value, label)| view! { <option value=value>{label}</option> })
+                .collect_view();
             let read_key = key.clone();
             view! {
                 <label class="menu-setting">{label}
-                    <input type="checkbox" id=field_id data-key=data_key
-                        prop:checked=move || {
+                    <select id=field_id data-key=data_key
+                        prop:value=move || {
                             batches.with(|set| {
                                 set.get(batch).and_then(|group| {
                                     control_step(&group.fields.controls, &read_key)
                                 })
-                            }).unwrap_or(0) != 0
+                            }).map(|step| step.to_string()).unwrap_or_default()
                         }
                         on:change=move |event| {
-                            set_control_step(
-                                batches,
-                                batch,
-                                &write_key,
-                                if event_target_checked(&event) { 1 } else { 0 },
-                            );
-                        }/>
+                            let raw = event_target_value(&event);
+                            if raw.is_empty() {
+                                clear_control(batches, batch, &write_key);
+                            } else if let Ok(step) = raw.parse::<i64>() {
+                                set_control_step(batches, batch, &write_key, step);
+                            }
+                        }>
+                        {options}
+                    </select>
                 </label>
             }
             .into_any()
@@ -987,8 +1091,11 @@ fn control_input(
                     <label class="menu-setting">{label}
                         <input type="number" id=field_id data-key=data_key
                             prop:value=move || read().map(|step| step.to_string()).unwrap_or_default()
-                            on:input=move |event| {
-                                if let Ok(step) = event_target_value(&event).parse::<i64>() {
+                            on:change=move |event| {
+                                let text = event_target_value(&event);
+                                if text.trim().is_empty() {
+                                    clear_control(batches, batch, &write_key);
+                                } else if let Ok(step) = text.parse::<i64>() {
                                     set_control_step(batches, batch, &write_key, step);
                                 }
                             }/>
@@ -1019,9 +1126,12 @@ fn control_input(
                             }).map(|step| control_value_text(&value_control, step))
                                 .unwrap_or_default()
                         }
-                        on:input=move |event| {
-                            if let Some(step) =
-                                control_step_from_text(&write_control, &event_target_value(&event))
+                        on:change=move |event| {
+                            let text = event_target_value(&event);
+                            if text.trim().is_empty() {
+                                clear_control(batches, batch, &write_key);
+                            } else if let Some(step) =
+                                control_step_from_text(&write_control, &text)
                             {
                                 set_control_step(batches, batch, &write_key, step);
                             }
@@ -1346,9 +1456,11 @@ pub fn ContributePage() -> impl IntoView {
     let parsed_metadata = StoredValue::new_local(Vec::<(String, ParsedMetadata)>::new());
     let batches = RwSignal::new(BatchSet::default());
     let catalog = RwSignal::new(None::<GroupCatalog>);
+    let catalog_attempted = RwSignal::new(false);
     let required_missing = Signal::derive(move || {
         let catalog = catalog.get();
-        batches.with(|set| missing_required_values(set, catalog.as_ref()))
+        let attempted = catalog_attempted.get();
+        batches.with(|set| missing_required_values(set, catalog.as_ref(), attempted))
     });
     let required_blocked = Signal::derive(move || !required_missing.get().is_empty());
     let focus_field = RwSignal::new(None::<(BatchId, String)>);
@@ -1486,6 +1598,18 @@ pub fn ContributePage() -> impl IntoView {
                     return;
                 }
             };
+            let schema = site.schema.clone();
+            if let Ok(index) = data::index().await {
+                catalog.update(|catalog| match catalog {
+                    Some(catalog) => catalog.put_schema(schema),
+                    None => {
+                        *catalog = Some(GroupCatalog {
+                            index,
+                            schemas: vec![schema],
+                        })
+                    }
+                });
+            }
             let prefill = parsed_metadata.with_value(|parsed| {
                 let pair_files = parsed
                     .iter()
@@ -1570,6 +1694,19 @@ pub fn ContributePage() -> impl IntoView {
         batch_epoch.update(|epoch| *epoch += 1);
     };
     on_cleanup(move || draft_store.with_value(ContributionDraftStore::flush));
+    Effect::new(move |_| {
+        if draft_complete.get() || busy.get() || !required_blocked.get() {
+            return;
+        }
+        if current.get().0 > 1 {
+            current.set(StepIndex(1));
+            furthest.set(StepIndex(1));
+            message.set(Some(
+                "A camera setting needs a valid value. Check the groups before continuing."
+                    .to_owned(),
+            ));
+        }
+    });
     spawn_local(async move {
         let status = draft_store.with_value(ContributionDraftStore::guard_status);
         let guard = ConsentGuard::of(&status);
@@ -1707,7 +1844,12 @@ pub fn ContributePage() -> impl IntoView {
                     current.set(StepIndex(1));
                 }
                 if batches.with_untracked(|set| {
-                    !missing_required_values(set, catalog.get_untracked().as_ref()).is_empty()
+                    !missing_required_values(
+                        set,
+                        catalog.get_untracked().as_ref(),
+                        catalog_attempted.get_untracked(),
+                    )
+                    .is_empty()
                 }) {
                     current.set(StepIndex(1));
                     furthest.set(StepIndex(1));
@@ -1769,8 +1911,16 @@ pub fn ContributePage() -> impl IntoView {
                         schemas.push(schema);
                     }
                 }
-                catalog.set(Some(GroupCatalog { index, schemas }));
+                catalog.update(|catalog| match catalog {
+                    Some(catalog) => {
+                        for schema in schemas {
+                            catalog.put_schema(schema);
+                        }
+                    }
+                    None => *catalog = Some(GroupCatalog { index, schemas }),
+                });
             }
+            catalog_attempted.set(true);
         });
     });
 
@@ -1839,7 +1989,13 @@ pub fn ContributePage() -> impl IntoView {
         let files = all_files.get();
         let batches = batches.get_untracked();
         let count = worker_count.get().max(1);
-        if !missing_required_values(&batches, catalog.get_untracked().as_ref()).is_empty() {
+        if !missing_required_values(
+            &batches,
+            catalog.get_untracked().as_ref(),
+            catalog_attempted.get_untracked(),
+        )
+        .is_empty()
+        {
             message.set(Some(
                 "Enter a valid value for every missing camera setting before processing."
                     .to_owned(),
@@ -1941,6 +2097,15 @@ pub fn ContributePage() -> impl IntoView {
         let mut pending = Vec::new();
         let version = snapshot_version.get_untracked();
         let catalog = catalog.get_untracked();
+        if !missing_required_values(&set, catalog.as_ref(), catalog_attempted.get_untracked())
+            .is_empty()
+        {
+            message.set(Some(
+                "A camera setting needs a valid value before sending.".to_owned(),
+            ));
+            current.set(StepIndex(1));
+            return;
+        }
         for group in set.groups() {
             if completed.with(|done| done.contains(&group.id)) {
                 continue;
@@ -2449,14 +2614,14 @@ pub fn ContributePage() -> impl IntoView {
                 let missing = required_missing.get();
                 (!missing.is_empty()).then(|| view! {
                     <div class="required-fields" id="required-fields" role="alert">
-                        <p>"These batches cannot be processed until every camera setting your files did not record has a value the camera allows. Enter the value you used for:"</p>
+                        <p>"These batches cannot be processed until every required camera setting has a value the camera allows. Check:"</p>
                         <ul>
                             {missing.into_iter().map(|missing| {
-                                let batch = missing.batch;
+                                let MissingRequired { batch, fields, problems } = missing;
                                 view! {
                                     <li>
                                         <span>{format!("Batch {}: ", batch.0)}</span>
-                                        {missing.fields.into_iter().map(|field| {
+                                        {fields.into_iter().map(|field| {
                                             let key = field.key;
                                             let label = if field.choices.is_empty() {
                                                 control_label(&key)
@@ -2475,6 +2640,11 @@ pub fn ContributePage() -> impl IntoView {
                                                 " "
                                             }
                                         }).collect_view()}
+                                        {(!problems.is_empty()).then(|| view! {
+                                            <ul class="muted">
+                                                {problems.into_iter().map(|problem| view! { <li>{problem}</li> }).collect_view()}
+                                            </ul>
+                                        })}
                                     </li>
                                 }
                             }).collect_view()}
@@ -2628,7 +2798,8 @@ pub fn ContributePage() -> impl IntoView {
                 </tbody>
             </table>
             </Disclosure>
-            <button class="button-primary" on:click=move |_| current.set(StepIndex(4))>"Continue to send"</button>
+            <button class="button-primary" on:click=move |_| current.set(StepIndex(4))
+                disabled=move || busy.get() || required_blocked.get()>"Continue to send"</button>
         </section>
         <section class="step" hidden=move || stage.get() != Stage::Send>
             <h2>"Send your samples"</h2>
@@ -3040,7 +3211,7 @@ fn BatchEditor(
                 });
                 let label = control_label(key.as_str());
                 let field_id = unmapped_field_id(id, key.as_str());
-                control_input(batches, id, key, control, Some(field_id), label)
+                control_input(batches, id, key, control, Some(field_id), label, false)
             }).collect_view()}
             {move || {
                 let rows = unmapped.get();
@@ -3057,7 +3228,7 @@ fn BatchEditor(
                         });
                         let label = control_label(key.as_str());
                         let field_id = unmapped_field_id(id, key.as_str());
-                        control_input(batches, id, key, control, Some(field_id), label)
+                        control_input(batches, id, key, control, Some(field_id), label, true)
                     }).collect_view()}
                 </div>
                 })
@@ -3131,6 +3302,18 @@ impl GroupCatalog {
         self.schemas
             .iter()
             .find(|schema| schema.body.as_str() == group.fields.body)
+    }
+
+    fn put_schema(&mut self, schema: looklab_schema::ControlSchema) {
+        if let Some(existing) = self
+            .schemas
+            .iter_mut()
+            .find(|existing| existing.body == schema.body)
+        {
+            *existing = schema;
+        } else {
+            self.schemas.push(schema);
+        }
     }
 }
 
@@ -3779,53 +3962,58 @@ fn group_settings(draft: DraftGroup<'_>) -> Result<GroupSettings, String> {
     }
     let monochrome_authorization = (render_class == RenderClass::Monochrome)
         .then_some(MonochromeAuthorization::ModelDevelopment180Days);
+    let validation = validate_controls(
+        draft.controls,
+        draft.unmapped,
+        draft.reproduced,
+        draft.schema,
+        draft.firmware,
+    );
+    if validation.blocked() {
+        let mut parts = Vec::new();
+        if !validation.fields.is_empty() {
+            let fields = validation
+                .fields
+                .into_iter()
+                .map(|field| {
+                    if field.choices.is_empty() {
+                        field.key
+                    } else {
+                        format!("{} ({})", field.key, field.choices)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            parts.push(format!("still needs a valid value for {fields}"));
+        }
+        if !validation.problems.is_empty() {
+            parts.push(format!(
+                "has invalid settings: {}",
+                validation.problems.join("; ")
+            ));
+        }
+        return Err(format!(
+            "This batch {}. Enter the value you used under Camera settings, or remove those photos from the batch.",
+            parts.join(" and ")
+        ));
+    }
     let mut entries = Vec::new();
-    for line in draft
-        .controls
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let (key, step) = line
-            .split_once('=')
-            .ok_or_else(|| format!("{line}: expected key=step"))?;
-        let key = key.trim();
-        let step = step
-            .trim()
-            .parse::<i64>()
-            .map_err(|_| format!("{line}: step is not an integer"))?;
+    for setting in validation.entries {
         let source = if draft
             .reproduced
             .iter()
-            .any(|(reproduced, reproduced_step)| reproduced == key && *reproduced_step == step)
-        {
+            .any(|(reproduced, reproduced_step)| {
+                reproduced == setting.key.as_str() && *reproduced_step == setting.step
+            }) {
             SettingSource::Reproduced
         } else {
             SettingSource::Declared
         };
         entries.push(ControlSetting {
-            key: key.to_owned(),
-            step,
+            key: setting.key.to_string(),
+            step: setting.step,
             source,
         });
-    }
-    let missing =
-        missing_control_values(draft.controls, draft.unmapped, draft.schema, draft.firmware);
-    if !missing.is_empty() {
-        let fields = missing
-            .into_iter()
-            .map(|field| {
-                if field.choices.is_empty() {
-                    field.key
-                } else {
-                    format!("{} ({})", field.key, field.choices)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "This batch still needs a valid value for {fields}. Enter the value you used under Camera settings, or remove those photos from the batch."
-        ));
     }
     let intent = if let Some(tag) = draft.tag {
         IntentChoice::Card(CardDeclaration::tagged(tag.clone()))
@@ -5112,13 +5300,14 @@ mod tests {
             "color=0",
         )]);
         assert_eq!(
-            missing_required_values(&set, None),
+            missing_required_values(&set, None, false),
             vec![MissingRequired {
                 batch: BatchId(1),
                 fields: vec![MissingField {
                     key: "dynamic_range".to_owned(),
                     choices: String::new(),
                 }],
+                problems: Vec::new(),
             }]
         );
     }
@@ -5130,7 +5319,7 @@ mod tests {
             &["dynamic_range"],
             "color=0\ndynamic_range=1",
         )]);
-        assert!(missing_required_values(&set, None).is_empty());
+        assert!(missing_required_values(&set, None, false).is_empty());
     }
 
     #[test]
@@ -5141,12 +5330,12 @@ mod tests {
             sim: "acros".to_owned(),
         }];
         let set = BatchSet::from_groups(vec![group]);
-        assert!(missing_required_values(&set, None).is_empty());
+        assert!(missing_required_values(&set, None, false).is_empty());
 
         let mut included = set.groups()[0].clone();
         included.fields.monochrome_opt_in = true;
         let set = BatchSet::from_groups(vec![included]);
-        assert_eq!(missing_required_values(&set, None).len(), 1);
+        assert_eq!(missing_required_values(&set, None, false).len(), 1);
     }
 
     fn x_m1_schema() -> looklab_schema::ControlSchema {
@@ -5292,19 +5481,23 @@ epochs:
     #[test]
     fn an_out_of_range_declared_value_blocks_the_process_step() {
         let catalog = x_m1_catalog(x_m1_schema());
-        let mut group =
-            required_group(BatchId(1), &["dynamic_range"], "color=0\ndynamic_range=200");
+        let mut group = required_group(
+            BatchId(1),
+            &["dynamic_range"],
+            "white_balance=0\ndynamic_range=200",
+        );
         group.fields.body = "fujifilm/x-m1".to_owned();
         group.fields.firmware = "1.00".to_owned();
         let set = BatchSet::from_groups(vec![group]);
         assert_eq!(
-            missing_required_values(&set, Some(&catalog)),
+            missing_required_values(&set, Some(&catalog), true),
             vec![MissingRequired {
                 batch: BatchId(1),
                 fields: vec![MissingField {
                     key: "dynamic_range".to_owned(),
                     choices: "DR100, DR200, DR400".to_owned(),
                 }],
+                problems: Vec::new(),
             }]
         );
         let error = group_settings_for(&set.groups()[0], &[], 0, Some(&catalog))
@@ -5316,15 +5509,145 @@ epochs:
         reproduced.fields.firmware = "1.00".to_owned();
         let set = BatchSet::from_groups(vec![reproduced]);
         assert_eq!(
-            missing_required_values(&set, Some(&catalog)),
+            missing_required_values(&set, Some(&catalog), true),
             vec![MissingRequired {
                 batch: BatchId(2),
                 fields: vec![MissingField {
                     key: "dynamic_range".to_owned(),
                     choices: "DR100, DR200, DR400".to_owned(),
                 }],
+                problems: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn a_camera_ready_batch_without_a_loaded_schema_blocks_until_reload() {
+        let mut group = required_group(BatchId(1), &[], "dynamic_range=1");
+        group.fields.body = "fujifilm/x-m1".to_owned();
+        group.fields.firmware = "1.00".to_owned();
+        group.camera_ready = true;
+        let set = BatchSet::from_groups(vec![group]);
+        assert!(missing_required_values(&set, None, false).is_empty());
+        let missing = missing_required_values(&set, None, true);
+        assert_eq!(missing.len(), 1);
+        assert!(
+            missing[0]
+                .problems
+                .iter()
+                .any(|problem| problem.contains("Reload the page"))
+        );
+    }
+
+    #[test]
+    fn bool_inputs_offer_a_choose_state_only_when_unreadable() {
+        assert_eq!(
+            bool_choices(true),
+            vec![("", "Choose"), ("0", "Off"), ("1", "On")]
+        );
+        assert_eq!(bool_choices(false), vec![("0", "Off"), ("1", "On")]);
+    }
+
+    #[test]
+    fn negative_decimal_text_keeps_its_sign() {
+        let schema = x_m1_schema();
+        let control = control_for(Some(&schema), "1.00", "exposure_compensation").expect("control");
+        assert_eq!(control_step_from_text(control, "-0.333333"), Some(-1));
+        assert_eq!(control_value_text(control, -1), "-0.333333");
+
+        let mut half = control.clone();
+        half.step = Some(looklab_schema::Rational::new(1, 2).expect("half step"));
+        half.range = Some(looklab_schema::Range {
+            min: looklab_schema::Rational::from_integer(-2),
+            max: looklab_schema::Rational::from_integer(2),
+        });
+        assert_eq!(control_step_from_text(&half, "-0.5"), Some(-1));
+        assert_eq!(control_value_text(&half, -1), "-0.5");
+    }
+
+    #[test]
+    fn strict_control_validation_rejects_bad_lines_and_missing_reproduced_settings() {
+        let schema = x_m1_schema();
+        let reproduced = vec![("dynamic_range".to_owned(), 1)];
+        let validation =
+            validate_controls("dynamic_range", &[], &reproduced, Some(&schema), "1.00");
+        assert!(
+            validation
+                .problems
+                .iter()
+                .any(|problem| problem.contains("expected key=step"))
+        );
+        assert!(
+            validation
+                .fields
+                .iter()
+                .any(|field| field.key == "dynamic_range")
+        );
+
+        let validation =
+            validate_controls("not_a_control=0", &[], &reproduced, Some(&schema), "1.00");
+        assert!(
+            validation
+                .problems
+                .iter()
+                .any(|problem| problem.contains("not a control"))
+        );
+        assert!(
+            validation
+                .fields
+                .iter()
+                .any(|field| field.key == "dynamic_range")
+        );
+
+        let validation =
+            validate_controls("dynamic_range=200", &[], &reproduced, Some(&schema), "1.00");
+        assert!(
+            validation
+                .fields
+                .iter()
+                .any(|field| field.key == "dynamic_range")
+        );
+
+        let validation = validate_controls(
+            "dynamic_range=0\ndynamic_range=1",
+            &[],
+            &reproduced,
+            Some(&schema),
+            "1.00",
+        );
+        assert!(
+            validation
+                .problems
+                .iter()
+                .any(|problem| problem.contains("entered more than once"))
+        );
+
+        let validation =
+            validate_controls("white_balance=0", &[], &reproduced, Some(&schema), "1.00");
+        assert!(
+            validation
+                .fields
+                .iter()
+                .any(|field| field.key == "dynamic_range")
+        );
+    }
+
+    #[test]
+    fn the_send_check_rejects_unknown_and_malformed_settings() {
+        let catalog = x_m1_catalog(x_m1_schema());
+        let mut group = required_group(BatchId(1), &[], "white_balance=0\nnot_a_control=0");
+        group.fields.body = "fujifilm/x-m1".to_owned();
+        group.fields.firmware = "1.00".to_owned();
+        let error = group_settings_for(&group, &[], 0, Some(&catalog))
+            .expect_err("unknown control is rejected");
+        assert!(error.contains("not a control"));
+
+        let mut group = required_group(BatchId(1), &[], "white_balance");
+        group.fields.body = "fujifilm/x-m1".to_owned();
+        group.fields.firmware = "1.00".to_owned();
+        let error = group_settings_for(&group, &[], 0, Some(&catalog))
+            .expect_err("malformed line is rejected");
+        assert!(error.contains("expected key=step"));
     }
 
     #[test]

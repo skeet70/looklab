@@ -37,7 +37,7 @@
 .payload-summary { font-size: 1.15rem; font-weight: 600; max-width: 65ch; }
 .pairing-card p { overflow-wrap: anywhere; }
 .menu-setting { display: flex; align-items: center; justify-content: space-between; gap: 1rem; max-width: 36rem; }
-.menu-setting input { width: 7rem; }
+.menu-setting input { width: 9rem; }
 .menu-setting select { width: 13rem; }
 .contribution-done > a { display: inline-block; margin: .5rem 1rem .5rem 0; }
 .contribution-done a { overflow-wrap: anywhere; max-width: 100%; }
