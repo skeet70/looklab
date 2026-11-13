@@ -152,6 +152,7 @@ impl Worker {
         let started = std::time::Instant::now();
         let mut completed = 0;
         while self.run_once().await?.is_some() {
+            trim_after_job();
             completed += 1;
             if completed >= max_jobs {
                 return Err(WorkerError::Job(format!(
@@ -200,14 +201,17 @@ impl Worker {
                 .await?;
             }
             match self.run_once().await {
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => trim_after_job(),
                 Ok(None) => {
                     tokio::select! {
                         () = &mut shutdown => return Ok(()),
                         () = tokio::time::sleep(Duration::from_secs(self.config.poll_seconds)) => {}
                     }
                 }
-                Err(error) => tracing::warn!(%error, "job failed"),
+                Err(error) => {
+                    tracing::warn!(%error, "job failed");
+                    trim_after_job();
+                }
             }
         }
     }
@@ -362,5 +366,45 @@ impl core::fmt::Debug for Worker {
             .debug_struct("Worker")
             .field("config", &self.config)
             .finish_non_exhaustive()
+    }
+}
+
+/// Returns a finished job's freed heap to the OS when the unit opts in.
+///
+/// glibc keeps freed blocks in its arenas after a job; a long-lived worker
+/// otherwise holds the job's peak RSS until restarted. The NixOS module sets
+/// `LOOKLAB_TRIM_AFTER_JOB=1` for the fit lane.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_after_job() {
+    if std::env::var_os("LOOKLAB_TRIM_AFTER_JOB").is_none() {
+        return;
+    }
+    trim_freed_heap();
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_after_job() {}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_freed_heap() {
+    #[allow(unsafe_code)]
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // SAFETY: malloc_trim releases only free arena pages; zero is the
+    // documented no-pad argument and the return value is a status bit.
+    #[allow(unsafe_code)]
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+mod tests {
+    #[test]
+    fn trim_freed_heap_accepts_a_freed_block() {
+        let mut blocks: Vec<Vec<u8>> = (0..32).map(|_| vec![7_u8; 1 << 20]).collect();
+        blocks.clear();
+        super::trim_freed_heap();
     }
 }

@@ -34,6 +34,10 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("looklab-server.service")
     machine.wait_for_unit("looklab-worker.service")
     machine.wait_for_unit("looklab-publisher.service")
+    machine.succeed(
+        "systemctl show looklab-worker.service -p Environment "
+        "| grep -q 'LOOKLAB_TRIM_AFTER_JOB=1'"
+    )
     machine.wait_for_file("/var/lib/looklab/looklab.sqlite3")
     machine.wait_for_file("/var/lib/looklab/data/bodies")
 

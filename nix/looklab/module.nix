@@ -456,6 +456,10 @@ in
         ExecStart = lib.escapeShellArgs (
           [ "${cfg.worker.package}/bin/looklab-worker" ] ++ workerArgs ++ [ "--lane" "fit" ]
         );
+        # glibc keeps a finished job's freed heap in its arenas. The worker
+        # returns it after each job when this is set: a one-family real-pool
+        # drain (no fit ran) idled at 20 MB with it and 2,010 MB without.
+        Environment = [ "LOOKLAB_TRIM_AFTER_JOB=1" ];
         Restart = "on-failure";
         RestartSec = 5;
         KillSignal = "SIGTERM";
