@@ -54,6 +54,7 @@ enum ReviewTarget {
     FailedGate(usize),
     FitHold(usize),
     SerialReuse(usize),
+    ManualConflict(usize),
     ManualCheck(usize),
 }
 
@@ -690,6 +691,30 @@ pub fn ModQueuePage() -> impl IntoView {
                             }).collect_view()}
                         </ul>
                         <ul class="activity-list" hidden=move || !matches!(filter.get(), QueueFilter::All | QueueFilter::CameraChecks)>
+                            {queue.manual_conflicts.into_iter().enumerate().map(|(index, conflict)| {
+                                let title = format!(
+                                    "{} {}: {} owners disagree",
+                                    conflict.camera.make(),
+                                    conflict.camera.model(),
+                                    conflict.label
+                                );
+                                let detail = format!(
+                                    "Firmware {} · {}",
+                                    conflict.firmware.as_str(),
+                                    super::body::reported_options_list(&conflict.options)
+                                );
+                                view! {
+                                    <li>
+                                        <button type="button" on:click=move |_| activate(ReviewTarget::ManualConflict(index))>
+                                            {title}
+                                        </button>
+                                        <p>{detail}</p>
+                                        <small>{ui::timestamp(conflict.newest_submitted_at)}</small>
+                                    </li>
+                                }
+                            }).collect_view()}
+                        </ul>
+                        <ul class="activity-list" hidden=move || !matches!(filter.get(), QueueFilter::All | QueueFilter::CameraChecks)>
                             {queue.manual_checks.into_iter().enumerate().map(|(index, check)| {
                                 let title = format!(
                                     "{} {}: {}",
@@ -876,6 +901,34 @@ pub fn ModQueuePage() -> impl IntoView {
                         <p>"Sharing a camera is not evidence of misuse. No trust change happens automatically."</p>
                     </section>
                 }.into_any()).unwrap_or_else(|| ().into_any()),
+                Some(ReviewTarget::ManualConflict(index)) => queue.manual_conflicts.get(index).map(|conflict| {
+                    let camera_path = format!(
+                        "/cameras/{}?control={}#manual-moderation",
+                        conflict.camera.as_str(),
+                        conflict.control.as_str()
+                    );
+                    let definition = conflict.definition_digest.to_string();
+                    let options = super::body::reported_options_list(&conflict.options);
+                    view! {
+                        <section>
+                            <button type="button" class="review-back" on:click=move |_| selected_alert.set(None)>"Back to queue"</button>
+                            <h2>{format!("{} {}: {}", conflict.camera.make(), conflict.camera.model(), conflict.label)}</h2>
+                            <p class="muted"><code>{conflict.control.as_str()}</code></p>
+                            <dl class="manual-check-detail">
+                                <dt>"Firmware"</dt>
+                                <dd>{conflict.firmware.as_str().to_owned()}</dd>
+                                <dt>"Reported options"</dt>
+                                <dd>{options}</dd>
+                                <dt>"Definition digest"</dt>
+                                <dd><code>{definition}</code></dd>
+                                <dt>"Newest report"</dt>
+                                <dd>{ui::timestamp(conflict.newest_submitted_at)}</dd>
+                            </dl>
+                            <p>"No option takes precedence. A moderator decision with cited evidence for this firmware scope resolves the conflict; reports that agree create no review item."</p>
+                            <p><A href=crate::base::site_url(&camera_path)>"Open this control's camera review"</A></p>
+                        </section>
+                    }
+                }.into_any()).unwrap_or_else(|| ().into_any()),
                 Some(ReviewTarget::ManualCheck(index)) => queue.manual_checks.get(index).map(|check| {
                     let camera_path = format!(
                         "/cameras/{}?control={}#manual-moderation",
@@ -1035,30 +1088,19 @@ fn review_targets(queue: &ReviewQueue, filter: QueueFilter) -> Vec<ReviewTarget>
         targets.extend((0..queue.serial_reuse.len()).map(ReviewTarget::SerialReuse));
     }
     if matches!(filter, QueueFilter::All | QueueFilter::CameraChecks) {
-        targets.extend(
-            queue
-                .manual_checks
-                .iter()
-                .enumerate()
-                .filter(|(_, check)| check.status == ManualCheckReviewStatus::Pending)
-                .map(|(index, _)| ReviewTarget::ManualCheck(index)),
-        );
+        targets.extend((0..queue.manual_conflicts.len()).map(ReviewTarget::ManualConflict));
     }
     targets
 }
 
 fn pending_manual_check_count(queue: &ReviewQueue) -> usize {
-    queue
-        .manual_checks
-        .iter()
-        .filter(|check| check.status == ManualCheckReviewStatus::Pending)
-        .count()
+    queue.manual_conflicts.len()
 }
 
 fn manual_check_status_text(status: &ManualCheckReviewStatus) -> &'static str {
     match status {
         ManualCheckReviewStatus::Counted => "counted toward agreement",
-        ManualCheckReviewStatus::Pending => "pending review",
+        ManualCheckReviewStatus::Conflicted => "part of a disagreement",
         ManualCheckReviewStatus::StaleDefinition => "older control definition",
         ManualCheckReviewStatus::Reviewed => "reviewed by moderator evidence",
     }

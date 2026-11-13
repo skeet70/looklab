@@ -1106,7 +1106,7 @@ pub fn ManualConfirmationPanel(
                         <tr>
                             <th scope="col">"Control"</th>
                             <th scope="col">"Category"</th>
-                            <th scope="col">"Confirmed actual"</th>
+                            <th scope="col">"Actual value"</th>
                             <th scope="col">"Manual says (documentation-derived)"</th>
                             <th scope="col">"Confirmation basis"</th>
                             <th scope="col">"Your answer"</th>
@@ -1413,6 +1413,7 @@ fn ModerationEditor(
                 let firmware = firmware_result.firmware.as_str().to_owned();
                 let actual = firmware_actual_text(firmware_result);
                 let basis = firmware_basis_text(firmware_result);
+                let detail = firmware_detail(firmware_result);
                 let stale = firmware_definition_digest(firmware_result)
                     .is_some_and(|digest| digest != current_digest);
                 let contradictions = firmware_result
@@ -1427,6 +1428,7 @@ fn ModerationEditor(
                 view! {
                     <li>
                         <strong>{format!("Firmware {firmware}")}</strong>{format!(": {actual} · {basis}")}
+                        {detail.map(|detail| view! { <div class="muted">{detail}</div> })}
                         {stale.then(|| view! {
                             <div class="muted">"Recorded against an older control definition."</div>
                         })}
@@ -1774,7 +1776,7 @@ fn receipt_text(receipt: &looklab_schema::ManualSubmissionReceipt) -> String {
             "{checks} check(s) recorded. Your profile is linked to this camera by a photo contribution, so these checks are eligible to count toward owner agreement."
         ),
         looklab_schema::ManualOwnerLinkage::Unlinked => format!(
-            "{checks} check(s) recorded. Your profile has no photo contribution linked to this camera, so these checks are received but do not count toward owner agreement. They stay visible on the camera page, and moderators can review them."
+            "{checks} check(s) recorded. Your profile has no photo contribution linked to this camera, so these checks count immediately as owner reports. A photo contribution of this camera later moves your newest answer into the linked count. A disagreement with another report opens a moderator review."
         ),
     }
 }

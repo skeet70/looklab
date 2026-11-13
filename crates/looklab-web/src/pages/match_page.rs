@@ -884,6 +884,7 @@ fn MatchResult(
     let copy_card = reply.card.clone();
     let save = permalink.clone();
     let card = reply.card.clone();
+    let card_experimental = reply.card.experimental;
     let export_slug = reply.target_slug.to_string();
     let export_version = reply.target_version.to_string();
     let software_href = crate::base::site_url(&format!(
@@ -989,6 +990,17 @@ fn MatchResult(
                 <section class="match-download">
                     <h3>"Card file"</h3>
                     <p>"This is the look's card, not a result for one camera. It does not use this camera's settings model. Firmware translates it, and that translation is not checked here."</p>
+                    {card_experimental.map(|images| view! {
+                        <p class="notice" role="note">
+                            {format!(
+                                "This card is experimental: the target rests on {} {} and no region has been checked against independent photos yet. ",
+                                images.get(),
+                                if images.get() == 1 { "image" } else { "images" }
+                            )}
+                            <a href=crate::base::site_url("/contribute/wanted")>"Help with a few more shots →"</a>
+                        </p>
+                        <p class="muted">"More independent photos, from different scenes, help check this look."</p>
+                    })}
                     <p>"Use firmware that supports looklab cards. Copy this file to your card’s look folder, then choose it in the firmware’s look menu."</p>
                     <a href=crate::base::site_url("/developers")>
                         "Compatible firmware and installation help"
@@ -1044,6 +1056,14 @@ fn recipe_text(
             context.camera.encoding.as_str()
         )),
         None => text.push_str("Historical pre-clip recipe: no output encoding recorded.\n"),
+    }
+    if let Some(base) = &card.approximated_base {
+        text.push_str(&format!(
+            "Approximation: the target's fitted coefficients approximate the declared base {base}.\n"
+        ));
+    }
+    if let Some(scope) = &card.destination_scope {
+        text.push_str(&format!("Destination realization: {scope}.\n"));
     }
     text.push_str(&format!(
         "Reachability: {}\n",
@@ -1629,6 +1649,7 @@ fn TargetCardDownload(
     let available = RwSignal::new(None::<bool>);
     let scope = RwSignal::new(None::<(looklab_publish::SelectionScope, Vec<String>)>);
     let approximated = RwSignal::new(false);
+    let experimental = RwSignal::new(false);
     let check_slug = slug.clone();
     let check_version = version.clone();
     Effect::new(move |_| {
@@ -1647,6 +1668,8 @@ fn TargetCardDownload(
                             return false;
                         };
                         approximated.set(entry.approximated);
+                        experimental
+                            .set(entry.support == looklab_publish::PublishedSupport::EarlyEstimate);
                         scope.set(Some(crate::selection::catalog_version_scope(
                             look, &version,
                         )));
@@ -1681,13 +1704,23 @@ fn TargetCardDownload(
             <button on:click=move |_| download.run(())>"Download the firmware card (.LLK)"</button>
             <p class="muted">"Checked against the version's file list. This download does not use a camera settings model or a matching result."</p>
         })}
+        {move || (available.get() == Some(true) && experimental.get()).then(|| view! {
+            <p class="notice" role="note">
+                "This card is experimental: the target is an early estimate, and no region has been checked against independent photos yet. "
+                <a href=crate::base::site_url("/contribute/wanted")>"Help with a few more shots →"</a>
+            </p>
+            <p class="muted">"More independent photos, from different scenes, help check this look."</p>
+            <p class="muted">"There is no editing-app export for this target. Export validation needs a supported probe, and this target has none yet."</p>
+        })}
         {move || (available.get() == Some(false)).then(|| view! {
             <p class="muted">{if approximated.get() {
-                "A firmware card for this version will appear here when available. This version approximates a declared base, so it is an experimental approximation, not the base itself."
+                "This version has no firmware card. It approximates a declared base, so it is an experimental approximation, not the base itself."
             } else {
                 match scope.get() {
-                    Some((looklab_publish::SelectionScope::Experimental, _)) => "A firmware card for this version will appear here when available. It is an experimental early estimate, and more independent photos would help check it.",
-                    _ => "No firmware card is available for this version.",
+                    Some((looklab_publish::SelectionScope::Experimental, _)) => {
+                        "This version has no firmware card in its published files."
+                    }
+                    _ => "This version has no firmware card.",
                 }
             }}</p>
             <a href=crate::base::site_url("/contribute/wanted")>"Help with a few more shots →"</a>

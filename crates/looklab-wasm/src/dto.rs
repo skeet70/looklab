@@ -60,6 +60,12 @@ pub struct CardDto {
     /// Set when the target's published support mask supported nothing.
     #[serde(default)]
     pub experimental: Option<looklab_match::ImageCount>,
+    /// Set when the target's fitted coefficients approximate a declared base.
+    #[serde(default)]
+    pub approximated_base: Option<String>,
+    /// Set when the destination realization excludes or approximates the target.
+    #[serde(default)]
+    pub destination_scope: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +126,8 @@ impl CardDto {
             confidence: level_value(card.confidence.level),
             confidence_reason: card.confidence.reason.clone(),
             experimental: card.experimental,
+            approximated_base: card.approximated_base.clone(),
+            destination_scope: card.destination_scope.clone(),
         }
     }
 }

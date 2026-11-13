@@ -187,6 +187,8 @@ pub struct MatchInputs {
     pub selection: Option<MatchSelection>,
     pub metric: ScoringMetric,
     pub output_encoding: Option<OutputEncoding>,
+    pub approximated_base: Option<String>,
+    pub destination_scope: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -665,8 +667,10 @@ pub fn run_match(message: &MatchRequest) -> Result<MatchReply, FacadeError> {
         .ok_or_else(|| FacadeError::Input(format!("no loaded input for sim {}", best.sim)))?;
     let winner = &case.sims[winner_index];
     let winner_model = &models[winner_index];
-    let card =
+    let mut card =
         settings_card_with_support(&target, &plan, winner_model, best, domains.get(&best.sim))?;
+    card.approximated_base = case.inputs.approximated_base.clone();
+    card.destination_scope = case.inputs.destination_scope.clone();
     let realization = winner_model.realize(&best.settings)?;
     let realization_lut = looklab_publish::bake_lut(&realization.look, |xyz| {
         winner_model.input_xyz(&realization, xyz)
@@ -817,7 +821,19 @@ pub fn run_verify(message: &VerifyRequestMessage) -> Result<VerifyReply, FacadeE
     } else {
         domains.get(&second.sim)
     };
-    let card = settings_card_with_support(target_for_second, &plan, card_model, &second, support)?;
+    let mut card =
+        settings_card_with_support(target_for_second, &plan, card_model, &second, support)?;
+    card.approximated_base = case.inputs.approximated_base.clone();
+    card.destination_scope = if downgraded {
+        let excluded: Vec<String> = case
+            .excluded
+            .iter()
+            .map(|entry| entry.sim.as_str().to_owned())
+            .collect();
+        looklab_match::destination_scope(next_mode, &excluded)
+    } else {
+        case.inputs.destination_scope.clone()
+    };
     let next_sim = case.sim(&second.sim)?;
     Ok(VerifyReply {
         permalink: case.permalink(next_sim, &second.sim, &next_calibration, next_mode)?,
@@ -1002,6 +1018,8 @@ mod tests {
                 selection: None,
                 metric: ScoringMetric::LegacyPreClipV1,
                 output_encoding: None,
+                approximated_base: None,
+                destination_scope: None,
             },
         };
         (request, document)
@@ -1276,6 +1294,28 @@ mod tests {
         let permalink = Permalink::parse(&reply.permalink).expect("permalink");
         assert_eq!(permalink.selection, Some(fixture.selection.clone()));
         assert_eq!(permalink.sim, fixture.sim.to_string());
+    }
+
+    #[test]
+    fn approximation_labels_survive_the_worker_wire() {
+        let mut fixture = qualified_request();
+        fixture.message.inputs.approximated_base = Some("classic-chrome@2.0.0".to_owned());
+        fixture.message.inputs.destination_scope =
+            Some("the camera realization is experimental".to_owned());
+        let reply = crate::run_match(&fixture.wire()).expect("match");
+        assert_eq!(
+            reply.card.approximated_base.as_deref(),
+            Some("classic-chrome@2.0.0")
+        );
+        assert_eq!(
+            reply.card.destination_scope.as_deref(),
+            Some("the camera realization is experimental")
+        );
+        let encoded = postcard::to_allocvec(&Ok::<crate::dto::MatchReply, String>(reply.clone()))
+            .expect("reply encodes");
+        let decoded = crate::decode_match_reply(&encoded).expect("reply decodes");
+        assert_eq!(decoded.card.approximated_base, reply.card.approximated_base);
+        assert_eq!(decoded.card.destination_scope, reply.card.destination_scope);
     }
 
     #[test]

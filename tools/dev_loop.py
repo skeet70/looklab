@@ -89,13 +89,16 @@ class Layout:
         stub_port = port_from_environment("LOOKLAB_DEV_API_PORT", DEFAULT_STUB_PORT)
         if public_port == stub_port:
             raise ValueError("LOOKLAB_DEV_PORT and LOOKLAB_DEV_API_PORT must differ")
+        stub_state = Path(os.environ.get("LOOKLAB_STUB_STATE") or target / "stub-state")
+        if not stub_state.is_absolute():
+            stub_state = origin / stub_state
         return cls(
             origin=origin,
             target=target,
             view=target / "source",
             dist=target / "dist",
             next_dist=target / "next-dist",
-            stub_state=target / "stub-state",
+            stub_state=stub_state.resolve(),
             runtime=runtime,
             stub_binary=target / "debug" / "examples" / "stub_server",
             stub_bin=target / "stub-bin",

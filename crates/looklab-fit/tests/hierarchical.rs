@@ -4,6 +4,8 @@
 
 #![cfg(feature = "synth")]
 #![allow(clippy::disallowed_types)]
+// The long recovery cases are compiled only for the pre-release tier.
+#![cfg_attr(not(feature = "long-tests"), allow(dead_code, unused_imports))]
 
 use looklab_body::Delta6;
 use looklab_color::RgbSpace;
@@ -908,6 +910,7 @@ fn recipe_images_do_not_move_the_published_look() {
     assert!(difference < 1e-9, "recipe moved the Look by {difference}");
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn single_body_bootstrap_draws_images() {
     let data = looklab_fit::synth::dataset(&looklab_fit::synth::SynthConfig {
@@ -997,6 +1000,7 @@ fn control_body(
     }
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn hierarchical_body_block_fits_control_responses() {
     let schema = looklab_schema::validate_control_schema(include_str!(

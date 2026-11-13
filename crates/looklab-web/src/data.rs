@@ -531,17 +531,7 @@ pub(crate) fn plain_base_label(base: &looklab_model::file::BaseReference) -> Str
 
 /// The exact base identity, for technical details.
 pub(crate) fn base_label(base: &looklab_model::file::BaseReference) -> String {
-    match base {
-        looklab_model::file::BaseReference::Look { slug, version } => {
-            format!("{}@{}", slug.as_str(), version.as_str())
-        }
-        looklab_model::file::BaseReference::BodyRealization { body, .. } => {
-            body.as_str().to_owned()
-        }
-        looklab_model::file::BaseReference::FamilyRendering {
-            maker, rendering, ..
-        } => format!("{maker} {rendering}"),
-    }
+    looklab_match::base_label(base)
 }
 
 fn version_summary<'a>(
@@ -699,6 +689,12 @@ pub async fn export_target(
     let summary = version_summary(&index, slug.as_str(), version.as_str())?;
     if !summary.matchable {
         return Err("This version cannot be exported to an editing app.".to_owned());
+    }
+    if summary.support == looklab_publish::PublishedSupport::EarlyEstimate {
+        return Err(
+            "This version is an experimental early estimate, and export validation needs a supported probe. There is no editing-app export for it."
+                .to_owned(),
+        );
     }
     if !summary.permits_new_outputs() {
         return Err("This version is no longer valid, so this export is unavailable.".to_owned());
@@ -1280,6 +1276,8 @@ pub struct ReviewQueue {
     pub nominations: Vec<EndorsementNomination>,
     #[serde(default)]
     pub manual_checks: Vec<looklab_schema::ManualCheckReview>,
+    #[serde(default)]
+    pub manual_conflicts: Vec<looklab_schema::ManualCheckConflict>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]

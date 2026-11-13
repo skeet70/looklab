@@ -2,3 +2,9 @@
 [profile.pre-release]
 slow-timeout = { period = "60s", terminate-after = 30 }
 fail-fast = false
+
+# Long fit recovery cases run for many minutes; stop only a case that stops making progress.
+# Sized against the slowest case that stays in the release gate, model_error::image_copies_do_not_add_confidence at 4h49m.
+[profile.long]
+slow-timeout = { period = "60s", terminate-after = 330 }
+fail-fast = false

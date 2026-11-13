@@ -1302,6 +1302,14 @@ async function propose_edges(size) {
   try {
     await page.goto(`${options.origin}/community/propose?kind=lut_look`);
     await page.waitForSelector('#lut-name', { timeout: 60_000 });
+    const lutOrder = await page.evaluate(() => {
+      const section = document.querySelector('section[aria-labelledby="lut-heading"]');
+      const zone = section?.querySelector('section.drop-zone');
+      const fields = [...(section?.querySelectorAll('input, select, textarea') ?? [])].filter((element) => !zone?.contains(element));
+      return Boolean(zone && fields.length > 0 && fields.every((element) => zone.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING));
+    });
+    check(lutOrder, `${options.browser} ${size}: the custom-look drop zone precedes the name and other fields`);
+    check(await page.locator('section[aria-labelledby="evidence-heading"]').count() === 0, `${options.browser} ${size}: a custom look shows no donation section`);
     await page.click('#submit-proposal');
     await page.waitForSelector('section[aria-labelledby="submit"] .error', { timeout: 60_000 });
     check((await page.locator('#payload-yaml').inputValue()).trim() === '', `${options.browser} ${size}: a missing .cube produces a form error, not an empty payload`);
@@ -1316,6 +1324,20 @@ async function propose_edges(size) {
     const offered = await page.locator('#lut-base-look option:not([value=""])').count();
     check(offered === expected, `${options.browser} ${size}: display bases offer ${expected} importer-supported versions`);
 
+    await page.goto(`${options.origin}/community/propose?kind=interface_profile`);
+    await page.waitForSelector('section[aria-labelledby="interface-heading"]', { timeout: 60_000 });
+    check(await page.locator('section[aria-labelledby="evidence-heading"]').count() === 0, `${options.browser} ${size}: an editing-app profile shows no donation section`);
+    await page.setInputFiles('section[aria-labelledby="interface-heading"] input[type=file]', `${REPO_ROOT}/data/interfaces/example-app-lut3d-v1.yaml`);
+    await page.waitForSelector('section[aria-labelledby="interface-heading"] p.muted', { timeout: 60_000 });
+    const interfaceOrder = await page.evaluate(() => {
+      const section = document.querySelector('section[aria-labelledby="interface-heading"]');
+      const zone = section?.querySelector('section.drop-zone');
+      const identity = [...(section?.querySelectorAll('p.muted') ?? [])].find((element) => element.textContent.includes('example-app/lut3d-v1'));
+      const outsideFields = [...(section?.querySelectorAll('input, select, textarea') ?? [])].filter((element) => !zone?.contains(element));
+      return Boolean(zone && identity && outsideFields.length === 0 && zone.compareDocumentPosition(identity) & Node.DOCUMENT_POSITION_FOLLOWING);
+    });
+    check(interfaceOrder, `${options.browser} ${size}: the editing-app profile drop zone precedes the profile identity and other fields`);
+
     await page.goto(`${options.origin}/community/propose?kind=mapping`);
     await page.waitForSelector('#mapping-camera', { timeout: 60_000 });
     await page.selectOption('#mapping-camera', 'fujifilm/x-s10');
@@ -1328,6 +1350,7 @@ async function propose_edges(size) {
 
     await page.goto(`${options.origin}/community/propose?kind=schema_change`);
     await page.waitForSelector('#schema-camera', { timeout: 60_000 });
+    check(await page.locator('section[aria-labelledby="evidence-heading"]').count() === 0, `${options.browser} ${size}: a control change shows no donation section`);
     await page.selectOption('#schema-camera', 'fujifilm/x-s10');
     await page.waitForSelector('#schema-epoch', { timeout: 60_000 });
     check((await page.locator('fieldset input[type=checkbox]').count()) > 0, `${options.browser} ${size}: controls are an explicit multi-select`);
@@ -1350,6 +1373,13 @@ async function propose_edges(size) {
     await page.selectOption('#schema-camera', '');
     await page.waitForSelector('#schema-epoch', { state: 'detached', timeout: 60_000 });
     check((await page.locator('#payload-yaml').inputValue()).trim() === '', `${options.browser} ${size}: clearing the camera clears the control payload`);
+
+    await page.goto(`${options.origin}/community/propose?kind=body`);
+    await page.waitForSelector('#body-kind', { timeout: 60_000 });
+    check(await page.locator('section[aria-labelledby="evidence-heading"]').count() === 1, `${options.browser} ${size}: a camera body shows the donation section`);
+    await page.selectOption('#body-kind', 'software');
+    await page.waitForSelector('section[aria-labelledby="evidence-heading"]', { state: 'detached', timeout: 60_000 });
+    check(await page.locator('section[aria-labelledby="evidence-heading"]').count() === 0, `${options.browser} ${size}: a software body shows no donation section`);
     await page.screenshot({ path: `${options.out}/propose-edges-${size}.png`, fullPage: true });
     await writeFile(`${options.out}/propose-edges-errors-${size}.json`, JSON.stringify(problems, null, 2));
     check(problems.length === 0, `${options.browser} ${size}: no page errors during proposal edge flows`);

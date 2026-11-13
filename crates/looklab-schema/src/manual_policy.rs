@@ -62,6 +62,20 @@ pub struct ManualEvidence {
     pub definition_digest: Sha256Hex,
     pub finding: Finding,
     pub submitted_at: i64,
+    /// Whether the reporting profile has a non-withdrawn serial-bearing photo of this camera.
+    #[serde(default = "default_linked")]
+    pub linked: bool,
+    /// Distinct profiles in this identity group whose newest answer agrees with the group's.
+    #[serde(default = "one_profile")]
+    pub profiles: u32,
+}
+
+const fn default_linked() -> bool {
+    true
+}
+
+const fn one_profile() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +238,8 @@ pub enum ConfirmationState {
     Documented,
     Unconfirmed,
     Confirmed,
+    /// Unlinked profiles agree on one actual value; it counts immediately but is not confirmed.
+    OwnerReported,
     Contradicted,
     ModeratorConfirmed,
     ModeratorRejected,
@@ -252,6 +268,22 @@ pub struct ConfirmedActual {
     pub firmware_scopes: Vec<FirmwareScope>,
 }
 
+/// One distinct reported actual value with the number of linked groups and unlinked profiles behind it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportedOption {
+    pub finding: Finding,
+    #[serde(default)]
+    pub linked_groups: u32,
+    #[serde(default)]
+    pub owner_profiles: u32,
+}
+
+impl ReportedOption {
+    pub fn reports(&self) -> u32 {
+        self.linked_groups.saturating_add(self.owner_profiles)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FirmwareConfirmation {
     pub firmware: ReportedFirmware,
@@ -262,6 +294,39 @@ pub struct FirmwareConfirmation {
     pub basis: Option<ConfirmationBasis>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_actual: Option<ConfirmedActual>,
+    /// Every distinct actual value reported for this firmware, most reported first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reported_options: Vec<ReportedOption>,
+    /// The number of unlinked profiles whose latest answer is counted for this firmware.
+    #[serde(default)]
+    pub owner_profiles: u32,
+    /// Every profile whose latest answer is counted, including one per linked group.
+    #[serde(default)]
+    pub reported_profiles: u32,
+}
+
+impl FirmwareConfirmation {
+    /// Whether this firmware's counted reports agree with the claim in `finding`.
+    pub fn reports_agree(&self, capability: &DocumentedCapability, finding: &Finding) -> bool {
+        let claim = ActualClaim::from_finding(capability, finding);
+        match self.state {
+            ConfirmationState::Confirmed => self
+                .confirmed_actual
+                .as_ref()
+                .is_some_and(|actual| actual.agrees_with(capability, finding)),
+            ConfirmationState::OwnerReported => {
+                self.reported_options.first().is_some_and(|option| {
+                    ActualClaim::from_finding(capability, &option.finding) == claim
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether more than one actual value was reported for this firmware.
+    pub fn reports_conflict(&self) -> bool {
+        self.reported_options.len() > 1
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +366,8 @@ pub struct ManualConfirmationSummary {
     pub confirmed: u32,
     pub contradicted: u32,
     pub unconfirmed: u32,
+    #[serde(default)]
+    pub owner_reported: u32,
     pub documented: u32,
 }
 
@@ -397,14 +464,26 @@ pub struct ManualConfirmationSubmission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ManualCheckReviewStatus {
-    /// Linked owner agreement counted for this firmware.
+    /// The newest answer for its profile and agrees with the firmware's reported or confirmed value.
     Counted,
-    /// Current, but neither counted nor covered by moderator evidence.
-    Pending,
+    /// Part of a disagreement at its control and firmware; the conflict is the review item.
+    Conflicted,
     /// Recorded against an older control definition.
     StaleDefinition,
     /// Received before a moderator decision that is unscoped or whose firmware scope covers it.
     Reviewed,
+}
+
+/// One control and firmware where owner reports disagree, with every option and its count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualCheckConflict {
+    pub camera: BodyId,
+    pub control: CapabilityKey,
+    pub label: String,
+    pub firmware: ReportedFirmware,
+    pub definition_digest: Sha256Hex,
+    pub options: Vec<ReportedOption>,
+    pub newest_submitted_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,6 +497,11 @@ pub struct ManualCheckReview {
     pub submitted_at: i64,
     pub owner_linkage: ManualOwnerLinkage,
     pub status: ManualCheckReviewStatus,
+}
+
+/// Whether two findings claim the same availability and domain for `capability`.
+pub fn findings_agree(capability: &DocumentedCapability, left: &Finding, right: &Finding) -> bool {
+    ActualClaim::from_finding(capability, left) == ActualClaim::from_finding(capability, right)
 }
 
 pub fn evaluate_camera(
@@ -447,6 +531,7 @@ pub fn evaluate_camera(
         confirmed: 0,
         contradicted: 0,
         unconfirmed: 0,
+        owner_reported: 0,
         documented: 0,
     };
     for control in &summary.controls {
@@ -457,6 +542,7 @@ pub fn evaluate_camera(
             ConfirmationState::Contradicted | ConfirmationState::ModeratorRejected => {
                 summary.contradicted += 1;
             }
+            ConfirmationState::OwnerReported => summary.owner_reported += 1,
             ConfirmationState::Unconfirmed => summary.unconfirmed += 1,
             ConfirmationState::Documented => summary.documented += 1,
         }
@@ -545,6 +631,9 @@ pub fn evaluate_control(
                         contradictions: Vec::new(),
                         basis: Some(ConfirmationBasis::Moderator),
                         confirmed_actual: None,
+                        reported_options: Vec::new(),
+                        owner_profiles: 0,
+                        reported_profiles: 0,
                     });
                 }
             }
@@ -585,6 +674,11 @@ pub fn evaluate_control(
         .any(|result| result.state == ConfirmationState::ModeratorRejected)
     {
         ConfirmationState::ModeratorRejected
+    } else if firmware
+        .iter()
+        .any(|result| result.state == ConfirmationState::OwnerReported)
+    {
+        ConfirmationState::OwnerReported
     } else if firmware.is_empty() {
         match moderators.first() {
             Some(record) if record.confirmed => ConfirmationState::ModeratorConfirmed,
@@ -637,9 +731,15 @@ fn evaluate_firmware(
     firmware: ReportedFirmware,
     evidence: &[&ManualEvidence],
 ) -> FirmwareConfirmation {
-    let mut groups: Vec<ClaimGroup<'_>> = Vec::new();
+    let mut linked_groups: Vec<ClaimGroup<'_>> = Vec::new();
+    let mut owner_groups: Vec<ClaimGroup<'_>> = Vec::new();
     for &entry in evidence {
         let claim = ActualClaim::from_finding(capability, &entry.finding);
+        let groups = if entry.linked {
+            &mut linked_groups
+        } else {
+            &mut owner_groups
+        };
         match groups.iter_mut().find(|group| group.claim == claim) {
             Some(group) => group.evidence.push(entry),
             None => groups.push(ClaimGroup {
@@ -648,8 +748,45 @@ fn evaluate_firmware(
             }),
         }
     }
-    groups.sort_by_key(|group| std::cmp::Reverse(group.evidence.len()));
-    let Some(leading) = groups.first() else {
+    linked_groups.sort_by_key(|group| std::cmp::Reverse(group.evidence.len()));
+    owner_groups.sort_by_key(|group| std::cmp::Reverse(group.evidence.len()));
+    let owner_profiles = owner_groups
+        .iter()
+        .flat_map(|group| group.evidence.iter())
+        .map(|entry| entry.profiles)
+        .sum::<u32>();
+    let reported_profiles = linked_groups
+        .iter()
+        .chain(owner_groups.iter())
+        .flat_map(|group| group.evidence.iter())
+        .map(|entry| entry.profiles)
+        .sum::<u32>();
+    let mut reported_options = reported_options(capability, &linked_groups, &owner_groups);
+    reported_options.sort_by(|left, right| {
+        right
+            .reports()
+            .cmp(&left.reports())
+            .then_with(|| finding_key(&left.finding).cmp(&finding_key(&right.finding)))
+    });
+    let Some(leading) = linked_groups.first() else {
+        if !owner_groups.is_empty() {
+            let state = if owner_groups.len() > 1 {
+                ConfirmationState::Contradicted
+            } else {
+                ConfirmationState::OwnerReported
+            };
+            return FirmwareConfirmation {
+                firmware,
+                state,
+                agreeing_groups: 0,
+                contradictions: owner_contradictions(&owner_groups),
+                basis: None,
+                confirmed_actual: None,
+                reported_options,
+                owner_profiles,
+                reported_profiles,
+            };
+        }
         return FirmwareConfirmation {
             firmware,
             state: if capability.availability == Availability::Available {
@@ -661,12 +798,20 @@ fn evaluate_firmware(
             contradictions: Vec::new(),
             basis: None,
             confirmed_actual: None,
+            reported_options,
+            owner_profiles,
+            reported_profiles,
         };
     };
     let agreeing_groups = leading.evidence.len() as u32;
-    if groups.len() > 1 {
-        let mut contradictions = groups[1..]
+    if linked_groups.len() > 1
+        || (agreeing_groups < AGREEMENT_GROUPS as u32 && reported_options.len() > 1)
+    {
+        let leading_claim = ActualClaim::from_finding(capability, &reported_options[0].finding);
+        let mut contradictions = linked_groups
             .iter()
+            .chain(owner_groups.iter())
+            .filter(|group| group.claim != leading_claim)
             .flat_map(|group| group.evidence.iter().copied())
             .map(|entry| Contradiction {
                 firmware: entry.firmware.clone(),
@@ -686,6 +831,9 @@ fn evaluate_firmware(
             contradictions,
             basis: None,
             confirmed_actual: None,
+            reported_options,
+            owner_profiles,
+            reported_profiles,
         };
     }
     if agreeing_groups as usize >= AGREEMENT_GROUPS {
@@ -711,16 +859,69 @@ fn evaluate_firmware(
             contradictions: Vec::new(),
             basis: Some(basis),
             confirmed_actual: Some(confirmed_actual),
+            reported_options,
+            owner_profiles,
+            reported_profiles,
         };
     }
     FirmwareConfirmation {
         firmware,
-        state: ConfirmationState::Unconfirmed,
+        state: ConfirmationState::OwnerReported,
         agreeing_groups,
         contradictions: Vec::new(),
         basis: None,
         confirmed_actual: None,
+        reported_options,
+        owner_profiles,
+        reported_profiles,
     }
+}
+
+/// Options from every linked claim group except the leading one.
+fn owner_contradictions(groups: &[ClaimGroup<'_>]) -> Vec<Contradiction> {
+    groups
+        .iter()
+        .skip(1)
+        .flat_map(|group| group.evidence.iter().copied())
+        .map(|entry| Contradiction {
+            firmware: entry.firmware.clone(),
+            finding: entry.finding.clone(),
+        })
+        .collect()
+}
+
+fn reported_options(
+    capability: &DocumentedCapability,
+    linked_groups: &[ClaimGroup<'_>],
+    owner_groups: &[ClaimGroup<'_>],
+) -> Vec<ReportedOption> {
+    let mut options: Vec<ReportedOption> = Vec::new();
+    for (groups, linked) in [(linked_groups, true), (owner_groups, false)] {
+        for group in groups {
+            let count = group.evidence.len() as u32;
+            match options.iter_mut().find(|option| {
+                ActualClaim::from_finding(capability, &option.finding) == group.claim
+            }) {
+                Some(option) => {
+                    if linked {
+                        option.linked_groups = option.linked_groups.saturating_add(count);
+                    } else {
+                        option.owner_profiles = option.owner_profiles.saturating_add(count);
+                    }
+                }
+                None => options.push(ReportedOption {
+                    finding: group.evidence[0].finding.clone(),
+                    linked_groups: if linked { count } else { 0 },
+                    owner_profiles: if linked { 0 } else { count },
+                }),
+            }
+        }
+    }
+    options
+}
+
+fn finding_key(finding: &Finding) -> String {
+    serde_json::to_string(finding).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

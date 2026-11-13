@@ -144,6 +144,7 @@ fn LookPageView(page: LookPage) -> impl IntoView {
     let approximated = RwSignal::new(false);
     let evidence_slug = page.slug.to_string();
     let card_eligible = RwSignal::new(false);
+    let card_experimental = RwSignal::new(false);
     let scene_index = RwSignal::new(Load::<SceneIndex>::Loading);
     let scene_name = RwSignal::new(String::new());
     let scene = RwSignal::new(Load::<Arc<PreparedScene>>::Loading);
@@ -183,6 +184,10 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                         version_scope.set(scope);
                         version_blockers.set(blockers);
                         card_eligible.set(page_version.card_eligible);
+                        card_experimental.set(
+                            page_version.support
+                                == looklab_publish::PublishedSupport::EarlyEstimate,
+                        );
                         approximated.set(page_version.approximated);
                     }
                     version.set(Load::Ready(Arc::new(loaded)));
@@ -515,11 +520,19 @@ fn LookPageView(page: LookPage) -> impl IntoView {
                     <p class="muted">"This card is for the look itself, not for one camera. It does not use camera settings or a matching result. Firmware translates it, and that translation is not checked here."</p>
                 }
             })}
+            {move || (card_eligible.get() && card_experimental.get()).then(|| view! {
+                <p class="notice" role="note">
+                    "This card is experimental: the target is an early estimate, and no region has been checked against independent photos yet. "
+                    <a href=crate::base::site_url("/contribute/wanted")>"Help with a few more shots →"</a>
+                </p>
+                <p class="muted">"More independent photos, from different scenes, help check this look."</p>
+                <p class="muted">"There is no editing-app export for this target. Export validation needs a supported probe, and this target has none yet."</p>
+            })}
             {move || (!card_eligible.get() && version_scope.get() == looklab_publish::SelectionScope::Experimental).then(|| view! {
                 <p class="muted">{if approximated.get() {
-                    "A firmware card for this version will appear here when available. This version approximates a declared base, so it is an experimental approximation, not the base itself."
+                    "This version has no firmware card. It approximates a declared base, so it is an experimental approximation, not the base itself."
                 } else {
-                    "A firmware card for this version will appear here when available. It is an experimental early estimate, and no region has been checked against independent photos."
+                    "This version has no firmware card in its published files."
                 }}</p>
             })}
             {move || overview_details.iter().find(|details| details.version == selected.get()).map(|details| view! {

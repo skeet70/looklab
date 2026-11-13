@@ -21,6 +21,8 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+# LOOKLAB_STUB_STATE selects the stub database directory; defaults to
+# $CARGO_TARGET_DIR/stub-state.
 export CARGO_TARGET_DIR="${LOOKLAB_UI_TARGET_DIR:-$root/target-ui}"
 [[ $CARGO_TARGET_DIR = /* ]] || CARGO_TARGET_DIR="$root/$CARGO_TARGET_DIR"
 export CARGO_PROFILE_DEV_DEBUG=0

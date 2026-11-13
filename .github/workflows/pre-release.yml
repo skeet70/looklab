@@ -77,3 +77,135 @@ jobs:
             target/release/deps
             target/release/build
             target/release/.fingerprint
+
+  long_fit_core:
+    name: long fit recovery, core
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          fixtures: "false"
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: long-fit-core
+          salt: release-long-fit-core
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+      - name: Long fit recovery contracts, core
+        run: nix develop -c cargo nextest run --locked -p looklab-fit --features long-tests --release --profile long --test controlled --test fit --test hierarchical --test sample_trust --test uncertainty_study -E '(binary(controlled) & not (test(capped_hessian_rows_converge_on_a_noisy_fit) | test(non_default_images_reduce_theta_uncertainty))) | binary(fit) | binary(hierarchical) | binary(sample_trust) | binary(uncertainty_study)' --no-fail-fast --ignore-default-filter
+      - uses: ./.github/actions/cache
+        if: ${{ !cancelled() }}
+        with:
+          mode: save
+          family: long-fit-core
+          salt: release-long-fit-core
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+
+  long_fit_model_error_a:
+    name: long fit recovery, model error A
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          fixtures: "false"
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: long-fit-model-error-a
+          salt: release-long-fit-model-error-a
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+      - name: Long model error contracts A
+        run: nix develop -c cargo nextest run --locked -p looklab-fit --features long-tests --release --profile long --test model_error -E 'binary(model_error) & (test(image_copies_do_not_add_confidence) | test(opposite_body_bias_does_not_dilute_with_more_bodies) | test(held_nuisance_offsets_do_not_become_model_error))' --no-fail-fast --ignore-default-filter
+      - uses: ./.github/actions/cache
+        if: ${{ !cancelled() }}
+        with:
+          mode: save
+          family: long-fit-model-error-a
+          salt: release-long-fit-model-error-a
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+
+  long_fit_model_error_b:
+    name: long fit recovery, model error B
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          fixtures: "false"
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: long-fit-model-error-b
+          salt: release-long-fit-model-error-b
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+      - name: Long model error contracts B
+        run: nix develop -c cargo nextest run --locked -p looklab-fit --features long-tests --release --profile long --test model_error -E 'binary(model_error) & not (test(image_copies_do_not_add_confidence) | test(opposite_body_bias_does_not_dilute_with_more_bodies) | test(held_nuisance_offsets_do_not_become_model_error))' --no-fail-fast --ignore-default-filter
+      - uses: ./.github/actions/cache
+        if: ${{ !cancelled() }}
+        with:
+          mode: save
+          family: long-fit-model-error-b
+          salt: release-long-fit-model-error-b
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+
+  long_cli:
+    name: long CLI fit cases
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          fixtures: "false"
+      - uses: ./.github/actions/cache
+        with:
+          mode: restore
+          family: long-cli
+          salt: release-long-cli
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+      - name: Long CLI fit contracts
+        run: nix develop -c cargo nextest run --locked -p looklab-cli --features long-tests --release --profile long --test e2e --test fit_exposure_hint -E 'binary(fit_exposure_hint) | (binary(e2e) & (test(synthetic_flow_fits_reports_compares_and_attempts_export) | test(fit_skips_an_undecodable_sample_and_keeps_going)))' --no-fail-fast --ignore-default-filter
+      - uses: ./.github/actions/cache
+        if: ${{ !cancelled() }}
+        with:
+          mode: save
+          family: long-cli
+          salt: release-long-cli
+          paths: |
+            target/.rustc_info.json
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint

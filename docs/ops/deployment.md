@@ -230,6 +230,27 @@ sudo -u looklab looklab admin import-lut \
 
 A display-referred entry whose declared base is not a published Look, whether an intended family rendering or a body rendering with a missing field, publishes a labelled approximate preview on the neutral baseline rather than a matchable target.
 
+**Revert a Look and reject contributions.** The same audited CLI actor restores a published version as a new version, rejects named contributions and queues the refit. Each rejected id must belong to the reverted Look's evidence. The command reports whether the restored copy is current or a historical copy that needs rebuilding.
+
+```sh
+sudo -u looklab looklab admin revert \
+  --db /var/lib/looklab/looklab.sqlite3 \
+  --blobs /var/lib/looklab/blobs \
+  --look <look-slug> \
+  --version 3 \
+  --reject-contribution <contribution-id> \
+  --reason "the contribution mislabels the rendering"
+```
+
+**Block future intake.** Blocking stops a profile from proposing, uploading, donating fixtures or confirming from files. It does not change the profile's tier, roles or reputation, and withdrawal still works. A repeated block records nothing new.
+
+```sh
+sudo -u looklab looklab admin block-intake \
+  --db /var/lib/looklab/looklab.sqlite3 \
+  --profile <internal-id> \
+  --reason "repeated mislabelled uploads"
+```
+
 ## Activate deferred monochrome intake
 
 Monochrome intake requires an approved camera schema with monochrome capability and family-scoped controls. Deploying the binaries does not replace the server's authoritative snapshot.

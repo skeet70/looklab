@@ -51,6 +51,7 @@ fn synth(dir: &Path, seed: &str, images: &str, samples: &str) {
     assert!(stdout.contains("synth"), "{stdout}");
 }
 
+#[cfg(feature = "long-tests")]
 fn fit(dir: &Path, slug: &str, out: &Path) {
     let (stdout, _) = ok({
         let mut command = looklab();
@@ -65,6 +66,7 @@ fn fit(dir: &Path, slug: &str, out: &Path) {
     assert!(out.exists());
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn synthetic_flow_fits_reports_compares_and_attempts_export() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -589,6 +591,7 @@ fn validate_exits_non_zero_and_names_the_file() {
     assert!(stdout.contains("broken.yaml"), "{stdout}");
 }
 
+#[cfg(feature = "long-tests")]
 #[test]
 fn fit_skips_an_undecodable_sample_and_keeps_going() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -683,7 +686,17 @@ fn card_inspect_and_eval_read_the_conformance_card() {
     assert!(stdout.contains("magic LLCF"), "{stdout}");
     assert!(stdout.contains("content id: "), "{stdout}");
     assert!(stdout.contains("slug: conformance-tone"), "{stdout}");
+    assert!(stdout.contains("status: qualified"), "{stdout}");
     assert!(stdout.contains("grid: 33^3"), "{stdout}");
+
+    let experimental = workspace().join("data/card/conformance-v1/valid/card-experimental.llk");
+    let (stdout, _) = ok({
+        let mut command = looklab();
+        command.args(["card", "inspect"]).arg(&experimental);
+        command
+    });
+    assert!(stdout.contains("status: experimental"), "{stdout}");
+    assert!(stdout.contains("slug: conformance-tone"), "{stdout}");
 
     let (stdout, _) = ok({
         let mut command = looklab();

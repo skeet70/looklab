@@ -527,7 +527,7 @@ fn ManualSection(
                 }
             }}
             <p class="muted">"From official manuals and firmware notes. Owner-confirmed corrections are shown separately from the manual claim. Documentation does not imply RAW decoding, contribution support or fit eligibility."</p>
-            <p class="muted">"Owner agreement counts profiles linked to this camera by contribution metadata. Unlinked checks are saved but do not count toward confirmation."</p>
+            <p class="muted">"Checks from any profile count as owner reports. Owner-reported shows when reports agree. Confirmed needs three profiles linked to the camera by a photo contribution, or a moderator decision with evidence. Disagreement goes to review."</p>
             {move || can_moderate().then(|| view! {
                 <p>
                     <A href=crate::base::site_url("/review?filter=camera-checks")>
@@ -604,7 +604,7 @@ fn ManualSection(
                     <tr>
                         <th scope="col">"Control"</th>
                         <th scope="col">"Category"</th>
-                        <th scope="col">"Confirmed actual"</th>
+                        <th scope="col">"Actual value"</th>
                         <th scope="col">"Manual says (documentation-derived)"</th>
                         <th scope="col">"Confirmation basis"</th>
                         <th scope="col">"Citations"</th>
@@ -633,11 +633,13 @@ pub(crate) fn documentation_note(
         return None;
     }
     Some(
-        if confirmation
-            .firmware
-            .iter()
-            .any(|result| matches!(result.basis.as_ref(), Some(ConfirmationBasis::Corrected)))
-        {
+        if confirmation.firmware.iter().any(|result| {
+            matches!(result.basis.as_ref(), Some(ConfirmationBasis::Corrected))
+                || result
+                    .reported_options
+                    .iter()
+                    .any(|option| matches!(option.finding, Finding::Corrected { .. }))
+        }) {
             "Documentation-derived; some firmware values are corrected by owners"
         } else {
             "Documentation-derived"
@@ -650,7 +652,8 @@ pub(crate) fn confirmation_state_text(state: ConfirmationState) -> &'static str 
         ConfirmationState::Documented => "documented only",
         ConfirmationState::Unconfirmed => "unconfirmed",
         ConfirmationState::Confirmed => "confirmed",
-        ConfirmationState::Contradicted => "contradicted",
+        ConfirmationState::OwnerReported => "Owner-reported",
+        ConfirmationState::Contradicted => "Owners disagree",
         ConfirmationState::ModeratorConfirmed => "moderator confirmed",
         ConfirmationState::ModeratorRejected => "moderator rejected",
     }
@@ -753,15 +756,16 @@ fn coverage_text(summary: &looklab_schema::ManualConfirmationSummary) -> (&'stat
             .sum();
         if recorded > 0 {
             let mut detail = format!(
-                "{recorded} current check(s) were received for these controls; {unlinked} came from profiles without a photo contribution linking them to this camera. None count toward owner agreement."
+                "{recorded} current check(s) were received for these controls; {unlinked} came from profiles without a photo contribution linking them to this camera."
             );
             if stale > 0 {
                 detail.push_str(&format!(
                     " {stale} check(s) were recorded against an older control definition and are not current evidence."
                 ));
             }
-            detail.push_str(" Moderators can review the received checks.");
-            return ("Checks received; none counted", detail);
+            detail
+                .push_str(" Agreeing reports count immediately; disagreements open a review item.");
+            return ("Checks received", detail);
         }
         return (
             "Documentation-derived only",
@@ -802,9 +806,19 @@ fn coverage_text(summary: &looklab_schema::ManualConfirmationSummary) -> (&'stat
 
 pub(crate) fn confirmation_text(confirmation: &looklab_schema::ControlConfirmation) -> String {
     match confirmation.state {
+        ConfirmationState::OwnerReported => format!(
+            "Owner-reported · reported by {}; not confirmed",
+            profile_count_text(
+                confirmation
+                    .firmware
+                    .iter()
+                    .map(|result| result.reported_profiles)
+                    .max()
+                    .unwrap_or(0)
+            )
+        ),
         ConfirmationState::Contradicted => {
-            "Owner reports disagree on at least one firmware value; no single actual value confirmed"
-                .to_owned()
+            "Owners disagree · no single actual value confirmed".to_owned()
         }
         ConfirmationState::Confirmed => format!(
             "Confirmed on at least one firmware value; {} group(s) at the strongest firmware",
@@ -844,6 +858,7 @@ pub(crate) fn control_actual_text(confirmation: &looklab_schema::ControlConfirma
         },
         ConfirmationState::ModeratorRejected => "Rejected by moderator".to_owned(),
         ConfirmationState::Confirmed => "Confirmed; actual value not recorded".to_owned(),
+        ConfirmationState::OwnerReported => "Owner-reported; not confirmed".to_owned(),
         _ => "Not confirmed".to_owned(),
     }
 }
@@ -861,6 +876,13 @@ pub(crate) fn firmware_basis_text(result: &FirmwareConfirmation) -> String {
         Some(ConfirmationBasis::Moderator) => "moderator decision".to_owned(),
         None => match result.state {
             ConfirmationState::Contradicted => "owner reports disagree".to_owned(),
+            ConfirmationState::OwnerReported => {
+                let mut text = "owner reports; not confirmed".to_owned();
+                if result.agreeing_groups > 0 {
+                    text.push_str(&format!(" · {} of 3 linked groups", result.agreeing_groups));
+                }
+                text
+            }
             ConfirmationState::Unconfirmed => {
                 format!("{} group(s); 3 needed", result.agreeing_groups)
             }
@@ -891,15 +913,29 @@ pub(crate) fn finding_text(finding: &Finding) -> String {
 pub(crate) fn firmware_actual_text(result: &FirmwareConfirmation) -> String {
     match &result.confirmed_actual {
         Some(actual) => format!(
-            "{} · {}",
+            "Confirmed, {} · {}",
             actual_availability_text(actual.availability),
             domain_text(&actual.domain)
         ),
         None => match result.state {
-            ConfirmationState::Contradicted => "No single actual value confirmed".to_owned(),
+            ConfirmationState::Contradicted => format!(
+                "Owners disagree: {}",
+                reported_options_list(&result.reported_options)
+            ),
+            ConfirmationState::OwnerReported => {
+                let actual = result
+                    .reported_options
+                    .first()
+                    .map(|option| finding_text(&option.finding))
+                    .unwrap_or_else(|| "actual value not recorded".to_owned());
+                format!(
+                    "Owner-reported, {actual} (reported by {})",
+                    profile_count_text(result.reported_profiles)
+                )
+            }
             ConfirmationState::Confirmed => "Confirmed; actual value not recorded".to_owned(),
             ConfirmationState::ModeratorConfirmed => {
-                "Confirmed by moderator; actual value in evidence".to_owned()
+                "Moderator confirmed; actual value in evidence".to_owned()
             }
             ConfirmationState::ModeratorRejected => "Rejected by moderator".to_owned(),
             ConfirmationState::Unconfirmed | ConfirmationState::Documented => {
@@ -910,13 +946,62 @@ pub(crate) fn firmware_actual_text(result: &FirmwareConfirmation) -> String {
 }
 
 pub(crate) fn firmware_detail(result: &FirmwareConfirmation) -> Option<String> {
-    result.confirmed_actual.as_ref().map(|actual| {
-        format!(
+    if let Some(actual) = result.confirmed_actual.as_ref() {
+        let mut text = format!(
             "{} independent group(s) · observed firmware {}",
             actual.agreeing_groups,
             firmware_scopes_text(&actual.firmware_scopes)
-        )
-    })
+        );
+        if result.reports_conflict() {
+            text.push_str(&format!(
+                " · owners disagree: {}",
+                reported_options_text(result)
+            ));
+        }
+        return Some(text);
+    }
+    None
+}
+
+fn profile_count_text(profiles: u32) -> String {
+    if profiles == 1 {
+        "1 profile".to_owned()
+    } else {
+        format!("{profiles} profiles")
+    }
+}
+
+fn group_count_text(groups: u32) -> String {
+    if groups == 1 {
+        "1 linked group".to_owned()
+    } else {
+        format!("{groups} linked groups")
+    }
+}
+
+fn reported_options_text(result: &FirmwareConfirmation) -> String {
+    reported_options_list(&result.reported_options)
+}
+
+pub(crate) fn reported_options_list(options: &[looklab_schema::ReportedOption]) -> String {
+    options
+        .iter()
+        .map(|option| {
+            let mut counts = Vec::new();
+            if option.owner_profiles > 0 {
+                counts.push(profile_count_text(option.owner_profiles));
+            }
+            if option.linked_groups > 0 {
+                counts.push(group_count_text(option.linked_groups));
+            }
+            format!(
+                "{} ({})",
+                finding_text(&option.finding),
+                counts.join(" and ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 pub(crate) fn firmware_definition_digest(result: &FirmwareConfirmation) -> Option<String> {
@@ -1133,5 +1218,118 @@ fn EpochDifferences(epochs: Vec<EpochPage>) -> impl IntoView {
             <ul>{rows.into_iter().map(|row| view! { <li>{row}</li> }).collect_view()}</ul>
         }
         .into_any()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use looklab_schema::{
+        Availability, CapabilityKey, ConfirmationState, ControlConfirmation, Finding,
+        FirmwareConfirmation, ManualControlIntake, ReportedFirmware, ReportedOption,
+    };
+
+    use super::{confirmation_text, firmware_actual_text};
+
+    fn control(
+        state: ConfirmationState,
+        firmware: Vec<FirmwareConfirmation>,
+    ) -> ControlConfirmation {
+        ControlConfirmation {
+            key: CapabilityKey::NativeSimulations,
+            state,
+            agreeing_groups: 0,
+            contradictions: Vec::new(),
+            moderator: None,
+            firmware,
+            documented_availability: Availability::Available,
+            intake: ManualControlIntake::default(),
+        }
+    }
+
+    #[test]
+    fn public_control_text_names_owner_reported_and_its_count() {
+        let firmware = FirmwareConfirmation {
+            firmware: ReportedFirmware::new("1.00").expect("firmware"),
+            state: ConfirmationState::OwnerReported,
+            agreeing_groups: 0,
+            contradictions: Vec::new(),
+            basis: None,
+            confirmed_actual: None,
+            reported_options: Vec::new(),
+            owner_profiles: 2,
+            reported_profiles: 2,
+        };
+        let text = confirmation_text(&control(ConfirmationState::OwnerReported, vec![firmware]));
+        assert!(text.starts_with("Owner-reported"), "{text}");
+        assert!(text.contains("reported by 2 profiles"), "{text}");
+    }
+
+    #[test]
+    fn public_control_text_names_disagreement() {
+        let text = confirmation_text(&control(ConfirmationState::Contradicted, Vec::new()));
+        assert!(text.starts_with("Owners disagree"), "{text}");
+    }
+
+    fn firmware(
+        state: ConfirmationState,
+        options: Vec<ReportedOption>,
+        profiles: u32,
+    ) -> FirmwareConfirmation {
+        FirmwareConfirmation {
+            firmware: ReportedFirmware::new("1.00").expect("firmware"),
+            state,
+            agreeing_groups: 0,
+            contradictions: Vec::new(),
+            basis: None,
+            confirmed_actual: None,
+            reported_options: options,
+            owner_profiles: profiles,
+            reported_profiles: profiles,
+        }
+    }
+
+    #[test]
+    fn owner_reported_actual_is_not_called_confirmed() {
+        let text = firmware_actual_text(&firmware(
+            ConfirmationState::OwnerReported,
+            vec![ReportedOption {
+                finding: Finding::Matches,
+                linked_groups: 0,
+                owner_profiles: 2,
+            }],
+            2,
+        ));
+        assert!(text.starts_with("Owner-reported"), "{text}");
+        assert!(!text.contains("Confirmed"), "{text}");
+        assert!(text.contains("reported by 2 profiles"), "{text}");
+    }
+
+    #[test]
+    fn disagreement_actual_lists_each_option_and_count() {
+        let text = firmware_actual_text(&firmware(
+            ConfirmationState::Contradicted,
+            vec![
+                ReportedOption {
+                    finding: Finding::Matches,
+                    linked_groups: 0,
+                    owner_profiles: 1,
+                },
+                ReportedOption {
+                    finding: Finding::Corrected {
+                        availability: Availability::Unavailable,
+                        domain: looklab_schema::CapabilityDomain::Unspecified,
+                    },
+                    linked_groups: 0,
+                    owner_profiles: 1,
+                },
+            ],
+            2,
+        ));
+        assert!(text.starts_with("Owners disagree:"), "{text}");
+        assert!(text.contains("matches the manual (1 profile)"), "{text}");
+        assert!(
+            text.contains("Not available · Not documented numerically (1 profile)"),
+            "{text}"
+        );
     }
 }

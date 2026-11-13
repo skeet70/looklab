@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 
-use looklab_export::card::{CardMeta, CardOptions, write_card};
+use looklab_export::card::{CardMeta, CardOptions, card_status, write_card};
 use looklab_model::LookDocument;
 use looklab_model::file::{
     BaseReference, BaseStatus, CameraRendering, LookKind, LookPin, LookVersion, LutEmulation,
@@ -1445,8 +1445,13 @@ fn republish_artifacts(
         .iter()
         .any(|artifact| artifact.name == looklab_publish::CARD_ARTIFACT)
     {
-        let card = write_card(&document, &card_meta(look), &CardOptions::default())
-            .map_err(|_| AdminError::Corrupt)?;
+        let status = card_status(&document).ok_or(AdminError::Corrupt)?;
+        let card = write_card(
+            &document,
+            &card_meta(look).with_status(status),
+            &CardOptions::default(),
+        )
+        .map_err(|_| AdminError::Corrupt)?;
         put_artifact(
             &store,
             &mut artifacts,
@@ -3908,6 +3913,7 @@ pub struct ModQueue {
     pub serial_reuse: Vec<SerialReuseFlag>,
     pub nominations: Vec<Nomination>,
     pub manual_checks: Vec<ManualCheckReview>,
+    pub manual_conflicts: Vec<looklab_schema::ManualCheckConflict>,
 }
 
 /// The queue a session at `tier` may read; endorsement nominations are seeder-only
@@ -4046,13 +4052,15 @@ pub async fn mod_queue(
         }
     }
 
+    let reviews = crate::manual_confirm::reviews(db, manual_catalog).await?;
     Ok(ModQueue {
         proposals,
         failed_gates,
         fit_holds,
         serial_reuse,
         nominations,
-        manual_checks: crate::manual_confirm::reviews(db, manual_catalog).await?,
+        manual_checks: reviews.checks,
+        manual_conflicts: reviews.conflicts,
     })
 }
 

@@ -6,7 +6,7 @@ use looklab_color::RgbSpace;
 use looklab_color::cam16::{Cam16Model, ViewingConditions};
 use looklab_color::ucs::{UcsSpace, ucs_to_jmh};
 use looklab_color::{Illuminant, Rgb, Xyz};
-use looklab_model::file::{LookIdentity, LookVersion, Slug, WbPolicy as LookWbPolicy};
+use looklab_model::file::{LookIdentity, LookKind, LookVersion, Slug, WbPolicy as LookWbPolicy};
 use looklab_model::probes;
 use looklab_model::{LookDocument, MatchRefusal};
 use sha2::{Digest, Sha256};
@@ -31,6 +31,11 @@ pub const FIT_RECORD_LENGTH: usize = 40;
 const LOW_EV: f64 = 12.0;
 const HIGH_EV: f64 = 6.0;
 const PIVOT: f64 = 0.18;
+
+/// The experimental probe rule's σ_ΔE ceiling and density floor (docs/02 §5),
+/// used when a published support mask supports no probe.
+const EXPERIMENTAL_SIGMA: f64 = 1.5;
+const EXPERIMENTAL_DENSITY_FLOOR: f64 = 0.01;
 
 /// Every variant rejects the whole file.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
@@ -122,6 +127,26 @@ impl Semantics {
     };
 }
 
+/// Whether a card's target has an independently checked region.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CardStatus {
+    /// The target's published support mask supports at least one probe.
+    #[default]
+    Qualified,
+    /// The target's published support mask supports no probe, so the card is
+    /// offered for experimental use only (docs/04 §8).
+    Experimental,
+}
+
+impl CardStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Qualified => "qualified",
+            Self::Experimental => "experimental",
+        }
+    }
+}
+
 /// META fields other than slug and version, which come from the Look identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CardMeta {
@@ -129,6 +154,7 @@ pub struct CardMeta {
     pub short_name: String,
     pub description: Option<String>,
     pub license: Option<String>,
+    pub status: CardStatus,
 }
 
 impl CardMeta {
@@ -138,6 +164,7 @@ impl CardMeta {
             short_name: short_name.into(),
             description: None,
             license: None,
+            status: CardStatus::Qualified,
         }
     }
 
@@ -150,6 +177,11 @@ impl CardMeta {
         self.license = Some(license.into());
         self
     }
+
+    pub fn with_status(mut self, status: CardStatus) -> Self {
+        self.status = status;
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +192,7 @@ pub struct Meta {
     pub short_name: String,
     pub description: Option<String>,
     pub license: Option<String>,
+    pub status: CardStatus,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,6 +326,10 @@ impl Card {
         &self.meta
     }
 
+    pub fn status(&self) -> CardStatus {
+        self.meta.status
+    }
+
     pub fn semantics(&self) -> &Semantics {
         &self.semantics
     }
@@ -395,15 +432,42 @@ impl Card {
     }
 }
 
+/// The status a card may carry for this document, or `None` when the document
+/// cannot have a card.
+///
+/// A native-family document whose published support mask supports no probe is
+/// the experimental target path: its card states that no region is checked yet.
+pub fn card_status(document: &LookDocument) -> Option<CardStatus> {
+    match document.match_refusal() {
+        None => Some(CardStatus::Qualified),
+        Some(MatchRefusal::Unsupported) if document.file.look.kind == LookKind::NativeFamily => {
+            Some(CardStatus::Experimental)
+        }
+        Some(_) => None,
+    }
+}
+
 /// # Errors
-/// Rejects out-of-range metadata, a non-adaptive or non-matchable look, or non-finite values.
+/// Rejects out-of-range metadata, a non-adaptive or non-matchable look, a status
+/// that does not match the document's evidence, or non-finite values.
 pub fn write_card(
     document: &LookDocument,
     meta: &CardMeta,
     options: &CardOptions,
 ) -> Result<Vec<u8>, CardError> {
-    if let Some(refusal) = document.match_refusal() {
-        return Err(CardError::NotMatchable(refusal));
+    match card_status(document) {
+        None => {
+            return Err(match document.match_refusal() {
+                Some(refusal) => CardError::NotMatchable(refusal),
+                None => CardError::Meta("card status"),
+            });
+        }
+        Some(expected) if expected != meta.status => {
+            return Err(CardError::Meta(
+                "card status does not match the target's evidence",
+            ));
+        }
+        Some(_) => {}
     }
     if document.file.look.wb_policy != LookWbPolicy::Adaptive {
         return Err(CardError::Meta("wb_policy is not adaptive"));
@@ -560,6 +624,9 @@ fn encode_meta(identity: &LookIdentity, meta: &CardMeta) -> Result<Vec<u8>, Card
     }
     if let Some(license) = &meta.license {
         push_tlv(&mut out, 6, license.as_bytes())?;
+    }
+    if meta.status != CardStatus::Qualified {
+        push_tlv(&mut out, 7, meta.status.as_str().as_bytes())?;
     }
     Ok(out)
 }
@@ -751,6 +818,7 @@ fn parse_meta(bytes: &[u8]) -> Result<Meta, CardError> {
     let mut short_name = None;
     let mut description = None;
     let mut license = None;
+    let mut status = None;
     while cursor < bytes.len() {
         if bytes.len() - cursor < 3 {
             return Err(CardError::Section("META", "truncated TLV record"));
@@ -836,6 +904,16 @@ fn parse_meta(bytes: &[u8]) -> Result<Meta, CardError> {
                 }
                 license = Some(text.to_owned());
             }
+            7 => {
+                if status.is_some() {
+                    return Err(CardError::Section("META", "duplicate status"));
+                }
+                status = Some(match data {
+                    b"qualified" => CardStatus::Qualified,
+                    b"experimental" => CardStatus::Experimental,
+                    _ => return Err(CardError::Meta("status")),
+                });
+            }
             _ => {}
         }
     }
@@ -846,6 +924,7 @@ fn parse_meta(bytes: &[u8]) -> Result<Meta, CardError> {
         short_name: short_name.ok_or(CardError::Section("META", "missing short name"))?,
         description,
         license,
+        status: status.unwrap_or_default(),
     })
 }
 
@@ -992,14 +1071,30 @@ fn neutral_axis(document: &LookDocument) -> Vec<[f32; 3]> {
 fn fit_records(document: &LookDocument) -> Vec<FitRecord> {
     let probes = probes::v1();
     let support = document.uncertainty.support.as_ref();
+    // A native-family target whose published mask supports no probe is the
+    // experimental path: the σ and density predicates choose the FIT records
+    // instead (docs/02 §5).
+    let experimental = document.file.look.kind == LookKind::NativeFamily
+        && support.is_some_and(|mask| mask.values.iter().all(|value| *value <= 0.5));
     let mut records = Vec::with_capacity(probes.probes.len());
     for (index, probe) in probes.probes.iter().enumerate() {
         let input = RgbSpace::Rec2020.xyz_to_rgb_linear(probe.xyz);
         let input = [input.r as f32, input.g as f32, input.b as f32];
         let output = output_rgb(document, probe.xyz);
-        let supported = support
-            .and_then(|mask| mask.values.get(index))
-            .is_some_and(|value| *value == 1.0);
+        let supported = if experimental {
+            let density = document
+                .uncertainty
+                .density
+                .as_ref()
+                .and_then(|density| density.values.get(index).copied())
+                .unwrap_or(f64::INFINITY);
+            f64::from(post_sigma(document, index)) <= EXPERIMENTAL_SIGMA
+                && density >= EXPERIMENTAL_DENSITY_FLOOR
+        } else {
+            support
+                .and_then(|mask| mask.values.get(index))
+                .is_some_and(|value| *value == 1.0)
+        };
         let sigma = if supported {
             post_sigma(document, index)
         } else {
@@ -1171,5 +1266,21 @@ impl Crc32 {
 
     fn finish(&self) -> u32 {
         !self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_meta_status_is_rejected() {
+        let mut meta = Vec::new();
+        push_tlv(&mut meta, 1, b"conformance-tone").expect("slug");
+        push_tlv(&mut meta, 2, b"1.0.0").expect("version");
+        push_tlv(&mut meta, 3, b"Conformance Tone").expect("name");
+        push_tlv(&mut meta, 4, b"Conf Tone").expect("short name");
+        push_tlv(&mut meta, 7, b"questionable").expect("status");
+        assert_eq!(parse_meta(&meta).unwrap_err(), CardError::Meta("status"));
     }
 }

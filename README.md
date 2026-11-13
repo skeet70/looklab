@@ -26,7 +26,7 @@ Do not copy build roots into another checkout. Use a source-only linked worktree
 
 ## Build pipelines
 
-CI has independent `lint`, `native`, `wasm release`, targeted trust-policy and browser error-reporting lanes. The required `ci` check succeeds only when every required lane succeeds. Compact real fitter-to-trust integration runs in the **Pre-release integration** workflow on `v*` tags or manual dispatch, not on ordinary pushes and pull requests. Native tests explicitly enable `looklab-fit/synth`. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
+CI has independent `lint`, `native`, `wasm release`, targeted trust-policy and browser error-reporting lanes. The required `ci` check succeeds only when every required lane succeeds. Compact real fitter-to-trust integration runs in the **Pre-release integration** workflow on `v*` tags or manual dispatch, not on ordinary pushes and pull requests. Native tests explicitly enable `looklab-fit/synth`. Ordinary CI runs only tests that finish within 120 s when run alone at `CARGO_PROFILE_TEST_OPT_LEVEL=3`; longer fit recovery and end-to-end fit cases require `looklab-fit/long-tests` or `looklab-cli/long-tests` and run before releases. Prep and scene WASM are built and validated before tests, which consume those artifacts without invoking Cargo.
 
 Native CI sets `CARGO_PROFILE_TEST_OPT_LEVEL=3` for the workspace test command and its compiler-cache restore/save steps. Debug assertions and overflow checks remain enabled. The override does not affect Pages, WASM product builds or the local default test profile. Local numerical tests can use the same override through `nix develop -c env CARGO_PROFILE_TEST_OPT_LEVEL=3 cargo test -p looklab-fit --features synth`.
 
@@ -42,9 +42,9 @@ Full-scale fitting studies and the growing-pool trust harness require an explici
 
 The noisy tone-recovery study fits two 20-image × 10,000-sample datasets and also requires `looklab-fit/full-scale`. Its coverage helper is compiled only with that feature.
 
-Before publishing a release, push its `v*` candidate tag or manually dispatch **Pre-release integration** for the release commit, and require both compact and worker integration jobs to pass. Neither job enables full-scale studies. Ordinary CI eligibility requires approximately two minutes or less of total integration-job wall time.
+Before publishing a release, push its `v*` candidate tag or manually dispatch **Pre-release integration** for the release commit, and require the compact, worker, long fit and long CLI integration jobs to pass. None of them enables full-scale studies. Ordinary CI eligibility requires approximately two minutes or less of total integration-job wall time.
 
-Both pre-release jobs run under the `pre-release` nextest profile in `.config/nextest.toml`, which reports a test as slow every 60s and terminates it after 30 periods, and both carry a job-level `timeout-minutes` (30 for compact, 120 for worker). A timed-out case is a failure; the limits only stop a case that makes no progress from consuming the job. The 30-minute per-test limit is sized against the slowest case measured on the current tree, `match_bundle::publish_writes_a_bundle_with_the_sims_published_at_each_release` at 13m 41s for two non-converged fits over 16,800 samples each. The worker test helper's queue drain also fails after 64 jobs or 15 minutes of drain time instead of spinning on a job that re-enqueues itself.
+The compact and worker jobs run under the `pre-release` nextest profile in `.config/nextest.toml`, which reports a test as slow every 60s and terminates it after 30 periods, and carry job-level `timeout-minutes` (30 for compact, 120 for worker). The long fit jobs run under the `long` profile, which reports a slow case every 60s and terminates it after 330 periods, and carry timeouts sized from the release measurement (120 for the core shard, 360 for model error A, 300 for model error B, 60 for the CLI cases). A timed-out case is a failure; the limits only stop a case that makes no progress from consuming the job. The 30-minute per-test limit is sized against the slowest case measured on the current tree, `match_bundle::publish_writes_a_bundle_with_the_sims_published_at_each_release` at 13m 41s for two non-converged fits over 16,800 samples each. The worker test helper's queue drain also fails after 64 jobs or 15 minutes of drain time instead of spinning on a job that re-enqueues itself.
 
 Worker tests retain ten fit-free or budget-short-circuit cases across `worker.rs` and `lut_rebase.rs` in ordinary CI, plus separate supersession coverage. Forty fitter-dependent cases across `worker.rs`, `lut_rebase.rs` and `match_bundle.rs` require `looklab-worker/integration` and run before releases with their original fixtures and assertions. The ignored 1,000-image benchmark and fixture-convergence diagnostic additionally require `looklab-worker/full-scale`.
 
@@ -59,6 +59,16 @@ Re-running the four cases that were still running at cancellation, one per proce
 | After the numerical application migration | 4m 40s | 125.517s | [Failed compact job](https://github.com/skeet70/looklab/actions/runs/42349668698/job/128334912687), `MissingProbe(0)`; not a passing integration result |
 
 The compact contract performs one real fit over 3 images × 500 samples. Supported output publishes, and a constructed historical anchor mismatch is rejected.
+
+The long fit tier moves 32 cases: 29 in `looklab-fit` behind `long-tests` and 3 in `looklab-cli` behind `long-tests`. The release measurement at `1d66d2f` used 8 threads under ambient load of 25 to 35; four-core walls are modeled from the measured per-test times, and the CLI wall was measured. The shard selections also run the fast cases in the same test targets. Two controlled cases ran for over 6 h in release and were stopped at the job bound; each may fit a dedicated job, but neither completed inside the bound, so they run locally before a release and are not in the workflow.
+
+| Long fit tier, release at `1d66d2f` | Selected cases | Test time | Four-core wall | Job timeout |
+|---|---:|---:|---:|---:|
+| `long_fit_core` | 31 | 2 h 51 m | 43 min | 120 min |
+| `long_fit_model_error_a` | 3 | 11 h 55 m | 4 h 49 m | 360 min |
+| `long_fit_model_error_b` | 12 | 13 h 18 m | 4 h 06 m | 300 min |
+| `long_cli` | 3 | 22 m 05 s | 14 m 04 s, measured | 60 min |
+| Local controlled cases | 2 | over 6 h each at load 25 to 35, stopped at 6 h | not in the workflow | none |
 
 Build measurements on 2026-11-06 and 2026-11-07 used application commit `c10b5d2` plus build, fitting-performance and test-tier changes, excluding concurrent uncommitted application edits. Pages times cover the build critical path, not deployment:
 

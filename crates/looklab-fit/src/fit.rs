@@ -15,7 +15,8 @@ use crate::model_error::{apply_model_error, estimate_model_error};
 use crate::outlier;
 use crate::predict::Layer;
 use crate::problem::{
-    ActiveColumns, BlockAcc, IntentFilter, PassOutput, Problem, ResidualSample, RowModel,
+    ActiveColumns, BlockAcc, HessianRow, HessianRows, IntentFilter, PassOutput, Problem,
+    ResidualSample, RowModel,
 };
 use crate::solve::{factor_in_place, select_lambda, select_lambda_diagonal, solve_in_place};
 use crate::types::{
@@ -1002,6 +1003,288 @@ pub(crate) fn condition_nuisances(
     condition_nuisances_inner(images, options, look, model, clip_k)
 }
 
+/// Replaces each image block's curvature with the exact Hessian of the objective
+/// in that image's three nuisance coordinates: the Student-t terms plus the
+/// exact domain penalty, not the IRLS/Gauss-Newton approximation.
+fn exact_nuisance_curvature(
+    layout: &Layout,
+    blocks: &[BlockAcc],
+    rows: &[HessianRow],
+) -> Vec<Vec<f64>> {
+    let total = layout.total;
+    let mut direction = vec![0.0_f64; total];
+    let mut product = vec![0.0_f64; total];
+    let mut scratch = crate::predict::CurvatureScratch::default();
+    let mut out = vec![Vec::new(); blocks.len()];
+    for (block_index, block) in blocks.iter().enumerate() {
+        let n = block.len();
+        if n != 3 {
+            continue;
+        }
+        let mut hessian = [0.0_f64; 9];
+        let mut failed = false;
+        for row in rows {
+            if !row
+                .columns
+                .iter()
+                .any(|(column, _)| *column as usize == block.params[0])
+            {
+                continue;
+            }
+            let mut positions = [usize::MAX; 3];
+            for (slot, global) in block.params.iter().enumerate() {
+                if let Some(position) = row
+                    .columns
+                    .iter()
+                    .position(|(column, _)| *column as usize == *global)
+                {
+                    positions[slot] = position;
+                }
+            }
+            if positions.contains(&usize::MAX) {
+                continue;
+            }
+            let derivatives = [
+                row.columns[positions[0]].1,
+                row.columns[positions[1]].1,
+                row.columns[positions[2]].1,
+            ];
+            let terms = [
+                row.robust_terms[positions[0]],
+                row.robust_terms[positions[1]],
+                row.robust_terms[positions[2]],
+            ];
+            for i in 0..3 {
+                for j in 0..3 {
+                    let dot = derivatives[i][0] * derivatives[j][0]
+                        + derivatives[i][1] * derivatives[j][1]
+                        + derivatives[i][2] * derivatives[j][2];
+                    hessian[i * 3 + j] += row.weight * dot + row.robust * terms[i] * terms[j];
+                }
+            }
+            let Some(curvature) = &row.curvature else {
+                continue;
+            };
+            if curvature.prepare_scratch(&mut scratch).is_err() {
+                failed = true;
+                break;
+            }
+            for i in 0..3 {
+                for global in block.params.iter() {
+                    direction[*global] = 0.0;
+                    product[*global] = 0.0;
+                }
+                direction[block.params[i]] = 1.0;
+                if curvature
+                    .add_hvp(&direction, &mut product, &mut scratch)
+                    .is_err()
+                {
+                    failed = true;
+                    break;
+                }
+                for j in 0..3 {
+                    hessian[i * 3 + j] += product[block.params[j]];
+                }
+            }
+            if failed {
+                break;
+            }
+        }
+        if failed {
+            continue;
+        }
+        for i in 0..3 {
+            for j in i + 1..3 {
+                let value = 0.5 * (hessian[i * 3 + j] + hessian[j * 3 + i]);
+                hessian[i * 3 + j] = value;
+                hessian[j * 3 + i] = value;
+            }
+        }
+        out[block_index] = hessian.to_vec();
+    }
+    out
+}
+
+fn rotate3(vectors: &[[f64; 3]; 3], direction: [f64; 3]) -> [f64; 3] {
+    let mut out = [0.0_f64; 3];
+    for (row, value) in out.iter_mut().enumerate() {
+        for column in 0..3 {
+            *value += vectors[row][column] * direction[column];
+        }
+    }
+    out
+}
+
+fn jacobi_eigen_3(matrix: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
+    let mut a = matrix;
+    let mut vectors = [[1.0_f64, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    for _ in 0..12 {
+        for (p, q) in [(0usize, 1usize), (0, 2), (1, 2)] {
+            let off = a[p][q];
+            if off.abs() < 1e-18 {
+                continue;
+            }
+            let theta = (a[q][q] - a[p][p]) / (2.0 * off);
+            let t = if theta >= 0.0 {
+                1.0 / (theta + (1.0 + theta * theta).sqrt())
+            } else {
+                -1.0 / (-theta + (1.0 + theta * theta).sqrt())
+            };
+            let c = 1.0 / (1.0 + t * t).sqrt();
+            let s = t * c;
+            let app = a[p][p];
+            let aqq = a[q][q];
+            a[p][p] = c * c * app - 2.0 * s * c * off + s * s * aqq;
+            a[q][q] = s * s * app + 2.0 * s * c * off + c * c * aqq;
+            a[p][q] = 0.0;
+            a[q][p] = 0.0;
+            for k in 0..3 {
+                if k != p && k != q {
+                    let akp = a[k][p];
+                    let akq = a[k][q];
+                    a[k][p] = c * akp - s * akq;
+                    a[p][k] = a[k][p];
+                    a[k][q] = s * akp + c * akq;
+                    a[q][k] = a[k][q];
+                }
+                let vkp = vectors[k][p];
+                let vkq = vectors[k][q];
+                vectors[k][p] = c * vkp - s * vkq;
+                vectors[k][q] = s * vkp + c * vkq;
+            }
+        }
+    }
+    let mut values = [a[0][0], a[1][1], a[2][2]];
+    for i in 0..3 {
+        for j in i + 1..3 {
+            if values[j] < values[i] {
+                values.swap(i, j);
+                for row in &mut vectors {
+                    row.swap(i, j);
+                }
+            }
+        }
+    }
+    (values, vectors)
+}
+
+/// Exact trust-region Newton step for a symmetric 3x3 model.
+fn trust_region_step_3(
+    hessian: [[f64; 3]; 3],
+    gradient: [f64; 3],
+    radius: f64,
+) -> Option<([f64; 3], f64)> {
+    let (values, vectors) = jacobi_eigen_3(hessian);
+    let mut transformed = [0.0_f64; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            transformed[i] += vectors[j][i] * gradient[j];
+        }
+    }
+    let norm = |d: [f64; 3]| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let predicted = |step: [f64; 3]| {
+        let mut linear = 0.0;
+        let mut quadratic = 0.0;
+        for i in 0..3 {
+            linear += gradient[i] * step[i];
+            for j in 0..3 {
+                quadratic += step[i] * hessian[i][j] * step[j];
+            }
+        }
+        -linear - 0.5 * quadratic
+    };
+    if values[0] > 0.0 {
+        let direction = [
+            -transformed[0] / values[0],
+            -transformed[1] / values[1],
+            -transformed[2] / values[2],
+        ];
+        if norm(direction) <= radius {
+            let step = rotate3(&vectors, direction);
+            return Some((step, predicted(step)));
+        }
+    }
+    let scale = transformed
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    if values[0] < 0.0 && transformed[0].abs() <= 1e-12 * scale.max(1.0) {
+        let mut direction = [0.0_f64; 3];
+        for i in 1..3 {
+            direction[i] = -transformed[i] / (values[i] - values[0]);
+        }
+        let squared = direction[1] * direction[1] + direction[2] * direction[2];
+        if squared < radius * radius {
+            direction[0] = (radius * radius - squared).sqrt();
+            let step = rotate3(&vectors, direction);
+            return Some((step, predicted(step)));
+        }
+    }
+    let lower = (-values[0]).max(0.0);
+    let mut low = lower + 1e-12 * (1.0 + lower);
+    let gnorm = (transformed[0] * transformed[0]
+        + transformed[1] * transformed[1]
+        + transformed[2] * transformed[2])
+        .sqrt();
+    let mut high = (gnorm / radius - values[0]).max(low + 1.0);
+    for _ in 0..64 {
+        let middle = 0.5 * (low + high);
+        let mut squared = 0.0;
+        for i in 0..3 {
+            let denominator = values[i] + middle;
+            if denominator <= 0.0 {
+                squared = f64::INFINITY;
+                break;
+            }
+            let value = transformed[i] / denominator;
+            squared += value * value;
+        }
+        if squared > radius * radius {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    let shift = 0.5 * (low + high);
+    let mut direction = [0.0_f64; 3];
+    for i in 0..3 {
+        direction[i] = -transformed[i] / (values[i] + shift);
+    }
+    if direction.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let step = rotate3(&vectors, direction);
+    Some((step, predicted(step)))
+}
+
+fn adapt_radius(radius: f64, realized: f64, predicted: f64, at_boundary: bool) -> f64 {
+    let ratio = if predicted > 1e-12 {
+        realized / predicted
+    } else {
+        0.0
+    };
+    if ratio < 0.25 {
+        (radius * 0.25).max(1e-6)
+    } else if ratio > 0.75 && at_boundary {
+        (radius * 2.0).min(1e3)
+    } else {
+        radius
+    }
+}
+
+fn nuisance_prior_cost(
+    problem: &Problem,
+    params: &Params,
+    image: usize,
+    options: &FitOptions,
+) -> f64 {
+    let range = params.layout.image(image);
+    let exposure = params.theta[range.start] - problem.images[image].exposure_hint;
+    let wb_r = params.theta[range.start + 1];
+    let wb_b = params.theta[range.start + 2];
+    0.5 * (exposure * exposure / (options.exposure_prior_sd * options.exposure_prior_sd)
+        + (wb_r * wb_r + wb_b * wb_b) / (options.wb_prior_sd * options.wb_prior_sd))
+}
+
 fn condition_nuisances_inner(
     images: &[FitImage],
     options: &FitOptions,
@@ -1039,7 +1322,7 @@ fn condition_nuisances_inner(
         .collect();
     let roles = prior_roles(&problem, &layout);
     let lambdas = options.initial_lambdas;
-    let mut damping = 1e-3;
+    let mut damping: f64 = 1e-3;
     let mut recent: Vec<f64> = Vec::new();
     let mut accepted_count = 0usize;
     let mut attempts = 0usize;
@@ -1048,15 +1331,55 @@ fn condition_nuisances_inner(
     for block in &mut blocks {
         block.reset();
     }
-    let mut pass = problem.pass(
-        &params,
-        active,
-        &mut blocks,
-        false,
-        false,
-        false,
-        IntentFilter::All,
-    );
+    let use_analytic = problem.samples.len() <= FULL_ROW_LIMIT;
+    let mut pass = if use_analytic {
+        problem.pass_with_analytic_rows(
+            &params,
+            active,
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::All,
+            HessianRows::All,
+        )
+    } else {
+        problem.pass(
+            &params,
+            active,
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::All,
+        )
+    };
+    let mut exact = if use_analytic && !pass.infeasible {
+        let rows = core::mem::take(&mut pass.coupled_rows);
+        let exact = exact_nuisance_curvature(&layout, &blocks, &rows);
+        drop(rows);
+        exact
+    } else {
+        Vec::new()
+    };
+    if pass.infeasible {
+        for block in &mut blocks {
+            block.reset();
+        }
+        pass = problem.pass(
+            &params,
+            active,
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::All,
+        );
+        exact.clear();
+    }
+    let mut radii = vec![STEP_RADIUS; problem.images.len()];
+    let mut predicted = vec![0.0_f64; problem.images.len()];
+    let mut at_boundary = vec![false; problem.images.len()];
     let mut cost =
         pass.cost + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
     recent.push(cost);
@@ -1083,42 +1406,88 @@ fn condition_nuisances_inner(
                 recent.len()
             );
         }
-        let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
-        let mut step = vec![0.0_f64; layout.total];
-        let mut failed: Option<usize> = None;
-        for (index, block) in blocks.iter().enumerate() {
-            let (prior_gradient, prior_curvature) =
-                prior_terms(&problem, &roles, &params, options, block);
-            let outcome = solve_block(
-                &layout,
-                block,
-                &mut step,
-                &penalties[index],
-                &prior_gradient,
-                &prior_curvature,
-                &params,
-                &lambdas,
-                damping,
-                hessian_scale,
-                StepLimit::WholeStep,
-            );
-            if outcome == BlockStep::Failed && failed.is_none() {
-                failed = Some(index);
+        if !exact.is_empty() {
+            for (block, matrix) in blocks.iter_mut().zip(exact.iter()) {
+                let n = block.len();
+                if matrix.len() == n * n {
+                    block.hessian.clone_from(matrix);
+                    for i in 0..n {
+                        block.full_diagonal[i] = matrix[i * n + i].abs().max(1.0);
+                    }
+                }
             }
         }
-        if let Some(index) = failed {
-            // An unsolved image block leaves its nuisances unmoved; accepting the trial
-            // would count a no-op as progress and lower the damping.
+        let hessian_scale = pass.active_samples.max(1) as f64 / pass.hessian_rows.max(1) as f64;
+        predicted.fill(0.0);
+        at_boundary.fill(false);
+        let mut step = vec![0.0_f64; layout.total];
+        let mut failed = false;
+        for (index, block) in blocks.iter().enumerate() {
+            let block_scale = if exact.get(index).is_some_and(|matrix| !matrix.is_empty()) {
+                1.0
+            } else {
+                hessian_scale
+            };
+            let n = block.len();
+            let (prior_gradient, prior_curvature) =
+                prior_terms(&problem, &roles, &params, options, block);
+            let lambda = block_lambda(block, &lambdas);
+            let identity = identity_matrix(&layout, block);
+            let mut hessian = [[0.0_f64; 3]; 3];
+            let mut gradient = [0.0_f64; 3];
+            for i in 0..n {
+                gradient[i] = block.gradient[i] + prior_gradient[i];
+                let mut smooth = 0.0;
+                let mut prior = 0.0;
+                for j in 0..n {
+                    hessian[i][j] = block_scale * block.hessian[i * n + j]
+                        + lambda * penalties[index][i * n + j]
+                        + identity[i * n + j];
+                    smooth += penalties[index][i * n + j] * params.theta[block.params[j]];
+                    prior += identity[i * n + j]
+                        * (params.theta[block.params[j]] - layout.identity_mean(block.params[j]));
+                }
+                hessian[i][i] += prior_curvature[i];
+                gradient[i] += lambda * smooth + prior;
+            }
+            match trust_region_step_3(hessian, gradient, radii[index]) {
+                Some((direction, reduction)) => {
+                    for i in 0..n {
+                        step[block.params[i]] = direction[i];
+                    }
+                    let norm = (direction[0] * direction[0]
+                        + direction[1] * direction[1]
+                        + direction[2] * direction[2])
+                        .sqrt();
+                    at_boundary[index] = norm >= 0.99 * radii[index];
+                    predicted[index] = reduction;
+                }
+                None => {
+                    let outcome = solve_block(
+                        &layout,
+                        block,
+                        &mut step,
+                        &penalties[index],
+                        &prior_gradient,
+                        &prior_curvature,
+                        &params,
+                        &lambdas,
+                        damping,
+                        block_scale,
+                        StepLimit::WholeStep,
+                    );
+                    match outcome {
+                        BlockStep::Solved(reduction) => predicted[index] = reduction,
+                        BlockStep::Failed => failed = true,
+                    }
+                }
+            }
+        }
+        if failed {
             damping = (damping * 10.0).min(1e6);
             if fit_diag() {
-                let block = &blocks[index];
-                let n = block.len();
                 eprintln!(
-                    "nuisance attempt {attempts} block {index} factorization failed damping {damping:.3e} n {n} diagonal {:?} gradient {:?}",
-                    (0..n)
-                        .map(|i| block.hessian[i * n + i])
-                        .collect::<Vec<f64>>(),
-                    block.gradient
+                    "nuisance attempt {attempts} trust-region step failed damping {damping:.3e}"
                 );
             }
             if damping >= 1e6 {
@@ -1149,11 +1518,78 @@ fn condition_nuisances_inner(
         );
         let trial_cost =
             trial_pass.cost + total_cost(&problem, &trial, &blocks, &penalties, &lambdas, options);
+        for index in 0..problem.images.len() {
+            let base =
+                pass.image_cost[index] + nuisance_prior_cost(&problem, &params, index, options);
+            let trial_image = trial_pass.image_cost[index]
+                + nuisance_prior_cost(&problem, &trial, index, options);
+            let realized = base - trial_image;
+            radii[index] =
+                adapt_radius(radii[index], realized, predicted[index], at_boundary[index]);
+        }
         if accepted(cost, trial_cost) {
             accepted_count += 1;
             params = trial;
-            pass = trial_pass;
-            cost = trial_cost;
+            if use_analytic {
+                for block in &mut blocks {
+                    block.reset();
+                }
+                let mut analytic = problem.pass_with_analytic_rows(
+                    &params,
+                    active,
+                    &mut blocks,
+                    false,
+                    false,
+                    false,
+                    IntentFilter::All,
+                    HessianRows::All,
+                );
+                if analytic.infeasible {
+                    if fit_diag() {
+                        eprintln!(
+                            "nuisance attempt {attempts} analytic curvature unavailable at the accepted state"
+                        );
+                    }
+                    exact.clear();
+                    for block in &mut blocks {
+                        block.reset();
+                    }
+                    pass = problem.pass(
+                        &params,
+                        active,
+                        &mut blocks,
+                        false,
+                        false,
+                        false,
+                        IntentFilter::All,
+                    );
+                    cost = pass.cost
+                        + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
+                } else {
+                    let rows = core::mem::take(&mut analytic.coupled_rows);
+                    exact = exact_nuisance_curvature(&layout, &blocks, &rows);
+                    drop(rows);
+                    pass = analytic;
+                    cost = pass.cost
+                        + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
+                }
+            } else {
+                exact.clear();
+                for block in &mut blocks {
+                    block.reset();
+                }
+                pass = problem.pass(
+                    &params,
+                    active,
+                    &mut blocks,
+                    false,
+                    false,
+                    false,
+                    IntentFilter::All,
+                );
+                cost = pass.cost
+                    + total_cost(&problem, &params, &blocks, &penalties, &lambdas, options);
+            }
             let gradient = gradient_max(GradientArgs {
                 layout: &layout,
                 problem: &problem,
@@ -10109,7 +10545,10 @@ mod review_tests {
             BlockAcc::new(BlockKind::Tint, vec![globals[1]], layout.total),
         ];
         for (i, block) in blocks.iter_mut().enumerate() {
-            params.theta[globals[i]] = 0.0;
+            // The identity prior is centered on the colorimetric tone mean (docs/02 §4.1).
+            // Start at that center so the prior gradient is zero and the fabricated
+            // gradient alone drives the right-hand side.
+            params.theta[globals[i]] = layout.identity_mean(globals[i]);
             let derivative = (i + 2) as f64;
             block.hessian[0] = derivative * derivative;
             block.full_diagonal[0] = derivative * derivative;
@@ -13269,6 +13708,10 @@ mod lifecycle_tests {
         for index in 0..f.problem.layout.images.start {
             f.params.theta[index] = f.problem.layout.identity_mean(index);
         }
+        // The tone prior is centered on the colorimetric tone, whose coordinates are not
+        // zero, so a tone smoothness penalty has a nonzero gradient there. The fixture
+        // freezes the prior-only objective, whose stationary point is the prior center.
+        f.lambdas.tone = 0.0;
         let (a, b) = f.options.sigma_prior;
         let root = 0.5 * libm::log(b / a);
         for index in 0..f.problem.contributors.len() {
@@ -15274,6 +15717,223 @@ mod look_only_domain_tests {
         assert!(
             matches!(error, FitError::RowContext(_)),
             "unexpected error: {error:?}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "synth"))]
+mod nuisance_curvature_tests {
+    use super::*;
+    use crate::synth::{SynthConfig, dataset};
+
+    fn active() -> ActiveColumns {
+        ActiveColumns {
+            image: true,
+            mode: false,
+            wb: true,
+            clip: false,
+            response: false,
+        }
+    }
+
+    fn image_blocks(layout: &Layout, problem: &Problem) -> Vec<BlockAcc> {
+        let mut blocks: Vec<BlockAcc> = (0..problem.images.len())
+            .map(|index| make_image_block(layout, index, active()))
+            .collect();
+        for block in &mut blocks {
+            block.reset();
+        }
+        blocks
+    }
+
+    #[test]
+    fn exact_nuisance_curvature_matches_gradient_differences() {
+        let data = dataset(&SynthConfig {
+            images: 2,
+            samples_per_image: 64,
+            ..SynthConfig::default()
+        });
+        let options = FitOptions {
+            fit_residual: false,
+            ..FitOptions::default()
+        };
+        let problem = Problem::new_with(&data.images, None, &options).expect("problem");
+        let layout = problem.layout.clone();
+        let mut params = params_from_look(&problem, &data.truth);
+        for (index, nuisance) in data.nuisances.iter().enumerate() {
+            let range = layout.image(index);
+            params.theta[range.start] = nuisance.exposure;
+            params.theta[range.start + 1] = nuisance.wb_log_r;
+            params.theta[range.start + 2] = nuisance.wb_log_b;
+        }
+        params.theta[layout.clip] = crate::layout::zeta_from_clip(data.clip_k);
+        let mut blocks = image_blocks(&layout, &problem);
+        let pass = problem.pass_with_analytic_rows(
+            &params,
+            active(),
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::All,
+            HessianRows::All,
+        );
+        let exact = exact_nuisance_curvature(&layout, &blocks, &pass.coupled_rows);
+        let step = 1e-5;
+        let gradient = |params: &Params, image: usize| {
+            let mut blocks = image_blocks(&layout, &problem);
+            let _ = problem.pass(
+                params,
+                active(),
+                &mut blocks,
+                false,
+                false,
+                false,
+                IntentFilter::All,
+            );
+            blocks[image].gradient.clone()
+        };
+        let mut worst = 0.0_f64;
+        for (image, block) in blocks.iter().enumerate() {
+            let n = block.len();
+            for coordinate in 0..n {
+                let global = block.params[coordinate];
+                let mut plus = params.clone();
+                let mut minus = params.clone();
+                plus.theta[global] += step;
+                minus.theta[global] -= step;
+                let plus = gradient(&plus, image);
+                let minus = gradient(&minus, image);
+                for other in 0..n {
+                    let numerical = (plus[other] - minus[other]) / (2.0 * step);
+                    let analytic = exact[image][coordinate * n + other];
+                    let scale = analytic.abs().max(numerical.abs()).max(1.0);
+                    let error = (analytic - numerical).abs() / scale;
+                    worst = worst.max(error);
+                    assert!(
+                        error < 1e-4,
+                        "image {image} coordinate {coordinate} row {other}: analytic {analytic:.9e} numerical {numerical:.9e} error {error:.3e}"
+                    );
+                }
+            }
+        }
+        eprintln!("exact nuisance curvature worst relative error {worst:.3e}");
+    }
+
+    #[test]
+    fn jacobi_eigen_3_recovers_eigenpairs() {
+        let matrix = [[4.0_f64, 1.0, 2.0], [1.0, 3.0, 0.0], [2.0, 0.0, 5.0]];
+        let (values, vectors) = jacobi_eigen_3(matrix);
+        for (column, value) in values.iter().enumerate() {
+            for row in 0..3 {
+                let mut applied = 0.0;
+                for k in 0..3 {
+                    applied += matrix[row][k] * vectors[k][column];
+                }
+                assert!(
+                    (applied - value * vectors[row][column]).abs() < 1e-10,
+                    "row {row} column {column}: {applied} vs {}",
+                    value * vectors[row][column]
+                );
+            }
+        }
+        for i in 0..3 {
+            for j in 0..3 {
+                let mut dot = 0.0;
+                for k in 0..3 {
+                    dot += vectors[k][i] * vectors[k][j];
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - expected).abs() < 1e-10,
+                    "orthogonality {i} {j}: {dot}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trust_region_step_3_handles_newton_boundary_and_hard_case() {
+        let (step, predicted) = trust_region_step_3(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [10.0, 0.0, 0.0],
+            1.0,
+        )
+        .expect("boundary step");
+        assert!((step[0] + 1.0).abs() < 1e-9 && step[1] == 0.0 && step[2] == 0.0);
+        assert!((predicted - 9.5).abs() < 1e-9, "predicted {predicted}");
+
+        let (step, _) = trust_region_step_3(
+            [[2.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 5.0]],
+            [1.0, 1.0, 1.0],
+            10.0,
+        )
+        .expect("Newton step");
+        assert!((step[0] + 0.5).abs() < 1e-9);
+        assert!((step[1] + 1.0 / 3.0).abs() < 1e-9);
+        assert!((step[2] + 0.2).abs() < 1e-9);
+
+        let (step, predicted) = trust_region_step_3(
+            [[-2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0, 0.0, 1.0],
+            1.0,
+        )
+        .expect("hard case");
+        let norm = (step[0] * step[0] + step[1] * step[1] + step[2] * step[2]).sqrt();
+        assert!((norm - 1.0).abs() < 1e-9, "hard-case norm {norm}");
+        assert!(
+            (step[0] - (8.0_f64 / 9.0).sqrt()).abs() < 1e-9,
+            "step {step:?}"
+        );
+        assert!(
+            (predicted - 7.0 / 6.0).abs() < 1e-9,
+            "predicted {predicted}"
+        );
+    }
+
+    #[test]
+    fn an_unusable_trial_shrinks_its_own_radius() {
+        let radius = 2.0;
+        let shrunk = adapt_radius(radius, f64::NEG_INFINITY, 1.0, false);
+        assert_eq!(shrunk, 0.5);
+        let twice = adapt_radius(shrunk, f64::NEG_INFINITY, 1.0, false);
+        assert!(
+            twice < shrunk,
+            "the repeated unusable trial must shrink again"
+        );
+        assert_eq!(adapt_radius(radius, 1.0, 1.0, true), 4.0);
+        assert_eq!(adapt_radius(radius, 0.5, 1.0, false), 2.0);
+    }
+
+    #[test]
+    fn an_infeasible_state_marks_its_image_cost_infinite() {
+        let data = dataset(&SynthConfig {
+            images: 2,
+            samples_per_image: 32,
+            ..SynthConfig::default()
+        });
+        let options = FitOptions {
+            fit_residual: false,
+            ..FitOptions::default()
+        };
+        let problem = Problem::new_with(&data.images, None, &options).expect("problem");
+        let mut params = params_from_look(&problem, &data.truth);
+        params.theta[problem.layout.tone_c0] += 1.0e6;
+        let mut blocks = image_blocks(&problem.layout, &problem);
+        let pass = problem.pass(
+            &params,
+            active(),
+            &mut blocks,
+            false,
+            false,
+            false,
+            IntentFilter::All,
+        );
+        assert!(pass.infeasible);
+        assert!(
+            pass.image_cost.iter().any(|value| value.is_infinite()),
+            "an unusable image must set its own cost to infinity: {:?}",
+            pass.image_cost
         );
     }
 }
