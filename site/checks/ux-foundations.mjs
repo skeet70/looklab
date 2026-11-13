@@ -227,6 +227,7 @@ const INTERNAL_TERMS = [
   { label: 'Epoch', pattern: /\bEpoch\b/ },
   { label: 'native_family Look', pattern: /\bnative_family\b/ },
   { label: 'lut_defined Look', pattern: /\blut_defined\b/ },
+  { label: 'Interface profile', pattern: /\binterface profile\b/i },
   { label: 'Realization', pattern: /\bRealization\b/ },
   { label: 'provisional', pattern: /\bprovisional\b/i },
   { label: 'ΔE (CAM16-UCS)', pattern: /ΔE\s*\(CAM16-UCS\)/ },

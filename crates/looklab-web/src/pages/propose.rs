@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use looklab_model::file::{BaseField, BaseReference, BaseStatus};
 use looklab_publish::{BodyPage, SiteIndex};
 use looklab_schema::{
     BodyId, Control, ControlChange, ControlDefault, ControlDefinition, ControlEdit, ControlKey,
@@ -20,6 +21,11 @@ const EXAMPLE_FILES: &str = "\
 classic_chrome FilmMode=0x0600
 provia FilmMode=0x0000
 acros FilmMode=0x0500 GrainSize=0x0002";
+
+const CAMERA_LEDE: &str =
+    "Tell us what your camera can do. A moderator checks the change and the evidence you share.";
+const CUSTOM_LOOK_LEDE: &str = "Custom looks are .cube LUTs that people made and share. A moderator checks the license and credit, then approves the import; approval alone does not publish the look. Published custom looks appear on Looks and in Compare.";
+const PIPELINE_LEDE: &str = "An editing-app pipeline tells looklab where your app applies a look, what it accepts and what happens afterward. A moderator checks the definition and its reference check.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MappingMode {
@@ -446,7 +452,12 @@ struct Form {
     lut_base: RwSignal<Option<BaseLookVersion>>,
     lut_base_body: RwSignal<Option<BodyId>>,
     lut_base_body_mode: RwSignal<BodyPickerMode>,
-    lut_base_body_text: RwSignal<String>,
+    lut_base_body_make: RwSignal<String>,
+    lut_base_body_model: RwSignal<String>,
+    lut_base_schema: RwSignal<Option<ControlSchema>>,
+    lut_base_schema_state: RwSignal<proposal_form::BaseData>,
+    lut_base_schema_error: RwSignal<Option<String>>,
+    lut_base_schema_request: RwSignal<u64>,
     lut_base_sim: RwSignal<String>,
     lut_base_dynamic_range: RwSignal<Option<LutDynamicRange>>,
     lut_base_notes: RwSignal<String>,
@@ -535,7 +546,12 @@ impl Form {
             lut_base: RwSignal::new(None),
             lut_base_body: RwSignal::new(None),
             lut_base_body_mode: RwSignal::new(BodyPickerMode::Catalog),
-            lut_base_body_text: RwSignal::new(String::new()),
+            lut_base_body_make: RwSignal::new(String::new()),
+            lut_base_body_model: RwSignal::new(String::new()),
+            lut_base_schema: RwSignal::new(None),
+            lut_base_schema_state: RwSignal::new(proposal_form::BaseData::Unavailable),
+            lut_base_schema_error: RwSignal::new(None),
+            lut_base_schema_request: RwSignal::new(0),
             lut_base_sim: RwSignal::new(String::new()),
             lut_base_dynamic_range: RwSignal::new(None),
             lut_base_notes: RwSignal::new(String::new()),
@@ -626,7 +642,7 @@ fn computed_payload(form: &Form) -> Result<String, String> {
         ProposalKind::InterfaceProfile => {
             let text = form.interface_text.get();
             if text.trim().is_empty() {
-                return Err("Choose an editing-app profile file.".to_owned());
+                return Err("Choose an editing-app pipeline file.".to_owned());
             }
             looklab_schema::validate_interface_profile(&text)
                 .map_err(|errors| join_errors(&errors))?;
@@ -738,6 +754,82 @@ fn schema_payload(form: &Form) -> Result<String, String> {
     proposal_form::schema_payload(&page.schema, &changes).map_err(|errors| join_errors(&errors))
 }
 
+/// Loads the published control schema for a base camera, when the index knows it.
+fn load_base_schema(form: Form, body: Option<BodyId>) {
+    form.manual.set(None);
+    form.lut_base_schema.set(None);
+    form.lut_base_schema_error.set(None);
+    form.lut_base_sim.set(String::new());
+    form.lut_base_dynamic_range.set(None);
+    let request = form.lut_base_schema_request.get_untracked().wrapping_add(1);
+    form.lut_base_schema_request.set(request);
+    let Some(body) = body else {
+        form.lut_base_schema_state
+            .set(proposal_form::BaseData::Unavailable);
+        return;
+    };
+    if form
+        .index
+        .get_untracked()
+        .as_ref()
+        .is_none_or(|index| camera_summary(index, &body).is_none())
+    {
+        form.lut_base_schema_state
+            .set(proposal_form::BaseData::Unavailable);
+        return;
+    }
+    let make = body.make().to_owned();
+    let model = body.model().to_owned();
+    form.lut_base_schema_state
+        .set(proposal_form::BaseData::Loading);
+    spawn_local(async move {
+        let result = async {
+            let page = data::body(&make, &model).await?;
+            looklab_schema::validate_control_schema(&page.schema)
+                .map_err(|errors| join_errors(&errors))
+        }
+        .await;
+        if form.lut_base_schema_request.try_get_untracked() != Some(request) {
+            return;
+        }
+        match result {
+            Ok(schema) => {
+                form.lut_base_schema.set(Some(schema));
+                form.lut_base_schema_state
+                    .set(proposal_form::BaseData::Ready);
+            }
+            Err(error) => {
+                form.lut_base_schema_error.set(Some(error));
+                form.lut_base_schema_state
+                    .set(proposal_form::BaseData::Unavailable);
+            }
+        }
+    });
+}
+
+fn unregistered_base_body(form: &Form) -> Option<BodyId> {
+    let make = form.lut_base_body_make.get();
+    let model = form.lut_base_body_model.get();
+    if make.trim().is_empty() || model.trim().is_empty() {
+        return None;
+    }
+    looklab_schema::body_id_from_name(&make, &model).ok()
+}
+
+/// The declared display base, resolved exactly as submission resolves it.
+fn base_reference(form: &Form) -> Result<(BaseReference, bool), String> {
+    let base = lut_base(form)?;
+    let matchable = match &base {
+        LutBase::Look { .. } => form
+            .lut_base
+            .get()
+            .is_some_and(|selected| selected.matchable),
+        _ => true,
+    };
+    let reference = BaseReference::try_from(&base).map_err(|error| error.to_string())?;
+    Ok((reference, matchable))
+}
+
 fn lut_payload(form: &Form) -> Result<String, String> {
     let file = form
         .lut_file
@@ -805,9 +897,10 @@ fn lut_base(form: &Form) -> Result<LutBase, String> {
         LutBaseMode::BodyRealization => {
             let body = form.lut_base_body.get().ok_or_else(|| {
                 if form.lut_base_body_mode.get() == BodyPickerMode::Unregistered
-                    && !form.lut_base_body_text.get().trim().is_empty()
+                    && (!form.lut_base_body_make.get().trim().is_empty()
+                        || !form.lut_base_body_model.get().trim().is_empty())
                 {
-                    "Enter the body id as make/model.".to_owned()
+                    "Enter the camera make and model.".to_owned()
                 } else {
                     "Choose or enter a base camera body.".to_owned()
                 }
@@ -1227,7 +1320,7 @@ pub fn ProposePage() -> impl IntoView {
         );
         if fixture_backed && chosen.is_empty() {
             form.message.set(Some(
-                "A camera confirmed from a sample file needs at least one donated original file. Choose provisional without one.".to_owned(),
+                "A camera confirmed from a sample file needs at least one donated original file. Choose not yet confirmed from a sample file instead.".to_owned(),
             ));
             return;
         }
@@ -1318,8 +1411,16 @@ pub fn ProposePage() -> impl IntoView {
     let available = crate::base::server_available();
 
     view! {
-        <h1>"Propose a change"</h1>
-        <p class="lede">"Tell us what your camera can do. A moderator checks the change and the evidence you share."</p>
+        <h1>{move || match form.kind.get() {
+            ProposalKind::LutLook => "Add a custom look",
+            ProposalKind::InterfaceProfile => "Add an editing-app pipeline",
+            _ => "Propose a change",
+        }}</h1>
+        <p class="lede">{move || match form.kind.get() {
+            ProposalKind::LutLook => CUSTOM_LOOK_LEDE,
+            ProposalKind::InterfaceProfile => PIPELINE_LEDE,
+            _ => CAMERA_LEDE,
+        }}</p>
         {move || form.index_error.get().map(|error| view! { <p class="error" role="alert">{error}</p> })}
         <KindPicker form/>
         {move || form.index.get().map(|index| {
@@ -1421,12 +1522,17 @@ fn submit_now(
 
 #[component]
 fn KindPicker(form: Form) -> impl IntoView {
-    let kinds = [
-        ProposalKind::Body,
-        ProposalKind::Mapping,
-        ProposalKind::SchemaChange,
-        ProposalKind::LutLook,
-        ProposalKind::InterfaceProfile,
+    let groups = [
+        ("Your look", vec![ProposalKind::LutLook]),
+        (
+            "Your camera",
+            vec![
+                ProposalKind::Body,
+                ProposalKind::Mapping,
+                ProposalKind::SchemaChange,
+            ],
+        ),
+        ("For developers", vec![ProposalKind::InterfaceProfile]),
     ];
     let description = move || match form.kind.get() {
         ProposalKind::Body => {
@@ -1442,7 +1548,7 @@ fn KindPicker(form: Form) -> impl IntoView {
             "Add a custom look built from a .cube LUT file. The file is uploaded with the proposal and stays private until approval; published custom looks appear on Looks and in Compare, and matchable ones also appear in Get the look."
         }
         ProposalKind::InterfaceProfile => {
-            "Define how an editing app applies exported looks with a looklab YAML profile. Published profiles appear on For developers → Editing apps and enable the Editing app result in Get the look."
+            "Define how an editing app applies exported looks with a looklab YAML pipeline. Published pipelines appear on For developers → Editing apps and enable the Editing app result in Get the look."
         }
         _ => "",
     };
@@ -1454,10 +1560,14 @@ fn KindPicker(form: Form) -> impl IntoView {
                     form.reset_for_kind(next);
                 }
             }>
-                {kinds.into_iter().map(|candidate| view! {
-                    <option value=candidate.as_str() prop:selected=move || form.kind.get() == candidate>
-                        {proposal_form::kind_label(candidate)}
-                    </option>
+                {groups.into_iter().map(|(label, kinds)| view! {
+                    <optgroup label=label>
+                        {kinds.into_iter().map(|candidate| view! {
+                            <option value=candidate.as_str() prop:selected=move || form.kind.get() == candidate>
+                                {proposal_form::kind_label(candidate)}
+                            </option>
+                        }).collect_view()}
+                    </optgroup>
                 }).collect_view()}
             </select>
             <p class="muted">{description}</p>
@@ -2142,6 +2252,22 @@ fn lut_dynamic_range_select(
 
 #[component]
 fn LutFields(form: Form, index: SiteIndex) -> impl IntoView {
+    let preset_open = web_sys::window()
+        .and_then(|window| window.location().hash().ok())
+        .is_some_and(|hash| hash == "#from-a-preset");
+    let preset_scrolled = StoredValue::new(false);
+    Effect::new(move |_| {
+        if preset_scrolled.get_value() || !preset_open || form.index.get().is_none() {
+            return;
+        }
+        if let Some(element) = web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.get_element_by_id("from-a-preset"))
+        {
+            element.scroll_into_view();
+            preset_scrolled.set_value(true);
+        }
+    });
     let mut versions = proposal_form::base_look_versions(&index);
     if let Some(neutral) = proposal_form::neutral_base(&versions) {
         versions.insert(0, neutral);
@@ -2151,7 +2277,7 @@ fn LutFields(form: Form, index: SiteIndex) -> impl IntoView {
     let bodies = StoredValue::new(index.bodies);
     view! {
         <section aria-labelledby="lut-heading">
-            <h2 id="lut-heading">"The custom look"</h2>
+            <h2 id="lut-heading">"Your custom look"</h2>
             <p>"A custom look is a .cube LUT that changes how colors and brightness render. Published custom looks appear on Looks and in Compare; matchable ones also appear in Get the look."</p>
             <p><a href="https://github.com/skeet70/looklab/blob/main/docs/02-color-pipeline.md#38-lut-defined-looks">"How custom looks are built"</a></p>
             <crate::ui::DropZone on_files=Callback::new(move |selected| {
@@ -2185,16 +2311,27 @@ fn LutFields(form: Form, index: SiteIndex) -> impl IntoView {
                     }
                 });
             }) accept=".cube".to_owned() folders=false/>
+            <crate::ui::Disclosure summary="Starting from a preset?".to_owned() id="from-a-preset".to_owned() open=preset_open>
+                <p>"Presets from Lightroom, RapidRAW or Capture One can't be added directly. Convert the preset to a .cube LUT, then add it here as a custom look."</p>
+                <p>"To make the .cube, apply the preset to a HALD identity image in your editor and export the result. A HALD image is a color grid; the preset changes every patch, and the changed grid becomes the LUT. Turn that image into a .cube with a converter you trust. RapidRAW can export an edit as a .cube directly, including from its command line, and can apply .cube and HALD LUTs, so you can check the converted look there."</p>
+                <p>"Turn off masks, vignette, grain, sharpening and lens corrections before exporting, and export the HALD at full size as a 16-bit TIFF or PNG with no resizing. Otherwise those effects are baked into the grid and corrupt the LUT."</p>
+                <p>"Global color and tone carry over. Masks, vignettes, grain and sharpening don't, because they depend on where things are in the photo."</p>
+                <p>"If the preset was made on top of a film simulation, a camera's standard look, or an app's default, choose that as the base. Until that base is measured, the look can be previewed but has no settings or card file. Photos of that base help."</p>
+                <p class="field-row"><a href=crate::base::site_url("/contribute/wanted")>"Wanted shots"</a><a href=crate::base::site_url("/contribute")>"Share photos you already have"</a></p>
+            </crate::ui::Disclosure>
             {move || form.lut_file.get().map(|file| view! {
-                <p class="muted">{format!("{} · {}³ nodes · domain {} to {} · sha256 {}", file.name, file.summary.size, file.summary.domain[0], file.summary.domain[1], &file.sha256.to_hex()[..16])}</p>
+                <p class="muted">{format!("{} · {}³ nodes", file.name, file.summary.size)}</p>
+                <crate::ui::Disclosure summary="File details".to_owned()>
+                    <p>{format!("Domain {} to {} · sha256 {}", file.summary.domain[0], file.summary.domain[1], file.sha256.to_hex())}</p>
+                </crate::ui::Disclosure>
             })}
             <label for="lut-name">"Look name"</label>
             <input id="lut-name" prop:value=move || form.lut_name.get() on:input=move |event| { form.manual.set(None); form.lut_name.set(event_target_value(&event)); }/>
-            <p class="muted">{move || looklab_schema::look_id_from_name(&form.lut_name.get()).map(|look| format!("Link: /looks/{look}")).unwrap_or_default()}</p>
             {move || {
                 let look = looklab_schema::look_id_from_name(&form.lut_name.get()).ok()?;
-                published.with_value(|looks| looks.iter().any(|entry| entry.slug.as_str() == look.as_str() && !entry.versions.is_empty())).then(|| view! {
-                    <p class="error" role="alert">{format!("The link /looks/{look} already has published versions. Choose another name.")}</p>
+                let existing = published.with_value(|looks| looks.iter().find(|entry| entry.slug.as_str() == look.as_str() && !entry.versions.is_empty()).map(|entry| entry.name.clone()));
+                existing.map(|name| view! {
+                    <p class="error" role="alert">{format!("The published look \"{name}\" already uses this name. Choose another name.")}</p>
                 })
             }}
             <label for="lut-attribution">"Credit the author"</label>
@@ -2206,20 +2343,21 @@ fn LutFields(form: Form, index: SiteIndex) -> impl IntoView {
             <input id="lut-source-url" prop:value=move || form.lut_source_url.get() on:input=move |event| { form.manual.set(None); form.lut_source_url.set(event_target_value(&event)); }/>
             <label for="lut-encoding">"What the LUT expects"</label>
             <select id="lut-encoding" on:change=move |event| { form.manual.set(None); if let Ok(mode) = event_target_value(&event).parse::<LutEncodingMode>() { form.lut_encoding.set(mode); } }>
-                <option value=LutEncodingMode::Scene.to_string() prop:selected=move || form.lut_encoding.get() == LutEncodingMode::Scene>"F-Log2 / F-Gamut (scene-referred)"</option>
-                <option value=LutEncodingMode::Display.to_string() prop:selected=move || form.lut_encoding.get() == LutEncodingMode::Display>"Display-referred, from a base rendering"</option>
+                <option value=LutEncodingMode::Scene.to_string() prop:selected=move || form.lut_encoding.get() == LutEncodingMode::Scene>"My LUT expects F-Log2 (F-Log2 / F-Gamut)"</option>
+                <option value=LutEncodingMode::Display.to_string() prop:selected=move || form.lut_encoding.get() == LutEncodingMode::Display>"My LUT goes on top of a finished look (a film simulation, a camera's standard look, or an app's default)"</option>
             </select>
+            <p class="muted">"F-Log2 / F-Gamut is the scene-referred encoding Fujifilm writes. A finished look is a film simulation, a camera's standard look, or an app's default rendering."</p>
             {move || (form.lut_encoding.get() == LutEncodingMode::Display).then(|| view! {
                 <div>
-                    <label for="lut-base-kind">"Base rendering"</label>
+                    <label for="lut-base-kind">"What is your LUT built on?"</label>
                     <select id="lut-base-kind" on:change=move |event| { form.manual.set(None); if let Ok(mode) = event_target_value(&event).parse::<LutBaseMode>() { form.lut_base_mode.set(mode); } }>
-                        <option value=LutBaseMode::Look.to_string() prop:selected=move || form.lut_base_mode.get() == LutBaseMode::Look>"A published Look version"</option>
-                        <option value=LutBaseMode::BodyRealization.to_string() prop:selected=move || form.lut_base_mode.get() == LutBaseMode::BodyRealization>"A camera or software rendering"</option>
-                        <option value=LutBaseMode::FamilyRendering.to_string() prop:selected=move || form.lut_base_mode.get() == LutBaseMode::FamilyRendering>"A family rendering"</option>
+                        <option value=LutBaseMode::Look.to_string() prop:selected=move || form.lut_base_mode.get() == LutBaseMode::Look>"A published look or the neutral baseline"</option>
+                        <option value=LutBaseMode::BodyRealization.to_string() prop:selected=move || form.lut_base_mode.get() == LutBaseMode::BodyRealization>"A camera or app rendering"</option>
+                        <option value=LutBaseMode::FamilyRendering.to_string() prop:selected=move || form.lut_base_mode.get() == LutBaseMode::FamilyRendering>"A camera maker's rendering that isn't measured yet"</option>
                     </select>
                     {move || (form.lut_base_mode.get() == LutBaseMode::Look).then(|| view! {
                         <div>
-                            <label for="lut-base-look">"Base Look version"</label>
+                            <label for="lut-base-look">"The look it was built on"</label>
                             <select id="lut-base-look" on:change=move |event| {
                                 form.manual.set(None);
                                 let Ok(index) = event_target_value(&event).parse::<usize>() else {
@@ -2230,7 +2368,7 @@ fn LutFields(form: Form, index: SiteIndex) -> impl IntoView {
                                     form.lut_base.set(versions.get(index).cloned());
                                 });
                             }>
-                                <option value="">"Choose a version"</option>
+                                <option value="">"Choose a look"</option>
                                 {versions.with_value(|options| options.iter().enumerate().map(|(index, version)| {
                                     let label = if version.matchable {
                                         format!("{} · {}", version.name, version.version)
@@ -2242,36 +2380,44 @@ fn LutFields(form: Form, index: SiteIndex) -> impl IntoView {
                                     }
                                 }).collect_view())}
                             </select>
-                            <p class="muted">"A published or rooted Look version, or the neutral baseline, is the base. Preview-only versions are labelled and are not matchable targets."</p>
+                            <p class="muted">"A published look or the neutral baseline can be the base. Preview-only looks are labelled and are not matchable targets."</p>
                         </div>
                     })}
                     {move || (form.lut_base_mode.get() == LutBaseMode::BodyRealization).then(|| view! {
                         <div>
-                            <label for="lut-base-body-mode">"Body source"</label>
+                            <label for="lut-base-body-mode">"Which camera or app?"</label>
                             <select id="lut-base-body-mode" on:change=move |event| {
                                 form.manual.set(None);
                                 if let Ok(mode) = event_target_value(&event).parse::<BodyPickerMode>() {
                                     form.lut_base_body_mode.set(mode);
                                     form.lut_base_body.set(None);
-                                    form.lut_base_body_text.set(String::new());
+                                    form.lut_base_body_make.set(String::new());
+                                    form.lut_base_body_model.set(String::new());
+                                    load_base_schema(form, None);
                                 }
                             }>
-                                <option value=BodyPickerMode::Catalog.to_string() prop:selected=move || form.lut_base_body_mode.get() == BodyPickerMode::Catalog>"Catalog body"</option>
-                                <option value=BodyPickerMode::Unregistered.to_string() prop:selected=move || form.lut_base_body_mode.get() == BodyPickerMode::Unregistered>"Unregistered body id"</option>
+                                <option value=BodyPickerMode::Catalog.to_string() prop:selected=move || form.lut_base_body_mode.get() == BodyPickerMode::Catalog>"Choose from the list"</option>
+                                <option value=BodyPickerMode::Unregistered.to_string() prop:selected=move || form.lut_base_body_mode.get() == BodyPickerMode::Unregistered>"My camera isn't listed"</option>
                             </select>
                             {move || (form.lut_base_body_mode.get() == BodyPickerMode::Catalog).then(|| view! {
                                 <div>
-                                    <label for="lut-base-body">"Camera body"</label>
+                                    <label for="lut-base-body">"Camera or app"</label>
                                     <select id="lut-base-body" on:change=move |event| {
                                         form.manual.set(None);
                                         let value = event_target_value(&event);
-                                        form.lut_base_body.set(if value.is_empty() { None } else { BodyId::new(&value).ok() });
+                                        let body = if value.is_empty() { None } else { BodyId::new(&value).ok() };
+                                        form.lut_base_body.set(body.clone());
+                                        load_base_schema(form, body);
                                     }>
-                                        <option value="" prop:selected=move || form.lut_base_body.get().is_none()>"Choose a body"</option>
+                                        <option value="" prop:selected=move || form.lut_base_body.get().is_none()>"Choose a camera or app"</option>
                                         {bodies.with_value(|bodies| bodies.iter().map(|body| {
                                             let value = body.id.as_str().to_owned();
                                             let id = body.id.clone();
-                                            let label = format!("{} {}", body.make, body.model);
+                                            let label = if body.kind == looklab_publish::BodyKind::Software {
+                                                format!("{} {} (editing app)", body.make, body.model)
+                                            } else {
+                                                format!("{} {}", body.make, body.model)
+                                            };
                                             view! {
                                                 <option value=value prop:selected=move || form.lut_base_body.get().as_ref() == Some(&id)>{label}</option>
                                             }
@@ -2281,24 +2427,72 @@ fn LutFields(form: Form, index: SiteIndex) -> impl IntoView {
                             })}
                             {move || (form.lut_base_body_mode.get() == BodyPickerMode::Unregistered).then(|| view! {
                                 <div>
-                                    <label for="lut-base-body-custom">"Body id"</label>
-                                    <input id="lut-base-body-custom" placeholder="maker/model" prop:value=move || form.lut_base_body_text.get() on:input=move |event| {
+                                    <label for="lut-base-body-make">"Camera make"</label>
+                                    <input id="lut-base-body-make" prop:value=move || form.lut_base_body_make.get() on:input=move |event| {
                                         form.manual.set(None);
-                                        let value = event_target_value(&event);
-                                        form.lut_base_body.set(BodyId::new(value.trim()).ok());
-                                        form.lut_base_body_text.set(value);
+                                        form.lut_base_body_make.set(event_target_value(&event));
+                                        form.lut_base_body.set(unregistered_base_body(&form));
+                                        form.lut_base_schema.set(None);
+                                        form.lut_base_schema_state.set(proposal_form::BaseData::Unavailable);
                                     }/>
-                                    <p class="muted">"An unregistered body keeps the base incomplete until its schema is available."</p>
+                                    <label for="lut-base-body-model">"Camera model"</label>
+                                    <input id="lut-base-body-model" prop:value=move || form.lut_base_body_model.get() on:input=move |event| {
+                                        form.manual.set(None);
+                                        form.lut_base_body_model.set(event_target_value(&event));
+                                        form.lut_base_body.set(unregistered_base_body(&form));
+                                        form.lut_base_schema.set(None);
+                                        form.lut_base_schema_state.set(proposal_form::BaseData::Unavailable);
+                                    }/>
+                                    <p class="muted">"Without a published control schema, the film simulation and dynamic range stay unchecked."</p>
                                 </div>
                             })}
-                            <p class="muted">"Renderer: X RAW Studio"</p>
-                            <label for="lut-base-sim">"Film simulation (optional)"</label>
-                            <input id="lut-base-sim" placeholder="For example: classic_chrome" prop:value=move || form.lut_base_sim.get() on:input=move |event| { form.manual.set(None); form.lut_base_sim.set(event_target_value(&event)); }/>
-                            <label for="lut-base-dr">"Dynamic range (optional)"</label>
+                            <p class="muted">"Rendered by X RAW Studio."</p>
+                            {move || match form.lut_base_schema_state.get() {
+                                proposal_form::BaseData::Loading => view! {
+                                    <p class="muted" role="status">"Loading this camera's film simulations…"</p>
+                                }.into_any(),
+                                proposal_form::BaseData::Unavailable => view! {
+                                    <p class="muted">"This base needs the camera's published control schema for its film simulation menu."</p>
+                                }.into_any(),
+                                proposal_form::BaseData::Ready => {
+                                    let schema = form.lut_base_schema.get();
+                                    let mut seen = std::collections::BTreeSet::new();
+                                    let options = schema.iter().flat_map(|schema| schema.epochs.iter()).flat_map(|epoch| epoch.native_sims.iter()).filter_map(|sim| {
+                                        if !seen.insert(sim.key.to_string()) {
+                                            return None;
+                                        }
+                                        let name = published.with_value(|looks| looks.iter().find(|look| look.slug.as_str() == sim.look.as_str()).map(|look| look.name.clone()))
+                                            .unwrap_or_else(|| data::sim_name(&sim.key));
+                                        Some((sim.key.to_string(), name))
+                                    }).collect::<Vec<_>>();
+                                    if options.is_empty() {
+                                        view! {
+                                            <p class="muted">"This camera's published controls list no film simulations."</p>
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <label for="lut-base-sim">"Film simulation"</label>
+                                            <select id="lut-base-sim" on:change=move |event| {
+                                                form.manual.set(None);
+                                                form.lut_base_sim.set(event_target_value(&event));
+                                            }>
+                                                <option value="" prop:selected=move || form.lut_base_sim.get().is_empty()>"Choose a film simulation"</option>
+                                                {options.into_iter().map(|(key, label)| {
+                                                    let selected_key = key.clone();
+                                                    view! {
+                                                        <option value=key prop:selected=move || form.lut_base_sim.get() == selected_key>{label}</option>
+                                                    }
+                                                }).collect_view()}
+                                            </select>
+                                        }.into_any()
+                                    }
+                                }
+                            }}
+                            <label for="lut-base-dr">"Dynamic range"</label>
                             {lut_dynamic_range_select(form, "lut-base-dr", form.lut_base_dynamic_range)}
                             <label for="lut-base-notes">"Notes (optional)"</label>
                             <input id="lut-base-notes" prop:value=move || form.lut_base_notes.get() on:input=move |event| { form.manual.set(None); form.lut_base_notes.set(event_target_value(&event)); }/>
-                            <p class="muted">"The declaration is stored with its resolution status. A missing or unknown setting stays incomplete or inconsistent and previews on the neutral baseline; it is not matched."</p>
+                            {move || form.lut_base_schema_error.get().map(|error| view! { <p class="error" role="alert">{error}</p> })}
                         </div>
                     })}
                     {move || (form.lut_base_mode.get() == LutBaseMode::FamilyRendering).then(|| view! {
@@ -2311,9 +2505,10 @@ fn LutFields(form: Form, index: SiteIndex) -> impl IntoView {
                             {lut_dynamic_range_select(form, "lut-family-dr", form.lut_family_dynamic_range)}
                             <label for="lut-family-notes">"Notes (optional)"</label>
                             <input id="lut-family-notes" prop:value=move || form.lut_family_notes.get() on:input=move |event| { form.manual.set(None); form.lut_family_notes.set(event_target_value(&event)); }/>
-                            <p class="muted">"A family rendering stays unmeasured until a native Look for that rendering is published."</p>
+                            <p class="muted">"A family rendering stays unmeasured until a native look for that rendering is published."</p>
                         </div>
                     })}
+                    <BaseOutcomePanel form/>
                 </div>
             })}
             <label for="lut-emulation">"What it reproduces"</label>
@@ -2340,13 +2535,137 @@ fn LutFields(form: Form, index: SiteIndex) -> impl IntoView {
     }
 }
 
+fn base_label(form: &Form, base: &BaseReference) -> String {
+    match base {
+        BaseReference::BodyRealization {
+            body,
+            film_simulation,
+            ..
+        } => {
+            let camera = form
+                .index
+                .get()
+                .and_then(|index| camera_summary(&index, body))
+                .map(|(make, model)| format!("{make} {model}"))
+                .unwrap_or_else(|| "this camera".to_owned());
+            let simulation = film_simulation.as_ref().and_then(|sim| {
+                let schema = form.lut_base_schema.get()?;
+                let declared = schema
+                    .epochs
+                    .iter()
+                    .flat_map(|epoch| epoch.native_sims.iter())
+                    .find(|declared| declared.key == *sim)?;
+                let name = form
+                    .index
+                    .get()
+                    .and_then(|index| {
+                        index
+                            .looks
+                            .iter()
+                            .find(|look| look.slug.as_str() == declared.look.as_str())
+                            .map(|look| look.name.clone())
+                    })
+                    .unwrap_or_else(|| data::sim_name(sim));
+                Some(name)
+            });
+            match simulation {
+                Some(simulation) => format!("{simulation} on the {camera}"),
+                None => camera,
+            }
+        }
+        _ => data::plain_base_label(base),
+    }
+}
+
+fn base_path_label(path: proposal_form::BasePath) -> &'static str {
+    match path {
+        proposal_form::BasePath::Now => "available now",
+        proposal_form::BasePath::WhenCameraReady => "once the destination camera's model is ready",
+        proposal_form::BasePath::WhenBaseMeasured => "once this base is measured",
+        proposal_form::BasePath::NotOffered => "not offered for this base",
+    }
+}
+
+fn base_outcome_view(outcome: proposal_form::BaseOutcome, label: String) -> AnyView {
+    let paths = view! {
+        <ul>
+            <li>{format!("Preview: {}", base_path_label(outcome.paths.preview))}</li>
+            <li>{format!("In-camera settings: {}", base_path_label(outcome.paths.settings))}</li>
+            <li>{format!("Card file: {}", base_path_label(outcome.paths.card))}</li>
+        </ul>
+    };
+    let message = match outcome.status {
+        BaseStatus::Pinned if outcome.neutral_baseline => view! {
+            <p>"Preview now. Settings appear when the destination camera's model is ready, and a card file is available for firmware that loads looklab looks."</p>
+            <p>"This base is measured on a neutral rendering, not your app's default."</p>
+        }.into_any(),
+        BaseStatus::Pinned => view! {
+            <p>"Preview now. Settings appear when the destination camera's model is ready, and a card file is available for firmware that loads looklab looks."</p>
+        }.into_any(),
+        BaseStatus::BaseIdentifiedUnmeasured => view! {
+            <p>{format!("Preview now. Settings and a card file appear once {label} is measured. A LUT made on top of a film simulation depends on that simulation.")}</p>
+            <p class="field-row">
+                <a href=crate::base::site_url("/contribute/wanted")>"Wanted shots"</a>
+                <a href=crate::base::site_url("/contribute")>"Share photos you already have"</a>
+            </p>
+        }.into_any(),
+        BaseStatus::BaseIncomplete { missing } => {
+            let text = if missing == BaseField::Body
+                && outcome.data == proposal_form::BaseData::Loading
+            {
+                "The camera's published control schema is loading; this base can't be checked yet. The preview uses the neutral baseline.".to_owned()
+            } else if missing == BaseField::Body
+                && outcome.data == proposal_form::BaseData::Unavailable
+            {
+                "The camera's published control schema is needed to check this base. The preview uses the neutral baseline.".to_owned()
+            } else {
+                format!(
+                    "Preview only, on the neutral baseline. The base is missing its {}.",
+                    proposal_form::base_field_label(missing)
+                )
+            };
+            view! { <p>{text}</p> }.into_any()
+        }
+        BaseStatus::BaseInconsistent { field } => view! {
+            <p>{format!("Preview only, on the neutral baseline. The camera's published controls don't list the base's {}.", proposal_form::base_field_label(field))}</p>
+        }.into_any(),
+    };
+    view! {
+        <div class="base-outcome-paths">{paths}</div>
+        {message}
+    }
+    .into_any()
+}
+
+#[component]
+fn BaseOutcomePanel(form: Form) -> impl IntoView {
+    view! {
+        <section class="base-outcome" aria-live="polite" aria-labelledby="base-outcome-heading">
+            <h3 id="base-outcome-heading">"What this base makes available"</h3>
+            {move || {
+                let (base, matchable) = match base_reference(&form) {
+                    Ok(base) => base,
+                    Err(message) => {
+                        return view! { <p class="muted">{message}</p> }.into_any();
+                    }
+                };
+                let schema = form.lut_base_schema.get();
+                let data = form.lut_base_schema_state.get();
+                let outcome =
+                    proposal_form::BaseOutcome::of(&base, schema.as_ref(), data, matchable);
+                base_outcome_view(outcome, base_label(&form, &base))
+            }}
+        </section>
+    }
+}
+
 #[component]
 fn InterfaceFields(form: Form) -> impl IntoView {
     view! {
         <section aria-labelledby="interface-heading">
-            <h2 id="interface-heading">"The editing-app profile"</h2>
-            <p>"Choose a looklab editing-app profile (.yaml). The full file is uploaded with your proposal and stays private until approval."</p>
-            <p><a href=crate::base::site_url("/developers/pipelines")>"About editing-app profiles"</a></p>
+            <h2 id="interface-heading">"The editing-app pipeline"</h2>
+            <p>"Choose a looklab editing-app pipeline (.yaml). The full file is uploaded with your proposal and stays private until approval."</p>
+            <p><a href=crate::base::site_url("/developers/pipelines")>"About editing-app pipelines"</a></p>
             <crate::ui::DropZone on_files=Callback::new(move |selected| {
                 let Some(file) = files::selected_files(selected).into_iter().next() else { return; };
                 let generation = form.interface_generation.get_untracked().wrapping_add(1);
@@ -2447,7 +2766,7 @@ fn EvidenceFields(form: Form) -> impl IntoView {
                         <p>{if required {
                             "A camera confirmed from a sample file needs at least one original camera file donated under CC0. Only checked files leave this device."
                         } else {
-                            "Without an original camera file, the mapping stays provisional. Only checked files leave this device."
+                            "Without an original camera file, the mapping stays not yet confirmed from a sample file. Only checked files leave this device."
                         }}</p>
                         {move || {
                             let (make, model) = form_evidence_identity(&form);

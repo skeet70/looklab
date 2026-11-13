@@ -1300,6 +1300,15 @@ async function propose_edges(size) {
   const session = await open(VIEWPORTS[size]);
   const { page, problems } = session;
   try {
+    await page.goto(`${options.origin}/community/propose?kind=lut_look#from-a-preset`);
+    await page.waitForSelector('#from-a-preset[open]', { timeout: 60_000 });
+    const presetVisible = await page.evaluate(() => {
+      const guide = document.querySelector('#from-a-preset');
+      if (!guide) return false;
+      const rect = guide.getBoundingClientRect();
+      return rect.top < innerHeight && rect.bottom > 0;
+    });
+    check(presetVisible, `${options.browser} ${size}: the preset deep link opens and scrolls to the guide`);
     await page.goto(`${options.origin}/community/propose?kind=lut_look`);
     await page.waitForSelector('#lut-name', { timeout: 60_000 });
     const lutOrder = await page.evaluate(() => {
@@ -1318,7 +1327,12 @@ async function propose_edges(size) {
     const index = await (await page.request.get(`${options.origin}/data/index.json`)).json();
     const bases = index.looks
       .filter((look) => (look.visibility ?? 'public') === 'public')
-      .flatMap((look) => look.versions.filter((version) => (version.matchable ?? true) && ['published', 'rooted'].includes(version.status)).map((version) => `${look.slug}@${version.version}`));
+      .flatMap((look) => look.versions.filter((version) =>
+        ['published', 'rooted'].includes(version.status)
+        && (version.applicability?.state ?? 'current') !== 'invalidated'
+        && version.support !== 'early_estimate'
+        && ((version.matchable ?? true) || version.artifact === 'source-lut.json')
+      ).map((version) => `${look.slug}@${version.version}`));
     const neutral = bases.some((base) => base.startsWith('looklab-neutral-srgb-v1@'));
     const expected = bases.length + (neutral ? 0 : 1);
     const offered = await page.locator('#lut-base-look option:not([value=""])').count();

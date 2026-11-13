@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+use looklab_model::file::{BaseField, BaseReference, BaseStatus, NEUTRAL_BASELINE_SLUG};
 use looklab_publish::{LookStatus, LookVisibility, SOURCE_LUT_ARTIFACT, SiteIndex};
 use looklab_schema::{
     Affects, Body, BodyId, BodyKind, BodyStatus, Capabilities, ColorSpace, ControlChange,
@@ -22,7 +23,7 @@ pub fn kind_label(kind: looklab_schema::ProposalKind) -> &'static str {
         ProposalKind::Mapping => "Add or fix a film simulation on a camera",
         ProposalKind::SchemaChange => "Change a camera's controls",
         ProposalKind::LutLook => "Add a custom look",
-        ProposalKind::InterfaceProfile => "Add an editing-app profile",
+        ProposalKind::InterfaceProfile => "Add an editing-app pipeline",
         ProposalKind::EpochSplit => "Separate firmware versions",
         ProposalKind::LookSplit => "Separate looks",
         ProposalKind::GateOverride => "Review a release exception",
@@ -43,7 +44,7 @@ pub fn menu_summary(
         ProposalKind::LutLook => summary.headline.replace("LUT-defined look", "custom look"),
         ProposalKind::InterfaceProfile => summary
             .headline
-            .replace("software interface profile", "editing-app profile"),
+            .replace("software interface profile", "editing-app pipeline"),
         ProposalKind::EpochSplit => summary.headline.replace("new epoch", "new firmware range"),
         _ => summary.headline.clone(),
     };
@@ -652,6 +653,100 @@ pub fn neutral_base(versions: &[BaseLookVersion]) -> Option<BaseLookVersion> {
     })
 }
 
+/// A path a custom look can offer after its display base is declared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BasePath {
+    /// Available now.
+    Now,
+    /// Available once the destination camera's model is ready for the settings.
+    WhenCameraReady,
+    /// Available once the named base has a measured rendering.
+    WhenBaseMeasured,
+    /// Not available for this base.
+    NotOffered,
+}
+
+/// Which data the browser has for the base camera's published schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BaseData {
+    Loading,
+    Ready,
+    Unavailable,
+}
+
+/// The paths a display base offers before a destination camera is chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BasePaths {
+    pub preview: BasePath,
+    pub settings: BasePath,
+    pub card: BasePath,
+}
+
+/// The resolved base status and the paths it offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BaseOutcome {
+    pub status: BaseStatus,
+    pub neutral_baseline: bool,
+    pub data: BaseData,
+    pub paths: BasePaths,
+}
+
+impl BaseOutcome {
+    pub(crate) fn of(
+        base: &BaseReference,
+        schema: Option<&ControlSchema>,
+        data: BaseData,
+        matchable: bool,
+    ) -> Self {
+        let status = if matches!(base, BaseReference::Look { .. }) && !matchable {
+            BaseStatus::BaseIdentifiedUnmeasured
+        } else {
+            base.resolve_status(schema)
+        };
+        let neutral_baseline = matches!(
+            base,
+            BaseReference::Look { slug, .. } if slug.as_str() == NEUTRAL_BASELINE_SLUG
+        );
+        Self {
+            status,
+            neutral_baseline,
+            data,
+            paths: base_paths(status),
+        }
+    }
+}
+
+/// Every base status maps to one typed set of available paths.
+pub(crate) fn base_paths(status: BaseStatus) -> BasePaths {
+    match status {
+        BaseStatus::Pinned => BasePaths {
+            preview: BasePath::Now,
+            settings: BasePath::WhenCameraReady,
+            card: BasePath::Now,
+        },
+        BaseStatus::BaseIdentifiedUnmeasured => BasePaths {
+            preview: BasePath::Now,
+            settings: BasePath::WhenBaseMeasured,
+            card: BasePath::WhenBaseMeasured,
+        },
+        BaseStatus::BaseIncomplete { .. } | BaseStatus::BaseInconsistent { .. } => BasePaths {
+            preview: BasePath::Now,
+            settings: BasePath::NotOffered,
+            card: BasePath::NotOffered,
+        },
+    }
+}
+
+/// A base field in photographer words.
+pub(crate) fn base_field_label(field: BaseField) -> &'static str {
+    match field {
+        BaseField::Body => "camera",
+        BaseField::Renderer => "rendering app",
+        BaseField::FilmSimulation => "film simulation",
+        BaseField::DynamicRange => "dynamic range",
+    }
+}
+
 /// A control to add to an epoch that does not declare it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ControlDefinitionDraft {
@@ -794,6 +889,200 @@ epochs:
     fn the_neutral_baseline_is_not_offered_twice() {
         let neutral = neutral_base(&[]).expect("neutral baseline");
         assert!(neutral_base(std::slice::from_ref(&neutral)).is_none());
+    }
+
+    fn base_schema() -> ControlSchema {
+        let yaml = r#"
+body: fujifilm/x-s10
+epochs:
+  - id: 1
+    firmware: { from: "1.00", to: "1.99" }
+    native_sims:
+      - key: provia
+        look: provia
+        makernote: { tag: FilmMode, value: 0x0000 }
+    exposure_modes: []
+    controls:
+      - key: dynamic_range
+        type: enum
+        values: [dr100, dr200, dr400]
+        default: dr100
+        look_affecting: true
+        affects: [tone]
+    solve_plan: []
+"#;
+        looklab_schema::validate_control_schema(yaml).expect("schema")
+    }
+
+    #[test]
+    fn base_outcomes_follow_the_resolved_status() {
+        use looklab_model::file::{DynamicRange, LookVersion, Renderer, Slug};
+
+        let schema = base_schema();
+        let neutral = BaseReference::neutral_baseline();
+        let outcome = BaseOutcome::of(&neutral, None, BaseData::Unavailable, true);
+        assert_eq!(outcome.status, BaseStatus::Pinned);
+        assert!(outcome.neutral_baseline);
+        assert_eq!(outcome.paths, base_paths(BaseStatus::Pinned));
+
+        let published = BaseReference::Look {
+            slug: Slug::new("provia").expect("slug"),
+            version: LookVersion::new("1.0.0").expect("version"),
+        };
+        let outcome = BaseOutcome::of(&published, None, BaseData::Unavailable, true);
+        assert_eq!(outcome.status, BaseStatus::Pinned);
+        assert!(!outcome.neutral_baseline);
+
+        let preview = BaseReference::Look {
+            slug: Slug::new("source-preview").expect("slug"),
+            version: LookVersion::new("1.0.0").expect("version"),
+        };
+        let outcome = BaseOutcome::of(&preview, None, BaseData::Unavailable, false);
+        assert_eq!(outcome.status, BaseStatus::BaseIdentifiedUnmeasured);
+        assert_eq!(
+            outcome.paths,
+            base_paths(BaseStatus::BaseIdentifiedUnmeasured)
+        );
+
+        let family = BaseReference::FamilyRendering {
+            maker: "Fujifilm".to_owned(),
+            rendering: "Classic Chrome".to_owned(),
+            dynamic_range: None,
+            notes: String::new(),
+        };
+        assert_eq!(
+            BaseOutcome::of(&family, None, BaseData::Unavailable, true).status,
+            BaseStatus::BaseIdentifiedUnmeasured
+        );
+
+        let body = |sim: Option<&str>, dynamic_range: Option<DynamicRange>| {
+            BaseReference::BodyRealization {
+                body: BodyId::new("fujifilm/x-s10").expect("body"),
+                renderer: Renderer::XRawStudio,
+                film_simulation: sim.map(|key| SimKey::new(key).expect("sim")),
+                dynamic_range,
+                notes: String::new(),
+            }
+        };
+        assert_eq!(
+            BaseOutcome::of(&body(None, None), None, BaseData::Unavailable, true).status,
+            BaseStatus::BaseIncomplete {
+                missing: BaseField::Body
+            }
+        );
+        assert_eq!(
+            BaseOutcome::of(&body(None, None), Some(&schema), BaseData::Ready, true).status,
+            BaseStatus::BaseIncomplete {
+                missing: BaseField::FilmSimulation
+            }
+        );
+        assert_eq!(
+            BaseOutcome::of(
+                &body(Some("provia"), None),
+                Some(&schema),
+                BaseData::Ready,
+                true
+            )
+            .status,
+            BaseStatus::BaseIncomplete {
+                missing: BaseField::DynamicRange
+            }
+        );
+        assert_eq!(
+            BaseOutcome::of(
+                &body(Some("provia"), Some(DynamicRange::Dr200)),
+                Some(&schema),
+                BaseData::Ready,
+                true,
+            )
+            .status,
+            BaseStatus::BaseIdentifiedUnmeasured
+        );
+        assert_eq!(
+            BaseOutcome::of(
+                &body(Some("eterna"), Some(DynamicRange::Dr200)),
+                Some(&schema),
+                BaseData::Ready,
+                true,
+            )
+            .status,
+            BaseStatus::BaseInconsistent {
+                field: BaseField::FilmSimulation
+            }
+        );
+    }
+
+    #[test]
+    fn every_base_status_maps_to_its_typed_paths() {
+        let measured = BasePaths {
+            preview: BasePath::Now,
+            settings: BasePath::WhenCameraReady,
+            card: BasePath::Now,
+        };
+        let unmeasured = BasePaths {
+            preview: BasePath::Now,
+            settings: BasePath::WhenBaseMeasured,
+            card: BasePath::WhenBaseMeasured,
+        };
+        let incomplete = BasePaths {
+            preview: BasePath::Now,
+            settings: BasePath::NotOffered,
+            card: BasePath::NotOffered,
+        };
+        for (status, expected) in [
+            (BaseStatus::Pinned, measured),
+            (BaseStatus::BaseIdentifiedUnmeasured, unmeasured),
+            (
+                BaseStatus::BaseIncomplete {
+                    missing: BaseField::Body,
+                },
+                incomplete,
+            ),
+            (
+                BaseStatus::BaseIncomplete {
+                    missing: BaseField::Renderer,
+                },
+                incomplete,
+            ),
+            (
+                BaseStatus::BaseIncomplete {
+                    missing: BaseField::FilmSimulation,
+                },
+                incomplete,
+            ),
+            (
+                BaseStatus::BaseIncomplete {
+                    missing: BaseField::DynamicRange,
+                },
+                incomplete,
+            ),
+            (
+                BaseStatus::BaseInconsistent {
+                    field: BaseField::Body,
+                },
+                incomplete,
+            ),
+            (
+                BaseStatus::BaseInconsistent {
+                    field: BaseField::Renderer,
+                },
+                incomplete,
+            ),
+            (
+                BaseStatus::BaseInconsistent {
+                    field: BaseField::FilmSimulation,
+                },
+                incomplete,
+            ),
+            (
+                BaseStatus::BaseInconsistent {
+                    field: BaseField::DynamicRange,
+                },
+                incomplete,
+            ),
+        ] {
+            assert_eq!(base_paths(status), expected, "{status:?}");
+        }
     }
 
     #[test]

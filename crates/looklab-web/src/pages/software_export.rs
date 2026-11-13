@@ -145,8 +145,8 @@ pub(super) fn SoftwareExportPanel(
         .or_else(|| profiles.first().cloned())
     else {
         return view! {
-            <ui::EmptyState title="No editing-app profiles are published yet".to_owned() message="A published pipeline definition and reference check are needed before building an editing-app export.".to_owned()>
-                <a href=crate::base::site_url("/developers/pipelines")>"About editing-app profiles"</a>
+            <ui::EmptyState title="No editing-app pipelines are published yet".to_owned() message="A published pipeline definition and reference check are needed before building an editing-app export.".to_owned()>
+                <a href=crate::base::site_url("/developers/pipelines")>"About editing-app pipelines"</a>
             </ui::EmptyState>
         }.into_any();
     };
@@ -329,7 +329,7 @@ pub(super) fn SoftwareExportPanel(
                 <select id="export-profile" on:change=move |event| {
                     let choice = match ArtifactHash::parse(&event_target_value(&event)) {
                         Ok(choice) => choice,
-                        Err(_) => { error.set(Some("Choose a published editing-app profile.".to_owned())); return; }
+                        Err(_) => { error.set(Some("Choose a published editing-app pipeline.".to_owned())); return; }
                     };
                     let entry = profiles.with_value(|entries| entries.iter().find(|entry| entry.manifest_sha256 == choice).cloned());
                     if let Some(entry) = entry { replay.set(None); selected.set(entry); }
@@ -516,7 +516,7 @@ fn SoftwareExportResult(result: Arc<CompletedExport>) -> impl IntoView {
             <ui::Disclosure summary="Validation and exact inputs".to_owned()>
                 <p>{format!("Target {} {} · manifest {}", result.pin.target, result.pin.target_version, result.pin.target_manifest)}</p>
                 <p>{format!("Pipeline {} · declared version {} · revision {} · engine {}", result.reply.profile_id, result.reply.profile_version, result.pin.profile.manifest_sha256, result.pin.version)}</p>
-                <p>{format!("Profile reference check {reference_status} ({} probes, {} clipped targets). It checks the declared pipeline, not this target or an editing app.", result.reference.probes, result.reference.target_clipped)}</p>
+                <p>{format!("Pipeline reference check {reference_status} ({} probes, {} clipped targets). It checks the declared pipeline, not this target or an editing app.", result.reference.probes, result.reference.target_clipped)}</p>
                 {result.pin.input_transform.as_ref().map(|entry| view! { <p>{format!("Input prior {} version {} · {}", entry.body, entry.version, entry.sha256)}</p> })}
                 <ul>{reports.into_iter().map(|report| view! {
                     <li>{format!("{} K: {} supported probes, median {:.2}, p95 {:.2}, max {:.2} ΔE; {} unsupported, {} clipped.", report.cct.kelvin(), report.stats.count, report.stats.median, report.stats.p95, report.stats.max, report.unsupported, report.clipped)}</li>
