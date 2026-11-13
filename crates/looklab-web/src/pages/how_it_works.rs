@@ -26,7 +26,7 @@ pub fn HowItWorksPage() -> impl IntoView {
                 <li>
                     <span class="developer-step-number">"02"</span>
                     <h2>"We measure the look"</h2>
-                    <p>"Comparing each pair separates the look from the camera that recorded it."</p>
+                    <p>"Comparing pairs from many cameras separates the look from the camera that recorded it."</p>
                 </li>
                 <li>
                     <span class="developer-step-number">"03"</span>
@@ -38,7 +38,7 @@ pub fn HowItWorksPage() -> impl IntoView {
                 <h2>"Two kinds of looks"</h2>
                 <p>"Built-in looks are the film simulations and picture styles a camera ships with, measured from RAW and straight-from-camera (SOOC) JPEG pairs. Photos from many cameras help separate the look from the sensor that recorded it."</p>
                 <p>"Custom looks are .cube LUTs that people made and share. They need no photos of their own, except to measure the look they were built on."</p>
-                <p>"A LUT made on top of a film simulation depends on that simulation. Until it's measured, your look can be previewed but has no settings or card file. Photos of that simulation help."</p>
+                <p>"A LUT made on top of a film simulation depends on that simulation. Until it's measured, your look can be previewed but has no card file, and at most Experimental settings. Photos of that simulation help."</p>
             </section>
             <section>
                 <h2>"What you get"</h2>
@@ -67,8 +67,8 @@ pub fn HowItWorksPage() -> impl IntoView {
             </section>
             <section>
                 <h2>"Where things stand"</h2>
-                <p>"Each look is measured per camera. It publishes for a camera as independent photo sets for that camera arrive, and more photos widen what the estimate covers. The number of photos behind a look says how much evidence exists, not how accurate the result is."</p>
-                <p>"There's nothing to send us. Your browser reads the photos here and sends only color samples, after you review them. Large folders are fine."</p>
+                <p>"A look publishes once its photos pass review. It shows as Experimental for a camera until independent photo sets from that camera let it be checked for those settings, and more photos widen what the estimate covers. The number of photos behind a look says how much evidence exists, not how accurate the result is."</p>
+                <p>"There's nothing to send us. Your browser reads the photos here and sends only color samples and the camera settings they were shot with, after you review them."</p>
                 <p class="field-row">
                     <a class="button" href=site_url("/contribute/wanted")>"See which shots we need"</a>
                     <a href=site_url("/contribute")>"Help with photos"</a>
