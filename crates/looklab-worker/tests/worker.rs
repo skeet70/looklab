@@ -3775,6 +3775,16 @@ async fn one_capture_group_reaches_the_fit() {
     .await
     .expect("family capture request");
     assert_eq!(observed, Some(1));
+    let detail: String = sqlx::query_scalar(
+        "SELECT detail FROM model_active_evidence_requests
+         WHERE subject_key = 'shared_family:classic-chrome'
+           AND request_kind = 'missing_independent_captures'",
+    )
+    .fetch_one(worker.pool())
+    .await
+    .expect("family request text");
+    assert!(detail.contains("Fujifilm X-T5"), "{detail}");
+    assert!(!detail.contains("fujifilm/x-t5"), "{detail}");
 
     add_contribution(worker, &credential, &dataset, &[1], 101).await;
     looklab_worker::refit::run(
