@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use leptos::prelude::*;
@@ -130,22 +130,36 @@ fn need_key(index: &SiteIndex, bodies: &[BodyPage], request: &EvidenceRequestWir
     }
 }
 
+/// A request's own scope: a shared family, or one camera realization.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum NeedScope {
+    Family(NeedKey),
+    Body(NeedKey, BodyId),
+}
+
 /// One entry per Look and need, naming every camera a request applies to.
 ///
-/// A body-realization request and the shared-family request for the same Look
-/// describe the same missing evidence, so they fold into one entry. The family
-/// wording wins because it covers every camera with the Look.
+/// A body-realization request folds into the shared-family request for the same
+/// Look and need, because both describe the same missing evidence. A body
+/// request without a family request stays with its own camera: each camera's
+/// realization is its own need.
 fn request_needs(
     index: &SiteIndex,
     bodies: &[BodyPage],
     requests: &[EvidenceRequestWire],
 ) -> Vec<RequestNeed> {
-    let mut order: Vec<NeedKey> = Vec::new();
-    let mut needs: HashMap<NeedKey, RequestNeed> = HashMap::new();
+    let mut order: Vec<NeedScope> = Vec::new();
+    let mut needs: HashMap<NeedScope, RequestNeed> = HashMap::new();
     for request in requests {
         let key = need_key(index, bodies, request);
-        let need = needs.entry(key.clone()).or_insert_with(|| {
-            order.push(key);
+        let scope = match &request.subject {
+            ModelSubject::SharedFamily { .. } => NeedScope::Family(key),
+            ModelSubject::BodyRealization { realization } => {
+                NeedScope::Body(key, realization.body.clone())
+            }
+        };
+        let need = needs.entry(scope.clone()).or_insert_with(|| {
+            order.push(scope);
             RequestNeed {
                 request: request.clone(),
                 parts: Vec::new(),
@@ -166,18 +180,42 @@ fn request_needs(
             }
         }
     }
+    let mut folded = HashSet::new();
+    for scope in &order {
+        let NeedScope::Body(key, _) = scope else {
+            continue;
+        };
+        let family_scope = NeedScope::Family(key.clone());
+        if !needs.contains_key(&family_scope) {
+            continue;
+        }
+        let Some(body_need) = needs.remove(scope) else {
+            continue;
+        };
+        let family = needs
+            .get_mut(&family_scope)
+            .expect("the family need was just found");
+        family.parts.extend(body_need.parts);
+        for camera in body_need.cameras {
+            if !family.cameras.contains(&camera) {
+                family.cameras.push(camera);
+            }
+        }
+        folded.insert(scope.clone());
+    }
+    order.retain(|scope| !folded.contains(scope));
     order
         .into_iter()
-        .filter_map(|key| needs.remove(&key))
+        .filter_map(|scope| needs.remove(&scope))
         .collect()
 }
 
 /// Each camera in the site index with its published looks and open requests.
 ///
 /// A request without a body applies to any camera with that Look, so it is
-/// listed once above the cameras instead of repeating under each of them. A
-/// need that spans several cameras is listed there too, with every camera it
-/// names.
+/// listed once above the cameras instead of repeating under each of them,
+/// naming the cameras known to need it. A body request stays with its camera
+/// unless a shared-family request folds it into that entry.
 fn standings(index: &SiteIndex, bodies: &[BodyPage], wanted: Option<&WantedFile>) -> StandingsView {
     let mut cameras = index
         .bodies
@@ -1264,6 +1302,77 @@ mod tests {
         assert_eq!(
             need_cameras(&index, &stands.family_requests[0]),
             "fujifilm x-t5 or any camera with this look"
+        );
+    }
+
+    #[test]
+    fn body_requests_without_a_family_request_stay_with_their_camera() {
+        let index = index_with(
+            vec![
+                body_summary("fujifilm/x-t5", BodyKind::Camera, &["provia"]),
+                body_summary("fujifilm/x-s10", BodyKind::Camera, &["provia"]),
+            ],
+            vec![look_summary(
+                "provia",
+                "PROVIA / Standard",
+                true,
+                LookVisibility::Public,
+            )],
+        );
+        let wanted = WantedFile {
+            bounties: Vec::new(),
+            evidence_requests: vec![
+                body_request("fujifilm/x-t5", "provia", Some(1)),
+                body_request("fujifilm/x-s10", "provia", Some(1)),
+            ],
+        };
+        let stands = standings(&index, &[], Some(&wanted));
+        assert!(stands.family_requests.is_empty());
+        assert_eq!(stands.cameras[0].id.as_str(), "fujifilm/x-s10");
+        assert_eq!(stands.cameras[1].id.as_str(), "fujifilm/x-t5");
+        assert_eq!(stands.cameras[0].requests.len(), 1);
+        assert_eq!(stands.cameras[1].requests.len(), 1);
+        assert_eq!(
+            stands.cameras[0].requests[0].cameras,
+            vec![BodyId::new("fujifilm/x-s10").expect("body")]
+        );
+        assert_eq!(
+            stands.cameras[1].requests[0].cameras,
+            vec![BodyId::new("fujifilm/x-t5").expect("body")]
+        );
+    }
+
+    #[test]
+    fn a_family_request_folds_body_requests_from_each_camera() {
+        let index = index_with(
+            vec![
+                body_summary("fujifilm/x-t5", BodyKind::Camera, &["provia"]),
+                body_summary("fujifilm/x-s10", BodyKind::Camera, &["provia"]),
+            ],
+            vec![look_summary(
+                "provia",
+                "PROVIA / Standard",
+                true,
+                LookVisibility::Public,
+            )],
+        );
+        let wanted = WantedFile {
+            bounties: Vec::new(),
+            evidence_requests: vec![
+                body_request("fujifilm/x-t5", "provia", Some(1)),
+                body_request("fujifilm/x-s10", "provia", Some(1)),
+                request(),
+            ],
+        };
+        let stands = standings(&index, &[], Some(&wanted));
+        assert_eq!(stands.family_requests.len(), 1);
+        assert_eq!(stands.family_requests[0].cameras.len(), 2);
+        assert!(stands.family_requests[0].any_camera);
+        assert!(
+            stands
+                .cameras
+                .iter()
+                .all(|camera| camera.requests.is_empty())
         );
     }
 
