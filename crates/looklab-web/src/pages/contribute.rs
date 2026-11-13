@@ -441,6 +441,23 @@ fn unmapped_field_id(batch: BatchId, key: &str) -> String {
     format!("unmapped-{}-{key}", batch.0)
 }
 
+/// The rows that need a value: unreadable settings plus reproduced settings a
+/// draft or the technical editor removed.
+fn setting_rows(group: &ContributionGroup) -> Vec<String> {
+    let entered = menu_settings(&group.fields.controls);
+    let mut rows = group.unmapped.clone();
+    for (key, _) in &group.reproduced {
+        if !entered
+            .iter()
+            .any(|entry| entry.key.as_str() == key.as_str())
+            && !rows.iter().any(|known| known == key)
+        {
+            rows.push(key.clone());
+        }
+    }
+    rows
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MonochromeConsent {
     None,
@@ -921,6 +938,24 @@ fn clear_control(batches: RwSignal<BatchSet>, id: BatchId, key: &looklab_schema:
     });
 }
 
+/// An empty number field clears an unreadable setting; a setting read from the
+/// files keeps its saved value.
+fn empty_numeric_control(
+    batches: RwSignal<BatchSet>,
+    id: BatchId,
+    key: &looklab_schema::ControlKey,
+    allow_empty: bool,
+) {
+    if allow_empty {
+        clear_control(batches, id, key);
+    } else if let Some(step) = batches.with_untracked(|set| {
+        set.get(id)
+            .and_then(|group| control_step(&group.fields.controls, key))
+    }) {
+        set_control_step(batches, id, key, step);
+    }
+}
+
 /// A decimal for a number input; fractions that do not terminate are rounded.
 fn rational_text(value: looklab_schema::Rational) -> String {
     if value.den == 1 {
@@ -1005,7 +1040,7 @@ fn control_input(
                     on:change=move |event| {
                         let text = event_target_value(&event);
                         if text.trim().is_empty() {
-                            clear_control(batches, batch, &write_key);
+                            empty_numeric_control(batches, batch, &write_key, allow_empty);
                         } else if let Ok(step) = text.parse::<i64>() {
                             set_control_step(batches, batch, &write_key, step);
                         }
@@ -1094,7 +1129,7 @@ fn control_input(
                             on:change=move |event| {
                                 let text = event_target_value(&event);
                                 if text.trim().is_empty() {
-                                    clear_control(batches, batch, &write_key);
+                                    empty_numeric_control(batches, batch, &write_key, allow_empty);
                                 } else if let Ok(step) = text.parse::<i64>() {
                                     set_control_step(batches, batch, &write_key, step);
                                 }
@@ -1129,7 +1164,7 @@ fn control_input(
                         on:change=move |event| {
                             let text = event_target_value(&event);
                             if text.trim().is_empty() {
-                                clear_control(batches, batch, &write_key);
+                                empty_numeric_control(batches, batch, &write_key, allow_empty);
                             } else if let Some(step) =
                                 control_step_from_text(&write_control, &text)
                             {
@@ -1457,6 +1492,7 @@ pub fn ContributePage() -> impl IntoView {
     let batches = RwSignal::new(BatchSet::default());
     let catalog = RwSignal::new(None::<GroupCatalog>);
     let catalog_attempted = RwSignal::new(false);
+    let catalog_generation = RwSignal::new(0_u64);
     let required_missing = Signal::derive(move || {
         let catalog = catalog.get();
         let attempted = catalog_attempted.get();
@@ -1898,14 +1934,19 @@ pub fn ContributePage() -> impl IntoView {
         let Some(facts) = plan.with(|plan| plan.as_ref().map(|plan| plan.facts.clone())) else {
             return;
         };
+        let generation = catalog_generation.get_untracked() + 1;
+        catalog_generation.set(generation);
+        catalog_attempted.set(false);
         spawn_local(async move {
             if let Ok(index) = data::index().await {
+                if catalog_generation.get_untracked() != generation {
+                    return;
+                }
                 snapshot_version.set(index.community_snapshot_version);
+                let bodies = batches.with_untracked(|set| bodies_to_load(&facts, &index, set));
                 let mut schemas = Vec::new();
-                for camera in &index.bodies {
-                    if facts.iter().any(|fact| {
-                        matching_camera(fact, &index).is_some_and(|matched| matched.id == camera.id)
-                    }) && let Ok(page) = data::body(camera.id.make(), camera.id.model()).await
+                for body in bodies {
+                    if let Ok(page) = data::body(body.make(), body.model()).await
                         && let Ok(schema) = looklab_schema::validate_control_schema(&page.schema)
                     {
                         schemas.push(schema);
@@ -1920,7 +1961,9 @@ pub fn ContributePage() -> impl IntoView {
                     None => *catalog = Some(GroupCatalog { index, schemas }),
                 });
             }
-            catalog_attempted.set(true);
+            if catalog_generation.get_untracked() == generation {
+                catalog_attempted.set(true);
+            }
         });
     });
 
@@ -3119,13 +3162,8 @@ fn BatchEditor(
                 .unwrap_or_default()
         })
     });
-    let unmapped = Memo::new(move |_| {
-        batches.with(|set| {
-            set.get(id)
-                .map(|group| group.unmapped.clone())
-                .unwrap_or_default()
-        })
-    });
+    let unmapped =
+        Memo::new(move |_| batches.with(|set| set.get(id).map_or_else(Vec::new, setting_rows)));
     let notes = Memo::new(move |_| {
         batches.with(|set| {
             set.get(id)
@@ -3217,7 +3255,7 @@ fn BatchEditor(
                 let rows = unmapped.get();
                 (!rows.is_empty()).then(|| view! {
                 <p class="warn" role="alert">
-                    "These settings were not readable from your files. Enter the values you used: a batch cannot be sent until each one has a value the camera allows."
+                    "These settings need a value before this batch can be sent. Enter the value you used for each one."
                 </p>
                 <div class="unmapped-controls">
                     {rows.into_iter().filter_map(|raw| looklab_schema::ControlKey::new(&raw).ok()).map(|key| {
@@ -3327,6 +3365,33 @@ fn matching_camera<'a>(
         .bodies
         .iter()
         .find(|camera| identity.matches(&camera.make, &camera.model))
+}
+
+/// The cameras whose schemas the catalog needs: those named by the files and
+/// any body a restored draft chose by hand.
+fn bodies_to_load(
+    facts: &[looklab_wasm::pairing::FileFacts],
+    index: &looklab_publish::SiteIndex,
+    batches: &BatchSet,
+) -> Vec<looklab_schema::BodyId> {
+    let mut bodies = Vec::new();
+    for camera in &index.bodies {
+        if facts
+            .iter()
+            .any(|fact| matching_camera(fact, index).is_some_and(|matched| matched.id == camera.id))
+            && !bodies.contains(&camera.id)
+        {
+            bodies.push(camera.id.clone());
+        }
+    }
+    for group in batches.groups() {
+        if let Ok(id) = looklab_schema::BodyId::new(&group.fields.body)
+            && !bodies.contains(&id)
+        {
+            bodies.push(id);
+        }
+    }
+    bodies
 }
 
 fn title_case_words(value: &str) -> String {
@@ -5630,6 +5695,31 @@ epochs:
                 .iter()
                 .any(|field| field.key == "dynamic_range")
         );
+    }
+
+    #[test]
+    fn a_restored_hand_chosen_body_is_loaded_for_its_schema() {
+        let catalog = x_m1_catalog(x_m1_schema());
+        let set = BatchSet::from_groups(vec![ContributionGroup {
+            fields: GroupFields {
+                body: "fujifilm/x-m1".to_owned(),
+                ..GroupFields::default()
+            },
+            ..ContributionGroup::default()
+        }]);
+        assert_eq!(
+            bodies_to_load(&[], &catalog.index, &set),
+            vec![looklab_schema::BodyId::new("fujifilm/x-m1").expect("body id")]
+        );
+    }
+
+    #[test]
+    fn a_deleted_reproduced_setting_gets_a_row_to_focus() {
+        let mut group = required_group(BatchId(1), &[], "white_balance=0");
+        group.reproduced = vec![("dynamic_range".to_owned(), 1)];
+        assert_eq!(setting_rows(&group), vec!["dynamic_range".to_owned()]);
+        group.fields.controls.push_str("\ndynamic_range=1");
+        assert!(setting_rows(&group).is_empty());
     }
 
     #[test]

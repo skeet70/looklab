@@ -1019,6 +1019,16 @@ async function requiredFields() {
     if (xm1) {
       const exposure = page.locator('.batch-editor input[data-key="exposure_compensation"]');
       check(await exposure.count() === 1, 'required-fields: X-M1 exposure compensation is a number input');
+      const savedExposure = await exposure.inputValue();
+      await exposure.fill('');
+      await exposure.blur();
+      await page.waitForFunction(
+        (expected) => document.querySelector('input[data-key="exposure_compensation"]')?.value === expected,
+        savedExposure,
+        { timeout: 30_000 },
+      );
+      check(await exposure.inputValue() === savedExposure, 'required-fields: clearing a read setting restores its value');
+      check(await gate.count() === 0, 'required-fields: clearing a read setting does not open the gate');
       await exposure.fill('');
       await exposure.pressSequentially('-0.333333');
       await exposure.blur();
@@ -1077,6 +1087,26 @@ async function requiredFields() {
       );
     }
     await page.screenshot({ path: `${options.out}/required-fields-restored-invalid.png`, fullPage: true });
+    const camera = page.getByRole('textbox', { name: 'Camera', exact: true });
+    await camera.fill('fujifilm/x-t5');
+    await camera.blur();
+    await page.locator('.notice').filter({ hasText: /Camera settings loaded|Camera found, but these files do not give its settings/ }).first().waitFor({ timeout: 120_000 });
+    await page.waitForTimeout(1000);
+    await page.reload();
+    await page.getByRole('heading', { name: /Check the groups/ }).waitFor({ timeout: 120_000 });
+    await page.getByRole('textbox', { name: 'Camera', exact: true }).waitFor({ timeout: 30_000 });
+    check(
+      await page.getByRole('textbox', { name: 'Camera', exact: true }).inputValue() === 'fujifilm/x-t5',
+      'required-fields: a hand-chosen camera survives restoration',
+    );
+    const restoredGate = page.locator('.required-fields');
+    if (await restoredGate.count()) {
+      check(
+        !(await restoredGate.innerText()).includes('settings did not load'),
+        'required-fields: a restored hand-chosen camera loads its schema',
+      );
+    }
+    await page.screenshot({ path: `${options.out}/required-fields-restored-camera.png`, fullPage: true });
     check(problems.length === 0, `required-fields: no page errors (${problems.join('; ')})`);
     return { gate: gateText, field: focused, choices: dynamicChoices };
   } catch (error) {
