@@ -12,7 +12,10 @@ mod serial;
 mod tiff;
 mod types;
 
-pub use attest::{PairingData, has_makernotes, pairing_data, software_matches_firmware};
+pub use attest::{
+    EditorApp, PairingData, Renderer, RendererEvidence, classify_renderer, has_makernotes,
+    pairing_data, software_matches_firmware,
+};
 pub use container::{parse, parse_jpeg, parse_raf, parse_tiff};
 pub use error::MetaError;
 pub use exif::{ExifData, ImageUniqueId, ParsedMetadata};

@@ -21,7 +21,6 @@ impl StorageKey {
     pub const SESSION: Self = Self("session");
     pub const PENDING_PROFILE: Self = Self("pending-profile");
     pub const DRAFT: Self = Self("contribution-draft");
-    pub const FIXTURE_CONSENT: Self = Self("fixture-consent");
 }
 
 /// # Errors
