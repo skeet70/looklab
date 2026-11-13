@@ -232,6 +232,34 @@ impl PrepWorker {
         self.send(function, bytes).await
     }
 
+    /// Solves one batch's proof of work. Its expected cost is proportional to the batch's
+    /// image count ([docs/05 §9](../../../docs/05-trust-and-integrity.md)), so the caller
+    /// bounds it by the send's remaining lifetime instead of the per-file limit.
+    ///
+    /// # Errors
+    /// Reports a trap, an error, a module built from different versions, or
+    /// [`WorkerFailure::Timeout`] when `deadline_ms` passes first.
+    pub async fn solve_pow(
+        &mut self,
+        bytes: Vec<u8>,
+        deadline_ms: i32,
+    ) -> Result<WorkerReply, WorkerFailure> {
+        if !self.verified {
+            self.check_version().await?;
+        }
+        match self
+            .link
+            .call(module_fn_id(ModuleFunction::SolvePow), &bytes, deadline_ms)
+            .await
+        {
+            Ok(reply) => {
+                self.memory = reply.memory;
+                Ok(reply)
+            }
+            Err(failure) => Err(self.stop(failure)),
+        }
+    }
+
     async fn check_version(&mut self) -> Result<(), WorkerFailure> {
         let request = version_request();
         let reply = match self

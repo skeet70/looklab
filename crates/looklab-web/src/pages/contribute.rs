@@ -3963,6 +3963,10 @@ struct SendOutcome {
     reload_required: bool,
 }
 
+const POW_EXPIRED: &str = "preparing them took longer than this send allows. Send again to finish; batches already sent are kept, and smaller sends finish sooner.";
+const POW_TRAPPED: &str =
+    "preparing them stopped with an error in this browser. Reload the page and send again.";
+
 async fn upload_send(
     session: crate::session::SessionContext,
     pending: Vec<PendingBatch>,
@@ -4010,6 +4014,8 @@ async fn upload_send(
         Ok(nonce) => nonce,
         Err(message) => return error(0, message),
     };
+    let nonce_expires_at_ms =
+        js_sys::Date::now() + nonce.expires_in_seconds.saturating_mul(1000) as f64;
     let mut worker = match PrepWorker::spawn() {
         Ok(worker) => worker,
         Err(message) => return error(0, message),
@@ -4094,11 +4100,15 @@ async fn upload_send(
             Ok(request) => request,
             Err(failure) => fail!(position, failure.to_string()),
         };
-        let pow_reply = match worker
-            .call(module_fn_id(ModuleFunction::SolvePow), pow_request)
-            .await
-        {
+        let remaining_ms = (nonce_expires_at_ms - js_sys::Date::now()).floor();
+        if remaining_ms <= 0.0 {
+            fail!(position, POW_EXPIRED.to_owned());
+        }
+        let deadline_ms = remaining_ms.min(f64::from(i32::MAX)) as i32;
+        let pow_reply = match worker.solve_pow(pow_request, deadline_ms).await {
             Ok(reply) => reply,
+            Err(crate::worker::WorkerFailure::Timeout) => fail!(position, POW_EXPIRED.to_owned()),
+            Err(crate::worker::WorkerFailure::Trap) => fail!(position, POW_TRAPPED.to_owned()),
             Err(failure) => fail!(position, failure.message()),
         };
         let pow = match decode_pow_reply(&pow_reply.bytes) {
