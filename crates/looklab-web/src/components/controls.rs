@@ -485,6 +485,9 @@ pub fn Stepper(
     current: RwSignal<StepIndex>,
     furthest: RwSignal<StepIndex>,
     #[prop(into, default = Signal::derive(|| true))] can_advance: Signal<bool>,
+    /// While this holds `Some(limit)`, steps after `limit` stay unreachable.
+    #[prop(into, default = Signal::derive(|| None))]
+    blocked_beyond: Signal<Option<usize>>,
     #[prop(into, default = Signal::derive(|| false))] locked: Signal<bool>,
     #[prop(into, default = Signal::derive(|| false))] finished: Signal<bool>,
     #[prop(into, default = Signal::derive(Vec::new))] summaries: Signal<Vec<Option<String>>>,
@@ -530,7 +533,11 @@ pub fn Stepper(
                                 type="button"
                                 class="step-link"
                                 aria-describedby=move || complete().then(|| described_by.clone())
-                                disabled=move || { locked.get() || index > furthest.get().0 }
+                                disabled=move || {
+                                    locked.get()
+                                        || index > furthest.get().0
+                                        || blocked_beyond.get().is_some_and(|limit| index > limit)
+                                }
                                 on:click=move |_| {
                                     if !locked.get_untracked() { current.set(StepIndex(index)); }
                                 }
@@ -564,7 +571,15 @@ pub fn Stepper(
                     >
                         "Back"
                     </button>
-                    <button type="button" disabled=move || { locked.get() || !can_advance.get() || count == 0 || (final_step.get() && on_finish.is_none()) }
+                    <button type="button" disabled=move || {
+                        locked.get()
+                            || !can_advance.get()
+                            || count == 0
+                            || (final_step.get() && on_finish.is_none())
+                            || blocked_beyond
+                                .get()
+                                .is_some_and(|limit| current.get().0.saturating_add(1) > limit)
+                    }
                         on:click=move |_| {
                             if locked.get_untracked() { return; }
                             let next = current.get_untracked().0.saturating_add(1);

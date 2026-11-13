@@ -7,9 +7,10 @@ a { color: var(--accent); text-underline-offset: .2em; }
 button, input, select, textarea { font: inherit; max-width: 100%; }
 button, .button, input, select, textarea { padding: .6rem .8rem; border-radius: .4rem; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
 button, .button { cursor: pointer; font-weight: 600; text-decoration: none; display: inline-block; }
-button:hover, .button:hover { background: var(--notice); }
-button:disabled { color: var(--muted); cursor: not-allowed; }
+button:hover:not(:disabled), .button:hover:not(:disabled) { background: var(--notice); }
+button:disabled { background: var(--notice); color: var(--muted); border-color: var(--line); cursor: not-allowed; }
 .button-primary { background: var(--accent); color: var(--accent-ink); }
+.button-primary:disabled { background: var(--notice); color: var(--muted); border-color: var(--line); }
 input[type=search], textarea { width: min(34rem, 100%); }
 label { display: block; font-weight: 600; margin-block: .8rem .3rem; }
 label:has(> input[type=checkbox]), label:has(> input[type=radio]) { display: flex; align-items: center; gap: .45rem; }
