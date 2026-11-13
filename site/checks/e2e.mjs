@@ -953,6 +953,34 @@ async function pages() {
     const { page } = session;
     if (session.authenticator) await session.authenticator.cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
     try {
+      const catalog = await (await page.request.get(`${options.origin}/data/index.json`)).json();
+      const cameras = catalog.bodies.filter(body => body.kind === 'camera');
+      const publishedLooks = catalog.looks.filter(look => (look.visibility === undefined || look.visibility === 'public') && look.versions.length > 0);
+      const firstLook = publishedLooks[0];
+      check(Boolean(firstLook), `${size}: the catalog publishes a look`);
+      const firstLookPattern = new RegExp(`^Simulated: ${firstLook.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`);
+      const expectedLabels = new Map();
+      const expectedKeys = new Map();
+      const sampleRequests = [];
+      for (const camera of cameras) {
+        const bodyPage = await (await page.request.get(`${options.origin}/data/bodies/${camera.id}.json`)).json();
+        const card = bodyPage.native_looks.find(look => look.sim_key !== look.look) ?? bodyPage.native_looks[0];
+        const label = publishedLooks.find(look => look.slug === card.look)?.name ?? card.look.split(/[-_.]/).filter(Boolean).join(' ');
+        expectedLabels.set(camera.id, label);
+        expectedKeys.set(camera.id, card.sim_key);
+        sampleRequests.push({
+          origin: 'pre_candidate',
+          subject: {
+            kind: 'body_realization',
+            realization: { body: camera.id, epoch: card.epoch, native_sim: card.sim_key },
+          },
+          capability: 'native_prediction',
+          kind: 'missing_independent_captures',
+          detail: `Add independent RAW captures with their in-camera JPEGs for ${camera.make} ${camera.model}.`,
+          observed_groups: 1,
+        });
+      }
+      await page.route('**/bounties.json', route => route.fulfill({ json: { bounties: [], evidence_requests: sampleRequests } }));
       await page.goto(`${options.origin}/help/passkeys`);
       await page.waitForSelector('h1');
       await page.screenshot({ path: `${options.out}/passkeys-${size}.png`, fullPage: true });
@@ -969,8 +997,30 @@ async function pages() {
         check(await page.locator('header.site-header').isVisible(), `${size}: ${route} has the shared shell`);
         check(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${size}: ${route} fits the viewport`);
       }
+      await page.goto(`${options.origin}/contribute/wanted`);
+      await page.getByRole('heading', { name: 'Where things stand', exact: true }).waitFor();
+      await page.getByText(sampleRequests[0].detail, { exact: false }).first().waitFor({ timeout: 120_000 });
+      for (const camera of cameras) {
+        const name = `${camera.make} ${camera.model}`;
+        const card = page.getByRole('article').filter({ has: page.getByRole('heading', { name, exact: true }) });
+        check(await card.count() === 1, `${size}: where things stand lists ${name}`);
+        const text = await card.textContent();
+        const label = expectedLabels.get(camera.id);
+        const key = expectedKeys.get(camera.id);
+        check(text.includes(`Add independent RAW captures with their in-camera JPEGs for ${name}.`), `${size}: where things stand names the open request for ${name}`);
+        check(text.includes(`${label}: `), `${size}: where things stand labels the request with the look name for ${name}`);
+        if (!label.includes(key)) check(!text.includes(key), `${size}: where things stand hides the raw setting key for ${name}`);
+        check(text.includes('1 independent group observed so far.'), `${size}: where things stand shows observed groups for ${name}`);
+      }
+      await page.screenshot({ path: `${options.out}/where-things-stand-${size}.png`, fullPage: true });
+      await page.unroute('**/bounties.json');
+      await page.route('**/bounties.json', route => route.fulfill({ json: { bounties: [], evidence_requests: [] } }));
+      await page.goto(`${options.origin}/contribute/wanted`);
+      await page.getByText('No open requests right now. You can still share photos you already have.', { exact: true }).waitFor();
+      check(await page.getByRole('heading', { name: 'Where things stand', exact: true }).isVisible(), `${size}: where things stand renders with no open requests`);
+      await page.unroute('**/bounties.json');
       await page.goto(`${options.origin}/looks`);
-      await page.getByRole('button', { name: /^Simulated: Sunlit Negative/ }).click();
+      await page.getByRole('button', { name: firstLookPattern }).click();
       await page.locator('main canvas').first().waitFor({ state: 'visible', timeout: 120_000 });
       check(await page.getByRole('slider', { name: 'Comparison divider' }).count() === 0, `${size}: a look opens as a single preview`);
       const overview = page.getByRole('tab', { name: 'Overview', exact: true });
@@ -984,7 +1034,7 @@ async function pages() {
       check(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${size}: look viewer fits the viewport`);
       await page.screenshot({ path: `${options.out}/look-viewer-${size}.png`, fullPage: true });
       const publishedVersion = await page.getByLabel('Published version').locator('option').first().getAttribute('value');
-      await page.goto(`${options.origin}/looks/sunlit-negative?version=99.0.0`);
+      await page.goto(`${options.origin}/looks/${firstLook.slug}?version=99.0.0`);
       await page.locator('main [role=alert]:visible').first().waitFor();
       check(await page.locator('main canvas:visible').evaluateAll(canvases => canvases.every(canvas => canvas.getContext('2d').getImageData(0, 0, 1, 1).data[3] === 0)), `${size}: an unavailable pinned version never shows the latest preview`);
       await page.getByRole('tab', { name: 'Measurements', exact: true }).click();
@@ -995,37 +1045,46 @@ async function pages() {
       check(new URL(page.url()).searchParams.get('version') === publishedVersion, `${size}: History version selection updates the shareable URL`);
       await page.getByRole('tab', { name: 'Overview', exact: true }).click();
       await page.locator('main canvas:visible').first().waitFor();
+      const publicLooks = catalog.looks.filter(look => look.visibility === undefined || look.visibility === 'public');
+      const builtInPublished = cameras.some(camera => camera.looks.some(slug => publishedLooks.some(look => look.slug === slug)));
       for (const theme of ['dark', 'light']) {
         await page.emulateMedia({ colorScheme: theme });
-        for (const [name, route] of [['home', '/'], ['looks', '/looks'], ['look', '/looks/sunlit-negative'], ['cameras', '/cameras'], ['camera', '/cameras/fujifilm/x-t5']]) {
+        for (const [name, route] of [['home', '/'], ['looks', '/looks'], ['look', `/looks/${firstLook.slug}`], ['cameras', '/cameras'], ['camera', '/cameras/fujifilm/x-t5']]) {
           await page.goto(`${options.origin}${route}`);
-          await page.locator('main canvas').first().waitFor({ state: 'visible', timeout: 120_000 });
-          for (let top = 0; top < await page.evaluate(() => document.documentElement.scrollHeight); top += viewport.height) {
-            await page.evaluate(top => window.scrollTo(0, top), top);
-            await page.waitForFunction(() => Array.from(document.querySelectorAll('main canvas')).filter(canvas => {
-              const box = canvas.getBoundingClientRect();
-              return box.width > 0 && box.height > 0 && box.bottom > 0 && box.top < innerHeight;
-            }).every(canvas => canvas.getContext('2d').getImageData(0, 0, 1, 1).data[3] === 255), null, { timeout: 120_000 });
+          await page.waitForSelector('h1');
+          const imageExpected = !((name === 'cameras' || name === 'camera') && !builtInPublished);
+          if (imageExpected) {
+            await page.locator('main canvas').first().waitFor({ state: 'visible', timeout: 120_000 });
+            for (let top = 0; top < await page.evaluate(() => document.documentElement.scrollHeight); top += viewport.height) {
+              await page.evaluate(top => window.scrollTo(0, top), top);
+              await page.waitForFunction(() => Array.from(document.querySelectorAll('main canvas')).filter(canvas => {
+                const box = canvas.getBoundingClientRect();
+                return box.width > 0 && box.height > 0 && box.bottom > 0 && box.top < innerHeight;
+              }).every(canvas => canvas.getContext('2d').getImageData(0, 0, 1, 1).data[3] === 255), null, { timeout: 120_000 });
+            }
           }
           check(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), `${size}: ${theme} ${name} fits the viewport after photos load`);
           if (name === 'home' || name === 'looks') {
             check(await page.getByRole('button', { name: /Synthetic Match Case/ }).count() === 0, `${size}: ${name} excludes test fixture looks`);
           }
-          const glance = await page.evaluate(() => {
-            const visible = element => {
-              const box = element.getBoundingClientRect();
-              return box.width > 0 && box.height > 0;
-            };
-            const top = selector => {
-              const element = Array.from(document.querySelectorAll(selector)).find(visible);
-              return element ? element.getBoundingClientRect().top + window.scrollY : null;
-            };
-            return { image: top('main canvas'), plot: top('main .plot'), table: top('main table') };
-          });
-          check(glance.image !== null, `${size}: ${theme} ${name} shows an image at the glance level`);
-          check(glance.plot === null || glance.plot > glance.image, `${size}: ${theme} ${name} keeps plots below the glance image`);
-          check(glance.table === null || glance.table > glance.image, `${size}: ${theme} ${name} keeps tables below the glance image`);
+          if (imageExpected) {
+            const glance = await page.evaluate(() => {
+              const visible = element => {
+                const box = element.getBoundingClientRect();
+                return box.width > 0 && box.height > 0;
+              };
+              const top = selector => {
+                const element = Array.from(document.querySelectorAll(selector)).find(visible);
+                return element ? element.getBoundingClientRect().top + window.scrollY : null;
+              };
+              return { image: top('main canvas'), plot: top('main .plot'), table: top('main table') };
+            });
+            check(glance.image !== null, `${size}: ${theme} ${name} shows an image at the glance level`);
+            check(glance.plot === null || glance.plot > glance.image, `${size}: ${theme} ${name} keeps plots below the glance image`);
+            check(glance.table === null || glance.table > glance.image, `${size}: ${theme} ${name} keeps tables below the glance image`);
+          }
           if (name === 'look' || name === 'camera') {
+            await page.getByRole('heading', { name: 'Recipes others use', exact: true }).waitFor({ state: 'visible', timeout: 120_000 });
             check(await page.getByRole('heading', { name: 'Recipes others use', exact: true }).isVisible(), `${size}: ${theme} ${name} shows the recipe leaderboard`);
           }
           if (name === 'home') {
@@ -1033,7 +1092,6 @@ async function pages() {
             check(await page.getByRole('group', { name: 'Image surround', exact: true }).count() === 0, `${size}: ${theme} home hides surround controls`);
             check(await page.getByRole('slider', { name: 'Comparison divider', exact: true }).count() === 1, `${size}: ${theme} home retains the split divider`);
             const index = await (await page.request.get(`${options.origin}/data/index.json`)).json();
-            const publicLooks = index.looks.filter(look => look.visibility === undefined || look.visibility === 'public');
             const baseline = index.reference_preview ? 'Neutral' : publicLooks[0].name;
             const initialLook = index.reference_preview ? publicLooks[0] : (publicLooks[1] ?? publicLooks[0]);
             const hero = page.getByRole('figure').filter({ has: page.getByRole('slider', { name: 'Comparison divider', exact: true }) });

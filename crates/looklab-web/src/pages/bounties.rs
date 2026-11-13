@@ -3,11 +3,13 @@
 use std::sync::Arc;
 
 use leptos::prelude::*;
-use looklab_publish::SiteIndex;
-use looklab_schema::{EvidenceRequestOrigin, EvidenceRequestWire, ModelSubject};
-use looklab_trust::Bounty;
+use looklab_model::file::Slug;
+use looklab_publish::{BodyKind, BodyPage, LookVisibility, SiteIndex};
+use looklab_schema::{BodyId, EvidenceRequestOrigin, EvidenceRequestWire, ModelSubject};
+use looklab_trust::{Bounty, BountyStatus};
+use wasm_bindgen::JsCast;
 
-use crate::data::{self, Load};
+use crate::data::{self, Load, WantedFile};
 use crate::ui;
 
 struct ExpectedVarianceReduction(f64);
@@ -54,8 +56,343 @@ struct WantedShots {
     bodies: Arc<Vec<looklab_publish::BodyPage>>,
 }
 
+/// One camera's published looks and the evidence still wanted for it.
+#[derive(Clone, Debug, PartialEq)]
+struct CameraStanding {
+    id: BodyId,
+    make: String,
+    model: String,
+    published: Vec<(Slug, String)>,
+    requests: Vec<EvidenceRequestWire>,
+    bounties: Vec<Bounty>,
+}
+
+fn published_looks(index: &SiteIndex, looks: &[Slug]) -> Vec<(Slug, String)> {
+    index
+        .looks
+        .iter()
+        .filter(|look| look.visibility == LookVisibility::Public)
+        .filter(|look| look.latest().is_some())
+        .filter(|look| looks.contains(&look.slug))
+        .map(|look| (look.slug.clone(), look.name.clone()))
+        .collect()
+}
+
+/// Each camera in the site index with its published looks and open requests.
+///
+/// A shared-family request or a bounty without a body applies to every camera
+/// whose built-in looks include that Look, because any of them can supply the
+/// missing photos.
+fn standings(index: &SiteIndex, wanted: Option<&WantedFile>) -> Vec<CameraStanding> {
+    let mut cameras = index
+        .bodies
+        .iter()
+        .filter(|body| body.kind == BodyKind::Camera)
+        .map(|body| CameraStanding {
+            id: body.id.clone(),
+            make: body.make.clone(),
+            model: body.model.clone(),
+            published: published_looks(index, &body.looks),
+            requests: Vec::new(),
+            bounties: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    cameras.sort_by(|left, right| {
+        left.make
+            .cmp(&right.make)
+            .then_with(|| left.model.cmp(&right.model))
+    });
+    let Some(wanted) = wanted else {
+        return cameras;
+    };
+    for camera in &mut cameras {
+        let Some(body) = index.bodies.iter().find(|body| body.id == camera.id) else {
+            continue;
+        };
+        for request in &wanted.evidence_requests {
+            let applies = match &request.subject {
+                ModelSubject::BodyRealization { realization } => realization.body == camera.id,
+                ModelSubject::SharedFamily { family } => body
+                    .looks
+                    .iter()
+                    .any(|look| look.as_str() == family.as_str()),
+            };
+            if applies {
+                camera.requests.push(request.clone());
+            }
+        }
+        for bounty in &wanted.bounties {
+            if bounty.status != BountyStatus::Open {
+                continue;
+            }
+            let applies = match &bounty.body {
+                Some(body) => body == &camera.id,
+                None => body
+                    .looks
+                    .iter()
+                    .any(|look| look.as_str() == bounty.look.as_str()),
+            };
+            if applies {
+                camera.bounties.push(bounty.clone());
+            }
+        }
+    }
+    cameras
+}
+
+/// The Look a request asks about, by its display name.
+///
+/// A camera-specific request resolves through its body page; the raw setting
+/// key is only a fallback when no published look names it.
+fn request_label(index: &SiteIndex, bodies: &[BodyPage], request: &EvidenceRequestWire) -> String {
+    if let Some(slug) = data::evidence_look(index, bodies, request) {
+        return index
+            .looks
+            .iter()
+            .find(|candidate| &candidate.slug == slug)
+            .map(|look| look.name.clone())
+            .unwrap_or_else(|| data::plain_id(slug.as_str()));
+    }
+    match &request.subject {
+        ModelSubject::BodyRealization { realization } => data::sim_name(&realization.native_sim),
+        ModelSubject::SharedFamily { family } => look_name(index, family.as_str()),
+    }
+}
+
+/// The groups seen so far, when the request publishes that count.
+fn observed_groups_line(groups: u32) -> String {
+    if groups == 1 {
+        "1 independent group observed so far.".to_owned()
+    } else {
+        format!("{groups} independent groups observed so far.")
+    }
+}
+
+fn capability_words(capability: looklab_schema::QualificationCapability) -> &'static str {
+    match capability {
+        looklab_schema::QualificationCapability::NativePrediction => "camera response",
+        looklab_schema::QualificationCapability::ControlsMatching => "settings and controls",
+        looklab_schema::QualificationCapability::CrossBodyAdmission => "cross-camera agreement",
+    }
+}
+
+fn look_name(index: &SiteIndex, look: &str) -> String {
+    index
+        .looks
+        .iter()
+        .find(|candidate| candidate.slug.as_str() == look)
+        .map(|candidate| candidate.name.clone())
+        .unwrap_or_else(|| data::plain_id(look))
+}
+
+/// The color and brightness a bounty asks for, in plain words.
+fn bounty_region(bounty: &Bounty) -> String {
+    let colors = [
+        "red",
+        "orange",
+        "yellow",
+        "yellow-green",
+        "green",
+        "turquoise",
+        "cyan",
+        "sky blue",
+        "blue",
+        "violet",
+        "magenta",
+        "pink",
+    ][usize::from(bounty.region.hue())];
+    let brightness = match bounty.region.exposure() {
+        0 | 1 => "deep shadows",
+        2 => "shadows",
+        3 => "midtones",
+        _ => "bright light",
+    };
+    format!("Photograph {colors} in {brightness}")
+}
+
+#[derive(Clone)]
+enum WantedLoad {
+    Loading,
+    /// The preview build has no API to ask.
+    Preview,
+    /// The API is configured but the request failed.
+    Failed,
+    Loaded(WantedFile),
+}
+
+#[derive(Clone)]
+struct Standings {
+    index: SiteIndex,
+    wanted: WantedLoad,
+    bodies: Vec<looklab_publish::BodyPage>,
+}
+
+/// Each camera's published looks and open requests, above the wanted-shot cards.
+#[component]
+fn WhereThingsStand(wanted: RwSignal<WantedLoad>) -> impl IntoView {
+    let state = RwSignal::new(Load::<Standings>::Loading);
+    Effect::new(move |_| {
+        let wanted = wanted.get();
+        let request_bodies = match &wanted {
+            WantedLoad::Loaded(wanted) => wanted
+                .evidence_requests
+                .iter()
+                .filter_map(|request| request.body().cloned())
+                .collect::<Vec<_>>(),
+            WantedLoad::Loading | WantedLoad::Preview | WantedLoad::Failed => Vec::new(),
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = async {
+                let index = data::index().await?;
+                let mut bodies = Vec::new();
+                for id in request_bodies {
+                    if bodies
+                        .iter()
+                        .any(|body: &looklab_publish::BodyPage| body.id == id)
+                    {
+                        continue;
+                    }
+                    let Some((make, model)) = id.as_str().split_once('/') else {
+                        continue;
+                    };
+                    if let Ok(Some(page)) = data::body_optional(make, model).await {
+                        bodies.push(page);
+                    }
+                }
+                Ok::<_, String>(Standings {
+                    index,
+                    wanted,
+                    bodies,
+                })
+            }
+            .await;
+            state.set(match result {
+                Ok(standings) => Load::Ready(standings),
+                Err(error) => Load::Failed(error),
+            });
+            ui::paint_browser().await;
+            // The section mounts after its data arrives, so the router cannot
+            // scroll to the fragment on its own.
+            if web_sys::window()
+                .and_then(|window| window.location().hash().ok())
+                .as_deref()
+                == Some("#where-things-stand")
+                && let Some(section) = document()
+                    .get_element_by_id("where-things-stand")
+                    .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok())
+            {
+                section.scroll_into_view();
+            }
+        });
+    });
+    view! {
+        <section
+            class="where-things-stand"
+            id="where-things-stand"
+            aria-labelledby="where-things-stand-title"
+        >
+            <h2 id="where-things-stand-title">"Where things stand"</h2>
+            <p>
+                "Each camera on the site, the looks published for it, and the photos still being asked for. Counts show what people have shared, not how close a look is."
+            </p>
+            {move || match state.get() {
+                Load::Loading => ui::loading().into_any(),
+                Load::Failed(error) => ui::failure(&error).into_any(),
+                Load::Ready(Standings { index, wanted, bodies }) => {
+                    let loaded = match &wanted {
+                        WantedLoad::Loaded(wanted) => Some(wanted),
+                        WantedLoad::Loading | WantedLoad::Preview | WantedLoad::Failed => None,
+                    };
+                    let cameras = standings(&index, loaded);
+                    let any_open = cameras
+                        .iter()
+                        .any(|camera| !camera.requests.is_empty() || !camera.bounties.is_empty());
+                    let cards = cameras.into_iter().map(|camera| {
+                        let name = format!("{} {}", camera.make, camera.model);
+                        let published = if camera.published.is_empty() {
+                            view! { <p class="muted">"No built-in looks published yet."</p> }.into_any()
+                        } else {
+                            let count = camera.published.len();
+                            let links = camera.published.iter().enumerate().map(|(position, (slug, look))| view! {
+                                {(position > 0).then_some(view! { ", " })}
+                                <a href=crate::base::site_url(&format!("/looks/{slug}"))>{look.clone()}</a>
+                            }).collect_view();
+                            view! {
+                                <p class="muted">
+                                    {format!("{count} built-in {} published: ", if count == 1 { "look" } else { "looks" })}
+                                    {links}
+                                </p>
+                            }.into_any()
+                        };
+                        let requests = camera.requests.iter().map(|request| {
+                            let label = request_label(&index, &bodies, request);
+                            let observed = request.observed_groups.map(|groups| view! {
+                                <span class="muted">" " {observed_groups_line(groups)}</span>
+                            });
+                            view! {
+                                <li>
+                                    <strong>{label}</strong>
+                                    ": "
+                                    {request.detail.clone()}
+                                    {observed}
+                                </li>
+                            }
+                        }).collect_view();
+                        let bounties = camera.bounties.iter().map(|bounty| view! {
+                            <li>
+                                {format!("{} for {}.", bounty_region(bounty), look_name(&index, bounty.look.as_str()))}
+                            </li>
+                        }).collect_view();
+                        view! {
+                            <article class="stand-card">
+                                <h3>
+                                    <a href=crate::base::site_url(&format!("/cameras/{}", camera.id))>{name}</a>
+                                </h3>
+                                {published}
+                                {(!camera.requests.is_empty() || !camera.bounties.is_empty()).then(|| view! {
+                                    <ul class="stand-requests">{requests}{bounties}</ul>
+                                })}
+                            </article>
+                        }
+                    }).collect_view();
+                    let empty = match &wanted {
+                        WantedLoad::Loading => None,
+                        WantedLoad::Preview => {
+                            Some("Open requests are not available in this demo.")
+                        }
+                        WantedLoad::Failed => {
+                            Some("Open requests could not be loaded right now.")
+                        }
+                        WantedLoad::Loaded(_) if !any_open => Some(
+                            "No open requests right now. You can still share photos you already have.",
+                        ),
+                        WantedLoad::Loaded(_) => None,
+                    };
+                    view! {
+                        {empty.map(|line| view! { <p class="muted" role="status">{line}</p> })}
+                        <div class="stand-grid">{cards}</div>
+                    }.into_any()
+                }
+            }}
+        </section>
+    }
+}
+
 #[component]
 pub fn BountiesPage() -> impl IntoView {
+    let wanted = RwSignal::new(WantedLoad::Loading);
+    Effect::new(move |_| {
+        if !crate::base::server_available() {
+            wanted.set(WantedLoad::Preview);
+            return;
+        }
+        wasm_bindgen_futures::spawn_local(async move {
+            wanted.set(match data::wanted().await {
+                Ok(wanted) => WantedLoad::Loaded(wanted),
+                Err(_) => WantedLoad::Failed,
+            });
+        });
+    });
     view! {
         <header class="wanted-intro">
             <p class="eyebrow">"A few photos, a useful difference"</p>
@@ -63,7 +400,13 @@ pub fn BountiesPage() -> impl IntoView {
             <p>"Help fill gaps in a look by sharing a few RAW+JPEG pairs. Find a request for your camera, then look for those colors around you."</p>
             <a href=crate::base::site_url("/contribute")>"Share your shots →"</a>
         </header>
-        <WantedCards/>
+        <WhereThingsStand wanted/>
+        {move || match wanted.get() {
+            WantedLoad::Loading => ui::loading().into_any(),
+            WantedLoad::Preview => ui::preview_notice().into_any(),
+            WantedLoad::Failed => ui::failure("Wanted shots could not be loaded right now.").into_any(),
+            WantedLoad::Loaded(loaded) => view! { <WantedCards preloaded=loaded/> }.into_any(),
+        }}
     }
 }
 
@@ -71,6 +414,7 @@ pub fn BountiesPage() -> impl IntoView {
 pub(super) fn WantedCards(
     #[prop(default = usize::MAX)] limit: usize,
     #[prop(default = true)] show_actions: bool,
+    #[prop(optional)] preloaded: Option<WantedFile>,
 ) -> impl IntoView {
     let state = RwSignal::new(Load::<WantedShots>::Loading);
     let available = crate::base::server_available();
@@ -78,9 +422,13 @@ pub(super) fn WantedCards(
         if !available {
             return;
         }
+        let preloaded = preloaded.clone();
         leptos::task::spawn_local_scoped_with_cancellation(async move {
             let result = async {
-                let wanted = data::wanted().await?;
+                let wanted = match preloaded {
+                    Some(wanted) => wanted,
+                    None => data::wanted().await?,
+                };
                 let mut bounties = wanted.bounties;
                 bounties.sort_by(|left, right| {
                     right
@@ -239,33 +587,36 @@ fn EvidenceRequestCard(
                 .unwrap_or_else(|| "the requested camera".to_owned())
         })
         .unwrap_or_else(|| "any supported camera".to_owned());
-    let look = match &request.subject {
-        ModelSubject::SharedFamily { family } => index
-            .looks
-            .iter()
-            .find(|look| look.slug.as_str() == family.as_str())
-            .map(|look| look.name.clone())
-            .unwrap_or_else(|| "the requested look".to_owned()),
-        ModelSubject::BodyRealization { .. } => "its camera model".to_owned(),
-    };
-    let capability = match request.capability {
-        looklab_schema::QualificationCapability::NativePrediction => "camera response",
-        looklab_schema::QualificationCapability::ControlsMatching => "settings and controls",
-        looklab_schema::QualificationCapability::CrossBodyAdmission => "cross-camera agreement",
-    };
+    let look = request_label(&index, &bodies, &request);
+    let capability = capability_words(request.capability);
     let origin = origin(&index, &bodies, &request).label();
-    let context = match (request.epoch(), request.native_sim()) {
-        (Some(epoch), Some(sim)) => format!("Firmware epoch {} · {}", epoch.get(), sim.as_str()),
-        _ => String::new(),
-    };
+    let firmware = request
+        .body()
+        .zip(request.epoch())
+        .and_then(|(body, epoch)| {
+            bodies
+                .iter()
+                .find(|page| &page.id == body)
+                .and_then(|page| page.epochs.iter().find(|range| range.id == epoch.get()))
+        })
+        .map(|range| {
+            if range.firmware_from == range.firmware_to {
+                format!("Firmware {}", range.firmware_from)
+            } else {
+                format!("Firmware {} to {}", range.firmware_from, range.firmware_to)
+            }
+        });
+    let context = firmware
+        .map(|firmware| format!("{camera}. {firmware}"))
+        .unwrap_or(camera);
     view! {
         <article class="wanted-card">
             <p class="help-meta">"5 to 10 minutes · " {origin}</p>
             <h2>{format!("Help measure {capability} for {look}")}</h2>
-            <p>{format!("{camera}. {context}")}</p>
+            <p>{context}</p>
             <p>{request.detail.clone()}</p>
             {request.observed_groups.map(|groups| view! {
-                <p class="muted">{format!("{groups} independent groups observed so far.")}</p>
+                <p class="muted">{observed_groups_line(groups)}</p>
             })}
             {show_action.then(|| view! {
                 <a href=crate::base::site_url("/contribute")>"Add your photos →"</a>
@@ -305,30 +656,11 @@ fn WantedCard(bounty: Bounty, index: Arc<SiteIndex>, show_action: bool) -> impl 
         .map(Impact::from_reduction)
         .map(Impact::label)
         .unwrap_or("Impact not estimated");
-    let colors = [
-        "red",
-        "orange",
-        "yellow",
-        "yellow-green",
-        "green",
-        "turquoise",
-        "cyan",
-        "sky blue",
-        "blue",
-        "violet",
-        "magenta",
-        "pink",
-    ][usize::from(bounty.region.hue())];
-    let brightness = match bounty.region.exposure() {
-        0 | 1 => "deep shadows",
-        2 => "shadows",
-        3 => "midtones",
-        _ => "bright light",
-    };
+    let region = bounty_region(&bounty);
     view! {
         <article class="wanted-card">
             <p class="help-meta">"5 to 10 minutes · " {impact}</p>
-            <h2>{format!("Photograph {colors} in {brightness}")}</h2>
+            <h2>{region}</h2>
             <p>{format!("Helps {look} on {camera}.")}</p>
             <p>"Capture tip: shoot RAW+JPEG at your lowest native ISO. Keep the subject still and turn off lens corrections where possible."</p>
             {show_action.then(|| view! {
@@ -515,6 +847,218 @@ mod tests {
         assert_eq!(
             origin(&index_for(&look, false), bodies, &request),
             WantedOrigin::BeforePublication
+        );
+    }
+
+    fn look_summary(
+        slug: &str,
+        name: &str,
+        published: bool,
+        visibility: LookVisibility,
+    ) -> LookSummary {
+        LookSummary {
+            slug: Slug::new(slug).expect("slug"),
+            name: name.to_owned(),
+            kind: LookKind::NativeFamily,
+            wb_policy: WbPolicy::Adaptive,
+            visibility,
+            head: None,
+            selected: None,
+            versions: if published {
+                vec![version_summary()]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn body_summary(id: &str, kind: BodyKind, looks: &[&str]) -> looklab_publish::BodySummary {
+        let id = BodyId::new(id).expect("body id");
+        looklab_publish::BodySummary {
+            make: id.make().to_owned(),
+            model: id.model().to_owned(),
+            id,
+            kind,
+            status: looklab_publish::BodyStatus::Active,
+            mapping_status: looklab_publish::MappingStatus::Provisional,
+            preparation: looklab_publish::PreparationPage::default(),
+            epochs: 1,
+            looks: looks
+                .iter()
+                .map(|slug| Slug::new(*slug).expect("slug"))
+                .collect(),
+        }
+    }
+
+    fn index_with(bodies: Vec<looklab_publish::BodySummary>, looks: Vec<LookSummary>) -> SiteIndex {
+        SiteIndex {
+            format: looklab_publish::SITE_FORMAT.to_owned(),
+            community_snapshot_version: 0,
+            bodies,
+            manuals: Vec::new(),
+            interfaces: Vec::new(),
+            input_transforms: Vec::new(),
+            looks,
+            scenes: Vec::new(),
+            reports: Vec::new(),
+            eligibility: Vec::new(),
+            current: Vec::new(),
+            bundles: Vec::new(),
+            reference_preview: None,
+        }
+    }
+
+    fn body_request(body: &str, sim: &str, observed: Option<u32>) -> EvidenceRequestWire {
+        EvidenceRequestWire {
+            origin: EvidenceRequestOrigin::PreCandidate,
+            subject: ModelSubject::BodyRealization {
+                realization: looklab_schema::BodyRealizationId {
+                    body: BodyId::new(body).expect("body"),
+                    epoch: looklab_schema::ControlEpochId::new(1),
+                    native_sim: looklab_schema::SimKey::new(sim).expect("sim"),
+                },
+            },
+            capability: QualificationCapability::NativePrediction,
+            kind: EvidenceRequestKind::MissingIndependentCaptures,
+            detail: "Add independent RAW captures with their in-camera JPEGs.".to_owned(),
+            observed_groups: observed,
+        }
+    }
+
+    fn bounty(body: Option<&str>, look: &str, status: BountyStatus) -> Bounty {
+        Bounty {
+            look: looklab_upload::LookSlug::new(look).expect("look"),
+            look_version: looklab_trust::VersionId::new(1),
+            body: body.map(|body| BodyId::new(body).expect("body")),
+            region: looklab_trust::Region::new(2, 1).expect("region"),
+            output: None,
+            expected_variance_reduction: 0.2,
+            reason: looklab_trust::BountyReason::UnverifiedRegion { sigma: 0.2 },
+            status,
+        }
+    }
+
+    #[test]
+    fn each_camera_lists_published_looks_and_open_requests() {
+        let index = index_with(
+            vec![
+                body_summary("fujifilm/x-t5", BodyKind::Camera, &["provia", "velvia"]),
+                body_summary("sony/a7", BodyKind::Camera, &["provia"]),
+                body_summary("acme/editor", BodyKind::Software, &["provia"]),
+            ],
+            vec![
+                look_summary("provia", "PROVIA / Standard", true, LookVisibility::Public),
+                look_summary("velvia", "Velvia / Vivid", false, LookVisibility::Public),
+                look_summary("fixture", "Fixture", true, LookVisibility::TestFixture),
+            ],
+        );
+        let wanted = WantedFile {
+            bounties: vec![
+                bounty(Some("sony/a7"), "provia", BountyStatus::Open),
+                bounty(None, "provia", BountyStatus::Resolved),
+            ],
+            evidence_requests: vec![body_request("fujifilm/x-t5", "provia", Some(2)), request()],
+        };
+        let stands = standings(&index, Some(&wanted));
+        assert_eq!(stands.len(), 2);
+        let fuji = &stands[0];
+        assert_eq!(fuji.make, "fujifilm");
+        assert_eq!(fuji.published.len(), 1);
+        assert_eq!(fuji.published[0].0.as_str(), "provia");
+        assert_eq!(fuji.published[0].1, "PROVIA / Standard");
+        assert_eq!(fuji.requests.len(), 2);
+        assert_eq!(fuji.requests[0].observed_groups, Some(2));
+        assert!(fuji.bounties.is_empty());
+        let sony = &stands[1];
+        assert_eq!(sony.published.len(), 1);
+        assert_eq!(sony.requests.len(), 1);
+        assert_eq!(sony.requests[0].observed_groups, Some(1));
+        assert_eq!(sony.bounties.len(), 1);
+        assert_eq!(sony.bounties[0].status, BountyStatus::Open);
+    }
+
+    #[test]
+    fn a_camera_without_open_requests_still_lists_its_looks() {
+        let index = index_with(
+            vec![body_summary("fujifilm/x-t5", BodyKind::Camera, &["provia"])],
+            vec![look_summary(
+                "provia",
+                "PROVIA / Standard",
+                true,
+                LookVisibility::Public,
+            )],
+        );
+        let wanted = WantedFile {
+            bounties: Vec::new(),
+            evidence_requests: Vec::new(),
+        };
+        let stands = standings(&index, Some(&wanted));
+        assert_eq!(stands.len(), 1);
+        assert_eq!(stands[0].published.len(), 1);
+        assert!(stands[0].requests.is_empty());
+        assert!(stands[0].bounties.is_empty());
+    }
+
+    #[test]
+    fn a_request_without_an_observed_count_keeps_the_request_text() {
+        let index = index_with(
+            vec![body_summary("fujifilm/x-t5", BodyKind::Camera, &["provia"])],
+            Vec::new(),
+        );
+        let wanted = WantedFile {
+            bounties: Vec::new(),
+            evidence_requests: vec![body_request("fujifilm/x-t5", "provia", None)],
+        };
+        let stands = standings(&index, Some(&wanted));
+        assert_eq!(stands[0].requests.len(), 1);
+        assert_eq!(stands[0].requests[0].observed_groups, None);
+        assert!(
+            stands[0].requests[0]
+                .observed_groups
+                .map(observed_groups_line)
+                .is_none()
+        );
+        assert_eq!(
+            stands[0].requests[0].detail,
+            "Add independent RAW captures with their in-camera JPEGs."
+        );
+    }
+
+    #[test]
+    fn a_bounty_without_a_body_reaches_cameras_with_that_look() {
+        let index = index_with(
+            vec![
+                body_summary("fujifilm/x-t5", BodyKind::Camera, &["provia"]),
+                body_summary("fujifilm/x-s10", BodyKind::Camera, &["provia"]),
+                body_summary("fujifilm/x-e3", BodyKind::Camera, &["velvia"]),
+            ],
+            Vec::new(),
+        );
+        let wanted = WantedFile {
+            bounties: vec![bounty(None, "provia", BountyStatus::Open)],
+            evidence_requests: Vec::new(),
+        };
+        let stands = standings(&index, Some(&wanted));
+        let with_bounty = stands
+            .iter()
+            .filter(|camera| camera.bounties.len() == 1)
+            .map(|camera| camera.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(with_bounty, ["fujifilm/x-s10", "fujifilm/x-t5"]);
+    }
+
+    #[test]
+    fn a_realization_request_labels_its_look_by_display_name() {
+        let page = body_page();
+        let request = realization_request(&page);
+        let look = page.native_looks[0].look.as_str().to_owned();
+        assert_eq!(
+            request_label(
+                &index_for(&look, true),
+                std::slice::from_ref(&page),
+                &request
+            ),
+            "Look"
         );
     }
 }
