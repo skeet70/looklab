@@ -653,12 +653,13 @@ async function contribute(size) {
         has: page.locator('.batch-choice-title', { hasText: /^Batch \d+: \d+ photos?, Provia$/ }),
       });
       check(await colourBatches.count() === 2, `${size}: matching camera, firmware and sim with different settings form separate groups`);
-      const highlightSteps = [];
+      const highlightValues = [];
       for (const batch of await colourBatches.all()) {
         await batch.click();
-        highlightSteps.push(await page.getByRole('spinbutton', { name: /^highlight tone$/i }).inputValue());
+        highlightValues.push(await page.getByRole('spinbutton', { name: /^highlight tone$/i }).inputValue());
       }
-      check(highlightSteps.includes('0') && highlightSteps.includes('-2'), `${size}: each group retains its own recorded highlight setting`);
+      // The input shows the menu value; the recorded step -2 is -1.0 at step 0.5.
+      check(highlightValues.includes('0') && highlightValues.includes('-1'), `${size}: each group retains its own recorded highlight setting`);
     }
     await page.locator('.batch-choice').filter({
       has: page.locator('.batch-choice-title', { hasText: new RegExp(`^Batch \\d+: \\d+ photos?, ${allBw ? 'Acros' : 'Provia'}$`) }),
