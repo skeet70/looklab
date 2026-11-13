@@ -949,12 +949,14 @@ async function requiredFields() {
     }
     const shiftRed = page.locator('.unmapped-controls input[data-key="wb_shift_r"]');
     if (await shiftRed.count()) {
-      check(await shiftRed.inputValue() === '0', 'required-fields: WB shift R starts at 0');
+      check(await shiftRed.inputValue() === '', 'required-fields: WB shift R starts empty');
+      check(await shiftRed.getAttribute('placeholder') === '0', 'required-fields: WB shift R shows 0 as a placeholder');
       check(await shiftRed.getAttribute('min') === '-9' && await shiftRed.getAttribute('max') === '9', 'required-fields: WB shift R is bounded -9..9');
     }
     const shiftBlue = page.locator('.unmapped-controls input[data-key="wb_shift_b"]');
     if (await shiftBlue.count()) {
-      check(await shiftBlue.inputValue() === '0', 'required-fields: WB shift B starts at 0');
+      check(await shiftBlue.inputValue() === '', 'required-fields: WB shift B starts empty');
+      check(await shiftBlue.getAttribute('placeholder') === '0', 'required-fields: WB shift B shows 0 as a placeholder');
       check(await shiftBlue.getAttribute('min') === '-9' && await shiftBlue.getAttribute('max') === '9', 'required-fields: WB shift B is bounded -9..9');
     }
     await dynamicRange.evaluate((select) => { select.size = select.options.length; });

@@ -1003,19 +1003,21 @@ fn control_input(
                 looklab_schema::ControlDefault::Number(value) => rational_text(value),
                 _ => String::new(),
             };
+            let placeholder = default_value;
             let value_control = control.clone();
             let write_control = control;
             let read_key = key.clone();
             view! {
                 <label class="menu-setting">{label}
                     <input type="number" id=field_id data-key=data_key min=min max=max step=step_attr
+                        placeholder=placeholder
                         prop:value=move || {
                             batches.with(|set| {
                                 set.get(batch).and_then(|group| {
                                     control_step(&group.fields.controls, &read_key)
                                 })
                             }).map(|step| control_value_text(&value_control, step))
-                                .unwrap_or_else(|| default_value.clone())
+                                .unwrap_or_default()
                         }
                         on:input=move |event| {
                             if let Some(step) =
