@@ -385,6 +385,11 @@ in
           mkdir -p "${cfg.manualsDir}"
           cp -R --remove-destination "${hostPackages.looklab-manuals}/." "${cfg.manualsDir}/"
         fi
+        if [ -d ${hostPackages.looklab-data}/transforms ]; then
+          mkdir -p ${cfg.dataDir}/transforms
+          chmod u+w ${cfg.dataDir}/transforms
+          cp -R --update=none ${hostPackages.looklab-data}/transforms/. ${cfg.dataDir}/transforms/
+        fi
         ${
           optionalString (cfg.scenesDir != null) ''
             if [ ! -e ${cfg.dataDir}/scenes/index.json ]; then

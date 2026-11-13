@@ -42,9 +42,11 @@ The module writes `/etc/looklab/looklab.toml` from the options (`bind`, `origin`
 
 The worker receives `--snapshot-dir /var/lib/looklab/community`, the same root as the server's `snapshot_dir`. Schema publication starts from the full authoritative baseline, applies the approved proposal and publishes a new snapshot version; server intake refreshes its snapshot view without a restart. The proposal's publication transition and catalog-publication request commit in one transaction. Worker publication names that version in the site index and publishes body pages even when no Look fit succeeds. Interrupted publication resumes from its recorded version and content hash. A binary switch does not approve new camera mappings or replace the seeded body files.
 
-The seeded data tree is a copy, not a store link: add a camera transform by writing `${dataDir}/transforms/<make>-<model>.yaml` as the `looklab` user. A re-install of the module does not overwrite it, and `rm ${dataDir}/.seeded` re-seeds from the flake on the next start.
+The seeded data tree is a copy, not a store link: add a camera transform by writing `${dataDir}/transforms/<make>-<model>.yaml` as the `looklab` user, and `rm ${dataDir}/.seeded` re-seeds from the flake on the next start.
 
-The module refreshes `${manualsDir}` from `packages.<system>.looklab-manuals` on every seed-service start, including when `.seeded` exists. Packaged records replace same-named files; files that exist only on the host remain. The refresh does not touch `bodies`, `transforms` or `.seeded`.
+Every seed-service start also installs each packaged transform from `packages.<system>.looklab-data` that `${dataDir}/transforms` lacks, so a deploy that ships a new camera transform makes that camera preparable after the server's startup publication. A packaged transform never replaces a same-named host file: changing an installed transform remains an operator step.
+
+The module refreshes `${manualsDir}` from `packages.<system>.looklab-manuals` on every seed-service start, including when `.seeded` exists. Packaged records replace same-named files; files that exist only on the host remain. The refresh does not touch `bodies` or `.seeded`.
 
 Photographic preview scenes are prepared offline; the worker never fetches sources or decodes RAW. `packages.<system>.looklab-scenes` builds the directory: it fetches the six `scene-*.dng` fixtures named in `fixtures/manifest.toml` as fixed-output derivations (URL and SHA-256 from the manifest) and runs the packaged `prepare_scenes` over them. `services.looklab.scenesDir` defaults to that package, so a host publishes the photo scenes without a manual step.
 

@@ -106,11 +106,19 @@ pkgs.testers.runNixOSTest {
     host_record = "/var/lib/looklab/data/manuals/operator-note.txt"
     machine.succeed(f"install -o looklab -g looklab -m 0400 /dev/null {host_record}")
     machine.succeed(f"rm {manual}")
+    packaged_transform = "/var/lib/looklab/data/transforms/fujifilm-x-m1.yaml"
+    packaged_transform_hash = machine.succeed(f"sha256sum {packaged_transform}").split()[0]
+    machine.succeed(f"rm {packaged_transform}")
+    host_transform = "/var/lib/looklab/data/transforms/fujifilm-x-t4.yaml"
+    machine.succeed(f"echo '# operator edit' >> {host_transform}")
+    host_transform_hash = machine.succeed(f"sha256sum {host_transform}").split()[0]
     for _ in range(2):
         machine.succeed("systemctl restart looklab-seed-data.service")
         assert manual_hash == machine.succeed(f"sha256sum {manual}").split()[0]
         assert "400" == machine.succeed(f"stat -c %a {host_record}").strip()
         assert body_hash == machine.succeed(f"sha256sum {body}").split()[0]
+        assert packaged_transform_hash == machine.succeed(f"sha256sum {packaged_transform}").split()[0]
+        assert host_transform_hash == machine.succeed(f"sha256sum {host_transform}").split()[0]
 
     machine.succeed("install -o looklab -g looklab -m 0600 /dev/null /var/lib/looklab/state-marker")
     secret = machine.succeed("sha256sum /var/lib/looklab/server-secret").split()[0]
