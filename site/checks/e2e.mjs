@@ -35,6 +35,7 @@ const USAGE = `usage: node site/checks/e2e.mjs [options]
   --expected FILE              canonical permalink to compare against
   --status TOKEN               status token for the /status screenshot
   --permalink BASE64URL        pinned match result for the pages flow
+  --wanted FILE                bounties.json payload for the pages flow
 
 needs the fixed-generation launcher and Playwright from nix:
 
@@ -70,6 +71,7 @@ const options = {
   expected: 'target-ui/dist/data/looks/synthetic-match/1.0.0/match.permalink',
   status: '',
   permalink: '',
+  wanted: '',
   'fail-draft-blobs': false,
   'bw-all': false,
 };
@@ -1279,8 +1281,6 @@ async function pages() {
       const firstLook = publishedLooks[0];
       check(Boolean(firstLook), `${size}: the catalog publishes a look`);
       const firstLookPattern = new RegExp(`^Simulated: ${firstLook.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`);
-      const expectedLabels = new Map();
-      const expectedKeys = new Map();
       const menuNames = {
         provia: 'PROVIA / Standard', velvia: 'Velvia / Vivid', astia: 'ASTIA / Soft',
         classic_chrome: 'Classic Chrome', classic_negative: 'Classic Negative',
@@ -1290,13 +1290,15 @@ async function pages() {
         monochrome: 'Monochrome', monochrome_ye: 'Monochrome + Ye Filter',
         monochrome_r: 'Monochrome + R Filter', monochrome_g: 'Monochrome + G Filter', sepia: 'Sepia',
       };
+      const productionWanted = options.wanted ? JSON.parse(await readFile(options.wanted, 'utf8')) : null;
+      const bodyPages = new Map();
       const sampleRequests = [];
+      const sampledLooks = new Set();
       for (const camera of cameras) {
         const bodyPage = await (await page.request.get(`${options.origin}/data/bodies/${camera.id}.json`)).json();
+        bodyPages.set(camera.id, bodyPage);
         const card = bodyPage.native_looks.find(look => look.sim_key !== look.look) ?? bodyPage.native_looks[0];
-        const label = publishedLooks.find(look => look.slug === card.look)?.name ?? menuNames[card.sim_key] ?? card.sim_key.replace(/_/g, ' ');
-        expectedLabels.set(camera.id, label);
-        expectedKeys.set(camera.id, card.sim_key);
+        sampledLooks.add(card.look);
         sampleRequests.push({
           origin: 'pre_candidate',
           subject: {
@@ -1309,15 +1311,17 @@ async function pages() {
           observed_groups: 1,
         });
       }
+      const familyLook = publishedLooks.find(look => !sampledLooks.has(look.slug)) ?? publishedLooks[0];
       sampleRequests.push({
         origin: 'pre_candidate',
-        subject: { kind: 'shared_family', family: 'classic-chrome' },
+        subject: { kind: 'shared_family', family: familyLook.slug },
         capability: 'native_prediction',
         kind: 'missing_independent_captures',
         detail: 'Family-wide independent captures are needed.',
         observed_groups: 2,
       });
-      await page.route('**/bounties.json', route => route.fulfill({ json: { bounties: [], evidence_requests: sampleRequests } }));
+      const wanted = productionWanted ?? { bounties: [], evidence_requests: sampleRequests };
+      await page.route('**/bounties.json', route => route.fulfill({ json: wanted }));
       await page.goto(`${options.origin}/help/passkeys`);
       await page.waitForSelector('h1');
       await page.screenshot({ path: `${options.out}/passkeys-${size}.png`, fullPage: true });
@@ -1336,26 +1340,100 @@ async function pages() {
       }
       await page.goto(`${options.origin}/contribute/wanted`);
       await page.getByRole('heading', { name: 'Where things stand', exact: true }).waitFor();
-      await page.locator('#where-things-stand').getByText(sampleRequests[0].detail, { exact: false }).first().waitFor({ timeout: 120_000 });
+      await page.locator('#where-things-stand .stand-card').first().waitFor({ timeout: 120_000 });
+      const lookOf = request => {
+        if (request.subject.kind === 'shared_family') return request.subject.family;
+        const realization = request.subject.realization;
+        const pageBody = bodyPages.get(realization.body);
+        return pageBody?.native_looks.find(card => card.epoch === realization.epoch && card.sim_key === realization.native_sim)?.look;
+      };
+      const labelFor = request => {
+        const look = lookOf(request);
+        if (request.subject.kind === 'shared_family') {
+          const slug = request.subject.family;
+          return catalog.looks.find(candidate => candidate.slug === slug)?.name
+            ?? menuNames[slug] ?? menuNames[slug.replaceAll('-', '_')] ?? slug.replaceAll('-', ' ');
+        }
+        const sim = request.subject.realization.native_sim;
+        return catalog.looks.find(candidate => candidate.slug === look)?.name
+          ?? menuNames[sim] ?? sim.replaceAll('_', ' ');
+      };
+      const cameraName = id => {
+        const camera = cameras.find(camera => camera.id === id);
+        return camera ? `${camera.make} ${camera.model}` : id;
+      };
+      const observedLine = groups => groups === 1 ? '1 independent group observed so far.' : `${groups} independent groups observed so far.`;
+      const needKeyOf = request => {
+        const origin = request.origin === 'report' ? `report:${request.report}` : request.origin;
+        return `${lookOf(request)}\u0000${request.capability}\u0000${request.kind}\u0000${origin}`;
+      };
+      const needs = new Map();
+      for (const request of wanted.evidence_requests) {
+        const look = lookOf(request);
+        check(Boolean(look), `${size}: every wanted request resolves its look`);
+        const key = needKeyOf(request);
+        const entry = needs.get(key) ?? { look, label: labelFor(request), anyCamera: false, cameras: new Set(), detail: request.detail, observed: request.observed_groups };
+        if (request.subject.kind === 'shared_family') {
+          entry.anyCamera = true;
+          entry.label = labelFor(request);
+          entry.detail = request.detail;
+          entry.observed = request.observed_groups;
+        } else {
+          entry.cameras.add(request.subject.realization.body);
+        }
+        needs.set(key, entry);
+      }
+      const familyNeeds = [...needs.values()].filter(need => need.anyCamera || need.cameras.size !== 1);
+      const needsFor = camera => [...needs.values()].filter(need => !need.anyCamera && need.cameras.size === 1 && need.cameras.has(camera.id));
+      const standText = await page.locator('#where-things-stand').textContent();
       for (const camera of cameras) {
         const name = `${camera.make} ${camera.model}`;
         const card = page.getByRole('article').filter({ has: page.getByRole('heading', { name, exact: true }) });
         check(await card.count() === 1, `${size}: where things stand lists ${name}`);
         const text = await card.textContent();
-        const label = expectedLabels.get(camera.id);
-        const key = expectedKeys.get(camera.id);
-        check(text.includes(`Add independent RAW captures with their in-camera JPEGs for ${name}.`), `${size}: where things stand names the open request for ${name}`);
-        check(text.includes(`${label}: `), `${size}: where things stand labels the request with the look name for ${name}`);
-        if (!label.includes(key)) check(!text.includes(key), `${size}: where things stand hides the raw setting key for ${name}`);
-        check(text.includes('1 independent group observed so far.'), `${size}: where things stand shows observed groups for ${name}`);
+        for (const need of needsFor(camera)) {
+          check(text.includes(`${need.label}: `), `${size}: where things stand labels the request with the look name for ${name}`);
+          check(text.includes(need.detail), `${size}: where things stand names the open request for ${name}`);
+          if (need.observed !== undefined) check(text.includes(observedLine(need.observed)), `${size}: where things stand shows observed groups for ${name}`);
+        }
       }
       const family = page.locator('#where-things-stand .stand-family');
-      check(await family.count() === 1, `${size}: family requests are grouped once`);
-      const familyText = await family.textContent();
-      check(familyText.includes('Family-wide independent captures are needed.'), `${size}: family block names the family request`);
-      check(familyText.includes('Classic Chrome'), `${size}: family block names the look`);
-      const cameraTexts = await page.locator('#where-things-stand .stand-card').allTextContents();
-      check(!cameraTexts.some(text => text.includes('Family-wide independent captures are needed.')), `${size}: family requests are not repeated under cameras`);
+      check(await family.count() === (familyNeeds.length > 0 ? 1 : 0), `${size}: family needs are grouped once`);
+      if (familyNeeds.length > 0) {
+        check(await family.locator('li').count() === familyNeeds.length, `${size}: where things stand shows one entry per look and need`);
+        const familyText = await family.textContent();
+        for (const need of familyNeeds) {
+          check(familyText.includes(need.label), `${size}: family block names ${need.label}`);
+          check(familyText.includes(need.detail), `${size}: family block names the request for ${need.label}`);
+          for (const id of need.cameras) check(familyText.includes(cameraName(id)), `${size}: family block names ${cameraName(id)}`);
+        }
+      }
+      for (const request of wanted.evidence_requests) {
+        if (request.subject.kind !== 'body_realization') continue;
+        const key = needKeyOf(request);
+        const need = needs.get(key);
+        const occurrences = standText.split(request.detail).length - 1;
+        const expected = need.anyCamera ? 0 : (request.detail === need.detail ? 1 : 0);
+        check(occurrences === expected, `${size}: where things stand shows a body request once, or not at all when merged`);
+        if (!productionWanted) {
+          const rawKey = request.subject.realization.native_sim;
+          if (!need.label.includes(rawKey)) check(!standText.includes(rawKey), `${size}: where things stand hides the raw setting key`);
+        }
+      }
+      const cards = page.locator('.wanted-grid .wanted-card');
+      const openBounties = wanted.bounties.filter(bounty => bounty.status === 'open').length;
+      check(await cards.count() === needs.size + openBounties, `${size}: wanted shots show one card per look and need`);
+      const headings = await cards.locator('h2').allTextContents();
+      check(new Set(headings).size === headings.length, `${size}: wanted cards do not repeat a look and need`);
+      for (const need of needs.values()) {
+        const heading = headings.find(heading => heading.includes(need.label));
+        check(Boolean(heading), `${size}: a wanted card names ${need.label}`);
+        const card = cards.filter({ has: page.getByRole('heading', { name: heading, exact: true }) });
+        const text = await card.textContent();
+        for (const id of need.cameras) check(text.includes(cameraName(id)), `${size}: the wanted card names ${cameraName(id)}`);
+        if (need.anyCamera) check(text.includes('any camera with this look'), `${size}: the wanted card names the family scope for ${need.label}`);
+      }
+      await page.screenshot({ path: `${options.out}/wanted-${size}.png`, fullPage: true });
       await page.screenshot({ path: `${options.out}/where-things-stand-${size}.png`, fullPage: true });
       await page.unroute('**/bounties.json');
       await page.route('**/bounties.json', route => route.fulfill({ json: { bounties: [], evidence_requests: [] } }));
