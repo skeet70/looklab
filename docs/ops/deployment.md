@@ -84,12 +84,12 @@ The worker claims jobs from one SQLite table. `--lane` splits the claim by job k
 
 | Lane | Job kinds |
 |---|---|
-| `publish` | `publish_site`, `blob_gc` (`hard_delete_blobs`), `honest_duplicate_merge` |
-| `fit` | `consistency_score`, `card_verification`, `nightly_refit`, `revert_refit`, `model_assessment`, `lut_rebase`, `lut_import`, `bounties` |
+| `publish` | `publish_site`, `blob_gc` (`hard_delete_blobs`) |
+| `fit` | `consistency_score`, `honest_duplicate_merge`, `card_verification`, `nightly_refit`, `revert_refit`, `model_assessment`, `lut_rebase`, `lut_import`, `bounties` |
 
 `--lane all` is the default and keeps the single-process behaviour, including unknown job kinds stored by a newer server. A lane filters candidates in SQL, keeps the queue order, and never reclaims another lane's expired lease. The `publish_site` single-writer guard is unchanged: one publisher writes the site tree at a time.
 
-The module runs `looklab-worker` with `--lane fit` and its refit memory limits, plus `looklab-publisher` from the same package with `--lane publish` and lower limits. Both use the same arguments, run after `looklab-seed-data`, and restart when the packaged data changes. `lut_import` and `lut_rebase` run `import_lut_look`, and `model_assessment` evaluates fitted probes under the fit options, so they stay in the fit lane. `bounties` loads every sample pool for a target and scores it, which is long numerical work, so it also stays in the fit lane. `card_verification` re-scores accepted card images without fitting, but it shares the fit lane with `consistency_score` and refit completion, which enqueue it with `enqueue_if_idle`; keeping it serial with its enqueuers means a run cannot miss a card accepted while it is queued. `honest_duplicate_merge` only rewrites duplicate links, so publication can run it immediately.
+The module runs `looklab-worker` with `--lane fit` and its refit memory limits, plus `looklab-publisher` from the same package with `--lane publish` and lower limits. Both use the same arguments, run after `looklab-seed-data`, and restart when the packaged data changes. `lut_import` and `lut_rebase` run `import_lut_look`, and `model_assessment` evaluates fitted probes under the fit options, so they stay in the fit lane. `bounties` loads every sample pool for a target and scores it, which is long numerical work, so it also stays in the fit lane. `card_verification` re-scores accepted card images without fitting, but it shares the fit lane with `consistency_score` and refit completion, which enqueue it with `enqueue_if_idle`; keeping it serial with its enqueuers means a run cannot miss a card accepted while it is queued. `honest_duplicate_merge` clears and rewrites duplicate links with separate statements, so it stays serial with the fits that read them.
 
 ## Hosts
 

@@ -128,8 +128,9 @@ impl JobKind {
             // fit lane with the code that enqueues it so a run cannot miss a
             // card accepted while it is queued.
             Self::CardVerification => Some(Lane::Fit),
-            // Merges duplicate images by capture tuple; no fit.
-            Self::HonestDuplicateMerge => Some(Lane::Publish),
+            // Rewrites duplicate links with separate statements, so it stays
+            // serial with the fits that read them.
+            Self::HonestDuplicateMerge => Some(Lane::Fit),
             // Runs the consistency fitter.
             Self::ConsistencyScore => Some(Lane::Fit),
             // Runs hierarchical refits.
@@ -754,7 +755,9 @@ mod tests {
         assert!(publish.contains(&"hard_delete_blobs"));
         assert!(fit.contains(&"bounties"));
         assert!(fit.contains(&"card_verification"));
+        assert!(fit.contains(&"honest_duplicate_merge"));
         assert!(!publish.contains(&"card_verification"));
+        assert!(!publish.contains(&"honest_duplicate_merge"));
         assert!(
             publish
                 .iter()
