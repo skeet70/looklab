@@ -203,6 +203,45 @@ async function fillControl(field, value = '0') {
   await input.blur();
 }
 
+/// A copy of the fixture JPEG whose EXIF `Software` tag names an editor.
+async function renderWithSoftware(name, software) {
+  const path = `${options.out}/${name}.jpg`;
+  const bytes = await readFile(options.jpeg);
+  let index = 2;
+  let tiffStart = -1;
+  while (index + 4 <= bytes.length) {
+    if (bytes[index] !== 0xff) break;
+    const marker = bytes[index + 1];
+    if (marker === 0xda || marker === 0xd9) break;
+    const length = bytes.readUInt16BE(index + 2);
+    if (marker === 0xe1 && bytes.toString('latin1', index + 4, index + 10) === 'Exif\0\0') {
+      tiffStart = index + 10;
+      break;
+    }
+    index += 2 + length;
+  }
+  if (tiffStart < 0) throw new Error('the fixture JPEG has no EXIF segment');
+  const patched = Buffer.from(bytes);
+  const little = patched.toString('latin1', tiffStart, tiffStart + 2) === 'II';
+  const u16 = (at) => (little ? patched.readUInt16LE(at) : patched.readUInt16BE(at));
+  const u32 = (at) => (little ? patched.readUInt32LE(at) : patched.readUInt32BE(at));
+  const ifd0 = tiffStart + u32(tiffStart + 4);
+  const count = u16(ifd0);
+  for (let entry = 0; entry < count; entry += 1) {
+    const at = ifd0 + 2 + entry * 12;
+    if (u16(at) !== 0x0131) continue;
+    const length = u32(at + 4);
+    const text = Buffer.from(`${software}\0`, 'latin1');
+    if (text.length > length) throw new Error('the fixture Software tag is too short');
+    const offset = tiffStart + u32(at + 8);
+    patched.fill(0, offset, offset + length);
+    text.copy(patched, offset);
+    await writeFile(path, patched);
+    return path;
+  }
+  throw new Error('the fixture JPEG has no Software tag');
+}
+
 async function addVirtualAuthenticator(page) {
   if (options.browser !== 'chromium') {
     await page.context().credentials.install();
@@ -556,6 +595,9 @@ async function contribute(size) {
     const acros = allBw ? null : await renderWithTag('render-acros', 0x1003, 0x0500);
     const acrosYellow = allBw ? null : await renderWithTag('render-acros-ye', 0x1003, 0x0502);
     const sepia = allBw ? null : await renderWithTag('render-sepia', 0x1003, 0x0310);
+    const editorExport = allBw
+      ? null
+      : await renderWithSoftware('render-lightroom', 'Adobe Lightroom 13.2');
     const dropped = allBw
       ? [options.raw, ...bwRenders]
       : [
@@ -565,6 +607,7 @@ async function contribute(size) {
           acros,
           acrosYellow,
           sepia,
+          editorExport,
           ...options.extra,
         ];
     summary.files = allBw
@@ -580,6 +623,11 @@ async function contribute(size) {
     await chooser.setFiles(dropped);
     await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).waitFor({ timeout: 120_000 });
     await capture('contribute-1-drop');
+    const dropSummary = (await page.locator('.drop-summary').textContent()).trim();
+    check(
+      /^\d+ files? on this device, [\d.]+ (KB|MB|GB)\. Nothing uploaded yet\.$/.test(dropSummary),
+      `${size}: the drop summary gives the file count, size and that nothing is uploaded (${JSON.stringify(dropSummary)})`,
+    );
     const stepItems = page.locator('.stepper .step-item');
     check(await stepItems.count() === 6, `${size}: the stepper lists six steps`);
     check(await stepItems.first().getAttribute('data-state') === 'complete', `${size}: the drop step is marked complete`);
@@ -677,7 +725,19 @@ async function contribute(size) {
       await page.getByRole('heading', { name: /Review what/ }).waitFor({ timeout: 900_000 });
       const withoutConsent = await page.locator('.payload-summary').textContent();
       check(withoutConsent.includes('2 colour renders') && !withoutConsent.includes('B&W'), `${size}: preparation leaves out B&W without consent`);
-      check(await page.locator('.step:not([hidden]) .excluded .excluded-files li').count() === 3, `${size}: the review lists the three B&W renders left out`);
+      check(await page.locator('.step:not([hidden]) .excluded .excluded-files li').count() === 4, `${size}: the review lists the three B&W renders and the editor export left out`);
+      const editorDetails = page.locator('.step:not([hidden]) .excluded-files', {
+        has: page.locator('summary', { hasText: 'Exported from Adobe Lightroom.' }),
+      });
+      check(await editorDetails.count() === 1, `${size}: an editor export is left out with its app named`);
+      check(await editorDetails.locator('li', { hasText: 'render-lightroom.jpg' }).count() === 1, `${size}: the editor export is named in the excluded list`);
+      const customLook = editorDetails.locator('a', { hasText: 'Add it as a custom look' });
+      check(
+        (await customLook.getAttribute('href')).endsWith('/community/propose?kind=lut_look'),
+        `${size}: the editor exclusion links to the custom-look proposal`,
+      );
+      await editorDetails.locator('summary').click();
+      await capture('contribute-editor-excluded');
       await page.getByRole('button', { name: 'Continue to send', exact: true }).click();
       await progress.getByRole('button', { name: 'Check groups', exact: true }).click();
     }
@@ -685,6 +745,18 @@ async function contribute(size) {
     check(!(await consentBox.isChecked()), `${size}: B&W consent stays unchecked until an explicit click`);
     await consentBox.check();
     check(await consentBox.isChecked(), `${size}: one click selects every B&W render in the drop`);
+    await consentBox.uncheck();
+    if (!allBw) {
+      const editorAfterToggle = page.locator('.step:not([hidden]) details.excluded-files', {
+        has: page.locator('summary', { hasText: 'Exported from Adobe Lightroom.' }),
+      });
+      await editorAfterToggle.first().waitFor({ timeout: 10_000 });
+      check(
+        await editorAfterToggle.count() === 1,
+        `${size}: the editor export reason stays listed after clearing B&W consent`,
+      );
+    }
+    await consentBox.check();
     await capture('contribute-consent-changed');
     check(await progress.getByRole('button', { name: 'Review', exact: true }).isDisabled(), `${size}: changed B&W selection requires fresh preparation before review`);
     check(await progress.getByRole('button', { name: 'Send', exact: true }).isDisabled(), `${size}: changed B&W selection cannot reuse the previous send step`);
@@ -716,7 +788,19 @@ async function contribute(size) {
     summary.prep_millis = Date.now() - started;
     await capture('contribute-3-inspector');
     check((await page.locator('.payload-summary').textContent()).includes('No pixels, no location'), `${size}: upload summary explains privacy`);
-    check(await page.locator('details.excluded-files').count() === 0, `${size}: every selected render was prepared`);
+    if (allBw) {
+      check(await page.locator('details.excluded-files').count() === 0, `${size}: every selected render was prepared`);
+    } else {
+      check(await page.locator('.step:not([hidden]) details.excluded-files').count() === 1, `${size}: only the editor export remains in Files left out`);
+      const editorDetails = page.locator('.step:not([hidden]) details.excluded-files', {
+        has: page.locator('summary', { hasText: 'Exported from Adobe Lightroom.' }),
+      });
+      check(await editorDetails.count() === 1, `${size}: the editor export keeps its reason after preparation`);
+      check(
+        (await editorDetails.locator('a', { hasText: 'Add it as a custom look' }).count()) === 1,
+        `${size}: the editor export keeps its custom-look link after preparation`,
+      );
+    }
     const withConsent = await page.locator('.payload-summary').textContent();
     if (allBw) {
       check(withConsent.includes('8 B&W renders') && !withConsent.includes('colour renders'), `${size}: the inspector counts eight B&W renders and no colour renders`);

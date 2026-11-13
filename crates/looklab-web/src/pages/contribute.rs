@@ -7,8 +7,8 @@ use leptos::task::spawn_local;
 use looklab_meta::ParsedMetadata;
 use looklab_prep::LocalImageKey;
 use looklab_upload::{
-    AttestationHash, CardDeclaration, ContributionKind, FirmwareId, FirmwareVersion,
-    MonochromeAuthorization, RenderClass, RenderTag, SettingSource,
+    AttestationHash, CardDeclaration, ContributionKind, DEFAULT_MAX_BATCHES, DEFAULT_MAX_IMAGES,
+    FirmwareId, FirmwareVersion, MonochromeAuthorization, RenderClass, RenderTag, SettingSource,
 };
 use looklab_wasm::coverage::{CoverageMap, coverage_map, sample_points};
 use looklab_wasm::prep::{ModuleFunction, default_pow};
@@ -131,6 +131,9 @@ pub(crate) struct ContributionGroup {
     pub(crate) mono_filter: Option<looklab_schema::MonoFilter>,
     /// The batch's renders the schema classifies as monochrome.
     pub(crate) monochrome: Vec<looklab_wasm::MonochromeRender>,
+    /// Other chunks of the same camera/firmware/look/settings group.
+    #[serde(default)]
+    pub(crate) siblings: Vec<BatchId>,
 }
 
 /// The batches one drop uploads.
@@ -143,7 +146,7 @@ pub(crate) struct BatchSet {
 fn active_bodies(set: &BatchSet) -> BTreeSet<String> {
     set.groups()
         .iter()
-        .filter(|group| !(group.is_monochrome() && !group.fields.monochrome_opt_in))
+        .filter(|group| group.is_sent())
         .map(|group| group.fields.body.clone())
         .filter(|body| !body.is_empty())
         .collect()
@@ -322,8 +325,7 @@ fn missing_required_values(
 ) -> Vec<MissingRequired> {
     set.groups()
         .iter()
-        .filter(|group| !group.renders.is_empty())
-        .filter(|group| !(group.is_monochrome() && !group.fields.monochrome_opt_in))
+        .filter(|group| group.is_sent())
         .filter_map(|group| {
             let schema = catalog.and_then(|catalog| catalog.schema_for(group));
             let validation = validate_controls(
@@ -491,23 +493,66 @@ impl BatchSet {
         Self { groups, next }
     }
 
-    /// Splits renders by body, firmware version, look, settings and card declaration.
+    /// Splits renders by body, firmware version, look, settings and card declaration,
+    /// keeping each batch within the upload image limit and each RAW's re-renders together.
     fn from_readings(readings: &[PairReading]) -> Self {
-        let mut set = Self::default();
-        let mut seen: HashMap<GroupKey, usize> = HashMap::new();
+        let mut order: Vec<GroupKey> = Vec::new();
+        let mut by_key: HashMap<GroupKey, Vec<&PairReading>> = HashMap::new();
         for reading in readings {
-            if let Some(&index) = seen.get(&reading.key()) {
-                if !set.groups[index].raws.contains(&reading.raw) {
-                    set.groups[index].raws.push(reading.raw.clone());
-                }
-                set.groups[index].renders.push(reading.render.clone());
-                set.groups[index].absorb(reading);
+            if reading.exclusion.is_some() {
                 continue;
             }
-            seen.insert(reading.key(), set.groups.len());
-            let id = set.allocate();
-            set.groups
-                .push(ContributionGroup::from_reading(id, reading));
+            let key = reading.key();
+            if !by_key.contains_key(&key) {
+                order.push(key.clone());
+            }
+            by_key.entry(key).or_default().push(reading);
+        }
+        let mut set = Self::default();
+        for key in order {
+            let list = by_key.remove(&key).unwrap_or_default();
+            let mut chunks: Vec<Vec<&PairReading>> = Vec::new();
+            let mut current: Vec<&PairReading> = Vec::new();
+            let mut index = 0;
+            while index < list.len() {
+                let raw = &list[index].raw;
+                let mut end = index;
+                while end < list.len() && &list[end].raw == raw {
+                    end += 1;
+                }
+                let group_len = end - index;
+                if !current.is_empty() && current.len() + group_len > DEFAULT_MAX_IMAGES {
+                    chunks.push(std::mem::take(&mut current));
+                }
+                current.extend_from_slice(&list[index..end]);
+                index = end;
+            }
+            if !current.is_empty() {
+                chunks.push(current);
+            }
+            let mut ids = Vec::new();
+            for chunk in chunks {
+                let id = set.allocate();
+                ids.push(id);
+                let mut group = ContributionGroup::from_reading(id, chunk[0]);
+                for reading in &chunk[1..] {
+                    if !group.raws.contains(&reading.raw) {
+                        group.raws.push(reading.raw.clone());
+                    }
+                    group.renders.push(reading.render.clone());
+                    group.absorb(reading);
+                }
+                set.groups.push(group);
+            }
+            for id in &ids {
+                if let Some(group) = set.groups.iter_mut().find(|group| group.id == *id) {
+                    group.siblings = ids
+                        .iter()
+                        .copied()
+                        .filter(|sibling| sibling != id)
+                        .collect();
+                }
+            }
         }
         set
     }
@@ -541,6 +586,10 @@ impl BatchSet {
         &self.groups
     }
 
+    fn sendable_count(&self) -> usize {
+        self.groups.iter().filter(|group| group.is_sent()).count()
+    }
+
     pub(crate) fn get(&self, id: BatchId) -> Option<&ContributionGroup> {
         self.groups.iter().find(|group| group.id == id)
     }
@@ -552,9 +601,21 @@ impl BatchSet {
             .map(|group| group.id)
     }
 
-    fn update(&mut self, id: BatchId, edit: impl FnOnce(&mut ContributionGroup)) {
-        if let Some(group) = self.groups.iter_mut().find(|group| group.id == id) {
-            edit(group);
+    fn update(&mut self, id: BatchId, edit: impl Fn(&mut ContributionGroup)) {
+        let Some(siblings) = self
+            .groups
+            .iter()
+            .find(|group| group.id == id)
+            .map(|group| group.siblings.clone())
+        else {
+            return;
+        };
+        let mut targets = vec![id];
+        targets.extend(siblings);
+        for target in targets {
+            if let Some(group) = self.groups.iter_mut().find(|group| group.id == target) {
+                edit(group);
+            }
         }
     }
 
@@ -563,12 +624,12 @@ impl BatchSet {
     }
 
     fn set_body_draft(&mut self, id: BatchId, body: String) {
-        self.update(id, |group| group.fields.body = body);
+        self.update(id, |group| group.fields.body = body.clone());
     }
 
     fn set_body(&mut self, id: BatchId, body: String) {
         self.update(id, |group| {
-            group.fields.body = body;
+            group.fields.body = body.clone();
             group.camera_ready = false;
             group.blocked = None;
             group.fields.sim.clear();
@@ -656,6 +717,7 @@ impl ContributionGroup {
                 .filter(|render| render.file == reading.render.as_str())
                 .cloned()
                 .collect(),
+            siblings: Vec::new(),
         };
         group.absorb(reading);
         group
@@ -716,6 +778,11 @@ impl ContributionGroup {
     fn is_monochrome(&self) -> bool {
         self.monochrome_renders() > 0
     }
+
+    /// A batch the upload will send: it has renders and is not unselected B&W.
+    fn is_sent(&self) -> bool {
+        !self.renders.is_empty() && !(self.is_monochrome() && !self.fields.monochrome_opt_in)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -758,6 +825,8 @@ pub(crate) struct PairReading {
     pub(crate) mono_filter: Option<looklab_schema::MonoFilter>,
     pub(crate) monochrome: Vec<looklab_wasm::MonochromeRender>,
     pub(crate) note: Option<String>,
+    /// Set when the JPEG is not a camera render and must not enter a batch.
+    pub(crate) exclusion: Option<FailureRow>,
 }
 
 impl PairReading {
@@ -1215,11 +1284,26 @@ pub(crate) struct SeedRow {
     pub(crate) seed: [u8; 32],
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum FailureKind {
+    #[default]
+    Other,
+    EditorExport,
+    Resaved,
+}
+
+impl FailureKind {
+    fn is_render_exclusion(self) -> bool {
+        matches!(self, Self::EditorExport | Self::Resaved)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FailureRow {
     pub(crate) name: String,
     pub(crate) message: String,
-    pub(crate) donated: bool,
+    #[serde(default)]
+    pub(crate) kind: FailureKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1337,8 +1421,8 @@ impl HelpWay {
             Self::ColorChart => HelpGuide {
                 title: "Photograph a color chart",
                 time: "About 5 minutes",
-                impact: Impact::High,
-                description: "Help measure how your camera sees color.",
+                impact: Impact::Low,
+                description: "Chart shots count as ordinary photos for now.",
                 steps: &[
                     "Use a ColorChecker Classic 24, SG 140 or Passport chart.",
                     "Light the chart evenly without glare. Keep it still and fill 30 to 60% of the frame.",
@@ -1346,6 +1430,7 @@ impl HelpWay {
                     "Use one built-in look for all 3 shots, such as Provia / Standard on Fujifilm, and set white balance to the light.",
                     "Take 3 shots total: 0, −1 and −2 EV exposure compensation. Keep all 3 original RAW+JPEG pairs. You do not need to repeat the bracket for each look.",
                     "Want to contribute more? Re-render just the 0 EV RAW in camera using other built-in looks, keeping the other settings unchanged. Add those JPEGs with the original files. No re-renders of the −1 and −2 EV RAWs are needed.",
+                    "For now, chart shots count as ordinary photos; chart analysis is not available yet.",
                 ],
                 action: "Add the chart shots",
             },
@@ -1581,7 +1666,8 @@ pub fn ContributePage() -> impl IntoView {
         let requested = body.clone();
         processed.set(Vec::new());
         seeds.set(Vec::new());
-        failures.set(Vec::new());
+        failures
+            .set(plan.with(|plan| plan.as_ref().map(render_exclusion_rows).unwrap_or_default()));
         coverage.set(None);
         points.set(Vec::new());
         furthest.set(StepIndex(1));
@@ -1657,7 +1743,9 @@ pub fn ContributePage() -> impl IntoView {
             match prefill {
                 Ok(prefill) => {
                     batches.update(|set| {
-                        set.update(id, |group| apply_site_prefill(group, &site.body, prefill));
+                        set.update(id, |group| {
+                            apply_site_prefill(group, &site.body, prefill.clone())
+                        });
                     });
                     message.set(Some(
                         "Camera settings loaded. Process these photos again before sending."
@@ -1691,7 +1779,8 @@ pub fn ContributePage() -> impl IntoView {
     let invalidate_preparation = Callback::new(move |()| {
         processed.set(Vec::new());
         seeds.set(Vec::new());
-        failures.set(Vec::new());
+        failures
+            .set(plan.with(|plan| plan.as_ref().map(render_exclusion_rows).unwrap_or_default()));
         coverage.set(None);
         points.set(Vec::new());
         furthest.set(StepIndex(1));
@@ -1722,10 +1811,12 @@ pub fn ContributePage() -> impl IntoView {
     let draft_store = StoredValue::new_local(ContributionDraftStore::new());
     let guard_consent = move || draft_store.with_value(ContributionDraftStore::guard_consent);
     let replace_batches = move |readings: Vec<PairReading>| {
+        let rows = exclusion_rows(&readings);
         let set = BatchSet::from_readings(&readings);
         let first = set.groups().first().map(|group| group.id);
         camera_check_generation.update(|generation| *generation += 1);
         batches.set(set);
+        failures.set(rows);
         selected_batch.set(first);
         batch_epoch.update(|epoch| *epoch += 1);
     };
@@ -1784,7 +1875,7 @@ pub fn ContributePage() -> impl IntoView {
             if let Ok(pairing) = pairing
                 && !pairing.groups.is_empty()
             {
-                let mut set = if draft.batches.is_empty()
+                let (mut set, render_exclusions) = if draft.batches.is_empty()
                     || draft.batches.iter().any(|group| group.renders.is_empty())
                 {
                     let Some(epoch) = prefill_ledger.try_update_value(PrefillLedger::reset) else {
@@ -1793,9 +1884,12 @@ pub fn ContributePage() -> impl IntoView {
                     };
                     let readings =
                         read_pairs(&pairing, &files, &parsed, prefill_ledger, epoch).await;
-                    BatchSet::from_readings(&readings)
+                    (
+                        BatchSet::from_readings(&readings),
+                        exclusion_rows(&readings),
+                    )
                 } else {
-                    BatchSet::from_groups(draft.batches)
+                    (BatchSet::from_groups(draft.batches), Vec::new())
                 };
                 if deny_monochrome {
                     set.set_monochrome_consent(false);
@@ -1815,6 +1909,7 @@ pub fn ContributePage() -> impl IntoView {
                 all_files.set(files);
                 parsed_metadata.set_value(parsed);
                 draft_files.set(draft.files);
+                let plan_exclusions = render_exclusion_rows(&pairing);
                 plan.set(Some(pairing));
                 let prepared = if drop_prepared {
                     None
@@ -1836,6 +1931,9 @@ pub fn ContributePage() -> impl IntoView {
                     seeds: Vec::new(),
                     failures: Vec::new(),
                 });
+                let mut restored_failures = restored_failures;
+                merge_failure_rows(&mut restored_failures, render_exclusions);
+                merge_failure_rows(&mut restored_failures, plan_exclusions);
                 let groups = groups
                     .into_iter()
                     .filter_map(|group| {
@@ -1873,9 +1971,9 @@ pub fn ContributePage() -> impl IntoView {
                     points.set(sample_points(&blobs, usize::MAX).unwrap_or_default());
                     processed.set(groups);
                     seeds.set(restored_seeds);
-                    failures.set(restored_failures);
                     current.set(StepIndex(3));
                 }
+                failures.set(restored_failures);
                 if processed.with(Vec::is_empty) {
                     current.set(StepIndex(1));
                 }
@@ -2029,6 +2127,12 @@ pub fn ContributePage() -> impl IntoView {
         let Some(pairing) = plan.get() else {
             return;
         };
+        let excluded_rows = failures
+            .get_untracked()
+            .into_iter()
+            .filter(|row| row.kind.is_render_exclusion())
+            .collect::<Vec<_>>();
+        let pairing = without_excluded_renders(&pairing, &excluded_rows);
         let files = all_files.get();
         let batches = batches.get_untracked();
         let count = worker_count.get().max(1);
@@ -2080,6 +2184,8 @@ pub fn ContributePage() -> impl IntoView {
             .await;
             match result {
                 Ok((groups, seed_rows, failure_rows)) => {
+                    let mut all_failures = excluded_rows.clone();
+                    all_failures.extend(failure_rows);
                     let blobs: Vec<Vec<u8>> = groups
                         .iter()
                         .flat_map(|group| group.blobs.iter().cloned())
@@ -2099,7 +2205,7 @@ pub fn ContributePage() -> impl IntoView {
                             })
                             .collect(),
                         seeds: seed_rows.clone(),
-                        failures: failure_rows.clone(),
+                        failures: all_failures.clone(),
                     };
                     if let Ok(text) = serde_json::to_string(&prepared) {
                         let pending = draft_store.with_value(|store| store.prepared(&text));
@@ -2109,7 +2215,7 @@ pub fn ContributePage() -> impl IntoView {
                     }
                     processed.set(groups);
                     seeds.set(seed_rows);
-                    failures.set(failure_rows);
+                    failures.set(all_failures);
                     if processed.with(Vec::is_empty) {
                         current.set(StepIndex(1));
                         message.set(Some("No photos could be processed. Check the excluded files below and try an original RAW+JPEG pair.".to_owned()));
@@ -2153,7 +2259,7 @@ pub fn ContributePage() -> impl IntoView {
             if completed.with(|done| done.contains(&group.id)) {
                 continue;
             }
-            if group.is_monochrome() && !group.fields.monochrome_opt_in {
+            if !group.is_sent() {
                 continue;
             }
             let images = prepared_images_of(&processed_groups, group.id);
@@ -2320,10 +2426,7 @@ pub fn ContributePage() -> impl IntoView {
             completed.set(Vec::new());
             processed.set(Vec::new());
             seeds.set(Vec::new());
-            let excluded = failures.get_untracked();
-            all_files.update(|files| {
-                files.retain(|file| excluded.iter().any(|row| row.name == file.name()));
-            });
+            all_files.set(Vec::new());
             parsed_metadata.set_value(Vec::new());
             points.set(Vec::new());
             current.set(StepIndex(5));
@@ -2381,54 +2484,15 @@ pub fn ContributePage() -> impl IntoView {
         }
     };
 
-    let donation = move |name: String| {
-        let Some(file) = all_files.with(|files| {
-            files
-                .iter()
-                .find(|file| file.name() == name.as_str())
-                .cloned()
-        }) else {
-            return;
-        };
-        spawn_local(async move {
-            let bytes = match file.bytes().await {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    message.set(Some(error));
-                    return;
-                }
-            };
-            if let Err(error) = download(file.name(), &bytes, "application/octet-stream") {
-                message.set(Some(error));
-                return;
-            }
-            let mut rows = failures.get();
-            if let Some(row) = rows.iter_mut().find(|row| row.name == file.name()) {
-                row.donated = true;
-            }
-            failures.set(rows);
-            let consent = format!(
-                "{{\"file\":\"{}\",\"consent\":\"fixture donation\",\"recorded_at\":{}}}",
-                file.name(),
-                js_sys::Date::now()
-            );
-            let _ = idb::put(idb::StorageKey::FIXTURE_CONSENT, &consent).await;
-            message.set(Some(
-                "Consent saved on this device. Follow the fixture donation instructions when sharing the downloaded file."
-                    .to_owned(),
-            ));
-        });
-    };
-
-    let on_donate = Callback::new(donation);
-
     view! {
         <div class="contribute-page">
         <header class="contribute-intro" class:contribution-active=move || stage.get() != Stage::Drop>
             <p class="eyebrow">"What helping takes"</p>
             <h1>"Help build looks"</h1>
             <p class="lede">"Your photos never leave this device. We extract the aesthetic, and you see exactly what's sent before it goes."</p>
-            <p>"Shared samples are how we measure a look. You need RAW+JPEG pairs from a supported camera, shot with a built-in look."</p>
+            <p>"There's nothing to send us. Your browser reads the photos here and sends only color samples and photo details (camera, lens, settings and month taken), after you review them. Large folders are fine."</p>
+            <p>"Shared samples are how we measure a look. Use the JPEG straight from the camera. A straight-from-camera JPEG shows how the camera rendered its RAW; an edited or exported JPEG shows your edit, so it can't measure the camera's look."</p>
+            <p>"Made your own look in an editing app? "<a href=crate::base::site_url("/community/propose?kind=lut_look")>"Add it as a custom look instead"</a>"."</p>
         </header>
         <p class="notice" hidden=move || !no_platform_store.get()>{crate::ui::PLATFORM_STORE_UNDETECTED_NOTICE}</p>
         {(!available).then(crate::ui::preview_notice)}
@@ -2513,6 +2577,19 @@ pub fn ContributePage() -> impl IntoView {
 
         <section class="step" hidden=move || stage.get() != Stage::Confirm>
             <h2>"Check the groups"</h2>
+            {move || {
+                let files = all_files.with(Vec::len);
+                (files > 0).then(|| {
+                    let bytes: u64 = all_files.with(|files| files.iter().map(LocalFile::size).sum());
+                    view! {
+                        <p class="drop-summary">{format!(
+                            "{files} {} on this device, {}. Nothing uploaded yet.",
+                            if files == 1 { "file" } else { "files" },
+                            format_bytes(bytes),
+                        )}</p>
+                    }
+                })
+            }}
             {move || plan.get().map(|pairing| view! {
                 <Pairing plan=pairing batches=batches catalog=catalog/>
             })}
@@ -2627,9 +2704,21 @@ pub fn ContributePage() -> impl IntoView {
                 view! {
                     <div class="batch-detail">
                         <h3>{heading}</h3>
-                        <p class="muted">
-                            "Settings entered here apply to every render in this batch, not to other batches. Only enter a missing value if it was used for all of them."
-                        </p>
+                        <p class="muted">{move || {
+                            let siblings = batches.with(|set| {
+                                set.get(id).map(|group| group.siblings.clone()).unwrap_or_default()
+                            });
+                            if siblings.is_empty() {
+                                "Settings entered here apply to every render in this batch. Only enter a missing value if it was used for all of them.".to_owned()
+                            } else {
+                                let names = siblings
+                                    .iter()
+                                    .map(|sibling| format!("Batch {}", sibling.0))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!("Settings entered here apply to every render in this batch and to {names}. Only enter a missing value if it was used for all of them.")
+                            }
+                        }}</p>
                         <BatchEditor id=id first=first batches=batches catalog=catalog firmware_ids=firmware_ids on_camera_change=revalidate_camera/>
                     </div>
                 }.into_any()
@@ -2639,7 +2728,7 @@ pub fn ContributePage() -> impl IntoView {
                 (!rows.is_empty()).then(|| view! {
                     <section class="excluded" aria-label="Excluded files">
                         <h3>"Files left out"</h3>
-                        {excluded_files(rows, on_donate)}
+                        {excluded_files(rows)}
                     </section>
                 })
             }}
@@ -2695,8 +2784,16 @@ pub fn ContributePage() -> impl IntoView {
                     </div>
                 })
             }}
+            {move || {
+                let groups = batches.with(BatchSet::sendable_count);
+                (groups > DEFAULT_MAX_BATCHES).then(|| view! {
+                    <p class="notice" role="status">{format!(
+                        "This selection needs {groups} batches, and one send allows {DEFAULT_MAX_BATCHES}. Send fewer photos now and add the rest in a following send."
+                    )}</p>
+                })
+            }}
             <button class="button-primary" on:click=process
-                disabled=move || busy.get() || required_blocked.get()
+                disabled=move || busy.get() || required_blocked.get() || (batches.with(BatchSet::sendable_count) > DEFAULT_MAX_BATCHES)
                 aria-describedby=move || required_blocked.get().then_some("required-fields")>"Process locally"</button>
         </section>
 
@@ -2749,7 +2846,7 @@ pub fn ContributePage() -> impl IntoView {
                 (!rows.is_empty()).then(|| view! {
                     <section class="excluded" aria-label="Excluded files">
                         <h3>"Files left out"</h3>
-                        {excluded_files(rows, on_donate)}
+                        {excluded_files(rows)}
                     </section>
                 })
             }}
@@ -2968,7 +3065,7 @@ pub fn ContributePage() -> impl IntoView {
                 (!rows.is_empty()).then(|| view! {
                     <section class="excluded" aria-label="Excluded files">
                         <h3>"Files left out"</h3>
-                        {excluded_files(rows, on_donate)}
+                        {excluded_files(rows)}
                     </section>
                 })
             }}
@@ -3075,7 +3172,11 @@ fn BatchEditor(
     };
     let write = move |field: TextField| {
         move |value: String| {
-            batches.update(|set| set.update(id, |group| *field.get_mut(&mut group.fields) = value));
+            batches.update(|set| {
+                set.update(id, |group| {
+                    *field.get_mut(&mut group.fields) = value.clone()
+                })
+            });
         }
     };
     let flag = move |field: FlagField| {
@@ -3755,6 +3856,8 @@ async fn reading_for_render(
         .into_iter()
         .filter_map(|name| pairing.facts.iter().find(|fact| fact.name == name))
         .collect::<Vec<_>>();
+    let exclusion = renderer_for(pairing, pair, render.as_str())
+        .and_then(|renderer| renderer_exclusion(render.as_str(), renderer));
     let mut reading = PairReading {
         raw: pair.raw.clone(),
         render: render.clone(),
@@ -3788,7 +3891,11 @@ async fn reading_for_render(
         mono_filter: None,
         monochrome: Vec::new(),
         note: None,
+        exclusion,
     };
+    if reading.exclusion.is_some() {
+        return reading;
+    }
     let Some((make, model)) = reading
         .camera
         .as_ref()
@@ -4202,10 +4309,114 @@ enum PairOutcome {
         seed: SeedRow,
     },
     Failed(FailureRow),
+    /// Every JPEG in the pair was left out, so there is nothing to prepare.
+    Skipped,
 }
 
-/// The pair's usable JPEGs, and a listing row for every monochrome render.
+/// The renderer of one JPEG in a pair, when both files' facts are known.
+fn renderer_for(
+    pairing: &PairingPlan,
+    pair: &looklab_wasm::PairGroup,
+    name: &str,
+) -> Option<looklab_meta::Renderer> {
+    let raw = pairing.facts.iter().find(|fact| fact.name == pair.raw)?;
+    let render = pairing.facts.iter().find(|fact| fact.name == name)?;
+    Some(looklab_meta::classify_renderer(
+        looklab_meta::RendererEvidence {
+            software: render.software.as_deref(),
+            makernotes: render.has_makernotes,
+            raw_makernotes: raw.has_makernotes,
+            raw_firmware: raw.firmware.as_deref(),
+        },
+    ))
+}
+
+fn renderer_exclusion(name: &str, renderer: looklab_meta::Renderer) -> Option<FailureRow> {
+    match renderer {
+        looklab_meta::Renderer::Camera => None,
+        looklab_meta::Renderer::Editor { app } => Some(FailureRow {
+            name: name.to_owned(),
+            message: format!(
+                "Exported from {}. Edited exports measure your edit, not the camera's look.",
+                app.name()
+            ),
+            kind: FailureKind::EditorExport,
+        }),
+        looklab_meta::Renderer::Resaved { .. } => Some(FailureRow {
+            name: name.to_owned(),
+            message: "This JPEG has no camera settings. Use the original from the memory card."
+                .to_owned(),
+            kind: FailureKind::Resaved,
+        }),
+    }
+}
+
+/// Drops JPEGs already excluded at the drop step so processing does not repeat them.
+fn without_excluded_renders(pairing: &PairingPlan, rows: &[FailureRow]) -> PairingPlan {
+    if rows.is_empty() {
+        return pairing.clone();
+    }
+    let names = rows
+        .iter()
+        .map(|row| row.name.as_str())
+        .collect::<HashSet<_>>();
+    PairingPlan {
+        groups: pairing
+            .groups
+            .iter()
+            .filter_map(|group| {
+                let jpegs = group
+                    .jpegs
+                    .iter()
+                    .filter(|name| !names.contains(name.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!jpegs.is_empty()).then(|| looklab_wasm::PairGroup {
+                    raw: group.raw.clone(),
+                    jpegs,
+                })
+            })
+            .collect(),
+        unpaired: pairing.unpaired.clone(),
+        facts: pairing.facts.clone(),
+    }
+}
+
+fn exclusion_rows(readings: &[PairReading]) -> Vec<FailureRow> {
+    readings
+        .iter()
+        .filter_map(|reading| reading.exclusion.clone())
+        .collect()
+}
+
+/// Every renderer exclusion in a pairing plan, so resets can restore them.
+fn render_exclusion_rows(pairing: &PairingPlan) -> Vec<FailureRow> {
+    pairing
+        .groups
+        .iter()
+        .flat_map(|pair| {
+            pair.jpegs.iter().filter_map(|name| {
+                renderer_for(pairing, pair, name)
+                    .and_then(|renderer| renderer_exclusion(name, renderer))
+            })
+        })
+        .collect()
+}
+
+fn merge_failure_rows(rows: &mut Vec<FailureRow>, extra: Vec<FailureRow>) {
+    for row in extra {
+        if !rows
+            .iter()
+            .any(|known| known.name == row.name && known.message == row.message)
+        {
+            rows.push(row);
+        }
+    }
+}
+
+/// The pair's usable JPEGs, and a listing row for every JPEG left out.
 fn split_renders(
+    pairing: &PairingPlan,
     pair: &looklab_wasm::PairGroup,
     excluded: &HashSet<String>,
 ) -> (Vec<RenderFile>, Vec<FailureRow>) {
@@ -4216,15 +4427,21 @@ fn split_renders(
             rows.push(FailureRow {
                 name: name.clone(),
                 message: MONOCHROME_UNSELECTED.to_owned(),
-                donated: false,
+                kind: FailureKind::Other,
             });
         } else if let Some(render) = RenderFile::new(name) {
-            usable.push(render);
+            if let Some(row) = renderer_for(pairing, pair, name)
+                .and_then(|renderer| renderer_exclusion(name, renderer))
+            {
+                rows.push(row);
+            } else {
+                usable.push(render);
+            }
         } else {
             rows.push(FailureRow {
                 name: name.clone(),
                 message: "the JPEG file name is invalid".to_owned(),
-                donated: false,
+                kind: FailureKind::Other,
             });
         }
     }
@@ -4243,7 +4460,7 @@ async fn prepare_pair(
         PairOutcome::Failed(FailureRow {
             name,
             message: message.to_owned(),
-            donated: false,
+            kind: FailureKind::Other,
         })
     };
     let Some(raw) = find_file(files, &pair.raw) else {
@@ -4459,13 +4676,9 @@ async fn run_files_progress(
                     worker = PrepWorker::spawn()?;
                 }
                 let pair = &pairing.groups[index];
-                let (usable, refusals) = split_renders(pair, excluded);
-                let outcome = if usable.is_empty() && !refusals.is_empty() {
-                    PairOutcome::Failed(FailureRow {
-                        name: pair.raw.clone(),
-                        message: MONOCHROME_UNSELECTED.to_owned(),
-                        donated: false,
-                    })
+                let (usable, refusals) = split_renders(pairing, pair, excluded);
+                let outcome = if usable.is_empty() {
+                    PairOutcome::Skipped
                 } else {
                     prepare_pair(&mut worker, pair, &usable, files, batches, &progress).await
                 };
@@ -4494,6 +4707,7 @@ async fn run_files_progress(
                 seed_rows.push(seed);
             }
             PairOutcome::Failed(row) => failures.push(row),
+            PairOutcome::Skipped => {}
         }
     }
     let mut card_failures = check_card_tags(&mut groups).await;
@@ -4607,7 +4821,7 @@ async fn check_card_tags(groups: &mut [ProcessedGroup]) -> Vec<FailureRow> {
             failures.push(FailureRow {
                 name: render.as_str().to_owned(),
                 message: format!("excluded: {reason}"),
-                donated: false,
+                kind: FailureKind::Other,
             });
         }
     }
@@ -4628,34 +4842,43 @@ fn group_failures(rows: Vec<FailureRow>) -> Vec<(String, Vec<FailureRow>)> {
     groups
 }
 
-fn excluded_files(rows: Vec<FailureRow>, on_donate: Callback<String>) -> impl IntoView {
-    group_failures(rows)
+fn excluded_files(rows: Vec<FailureRow>) -> impl IntoView {
+    let groups = group_failures(rows)
         .into_iter()
         .map(|(message, rows)| {
             let count = rows.len();
+            let editor = rows
+                .first()
+                .is_some_and(|row| row.kind == FailureKind::EditorExport);
             view! {
                 <details class="disclosure excluded-files">
                     <summary>{format!("{count} {} left out: {message}", if count == 1 { "file" } else { "files" })}</summary>
                     <ul>
-                        {rows.into_iter().map(|row| {
-                            let name = row.name.clone();
-                            view! {
-                                <li>
-                                    <span>{row.name.clone()}</span>
-                                    {(!row.donated).then(|| view! {
-                                        <button type="button" class="excluded-donate"
-                                            on:click=move |_| on_donate.run(name.clone())>
-                                            "Donate this file as a test fixture"
-                                        </button>
-                                    })}
-                                </li>
-                            }
+                        {rows.into_iter().map(|row| view! {
+                            <li>{row.name}</li>
                         }).collect_view()}
                     </ul>
+                    {editor.then(|| view! {
+                        <p class="muted">
+                            "A look you made in an editing app can be added as a custom look. "
+                            <a href=crate::base::site_url("/community/propose?kind=lut_look")>"Add it as a custom look"</a>
+                            "."
+                        </p>
+                    })}
                 </details>
             }
         })
-        .collect_view()
+        .collect_view();
+    view! {
+        <div class="excluded-list">
+            {groups}
+            <p class="muted">
+                "Camera not listed? "
+                <a href=crate::base::site_url("/community/propose?kind=body")>"Add it with a sample file"</a>
+                "."
+            </p>
+        </div>
+    }
 }
 
 /// Pending cameras come first; the caller truncates to the attestation limit.
@@ -4699,6 +4922,16 @@ impl PreparedRenderCounts {
                 format!("{colour} colour {colour_unit} and {monochrome} B&W {monochrome_unit}")
             }
         }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
     }
 }
 
@@ -5099,7 +5332,61 @@ mod tests {
             mono_filter: None,
             monochrome: Vec::new(),
             note: None,
+            exclusion: None,
         }
+    }
+
+    fn file_fact(
+        name: &str,
+        kind: looklab_wasm::pairing::FileKindView,
+        software: Option<&str>,
+        has_makernotes: bool,
+    ) -> looklab_wasm::pairing::FileFacts {
+        looklab_wasm::pairing::FileFacts {
+            name: name.to_owned(),
+            kind,
+            make: Some("fujifilm".to_owned()),
+            model: Some("x-t5".to_owned()),
+            firmware: Some("1.00".to_owned()),
+            has_serial: false,
+            software: software.map(str::to_owned),
+            has_makernotes,
+            render_tag: None,
+            render_tag_malformed: false,
+        }
+    }
+
+    fn plan_for(
+        pair: &looklab_wasm::PairGroup,
+        software: Option<&str>,
+        makernotes: bool,
+    ) -> PairingPlan {
+        let mut facts = vec![file_fact(
+            &pair.raw,
+            looklab_wasm::pairing::FileKindView::Raw,
+            None,
+            true,
+        )];
+        facts.extend(pair.jpegs.iter().map(|name| {
+            file_fact(
+                name,
+                looklab_wasm::pairing::FileKindView::Jpeg,
+                software,
+                makernotes,
+            )
+        }));
+        PairingPlan {
+            groups: vec![pair.clone()],
+            unpaired: Vec::new(),
+            facts,
+        }
+    }
+
+    fn split(
+        pair: &looklab_wasm::PairGroup,
+        excluded: &HashSet<String>,
+    ) -> (Vec<RenderFile>, Vec<FailureRow>) {
+        split_renders(&plan_for(pair, None, true), pair, excluded)
     }
 
     #[test]
@@ -5109,7 +5396,7 @@ mod tests {
             jpegs: vec!["a-acros.jpg".to_owned(), "a-provia.jpg".to_owned()],
         };
         let excluded = HashSet::from(["a-acros.jpg".to_owned(), "b-acros.jpg".to_owned()]);
-        let (usable, rows) = split_renders(&pair, &excluded);
+        let (usable, rows) = split(&pair, &excluded);
         assert_eq!(
             usable.iter().map(RenderFile::as_str).collect::<Vec<_>>(),
             vec!["a-provia.jpg"]
@@ -5121,9 +5408,54 @@ mod tests {
             raw: "b.raf".to_owned(),
             jpegs: vec!["b-acros.jpg".to_owned()],
         };
-        let (usable, rows) = split_renders(&only_monochrome, &excluded);
+        let (usable, rows) = split(&only_monochrome, &excluded);
         assert!(usable.is_empty());
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn an_excluded_reading_forms_no_batch() {
+        let mut reading = reading("a.raf", "fujifilm", "x-t5", "provia", 0);
+        reading.exclusion = Some(FailureRow {
+            name: "a.raf.jpg".to_owned(),
+            message: "This JPEG has no camera settings. Use the original from the memory card."
+                .to_owned(),
+            kind: FailureKind::Resaved,
+        });
+        let set = BatchSet::from_readings(&[reading]);
+        assert!(set.groups().is_empty());
+    }
+
+    #[test]
+    fn editor_exports_and_re_saved_jpegs_leave_the_batch() {
+        let pair = looklab_wasm::PairGroup {
+            raw: "a.raf".to_owned(),
+            jpegs: vec!["a.jpg".to_owned(), "b.jpg".to_owned()],
+        };
+        let plan = plan_for(
+            &pair,
+            Some("Adobe Photoshop Lightroom Classic 13.2 (Windows)"),
+            true,
+        );
+        let (usable, rows) = split_renders(&plan, &pair, &HashSet::new());
+        assert!(usable.is_empty());
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.kind == FailureKind::EditorExport));
+        assert!(
+            rows[0]
+                .message
+                .starts_with("Exported from Adobe Lightroom.")
+        );
+
+        let plan = plan_for(&pair, Some("iOS 17.5.1"), false);
+        let (usable, rows) = split_renders(&plan, &pair, &HashSet::new());
+        assert!(usable.is_empty());
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.kind == FailureKind::Resaved));
+        assert_eq!(
+            rows[0].message,
+            "This JPEG has no camera settings. Use the original from the memory card."
+        );
     }
 
     #[test]
@@ -5132,7 +5464,7 @@ mod tests {
             raw: "a.raf".to_owned(),
             jpegs: vec!["a-acros.jpg".to_owned(), "a-provia.jpg".to_owned()],
         };
-        let (usable, rows) = split_renders(&pair, &HashSet::new());
+        let (usable, rows) = split(&pair, &HashSet::new());
         assert_eq!(
             usable.iter().map(RenderFile::as_str).collect::<Vec<_>>(),
             vec!["a-acros.jpg", "a-provia.jpg"]
@@ -5145,7 +5477,7 @@ mod tests {
         let row = |name: &str, message: &str| FailureRow {
             name: name.to_owned(),
             message: message.to_owned(),
-            donated: false,
+            kind: FailureKind::Other,
         };
         let groups = group_failures(vec![
             row("a.jpg", MONOCHROME_UNSELECTED),
@@ -5741,6 +6073,82 @@ epochs:
     }
 
     #[test]
+    fn a_large_selection_is_chunked_at_the_upload_limit() {
+        let readings = (0..101)
+            .map(|index| reading(&format!("a{index}.raf"), "fujifilm", "x-t5", "provia", 0))
+            .collect::<Vec<_>>();
+        let set = BatchSet::from_readings(&readings);
+        assert_eq!(set.groups().len(), 2);
+        assert_eq!(set.groups()[0].renders.len(), DEFAULT_MAX_IMAGES);
+        assert_eq!(set.groups()[1].renders.len(), 1);
+    }
+
+    #[test]
+    fn unselected_bw_batches_do_not_count_toward_the_send_gate() {
+        let mut readings = (0..64)
+            .map(|index| {
+                reading(
+                    &format!("a{index}.raf"),
+                    "fujifilm",
+                    "x-t5",
+                    "provia",
+                    index as i64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut bw = reading("bw.raf", "fujifilm", "x-t5", "acros", 0);
+        bw.monochrome = vec![looklab_wasm::MonochromeRender {
+            file: "bw.raf.jpg".to_owned(),
+            sim: "acros".to_owned(),
+        }];
+        readings.push(bw);
+        let set = BatchSet::from_readings(&readings);
+        assert_eq!(set.groups().len(), 65);
+        assert_eq!(set.sendable_count(), 64);
+    }
+
+    #[test]
+    fn chunk_edits_and_serial_opt_in_reach_every_chunk() {
+        let readings = (0..101)
+            .map(|index| reading(&format!("a{index}.raf"), "fujifilm", "x-t5", "provia", 0))
+            .collect::<Vec<_>>();
+        let mut set = BatchSet::from_readings(&readings);
+        let first = set.groups()[0].id;
+        set.set_serial(first, true);
+        set.update(first, |group| {
+            group.fields.controls = "color=1".to_owned();
+        });
+        assert!(set.groups().iter().all(|group| group.serial_opt_in));
+        assert!(
+            set.groups()
+                .iter()
+                .all(|group| group.fields.controls == "color=1")
+        );
+    }
+
+    #[test]
+    fn a_re_render_group_is_not_split_between_batches() {
+        let mut readings = (0..99)
+            .map(|index| reading(&format!("a{index}.raf"), "fujifilm", "x-t5", "provia", 0))
+            .collect::<Vec<_>>();
+        for render in ["a99.jpg", "b99.jpg", "c99.jpg"] {
+            readings.push(render_reading(
+                "a99.raf", render, "fujifilm", "x-t5", "provia", 0, "1.00",
+            ));
+        }
+        let set = BatchSet::from_readings(&readings);
+        assert_eq!(set.groups().len(), 2);
+        assert_eq!(set.groups()[0].renders.len(), 99);
+        assert_eq!(set.groups()[1].renders.len(), 3);
+        assert!(
+            set.groups()[1]
+                .renders
+                .iter()
+                .all(|render| render.as_str().ends_with("99.jpg"))
+        );
+    }
+
+    #[test]
     fn mixed_cameras_looks_and_settings_get_their_own_batch() {
         let readings = vec![
             reading("a.raf", "fujifilm", "x-t5", "provia", 0),
@@ -5869,7 +6277,7 @@ epochs:
                 "RENDER-ACROS.JPG".to_owned(),
             ],
         };
-        let (usable, rows) = split_renders(&pair, &HashSet::from(["RENDER-ACROS.JPG".to_owned()]));
+        let (usable, rows) = split(&pair, &HashSet::from(["RENDER-ACROS.JPG".to_owned()]));
 
         assert_eq!(
             usable.iter().map(RenderFile::as_str).collect::<Vec<_>>(),

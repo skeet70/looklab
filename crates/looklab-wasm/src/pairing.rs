@@ -47,6 +47,8 @@ pub struct FileFacts {
     pub model: Option<String>,
     pub firmware: Option<String>,
     pub has_serial: bool,
+    pub software: Option<String>,
+    pub has_makernotes: bool,
     pub render_tag: Option<looklab_meta::RenderTag>,
     pub render_tag_malformed: bool,
 }
@@ -114,6 +116,8 @@ pub fn inspect_metadata(files: &[MetadataFile]) -> Result<PairingPlan, FacadeErr
                     model: None,
                     firmware: None,
                     has_serial: false,
+                    software: None,
+                    has_makernotes: false,
                     render_tag: None,
                     render_tag_malformed: false,
                 });
@@ -172,6 +176,8 @@ fn facts_of(name: &str, kind: FileKindView, metadata: &ParsedMetadata) -> FileFa
         model: metadata.exif.model.clone(),
         firmware: metadata.firmware.clone(),
         has_serial: metadata.body_serial().is_some(),
+        software: metadata.exif.software.clone(),
+        has_makernotes: looklab_meta::has_makernotes(metadata),
         render_tag: metadata.render_tag.valid().cloned(),
         render_tag_malformed: metadata.render_tag.is_malformed(),
     }

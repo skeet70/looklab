@@ -50,7 +50,6 @@
 .excluded { margin-block: 1.25rem; }
 .excluded-files ul { margin-block: .5rem; }
 .excluded-files li { margin-block: .3rem; }
-.excluded-donate { margin-inline-start: .75rem; padding: .25rem .5rem; font-size: var(--text-small); }
 .send-progress { margin-block-start: 1rem; max-width: 36rem; }
 .send-progress progress { display: block; width: 100%; }
 .status-links { overflow-wrap: anywhere; }

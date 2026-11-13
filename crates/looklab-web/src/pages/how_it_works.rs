@@ -68,7 +68,7 @@ pub fn HowItWorksPage() -> impl IntoView {
             <section>
                 <h2>"Where things stand"</h2>
                 <p>"A look publishes once its photos pass review. It shows as Experimental for a camera until independent photo sets from that camera let it be checked for those settings, and more photos widen what the estimate covers. The number of photos behind a look says how much evidence exists, not how accurate the result is."</p>
-                <p>"There's nothing to send us. Your browser reads the photos here and sends only color samples and the camera settings they were shot with, after you review them."</p>
+                <p>"There's nothing to send us. Your browser reads the photos here and sends only color samples and photo details (camera, lens, settings and month taken), after you review them."</p>
                 <p class="field-row">
                     <a class="button" href=site_url("/contribute/wanted")>"See which shots we need"</a>
                     <a href=site_url("/contribute")>"Help with photos"</a>
