@@ -671,7 +671,7 @@ fn OutputMethodPicker(
                 {[
                     (Application::Camera, "In-camera settings", "A menu-by-menu recipe for your camera."),
                     (Application::Card, "Custom firmware", "A card for firmware that loads looklab looks."),
-                    (Application::Software, "Editing app", "An export for a published software pipeline."),
+                    (Application::Software, "Editing app", "An export for an app with a published pipeline."),
                 ].into_iter().map(move |(choice, label, detail)| view! {
                     <button
                         type="button"

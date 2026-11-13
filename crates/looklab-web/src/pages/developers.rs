@@ -445,7 +445,7 @@ pub fn PipelinesPage() -> impl IntoView {
             <header>
                 <p class="eyebrow">"For editing-app authors"</p>
                 <h1>"Bring looks into your editing app"</h1>
-                <p class="lede">"An interface profile tells looklab where your app applies a look, what it accepts and what happens afterward."</p>
+                <p class="lede">"An editing-app pipeline tells looklab where your app applies a look, what it accepts and what happens afterward."</p>
             </header>
             <section>
                 <h2>"Describe your pipeline"</h2>
@@ -457,26 +457,26 @@ pub fn PipelinesPage() -> impl IntoView {
                     <dt>"What happens afterward"</dt>
                     <dd>"Output transforms, tone processing and clipping. A round-trip report measures what the export can and cannot reproduce."</dd>
                 </dl>
-                <p>"Profiles are for software pipelines. Camera firmware implements the card format instead."</p>
+                <p>"A pipeline describes a software app. Camera firmware implements the card format instead."</p>
             </section>
             <section>
-                <h2>"Published profiles"</h2>
+                <h2>"Published pipelines"</h2>
                 <PublishedProfiles/>
                 <p>
                     <a href="https://github.com/skeet70/looklab/tree/main/data/interfaces">
-                        "Browse interface profiles in the repository"
+                        "Browse editing-app pipelines in the repository"
                     </a>
                 </p>
             </section>
             <section>
                 <h2>"Add your editing app"</h2>
-                <p>"Propose a profile as a form or YAML. The submission flow generates a round-trip report for review."</p>
+                <p>"Propose a pipeline as a form or YAML. The submission flow generates a round-trip report for review."</p>
                 <a class="button" href=site_url("/community/propose?kind=interface_profile")>
-                    "Propose an editing-app profile"
+                    "Propose an editing-app pipeline"
                 </a>
                 <p>
                     <a href="https://github.com/skeet70/looklab/blob/main/docs/04-matching-and-export.md#6-interface-profiles-software-pipelines">
-                        "Read the interface profile specification"
+                        "Read the editing-app pipeline specification"
                     </a>
                 </p>
             </section>
@@ -499,8 +499,8 @@ fn PublishedProfiles() -> impl IntoView {
             data::Load::Failed(error) => crate::ui::failure(&error).into_any(),
             data::Load::Ready(entries) if entries.is_empty() => view! {
                 <EmptyState
-                    title="No profiles published in this site data".to_owned()
-                    message="Approved editing-app profiles include a pipeline definition and its reference round-trip report.".to_owned()
+                    title="No pipelines published in this site data".to_owned()
+                    message="Approved editing-app pipelines include a definition and its reference round-trip report.".to_owned()
                 />
             }.into_any(),
             data::Load::Ready(entries) => view! {
@@ -536,11 +536,10 @@ fn PublishedProfile(entry: looklab_publish::InterfaceProfileEntry) -> impl IntoV
     view! {
         <article>
             <h3>{name}</h3>
-            <p>"A software pipeline definition, not a photo-editing preset."</p>
             <button type="button" disabled=move || loading.get() on:click=load>
                 "View pipeline and reference check"
             </button>
-            {move || loading.get().then(|| view! { <p role="status">"Checking published profile artifacts…"</p> })}
+            {move || loading.get().then(|| view! { <p role="status">"Checking published pipeline artifacts…"</p> })}
             {move || state.get().map(|result| match result {
                 Err(error) => crate::ui::failure(&error).into_any(),
                 Ok(profile) => {
@@ -570,9 +569,9 @@ fn PublishedProfile(entry: looklab_publish::InterfaceProfileEntry) -> impl IntoV
                                     state.set(Some(Err(error)));
                                 }
                             }>"Download reference report"</button>
-                            <a href=site_url("/match?apply=software")>"Use an editing-app profile"</a>
+                            <a href=site_url("/match?apply=software")>"Use an editing-app pipeline"</a>
                         </div>
-                        <Disclosure summary="Profile identity".to_owned()>
+                        <Disclosure summary="Pipeline identity".to_owned()>
                             <p>{format!("{} · definition format version {} · revision {}", profile.manifest.id, profile.manifest.version, profile.pin.manifest_sha256)}</p>
                         </Disclosure>
                     }.into_any()

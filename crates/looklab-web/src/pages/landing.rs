@@ -57,7 +57,7 @@ pub fn Landing() -> impl IntoView {
             Load::Ready(HomeReady::Choices { index, scene }) => view! { <HomeChoices index=*index scene/> }.into_any(),
         }}
         <Show when=move || state.with(|state| !matches!(state, Load::Ready(HomeReady::NoPublishedLooks)))>
-            <section class="home-help"><div><h2>"Where the looks come from"</h2><p>"Built-in looks are measured from RAW and JPEG pairs that people share. About a minute with photos you already have."</p></div><a class="button" href=crate::base::site_url("/contribute")>"Help build looks"</a></section>
+            <section class="home-help"><div><h2>"Where the looks come from"</h2><p>"Built-in looks are measured from RAW and JPEG pairs that people share. About a minute with photos you already have."</p><p>"Custom looks are .cube LUTs that people made and share. " <a href=crate::base::site_url("/community/propose?kind=lut_look")>"Add a custom look"</a></p></div><a class="button" href=crate::base::site_url("/contribute")>"Help build looks"</a></section>
         </Show>
         <section class="home-developers"><p>"Building camera firmware? Your firmware can load these looks from a card file."</p><a href=crate::base::site_url("/developers")>"For developers →"</a></section>
     }

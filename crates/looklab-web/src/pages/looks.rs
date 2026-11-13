@@ -217,7 +217,10 @@ pub fn LooksPage() -> impl IntoView {
         });
     });
     view! {
-        <h1>"Look gallery"</h1>
+        <div class="section-heading">
+            <h1>"Look gallery"</h1>
+            <a href=crate::base::site_url("/community/propose?kind=lut_look")>"Add a custom look"</a>
+        </div>
         <p class="lede">"Discover what makes other cameras special. Bring it to yours."</p>
         {move || match state.get() {
             Load::Loading => ui::loading().into_any(), Load::Failed(error) => ui::failure(&error).into_any(),
@@ -227,6 +230,9 @@ pub fn LooksPage() -> impl IntoView {
             },
             Load::Ready(Gallery::Ready(ready)) => {
                 let GalleryReady { bodies, scene, items, availability } = *ready;
+                let filter_bodies = bodies.clone();
+                let has_custom = items.iter().any(|item| matches!(item.origin, ui::LookOrigin::Custom { .. }));
+                let gallery_scene = scene.clone();
                 view! {
                     {(availability == CatalogAvailability::ExperimentalOnly).then(|| view! {
                         <ui::Notice
@@ -240,28 +246,52 @@ pub fn LooksPage() -> impl IntoView {
                     <label for="look-filter">"Search looks"</label>
                     <input id="look-filter" type="search" placeholder="Search by name or character" on:input=move |event| filter.set(event_target_value(&event))/>
                     <ui::CameraPicker cameras=bodies.clone() selected=camera label="Filter by camera".to_owned()/>
-                    <div class="look-gallery">{move || {
+                    {move || {
                         let needle = filter.get().to_lowercase();
                         let selected = camera.get();
-                        items.iter()
-                            .filter(|item| {
-                                let matches_text = needle.is_empty()
-                                    || item.name.to_lowercase().contains(&needle)
-                                    || item.character.to_lowercase().contains(&needle);
-                                let matches_camera = selected.as_ref().is_none_or(|id| {
-                                    bodies.iter().any(|body| &body.id == id && body.looks.contains(&item.slug))
-                                });
-                                matches_text && matches_camera
-                            })
+                        let matches = |item: &ui::LookCardItem| {
+                            let matches_text = needle.is_empty()
+                                || item.name.to_lowercase().contains(&needle)
+                                || item.character.to_lowercase().contains(&needle);
+                            let matches_camera = selected.as_ref().is_none_or(|id| {
+                                filter_bodies.iter().any(|body| &body.id == id && body.looks.contains(&item.slug))
+                            });
+                            matches_text && matches_camera
+                        };
+                        let built_in = items.iter()
+                            .filter(|item| matches!(item.origin, ui::LookOrigin::BuiltIn { .. }) && matches(item))
                             .cloned()
                             .map(|mut item| {
                                 item.evidence = evidence.get().get(item.slug.as_str()).cloned();
-                                view! {
-                                    <ui::LookCard item scene=scene.clone()/>
-                                }
+                                view! { <ui::LookCard item scene=gallery_scene.clone()/> }
                             })
-                            .collect_view()
-                    }}</div>
+                            .collect_view();
+                        let custom = items.iter()
+                            .filter(|item| matches!(item.origin, ui::LookOrigin::Custom { .. }) && matches(item))
+                            .cloned()
+                            .map(|mut item| {
+                                item.evidence = evidence.get().get(item.slug.as_str()).cloned();
+                                view! { <ui::LookCard item scene=gallery_scene.clone()/> }
+                            })
+                            .collect_view();
+                        view! {
+                            <h2>"Built-in looks"</h2>
+                            <div class="look-gallery">{built_in}</div>
+                            <h2>"Custom looks"</h2>
+                            {if has_custom {
+                                view! { <div class="look-gallery">{custom}</div> }.into_any()
+                            } else {
+                                view! {
+                                    <ui::EmptyState
+                                        title="No custom looks yet".to_owned()
+                                        message="Custom looks are .cube LUTs that people made and share.".to_owned()
+                                    >
+                                        <a href=crate::base::site_url("/community/propose?kind=lut_look")>"Add a custom look"</a>
+                                    </ui::EmptyState>
+                                }.into_any()
+                            }}
+                        }
+                    }}
                 }.into_any()
             }
         }}

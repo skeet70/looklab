@@ -657,8 +657,9 @@ pub fn Disclosure(
     summary: String,
     children: Children,
     #[prop(default = false)] open: bool,
+    #[prop(optional)] id: Option<String>,
 ) -> impl IntoView {
-    view! { <details class="disclosure" open=open><summary>{summary}</summary>{children()}</details> }
+    view! { <details class="disclosure" id=id open=open><summary>{summary}</summary>{children()}</details> }
 }
 
 /// Native modal dialog with browser focus containment and Escape dismissal.
