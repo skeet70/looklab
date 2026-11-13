@@ -10,21 +10,75 @@ pub fn HowItWorksPage() -> impl IntoView {
             <header>
                 <p class="eyebrow">"Method"</p>
                 <h1>"How looks are measured and matched"</h1>
-                <p class="lede">"A look describes how colors and brightness change in a photograph. looklab measures that character, then helps you bring it to another camera."</p>
-                <a class="button" href=site_url("/looks")>"Browse looks"</a>
+                <p class="lede">"looklab measures camera looks from shared photos, then gives you settings for your camera or a card file for custom firmware."</p>
+                <p class="field-row">
+                    <a class="button" href=site_url("/looks")>"Browse looks"</a>
+                    <a class="button" href=site_url("/community/propose?kind=lut_look")>"Add a custom look"</a>
+                    <a class="button" href=site_url("/contribute")>"Help with photos"</a>
+                </p>
             </header>
+            <ol class="developer-steps">
+                <li>
+                    <span class="developer-step-number">"01"</span>
+                    <h2>"Bring photos"</h2>
+                    <p>"Share RAW and straight-from-camera JPEG pairs you already have."</p>
+                </li>
+                <li>
+                    <span class="developer-step-number">"02"</span>
+                    <h2>"We measure the look"</h2>
+                    <p>"Comparing each pair separates the look from the camera that recorded it."</p>
+                </li>
+                <li>
+                    <span class="developer-step-number">"03"</span>
+                    <h2>"You get settings or a card file"</h2>
+                    <p>"Use the closest menu settings on your camera, or load the look with custom firmware."</p>
+                </li>
+            </ol>
             <section>
-                <h2>"Measured from real photographs"</h2>
-                <p>"A camera’s RAW file records the light it captured. Its JPEG shows how a built-in look rendered that light. Comparing the pair lets us measure contrast, tint, saturation, hue and color brightness."</p>
-                <p>"Shared pairs from different cameras and lighting conditions help separate the look from the camera that made it. More varied photos strengthen the estimate, especially in shadows, highlights and less common colors."</p>
-                <p>"Your photos stay on your device. When you contribute, only shuffled color samples and selected camera settings are sent, after you review them."</p>
-                <a href=site_url("/contribute")>"Help with photos you already have"</a>
+                <h2>"Two kinds of looks"</h2>
+                <p>"Built-in looks are the film simulations and picture styles a camera ships with, measured from RAW and straight-from-camera (SOOC) JPEG pairs. Photos from many cameras help separate the look from the sensor that recorded it."</p>
+                <p>"Custom looks are .cube LUTs that people made and share. They need no photos of their own, except to measure the look they were built on."</p>
+                <p>"A LUT made on top of a film simulation depends on that simulation. Until it's measured, your look can be previewed but has no settings or card file. Photos of that simulation help."</p>
             </section>
             <section>
-                <h2>"See the character, then get the settings"</h2>
-                <p>"Compare looks on the same sample photograph, or choose your camera to get a recipe. Your camera’s controls may not reach every part of another camera’s look. The result explains what is close and what will still differ."</p>
-                <p>"Every preview is simulated by our model. It is not a photograph taken by your camera at those settings. Checking with your own shots measures the result and can improve the suggestion."</p>
-                <a href=site_url("/match")>"Get a look on your camera"</a>
+                <h2>"What you get"</h2>
+                <dl class="developer-definition-list">
+                    <dt>"In-camera settings"</dt>
+                    <dd>"The closest menu settings on your camera."</dd>
+                    <dt>"Card file"</dt>
+                    <dd>"A .llk file custom firmware loads as an in-camera look, reaching more of the camera's pipeline than menu settings."</dd>
+                    <dt>"Editing app"</dt>
+                    <dd>"An export for apps with a published pipeline."</dd>
+                </dl>
+                <p>"Menu settings are as close as your camera's own controls can get. They may not reach every part of another camera's look."</p>
+                <p class="field-row">
+                    <a class="button" href=site_url("/match")>"Get the look"</a>
+                    <a href=site_url("/developers")>"For developers"</a>
+                </p>
+            </section>
+            <section>
+                <h2>"Why straight-from-camera JPEGs"</h2>
+                <p>"A straight-from-camera JPEG shows how the camera rendered its RAW. An edited or exported JPEG shows your edit, so it can't measure the camera's look."</p>
+                <p>
+                    "Presets from Lightroom, RapidRAW or Capture One can't be added directly. "
+                    <a href=site_url("/community/propose?kind=lut_look#from-a-preset")>"Convert the preset to a .cube LUT"</a>
+                    ", then add it as a custom look. Global color and tone carry over; masks, vignettes, grain and sharpening don't."
+                </p>
+            </section>
+            <section>
+                <h2>"Where things stand"</h2>
+                <p>"Each look is measured per camera. It publishes for a camera as independent photo sets for that camera arrive, and more photos widen what the estimate covers. The number of photos behind a look says how much evidence exists, not how accurate the result is."</p>
+                <p>"There's nothing to send us. Your browser reads the photos here and sends only color samples, after you review them. Large folders are fine."</p>
+                <p class="field-row">
+                    <a class="button" href=site_url("/contribute/wanted")>"See which shots we need"</a>
+                    <a href=site_url("/contribute")>"Help with photos"</a>
+                </p>
+            </section>
+            <section>
+                <h2>"For firmware projects"</h2>
+                <p>"A card file is not tied to one camera. Your firmware reads the card and translates it into its own pipeline, so the look can reach more of the camera than menu settings do."</p>
+                <p>"Card loaders are written by firmware projects. The firmware already verified from tagged renders is listed on For developers, together with the format to implement."</p>
+                <a class="button" href=site_url("/developers")>"For developers"</a>
             </section>
             <section>
                 <h2>"What does “close” mean?"</h2>
