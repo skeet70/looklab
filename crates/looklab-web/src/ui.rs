@@ -67,10 +67,11 @@ pub fn no_published_looks() -> impl IntoView + use<> {
     view! {
         <EmptyState
             title="No looks are published yet".to_owned()
-            message="looklab measures a camera's color from RAW and JPEG pairs shared by the people who shoot it. Looks are published once a camera has enough checked photos.".to_owned()
+            message="looklab measures a camera's color from RAW and straight-from-camera JPEG pairs that people share. A look appears once enough of those pairs have been measured and checked. Photos from more shoots let the settings it gives you be checked too.".to_owned()
         >
             <p class="field-row">
                 <a class="button" href=crate::base::site_url("/contribute")>"Share photos you already have"</a>
+                <a href=crate::base::site_url("/contribute/wanted#where-things-stand")>"See where things stand for each camera →"</a>
                 <a href=crate::base::site_url("/about/how-it-works")>"How looks are made →"</a>
             </p>
         </EmptyState>
