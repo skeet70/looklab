@@ -204,12 +204,10 @@ pub(crate) fn ExperimentalEvidence(
     let (line, action) = match detail {
         Some(detail) => (
             format!("Experimental: {detail}"),
-            Some(
-                "More independent photos (different scenes) of this film simulation on that camera help.",
-            ),
+            Some("More independent photos, from different scenes, help check this look."),
         ),
         None => (
-            "Experimental: this target is not a qualified result for these settings.".to_owned(),
+            "Experimental: no checked result covers these settings yet.".to_owned(),
             None,
         ),
     };

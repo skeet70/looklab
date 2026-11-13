@@ -107,60 +107,62 @@ fn reachability_text(reachability: &looklab_wasm::dto::ReachabilityDto) -> Strin
     let base = if reachability.assessed == 0 {
         match reachability.status {
             ReachabilityStatus::NoRecipeFound => format!(
-                "No recipe found: {} of {} rendered points stay within {:.1} ΔE; no assessed target uncertainty or validated domain covers these points.",
+                "No recipe stays close at every point we could render: {} of {} points are within {:.1} ΔE. We could not check the target's uncertainty or these colours.",
                 reachability.within_tolerance, reachability.evaluated, reachability.tolerance
             ),
-            _ => "Reachability is unassessed: no assessed target uncertainty or validated domain covers these points.".to_owned(),
+            _ => "We could not check how close this recipe stays: the target's uncertainty and these colours are not covered by a check yet.".to_owned(),
         }
     } else {
         match reachability.status {
             ReachabilityStatus::Reachable => format!(
-                "One settings recipe is predicted to stay within {:.1} ΔE at every assessed point ({} of {} assessed).",
-                reachability.tolerance, reachability.within_assessed, reachability.declared
+                "One recipe is predicted to stay close at every point checked ({} of {}).",
+                reachability.within_assessed, reachability.declared
             ),
             ReachabilityStatus::Partial => format!(
-                "Partial predicted reachability: {} of {} assessed points stay within {:.1} ΔE with one settings recipe.",
-                reachability.within_assessed, reachability.declared, reachability.tolerance
+                "One recipe is predicted to stay close at {} of {} points checked.",
+                reachability.within_assessed, reachability.declared
             ),
             ReachabilityStatus::NoRecipeFound => format!(
-                "No recipe found: {} of {} assessed points stay within {:.1} ΔE with one settings recipe.",
+                "No recipe stays close at every point checked: {} of {} points are within {:.1} ΔE.",
                 reachability.within_assessed, reachability.assessed, reachability.tolerance
             ),
             ReachabilityStatus::Unassessed => {
-                "Reachability is unassessed for these points.".to_owned()
+                "We could not check how close this recipe stays across these points yet.".to_owned()
             }
         }
     };
     let rendered = format!(
-        "Rendered evaluation: {} of {} evaluated points within {:.1} ΔE.",
+        "Across the colours we could render, {} of {} points are within {:.1} ΔE.",
         reachability.within_tolerance, reachability.evaluated, reachability.tolerance
     );
     let settings = match reachability.settings {
-        SettingsSupport::Assessed => "settings support assessed",
-        SettingsSupport::Extrapolated => "settings support extrapolated",
-        SettingsSupport::Missing => "settings support missing",
+        SettingsSupport::Assessed => "settings checked",
+        SettingsSupport::Extrapolated => "settings extrapolated",
+        SettingsSupport::Missing => "settings missing",
     };
     let domain = if reachability.domain_assessed {
-        "validated assessment domain"
+        "colours covered by a check"
     } else {
-        "no validated assessment domain"
+        "colours not covered by a check"
     };
     let uncertainty = match reachability.uncertainty {
-        AssessmentStatus::Assessed => "target uncertainty assessed",
-        AssessmentStatus::Partial => "target uncertainty partial",
-        AssessmentStatus::Unassessed => "target uncertainty unassessed",
+        AssessmentStatus::Assessed => "target uncertainty checked",
+        AssessmentStatus::Partial => "target uncertainty partly checked",
+        AssessmentStatus::Unassessed => "target uncertainty not checked",
     };
-    format!("{base} {rendered} Evidence: {settings}; {domain}; {uncertainty}.")
+    format!("{base} {rendered} What we could check: {settings}, {domain}, {uncertainty}.")
 }
 
 fn joint_uncertainty_text(status: AssessmentStatus) -> &'static str {
     match status {
-        AssessmentStatus::Assessed => "Joint prediction-minus-target uncertainty is assessed.",
+        AssessmentStatus::Assessed => {
+            "Joint uncertainty between the prediction and the target is checked."
+        }
         AssessmentStatus::Partial => {
-            "Joint prediction-minus-target uncertainty is partially assessed."
+            "Joint uncertainty between the prediction and the target is partly checked."
         }
         AssessmentStatus::Unassessed => {
-            "Joint prediction-minus-target uncertainty is unassessed: no target/camera cross-covariance."
+            "Joint uncertainty between the prediction and the target is not checked: no shared uncertainty estimate is available."
         }
     }
 }
@@ -247,14 +249,14 @@ pub fn MatchPage() -> impl IntoView {
                         None => crate::selection::catalog_version(look),
                     })
                     .filter(|version| version.matchable)
-                    .ok_or("Choose a matchable published look.")?
+                    .ok_or("Choose a published look that can be matched.")?
                     .version
                     .to_string();
                 target_version.set(Some(version.clone()));
                 let loaded = data::match_version(slug.as_str(), &version).await?;
                 let page = data::look(slug.as_str()).await?;
                 let Some(body_page) = body.get_untracked() else {
-                    return Err("Camera settings are not loaded.".to_owned());
+                    return Err("Your camera settings are still loading.".to_owned());
                 };
                 let scoped = match_data::inputs_for_camera(match_data::MatchRequest {
                     version: &loaded,
@@ -448,7 +450,7 @@ pub fn MatchPage() -> impl IntoView {
                         .map(looklab_model::file::LookVersion::new).transpose()
                     {
                         Ok(version) => version,
-                        Err(error) => return ui::failure(&format!("Invalid target version: {error}")).into_any(),
+                        Err(error) => return ui::failure(&format!("That version is not available. {error}")).into_any(),
                     };
                     return view! {
                         <TargetOutput index selected scene application=application.get() requested/>
@@ -648,7 +650,7 @@ pub fn MatchPage() -> impl IntoView {
                         <button class="secondary" on:click=move |_| {
                             mode.set(looklab_publish::SelectionScope::Experimental);
                             run.run(());
-                        }>"Try experimental matching"</button>
+                        }>"Try an experimental match"</button>
                     })}
                 </p>
             </div>
@@ -668,7 +670,7 @@ fn OutputMethodPicker(
             <div class="match-methods">
                 {[
                     (Application::Camera, "In-camera settings", "A menu-by-menu recipe for your camera."),
-                    (Application::Card, "Custom firmware", "A target card for firmware that loads looklab looks."),
+                    (Application::Card, "Custom firmware", "A card for firmware that loads looklab looks."),
                     (Application::Software, "Editing app", "An export for a published software pipeline."),
                 ].into_iter().map(move |(choice, label, detail)| view! {
                     <button
@@ -739,8 +741,8 @@ fn TargetOutput(
     if items.is_empty() && requested.get_untracked().is_none() {
         return view! {
             <ui::EmptyState
-                title="No target downloads are published yet".to_owned()
-                message="Published target downloads do not depend on an in-camera settings model.".to_owned()
+                title="No card downloads are available yet".to_owned()
+                message="Firmware cards are published for the look itself. They do not need a settings model for your camera.".to_owned()
             />
         }.into_any();
     }
@@ -765,12 +767,12 @@ fn TargetOutput(
                     None => crate::selection::catalog_version(&target),
                 };
                 let Some(version) = chosen else {
-                    return ui::failure("The requested target version is not published.").into_any();
+                    return ui::failure("That version of this look is not published.").into_any();
                 };
                 match application {
                     Application::Card => view! {
                         <h3>{target.name.clone()}</h3>
-                        <p>"The firmware translates this body-agnostic target into its own pipeline. No camera model, settings fit or control-response model is required."</p>
+                        <p>"Your firmware translates this look for its own pipeline. No camera settings model or matching result is needed."</p>
                         <TargetCardDownload slug version=version.version.clone()/>
                     }.into_any(),
                     Application::Software => view! {
@@ -987,17 +989,17 @@ fn MatchResult(
             {(application == Application::Card).then(|| view! {
                 <section class="match-download">
                     <h3>"Card file"</h3>
-                    <p>"This is the look's target card, not a camera realization. It does not use this camera's model or settings. Firmware translation is verified separately and is not guaranteed."</p>
+                    <p>"This is the look's card, not a result for one camera. It does not use this camera's settings model. Firmware translates it, and that translation is not checked here."</p>
                     {card_experimental.map(|images| view! {
                         <p class="notice" role="note">
                             {format!(
-                                "This card is experimental: the target rests on {} {} with no independently checked region yet. ",
+                                "This card is experimental: the target rests on {} {} and no region has been checked against independent photos yet. ",
                                 images.get(),
                                 if images.get() == 1 { "image" } else { "images" }
                             )}
                             <a href=crate::base::site_url("/contribute/wanted")>"Help with a few more shots →"</a>
                         </p>
-                        <p class="muted">"More independent photos (different scenes) of this film simulation on this camera help."</p>
+                        <p class="muted">"More independent photos, from different scenes, help check this look."</p>
                     })}
                     <p>"Use firmware that supports looklab cards. Copy this file to your card’s look folder, then choose it in the firmware’s look menu."</p>
                     <a href=crate::base::site_url("/developers")>
@@ -1045,7 +1047,7 @@ fn recipe_text(
 ) -> String {
     let mut text = format!(
         "looklab settings\nFilm simulation: {}\nScoring metric: {}\n",
-        sim_name(&card.sim),
+        data::sim_name(&card.sim),
         card.metric.identity()
     );
     match card.output {
@@ -1081,7 +1083,7 @@ fn recipe_text(
     text.push('\n');
     if let Some(images) = card.experimental {
         text.push_str(&format!(
-            "Support: experimental estimate resting on {} {}; no region has an independent held-out check.\n",
+            "Support: an experimental estimate from {} {}; no region has been checked against independent photos.\n",
             images.get(),
             if images.get() == 1 { "image" } else { "images" }
         ));
@@ -1140,7 +1142,7 @@ pub fn Card(
     regions.sort_unstable();
     regions.dedup();
     let regions_text = if card.reachability.assessed == 0 {
-        "No assessed regions are available; the rendered evaluation is descriptive only.".to_owned()
+        "No regions have been checked, so the rendered evaluation is descriptive only.".to_owned()
     } else if regions.is_empty() {
         "Nothing noticeable is predicted to differ.".to_owned()
     } else {
@@ -1181,7 +1183,7 @@ pub fn Card(
                 {card.experimental.map(|images| view! {
                     <p class="notice" role="note">
                         {format!(
-                            "This estimate rests on {} {} with no independently checked region. ",
+                            "This estimate rests on {} {} and no region has been checked against independent photos. ",
                             images.get(),
                             if images.get() == 1 { "image" } else { "images" }
                         )}
@@ -1191,7 +1193,7 @@ pub fn Card(
             </header>
             <dl class="recipe-settings">
                 <dt>"Film simulation"</dt>
-                <dd>{sim_name(&card.sim)}</dd>
+                <dd>{data::sim_name(&card.sim)}</dd>
                 {move || {
                     let mut entries = entries.clone();
                     let camera = body.and_then(|body| body.get());
@@ -1315,16 +1317,13 @@ pub fn MatchResultPage() -> impl IntoView {
                     );
                 }
                 if replay && reply.permalink != pinned.canonical() {
-                    return Err(
-                        "These pinned versions no longer reproduce the recorded recipe.".into(),
-                    );
+                    return Err("The saved versions no longer reproduce this recipe.".into());
                 }
                 let mut blockers = scoped.blockers;
                 if replay {
                     blockers.insert(
                         0,
-                        "This is a pinned internal replay of the calculation as recorded."
-                            .to_owned(),
+                        "This replays the saved calculation as it was recorded.".to_owned(),
                     );
                 }
                 Ok((
@@ -1437,7 +1436,7 @@ fn InlineVerification(inputs: MatchInputs) -> impl IntoView {
                     "Partial assessment: some declared settings or contributor cells are assessed; significance is not complete."
                 }
                 AssessmentStatus::Unassessed => {
-                    "Descriptive only: joint uncertainty and significance are unassessed for these captured colours."
+                    "Descriptive only: uncertainty and significance are not checked for these captured colours."
                 }
             };
             let metric = reply.first_measured.metric.identity();
@@ -1561,34 +1560,24 @@ fn excluded_note(excluded: &[looklab_publish::ExcludedSim]) -> Option<String> {
             let reason = match entry.reason {
                 looklab_publish::SimExclusion::NoPublishedLook => "no published look",
                 looklab_publish::SimExclusion::NoResponse => "no published response",
-                looklab_publish::SimExclusion::NoRealization => "no selected realization",
+                looklab_publish::SimExclusion::NoRealization => "no camera settings model selected",
                 looklab_publish::SimExclusion::UnacceptedRealization => {
-                    "the realization is not numerically valid or gate-passing"
+                    "the camera settings model did not pass its checks"
                 }
                 looklab_publish::SimExclusion::TargetIneligible => {
-                    "the pinned target is not eligible"
+                    "the saved target cannot be used for new matches"
                 }
                 looklab_publish::SimExclusion::UnassessedRealization => {
-                    "only unassessed legacy artifacts exist"
+                    "only older, unchecked files exist"
                 }
                 looklab_publish::SimExclusion::MissingFirmware => {
-                    "the realization has no offsets for the requested firmware"
+                    "the camera settings have no values for this firmware"
                 }
             };
-            format!("{} ({reason})", sim_name(&entry.sim))
+            format!("{} ({reason})", data::sim_name(&entry.sim))
         })
         .collect();
     Some(format!("Not considered: {}.", items.join(", ")))
-}
-
-fn sim_name(sim: &looklab_schema::SimKey) -> String {
-    match sim.as_str() {
-        "classic_chrome" => "Classic Chrome".into(),
-        "provia" => "PROVIA / Standard".into(),
-        "velvia" => "Velvia / Vivid".into(),
-        "astia" => "ASTIA / Soft".into(),
-        key => key.replace(['_', '-'], " "),
-    }
 }
 
 fn menu_value(value: &str) -> String {
@@ -1711,25 +1700,27 @@ fn TargetCardDownload(
             {blockers.into_iter().map(|blocker| view! { <p class="notice">{blocker}</p> }).collect_view()}
         })}
         {move || (available.get() == Some(true)).then(|| view! {
-            <p>"Custom firmware can load this look's target card; it does not use a camera realization."</p>
-            <button on:click=move |_| download.run(())>"Download the look's target card (.LLK)"</button>
-            <p class="muted">"Verified against the target version manifest. This download does not use a camera realization, control-response model or matching result."</p>
+            <p>"Custom firmware can load this look's firmware card. It does not use a camera settings model."</p>
+            <button on:click=move |_| download.run(())>"Download the firmware card (.LLK)"</button>
+            <p class="muted">"Checked against the version's file list. This download does not use a camera settings model or a matching result."</p>
         })}
         {move || (available.get() == Some(true) && experimental.get()).then(|| view! {
             <p class="notice" role="note">
-                "This card is experimental: the target is an early estimate with no independently checked region yet. "
+                "This card is experimental: the target is an early estimate, and no region has been checked against independent photos yet. "
                 <a href=crate::base::site_url("/contribute/wanted")>"Help with a few more shots →"</a>
             </p>
-            <p class="muted">"More independent photos (different scenes) of this film simulation on this camera help."</p>
-            <p class="muted">"An editing-app export is not offered for this target: export validation needs a supported probe, and this target has none yet."</p>
+            <p class="muted">"More independent photos, from different scenes, help check this look."</p>
+            <p class="muted">"There is no editing-app export for this target. Export validation needs a supported probe, and this target has none yet."</p>
         })}
         {move || (available.get() == Some(false)).then(|| view! {
             <p class="muted">{if approximated.get() {
-                "No card is offered for this target version: its fitted coefficients approximate a declared base, so it is an experimental approximation rather than the base itself."
+                "This version has no firmware card. It approximates a declared base, so it is an experimental approximation, not the base itself."
             } else {
                 match scope.get() {
-                    Some((looklab_publish::SelectionScope::Experimental, _)) => "No card is offered for this target version: its published files carry no card.",
-                    _ => "This look version has no publishable target card.",
+                    Some((looklab_publish::SelectionScope::Experimental, _)) => {
+                        "This version has no firmware card in its published files."
+                    }
+                    _ => "This version has no firmware card.",
                 }
             }}</p>
             <a href=crate::base::site_url("/contribute/wanted")>"Help with a few more shots →"</a>

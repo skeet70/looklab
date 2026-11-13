@@ -200,11 +200,11 @@ impl LookVersionPage {
 }
 
 /// The version notice for a target whose published support has no checked region.
-pub const UNCHECKED_REGION_NOTICE: &str = "Experimental early estimate: the fit converged, but no region has an independently checked measurement yet.";
+pub const UNCHECKED_REGION_NOTICE: &str = "Experimental early estimate: the calculation finished, but no region has been checked against independent photos yet.";
 
 const UNCHECKED_REGION_SPOT: &str = "the overall colour response";
 
-const UNCHECKED_REGION_NOTE: &str = "More independent photos (different scenes) of this film simulation on this camera would supply the missing check.";
+const UNCHECKED_REGION_NOTE: &str = "More independent photos, from different scenes, of this film simulation on this camera would supply the missing check.";
 
 fn source_preview(
     manifest: &VersionManifest,

@@ -231,7 +231,7 @@ pub fn LooksPage() -> impl IntoView {
                     {(availability == CatalogAvailability::ExperimentalOnly).then(|| view! {
                         <ui::Notice
                             kind=ui::NoticeKind::Warning
-                            message="These looks are experimental early estimates: each fit converged, but no region has an independently checked measurement yet. Numbers on these pages are not a measured rating.".to_owned()
+                            message="These looks are experimental early estimates. Their calculations finished, but no part has been checked against independent photos yet. The numbers on these pages are not a measured rating.".to_owned()
                         />
                         <p class="field-row">
                             <a href=crate::base::site_url("/contribute/wanted")>"Help with a few more shots →"</a>

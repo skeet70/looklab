@@ -280,7 +280,7 @@ fn displayed_scope(
             || {
                 (
                     SelectionScope::Unassessed,
-                    vec!["This version has no published page metadata.".to_owned()],
+                    vec!["This version's published details could not be read.".to_owned()],
                 )
             },
             |entry| crate::selection::version_scope(page, index, entry),
@@ -697,7 +697,10 @@ fn ComparisonView(ready: CompareReady) -> impl IntoView {
                             notes.push(format!("{name}: {}", data::source_preview_label(preview)));
                         }
                     }
-                    notes.push("The visual comparison uses each published preview LUT.".to_owned());
+                    notes.push(
+                        "This comparison shows published previews. There are no measured differences to rate."
+                            .to_owned(),
+                    );
                     let _ = comparison.try_set(Load::Ready(ComparisonOutcome::SourcePreview(
                         notes.join(" "),
                     )));
