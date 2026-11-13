@@ -125,6 +125,17 @@ pkgs.testers.runNixOSTest {
         assert packaged_transform_hash == machine.succeed(f"sha256sum {packaged_transform}").split()[0]
         assert host_transform_hash == machine.succeed(f"sha256sum {host_transform}").split()[0]
 
+    # Restoring seed data can request a publication; let it finish so the
+    # restart below is the only change under test.
+    pending = machine.succeed(
+        "sqlite3 -cmd '.timeout 5000' 'file:/var/lib/looklab/looklab.sqlite3?mode=ro' "
+        "\"SELECT generation FROM publication WHERE id = 1\""
+    ).strip()
+    machine.wait_until_succeeds(
+        "sqlite3 -cmd '.timeout 5000' 'file:/var/lib/looklab/looklab.sqlite3?mode=ro' "
+        f"\"SELECT published >= {pending} FROM publication WHERE id = 1\" | grep -qx 1",
+        timeout=120,
+    )
     machine.succeed("install -o looklab -g looklab -m 0600 /dev/null /var/lib/looklab/state-marker")
     secret = machine.succeed("sha256sum /var/lib/looklab/server-secret").split()[0]
     index = machine.succeed("sha256sum /var/lib/looklab/site/data/index.json").split()[0]
