@@ -961,11 +961,20 @@ async function pages() {
       const firstLookPattern = new RegExp(`^Simulated: ${firstLook.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`);
       const expectedLabels = new Map();
       const expectedKeys = new Map();
+      const menuNames = {
+        provia: 'PROVIA / Standard', velvia: 'Velvia / Vivid', astia: 'ASTIA / Soft',
+        classic_chrome: 'Classic Chrome', classic_negative: 'Classic Negative',
+        pro_neg_hi: 'PRO Neg. Hi', pro_neg_std: 'PRO Neg. Std', eterna: 'ETERNA / Cinema',
+        eterna_bleach_bypass: 'ETERNA Bleach Bypass', acros: 'ACROS',
+        acros_ye: 'ACROS + Ye Filter', acros_r: 'ACROS + R Filter', acros_g: 'ACROS + G Filter',
+        monochrome: 'Monochrome', monochrome_ye: 'Monochrome + Ye Filter',
+        monochrome_r: 'Monochrome + R Filter', monochrome_g: 'Monochrome + G Filter', sepia: 'Sepia',
+      };
       const sampleRequests = [];
       for (const camera of cameras) {
         const bodyPage = await (await page.request.get(`${options.origin}/data/bodies/${camera.id}.json`)).json();
         const card = bodyPage.native_looks.find(look => look.sim_key !== look.look) ?? bodyPage.native_looks[0];
-        const label = publishedLooks.find(look => look.slug === card.look)?.name ?? card.look.split(/[-_.]/).filter(Boolean).join(' ');
+        const label = publishedLooks.find(look => look.slug === card.look)?.name ?? menuNames[card.sim_key] ?? card.sim_key.replace(/_/g, ' ');
         expectedLabels.set(camera.id, label);
         expectedKeys.set(camera.id, card.sim_key);
         sampleRequests.push({
@@ -980,6 +989,14 @@ async function pages() {
           observed_groups: 1,
         });
       }
+      sampleRequests.push({
+        origin: 'pre_candidate',
+        subject: { kind: 'shared_family', family: 'classic-chrome' },
+        capability: 'native_prediction',
+        kind: 'missing_independent_captures',
+        detail: 'Family-wide independent captures are needed.',
+        observed_groups: 2,
+      });
       await page.route('**/bounties.json', route => route.fulfill({ json: { bounties: [], evidence_requests: sampleRequests } }));
       await page.goto(`${options.origin}/help/passkeys`);
       await page.waitForSelector('h1');
@@ -999,7 +1016,7 @@ async function pages() {
       }
       await page.goto(`${options.origin}/contribute/wanted`);
       await page.getByRole('heading', { name: 'Where things stand', exact: true }).waitFor();
-      await page.getByText(sampleRequests[0].detail, { exact: false }).first().waitFor({ timeout: 120_000 });
+      await page.locator('#where-things-stand').getByText(sampleRequests[0].detail, { exact: false }).first().waitFor({ timeout: 120_000 });
       for (const camera of cameras) {
         const name = `${camera.make} ${camera.model}`;
         const card = page.getByRole('article').filter({ has: page.getByRole('heading', { name, exact: true }) });
@@ -1012,6 +1029,13 @@ async function pages() {
         if (!label.includes(key)) check(!text.includes(key), `${size}: where things stand hides the raw setting key for ${name}`);
         check(text.includes('1 independent group observed so far.'), `${size}: where things stand shows observed groups for ${name}`);
       }
+      const family = page.locator('#where-things-stand .stand-family');
+      check(await family.count() === 1, `${size}: family requests are grouped once`);
+      const familyText = await family.textContent();
+      check(familyText.includes('Family-wide independent captures are needed.'), `${size}: family block names the family request`);
+      check(familyText.includes('Classic Chrome'), `${size}: family block names the look`);
+      const cameraTexts = await page.locator('#where-things-stand .stand-card').allTextContents();
+      check(!cameraTexts.some(text => text.includes('Family-wide independent captures are needed.')), `${size}: family requests are not repeated under cameras`);
       await page.screenshot({ path: `${options.out}/where-things-stand-${size}.png`, fullPage: true });
       await page.unroute('**/bounties.json');
       await page.route('**/bounties.json', route => route.fulfill({ json: { bounties: [], evidence_requests: [] } }));

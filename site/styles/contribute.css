@@ -63,6 +63,8 @@
 .wanted-intro { max-width: 70ch; margin-bottom: 2rem; }
 .where-things-stand { margin-bottom: 2.5rem; }
 .where-things-stand > p { max-width: 70ch; }
+.stand-family { margin-bottom: 1rem; padding: 1rem 1.25rem; border: 1px solid var(--line); border-radius: .6rem; background: var(--panel); }
+.stand-family h3 { margin: .2rem 0 .5rem; font-size: 1.05rem; }
 .stand-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr)); gap: 1rem; margin-top: 1rem; }
 .stand-card { min-width: 0; padding: 1rem 1.25rem; border: 1px solid var(--line); border-radius: .6rem; background: var(--panel); }
 .stand-card h3 { margin: .2rem 0 .5rem; font-size: 1.05rem; }

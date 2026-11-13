@@ -78,12 +78,19 @@ fn published_looks(index: &SiteIndex, looks: &[Slug]) -> Vec<(Slug, String)> {
         .collect()
 }
 
+/// The cameras' own requests, plus the requests that apply to any camera.
+struct StandingsView {
+    cameras: Vec<CameraStanding>,
+    family_requests: Vec<EvidenceRequestWire>,
+    family_bounties: Vec<Bounty>,
+}
+
 /// Each camera in the site index with its published looks and open requests.
 ///
-/// A shared-family request or a bounty without a body applies to every camera
-/// whose built-in looks include that Look, because any of them can supply the
-/// missing photos.
-fn standings(index: &SiteIndex, wanted: Option<&WantedFile>) -> Vec<CameraStanding> {
+/// A shared-family request or a bounty without a body applies to any camera
+/// with that Look, so it is listed once above the cameras instead of repeating
+/// under each of them.
+fn standings(index: &SiteIndex, wanted: Option<&WantedFile>) -> StandingsView {
     let mut cameras = index
         .bodies
         .iter()
@@ -102,42 +109,54 @@ fn standings(index: &SiteIndex, wanted: Option<&WantedFile>) -> Vec<CameraStandi
             .cmp(&right.make)
             .then_with(|| left.model.cmp(&right.model))
     });
+    let mut family_requests = Vec::new();
+    let mut family_bounties = Vec::new();
     let Some(wanted) = wanted else {
-        return cameras;
+        return StandingsView {
+            cameras,
+            family_requests,
+            family_bounties,
+        };
     };
     for camera in &mut cameras {
-        let Some(body) = index.bodies.iter().find(|body| body.id == camera.id) else {
-            continue;
-        };
         for request in &wanted.evidence_requests {
-            let applies = match &request.subject {
-                ModelSubject::BodyRealization { realization } => realization.body == camera.id,
-                ModelSubject::SharedFamily { family } => body
-                    .looks
-                    .iter()
-                    .any(|look| look.as_str() == family.as_str()),
-            };
-            if applies {
-                camera.requests.push(request.clone());
+            match &request.subject {
+                ModelSubject::BodyRealization { realization } => {
+                    if realization.body == camera.id {
+                        camera.requests.push(request.clone());
+                    }
+                }
+                ModelSubject::SharedFamily { .. } => {}
             }
         }
         for bounty in &wanted.bounties {
             if bounty.status != BountyStatus::Open {
                 continue;
             }
-            let applies = match &bounty.body {
-                Some(body) => body == &camera.id,
-                None => body
-                    .looks
-                    .iter()
-                    .any(|look| look.as_str() == bounty.look.as_str()),
-            };
-            if applies {
+            if bounty.body.as_ref() == Some(&camera.id) {
                 camera.bounties.push(bounty.clone());
             }
         }
     }
-    cameras
+    family_requests.extend(
+        wanted
+            .evidence_requests
+            .iter()
+            .filter(|request| matches!(request.subject, ModelSubject::SharedFamily { .. }))
+            .cloned(),
+    );
+    family_bounties.extend(
+        wanted
+            .bounties
+            .iter()
+            .filter(|bounty| bounty.status == BountyStatus::Open && bounty.body.is_none())
+            .cloned(),
+    );
+    StandingsView {
+        cameras,
+        family_requests,
+        family_bounties,
+    }
 }
 
 /// The Look a request asks about, by its display name.
@@ -145,17 +164,25 @@ fn standings(index: &SiteIndex, wanted: Option<&WantedFile>) -> Vec<CameraStandi
 /// A camera-specific request resolves through its body page; the raw setting
 /// key is only a fallback when no published look names it.
 fn request_label(index: &SiteIndex, bodies: &[BodyPage], request: &EvidenceRequestWire) -> String {
-    if let Some(slug) = data::evidence_look(index, bodies, request) {
-        return index
-            .looks
-            .iter()
-            .find(|candidate| &candidate.slug == slug)
-            .map(|look| look.name.clone())
-            .unwrap_or_else(|| data::plain_id(slug.as_str()));
+    let resolved = data::evidence_look(index, bodies, request);
+    if let Some(name) = resolved
+        .and_then(|slug| index.looks.iter().find(|candidate| &candidate.slug == slug))
+        .map(|look| look.name.clone())
+    {
+        return name;
     }
     match &request.subject {
         ModelSubject::BodyRealization { realization } => data::sim_name(&realization.native_sim),
-        ModelSubject::SharedFamily { family } => look_name(index, family.as_str()),
+        ModelSubject::SharedFamily { family } => {
+            let key = family.as_str().replace('-', "_");
+            looklab_schema::SimKey::new(&key)
+                .map(|sim| data::sim_name(&sim))
+                .unwrap_or_else(|_| {
+                    resolved
+                        .map(|slug| data::plain_id(slug.as_str()))
+                        .unwrap_or_else(|| look_name(index, family.as_str()))
+                })
+        }
     }
 }
 
@@ -233,6 +260,9 @@ fn WhereThingsStand(wanted: RwSignal<WantedLoad>) -> impl IntoView {
     let state = RwSignal::new(Load::<Standings>::Loading);
     Effect::new(move |_| {
         let wanted = wanted.get();
+        if matches!(wanted, WantedLoad::Loading) {
+            return;
+        }
         let request_bodies = match &wanted {
             WantedLoad::Loaded(wanted) => wanted
                 .evidence_requests
@@ -303,10 +333,43 @@ fn WhereThingsStand(wanted: RwSignal<WantedLoad>) -> impl IntoView {
                         WantedLoad::Loaded(wanted) => Some(wanted),
                         WantedLoad::Loading | WantedLoad::Preview | WantedLoad::Failed => None,
                     };
-                    let cameras = standings(&index, loaded);
-                    let any_open = cameras
-                        .iter()
-                        .any(|camera| !camera.requests.is_empty() || !camera.bounties.is_empty());
+                    let StandingsView {
+                        cameras,
+                        family_requests,
+                        family_bounties,
+                    } = standings(&index, loaded);
+                    let any_open = !family_requests.is_empty()
+                        || !family_bounties.is_empty()
+                        || cameras
+                            .iter()
+                            .any(|camera| !camera.requests.is_empty() || !camera.bounties.is_empty());
+                    let family = (!family_requests.is_empty() || !family_bounties.is_empty()).then(|| {
+                        let requests = family_requests.iter().map(|request| {
+                            let label = request_label(&index, &bodies, request);
+                            let observed = request.observed_groups.map(|groups| view! {
+                                <span class="muted">" " {observed_groups_line(groups)}</span>
+                            });
+                            view! {
+                                <li>
+                                    <strong>{label}</strong>
+                                    ": "
+                                    {request.detail.clone()}
+                                    {observed}
+                                </li>
+                            }
+                        }).collect_view();
+                        let bounties = family_bounties.iter().map(|bounty| view! {
+                            <li>
+                                {format!("{} for {}.", bounty_region(bounty), look_name(&index, bounty.look.as_str()))}
+                            </li>
+                        }).collect_view();
+                        view! {
+                            <div class="stand-family">
+                                <h3>"Any camera with these looks can help"</h3>
+                                <ul class="stand-requests">{requests}{bounties}</ul>
+                            </div>
+                        }
+                    });
                     let cards = cameras.into_iter().map(|camera| {
                         let name = format!("{} {}", camera.make, camera.model);
                         let published = if camera.published.is_empty() {
@@ -370,6 +433,7 @@ fn WhereThingsStand(wanted: RwSignal<WantedLoad>) -> impl IntoView {
                     };
                     view! {
                         {empty.map(|line| view! { <p class="muted" role="status">{line}</p> })}
+                        {family}
                         <div class="stand-grid">{cards}</div>
                     }.into_any()
                 }
@@ -960,19 +1024,21 @@ mod tests {
             evidence_requests: vec![body_request("fujifilm/x-t5", "provia", Some(2)), request()],
         };
         let stands = standings(&index, Some(&wanted));
-        assert_eq!(stands.len(), 2);
-        let fuji = &stands[0];
+        assert_eq!(stands.cameras.len(), 2);
+        assert_eq!(stands.family_requests.len(), 1);
+        assert_eq!(stands.family_requests[0].observed_groups, Some(1));
+        assert!(stands.family_bounties.is_empty());
+        let fuji = &stands.cameras[0];
         assert_eq!(fuji.make, "fujifilm");
         assert_eq!(fuji.published.len(), 1);
         assert_eq!(fuji.published[0].0.as_str(), "provia");
         assert_eq!(fuji.published[0].1, "PROVIA / Standard");
-        assert_eq!(fuji.requests.len(), 2);
+        assert_eq!(fuji.requests.len(), 1);
         assert_eq!(fuji.requests[0].observed_groups, Some(2));
         assert!(fuji.bounties.is_empty());
-        let sony = &stands[1];
+        let sony = &stands.cameras[1];
         assert_eq!(sony.published.len(), 1);
-        assert_eq!(sony.requests.len(), 1);
-        assert_eq!(sony.requests[0].observed_groups, Some(1));
+        assert!(sony.requests.is_empty());
         assert_eq!(sony.bounties.len(), 1);
         assert_eq!(sony.bounties[0].status, BountyStatus::Open);
     }
@@ -993,10 +1059,12 @@ mod tests {
             evidence_requests: Vec::new(),
         };
         let stands = standings(&index, Some(&wanted));
-        assert_eq!(stands.len(), 1);
-        assert_eq!(stands[0].published.len(), 1);
-        assert!(stands[0].requests.is_empty());
-        assert!(stands[0].bounties.is_empty());
+        assert_eq!(stands.cameras.len(), 1);
+        assert_eq!(stands.cameras[0].published.len(), 1);
+        assert!(stands.cameras[0].requests.is_empty());
+        assert!(stands.cameras[0].bounties.is_empty());
+        assert!(stands.family_requests.is_empty());
+        assert!(stands.family_bounties.is_empty());
     }
 
     #[test]
@@ -1010,22 +1078,22 @@ mod tests {
             evidence_requests: vec![body_request("fujifilm/x-t5", "provia", None)],
         };
         let stands = standings(&index, Some(&wanted));
-        assert_eq!(stands[0].requests.len(), 1);
-        assert_eq!(stands[0].requests[0].observed_groups, None);
+        assert_eq!(stands.cameras[0].requests.len(), 1);
+        assert_eq!(stands.cameras[0].requests[0].observed_groups, None);
         assert!(
-            stands[0].requests[0]
+            stands.cameras[0].requests[0]
                 .observed_groups
                 .map(observed_groups_line)
                 .is_none()
         );
         assert_eq!(
-            stands[0].requests[0].detail,
+            stands.cameras[0].requests[0].detail,
             "Add independent RAW captures with their in-camera JPEGs."
         );
     }
 
     #[test]
-    fn a_bounty_without_a_body_reaches_cameras_with_that_look() {
+    fn a_bounty_without_a_body_is_listed_once_for_the_family() {
         let index = index_with(
             vec![
                 body_summary("fujifilm/x-t5", BodyKind::Camera, &["provia"]),
@@ -1039,12 +1107,13 @@ mod tests {
             evidence_requests: Vec::new(),
         };
         let stands = standings(&index, Some(&wanted));
-        let with_bounty = stands
-            .iter()
-            .filter(|camera| camera.bounties.len() == 1)
-            .map(|camera| camera.id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(with_bounty, ["fujifilm/x-s10", "fujifilm/x-t5"]);
+        assert_eq!(stands.family_bounties.len(), 1);
+        assert!(
+            stands
+                .cameras
+                .iter()
+                .all(|camera| camera.bounties.is_empty())
+        );
     }
 
     #[test]
@@ -1059,6 +1128,32 @@ mod tests {
                 &request
             ),
             "Look"
+        );
+    }
+
+    #[test]
+    fn an_unpublished_family_uses_the_menu_name() {
+        let mut request = request();
+        request.subject = ModelSubject::SharedFamily {
+            family: LookId::new("classic-chrome").expect("family"),
+        };
+        assert_eq!(
+            request_label(&index_with(Vec::new(), Vec::new()), &[], &request),
+            "Classic Chrome"
+        );
+    }
+
+    #[test]
+    fn an_unpublished_look_uses_the_menu_name() {
+        let page = body_page();
+        let mut request = realization_request(&page);
+        let ModelSubject::BodyRealization { realization } = &mut request.subject else {
+            panic!("realization");
+        };
+        realization.native_sim = looklab_schema::SimKey::new("astia").expect("sim");
+        assert_eq!(
+            request_label(&index_with(Vec::new(), Vec::new()), &[page], &request),
+            "ASTIA / Soft"
         );
     }
 }

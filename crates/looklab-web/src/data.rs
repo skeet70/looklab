@@ -1177,10 +1177,24 @@ pub async fn bundle_qualification(
 /// A film simulation key in menu words.
 pub(crate) fn sim_name(sim: &looklab_schema::SimKey) -> String {
     match sim.as_str() {
-        "classic_chrome" => "Classic Chrome".into(),
         "provia" => "PROVIA / Standard".into(),
         "velvia" => "Velvia / Vivid".into(),
         "astia" => "ASTIA / Soft".into(),
+        "classic_chrome" => "Classic Chrome".into(),
+        "classic_negative" => "Classic Negative".into(),
+        "pro_neg_hi" => "PRO Neg. Hi".into(),
+        "pro_neg_std" => "PRO Neg. Std".into(),
+        "eterna" => "ETERNA / Cinema".into(),
+        "eterna_bleach_bypass" => "ETERNA Bleach Bypass".into(),
+        "acros" => "ACROS".into(),
+        "acros_ye" => "ACROS + Ye Filter".into(),
+        "acros_r" => "ACROS + R Filter".into(),
+        "acros_g" => "ACROS + G Filter".into(),
+        "monochrome" => "Monochrome".into(),
+        "monochrome_ye" => "Monochrome + Ye Filter".into(),
+        "monochrome_r" => "Monochrome + R Filter".into(),
+        "monochrome_g" => "Monochrome + G Filter".into(),
+        "sepia" => "Sepia".into(),
         key => key.replace(['_', '-'], " "),
     }
 }

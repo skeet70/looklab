@@ -389,14 +389,38 @@ async fn ack_subject_generation(
     ack_pending(&mut conn, subject, generation, now).await
 }
 
+fn body_display_names(
+    snapshot_root: &std::path::Path,
+    members: &[ScopeMember],
+) -> BTreeMap<UploadBodyId, String> {
+    let data = crate::body::DataDir::new(snapshot_root);
+    members
+        .iter()
+        .map(|member| {
+            let name = data
+                .load(&member.body)
+                .map(|resources| format!("{} {}", resources.body.make, resources.body.model))
+                .unwrap_or_else(|_| member.body.as_str().to_owned());
+            (member.body.clone(), name)
+        })
+        .collect()
+}
+
 async fn note_missing_capture_groups(
     conn: &mut sqlx::SqliteConnection,
     family: &LookId,
     members: &[ScopeMember],
+    names: &BTreeMap<UploadBodyId, String>,
     count: usize,
     now: i64,
 ) -> Result<()> {
     let observed = Some(u32::try_from(count).unwrap_or(u32::MAX));
+    let name_of = |body: &UploadBodyId| {
+        names
+            .get(body)
+            .cloned()
+            .unwrap_or_else(|| body.as_str().to_owned())
+    };
     for member in members {
         let subject_model = ModelSubject::BodyRealization {
             realization: member.realization.clone(),
@@ -410,10 +434,8 @@ async fn note_missing_capture_groups(
                 "A second independent capture from a different scene is needed"
             };
             let detail = format!(
-                "{}/{}/{}: {count} independent RAW capture(s) exist. {needed} to check the look against photos it was not fitted to. One RAW re-rendered to several film simulations counts as one capture.",
-                member.body.as_str(),
-                member.realization.epoch.get(),
-                member.realization.native_sim.as_str()
+                "{}: {count} independent RAW capture(s) exist. {needed} to check the look against photos it was not fitted to. One RAW re-rendered to several film simulations counts as one capture.",
+                name_of(&member.body),
             );
             model_store::record_active_evidence_request(
                 conn,
@@ -442,9 +464,9 @@ async fn note_missing_capture_groups(
     let family_subject = family_model.key();
     model_store::register_subject(conn, &family_model, now).await?;
     if count < 2 {
-        let bodies: Vec<&str> = members
+        let bodies: Vec<String> = members
             .iter()
-            .map(|member| member.body.as_str())
+            .map(|member| name_of(&member.body))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -1270,10 +1292,12 @@ async fn fit_free(
     let capture_groups = native_group_count(&pools)?;
     {
         let mut conn = db_pool.acquire().await?;
+        let names = body_display_names(snapshot_root, &plan.members);
         note_missing_capture_groups(
             &mut conn,
             &plan.family_id,
             &plan.members,
+            &names,
             capture_groups,
             now_unix(),
         )
@@ -2201,10 +2225,12 @@ async fn fit_component(
                 .filter(|candidate| candidate.family_id == plan.family_id)
                 .flat_map(|candidate| candidate.members.iter().cloned())
                 .collect();
+            let names = body_display_names(snapshot_root, &members);
             note_missing_capture_groups(
                 &mut conn,
                 &plan.family_id,
                 &members,
+                &names,
                 capture_groups,
                 now_unix(),
             )
@@ -9118,6 +9144,31 @@ camera_to_xyz:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_names_come_from_the_published_snapshot() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("bodies")).expect("bodies");
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/bodies");
+        for name in ["fujifilm-x-t5.body.yaml", "fujifilm-x-t5.yaml"] {
+            std::fs::copy(shipped.join(name), root.join("bodies").join(name))
+                .expect("snapshot body file");
+        }
+        let body = UploadBodyId::new("fujifilm/x-t5").expect("body");
+        let member = ScopeMember {
+            body: body.clone(),
+            realization: BodyRealizationId {
+                body: looklab_schema::BodyId::new("fujifilm/x-t5").expect("body"),
+                epoch: looklab_schema::ControlEpochId::new(1),
+                native_sim: looklab_schema::SimKey::new("provia").expect("sim"),
+            },
+            scope: EvidenceScope::Seed,
+            admission: None,
+        };
+        let names = body_display_names(root, std::slice::from_ref(&member));
+        assert_eq!(names.get(&body).map(String::as_str), Some("Fujifilm X-T5"));
+    }
 
     fn subject() -> SubjectKey {
         SubjectKey::for_family(&LookId::new("classic-chrome").expect("family"))
