@@ -918,6 +918,7 @@ async function requiredFields() {
     await page.getByRole('heading', { name: /^\d+ pairs? found$/ }).waitFor({ timeout: 120_000 });
     const gate = page.locator('.required-fields');
     await gate.waitFor({ timeout: 120_000 });
+    await page.locator('.unmapped-controls select[data-key="dynamic_range"]').waitFor({ timeout: 30_000 });
     const gateText = await gate.innerText();
     check(/dynamic range/i.test(gateText), `required-fields: the gate names dynamic range (${JSON.stringify(gateText)})`);
     check(gateText.includes('DR100, DR200, DR400'), 'required-fields: the gate names the dynamic range choices');
