@@ -1,6 +1,6 @@
 # Litestream replication and restore drill
 
-`looklab-server` and `looklab-worker` share one SQLite database in WAL mode ([03 §4](../03-data-model.md)). Litestream 0.5 runs beside them as a third process, reads committed WAL pages and writes LTX files to a replica. Replication is asynchronous, so the recovery point is the last sync, not the last commit. Production currently relies on OVH's automatic daily VPS backup instead ([deployment.md](deployment.md)); Litestream is the upgrade path for a finer recovery point and is disabled by default.
+`looklab-server`, the fit `looklab-worker` and `looklab-publisher` share one SQLite database in WAL mode ([03 §4](../03-data-model.md)). Litestream 0.5 runs beside them as a fourth process, reads committed WAL pages and writes LTX files to a replica. Replication is asynchronous, so the recovery point is the last sync, not the last commit. Production currently relies on OVH's automatic daily VPS backup instead ([deployment.md](deployment.md)); Litestream is the upgrade path for a finer recovery point and is disabled by default.
 
 ## Replication
 
@@ -32,17 +32,17 @@ socket:
 - Run one Litestream per database and replica path. Two instances writing the same path leave a chain that cannot be restored.
 - The replica holds contribution metadata, serial HMACs and WebAuthn credentials. Give the bucket the same access controls as the database. Sample blobs, the server secret and the published site tree live outside SQLite and are not covered by Litestream.
 
-## WAL and checkpointing with two application processes
+## WAL and checkpointing with the application processes
 
-Three processes open the file: `looklab-server`, `looklab-worker` and Litestream. The first two write; Litestream reads the WAL and holds a read transaction between its own checkpoints so that no other process can restart the WAL underneath it. Litestream then checkpoints the database itself: PASSIVE when the WAL passes `min-checkpoint-page-count` (1000 pages) or `checkpoint-interval` (1m), and a TRUNCATE when it passes `truncate-page-n` (121359 pages, about 500 MB).
+Four processes open the file: `looklab-server`, the fit `looklab-worker`, `looklab-publisher` and Litestream. The application processes write; Litestream reads the WAL and holds a read transaction between its own checkpoints so that no other process can restart the WAL underneath it. Litestream then checkpoints the database itself: PASSIVE when the WAL passes `min-checkpoint-page-count` (1000 pages) or `checkpoint-interval` (1m), and a TRUNCATE when it passes `truncate-page-n` (121359 pages, about 500 MB).
 
-- Both application processes use the same `db::open` (`looklab_server::open_database`), which sets `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON` and a 5 s busy timeout on every connection (`crates/looklab-server/src/db.rs`). The busy timeout absorbs Litestream's short checkpoint write locks.
+- All application processes use the same `db::open` (`looklab_server::open_database`), which sets `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON` and a 5 s busy timeout on every connection (`crates/looklab-server/src/db.rs`). The busy timeout absorbs Litestream's short checkpoint write locks.
 - A forced TRUNCATE checkpoint waits for all readers and writers. On a WAL near the 500 MB threshold that wait can exceed the 5 s busy timeout and fail a request. The database holds metadata only, with sample blobs outside SQLite; do not run `VACUUM` or `wal_checkpoint(TRUNCATE)` by hand during traffic.
 - The application does not set `wal_autocheckpoint=0`; SQLite's default autocheckpoint at 1000 pages stays active. A checkpoint by another connection between a write and its sync is detected by 0.5: the drill forced `wal_checkpoint(TRUNCATE)` after a write and before the sync, the WAL went from 70072 bytes to 0, and the next sync still wrote TXID 2 (191 bytes) and the restored file contained the row. Under sustained high write rates the repeated app checkpoints make Litestream fall back to full-state snapshots; if the database ever becomes write-heavy, open the application connections with `wal_autocheckpoint=0` and let Litestream own checkpointing.
 - Keep the database, its `-wal` and `-shm` files on a local filesystem, and keep Litestream's metadata directory `.looklab.sqlite3-litestream/` beside the database. Do not delete or replace any of them under a running server.
 - Do not copy the `.sqlite3` file alone while the WAL has frames; the copy misses committed transactions. Use `litestream restore`, or `VACUUM INTO` on a quiesced database.
 - If the database is deleted and recreated, remove all three files and run `litestream reset <db>`. Litestream does not track database deletions.
-- Never restore over the live path while the server, worker or Litestream runs; `litestream restore` refuses to overwrite without `-force`. After replacing the file in place, run `litestream reset <db>` before replication resumes so Litestream takes a fresh snapshot instead of continuing from metadata for the old file.
+- Never restore over the live path while the server, either worker unit or Litestream runs; `litestream restore` refuses to overwrite without `-force`. After replacing the file in place, run `litestream reset <db>` before replication resumes so Litestream takes a fresh snapshot instead of continuing from metadata for the old file.
 - Replication is asynchronous. The recovery point is `sync-interval` plus the in-flight window; a graceful stop flushes with a final sync (`shutdown-sync-timeout`, 30 s default), and a host loss loses the last window.
 
 ## Restore drill
@@ -151,4 +151,4 @@ The drill is API-only, so `site` reports `not_configured`. A production restore 
 - S3 credentials, bucket policy, object lifecycle or cross-host durability. The drill uses a file replica; the S3 example is accepted by `litestream databases` but not exercised here.
 - Recovery of blobs, the server secret or the published site tree. Those need their own backups. A restored database served with a different `server-secret` invalidates serial HMACs and every outstanding signed upload.
 - Point-in-time restore to an older TXID, and retention expiry. Both need a longer run and a configured `snapshot.retention`.
-- A hot standby. The restored file is opened by a freshly started server after both writers and Litestream have stopped.
+- A hot standby. The restored file is opened by a freshly started server after the application processes and Litestream have stopped.

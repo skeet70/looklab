@@ -33,6 +33,7 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("looklab-seed-data.service")
     machine.wait_for_unit("looklab-server.service")
     machine.wait_for_unit("looklab-worker.service")
+    machine.wait_for_unit("looklab-publisher.service")
     machine.wait_for_file("/var/lib/looklab/looklab.sqlite3")
     machine.wait_for_file("/var/lib/looklab/data/bodies")
 
@@ -127,8 +128,11 @@ pkgs.testers.runNixOSTest {
         "sqlite3 'file:/var/lib/looklab/looklab.sqlite3?mode=ro' 'select count(*) from _sqlx_migrations'"
     ).strip()
 
-    machine.succeed("systemctl restart looklab-worker.service looklab-server.service")
+    machine.succeed(
+        "systemctl restart looklab-worker.service looklab-publisher.service looklab-server.service"
+    )
     machine.wait_for_unit("looklab-worker.service")
+    machine.wait_for_unit("looklab-publisher.service")
     machine.wait_for_unit("looklab-server.service")
     machine.wait_until_succeeds("curl -fsS http://127.0.0.1:8080/readyz", timeout=300)
 
@@ -140,5 +144,75 @@ pkgs.testers.runNixOSTest {
     machine.succeed("test -e /var/lib/looklab/state-marker")
     machine.succeed("curl -fsS http://127.0.0.1:8080/ | grep -qi '<html'")
     machine.succeed("curl -fsS http://127.0.0.1:8080/data/index.json | jq -e '.format == \"looklab-site/1\"'")
+
+    # Publication must proceed while the fit lane is occupied. A running
+    # consistency fit holds an expired lease that only its lane may reclaim,
+    # and a queued fit job sorts before every publication request.
+    machine.succeed("systemctl stop looklab-worker.service")
+    machine.succeed(
+        "sqlite3 -cmd '.timeout 5000' /var/lib/looklab/looklab.sqlite3 "
+        "\"INSERT INTO jobs (id, kind, payload, status, attempts, run_after, locked_until, created_at) "
+        "VALUES ('expired-fit', 'consistency_score', '{}', 'running', 1, 0, 1, 0)\""
+    )
+    machine.succeed(
+        "sqlite3 -cmd '.timeout 5000' /var/lib/looklab/looklab.sqlite3 "
+        "\"INSERT INTO jobs (id, kind, payload, status, attempts, run_after, created_at) "
+        "VALUES ('a-queued-fit', 'consistency_score', '{}', 'queued', 0, 0, 0)\""
+    )
+
+    machine.succeed(
+        "curl -fsS http://127.0.0.1:8080/data/index.json "
+        "| jq -e '([.manuals[].id] | index(\"fujifilm/x-m1\")) != null'"
+    )
+    machine.succeed("rm /var/lib/looklab/data/manuals/fujifilm-x-m1.yaml")
+    machine.succeed(
+        "sqlite3 -cmd '.timeout 5000' /var/lib/looklab/looklab.sqlite3 "
+        "\"UPDATE publication SET generation = generation + 1 WHERE id = 1\""
+    )
+    generation = machine.succeed(
+        "sqlite3 -cmd '.timeout 5000' 'file:/var/lib/looklab/looklab.sqlite3?mode=ro' "
+        "\"SELECT generation FROM publication WHERE id = 1\""
+    ).strip()
+    machine.wait_until_succeeds(
+        "sqlite3 -cmd '.timeout 5000' 'file:/var/lib/looklab/looklab.sqlite3?mode=ro' "
+        f"\"SELECT published >= {generation} FROM publication WHERE id = 1\" | grep -qx 1",
+        timeout=120,
+    )
+    published = machine.succeed("sha256sum /var/lib/looklab/site/data/index.json").split()[0]
+    assert published != index, "the publication did not rewrite the index"
+    machine.succeed(
+        "curl -fsS http://127.0.0.1:8080/data/index.json "
+        "| jq -e '([.manuals[].id] | index(\"fujifilm/x-m1\")) == null'"
+    )
+    fit_state = machine.succeed(
+        "sqlite3 -cmd '.timeout 5000' 'file:/var/lib/looklab/looklab.sqlite3?mode=ro' "
+        "\"SELECT status || ':' || attempts FROM jobs WHERE id = 'a-queued-fit'\""
+    ).strip()
+    assert fit_state == "queued:0", f"the publish lane claimed a fit job: {fit_state}"
+    expired_state = machine.succeed(
+        "sqlite3 -cmd '.timeout 5000' 'file:/var/lib/looklab/looklab.sqlite3?mode=ro' "
+        "\"SELECT status || ':' || attempts FROM jobs WHERE id = 'expired-fit'\""
+    ).strip()
+    assert expired_state == "running:1", f"the fit lease changed: {expired_state}"
+
+    # Restore the manual and publish again so the catalog is complete.
+    machine.succeed("systemctl restart looklab-seed-data.service")
+    machine.succeed(
+        "sqlite3 -cmd '.timeout 5000' /var/lib/looklab/looklab.sqlite3 "
+        "\"UPDATE publication SET generation = generation + 1 WHERE id = 1\""
+    )
+    generation = machine.succeed(
+        "sqlite3 -cmd '.timeout 5000' 'file:/var/lib/looklab/looklab.sqlite3?mode=ro' "
+        "\"SELECT generation FROM publication WHERE id = 1\""
+    ).strip()
+    machine.wait_until_succeeds(
+        "sqlite3 -cmd '.timeout 5000' 'file:/var/lib/looklab/looklab.sqlite3?mode=ro' "
+        f"\"SELECT published >= {generation} FROM publication WHERE id = 1\" | grep -qx 1",
+        timeout=120,
+    )
+    machine.succeed(
+        "curl -fsS http://127.0.0.1:8080/data/index.json "
+        "| jq -e '([.manuals[].id] | index(\"fujifilm/x-m1\")) != null'"
+    )
   '';
 }

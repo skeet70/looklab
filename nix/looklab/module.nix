@@ -184,13 +184,13 @@ in
     user = mkOption {
       type = types.str;
       default = "looklab";
-      description = "System user running both services.";
+      description = "System user running the server and both worker units.";
     };
 
     group = mkOption {
       type = types.str;
       default = cfg.user;
-      description = "System group running both services.";
+      description = "System group running the server and both worker units.";
     };
 
     server.package = mkOption {
@@ -235,6 +235,20 @@ in
         type = types.str;
         default = "4G";
         description = "cgroup memory throttle for the worker.";
+      };
+    };
+
+    publisher = {
+      memoryMax = mkOption {
+        type = types.str;
+        default = "512M";
+        description = "cgroup memory ceiling for the publication worker.";
+      };
+
+      memoryHigh = mkOption {
+        type = types.str;
+        default = "384M";
+        description = "cgroup memory throttle for the publication worker.";
       };
     };
 
@@ -359,6 +373,7 @@ in
       before = [
         "looklab-server.service"
         "looklab-worker.service"
+        "looklab-publisher.service"
       ];
       serviceConfig = {
         Type = "oneshot";
@@ -425,7 +440,7 @@ in
     };
 
     systemd.services.looklab-worker = {
-      description = "looklab job runner and site publisher";
+      description = "looklab fit and job runner";
       wantedBy = [ "multi-user.target" ];
       restartTriggers = [ hostPackages.looklab-data ];
       after = [
@@ -439,7 +454,7 @@ in
         User = cfg.user;
         Group = cfg.group;
         ExecStart = lib.escapeShellArgs (
-          [ "${cfg.worker.package}/bin/looklab-worker" ] ++ workerArgs
+          [ "${cfg.worker.package}/bin/looklab-worker" ] ++ workerArgs ++ [ "--lane" "fit" ]
         );
         Restart = "on-failure";
         RestartSec = 5;
@@ -447,6 +462,32 @@ in
         TimeoutStopSec = 600;
         MemoryMax = cfg.worker.memoryMax;
         MemoryHigh = cfg.worker.memoryHigh;
+      };
+    };
+
+    systemd.services.looklab-publisher = {
+      description = "looklab publication worker";
+      wantedBy = [ "multi-user.target" ];
+      restartTriggers = [ hostPackages.looklab-data ];
+      after = [
+        "network.target"
+        "looklab-server.service"
+        "looklab-seed-data.service"
+      ];
+      requires = [ "looklab-seed-data.service" ];
+      serviceConfig = hardening // {
+        Type = "simple";
+        User = cfg.user;
+        Group = cfg.group;
+        ExecStart = lib.escapeShellArgs (
+          [ "${cfg.worker.package}/bin/looklab-worker" ] ++ workerArgs ++ [ "--lane" "publish" ]
+        );
+        Restart = "on-failure";
+        RestartSec = 5;
+        KillSignal = "SIGTERM";
+        TimeoutStopSec = 600;
+        MemoryMax = cfg.publisher.memoryMax;
+        MemoryHigh = cfg.publisher.memoryHigh;
       };
     };
 

@@ -1,5 +1,5 @@
 # /etc/looklab/looklab.toml
-# One server process, one worker process, one local state directory.
+# One server process, one fit worker process, one publisher process, one local state directory.
 
 bind = "127.0.0.1:8080"
 db_path = "/var/lib/looklab/looklab.sqlite3"

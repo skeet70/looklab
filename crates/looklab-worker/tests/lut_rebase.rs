@@ -940,6 +940,7 @@ async fn retrying_completed_work_does_not_publish_another_version() {
         fixture.worker.pool(),
         3_600,
         looklab_worker::clock::now_unix(),
+        looklab_worker::jobs::Lane::All,
     )
     .await
     .expect("claim")
@@ -1180,6 +1181,7 @@ async fn losing_the_lease_during_fit_does_not_hold_work() {
         fixture.worker.pool(),
         3_600,
         looklab_worker::clock::now_unix(),
+        looklab_worker::jobs::Lane::All,
     )
     .await
     .expect("claim")

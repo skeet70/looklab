@@ -2,10 +2,14 @@
 
 use std::path::PathBuf;
 
+use crate::jobs::Lane;
+
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     pub db: PathBuf,
     pub blobs: PathBuf,
+    /// Job kinds this process claims.
+    pub lane: Lane,
     /// Body and control-schema snapshots (`data/bodies`).
     pub data: PathBuf,
     /// Documentation-derived camera catalog directory.
@@ -33,6 +37,7 @@ impl WorkerConfig {
         Self {
             db: db.into(),
             blobs: blobs.into(),
+            lane: Lane::All,
             data: PathBuf::from("data"),
             manuals: PathBuf::from("data/manuals"),
             snapshot_dir: PathBuf::from("data/community"),

@@ -9,7 +9,7 @@ use looklab_schema::{
 use looklab_server::{ContributionId, ProposalId};
 use looklab_upload::BodyId;
 use serde::{Deserialize, Serialize};
-use sqlx::{SqliteConnection, SqlitePool};
+use sqlx::{Sqlite, SqliteConnection, SqlitePool};
 
 use crate::clock::now_unix;
 use crate::error::{Result, WorkerError};
@@ -40,6 +40,19 @@ impl fmt::Display for JobId {
     }
 }
 
+/// The subset of job kinds one worker process claims.
+///
+/// A publication must not wait for a fit, so a host can run one process per
+/// lane. `All` keeps the single-process behaviour and also claims kinds this
+/// build does not know.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Lane {
+    #[default]
+    All,
+    Publish,
+    Fit,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobKind {
     ConsistencyScore,
@@ -56,23 +69,86 @@ pub enum JobKind {
     Other(String),
 }
 
-impl JobKind {
-    pub fn parse(value: &str) -> Self {
-        match value {
-            "consistency_score" => Self::ConsistencyScore,
-            "honest_duplicate_merge" => Self::HonestDuplicateMerge,
-            "nightly_refit" => Self::NightlyRefit,
-            // The server enqueues this name when a withdrawal is recorded.
-            "blob_gc" | "hard_delete_blobs" => Self::BlobGc,
-            "bounties" => Self::Bounties,
-            "card_verification" => Self::CardVerification,
-            "publish_site" => Self::PublishSite,
-            "lut_rebase" => Self::LutRebase,
-            "lut_import" => Self::LutImport,
-            "revert_refit" => Self::RevertRefit,
-            "model_assessment" => Self::ModelAssessment,
-            other => Self::Other(other.to_owned()),
+/// Every stored `kind` string and the kind it parses to.
+///
+/// One table feeds [`JobKind::parse`] and [`Lane::kinds`], so the decoder and
+/// the SQL filter cannot drift. `hard_delete_blobs` is the legacy name the
+/// server writes when a withdrawal is recorded.
+const JOB_KINDS: &[(&str, JobKind)] = &[
+    ("consistency_score", JobKind::ConsistencyScore),
+    ("honest_duplicate_merge", JobKind::HonestDuplicateMerge),
+    ("nightly_refit", JobKind::NightlyRefit),
+    ("blob_gc", JobKind::BlobGc),
+    ("hard_delete_blobs", JobKind::BlobGc),
+    ("bounties", JobKind::Bounties),
+    ("card_verification", JobKind::CardVerification),
+    ("publish_site", JobKind::PublishSite),
+    ("lut_rebase", JobKind::LutRebase),
+    ("lut_import", JobKind::LutImport),
+    ("revert_refit", JobKind::RevertRefit),
+    ("model_assessment", JobKind::ModelAssessment),
+];
+
+impl Lane {
+    /// The `kind` values this lane claims, or `None` for every value.
+    fn kinds(self) -> Option<impl Iterator<Item = &'static str>> {
+        match self {
+            Self::All => None,
+            lane => Some(
+                JOB_KINDS
+                    .iter()
+                    .filter(move |(_, kind)| kind.lane() == Some(lane))
+                    .map(|(name, _)| *name),
+            ),
         }
+    }
+
+    /// Whether this lane claims `kind`; `All` claims every kind.
+    pub fn includes(self, kind: &JobKind) -> bool {
+        match self {
+            Self::All => true,
+            lane => kind.lane() == Some(lane),
+        }
+    }
+}
+
+impl JobKind {
+    /// The lane that owns this kind, or `None` for an unknown stored string.
+    ///
+    /// Every variant is listed so a new kind must be assigned before it
+    /// compiles. Publication lives in `Publish`; fits, long numerical work and
+    /// jobs that must stay serial with their enqueuers live in `Fit`.
+    pub fn lane(&self) -> Option<Lane> {
+        match self {
+            // Writes or validates the site tree; no colour fit.
+            Self::PublishSite => Some(Lane::Publish),
+            // Deletes blobs; no fit.
+            Self::BlobGc => Some(Lane::Publish),
+            // Re-scores accepted card images without fitting, but shares the
+            // fit lane with the code that enqueues it so a run cannot miss a
+            // card accepted while it is queued.
+            Self::CardVerification => Some(Lane::Fit),
+            // Merges duplicate images by capture tuple; no fit.
+            Self::HonestDuplicateMerge => Some(Lane::Publish),
+            // Runs the consistency fitter.
+            Self::ConsistencyScore => Some(Lane::Fit),
+            // Runs hierarchical refits.
+            Self::NightlyRefit | Self::RevertRefit => Some(Lane::Fit),
+            // Scores every sample pool for a target; long numerical work.
+            Self::Bounties => Some(Lane::Fit),
+            // Evaluates fitted probes and can queue a refit.
+            Self::ModelAssessment => Some(Lane::Fit),
+            // Rebuilds a LUT approximation with `import_lut_look`.
+            Self::LutRebase | Self::LutImport => Some(Lane::Fit),
+            Self::Other(_) => None,
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        JOB_KINDS
+            .iter()
+            .find_map(|(name, kind)| (*name == value).then(|| kind.clone()))
+            .unwrap_or_else(|| Self::Other(value.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -331,32 +407,57 @@ impl JobOwnership {
 pub struct PublicationGeneration(i64);
 
 /// A job whose lease expired is reclaimable. A live publisher blocks another
-/// `publish_site` claim, so output writers never overlap.
-pub async fn claim(pool: &SqlitePool, lease_seconds: i64, now: i64) -> Result<Option<ClaimedJob>> {
-    let row: Option<(String, String, String, i64)> = sqlx::query_as(
-        "UPDATE jobs SET status = 'running', locked_until = ?, attempts = attempts + 1
+/// `publish_site` claim, so output writers never overlap. A lane claims only
+/// its own kinds, so it never reclaims another lane's expired lease.
+pub async fn claim(
+    pool: &SqlitePool,
+    lease_seconds: i64,
+    now: i64,
+    lane: Lane,
+) -> Result<Option<ClaimedJob>> {
+    let mut query =
+        sqlx::QueryBuilder::<Sqlite>::new("UPDATE jobs SET status = 'running', locked_until = ");
+    query.push_bind(now + lease_seconds);
+    query.push(
+        ", attempts = attempts + 1
          WHERE id = (
              SELECT candidate.id FROM jobs candidate
-             WHERE ((candidate.status = 'queued' AND candidate.run_after <= ?)
-                 OR (candidate.status = 'running' AND candidate.locked_until IS NOT NULL
-                     AND candidate.locked_until <= ?))
+             WHERE ((candidate.status = 'queued' AND candidate.run_after <= ",
+    );
+    query.push_bind(now);
+    query.push(
+        ") OR (candidate.status = 'running' AND candidate.locked_until IS NOT NULL
+                     AND candidate.locked_until <= ",
+    );
+    query.push_bind(now);
+    query.push(
+        "))
                AND (candidate.kind <> 'publish_site'
                  OR NOT EXISTS (
                      SELECT 1 FROM jobs writer
                      WHERE writer.kind = 'publish_site' AND writer.status = 'running'
                        AND writer.id <> candidate.id
-                       AND (writer.locked_until IS NULL OR writer.locked_until > ?)))
+                       AND (writer.locked_until IS NULL OR writer.locked_until > ",
+    );
+    query.push_bind(now);
+    query.push(")))");
+    if let Some(kinds) = lane.kinds() {
+        query.push(" AND candidate.kind IN (");
+        let mut separated = query.separated(", ");
+        for kind in kinds {
+            separated.push_bind(kind);
+        }
+        separated.push_unseparated(")");
+    }
+    query.push(
+        "
              ORDER BY candidate.run_after, candidate.created_at, candidate.id
              LIMIT 1
          )
          RETURNING id, kind, payload, attempts",
-    )
-    .bind(now + lease_seconds)
-    .bind(now)
-    .bind(now)
-    .bind(now)
-    .fetch_optional(pool)
-    .await?;
+    );
+    let row: Option<(String, String, String, i64)> =
+        query.build_query_as().fetch_optional(pool).await?;
     Ok(row.map(|(id, kind, payload, attempts)| ClaimedJob {
         id: JobId(id),
         kind: JobKind::parse(&kind),
@@ -644,5 +745,243 @@ mod tests {
             JobPayload::decode(&kind, &encoded).expect("decode"),
             payload
         );
+    }
+
+    #[test]
+    fn every_known_kind_has_one_lane() {
+        let publish: Vec<_> = Lane::Publish.kinds().expect("publish kinds").collect();
+        let fit: Vec<_> = Lane::Fit.kinds().expect("fit kinds").collect();
+        assert!(publish.contains(&"hard_delete_blobs"));
+        assert!(fit.contains(&"bounties"));
+        assert!(fit.contains(&"card_verification"));
+        assert!(!publish.contains(&"card_verification"));
+        assert!(
+            publish
+                .iter()
+                .all(|name| !fit.contains(name)
+                    && JobKind::parse(name).lane() == Some(Lane::Publish))
+        );
+        assert!(
+            fit.iter()
+                .all(|name| JobKind::parse(name).lane() == Some(Lane::Fit))
+        );
+        assert_eq!(JobKind::Other("future_kind".to_owned()).lane(), None);
+        assert_eq!(
+            JobKind::parse("future_kind").lane(),
+            None,
+            "an unknown stored kind belongs to no lane"
+        );
+        assert!(Lane::All.kinds().is_none());
+    }
+
+    #[test]
+    fn lanes_include_only_the_kinds_they_schedule() {
+        assert!(Lane::All.includes(&JobKind::NightlyRefit));
+        assert!(Lane::All.includes(&JobKind::BlobGc));
+        assert!(Lane::All.includes(&JobKind::PublishSite));
+        assert!(Lane::Fit.includes(&JobKind::NightlyRefit));
+        assert!(!Lane::Publish.includes(&JobKind::NightlyRefit));
+        assert!(Lane::Publish.includes(&JobKind::BlobGc));
+        assert!(!Lane::Fit.includes(&JobKind::BlobGc));
+        assert!(Lane::Publish.includes(&JobKind::PublishSite));
+        assert!(!Lane::Fit.includes(&JobKind::PublishSite));
+    }
+
+    async fn claim_fixture() -> (tempfile::TempDir, SqlitePool) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pool = looklab_server::open_database(&dir.path().join("db.sqlite"))
+            .await
+            .expect("database");
+        (dir, pool)
+    }
+
+    #[tokio::test]
+    async fn a_publish_lane_claim_skips_an_earlier_queued_fit_job() {
+        let (_dir, pool) = claim_fixture().await;
+        let fit = enqueue(
+            &pool,
+            &JobPayload::ConsistencyScore {
+                contribution_id: ContributionId::new(),
+            },
+            0,
+        )
+        .await
+        .expect("enqueue fit");
+        let publish = enqueue(&pool, &JobPayload::PublishSite, 1)
+            .await
+            .expect("enqueue publish");
+
+        let claimed = claim(&pool, 60, 100, Lane::Publish)
+            .await
+            .expect("claim")
+            .expect("queued publisher");
+        assert_eq!(claimed.id, publish);
+        assert_eq!(claimed.kind, JobKind::PublishSite);
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
+            .bind(fit.as_str())
+            .fetch_one(&pool)
+            .await
+            .expect("fit status");
+        assert_eq!(status, "queued");
+
+        let next = claim(&pool, 60, 100, Lane::All)
+            .await
+            .expect("claim")
+            .expect("queued fit job");
+        assert_eq!(next.id, fit);
+        assert_eq!(next.kind, JobKind::ConsistencyScore);
+    }
+
+    #[tokio::test]
+    async fn a_fit_lane_claim_skips_publish_site() {
+        let (_dir, pool) = claim_fixture().await;
+        let publish = enqueue(&pool, &JobPayload::PublishSite, 0)
+            .await
+            .expect("enqueue publish");
+        let fit = enqueue(&pool, &JobPayload::NightlyRefit { bodies: vec![] }, 1)
+            .await
+            .expect("enqueue fit");
+
+        let claimed = claim(&pool, 60, 100, Lane::Fit)
+            .await
+            .expect("claim")
+            .expect("queued fit job");
+        assert_eq!(claimed.id, fit);
+        assert_eq!(claimed.kind, JobKind::NightlyRefit);
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
+            .bind(publish.as_str())
+            .fetch_one(&pool)
+            .await
+            .expect("publish status");
+        assert_eq!(status, "queued");
+
+        let next = claim(&pool, 60, 100, Lane::All)
+            .await
+            .expect("claim")
+            .expect("queued publisher");
+        assert_eq!(next.id, publish);
+        assert_eq!(next.kind, JobKind::PublishSite);
+    }
+
+    #[tokio::test]
+    async fn the_all_lane_claims_both_kinds_in_queue_order() {
+        let (_dir, pool) = claim_fixture().await;
+        let fit = enqueue(
+            &pool,
+            &JobPayload::ConsistencyScore {
+                contribution_id: ContributionId::new(),
+            },
+            0,
+        )
+        .await
+        .expect("enqueue fit");
+        let publish = enqueue(&pool, &JobPayload::PublishSite, 1)
+            .await
+            .expect("enqueue publish");
+
+        let first = claim(&pool, 60, 100, Lane::All)
+            .await
+            .expect("claim")
+            .expect("queued fit job");
+        assert_eq!(first.id, fit);
+        assert_eq!(first.kind, JobKind::ConsistencyScore);
+
+        let second = claim(&pool, 60, 100, Lane::All)
+            .await
+            .expect("claim")
+            .expect("queued publisher");
+        assert_eq!(second.id, publish);
+        assert_eq!(second.kind, JobKind::PublishSite);
+    }
+
+    #[tokio::test]
+    async fn the_publish_lane_claims_the_legacy_hard_delete_name() {
+        let (_dir, pool) = claim_fixture().await;
+        sqlx::query(
+            "INSERT INTO jobs (id, kind, payload, status, attempts, run_after, created_at)
+             VALUES ('legacy', 'hard_delete_blobs', '{}', 'queued', 0, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert legacy kind");
+
+        let claimed = claim(&pool, 60, 100, Lane::Publish)
+            .await
+            .expect("claim")
+            .expect("queued blob sweep");
+        assert_eq!(claimed.id.as_str(), "legacy");
+        assert_eq!(claimed.kind, JobKind::BlobGc);
+        assert_eq!(claimed.kind.as_str(), "blob_gc");
+    }
+
+    #[tokio::test]
+    async fn a_lane_never_reclaims_another_lanes_expired_lease() {
+        let (_dir, pool) = claim_fixture().await;
+        let fit = enqueue(
+            &pool,
+            &JobPayload::ConsistencyScore {
+                contribution_id: ContributionId::new(),
+            },
+            0,
+        )
+        .await
+        .expect("enqueue fit");
+        let first = claim(&pool, 10, 100, Lane::Fit)
+            .await
+            .expect("claim")
+            .expect("fit job");
+        assert_eq!(first.id, fit);
+        let publish = enqueue(&pool, &JobPayload::PublishSite, 1)
+            .await
+            .expect("enqueue publish");
+
+        let claimed = claim(&pool, 60, 200, Lane::Publish)
+            .await
+            .expect("claim")
+            .expect("queued publisher");
+        assert_eq!(claimed.id, publish);
+        let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM jobs WHERE id = ?")
+            .bind(fit.as_str())
+            .fetch_one(&pool)
+            .await
+            .expect("fit attempts");
+        assert_eq!(attempts, 1, "the publish lane left the expired fit lease");
+
+        let reclaimed = claim(&pool, 60, 200, Lane::All)
+            .await
+            .expect("claim")
+            .expect("expired fit lease");
+        assert_eq!(reclaimed.id, fit);
+        assert_eq!(reclaimed.attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn only_the_all_lane_claims_an_unknown_kind() {
+        let (_dir, pool) = claim_fixture().await;
+        sqlx::query(
+            "INSERT INTO jobs (id, kind, payload, status, attempts, run_after, created_at)
+             VALUES ('future', 'future_kind', '{}', 'queued', 0, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert unknown kind");
+
+        assert!(
+            claim(&pool, 60, 100, Lane::Publish)
+                .await
+                .expect("claim")
+                .is_none()
+        );
+        assert!(
+            claim(&pool, 60, 100, Lane::Fit)
+                .await
+                .expect("claim")
+                .is_none()
+        );
+        let claimed = claim(&pool, 60, 100, Lane::All)
+            .await
+            .expect("claim")
+            .expect("unknown kind");
+        assert_eq!(claimed.kind, JobKind::Other("future_kind".to_owned()));
     }
 }

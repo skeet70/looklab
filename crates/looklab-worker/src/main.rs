@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use clap::Parser;
-use looklab_worker::jobs::JobPayload;
+use looklab_worker::jobs::{JobKind, JobPayload, Lane};
 use looklab_worker::{Worker, WorkerConfig, clock, jobs};
 
 #[derive(Debug, Parser)]
@@ -36,6 +36,9 @@ struct Args {
     transforms: PathBuf,
     #[arg(long, default_value_t = 0x5eed_1a5e)]
     seed: u64,
+    /// Job kinds this process claims.
+    #[arg(long, value_enum, default_value = "all")]
+    lane: Lane,
     /// Job lease; a restarted process reclaims an interrupted job after at most this long.
     #[arg(long, default_value_t = 3_600)]
     lease_seconds: i64,
@@ -52,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let mut config = WorkerConfig::new(args.db, args.blobs);
+    config.lane = args.lane;
     config.data = args.data;
     config.manuals = args.manuals;
     config.snapshot_dir = args.snapshot_dir;
@@ -77,20 +81,27 @@ async fn main() -> anyhow::Result<()> {
 /// and keeps pending jobs in the table.
 async fn schedule_startup(worker: &Worker) -> anyhow::Result<()> {
     let now = clock::now_unix();
-    jobs::enqueue_pending_publication(worker.pool(), now).await?;
-    jobs::enqueue_if_idle(
-        worker.pool(),
-        &JobPayload::BlobGc {
-            contribution_id: None,
-        },
-        now,
-    )
-    .await?;
-    let index = worker.config().site.join("data/index.json");
-    let catalog = &worker.config().manuals;
-    let catalog_present = catalog.is_dir() || catalog.is_file();
-    if !index.is_file() || (catalog_present && !published_index_has_manuals(&index)) {
-        jobs::request_publish(worker.pool(), now).await?;
+    let lane = worker.config().lane;
+    if lane.includes(&JobKind::PublishSite) {
+        jobs::enqueue_pending_publication(worker.pool(), now).await?;
+    }
+    if lane.includes(&JobKind::BlobGc) {
+        jobs::enqueue_if_idle(
+            worker.pool(),
+            &JobPayload::BlobGc {
+                contribution_id: None,
+            },
+            now,
+        )
+        .await?;
+    }
+    if lane.includes(&JobKind::PublishSite) {
+        let index = worker.config().site.join("data/index.json");
+        let catalog = &worker.config().manuals;
+        let catalog_present = catalog.is_dir() || catalog.is_file();
+        if !index.is_file() || (catalog_present && !published_index_has_manuals(&index)) {
+            jobs::request_publish(worker.pool(), now).await?;
+        }
     }
     Ok(())
 }

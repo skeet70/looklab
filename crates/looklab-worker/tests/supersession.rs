@@ -437,7 +437,7 @@ async fn pause_publisher(worker: &Worker) -> (jobs::JobId, i64, PublicationGener
     let observed = jobs::publication_generation(worker.pool())
         .await
         .expect("generation");
-    let job = jobs::claim(worker.pool(), 3_600, now_unix())
+    let job = jobs::claim(worker.pool(), 3_600, now_unix(), jobs::Lane::All)
         .await
         .expect("claim")
         .expect("queued publisher");
@@ -471,7 +471,7 @@ async fn a_running_publisher_blocks_another_publish_claim() {
         .await
         .expect("second publisher");
     assert!(
-        jobs::claim(worker.pool(), 3_600, now_unix())
+        jobs::claim(worker.pool(), 3_600, now_unix(), jobs::Lane::All)
             .await
             .expect("claim")
             .is_none(),
@@ -483,7 +483,7 @@ async fn a_running_publisher_blocks_another_publish_claim() {
             .await
             .expect("complete")
     );
-    let next = jobs::claim(worker.pool(), 3_600, now_unix())
+    let next = jobs::claim(worker.pool(), 3_600, now_unix(), jobs::Lane::All)
         .await
         .expect("claim")
         .expect("publish job");

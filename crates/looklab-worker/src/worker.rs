@@ -25,7 +25,10 @@ impl Worker {
         std::fs::create_dir_all(&config.blobs)?;
         let pool = looklab_server::open_database(&config.db).await?;
         crate::source_identity::activate(&pool).await?;
-        crate::model_assessment::enqueue_engine_verification(&pool, &config, now_unix()).await?;
+        if config.lane.includes(&JobKind::ModelAssessment) {
+            crate::model_assessment::enqueue_engine_verification(&pool, &config, now_unix())
+                .await?;
+        }
         Ok(Self { pool, config })
     }
 
@@ -53,9 +56,15 @@ impl Worker {
     /// A failed job is marked before the error returns.
     pub async fn run_once(&self) -> Result<Option<JobId>> {
         let now = now_unix();
-        let _ = crate::model_fit::enqueue_pending(&self.pool, &self.config, now).await?;
-        let _ = jobs::enqueue_pending_publication(&self.pool, now).await?;
-        let Some(job) = jobs::claim(&self.pool, self.config.lease_seconds, now).await? else {
+        if self.config.lane.includes(&JobKind::NightlyRefit) {
+            let _ = crate::model_fit::enqueue_pending(&self.pool, &self.config, now).await?;
+        }
+        if self.config.lane.includes(&JobKind::PublishSite) {
+            let _ = jobs::enqueue_pending_publication(&self.pool, now).await?;
+        }
+        let Some(job) =
+            jobs::claim(&self.pool, self.config.lease_seconds, now, self.config.lane).await?
+        else {
             return Ok(None);
         };
         // Read before the snapshot: a request committed during publication then
@@ -168,7 +177,9 @@ impl Worker {
                 () = std::future::ready(()) => {}
             }
             let now = now_unix();
-            if jobs::nightly_due(&self.pool, now, self.config.nightly_interval).await? {
+            if self.config.lane.includes(&JobKind::NightlyRefit)
+                && jobs::nightly_due(&self.pool, now, self.config.nightly_interval).await?
+            {
                 jobs::enqueue(
                     &self.pool,
                     &JobPayload::NightlyRefit { bodies: Vec::new() },
@@ -176,7 +187,9 @@ impl Worker {
                 )
                 .await?;
             }
-            if jobs::blob_gc_due(&self.pool, now, BLOB_GC_INTERVAL_SECONDS).await? {
+            if self.config.lane.includes(&JobKind::BlobGc)
+                && jobs::blob_gc_due(&self.pool, now, BLOB_GC_INTERVAL_SECONDS).await?
+            {
                 jobs::enqueue_if_idle(
                     &self.pool,
                     &JobPayload::BlobGc {

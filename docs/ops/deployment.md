@@ -1,8 +1,8 @@
 # Deployment
 
-The production process model is two native binaries over one local state directory: `looklab-server` owns the HTTP listener, SQLite, private blobs and the published data directory; `looklab-worker` owns fits, trust jobs and static publication. Both open the same SQLite file. There is no queue broker, object store or external cache. (`docs/ops/litestream.md` covers database replication.)
+The production process model is two native binaries over one local state directory: `looklab-server` owns the HTTP listener, SQLite, private blobs and the published data directory; `looklab-worker` runs fits and trust jobs, and the same binary as `looklab-publisher` runs static publication. All open the same SQLite file. There is no queue broker, object store or external cache. (`docs/ops/litestream.md` covers database replication.)
 
-A host is one NixOS configuration that imports `nixosModules.looklab`. The module packages the server, the worker, the operator CLI and the SPA, runs the two services under a dedicated user, terminates TLS in Caddy and seeds the data tree. `nixosConfigurations.looklab-ovh` is the production host; a staging host or a second provider is another entry that imports the same module.
+A host is one NixOS configuration that imports `nixosModules.looklab`. The module packages the server, the worker, the operator CLI and the SPA, runs the server and both worker units under a dedicated user, terminates TLS in Caddy and seeds the data tree. `nixosConfigurations.looklab-ovh` is the production host; a staging host or a second provider is another entry that imports the same module.
 
 Production at <https://looklab.fujimod.com> serves the SPA, API and published data from the VPS on one origin. GitHub Pages is a separate preview, not production's frontend.
 
@@ -78,6 +78,19 @@ The server creates the secret with OS randomness when the file is absent and kee
 
 `origin` must be the exact public page origin and `rp_id` its host or a parent domain; HTTP origins are accepted only for `localhost` and `127.0.0.1`. Nonce responses advertise the configured RP ID, and the SPA uses that value for assertions as well as the server's registration options.
 
+## Worker lanes
+
+The worker claims jobs from one SQLite table. `--lane` splits the claim by job kind so a long fit cannot hold publication:
+
+| Lane | Job kinds |
+|---|---|
+| `publish` | `publish_site`, `blob_gc` (`hard_delete_blobs`), `honest_duplicate_merge` |
+| `fit` | `consistency_score`, `card_verification`, `nightly_refit`, `revert_refit`, `model_assessment`, `lut_rebase`, `lut_import`, `bounties` |
+
+`--lane all` is the default and keeps the single-process behaviour, including unknown job kinds stored by a newer server. A lane filters candidates in SQL, keeps the queue order, and never reclaims another lane's expired lease. The `publish_site` single-writer guard is unchanged: one publisher writes the site tree at a time.
+
+The module runs `looklab-worker` with `--lane fit` and its refit memory limits, plus `looklab-publisher` from the same package with `--lane publish` and lower limits. Both use the same arguments, run after `looklab-seed-data`, and restart when the packaged data changes. `lut_import` and `lut_rebase` run `import_lut_look`, and `model_assessment` evaluates fitted probes under the fit options, so they stay in the fit lane. `bounties` loads every sample pool for a target and scores it, which is long numerical work, so it also stays in the fit lane. `card_verification` re-scores accepted card images without fitting, but it shares the fit lane with `consistency_score` and refit completion, which enqueue it with `enqueue_if_idle`; keeping it serial with its enqueuers means a run cannot miss a card accepted while it is queued. `honest_duplicate_merge` only rewrites duplicate links, so publication can run it immediately.
+
 ## Hosts
 
 `nixosConfigurations.looklab-ovh` ([nix/hosts/looklab-ovh.nix](../../nix/hosts/looklab-ovh.nix)) holds the OVH VPS-1 specifics: the disko layout for the single virtio disk (`/dev/vda`, GPT with a 1 MB BIOS boot partition, a 512 MB ESP and ext4 on the rest), a hybrid GRUB install that boots from either BIOS or UEFI, OpenSSH key-only, automatic garbage collection and the module itself:
@@ -149,7 +162,7 @@ nix run github:nix-community/nixos-anywhere -- \
 nix run github:nix-community/nixos-anywhere -- --flake .#looklab-ovh --vm-test
 ```
 
-After the reboot, `ssh root@<ip>` lands on the new system, and `systemctl status looklab-server looklab-worker caddy` shows the three units.
+After the reboot, `ssh root@<ip>` lands on the new system, and `systemctl status looklab-server looklab-worker looklab-publisher caddy` shows the four units.
 
 ## Deploy and roll back
 
@@ -175,7 +188,7 @@ Routine deployments do not require a new provider snapshot or a manual SQLite ba
 
 SQLx rejects applied migrations absent from the binary. In particular, the pre-0021 server cannot start against a database with migration 0021, and its worker does not exclude deferred monochrome contributions from colour fitting. A listed NixOS generation is not proof that it can safely run against the current database.
 
-For an incompatible rollback, stop both services and preserve the current database, backup and server secret. Do not restore an older database over newly accepted contributions or run a downlevel worker against monochrome records. Prefer a forward fix; restore a backup only after establishing that no accepted work is lost.
+For an incompatible rollback, stop the server and both worker units and preserve the current database, backup and server secret. Do not restore an older database over newly accepted contributions or run a downlevel worker against monochrome records. Prefer a forward fix; restore a backup only after establishing that no accepted work is lost.
 
 ## Secrets
 
@@ -282,12 +295,12 @@ services.looklab.litestream = {
 };
 ```
 
-The module writes `/etc/looklab/litestream.yml` (0.5 schema: `dbs`, `snapshot`, `l0-retention`, `socket`) and runs `litestream replicate` as a third unit beside the server and worker. `docs/ops/litestream.md` covers WAL checkpointing with three processes, retention and the drill.
+The module writes `/etc/looklab/litestream.yml` (0.5 schema: `dbs`, `snapshot`, `l0-retention`, `socket`) and runs `litestream replicate` as a fourth unit beside the server and the two worker units. `docs/ops/litestream.md` covers WAL checkpointing with four processes, retention and the drill.
 
-Restore onto the host, with both application units and replication stopped:
+Restore onto the host, with all application units and replication stopped:
 
 ```sh
-systemctl stop looklab-litestream looklab-worker looklab-server
+systemctl stop looklab-litestream looklab-worker looklab-publisher looklab-server
 cd /var/lib/looklab
 mv looklab.sqlite3 looklab.sqlite3.lost
 mv looklab.sqlite3-wal looklab.sqlite3-wal.lost 2>/dev/null || true
@@ -295,7 +308,7 @@ mv looklab.sqlite3-shm looklab.sqlite3-shm.lost 2>/dev/null || true
 sudo -u looklab litestream restore -config /etc/looklab/litestream.yml \
   -integrity-check full -o /var/lib/looklab/looklab.sqlite3 s3://looklab-sqlite/looklab
 sudo -u looklab litestream reset -config /etc/looklab/litestream.yml /var/lib/looklab/looklab.sqlite3
-systemctl start looklab-server looklab-worker looklab-litestream
+systemctl start looklab-server looklab-worker looklab-publisher looklab-litestream
 curl -fsS http://127.0.0.1:8080/readyz
 ```
 
@@ -313,7 +326,7 @@ It stores state under `${XDG_STATE_HOME:-$HOME/.local/state}/looklab`, increment
 
 ## Sizing
 
-On a local debug build the server idles near 22 MB RSS and peaked at 174 MB after page loads and uploads; an idle worker uses about 15 MB. Worker memory scales with refit batch size: a synthetic 1,000-image Look refit in one batch reached about 2 GB RSS, so a 1 GB host suits small batches and larger refits need more memory. Both share one SQLite file; run exactly one worker process. The worker polls every 5 s, renews its job lease every third of `--lease-seconds`, and reclaims interrupted jobs after the lease expires. Queued jobs live in SQLite and survive restarts; the startup path re-queues requested publications and publishes a missing catalog.
+On a local debug build the server idles near 22 MB RSS and peaked at 174 MB after page loads and uploads; an idle worker uses about 15 MB. Worker memory scales with refit batch size: a synthetic 1,000-image Look refit in one batch reached about 2 GB RSS, so a 1 GB host suits small batches and larger refits need more memory. All units share one SQLite file; run exactly one fit worker and one publisher. The worker polls every 5 s, renews its job lease every third of `--lease-seconds`, and reclaims interrupted jobs after the lease expires. Queued jobs live in SQLite and survive restarts; the startup path re-queues requested publications and publishes a missing catalog.
 
 The default worker solve uses the fitter's sweep limit. An explicit `WorkerConfig::sweep_budget` limits total sample evaluations and produces a resumable checkpoint on exhaustion. A fixed 2M-evaluation budget cannot reach final refinement for the 1,000-image fixture after warm-up.
 
@@ -359,13 +372,13 @@ sqlite3 'file:/var/lib/looklab/looklab.sqlite3?mode=ro' \
 
 `/readyz` is 200 only when SQLite answers and, if `site.data_dir` is configured, the published index parses with format `looklab-site/1`. A missing index is reported as `site: missing`, an unparsable one as `site: invalid`.
 
-`nix build .#checks.x86_64-linux.looklab-deploy -L` boots the module in a VM, waits for both units, checks `/healthz`, `/readyz`, `/`, `/data/index.json`, the state-dir and secret permissions, then restarts both units and checks that the secret, the published index and the migrated database survive. The published index must list the six photo scenes and the three test charts with CC0 provenance, and a scene PNG must match its listed digest.
+`nix build .#checks.x86_64-linux.looklab-deploy -L` boots the module in a VM, waits for the server and both worker units, checks `/healthz`, `/readyz`, `/`, `/data/index.json`, the state-dir and secret permissions, then restarts the units and checks that the secret, the published index and the migrated database survive. It also holds a running fit job with an expired lease and a queued fit job that sorts first, requests a publication through the generation counter, and checks that the publisher rewrites the index while both fit jobs stay untouched. The published index must list the six photo scenes and the three test charts with CC0 provenance, and a scene PNG must match its listed digest.
 
-To prove persistence and publication from the browser: register a passkey, upload one batch, and note the status URL. Restart both services, then reload `/status/<token>` (the SPA page) and its `.rss` feed; the feed must list the same contribution. The worker log or the `jobs` query must show the queued scoring and publication rows moving to `done`, and `/data/index.json` must keep the same digest unless the catalog changed.
+To prove persistence and publication from the browser: register a passkey, upload one batch, and note the status URL. Restart the server and worker units, then reload `/status/<token>` (the SPA page) and its `.rss` feed; the feed must list the same contribution. The worker log or the `jobs` query must show the queued scoring and publication rows moving to `done`, and `/data/index.json` must keep the same digest unless the catalog changed.
 
 ## Containers
 
-Run the server and worker as two processes of the same image, sharing one volume at `/var/lib/looklab`; do not run them in one container with a shared PID namespace. Pass the config file or the `LOOKLAB_*` variables, expose only the server port, and send SIGTERM to each process. The server drains in-flight HTTP requests and closes the pool; the worker finishes its current job and exits without claiming another. Do not run the worker on an ephemeral filesystem: SQLite, blobs and `site/data` must be on the persistent volume. `deploy/looklab.toml.example` lists every config key for a hand-written file.
+Run the server and the two worker units as three processes of the same image, sharing one volume at `/var/lib/looklab`; do not run them in one container with a shared PID namespace. Run one worker with `--lane fit` and one with `--lane publish`, never two on the default `--lane all`; a single `--lane all` process is still valid. Pass the config file or the `LOOKLAB_*` variables, expose only the server port, and send SIGTERM to each process. The server drains in-flight HTTP requests and closes the pool; each worker finishes its current job and exits without claiming another. Do not run the workers on an ephemeral filesystem: SQLite, blobs and `site/data` must be on the persistent volume. `deploy/looklab.toml.example` lists every config key for a hand-written file.
 
 ## Untouched constraints
 
