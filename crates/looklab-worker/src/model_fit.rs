@@ -10256,10 +10256,11 @@ camera_to_xyz:
         )
         .await
         .expect("assessment enqueued");
-        let claimed = crate::jobs::claim(&pool, 60, crate::clock::now_unix())
-            .await
-            .expect("claim")
-            .expect("queued assessment");
+        let claimed =
+            crate::jobs::claim(&pool, 60, crate::clock::now_unix(), crate::jobs::Lane::All)
+                .await
+                .expect("claim")
+                .expect("queued assessment");
         let JobPayload::ModelAssessment { request } =
             claimed.payload().expect("assessment payload")
         else {

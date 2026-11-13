@@ -2082,15 +2082,17 @@ async fn a_claim_fences_state_changes_by_attempt() {
         .enqueue(&JobPayload::HonestDuplicateMerge, 0)
         .await
         .expect("enqueue");
-    let first = looklab_worker::jobs::claim(worker.pool(), 10, 100)
-        .await
-        .expect("claim")
-        .expect("job");
+    let first =
+        looklab_worker::jobs::claim(worker.pool(), 10, 100, looklab_worker::jobs::Lane::All)
+            .await
+            .expect("claim")
+            .expect("job");
     assert_eq!(first.attempts, 1);
-    let second = looklab_worker::jobs::claim(worker.pool(), 10, 200)
-        .await
-        .expect("reclaim")
-        .expect("job");
+    let second =
+        looklab_worker::jobs::claim(worker.pool(), 10, 200, looklab_worker::jobs::Lane::All)
+            .await
+            .expect("reclaim")
+            .expect("job");
     assert_eq!(second.id, first.id);
     assert_eq!(second.attempts, 2);
     assert!(
