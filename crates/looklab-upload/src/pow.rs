@@ -22,7 +22,7 @@ const SALT: &[u8] = b"looklab-pow-v1";
 
 pub const DEFAULT_MEMORY_KIB: u32 = 16 * 1024;
 pub const DEFAULT_ITERATIONS: u32 = 1;
-pub const DEFAULT_DIFFICULTY_BITS_PER_IMAGE: f64 = 8.0;
+pub const DEFAULT_DIFFICULTY_BITS_PER_IMAGE: f64 = 3.0;
 
 /// Arguments to every Argon2id evaluation in a batch.
 #[derive(Debug, Clone, Copy, PartialEq)]
